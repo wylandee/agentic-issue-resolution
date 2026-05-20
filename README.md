@@ -1,6 +1,10 @@
 ﻿# TODO
 
 
+Sample repo 1: 
+https://github.com/juice-shop/juice-shop.git
+*set npm config to make package lock before running npm install
+
 agent-remediation-engine/
 ├── config/
 │   ├── prompts/                # System templates (Jinja2) for triage & remedy brains
