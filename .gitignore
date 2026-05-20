@@ -1,0 +1,63 @@
+﻿# ==============================================================================
+# Agent Remediation Engine Specific
+# ==============================================================================
+
+# Ignore all data files, vector embeddings, and target code clones
+/data/clones/*
+/data/trajectories/*
+/data/vector_store/*
+
+# Keep the directory structure intact in git
+!/data/clones/.gitkeep
+!/data/trajectories/.gitkeep
+!/data/vector_store/.gitkeep
+
+# ==============================================================================
+# Secrets & Environment Variables (CRITICAL)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+secrets.yaml
+
+# ==============================================================================
+# Python
+# ==============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ==============================================================================
+# Testing, Linting & Coverage
+# ==============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ==============================================================================
+# IDEs & OS
+# ==============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
