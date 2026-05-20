@@ -1,0 +1,123 @@
+{
+  "reportSchema": "1.1",
+  "scanInfo": {
+    "engineVersion": "12.2.2",
+    "dataSource": [
+      {
+        "name": "NVD CVE 2024",
+        "timestamp": "2024-05-19T07:16:30Z"
+      }
+    ]
+  },
+  "projectInfo": {
+    "name": "OWASP Juice Shop",
+    "groupID": "org.owasp",
+    "artifactID": "juice-shop",
+    "version": "14.3.0",
+    "reportDate": "2026-05-20T03:57:50Z",
+    "credits": {
+      "NVD": "This product uses the NVD API but is not endorsed or certified by the NVD. This report contains data retrieved from the National Vulnerability Database: https://nvd.nist.gov",
+      "CISA": "This report may contain data retrieved from the CISA Known Exploited Vulnerability Catalog: https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+      "NPM": "This report may contain data retrieved from the Github Advisory Database (via NPM Audit API): https://github.com/advisories/",
+      "RETIREJS": "This report may contain data retrieved from the RetireJS community: https://retirejs.github.io/retire.js/",
+      "OSSINDEX": "This report may contain data retrieved from the Sonatype Guide OSS Index API: https://www.sonatype.com/products/sonatype-guide/oss-index-users"
+    }
+  },
+  "dependencies": [
+    {
+      "isVirtual": false,
+      "fileName": "lodash-4.17.20.tgz",
+      "filePath": "/src/node_modules/lodash/package.json",
+      "md5": "e4b025f1c50b691b017b3c224a0d9229",
+      "sha1": "0b153b34208ee4e7e6f85959325c8cc3a69911e3",
+      "sha256": "4b68e89f81fcbc9e449a562dfd807604f061e38ea1dbf5be4f2910fae134ab9a",
+      "description": "Lodash modular utilities.",
+      "license": "MIT",
+      "projectReferences": [
+        "package.json"
+      ],
+      "includedBy": [
+        {
+          "reference": "/src/package.json",
+          "type": "npm"
+        }
+      ],
+      "evidenceCollected": {
+        "vendorEvidence": [
+          {
+            "type": "vendor",
+            "confidence": "HIGH",
+            "source": "package.json",
+            "name": "name",
+            "value": "lodash"
+          }
+        ],
+        "productEvidence": [
+          {
+            "type": "product",
+            "confidence": "HIGH",
+            "source": "package.json",
+            "name": "name",
+            "value": "lodash"
+          }
+        ],
+        "versionEvidence": [
+          {
+            "type": "version",
+            "confidence": "HIGHEST",
+            "source": "package.json",
+            "name": "version",
+            "value": "4.17.20"
+          }
+        ]
+      },
+      "packages": [
+        {
+          "id": "pkg:npm/lodash@4.17.20",
+          "confidence": "HIGHEST",
+          "url": "https://ossindex.sonatype.org/component/pkg:npm/lodash@4.17.20"
+        }
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23337",
+          "severity": "HIGH",
+          "cvssv3": {
+            "baseScore": 7.5,
+            "attackVector": "NETWORK",
+            "attackComplexity": "LOW",
+            "privilegesRequired": "NONE",
+            "userInteraction": "NONE",
+            "scope": "UNCHANGED",
+            "confidentialityImpact": "NONE",
+            "integrityImpact": "HIGH",
+            "availabilityImpact": "NONE",
+            "baseSeverity": "HIGH"
+          },
+          "cwes": [
+            "CWE-77"
+          ],
+          "description": "lodash versions prior to 4.17.21 are vulnerable to Command Injection via the template function.",
+          "references": [
+            {
+              "source": "NVD",
+              "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-23337",
+              "name": "https://nvd.nist.gov/vuln/detail/CVE-2021-23337"
+            }
+          ],
+          "vulnerableSoftware": [
+            {
+              "software": {
+                "id": "cpe:2.3:a:lodash:lodash:*:*:*:*:*:node.js:*:*",
+                "vulnerabilityIdMatched": "true",
+                "versionEndExcluding": "4.17.21",
+                "vulnerable": "true"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

