@@ -1,0 +1,12 @@
+# Auto-detect text files and perform LF normalization
+* text=auto
+
+# Force specific files to always use LF (Linux/Mac style)
+*.js text eol=lf
+*.ts text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+
+# Force Windows batch scripts to use CRLF
+*.bat text eol=crlf
