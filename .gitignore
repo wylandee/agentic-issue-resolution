@@ -6,6 +6,7 @@
 /data/clones/*
 /data/trajectories/*
 /data/vector_store/*
+/data/*.csv
 
 # Keep the directory structure intact in git
 !/data/clones/.gitkeep
