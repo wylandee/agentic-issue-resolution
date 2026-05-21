@@ -291,7 +291,9 @@ class LocalizedIssue(BaseModel):
     A ``VulnerabilityIssue`` enriched with AST-level code localization context.
 
     Produced by the SAST code locator (``locate_sast``) and the SCA manifest
-    locator (``locate_dependency``). Agents use this to plan targeted edits.
+    locator (``locate_dependency``). This model is a *pure localization result* —
+    it contains no fix instructions or remediation planning. Fix planning is the
+    responsibility of the downstream "Plan Fix" agent.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -337,9 +339,9 @@ class LocalizedIssue(BaseModel):
     manifest_snippet: Optional[str] = Field(
         None, description="3-line snippet centred on the manifest declaration."
     )
-    fix_instruction: Optional[str] = Field(
+    package_manager: Optional[str] = Field(
         None,
-        description="Short natural-language instruction for a Remedy agent.",
+        description="Detected package manager (npm / yarn / pnpm) for the manifest.",
     )
 
     # Confidence

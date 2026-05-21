@@ -14,6 +14,9 @@ from .schemas import (
     EditStatus,
     ValidationStatus,
     TrajectoryEventKind,
+    # Sub-models
+    CWEEntry,
+    LineRange,
     # Core domain models
     VulnerabilityIssue,
     LocalizedIssue,
@@ -32,6 +35,8 @@ __all__ = [
     "EditStatus",
     "ValidationStatus",
     "TrajectoryEventKind",
+    "CWEEntry",
+    "LineRange",
     "VulnerabilityIssue",
     "LocalizedIssue",
     "EditRequest",

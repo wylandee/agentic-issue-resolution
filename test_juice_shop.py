@@ -1,50 +1,41 @@
-import csv
 import json
 from pathlib import Path
 
-# Import your manifest locator!
-from src.tools.manifest_locator import locate_dependency
+# Import our Pydantic schema and the upgraded locator
+from src.contracts import VulnerabilityIssue
+from src.tools.manifest_locator import locate_from_issue
 
-def test_real_repo():
-    # 1. Define paths
+def test_v2_pipeline():
     project_root = Path(__file__).resolve().parent
-    csv_path = project_root / "data" / "odc_issues.csv"
+    jsonl_path = project_root / "data" / "odc_issues.jsonl"
     repo_path = project_root / "data" / "clones" / "juice-shop"
 
-    # 2. Safety checks
-    if not csv_path.exists():
-        print(f"❌ Error: CSV not found at {csv_path}")
-        return
-    if not repo_path.exists():
-        print(f"❌ Error: Codebase not found at {repo_path}")
+    if not jsonl_path.exists() or not repo_path.exists():
+        print("❌ Error: Missing jsonl file or juice-shop clone.")
         return
 
-    print(f"✅ Found CSV and Codebase. Starting test...\n")
+    print("✅ Found JSONL and Codebase. Starting V2 Test...\n")
 
-    # 3. Read the CSV and process the first 5 findings
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        
-        # Keep track of how many we process so we don't spam your terminal
-        count = 0 
-        
-        for row in reader:
-            # Grab the dependency name from the CSV column
-            raw_dep_name = row.get("Dependency_Name") 
-            
-            if not raw_dep_name:
+    count = 0
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
                 continue
-
-            print(f"--- 🔍 Processing: {raw_dep_name} ---")
             
-            # Call your Manifest Locator tool
-            result = locate_dependency(repo_path, raw_dep_name)
+            # 1. Magically convert the JSON string back into a strict Pydantic object!
+            issue = VulnerabilityIssue.model_validate_json(line)
             
-            # Print the output formatted nicely
-            print(json.dumps(result, indent=2))
-            print("-" * 50 + "\n")
+            print(f"--- 🔍 Processing: {issue.package_name} (Vuln: {issue.rule_id or issue.cve_id}) ---")
+            
+            # 2. Pass the typed issue to our new locator
+            # enrich_osv=True means it will actually call the Google OSV API!
+            localized_issue = locate_from_issue(issue, repo_path)
+            
+            # 3. Print the resulting LocalizedIssue Pydantic object as JSON
+            print(localized_issue.model_dump_json(indent=2))
+            print("-" * 60 + "\n")
             
             count += 1
 
 if __name__ == "__main__":
-    test_real_repo()
+    test_v2_pipeline()
