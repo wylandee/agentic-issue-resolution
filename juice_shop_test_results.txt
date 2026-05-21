@@ -1,0 +1,1334 @@
+✅ Found CSV and Codebase. Starting test...
+
+--- 🔍 Processing: @tootallnate/once:1.1.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "@tootallnate/once",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of '@tootallnate/once'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: base64url:0.0.6 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "base64url",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'base64url'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: bench.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "bench",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'bench'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: bench.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "bench",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'bench'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: blaze.jar (shaded: commons-io:commons-io:2.4) ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "blaze.jar (shaded",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'blaze.jar (shaded'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: blaze.jar (shaded: commons-io:commons-io:2.4) ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "blaze.jar (shaded",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'blaze.jar (shaded'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: blaze.jar ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "blaze",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'blaze'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: cookie:0.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "cookie",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'cookie'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: crypto-js:3.3.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "crypto-js",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'crypto-js'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: crypto-js:3.3.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "crypto-js",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'crypto-js'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: diff:5.0.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "diff",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'diff'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: elliptic:6.6.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "elliptic",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'elliptic'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: engine.io:4.1.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "engine.io",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'engine.io'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: engine.io:4.1.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "engine.io",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'engine.io'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: express-jwt:0.1.3 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "express-jwt",
+  "is_direct": true,
+  "line_number": 112,
+  "snippet": "    \"express-ipfilter\": \"^1.3.2\",\n    \"express-jwt\": \"0.1.3\",\n    \"express-rate-limit\": \"^7.5.1\",",
+  "ai_instruction": "Change the version of express-jwt on line 112."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: express-jwt:0.1.3 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "express-jwt",
+  "is_direct": true,
+  "line_number": 112,
+  "snippet": "    \"express-ipfilter\": \"^1.3.2\",\n    \"express-jwt\": \"0.1.3\",\n    \"express-rate-limit\": \"^7.5.1\",",
+  "ai_instruction": "Change the version of express-jwt on line 112."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:11.1.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:16.5.4 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:16.5.4 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:3.9.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:4.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:5.2.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: file-type:6.2.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "file-type",
+  "is_direct": true,
+  "line_number": 118,
+  "snippet": "    \"file-stream-rotator\": \"^1.0.0\",\n    \"file-type\": \"^16.5.4\",\n    \"finale-rest\": \"^1.2.2\",",
+  "ai_instruction": "Change the version of file-type on line 118."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: got:8.3.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "got",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'got'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: got:8.3.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "got",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'got'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: grunt-cli:1.5.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "grunt-cli",
+  "is_direct": true,
+  "line_number": 214,
+  "snippet": "    \"globals\": \"^17.4.0\",\n    \"grunt-cli\": \"^1.5.0\",\n    \"mocha\": \"^8.4.0\",",
+  "ai_instruction": "Change the version of grunt-cli on line 214."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: http-cache-semantics:3.8.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "http-cache-semantics",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'http-cache-semantics'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.1.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.1.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.1.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.1.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jsonwebtoken:0.4.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jsonwebtoken",
+  "is_direct": true,
+  "line_number": 132,
+  "snippet": "    \"js-yaml\": \"^3.14.0\",\n    \"jsonwebtoken\": \"0.4.0\",\n    \"libxmljs2\": \"~0.37.0\",",
+  "ai_instruction": "Change the version of jsonwebtoken on line 132."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jws:0.2.6 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'jws'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: jws:0.2.6 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "jws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'jws'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash.set:4.3.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash.set",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash.set'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: lodash:2.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "lodash",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'lodash'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: marsdb:0.6.11 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "marsdb",
+  "is_direct": true,
+  "line_number": 134,
+  "snippet": "    \"libxmljs2\": \"~0.37.0\",\n    \"marsdb\": \"^0.6.11\",\n    \"material-icons\": \"^1.13.14\",",
+  "ai_instruction": "Change the version of marsdb on line 134."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: minimatch:3.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "minimatch",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'minimatch'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment.min.js ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment.min",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment.min'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment:2.0.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment:2.0.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: moment:2.0.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "moment",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'moment'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: nanoid:3.1.20 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "nanoid",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'nanoid'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: nanoid:3.1.20 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "nanoid",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'nanoid'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: nanoid:3.1.20 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "nanoid",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'nanoid'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: notevil:1.3.3 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "notevil",
+  "is_direct": true,
+  "line_number": 140,
+  "snippet": "    \"node-pre-gyp\": \"^0.15.0\",\n    \"notevil\": \"^1.3.3\",\n    \"on-finished\": \"^2.3.0\",",
+  "ai_instruction": "Change the version of notevil on line 140."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: notevil:1.3.3 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "notevil",
+  "is_direct": true,
+  "line_number": 140,
+  "snippet": "    \"node-pre-gyp\": \"^0.15.0\",\n    \"notevil\": \"^1.3.3\",\n    \"on-finished\": \"^2.3.0\",",
+  "ai_instruction": "Change the version of notevil on line 140."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: parseuri:0.0.6 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "parseuri",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'parseuri'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: sanitize-html:1.4.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "sanitize-html",
+  "is_direct": true,
+  "line_number": 149,
+  "snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
+  "ai_instruction": "Change the version of sanitize-html on line 149."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: serialize-javascript:5.0.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "serialize-javascript",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'serialize-javascript'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: serialize-javascript:5.0.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "serialize-javascript",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'serialize-javascript'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: simple-get:4.0.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "simple-get",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'simple-get'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: socket.io-parser:4.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "socket.io-parser",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'socket.io-parser'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: socket.io-parser:4.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "socket.io-parser",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'socket.io-parser'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: socket.io-parser:4.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "socket.io-parser",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'socket.io-parser'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: socket.io-parser:4.0.5 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "socket.io-parser",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'socket.io-parser'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: socket.io:3.1.2 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "socket.io",
+  "is_direct": true,
+  "line_number": 153,
+  "snippet": "    \"serve-index\": \"^1.9.1\",\n    \"socket.io\": \"^3.1.2\",\n    \"sqlite3\": \"^5.1.7\",",
+  "ai_instruction": "Change the version of socket.io on line 153."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: ws:8.17.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "ws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'ws'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: ws:8.17.1 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "ws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'ws'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: ws:8.18.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "ws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'ws'."
+}
+--------------------------------------------------
+
+--- 🔍 Processing: ws:8.18.0 ---
+{
+  "status": "success",
+  "manifest_file": "package.json",
+  "package_name": "ws",
+  "is_direct": false,
+  "line_number": null,
+  "snippet": null,
+  "ai_instruction": "This is a transitive dependency. Do not edit existing dependencies. Instead, add an 'overrides' block to the root of package.json to force the version of 'ws'."
+}
+--------------------------------------------------
+

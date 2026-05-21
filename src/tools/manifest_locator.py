@@ -22,17 +22,21 @@ def normalize_package_name(raw_name: str) -> str:
     if not name:
         return ""
 
+    # Strip ODC formatting like version colons (package:1.2.3) and parenthesis
+    name = name.split(":")[0]
+    name = re.sub(r"\s*\(.*?\)", "", name)
+
     # Keep npm scoped packages intact if already clean (e.g. @types/node).
     if name.startswith("@") and "/" in name and not re.search(r"\.(tgz|jar|zip)$", name, re.IGNORECASE):
         return name
 
-    # Remove common archive/binary suffixes.
-    name = re.sub(r"\.(tgz|jar|zip)$", "", name, flags=re.IGNORECASE)
+    # Remove common archive/binary/js suffixes.
+    name = re.sub(r"\.(tgz|jar|zip|js)$", "", name, flags=re.IGNORECASE)
 
     # Remove trailing version-ish segment: -1.2.3, _1.2.3, .1.2.3, -v1.2.3
     name = re.sub(r"[-_.]v?\d+(?:\.\d+)*(?:[-+][A-Za-z0-9._-]+)?$", "", name)
 
-    return name
+    return name.strip()
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
