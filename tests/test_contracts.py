@@ -36,6 +36,8 @@ from src.contracts import (
     ValidationResult,
     ValidationStatus,
     VulnerabilityIssue,
+    FixPlan,
+    FixPlanStatus,
 )
 from src.contracts.schemas import (
     CWEEntry,
@@ -729,3 +731,99 @@ class TestJSONLSerialisation:
             TrajectoryEventKind.LOCALIZE,
             TrajectoryEventKind.DELIVER,
         ]
+
+
+# ===========================================================================
+# FixPlan Invariants
+# ===========================================================================
+
+
+class TestFixPlan:
+    def test_version_found_success(self):
+        fp = FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="1.2.3",
+            instruction="Update package to 1.2.3",
+            strategy_used="osv_api",
+        )
+        assert fp.status == FixPlanStatus.VERSION_FOUND
+        assert fp.fixed_version == "1.2.3"
+        assert fp.workaround_snippets is None
+
+    def test_version_found_missing_version_raises(self):
+        with pytest.raises(ValidationError, match="status='version_found' requires a non-empty fixed_version"):
+            FixPlan(
+                status=FixPlanStatus.VERSION_FOUND,
+                fixed_version=None,
+                instruction="Update package",
+                strategy_used="osv_api",
+            )
+
+    def test_version_found_with_snippets_raises(self):
+        with pytest.raises(ValidationError, match="status='version_found' must have workaround_snippets=None"):
+            FixPlan(
+                status=FixPlanStatus.VERSION_FOUND,
+                fixed_version="1.2.3",
+                workaround_snippets=["snippet"],
+                instruction="Update package",
+                strategy_used="osv_api",
+            )
+
+    def test_workaround_found_success(self):
+        fp = FixPlan(
+            status=FixPlanStatus.WORKAROUND_FOUND,
+            workaround_snippets=["Use safe methods"],
+            instruction="Apply workaround",
+            strategy_used="serper",
+        )
+        assert fp.status == FixPlanStatus.WORKAROUND_FOUND
+        assert fp.workaround_snippets == ["Use safe methods"]
+        assert fp.fixed_version is None
+
+    def test_workaround_found_missing_snippets_raises(self):
+        with pytest.raises(ValidationError, match="status='workaround_found' requires a non-empty workaround_snippets list"):
+            FixPlan(
+                status=FixPlanStatus.WORKAROUND_FOUND,
+                workaround_snippets=None,
+                instruction="Apply workaround",
+                strategy_used="serper",
+            )
+
+    def test_workaround_found_with_version_raises(self):
+        with pytest.raises(ValidationError, match="status='workaround_found' must have fixed_version=None"):
+            FixPlan(
+                status=FixPlanStatus.WORKAROUND_FOUND,
+                fixed_version="1.2.3",
+                workaround_snippets=["snippet"],
+                instruction="Apply workaround",
+                strategy_used="serper",
+            )
+
+    def test_no_fix_success(self):
+        fp = FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No fix available",
+            strategy_used="none",
+        )
+        assert fp.status == FixPlanStatus.NO_FIX
+        assert fp.fixed_version is None
+        assert fp.workaround_snippets is None
+
+    def test_no_fix_with_version_raises(self):
+        with pytest.raises(ValidationError, match="status='no_fix' must have fixed_version=None"):
+            FixPlan(
+                status=FixPlanStatus.NO_FIX,
+                fixed_version="1.2.3",
+                instruction="No fix available",
+                strategy_used="none",
+            )
+
+    def test_no_fix_with_snippets_raises(self):
+        with pytest.raises(ValidationError, match="status='no_fix' must have workaround_snippets=None"):
+            FixPlan(
+                status=FixPlanStatus.NO_FIX,
+                workaround_snippets=["snippet"],
+                instruction="No fix available",
+                strategy_used="none",
+            )
+

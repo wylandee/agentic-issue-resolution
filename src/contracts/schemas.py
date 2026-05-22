@@ -107,6 +107,88 @@ class TrajectoryEventKind(str, Enum):
     ABORT = "abort"
 
 
+class FixPlanStatus(str, Enum):
+    """Outcome of the fix-planner waterfall for one SCA finding."""
+
+    VERSION_FOUND = "version_found"       # A safe pinned version was identified
+    WORKAROUND_FOUND = "workaround_found" # No upstream fix; web snippets found
+    NO_FIX = "no_fix"                     # All strategies exhausted, nothing found
+
+
+# ---------------------------------------------------------------------------
+# FixPlan
+# ---------------------------------------------------------------------------
+
+
+class FixPlan(BaseModel):
+    """
+    Structured output of the fix-planner waterfall.
+
+    Produced by ``src/tools/fix_planner.py`` and consumed by the downstream
+    Remedy agent to apply the correct type of edit.
+
+    Invariants (enforced by model_validator):
+    - ``version_found``    → ``fixed_version`` is set, ``workaround_snippets`` is None.
+    - ``workaround_found`` → ``workaround_snippets`` is non-empty, ``fixed_version`` is None.
+    - ``no_fix``           → both ``fixed_version`` and ``workaround_snippets`` are None.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: FixPlanStatus = Field(..., description="Outcome of the waterfall.")
+    fixed_version: Optional[str] = Field(
+        None,
+        description="Safe pinned version to upgrade to (set iff status=version_found).",
+    )
+    workaround_snippets: Optional[List[str]] = Field(
+        None,
+        description="Ordered list of workaround text snippets from web search "
+                    "(set iff status=workaround_found).",
+    )
+    instruction: str = Field(
+        ...,
+        min_length=1,
+        description="Natural-language action for the Remedy agent.",
+    )
+    strategy_used: str = Field(
+        ...,
+        min_length=1,
+        description="Which waterfall step produced this plan "
+                    "(local_regex | osv_api | npm_registry | serper | none).",
+    )
+
+    @model_validator(mode="after")
+    def _check_invariants(self) -> "FixPlan":
+        if self.status == FixPlanStatus.VERSION_FOUND:
+            if not self.fixed_version:
+                raise ValueError(
+                    "status='version_found' requires a non-empty fixed_version."
+                )
+            if self.workaround_snippets is not None:
+                raise ValueError(
+                    "status='version_found' must have workaround_snippets=None."
+                )
+        elif self.status == FixPlanStatus.WORKAROUND_FOUND:
+            if not self.workaround_snippets:
+                raise ValueError(
+                    "status='workaround_found' requires a non-empty workaround_snippets list."
+                )
+            if self.fixed_version is not None:
+                raise ValueError(
+                    "status='workaround_found' must have fixed_version=None."
+                )
+        else:  # NO_FIX
+            if self.fixed_version is not None:
+                raise ValueError(
+                    "status='no_fix' must have fixed_version=None."
+                )
+            if self.workaround_snippets is not None:
+                raise ValueError(
+                    "status='no_fix' must have workaround_snippets=None."
+                )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Shared sub-models
 # ---------------------------------------------------------------------------
