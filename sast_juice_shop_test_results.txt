@@ -1,0 +1,1464 @@
+✅ Found JSONL and Codebase. Starting SAST Code Locator Test...
+
+--- 🔍 Processing: javascript.express.code.eval-express.eval-express in routes/userProfile.ts ---
+📍 Target Line: 61
+🧩 Enclosing Function: getUserProfile (function)
+⚠️ Sink Expression: eval(code)
+📦 Imports Found: 10
+💡 Data Flow Hints: ['sink: eval()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+    let username = user.username
+
+    if (username?.match(/#{(.*)}/) !== null && utils.isChallengeEnabled(challenges.usernameXssChallenge)) {
+      req.app.locals.abused_ssti_bug = true
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.code.vm-express.vm-express in routes/b2bOrder.ts ---
+📍 Target Line: 23
+🧩 Enclosing Function: b2bOrder (function)
+⚠️ Sink Expression: vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })
+📦 Imports Found: 7
+💡 Data Flow Hints: ['sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import * as security from '../lib/insecurity'
+import * as utils from '../lib/utils'
+
+export function b2bOrder () {
+  return ({ body }: Request, res: Response, next: NextFunction) => {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.code.vm-express.vm-express in routes/fileUpload.ts ---
+📍 Target Line: 83
+🧩 Enclosing Function: handleXmlUpload (function)
+⚠️ Sink Expression: vm.runInContext('libxml.parseXml(data, { noblanks: true, noent: true, nocdata: true })', sandbox, { timeout: 2000 })
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+}
+
+function handleXmlUpload ({ file }: Request, res: Response, next: NextFunction) {
+  if (utils.endsWith(file?.originalname.toLowerCase(), '.xml')) {
+    challengeUtils.solveIf(challenges.deprecatedInterfaceChallenge, () => { return true })
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.code.vm-express.vm-express in routes/fileUpload.ts ---
+📍 Target Line: 117
+🧩 Enclosing Function: handleYamlUpload (function)
+⚠️ Sink Expression: vm.runInContext('JSON.stringify(yaml.load(data))', sandbox, { timeout: 2000 })
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+}
+
+function handleYamlUpload ({ file }: Request, res: Response, next: NextFunction) {
+  if (utils.endsWith(file?.originalname.toLowerCase(), '.yml') || utils.endsWith(file?.originalname.toLowerCase(), '.yaml')) {
+    challengeUtils.solveIf(challenges.deprecatedInterfaceChallenge, () => { return true })
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in data/static/codefixes/dbSchemaChallenge_1.ts ---
+📍 Target Line: 5
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query("SELECT * FROM Products WHERE ((name LIKE '%"+criteria+"%' OR description LIKE '%"+criteria+"%') AND deletedAt IS NULL) ORDER BY name")
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    models.sequelize.query("SELECT * FROM Products WHERE ((name LIKE '%"+criteria+"%' OR description LIKE '%"+criteria+"%') AND deletedAt IS NULL) ORDER BY name")
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in data/static/codefixes/dbSchemaChallenge_3.ts ---
+📍 Target Line: 11
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+const injectionChars = /"|'|;|and|or|;|#/i;
+
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in data/static/codefixes/unionSqlInjectionChallenge_1.ts ---
+📍 Target Line: 6
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    criteria.replace(/"|'|;|and|or/i, "")
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in data/static/codefixes/unionSqlInjectionChallenge_3.ts ---
+📍 Target Line: 10
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    // only allow apple or orange related searches
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in routes/login.ts ---
+📍 Target Line: 34
+🧩 Enclosing Function: login (function)
+⚠️ Sink Expression: security.hash(req.body.password || '')
+📦 Imports Found: 10
+💡 Data Flow Hints: ['taint source: req.body', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+        user.bid = basket.id // keep track of original basket
+        security.authenticatedUsers.put(token, user)
+        res.json({ authentication: { token, bid: basket.id, umail: user.data.email } })
+      }).catch((error: Error) => {
+        next(error)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.db.sequelize-express.sequelize-express in routes/search.ts ---
+📍 Target Line: 23
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.query', 'sink: Sequelize raw query']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+class ErrorWithParent extends Error {
+  parent: Error | undefined
+}
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/dataExport.ts ---
+📍 Target Line: 33
+🧩 Enclosing Function: dataExport (function)
+⚠️ Sink Expression: db.ordersCollection.find({ email: updatedEmail })
+📦 Imports Found: 7
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+        let memories, orders, reviews
+        try {
+          memories = await MemoryModel.findAll({ where: { UserId: req.body.UserId } })
+        } catch (error) {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/dataExport.ts ---
+📍 Target Line: 40
+🧩 Enclosing Function: dataExport (function)
+⚠️ Sink Expression: db.reviewsCollection.find({ author: email })
+📦 Imports Found: 7
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+        }
+
+        try {
+          orders = await db.ordersCollection.find({ email: updatedEmail })
+        } catch (error) {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/likeProductReviews.ts ---
+📍 Target Line: 25
+🧩 Enclosing Function: likeProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.findOne({ _id: id })
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+export function likeProductReviews () {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const id = req.body.id
+    const user = security.authenticatedUsers.from(req)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/likeProductReviews.ts ---
+📍 Target Line: 36
+🧩 Enclosing Function: likeProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.update(
+📦 Imports Found: 6
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      if (!review) {
+        return res.status(404).json({ error: 'Not found' })
+      }
+
+      const likedBy = review.likedBy
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/likeProductReviews.ts ---
+📍 Target Line: 43
+🧩 Enclosing Function: likeProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.findOne({ _id: id })
+📦 Imports Found: 6
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      }
+
+      await db.reviewsCollection.update(
+        { _id: id },
+        { $inc: { likesCount: 1 } }
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/likeProductReviews.ts ---
+📍 Target Line: 51
+🧩 Enclosing Function: likeProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.update(
+📦 Imports Found: 6
+💡 Data Flow Hints: ['sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      await sleep(150)
+      try {
+        const updatedReview: Review = await db.reviewsCollection.findOne({ _id: id })
+        const updatedLikedBy = updatedReview.likedBy
+        updatedLikedBy.push(user.data.email)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/orderHistory.ts ---
+📍 Target Line: 17
+🧩 Enclosing Function: orderHistory (function)
+⚠️ Sink Expression: ordersCollection.find({ email: updatedEmail })
+📦 Imports Found: 3
+💡 Data Flow Hints: ['taint source: req.headers']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+import { ordersCollection } from '../data/mongodb'
+import * as security from '../lib/insecurity'
+
+export function orderHistory () {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/orderHistory.ts ---
+📍 Target Line: 36
+🧩 Enclosing Function: toggleDeliveryStatus (function)
+⚠️ Sink Expression: ordersCollection.update({ _id: req.params.id }, { $set: { delivered: deliveryStatus, eta } })
+📦 Imports Found: 3
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const order = await ordersCollection.find()
+    res.status(200).json({ status: 'success', data: order.reverse() })
+  }
+}
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/showProductReviews.ts ---
+📍 Target Line: 36
+🧩 Enclosing Function: showProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.find({ $where: 'this.product == ' + id })
+📦 Imports Found: 7
+💡 Data Flow Hints: ['taint source: req.params', 'sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+}
+
+export function showProductReviews () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    // Truncate id to avoid unintentional RCE
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/trackOrder.ts ---
+📍 Target Line: 18
+🧩 Enclosing Function: trackOrder (function)
+⚠️ Sink Expression: db.ordersCollection.find({ $where: `this.orderId === '${id}'` })
+📦 Imports Found: 5
+💡 Data Flow Hints: ['taint source: req.params', 'sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import { type Request, type Response } from 'express'
+import * as db from '../data/mongodb'
+import { challenges } from '../data/datacache'
+
+export function trackOrder () {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.mongodb.express-mongo-nosqli.express-mongo-nosqli in routes/updateProductReviews.ts ---
+📍 Target Line: 18
+🧩 Enclosing Function: updateProductReviews (function)
+⚠️ Sink Expression: db.reviewsCollection.update( // vuln-code-snippet neutral-line forgedReviewChallenge
+📦 Imports Found: 5
+💡 Data Flow Hints: ['taint source: req.body', 'sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import * as challengeUtils from '../lib/challengeUtils'
+import { challenges } from '../data/datacache'
+import * as security from '../lib/insecurity'
+import * as db from '../data/mongodb'
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: generic.secrets.security.detected-generic-secret.detected-generic-secret in data/static/users.yml ---
+📍 Target Line: 151
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: totpSecret: IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+  password: '0Y8rMnww$*9VFYE§59-!Fg1L6t&6lB'
+  key: jannik
+  role: 'admin'
+  securityQuestion:
+    id: 1
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: generic.secrets.security.detected-jwt-token.detected-jwt-token in frontend/src/app/app.guard.spec.ts ---
+📍 Target Line: 46
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: localStorage.setItem('token', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c')
+📦 Imports Found: 6
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.7
+
+✂️ Snippet Preview (First 5 lines):
+    it('should close for anonymous users', () => {
+        const guard = TestBed.inject(LoginGuard)
+
+        localStorage.removeItem('token')
+        expect(guard.canActivate()).toBe(false)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: generic.secrets.security.detected-jwt-token.detected-jwt-token in frontend/src/app/last-login-ip/last-login-ip.component.spec.ts ---
+📍 Target Line: 72
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: localStorage.setItem('token', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7Imxhc3RMb2dpbklwIjoiMS4yLjMuNCJ9fQ.RAkmdqwNypuOxv3SDjPO4xMKvd1CddKvDFYDBfUt3bg')
+📦 Imports Found: 7
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.7
+
+✂️ Snippet Preview (First 5 lines):
+    })
+
+    it('should log JWT parsing error to console', () => {
+        console.log = vi.fn()
+        localStorage.setItem('token', 'definitelyInvalidJWT')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: generic.secrets.security.detected-jwt-token.detected-jwt-token in frontend/src/app/last-login-ip/last-login-ip.component.spec.ts ---
+📍 Target Line: 78
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: localStorage.setItem('token', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7fX0.bVBhvll6IaeR3aUdoOeyR8YZe2S2DfhGAxTGfd9enLw')
+📦 Imports Found: 7
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.7
+
+✂️ Snippet Preview (First 5 lines):
+        expect(console.log).toHaveBeenCalled()
+    })
+
+    it('should set Last-Login IP from JWT as trusted HTML', () => {
+        localStorage.setItem('token', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7Imxhc3RMb2dpbklwIjoiMS4yLjMuNCJ9fQ.RAkmdqwNypuOxv3SDjPO4xMKvd1CddKvDFYDBfUt3bg')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/fileUpload.ts ---
+📍 Target Line: 33
+🧩 Enclosing Function: handleZipFileUpload (function)
+⚠️ Sink Expression: fs.open(tempFile, 'w', function (err, fd) {
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    return res.status(400).json({ error: 'File is not passed' })
+  }
+}
+
+function handleZipFileUpload ({ file }: Request, res: Response, next: NextFunction) {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/fileUpload.ts ---
+📍 Target Line: 38
+🧩 Enclosing Function: handleZipFileUpload (function)
+⚠️ Sink Expression: fs.createReadStream(tempFile)
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  if (utils.endsWith(file?.originalname.toLowerCase(), '.zip')) {
+    if (((file?.buffer) != null) && utils.isChallengeEnabled(challenges.fileWriteChallenge)) {
+      const buffer = file.buffer
+      const filename = file.originalname.toLowerCase()
+      const tempFile = path.join(os.tmpdir(), filename)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/profileImageFileUpload.ts ---
+📍 Target Line: 43
+🧩 Enclosing Function: profileImageFileUpload (function)
+⚠️ Sink Expression: fs.writeFile(filePath, buffer)
+📦 Imports Found: 7
+💡 Data Flow Hints: ['taint source: req.cookies']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      return
+    }
+    const loggedInUser = security.authenticatedUsers.get(req.cookies.token)
+    if (!loggedInUser) {
+      next(new Error('Blocked illegal activity by ' + req.socket.remoteAddress))
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/profileImageUrlUpload.ts ---
+📍 Target Line: 29
+🧩 Enclosing Function: profileImageUrlUpload (function)
+⚠️ Sink Expression: fs.createWriteStream(`frontend/dist/frontend/assets/public/images/uploads/${loggedInUser.data.id}.${ext}`, { flags: 'w' })
+📦 Imports Found: 8
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      const url = req.body.imageUrl
+      if (url.match(/(.)*solve\/challenges\/server-side(.)*/) !== null) req.app.locals.abused_ssrf_bug = true
+      const loggedInUser = security.authenticatedUsers.get(req.cookies.token)
+      if (loggedInUser) {
+        try {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/vulnCodeFixes.ts ---
+📍 Target Line: 81
+🧩 Enclosing Function: checkCorrectFix (arrow_function)
+⚠️ Sink Expression: fs.readFileSync('./data/static/codefixes/' + key + '.info.yml', 'utf8')
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  const key = req.body.key
+  const selectedFix = req.body.selectedFix
+  const fixData = readFixes(key)
+  if (fixData.fixes.length === 0) {
+    res.status(404).json({
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.file.fs-express.fs-express in routes/vulnCodeSnippet.ts ---
+📍 Target Line: 90
+🧩 Enclosing Function: checkVulnLines (arrow_function)
+⚠️ Sink Expression: fs.readFileSync('./data/static/codefixes/' + key + '.info.yml', 'utf8')
+📦 Imports Found: 8
+💡 Data Flow Hints: ['taint source: req.body']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    const statusCode = setStatusCode(error)
+    res.status(statusCode).json({ status: 'error', error: utils.getErrorMessage(error) })
+    return
+  }
+  const vulnLines: number[] = snippetData.vulnLines
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.remote-property-injection.remote-property-injection in routes/currentUser.ts ---
+📍 Target Line: 31
+🧩 Enclosing Function: retrieveLoggedInUser (function)
+⚠️ Sink Expression: baseUser[field] = user?.data[field as keyof typeof user.data]
+📦 Imports Found: 4
+💡 Data Flow Hints: ['taint source: req.query']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+        // If not provided, both these variables will be undefined.
+        const fieldsParam = req.query?.fields as string | undefined
+        const requestedFields = fieldsParam ? fieldsParam.split(',').map(f => f.trim()) : []
+
+        let baseUser: any = {}
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.code-string-concat.code-string-concat in routes/userProfile.ts ---
+📍 Target Line: 61
+🧩 Enclosing Function: getUserProfile (function)
+⚠️ Sink Expression: eval(code)
+📦 Imports Found: 10
+💡 Data Flow Hints: ['sink: eval()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+    let username = user.username
+
+    if (username?.match(/#{(.*)}/) !== null && utils.isChallengeEnabled(challenges.usernameXssChallenge)) {
+      req.app.locals.abused_ssti_bug = true
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in data/static/codefixes/dbSchemaChallenge_1.ts ---
+📍 Target Line: 5
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query("SELECT * FROM Products WHERE ((name LIKE '%"+criteria+"%' OR description LIKE '%"+criteria+"%') AND deletedAt IS NULL) ORDER BY name")
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    models.sequelize.query("SELECT * FROM Products WHERE ((name LIKE '%"+criteria+"%' OR description LIKE '%"+criteria+"%') AND deletedAt IS NULL) ORDER BY name")
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in data/static/codefixes/dbSchemaChallenge_3.ts ---
+📍 Target Line: 11
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+const injectionChars = /"|'|;|and|or|;|#/i;
+
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in data/static/codefixes/unionSqlInjectionChallenge_1.ts ---
+📍 Target Line: 6
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    criteria.replace(/"|'|;|and|or/i, "")
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in data/static/codefixes/unionSqlInjectionChallenge_3.ts ---
+📍 Target Line: 10
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 0
+💡 Data Flow Hints: ['taint source: req.query', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 0.9
+
+✂️ Snippet Preview (First 5 lines):
+export function searchProducts () {
+  return (req: Request, res: Response, next: NextFunction) => {
+    let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
+    // only allow apple or orange related searches
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in routes/login.ts ---
+📍 Target Line: 34
+🧩 Enclosing Function: login (function)
+⚠️ Sink Expression: security.hash(req.body.password || '')
+📦 Imports Found: 10
+💡 Data Flow Hints: ['taint source: req.body', 'sink: HTTP response write', 'sink: Sequelize raw query']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+        user.bid = basket.id // keep track of original basket
+        security.authenticatedUsers.put(token, user)
+        res.json({ authentication: { token, bid: basket.id, umail: user.data.email } })
+      }).catch((error: Error) => {
+        next(error)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection in routes/search.ts ---
+📍 Target Line: 23
+🧩 Enclosing Function: searchProducts (function)
+⚠️ Sink Expression: models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`)
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.query', 'sink: Sequelize raw query']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+class ErrorWithParent extends Error {
+  parent: Error | undefined
+}
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: yaml.github-actions.security.run-shell-injection.run-shell-injection in .github/workflows/update-challenges-ebook.yml ---
+📍 Target Line: 22
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: run: |
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+    if: github.repository == 'juice-shop/juice-shop'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out Git repository
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: yaml.github-actions.security.run-shell-injection.run-shell-injection in .github/workflows/update-challenges-www-legacy.yml ---
+📍 Target Line: 27
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: run: |
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+      with:
+        token: ${{ secrets.BOT_TOKEN }}
+        repository: OWASP/www-project-juice-shop
+        ref: master
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: yaml.github-actions.security.run-shell-injection.run-shell-injection in .github/workflows/update-challenges-www-legacy.yml ---
+📍 Target Line: 36
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: run: |
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+    - name: Update challenges.yml
+      run: |
+        if [ "${{ github.ref_name }}" = "master" ]; then
+          DEST_FILE="_data/challenges.yml"
+        else
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: yaml.github-actions.security.run-shell-injection.run-shell-injection in .github/workflows/update-challenges-www.yml ---
+📍 Target Line: 27
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: run: |
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+      with:
+        token: ${{ secrets.BOT_TOKEN }}
+        repository: juice-shop/juice-shop.github.io
+        ref: master
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: yaml.github-actions.security.run-shell-injection.run-shell-injection in .github/workflows/update-challenges-www.yml ---
+📍 Target Line: 36
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: run: |
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+    - name: Update challenges.yml
+      run: |
+        if [ "${{ github.ref_name }}" = "master" ]; then
+          DEST_FILE="_data/challenges.yml"
+        else
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.browser.security.eval-detected.eval-detected in routes/captcha.ts ---
+📍 Target Line: 22
+🧩 Enclosing Function: captchas (function)
+⚠️ Sink Expression: eval(expression)
+📦 Imports Found: 2
+💡 Data Flow Hints: ['sink: eval()', 'sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    const operators = ['*', '+', '-']
+
+    const firstTerm = Math.floor((Math.random() * 10) + 1)
+    const secondTerm = Math.floor((Math.random() * 10) + 1)
+    const thirdTerm = Math.floor((Math.random() * 10) + 1)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.browser.security.eval-detected.eval-detected in routes/userProfile.ts ---
+📍 Target Line: 61
+🧩 Enclosing Function: getUserProfile (function)
+⚠️ Sink Expression: eval(code)
+📦 Imports Found: 10
+💡 Data Flow Hints: ['sink: eval()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+    let username = user.username
+
+    if (username?.match(/#{(.*)}/) !== null && utils.isChallengeEnabled(challenges.usernameXssChallenge)) {
+      req.app.locals.abused_ssti_bug = true
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.open-redirect-deepsemgrep.open-redirect-deepsemgrep in routes/redirect.ts ---
+📍 Target Line: 19
+🧩 Enclosing Function: performRedirect (function)
+⚠️ Sink Expression: res.redirect(toUrl)
+📦 Imports Found: 5
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import { challenges } from '../data/datacache'
+import * as security from '../lib/insecurity'
+import * as utils from '../lib/utils'
+
+export function performRedirect () {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-check-directory-listing.express-check-directory-listing in server.ts ---
+📍 Target Line: 269
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: serveIndex('ftp', { icons: true })
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+        })
+      }
+      // @ts-expect-error FIXME passed argument has wrong type
+      origEnd.apply(this, arguments)
+    }
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-check-directory-listing.express-check-directory-listing in server.ts ---
+📍 Target Line: 273
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: serveIndex('.well-known', { icons: true, view: 'details' })
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    }
+    next()
+  }
+
+  // vuln-code-snippet start directoryListingChallenge accessLogDisclosureChallenge
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-check-directory-listing.express-check-directory-listing in server.ts ---
+📍 Target Line: 277
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: serveIndex('encryptionkeys', { icons: true, view: 'details' })
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  // vuln-code-snippet start directoryListingChallenge accessLogDisclosureChallenge
+  /* /ftp directory browsing and file download */ // vuln-code-snippet neutral-line directoryListingChallenge
+  app.use('/ftp', serveIndexMiddleware, serveIndex('ftp', { icons: true })) // vuln-code-snippet vuln-line directoryListingChallenge
+  app.use('/ftp(?!/quarantine)/:file', servePublicFiles()) // vuln-code-snippet vuln-line directoryListingChallenge
+  app.use('/ftp/quarantine/:file', serveQuarantineFiles()) // vuln-code-snippet neutral-line directoryListingChallenge
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-check-directory-listing.express-check-directory-listing in server.ts ---
+📍 Target Line: 281
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: serveIndex('logs', { icons: true, view: 'details' })
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  app.use('/ftp/quarantine/:file', serveQuarantineFiles()) // vuln-code-snippet neutral-line directoryListingChallenge
+
+  app.use('/.well-known', serveIndexMiddleware, serveIndex('.well-known', { icons: true, view: 'details' }))
+  app.use('/.well-known', express.static('.well-known'))
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-detect-notevil-usage.express-detect-notevil-usage in routes/b2bOrder.ts ---
+📍 Target Line: 23
+🧩 Enclosing Function: b2bOrder (function)
+⚠️ Sink Expression: vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })
+📦 Imports Found: 7
+💡 Data Flow Hints: ['sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import * as security from '../lib/insecurity'
+import * as utils from '../lib/utils'
+
+export function b2bOrder () {
+  return ({ body }: Request, res: Response, next: NextFunction) => {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-libxml-vm-noent.express-libxml-vm-noent in routes/fileUpload.ts ---
+📍 Target Line: 83
+🧩 Enclosing Function: handleXmlUpload (function)
+⚠️ Sink Expression: vm.runInContext('libxml.parseXml(data, { noblanks: true, noent: true, nocdata: true })', sandbox, { timeout: 2000 })
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+}
+
+function handleXmlUpload ({ file }: Request, res: Response, next: NextFunction) {
+  if (utils.endsWith(file?.originalname.toLowerCase(), '.xml')) {
+    challengeUtils.solveIf(challenges.deprecatedInterfaceChallenge, () => { return true })
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-open-redirect.express-open-redirect in routes/redirect.ts ---
+📍 Target Line: 19
+🧩 Enclosing Function: performRedirect (function)
+⚠️ Sink Expression: res.redirect(toUrl)
+📦 Imports Found: 5
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import { challenges } from '../data/datacache'
+import * as security from '../lib/insecurity'
+import * as utils from '../lib/utils'
+
+export function performRedirect () {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-res-sendfile.express-res-sendfile in routes/fileServer.ts ---
+📍 Target Line: 33
+🧩 Enclosing Function: verify (function)
+⚠️ Sink Expression: path.resolve('ftp/', file)
+📦 Imports Found: 6
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    }
+  }
+
+  function verify (file: string, res: Response, next: NextFunction) {
+    if (file && (endsWithAllowlistedFileType(file) || (file === 'incident-support.kdbx'))) {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-res-sendfile.express-res-sendfile in routes/keyServer.ts ---
+📍 Target Line: 14
+🧩 Enclosing Function: serveKeyFiles (function)
+⚠️ Sink Expression: path.resolve('encryptionkeys/', file)
+📦 Imports Found: 2
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+ */
+
+import path from 'node:path'
+import { type Request, type Response, type NextFunction } from 'express'
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-res-sendfile.express-res-sendfile in routes/logfileServer.ts ---
+📍 Target Line: 14
+🧩 Enclosing Function: serveLogFiles (function)
+⚠️ Sink Expression: path.resolve('logs/', file)
+📦 Imports Found: 2
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+ */
+
+import path from 'node:path'
+import { type Request, type Response, type NextFunction } from 'express'
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.express-res-sendfile.express-res-sendfile in routes/quarantineServer.ts ---
+📍 Target Line: 14
+🧩 Enclosing Function: serveQuarantineFiles (function)
+⚠️ Sink Expression: path.resolve('ftp/quarantine/', file)
+📦 Imports Found: 2
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+ */
+
+import path from 'node:path'
+import { type Request, type Response, type NextFunction } from 'express'
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.security.audit.xss.pug.explicit-unescape.template-explicit-unescape in views/promotionVideo.pug ---
+📍 Target Line: 75
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: if (splitted.length != 2) {
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.3
+
+✂️ Snippet Preview (First 5 lines):
+            var lines = vtt.trim().replace('\\r\n', '\n').split(/[\r\n]/).map(function(line) {
+            return line.trim();
+            });
+            var cues = [];
+            var start = null;
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.session-fixation.session-fixation in lib/insecurity.ts ---
+📍 Target Line: 195
+🧩 Enclosing Function: updateAuthenticatedUsers (arrow_function)
+⚠️ Sink Expression: res.cookie('token', token)
+📦 Imports Found: 11
+💡 Data Flow Hints: ['taint source: req.cookies']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  }
+}
+
+export const updateAuthenticatedUsers = () => (req: Request, res: Response, next: NextFunction) => {
+  const token = req.cookies.token || utils.jwtFrom(req)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.session-fixation.session-fixation in routes/updateUserProfile.ts ---
+📍 Target Line: 40
+🧩 Enclosing Function: updateUserProfile (function)
+⚠️ Sink Expression: res.cookie('token', updatedToken)
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.headers', 'taint source: process.env']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      challengeUtils.solveIf(challenges.csrfChallenge, () => {
+        return ((req.headers.origin?.includes('://htmledit.squarefree.com')) ??
+          (req.headers.referer?.includes('://htmledit.squarefree.com'))) &&
+          req.body.username !== user.username
+      })
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.web.cookies-default-express.cookies-default-express in lib/insecurity.ts ---
+📍 Target Line: 195
+🧩 Enclosing Function: updateAuthenticatedUsers (arrow_function)
+⚠️ Sink Expression: res.cookie('token', token)
+📦 Imports Found: 11
+💡 Data Flow Hints: ['taint source: req.cookies']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  }
+}
+
+export const updateAuthenticatedUsers = () => (req: Request, res: Response, next: NextFunction) => {
+  const token = req.cookies.token || utils.jwtFrom(req)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.web.cookies-default-express.cookies-default-express in routes/updateUserProfile.ts ---
+📍 Target Line: 40
+🧩 Enclosing Function: updateUserProfile (function)
+⚠️ Sink Expression: res.cookie('token', updatedToken)
+📦 Imports Found: 6
+💡 Data Flow Hints: ['taint source: req.headers', 'taint source: process.env']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      challengeUtils.solveIf(challenges.csrfChallenge, () => {
+        return ((req.headers.origin?.includes('://htmledit.squarefree.com')) ??
+          (req.headers.referer?.includes('://htmledit.squarefree.com'))) &&
+          req.body.username !== user.username
+      })
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.web.cors-default-config-express.cors-default-config-express in server.ts ---
+📍 Target Line: 182
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: cors()
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  app.locals.captchaId = 0
+  app.locals.captchaReqId = 1
+  app.locals.captchaBypassReqTimes = []
+  app.locals.abused_ssti_bug = false
+  app.locals.abused_ssrf_bug = false
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.web.cors-default-config-express.cors-default-config-express in server.ts ---
+📍 Target Line: 183
+🧩 Enclosing Function: configureApp (function)
+⚠️ Sink Expression: cors()
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  app.locals.captchaReqId = 1
+  app.locals.captchaBypassReqTimes = []
+  app.locals.abused_ssti_bug = false
+  app.locals.abused_ssrf_bug = false
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.express.web.tainted-redirect-express.tainted-redirect-express in routes/redirect.ts ---
+📍 Target Line: 19
+🧩 Enclosing Function: performRedirect (function)
+⚠️ Sink Expression: res.redirect(toUrl)
+📦 Imports Found: 5
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import { challenges } from '../data/datacache'
+import * as security from '../lib/insecurity'
+import * as utils from '../lib/utils'
+
+export function performRedirect () {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.jsonwebtoken.security.jwt-hardcode.hardcoded-jwt-secret in lib/insecurity.ts ---
+📍 Target Line: 56
+🧩 Enclosing Function: authorize (arrow_function)
+⚠️ Sink Expression: jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+export const cutOffPoisonNullByte = (str: string) => {
+  const nullByte = '%00'
+  if (utils.contains(str, nullByte)) {
+    return str.substring(0, str.indexOf(nullByte))
+  }
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.hardcoded.strings.detected-private-key.detected-private-key in lib/insecurity.ts ---
+📍 Target Line: 23
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: const privateKey = '-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.7
+
+✂️ Snippet Preview (First 5 lines):
+import sanitizeHtmlLib from 'sanitize-html'
+import sanitizeFilenameLib from 'sanitize-filename'
+import * as utils from './utils'
+
+/* jslint node: true */
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 76
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet vuln-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-line[\r\n]{0,2}/g, '')
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-start([^])*[/#]{0,2} vuln-code-snippet hide-end[\r\n]{0,2}/g, '')
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 76
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet vuln-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-line[\r\n]{0,2}/g, '')
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-start([^])*[/#]{0,2} vuln-code-snippet hide-end[\r\n]{0,2}/g, '')
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 76
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet vuln-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-line[\r\n]{0,2}/g, '')
+  snippet = snippet.replace(/.*[/#]{0,2} vuln-code-snippet hide-start([^])*[/#]{0,2} vuln-code-snippet hide-end[\r\n]{0,2}/g, '')
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 78
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet neutral-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+  if (lines.length === 1) lines = snippet.split('\n')
+  if (lines.length === 1) lines = snippet.split('\r')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 78
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet neutral-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+  if (lines.length === 1) lines = snippet.split('\n')
+  if (lines.length === 1) lines = snippet.split('\r')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp in lib/codingChallenges.ts ---
+📍 Target Line: 78
+🧩 Enclosing Function: getCodingChallengeFromFileContent (function)
+⚠️ Sink Expression: new RegExp(`vuln-code-snippet neutral-line.*${challengeKey}`).exec(lines[i])
+📦 Imports Found: 3
+💡 Data Flow Hints: ['sink: exec()']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  snippet = snippet.trim()
+
+  let lines = snippet.split('\r\n')
+  if (lines.length === 1) lines = snippet.split('\n')
+  if (lines.length === 1) lines = snippet.split('\r')
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.hardcoded-hmac-key.hardcoded-hmac-key in lib/insecurity.ts ---
+📍 Target Line: 44
+🧩 Enclosing Function: hmac (arrow_function)
+⚠️ Sink Expression: crypto.createHmac('sha256', 'pa4qacea4VK9t9nGv7yZtwmj')
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  tokenMap: Record<string, ResponseWithUser>
+  idMap: Record<string, string>
+  put: (token: string, user: ResponseWithUser) => void
+  get: (token?: string) => ResponseWithUser | undefined
+  tokenOf: (user: UserModel) => string | undefined
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.hardcoded-hmac-key.hardcoded-hmac-key in lib/insecurity.ts ---
+📍 Target Line: 152
+🧩 Enclosing Function: deluxeToken (arrow_function)
+⚠️ Sink Expression: crypto.createHmac('sha256', privateKey)
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+// vuln-code-snippet end redirectCryptoCurrencyChallenge redirectChallenge
+
+export const roles = {
+  customer: 'customer',
+  deluxe: 'deluxe',
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop.prototype-pollution-loop in frontend/src/hacking-instructor/helpers/helpers.ts ---
+📍 Target Line: 49
+🧩 Enclosing Function: waitForInputToHaveValue (function)
+⚠️ Sink Expression: replacementValue = replacementValue[property]
+📦 Imports Found: 1
+💡 Data Flow Hints: ['sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+    if (options.replacement?.length === 2) {
+      if (!config) {
+        const res = await fetch('/rest/admin/application-configuration')
+        const json = await res.json()
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag in routes/videoHandler.ts ---
+📍 Target Line: 57
+🧩 Enclosing Function: promotionVideo (arrow_function)
+⚠️ Sink Expression: utils.contains(subs, '</script><script>alert(`xss`)</script>')
+📦 Imports Found: 8
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+  }
+}
+
+export const promotionVideo = () => {
+  return (req: Request, res: Response) => {
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag in routes/videoHandler.ts ---
+📍 Target Line: 71
+🧩 Enclosing Function: promotionVideo (arrow_function)
+⚠️ Sink Expression: compiledTemplate.replace('<script id="subtitle"></script>', '<script id="subtitle" type="text/vtt" data-label="English" data-lang="en">' + subs + '</script>')
+📦 Imports Found: 8
+💡 Data Flow Hints: ['sink: HTTP response write']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+      template = template.replace(/_title_/g, entities.encode(config.get<string>('application.name')))
+      template = template.replace(/_favicon_/g, favicon())
+      template = template.replace(/_bgColor_/g, theme.bgColor)
+      template = template.replace(/_textColor_/g, theme.textColor)
+      template = template.replace(/_navColor_/g, theme.navColor)
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.node-stdlib.cryptography.crypto-weak-algorithm.crypto-weak-algorithm in Gruntfile.js ---
+📍 Target Line: 76
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: crypto.createHash('md5')
+📦 Imports Found: 1
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.7
+
+✂️ Snippet Preview (First 5 lines):
+        ]
+      }
+    }
+  })
+
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.node-stdlib.cryptography.crypto-weak-algorithm.crypto-weak-algorithm in lib/insecurity.ts ---
+📍 Target Line: 43
+🧩 Enclosing Function: hash (arrow_function)
+⚠️ Sink Expression: crypto.createHash('md5')
+📦 Imports Found: 11
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+interface IAuthenticatedUsers {
+  tokenMap: Record<string, ResponseWithUser>
+  idMap: Record<string, string>
+  put: (token: string, user: ResponseWithUser) => void
+  get: (token?: string) => ResponseWithUser | undefined
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.node-stdlib.cryptography.crypto-weak-algorithm.crypto-weak-algorithm in lib/utils.ts ---
+📍 Target Line: 89
+🧩 Enclosing Function: ctfFlag (arrow_function)
+⚠️ Sink Expression: getCtfKey()
+📦 Imports Found: 11
+💡 Data Flow Hints: ['taint source: process.env']
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+    if (process.env.CTF_KEY !== undefined && process.env.CTF_KEY !== '') {
+      cachedCtfKey = process.env.CTF_KEY
+    } else {
+      const data = fs.readFileSync('ctf.key', 'utf8')
+      cachedCtfKey = data
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.sequelize.node-sequelize-hardcoded-secret-argument.node-sequelize-hardcoded-secret-argument in models/index.ts ---
+📍 Target Line: 33
+🧩 Enclosing Function: createSequelize (function)
+⚠️ Sink Expression: return new Sequelize('database', 'username', 'password', {
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+import { relationsInit } from './relations'
+import { SecurityAnswerModelInit } from './securityAnswer'
+import { SecurityQuestionModelInit } from './securityQuestion'
+import { UserModelInit } from './user'
+import { WalletModelInit } from './wallet'
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.audit.detect-replaceall-sanitization.detect-replaceall-sanitization in data/static/codefixes/restfulXssChallenge_2.ts ---
+📍 Target Line: 46
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: tableData[i].description.replaceAll('<', '&lt;')
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.6
+
+✂️ Snippet Preview (First 5 lines):
+          this.filterTable()
+        })
+        this.cdRef.detectChanges()
+      },
+      error: (err) => { console.log(err) }
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.audit.detect-replaceall-sanitization.detect-replaceall-sanitization in data/static/codefixes/restfulXssChallenge_2.ts ---
+📍 Target Line: 46
+🧩 Enclosing Function: None (unknown)
+⚠️ Sink Expression: tableData[i].description.replaceAll('<', '&lt;')
+📦 Imports Found: 0
+💡 Data Flow Hints: []
+📈 Confidence Score: 0.6
+
+✂️ Snippet Preview (First 5 lines):
+          this.filterTable()
+        })
+        this.cdRef.detectChanges()
+      },
+      error: (err) => { console.log(err) }
+[...] 
+------------------------------------------------------------
+
+--- 🔍 Processing: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring in server.ts ---
+📍 Target Line: 157
+🧩 Enclosing Function: collectDurationPromise (arrow_function)
+⚠️ Sink Expression: console.error('Error in timed startup function: ' + name, err)
+📦 Imports Found: 20
+💡 Data Flow Hints: []
+📈 Confidence Score: 1.0
+
+✂️ Snippet Preview (First 5 lines):
+
+// Wraps the function and measures its (async) execution time
+const collectDurationPromise = (name: string, func: (...args: any) => Promise<any>) => {
+  return async (...args: any) => {
+    const end = startupGauge.startTimer({ task: name })
+[...] 
+------------------------------------------------------------
+
