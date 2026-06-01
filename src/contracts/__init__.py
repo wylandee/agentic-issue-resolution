@@ -27,6 +27,11 @@ from .schemas import (
     ValidationResult,
     PatchAttempt,
     TrajectoryEvent,
+    # Triage layer (Phase 4.0)
+    SystemContext,
+    CVEEnrichment,
+    VulnerabilityGroup,
+    TriageResult,
 )
 
 __all__ = [
@@ -48,4 +53,9 @@ __all__ = [
     "ValidationResult",
     "PatchAttempt",
     "TrajectoryEvent",
+    # Triage layer (Phase 4.0)
+    "SystemContext",
+    "CVEEnrichment",
+    "VulnerabilityGroup",
+    "TriageResult",
 ]

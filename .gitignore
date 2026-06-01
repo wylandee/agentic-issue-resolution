@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # Agent Remediation Engine Specific
 # ==============================================================================
 
@@ -12,6 +12,10 @@
 !/data/clones/.gitkeep
 !/data/trajectories/.gitkeep
 !/data/vector_store/.gitkeep
+
+# Triage enrichment cache (KEV JSON, future EPSS cache)
+/data/cache/*
+!/data/cache/.gitkeep
 
 # ==============================================================================
 # Secrets & Environment Variables (CRITICAL)

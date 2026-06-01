@@ -676,3 +676,249 @@ class TrajectoryEvent(BaseModel):
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+
+# ---------------------------------------------------------------------------
+# Triage layer contracts (Phase 4.0)
+# ---------------------------------------------------------------------------
+
+
+class SystemContext(BaseModel):
+    """
+    Caller-supplied metadata describing the scan session.
+
+    Passed through the triage pipeline so agents can contextualise their
+    verdicts (e.g. prod vs. dev environment, target language, org policies).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    repo_url: Optional[str] = Field(
+        None, description="HTTPS clone URL of the target repository."
+    )
+    base_ref: Optional[str] = Field(
+        None, description="Git branch or commit SHA that was scanned."
+    )
+    scanned_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp when the scan was initiated.",
+    )
+    environment: Optional[str] = Field(
+        None,
+        description="Deployment environment label (e.g. 'production', 'staging', 'dev').",
+    )
+    deployment_os: Optional[str] = Field(
+        None, description="Operating system where the app is deployed."
+    )
+    public_facing: Optional[bool] = Field(
+        None, description="Whether the app is public-facing (Internet-accessible)."
+    )
+    primary_language: Optional[str] = Field(
+        None, description="Primary programming language of the codebase."
+    )
+    deployment_architecture: Optional[str] = Field(
+        None, description="Architecture layout, e.g. serverless, containerized, monolith."
+    )
+    data_sensitivity: Optional[str] = Field(
+        None, description="Data sensitivity level, e.g. high, medium, low, public."
+    )
+    tags: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Arbitrary key-value metadata (e.g. team, project, cost-center).",
+    )
+
+
+class CVEEnrichment(BaseModel):
+    """
+    External threat-intelligence enrichment for a single CVE identifier.
+
+    Populated by ``src/triage/enrichment.py`` from the FIRST EPSS API and the
+    CISA Known Exploited Vulnerabilities (KEV) catalogue.  Always returned,
+    even when upstream APIs fail — safe defaults indicate "unknown risk".
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    cve_id: str = Field(..., description="CVE identifier this record enriches.")
+
+    # FIRST EPSS
+    epss: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="EPSS probability score (0–1).  0.0 = unknown / API failure.",
+    )
+    epss_percentile: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="EPSS percentile rank (0–1).  0.0 = unknown / API failure.",
+    )
+
+    # CISA KEV
+    in_kev: bool = Field(
+        default=False,
+        description="True if the CVE appears in the CISA KEV catalogue.",
+    )
+    kev_date_added: Optional[str] = Field(
+        None,
+        description="ISO-8601 date the CVE was added to KEV (e.g. '2023-04-03').",
+    )
+
+    # Provenance
+    enriched_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp when enrichment was fetched.",
+    )
+    enrichment_source: str = Field(
+        default="none",
+        description="Which data sources contributed: 'epss', 'kev', 'epss+kev', or 'none'.",
+    )
+
+
+class VulnerabilityGroup(BaseModel):
+    """
+    A set of ``VulnerabilityIssue`` records that share the same vulnerable
+    component (SCA) or code location (SAST).
+
+    Produced by ``src/triage/grouper.py``.  The grouper deduplicates
+    cross-tool findings and merges overlapping CVE/component/file triples into
+    a single authoritative group for downstream triage.
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    # Stable deterministic key
+    group_id: str = Field(
+        ...,
+        description=(
+            "Deterministic group key.  "
+            "SCA: 'sca:{file_path}:{package_name}'. "
+            "SAST: 'sast:{file_path}:{rule_id}:{line_start}-{line_end}'."
+        ),
+    )
+
+    issue_type: IssueType = Field(..., description="SAST or SCA classification of this group.")
+
+    # Component identity
+    vulnerable_component: Optional[str] = Field(
+        None,
+        description="Package name (SCA) or Semgrep rule ID (SAST) shared by all members.",
+    )
+    file_path: Optional[str] = Field(
+        None,
+        description="Repo-relative path to the affected file (may be None for SCA without location).",
+    )
+
+    # CVE / version metadata (SCA-oriented; empty for pure SAST groups)
+    cve_ids: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated list of CVE identifiers affecting this component.",
+    )
+    versions: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated installed versions of the vulnerable package.",
+    )
+
+    # Scanner provenance
+    sources: List[IssueSource] = Field(
+        default_factory=list,
+        description="Which scanners contributed at least one issue to this group.",
+    )
+
+    # Representative issue
+    representative_issue_id: UUID = Field(
+        ...,
+        description=(
+            "UUID of the member issue chosen as the canonical finding for triage. "
+            "Chosen by: fixed_version present > most fields populated > first seen."
+        ),
+    )
+
+    # All member issues
+    issues: List[VulnerabilityIssue] = Field(
+        default_factory=list,
+        description="All ``VulnerabilityIssue`` records that belong to this group.",
+    )
+
+    # Enrichment (attached after grouping, before triage)
+    enrichment: Optional[CVEEnrichment] = Field(
+        None,
+        description="Threat-intel enrichment for the primary CVE of this group.",
+    )
+
+    grouped_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+    )
+
+
+class TriageResult(BaseModel):
+    """
+    Deterministic or LLM-assisted triage verdict for one ``VulnerabilityGroup``.
+
+    Produced by ``src/triage/agent.py``.  The triage agent may use an LLM for
+    initial reasoning, but deterministic guardrails (KEV, EPSS, original
+    severity) are always applied afterwards to prevent the LLM from
+    under-ranking exploitable issues.
+
+    Invariant: ``false_positive_reason`` MUST be set when ``is_valid=False``.
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    chain_of_thought: str = Field(
+        default="",
+        description="Step-by-step chain of thought reasoning before deciding the triage fields.",
+    )
+    group_id: str = Field(..., description="Matches ``VulnerabilityGroup.group_id``.")
+
+    # Validity
+    is_valid: bool = Field(
+        ...,
+        description=(
+            "False if the group is assessed as a false positive or out-of-scope. "
+            "Only set to False when there is explicit, specific evidence."
+        ),
+    )
+    false_positive_reason: Optional[str] = Field(
+        None,
+        description="Required when is_valid=False.  Must explain the specific evidence.",
+    )
+
+    # Priority
+    revised_priority: Severity = Field(
+        ...,
+        description=(
+            "Revised priority using the canonical Severity enum.  "
+            "Guardrails clamp: KEV → CRITICAL; EPSS≥0.5 or HIGH/CRITICAL original → at least HIGH."
+        ),
+    )
+    priority_reasoning: str = Field(
+        ...,
+        min_length=1,
+        description="Human-readable explanation of the revised priority.",
+    )
+
+    # Recommendation
+    recommended_issue_id: UUID = Field(
+        ...,
+        description="UUID of the ``VulnerabilityIssue`` recommended for remediation.",
+    )
+
+    # Provenance
+    triage_method: str = Field(
+        ...,
+        description="'deterministic' if no LLM was used; 'llm' if structured LLM output was applied.",
+    )
+
+    triaged_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+    )
+
+    @model_validator(mode="after")
+    def _require_fp_reason(self) -> "TriageResult":
+        if not self.is_valid and not self.false_positive_reason:
+            raise ValueError(
+                "false_positive_reason is required when is_valid=False."
+            )
+        return self
