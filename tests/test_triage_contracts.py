@@ -170,6 +170,7 @@ class TestVulnerabilityGroup:
         assert group.sources == []
         assert group.issues == []
         assert group.enrichment is None
+        assert group.is_reachable is None
 
     def test_with_cve_and_sources(self):
         issue = _make_issue()
@@ -200,6 +201,12 @@ class TestVulnerabilityGroup:
         group.enrichment = enrichment
         assert group.enrichment.in_kev is True
 
+    def test_reachability_can_be_attached(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        group.is_reachable = False
+        assert group.is_reachable is False
+
 
 # ---------------------------------------------------------------------------
 # TriageResult
@@ -207,6 +214,9 @@ class TestVulnerabilityGroup:
 
 
 class TestTriageResult:
+    def test_chain_of_thought_is_first_field(self):
+        assert next(iter(TriageResult.model_fields)) == "chain_of_thought"
+
     def test_valid_result(self):
         group = _make_group()
         result = _make_triage_result(group)

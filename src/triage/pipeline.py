@@ -24,6 +24,7 @@ select_issues_for_remediation(results)
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from src.contracts.schemas import (
@@ -37,6 +38,7 @@ from src.contracts.schemas import (
 from src.triage.agent import run_triage
 from src.triage.enrichment import enrich_cves
 from src.triage.grouper import group_issues
+from src.triage.reachability import analyze_reachability
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +119,8 @@ def run_triage_pipeline(
     system_context:
         Caller-supplied scan session metadata.
     repo_root:
-        Optional absolute path to the repository; reserved for future
-        enrichment steps (e.g. manifest inspection).
+        Optional absolute path to the repository. When present and it exists,
+        SCA reachability analysis is run before triage.
 
     Returns
     -------
@@ -158,7 +160,11 @@ def run_triage_pipeline(
     # Step 4: Attach enrichment to groups
     _attach_enrichment(groups, enrichment_map)
 
-    # Step 5: Triage each group
+    # Step 5: Reachability analysis for SCA groups (failure-safe)
+    if repo_root and Path(repo_root).exists():
+        analyze_reachability(groups, repo_root)
+
+    # Step 6: Triage each group
     results: List[Tuple[VulnerabilityGroup, TriageResult]] = []
     for group in groups:
         try:

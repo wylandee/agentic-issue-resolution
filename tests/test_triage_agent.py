@@ -29,7 +29,7 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.triage.agent import run_triage
+from src.triage.agent import _build_triage_prompt, run_triage
 
 
 # ---------------------------------------------------------------------------
@@ -258,3 +258,34 @@ class TestLLMGuardrails:
         group = _group(_issue())
         result = run_triage(group, _context())
         assert result.triage_method == "deterministic"
+
+
+class TestTriagePrompt:
+    def test_prompt_includes_reachability_analysis_true(self):
+        issue = _issue()
+        group = _group(issue)
+        group.is_reachable = True
+
+        prompt = _build_triage_prompt(group, _context())
+
+        assert "=== DATA ===" in prompt
+        assert (
+            "Reachability Analysis: TRUE (Package is explicitly imported in application code)"
+            in prompt
+        )
+
+    def test_prompt_rule_d_uses_explicit_false_reachability(self):
+        issue = _issue()
+        group = _group(issue)
+        group.is_reachable = False
+
+        prompt = _build_triage_prompt(group, _context())
+
+        assert (
+            "Reachability Analysis: FALSE (Package is a direct dependency but is NEVER imported in the application source code)"
+            in prompt
+        )
+        assert (
+            "Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive."
+            in prompt
+        )

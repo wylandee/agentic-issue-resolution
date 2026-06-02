@@ -846,6 +846,14 @@ class VulnerabilityGroup(BaseModel):
         None,
         description="Threat-intel enrichment for the primary CVE of this group.",
     )
+    is_reachable: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Reachability analysis result for SCA groups. "
+            "True when the package is imported in app code; False when it is a direct "
+            "dependency but never imported; None when reachability is unknown."
+        ),
+    )
 
     grouped_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),

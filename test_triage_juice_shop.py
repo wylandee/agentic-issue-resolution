@@ -22,18 +22,20 @@ def run_jsonl_fp_test(jsonl_path: str):
     # 1. Iterate through the JSONL and pick out our 2 targets
     test_issues = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
+         for line in f:
             if not line.strip(): continue
             
             data = json.loads(line)
             issue = VulnerabilityIssue(**data)
             
             # Target 1: The Apache Ivy Hallucination
-            if issue.package_name == "blaze.jar":
+            if issue.package_name == "sanitize-html":
                 test_issues.append(issue)
-            
-            # Target 2: The Typosquatting Mix-up
-            elif issue.package_name == "grunt-cli":
+
+            if issue.package_name == "grunt-cli":
+                test_issues.append(issue)
+
+            if issue.package_name == "base64url":
                 test_issues.append(issue)
 
     print(f"📥 Extracted {len(test_issues)} specific raw alerts from the JSONL.\n")
@@ -45,14 +47,15 @@ def run_jsonl_fp_test(jsonl_path: str):
         deployment_os="linux",          
         deployment_architecture="containerized",
         environment="production",
-        primary_language="javascript/nodejs",
+        primary_language="javascript/node.js v24.15",
         description="This is a Node.js / JavaScript web application." 
     )
 
     # 3. Run the pipeline
+    repo_root = "data/clones/juice-shop"
     print("⚙️  Context: Node.js, Linux, Production")
     print("⚙️  Running Triage Pipeline...\n")
-    triage_results = run_triage_pipeline(test_issues, context)
+    triage_results = run_triage_pipeline(test_issues, context, repo_root)
     
     print("="*50)
     print("📊 LLM FALSE POSITIVE RESULTS")

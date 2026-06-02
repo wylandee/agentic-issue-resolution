@@ -262,6 +262,15 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
     cve_list = ", ".join(group.cve_ids) if group.cve_ids else "none"
     sources = ", ".join(s.value for s in group.sources)
     original_sev = _original_severity(group)
+    reachability_info = (
+        "TRUE (Package is explicitly imported in application code)"
+        if group.is_reachable is True
+        else (
+            "FALSE (Package is a direct dependency but is NEVER imported in the application source code)"
+            if group.is_reachable is False
+            else "UNKNOWN (Likely a transitive dependency; cannot reliably determine reachability)"
+        )
+    )
 
     sys_os = context.deployment_os or "unknown"
     sys_public = "yes" if context.public_facing is True else ("no" if context.public_facing is False else "unknown")
@@ -272,7 +281,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
     lines = [
         "You are a senior application security engineer triaging a vulnerability group.",
         "",
-        "--- FINDING DETAILS ---",
+        "=== DATA ===",
         f"Group ID: {group.group_id}",
         f"Issue type: {group.issue_type.value}",
         f"Component: {group.vulnerable_component or 'unknown'}",
@@ -281,13 +290,14 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         f"Installed versions: {', '.join(group.versions) or 'unknown'}",
         f"Sources: {sources}",
         f"Original severity: {original_sev.value}",
+        f"Reachability Analysis: {reachability_info}",
         f"{epss_info}",
         f"{kev_info}",
         "",
-        "--- CVE DETAILS ---",
+        "=== CVE DETAILS ===",
         _build_cve_details_prompt(group),
         "",
-        "--- SYSTEM CONTEXT ---",
+        "=== SYSTEM CONTEXT ===",
         f"Environment: {context.environment or 'unknown'}",
         f"Deployment OS: {sys_os}",
         f"Public Facing: {sys_public}",
@@ -295,7 +305,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         f"Deployment Architecture: {sys_arch}",
         f"Data Sensitivity: {sys_sens}",
         "",
-        "--- TRIAGE INSTRUCTIONS & FALSE POSITIVE RULES ---",
+        "=== TRIAGE INSTRUCTIONS & FALSE POSITIVE RULES ===",
         "Assess whether this finding is a genuine, in-scope vulnerability that should be remediated.",
         "You must follow strict rules to determine if a finding is a false positive.",
         "",
@@ -313,10 +323,10 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "   - Compare that to the File Path and System Context fields to determine if the CVE is truly relevant to this finding",
         "  Rule B: The vulnerability is valid, but the exploit strictly requires an OS or architecture that contradicts the SystemContext.",
         "  Rule C: The vulnerability is valid, but is only present in development code (e.g. tests, specs, dev-only tools) or code that is removed before production.",
-        "  Rule D: The vulnerability is valid, but the codebase does not use the specific functions or affected lines which can be exploited.",
+        "  Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive.",
         "",
         "If the finding does NOT satisfy any of the above four rules, it MUST be considered a valid vulnerability (is_valid=True).",
-        "For valid vulnerabilities, decide an appropriate priority score (revised_priority) based on all the provided information (severity, EPSS, KEV, System Context, data sensitivity, public-facing, etc.).",
+        "For valid vulnerabilities, decide an appropriate priority score (revised_priority) based on all the provided information (original severity, CVSS, EPSS, KEV, System Context, data sensitivity, public-facing, etc.).",
         "",
         "Assign a revised_priority using one of: CRITICAL, HIGH, MEDIUM, LOW, INFO, UNKNOWN.",
         "Set triage_method to 'llm'.",

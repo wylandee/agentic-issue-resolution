@@ -157,6 +157,29 @@ class TestRunTriagePipeline:
         assert group.enrichment.in_kev is True
         assert triage.revised_priority == Severity.CRITICAL
 
+    def test_reachability_runs_when_repo_root_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
+        issues = [_sca()]
+
+        with patch("src.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
+            "src.triage.pipeline.analyze_reachability"
+        ) as mock_reachability:
+            run_triage_pipeline(issues, _ctx(), repo_root=str(tmp_path))
+
+        mock_reachability.assert_called_once()
+
+    def test_reachability_skipped_when_repo_root_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
+        issues = [_sca()]
+        missing_root = tmp_path / "missing-repo"
+
+        with patch("src.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
+            "src.triage.pipeline.analyze_reachability"
+        ) as mock_reachability:
+            run_triage_pipeline(issues, _ctx(), repo_root=str(missing_root))
+
+        mock_reachability.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # select_issues_for_remediation
