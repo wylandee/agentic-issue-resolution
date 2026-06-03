@@ -255,15 +255,15 @@ class TestExtractFixedFromOsvVuln:
 
     def test_semver_range(self):
         vuln = self._make_vuln("SEMVER", "4.17.21")
-        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == "4.17.21"
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == ("4.17.21", None)
 
     def test_ecosystem_range(self):
         vuln = self._make_vuln("ECOSYSTEM", "4.17.21")
-        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == "4.17.21"
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == ("4.17.21", None)
 
     def test_git_range_ignored(self):
         vuln = self._make_vuln("GIT", "abc123")
-        assert _extract_fixed_from_osv_vuln(vuln, "lodash") is None
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == (None, None)
 
     def test_semver_preferred_over_ecosystem(self):
         vuln = {
@@ -277,14 +277,24 @@ class TestExtractFixedFromOsvVuln:
                 }
             ]
         }
-        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == "4.17.21"
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == ("4.17.21", None)
 
     def test_package_name_mismatch_skipped(self):
         vuln = self._make_vuln("SEMVER", "4.17.21", pkg_name="other-pkg")
-        assert _extract_fixed_from_osv_vuln(vuln, "lodash") is None
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == (None, None)
+
+    def test_falls_back_to_workaround_text_case_insensitive(self):
+        vuln = {
+            "details": "Workaround: disable the vulnerable feature until a patch ships.",
+            "affected": [],
+        }
+        assert _extract_fixed_from_osv_vuln(vuln, "lodash") == (
+            None,
+            ["Workaround: disable the vulnerable feature until a patch ships."],
+        )
 
     def test_empty_vuln(self):
-        assert _extract_fixed_from_osv_vuln({}, "lodash") is None
+        assert _extract_fixed_from_osv_vuln({}, "lodash") == (None, None)
 
 
 # ===========================================================================
@@ -402,7 +412,7 @@ class TestQueryOsvFixedVersion:
         with patch("src.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
-        assert result == "4.17.21"
+        assert result == ("4.17.21", None)
 
     def test_id_only_triggers_detail_fetch(self):
         """querybatch returns only {id: ...}, no 'affected' → fall back to GET."""
@@ -432,18 +442,44 @@ class TestQueryOsvFixedVersion:
              patch("src.tools.fix_planner.requests.get", return_value=get_mock):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
-        assert result == "4.17.21"
+        assert result == ("4.17.21", None)
+
+    def test_workaround_text_returned_when_no_fixed_event(self):
+        body = {
+            "results": [
+                {
+                    "vulns": [
+                        {
+                            "id": "GHSA-xxxx",
+                            "details": "Mitigation: disable the parser while awaiting a fix.",
+                            "affected": [
+                                {
+                                    "package": {"name": "lodash"},
+                                    "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        with patch("src.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
+            result = _query_osv_fixed_version(_make_vuln_issue())
+        assert result == (
+            None,
+            ["Mitigation: disable the parser while awaiting a fix."],
+        )
 
     def test_network_failure_returns_none(self):
         with patch("src.tools.fix_planner.requests.post", side_effect=Exception("timeout")):
             result = _query_osv_fixed_version(_make_vuln_issue())
-        assert result is None
+        assert result == (None, None)
 
     def test_empty_results_returns_none(self):
         body = {"results": [{}]}
         with patch("src.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
             result = _query_osv_fixed_version(_make_vuln_issue())
-        assert result is None
+        assert result == (None, None)
 
     def test_no_package_name_returns_none(self):
         issue = _make_vuln_issue(package_name=None, purl=None)
@@ -451,7 +487,7 @@ class TestQueryOsvFixedVersion:
         with patch("src.tools.fix_planner.requests.post") as mock_post:
             result = _query_osv_fixed_version(issue)
         mock_post.assert_not_called()
-        assert result is None
+        assert result == (None, None)
 
 
 # ===========================================================================
@@ -513,7 +549,7 @@ class TestPlanFixWaterfall:
     def _no_network(self):
         """Patch everything to fail so we reach step 5."""
         return [
-            patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None),
+            patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)),
             patch("src.tools.fix_planner._fetch_npm_latest", return_value=None),
             patch("src.tools.fix_planner._search_serper_workarounds", return_value=None),
         ]
@@ -531,17 +567,28 @@ class TestPlanFixWaterfall:
         """No local hint, but OSV returns a fixed version."""
         issue = _make_vuln_issue(message="No version hint here.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.VERSION_FOUND.value
         assert result["fixed_version"] == "4.17.21"
+        assert result["strategy_used"] == "osv_api"
+
+    def test_step2_osv_api_workaround(self):
+        issue = _make_vuln_issue(message="No version hint here.")
+        loc = _make_localized(issue=issue)
+        snippets = ["Workaround: disable the vulnerable option."]
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, snippets)):
+            result = plan_fix(loc)
+        assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
+        assert result["fixed_version"] is None
+        assert result["workaround_snippets"] == snippets
         assert result["strategy_used"] == "osv_api"
 
     def test_step3_npm_registry(self):
         """No hint + OSV fails → npm registry returns latest."""
         issue = _make_vuln_issue(message="No version hint here.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.VERSION_FOUND.value
@@ -556,7 +603,7 @@ class TestPlanFixWaterfall:
             purl="pkg:maven/commons-io/commons-io@2.4",
         )
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest") as npm_mock, \
              patch("src.tools.fix_planner._search_serper_workarounds", return_value=None):
             result = plan_fix(loc)
@@ -569,7 +616,7 @@ class TestPlanFixWaterfall:
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
         snippets = ["Workaround A", "Workaround B"]
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
              patch("src.tools.fix_planner._search_serper_workarounds", return_value=snippets):
             result = plan_fix(loc)
@@ -587,7 +634,7 @@ class TestPlanFixWaterfall:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest", return_value=None):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.NO_FIX.value
@@ -616,7 +663,7 @@ class TestPlanFixRoundTrip:
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
         snippets = ["patch A"]
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
              patch("src.tools.fix_planner._search_serper_workarounds", return_value=snippets):
             result = plan_fix(loc)
@@ -628,7 +675,7 @@ class TestPlanFixRoundTrip:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=None), \
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)), \
              patch("src.tools.fix_planner._fetch_npm_latest", return_value=None):
             result = plan_fix(loc)
         fp = FixPlan(**result)

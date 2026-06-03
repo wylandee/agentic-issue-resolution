@@ -41,7 +41,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -67,6 +67,7 @@ _VERSION_RE = re.compile(
     r"v?(\d+\.\d+(?:\.\d+)?)(?:[-+][A-Za-z0-9._-]+)?",
     re.IGNORECASE,
 )
+_WORKAROUND_KEYWORDS = ("workaround", "mitigate", "mitigation")
 
 # Instruction templates
 _DIRECT_TMPL = 'Update "{package}" in {manifest} to version "{version}".'
@@ -189,7 +190,49 @@ def _build_instruction(
 # ---------------------------------------------------------------------------
 
 
-def _extract_fixed_from_osv_vuln(vuln: Dict[str, Any], package_name: str) -> Optional[str]:
+def _contains_workaround_keyword(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _WORKAROUND_KEYWORDS)
+
+
+def _extract_osv_workaround_snippets(vuln: Dict[str, Any]) -> Optional[List[str]]:
+    """Extract workaround or mitigation text from OSV details/references."""
+    snippets: List[str] = []
+
+    def _add_snippet(candidate: Optional[str]) -> None:
+        if not candidate:
+            return
+        snippet = candidate.strip()
+        if not snippet or not _contains_workaround_keyword(snippet):
+            return
+        if snippet not in snippets:
+            snippets.append(snippet)
+
+    for field in ("details", "summary"):
+        value = vuln.get(field)
+        if isinstance(value, str):
+            _add_snippet(value)
+
+    for reference in (vuln.get("references") or []):
+        if not isinstance(reference, dict):
+            continue
+        parts = [
+            str(value).strip()
+            for value in reference.values()
+            if isinstance(value, str) and value.strip()
+        ]
+        if not parts:
+            continue
+        combined = " | ".join(parts)
+        _add_snippet(combined)
+
+    return snippets or None
+
+
+def _extract_fixed_from_osv_vuln(
+    vuln: Dict[str, Any],
+    package_name: str,
+) -> Tuple[Optional[str], Optional[List[str]]]:
     """
     Walk an OSV vuln object's ``affected[].ranges[].events[]`` to find a
     non-Git ``fixed`` version.
@@ -218,7 +261,11 @@ def _extract_fixed_from_osv_vuln(vuln: Dict[str, Any], package_name: str) -> Opt
                     else:
                         fallback = str(fixed)
 
-    return preferred or fallback
+    fixed = preferred or fallback
+    if fixed:
+        return fixed, None
+
+    return None, _extract_osv_workaround_snippets(vuln)
 
 
 def _fetch_osv_vuln_detail(vuln_id: str) -> Optional[Dict[str, Any]]:
@@ -233,7 +280,7 @@ def _fetch_osv_vuln_detail(vuln_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _query_osv_fixed_version(issue: Any) -> Optional[str]:
+def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[str]]]:
     """
     Query the OSV querybatch API for the fixed version.
 
@@ -244,7 +291,7 @@ def _query_osv_fixed_version(issue: Any) -> Optional[str]:
     """
     package_name = _package_name_from_issue(issue)
     if not package_name:
-        return None
+        return None, None
 
     query: Dict[str, Any] = {}
    
@@ -276,18 +323,28 @@ def _query_osv_fixed_version(issue: Any) -> Optional[str]:
         results: List[Dict[str, Any]] = resp.json().get("results") or []
     except Exception as exc:
         log.warning("OSV querybatch failed: %s", exc)
-        return None
+        return None, None
 
     if not results:
-        return None
+        return None, None
+
+    workaround_snippets: List[str] = []
+
+    def _merge_snippets(snippets: Optional[List[str]]) -> None:
+        if not snippets:
+            return
+        for snippet in snippets:
+            if snippet not in workaround_snippets:
+                workaround_snippets.append(snippet)
 
     for result in results:
         # Case A: full vuln objects embedded directly in result
         for vuln in (result.get("vulns") or []):
             if "affected" in vuln:
-                fixed = _extract_fixed_from_osv_vuln(vuln, package_name)
+                fixed, snippets = _extract_fixed_from_osv_vuln(vuln, package_name)
                 if fixed:
-                    return fixed
+                    return fixed, None
+                _merge_snippets(snippets)
 
         # Case B: only vuln IDs returned — fetch details individually
         for vuln in (result.get("vulns") or []):
@@ -296,11 +353,12 @@ def _query_osv_fixed_version(issue: Any) -> Optional[str]:
                 continue
             detail = _fetch_osv_vuln_detail(vuln_id)
             if detail:
-                fixed = _extract_fixed_from_osv_vuln(detail, package_name)
+                fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
                 if fixed:
-                    return fixed
+                    return fixed, None
+                _merge_snippets(snippets)
 
-    return None
+    return None, (workaround_snippets or None)
 
 
 # ---------------------------------------------------------------------------
@@ -413,13 +471,26 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     # ------------------------------------------------------------------
     # Step 2: OSV API
     # ------------------------------------------------------------------
-    fixed = _query_osv_fixed_version(issue)
+    fixed, osv_workarounds = _query_osv_fixed_version(issue)
     if fixed:
         log.info("[fix_planner] Step 2 (osv_api): found %s → %s", package_name, fixed)
         return _version_plan(
             package_name, fixed, package_manager, is_direct, manifest_file,
             strategy="osv_api",
         )
+    if osv_workarounds:
+        log.info(
+            "[fix_planner] Step 2 (osv_api): found %d workaround snippets for %s",
+            len(osv_workarounds),
+            package_name,
+        )
+        return {
+            "status": FixPlanStatus.WORKAROUND_FOUND.value,
+            "fixed_version": None,
+            "workaround_snippets": osv_workarounds,
+            "instruction": _WORKAROUND_INSTRUCTION,
+            "strategy_used": "osv_api",
+        }
 
     # ------------------------------------------------------------------
     # Step 3: npm registry — latest dist-tag (npm/javascript only)

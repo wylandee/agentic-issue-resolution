@@ -1,93 +1,115 @@
 import os
 import json
 import logging
-from src.contracts.schemas import VulnerabilityIssue, SystemContext
-from src.triage.pipeline import run_triage_pipeline
-from src.triage.agent import _build_triage_prompt  # <-- IMPORT ADDED HERE
+from pathlib import Path
 from dotenv import load_dotenv
 
+# --- Contracts ---
+from src.contracts.schemas import VulnerabilityIssue, SystemContext, IssueType, FixPlan
+
+# --- Senses (Locators & Planners) ---
+from src.tools.manifest_locator import locate_from_issue as locate_sca
+from src.tools.fix_planner import plan_fix
+
+# --- Brain (Triage Layer) ---
+from src.triage.grouper import group_issues
+from src.triage.enrichment import enrich_cves
+from src.triage.reachability import analyze_reachability
+from src.triage.agent import run_triage
+
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-def run_jsonl_fp_test(jsonl_path: str):
+def run_triage_only_test(jsonl_path: str, repo_root: str, max_issues: int = 5):
     print("==================================================")
-    print("🕵️  STARTING REAL-WORLD LLM FALSE POSITIVE TEST")
+    print(f"STARTING SHIFT-LEFT TRIAGE TEST (Capped at {max_issues})")
     print("==================================================")
 
     if not os.path.exists(jsonl_path):
-        print(f"❌ Error: Could not find JSONL file at {jsonl_path}")
+        print(f"Error: Could not find JSONL file at {jsonl_path}")
         return
 
-    # 1. Iterate through the JSONL and pick out our 2 targets
-    test_issues = []
+    # 1. INGESTION
+    raw_issues = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
-         for line in f:
+        for line in f:
             if not line.strip(): continue
-            
-            data = json.loads(line)
-            issue = VulnerabilityIssue(**data)
-            
-            # Target 1: The Apache Ivy Hallucination
-            if issue.package_name == "sanitize-html":
-                test_issues.append(issue)
+            raw_issues.append(VulnerabilityIssue(**json.loads(line)))
+            if len(raw_issues) >= max_issues:
+                break
+    print(f"\n[STEP 1] Ingested {len(raw_issues)} raw vulnerabilities.")
 
-            if issue.package_name == "grunt-cli":
-                test_issues.append(issue)
+    # 2. LOCATE & PLAN (Shift-Left)
+    print("\n[STEP 2] Locating & Planning Fixes...")
+    sca_plans = []
+    for issue in raw_issues:
+        if issue.issue_type == IssueType.SCA:
+            localized = locate_sca(issue, Path(repo_root))
+            plan_dict = plan_fix(localized)
+            plan = FixPlan(**plan_dict)
+            sca_plans.append((localized, plan))
+            print(f"   ↳ {issue.package_name}: {plan.status.value} ({plan.fixed_version or 'No Version'})")
 
-            if issue.package_name == "base64url":
-                test_issues.append(issue)
+    # 3. STRATEGY-BASED GROUPING
+    print("\n[STEP 3] Grouping by Strategy & Calculating High-Water Mark...")
+    groups = group_issues(issues=raw_issues, sca_issue_plans=sca_plans)
+    print(f"   Reduced {len(raw_issues)} raw issues into {len(groups)} distinct action groups.")
 
-    print(f"📥 Extracted {len(test_issues)} specific raw alerts from the JSONL.\n")
+    # 4. ENRICHMENT & REACHABILITY
+    print("\n🌐 [STEP 4] Enrichment (AST Reachability & EPSS/KEV)...")
+    analyze_reachability(groups, repo_root)
+    
+    all_cves = list({cve for group in groups for cve in group.cve_ids})
+    enrichment_data = enrich_cves(all_cves)
+    
+    for group in groups:
+        if group.cve_ids:
+            # Attach highest EPSS enrichment
+            group.enrichment = max(
+                (enrichment_data.get(cve) for cve in group.cve_ids if cve in enrichment_data),
+                key=lambda x: x.epss if x else 0,
+                default=None
+            )
 
-    # 2. Define Context (Explicitly stating it is a Node.js app!)
-    # Note: Double check if your schema expects `public_facing` or `is_public_facing`
+    # 5. LLM TRIAGE
+    print("\n[STEP 5] Executing AI Triage & RBVM Guardrails...")
     context = SystemContext(
-        public_facing=True,
-        deployment_os="linux",          
+        is_public_facing=True,
+        deployment_os="linux",
         deployment_architecture="containerized",
         environment="production",
-        primary_language="javascript/node.js v24.15",
+        primary_language="javascript/nodejs"
     )
 
-    # 3. Run the pipeline
-    repo_root = "data/clones/juice-shop"
-    print("⚙️  Context: Node.js, Linux, Production")
-    print("⚙️  Running Triage Pipeline...\n")
-    triage_results = run_triage_pipeline(test_issues, context, repo_root)
-    
+    print("\n" + "="*50)
+    print("TRIAGE RESULTS")
     print("="*50)
-    print("📊 LLM FALSE POSITIVE RESULTS")
-    print("="*50)
-    
-    for group, result in triage_results:
-        status_icon = "✅ VALID" if result.is_valid else "❌ FALSE POSITIVE"
+
+    for group in groups:
+        result = run_triage(group, context)
         
-        print(f"\n📦 Group: {group.vulnerable_component} (in {group.file_path})")
-        print(f"   ↳ Method      -> 🤖 {result.triage_method.upper()}")
-        print(f"   ↳ Status      -> {status_icon}")
+        status_icon = "VALID" if result.is_valid else "FALSE POSITIVE"
+        
+        print(f"\n Group: {group.vulnerable_component} (in {group.file_path})")
+        print(f"   ↳ Unified Plan: {group.fix_plan.status.value if group.fix_plan else 'UNKNOWN'}")
+        print(f"   ↳ Target Ver. : {group.fix_plan.fixed_version if group.fix_plan else 'N/A'}")
+        print(f"   ↳ Status      : {status_icon}")
         
         if not result.is_valid:
-            print(f"   ↳ FP Reason   -> {result.false_positive_reason}")
+            print(f"   ↳ FP Reason   : {result.false_positive_reason}")
+            print(f"   ↳ Val. Conf.  : {result.validity_confidence_score} / 1.0")
         else:
-            print(f"   ↳ Priority    -> {result.revised_priority.name}")
-            print(f"   ↳ Reasoning   -> {result.priority_reasoning}")
-
-        print(f"COT:  {result.chain_of_thought}")
-
-        # -------------------------------------------------------------
-        # PRINT THE PROMPT HERE
-        # -------------------------------------------------------------
-        print("\n   [🔍 PROMPT SENT TO LLM]")
-        prompt_text = _build_triage_prompt(group, context)
-        print("   " + "-"*60)
-        for line in prompt_text.split('\n'):
-            print(f"   | {line}")
-        print("   " + "-"*60 + "\n")
+            print(f"   ↳ Priority    : {result.revised_priority.name}")
+            print(f"   ↳ Pri. Conf.  : {result.priority_confidence_score} / 1.0")
+            print(f"   ↳ Reasoning   : {result.priority_reasoning}")
+        
+        print(f"\n   [Chain of Thought]\n   {result.chain_of_thought}\n")
 
 if __name__ == "__main__":
     os.environ["TRIAGE_LLM_ENABLED"] = "true"
     os.environ["TRIAGE_LLM_MODEL"] = "gpt-4o-mini"
     
     INGESTED_JSONL_PATH = "./data/odc_issues.jsonl"
-    run_jsonl_fp_test(jsonl_path=INGESTED_JSONL_PATH)
+    JUICE_SHOP_REPO = os.path.abspath("./data/clones/juice-shop")
+    
+    run_triage_only_test(INGESTED_JSONL_PATH, JUICE_SHOP_REPO, max_issues=5)

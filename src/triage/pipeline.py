@@ -7,11 +7,13 @@ run_triage_pipeline(issues, system_context, repo_root=None)
     → List[Tuple[VulnerabilityGroup, TriageResult]]
 
     Full pipeline:
-    1. group_issues(issues)         → List[VulnerabilityGroup]
-    2. enrich_cves(all_cve_ids)     → Dict[str, CVEEnrichment]
-    3. Attach enrichment to groups  (primary CVE enrichment per group)
-    4. run_triage(group, context)   → TriageResult per group
-    5. Return all (group, result) pairs
+    1. locate + plan each SCA issue  → List[Tuple[LocalizedIssue, FixPlan]]
+    2. group_issues(...)             → List[VulnerabilityGroup]
+    3. enrich_cves(all_cve_ids)      → Dict[str, CVEEnrichment]
+    4. Attach enrichment to groups   (primary CVE enrichment per group)
+    5. Optional reachability analysis for SCA groups
+    6. run_triage(group, context)    → TriageResult per group
+    7. Return all (group, result) pairs
 
 select_issues_for_remediation(results)
     → List[VulnerabilityIssue]
@@ -29,6 +31,10 @@ from typing import Dict, List, Optional, Tuple
 
 from src.contracts.schemas import (
     CVEEnrichment,
+    FixPlan,
+    FixPlanStatus,
+    IssueType,
+    LocalizedIssue,
     Severity,
     SystemContext,
     TriageResult,
@@ -99,6 +105,67 @@ def _find_issue_by_id(
     return None
 
 
+def _fallback_localized_issue(issue: VulnerabilityIssue) -> LocalizedIssue:
+    """Build a minimal LocalizedIssue when repository localization is unavailable."""
+    return LocalizedIssue(
+        issue=issue,
+        manifest_file=issue.file_path,
+        localization_confidence=0.0,
+    )
+
+
+def _fallback_no_fix_plan() -> FixPlan:
+    """Return a safe no-fix plan when planning fails unexpectedly."""
+    return FixPlan(
+        status=FixPlanStatus.NO_FIX,
+        fixed_version=None,
+        workaround_snippets=None,
+        instruction="No upstream patch or workaround was found. Inform the user.",
+        strategy_used="NO_FIX",
+    )
+
+
+def _prepare_sca_issue_plans(
+    sca_issues: List[VulnerabilityIssue],
+    repo_root: Optional[str],
+) -> List[Tuple[LocalizedIssue, FixPlan]]:
+    """Locate and plan SCA issues before grouping."""
+    if not sca_issues:
+        return []
+
+    from src.tools.fix_planner import plan_fix
+    from src.tools.manifest_locator import locate_from_issue
+
+    repo_path = Path(repo_root) if repo_root and Path(repo_root).exists() else None
+    issue_plans: List[Tuple[LocalizedIssue, FixPlan]] = []
+
+    for issue in sca_issues:
+        localized_issue = _fallback_localized_issue(issue)
+        if repo_path is not None:
+            try:
+                localized_issue = locate_from_issue(issue, repo_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "SCA localization failed for %s (%s); using fallback localization.",
+                    issue.id,
+                    exc,
+                )
+
+        try:
+            fix_plan = FixPlan(**plan_fix(localized_issue))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Fix planning failed for %s (%s); using no-fix fallback.",
+                issue.id,
+                exc,
+            )
+            fix_plan = _fallback_no_fix_plan()
+
+        issue_plans.append((localized_issue, fix_plan))
+
+    return issue_plans
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -134,8 +201,11 @@ def run_triage_pipeline(
 
     logger.info("Triage pipeline: processing %d issues.", len(issues))
 
-    # Step 1: Group
-    groups = group_issues(issues)
+    sca_issues = [issue for issue in issues if issue.issue_type == IssueType.SCA]
+    sca_issue_plans = _prepare_sca_issue_plans(sca_issues, repo_root)
+
+    # Step 1: Group after SCA locate + plan
+    groups = group_issues(issues, sca_issue_plans=sca_issue_plans)
     logger.info("Triage pipeline: produced %d groups.", len(groups))
 
     # Step 2: Collect all unique CVE IDs for bulk enrichment

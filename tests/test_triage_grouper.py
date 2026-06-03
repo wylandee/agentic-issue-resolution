@@ -12,14 +12,13 @@ Covers:
 
 from __future__ import annotations
 
-from uuid import uuid4
-
-import pytest
-
 from src.contracts.schemas import (
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
     LineRange,
+    LocalizedIssue,
     Severity,
     VulnerabilityIssue,
 )
@@ -72,6 +71,38 @@ def _sast(
     )
 
 
+def _localized(
+    issue: VulnerabilityIssue,
+    *,
+    manifest_file: str | None = None,
+    is_direct_dependency: bool | None = True,
+    package_manager: str | None = "npm",
+) -> LocalizedIssue:
+    return LocalizedIssue(
+        issue=issue,
+        manifest_file=manifest_file or issue.file_path,
+        is_direct_dependency=is_direct_dependency,
+        package_manager=package_manager,
+        localization_confidence=0.95,
+    )
+
+
+def _plan(
+    *,
+    status: FixPlanStatus,
+    fixed_version: str | None = None,
+    workaround_snippets: list[str] | None = None,
+    strategy_used: str = "osv_api",
+) -> FixPlan:
+    return FixPlan(
+        status=status,
+        fixed_version=fixed_version,
+        workaround_snippets=workaround_snippets,
+        instruction="test plan",
+        strategy_used=strategy_used,
+    )
+
+
 # ---------------------------------------------------------------------------
 # SCA grouping
 # ---------------------------------------------------------------------------
@@ -81,13 +112,20 @@ class TestSCAGrouping:
     def test_same_package_multiple_cves_become_one_group(self):
         issues = [
             _sca(cve_id="CVE-2021-23337"),
-            _sca(cve_id="CVE-2020-28500"),  # Different CVE, same component/file
+            _sca(cve_id="CVE-2020-28500"),
         ]
-        groups = group_issues(issues)
+        pairs = [
+            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22")),
+        ]
+        groups = group_issues(issues, sca_issue_plans=pairs)
         assert len(groups) == 1
         g = groups[0]
         assert set(g.cve_ids) == {"CVE-2021-23337", "CVE-2020-28500"}
         assert g.issue_type == IssueType.SCA
+        assert g.fix_plan is not None
+        assert g.fix_plan.fixed_version == "4.17.22"
+        assert g.fix_plan.strategy_used == "UPDATE_VERSION"
 
     def test_duplicate_cve_same_component_is_deduped(self):
         """Same CVE appearing twice (e.g. from the same scanner run) → one CVE ID."""
@@ -95,7 +133,11 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2021-23337"),
             _sca(cve_id="CVE-2021-23337"),  # Exact duplicate
         ]
-        groups = group_issues(issues)
+        pairs = [
+            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+        ]
+        groups = group_issues(issues, sca_issue_plans=pairs)
         assert len(groups) == 1
         assert groups[0].cve_ids == ["CVE-2021-23337"]
 
@@ -103,19 +145,34 @@ class TestSCAGrouping:
         """Semgrep SCA + ODC finding the same CVE on the same package/file → merge."""
         semgrep_issue = _sca(source=IssueSource.SEMGREP, cve_id="CVE-2021-44228")
         odc_issue = _sca(source=IssueSource.ODC, cve_id="CVE-2021-44228")
-        groups = group_issues([semgrep_issue, odc_issue])
+        groups = group_issues(
+            [semgrep_issue, odc_issue],
+            sca_issue_plans=[
+                (_localized(semgrep_issue), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround A"])),
+                (_localized(odc_issue), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround B"])),
+            ],
+        )
         assert len(groups) == 1
         g = groups[0]
         assert IssueSource.SEMGREP in g.sources
         assert IssueSource.ODC in g.sources
         assert len(g.issues) == 2
+        assert g.fix_plan is not None
+        assert g.fix_plan.strategy_used == "WORKAROUND"
+        assert g.fix_plan.workaround_snippets == ["Workaround A", "Workaround B"]
 
     def test_different_packages_different_files_make_separate_groups(self):
         issues = [
             _sca(package_name="lodash", file_path="package.json"),
             _sca(package_name="express", file_path="backend/package.json"),
         ]
-        groups = group_issues(issues)
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+            ],
+        )
         assert len(groups) == 2
 
     def test_representative_prefers_issue_with_fixed_version(self):
@@ -130,15 +187,61 @@ class TestSCAGrouping:
             _sca(package_version="4.17.20", cve_id="CVE-2021-23337"),
             _sca(package_version="4.17.20", cve_id="CVE-2020-28500"),
         ]
-        groups = group_issues(issues)
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+            ],
+        )
         assert groups[0].versions == ["4.17.20"]
 
     def test_no_cve_sca_still_groups(self):
         issues = [_sca(cve_id=None), _sca(cve_id=None)]
-        groups = group_issues(issues)
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+            ],
+        )
         # Same component/file → one group; no CVE IDs expected
         assert len(groups) == 1
         assert groups[0].cve_ids == []
+
+    def test_same_component_different_fix_strategies_split_groups(self):
+        issues = [
+            _sca(cve_id="CVE-2021-23337"),
+            _sca(cve_id="CVE-2020-28500"),
+        ]
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Mitigation: disable feature"])),
+            ],
+        )
+        assert len(groups) == 2
+        group_ids = {group.group_id for group in groups}
+        assert "sca:package.json:lodash:UPDATE_VERSION" in group_ids
+        assert "sca:package.json:lodash:WORKAROUND" in group_ids
+
+    def test_highest_fixed_version_handles_partial_and_v_prefix(self):
+        issues = [
+            _sca(cve_id="CVE-2021-23337"),
+            _sca(cve_id="CVE-2020-28500"),
+        ]
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="v1.2")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.2.5")),
+            ],
+        )
+        assert len(groups) == 1
+        assert groups[0].fix_plan is not None
+        assert groups[0].fix_plan.fixed_version == "1.2.5"
+        assert len(groups[0].localized_issues) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +289,13 @@ class TestMixedGrouping:
             _sca(package_name="express", file_path="backend/package.json"),
             _sast(file_path="src/login.js", rule_id="xss", line_start=5, line_end=5),
         ]
-        groups = group_issues(issues)
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.18.3")),
+            ],
+        )
         assert len(groups) == 3
 
     def test_mixed_list_correct_types(self):
@@ -211,14 +320,21 @@ class TestMixedGrouping:
 class TestGroupSCAAlias:
     def test_alias_excludes_sast(self):
         issues = [_sca(), _sast()]
-        sca_groups = group_sca_issues(issues)
+        sca_groups = group_sca_issues(
+            issues,
+            sca_issue_plans=[(_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none"))],
+        )
         assert all(g.issue_type == IssueType.SCA for g in sca_groups)
 
     def test_alias_matches_group_issues_on_sca_only_input(self):
         # Create one shared list so both calls operate on the same issue objects
         issues = [_sca(cve_id="CVE-2021-23337"), _sca(cve_id="CVE-2020-28500")]
-        alias_result = group_sca_issues(issues)
-        direct_result = group_issues(issues)
+        pairs = [
+            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22")),
+        ]
+        alias_result = group_sca_issues(issues, sca_issue_plans=pairs)
+        direct_result = group_issues(issues, sca_issue_plans=pairs)
         assert len(alias_result) == len(direct_result)
         alias_ids = {g.group_id for g in alias_result}
         direct_ids = {g.group_id for g in direct_result}

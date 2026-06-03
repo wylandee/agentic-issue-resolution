@@ -21,8 +21,11 @@ from pydantic import ValidationError
 
 from src.contracts.schemas import (
     CVEEnrichment,
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
+    LocalizedIssue,
     Severity,
     SystemContext,
     TriageResult,
@@ -174,6 +177,8 @@ class TestVulnerabilityGroup:
         assert group.versions == []
         assert group.sources == []
         assert group.issues == []
+        assert group.localized_issues == []
+        assert group.fix_plan is None
         assert group.enrichment is None
         assert group.is_reachable is None
 
@@ -205,6 +210,22 @@ class TestVulnerabilityGroup:
         enrichment = CVEEnrichment(cve_id="CVE-2021-23337", epss=0.7, in_kev=True)
         group.enrichment = enrichment
         assert group.enrichment.in_kev is True
+
+    def test_localized_issues_and_fix_plan_can_be_attached(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        localized = LocalizedIssue(issue=issue, manifest_file="package.json", localization_confidence=0.95)
+        plan = FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="4.17.21",
+            workaround_snippets=None,
+            instruction="Update dependency.",
+            strategy_used="UPDATE_VERSION",
+        )
+        group.localized_issues = [localized]
+        group.fix_plan = plan
+        assert group.localized_issues[0].manifest_file == "package.json"
+        assert group.fix_plan.fixed_version == "4.17.21"
 
     def test_reachability_can_be_attached(self):
         issue = _make_issue()

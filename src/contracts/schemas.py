@@ -797,7 +797,7 @@ class VulnerabilityGroup(BaseModel):
         ...,
         description=(
             "Deterministic group key.  "
-            "SCA: 'sca:{file_path}:{package_name}'. "
+            "SCA: 'sca:{manifest_file}:{package_name}:{fix_strategy}'. "
             "SAST: 'sast:{file_path}:{rule_id}:{line_start}-{line_end}'."
         ),
     )
@@ -843,6 +843,20 @@ class VulnerabilityGroup(BaseModel):
     issues: List[VulnerabilityIssue] = Field(
         default_factory=list,
         description="All ``VulnerabilityIssue`` records that belong to this group.",
+    )
+    localized_issues: List[LocalizedIssue] = Field(
+        default_factory=list,
+        description=(
+            "All pre-group localization results associated with this group. "
+            "Primarily populated for SCA groups in the shift-left flow."
+        ),
+    )
+    fix_plan: Optional[FixPlan] = Field(
+        None,
+        description=(
+            "Unified remediation plan for the group. For SCA groups this is the "
+            "group-level plan derived from member issue fix plans."
+        ),
     )
 
     # Enrichment (attached after grouping, before triage)
