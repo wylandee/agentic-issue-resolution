@@ -315,6 +315,10 @@ class VulnerabilityIssue(BaseModel):
     finding_url: Optional[str] = Field(
         None, description="Deep-link to the scanner UI for this finding."
     )
+    dataflow_trace: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Raw Semgrep dataflow trace object for SAST findings, if present.",
+    )
 
     # Validation profile (which sandbox ruleset to use)
     validation_profile: Optional[str] = Field(
