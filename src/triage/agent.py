@@ -39,6 +39,11 @@ from src.contracts.schemas import (
 
 logger = logging.getLogger(__name__)
 
+_UNREACHABLE_CODE_NOTE = (
+    "Reachability analysis shows the package is not imported by the application "
+    "source code."
+)
+
 # ---------------------------------------------------------------------------
 # Priority ordering helpers
 # ---------------------------------------------------------------------------
@@ -151,6 +156,7 @@ def _deterministic_triage(
     """
     original_sev = _original_severity(group)
     enrichment = group.enrichment
+    is_unreachable_code = group.is_reachable is False
 
     # Start optimistic
     is_valid = True
@@ -160,6 +166,8 @@ def _deterministic_triage(
     reasoning_parts: list[str] = [
         f"Original severity: {original_sev.value}."
     ]
+    if is_unreachable_code:
+        reasoning_parts.append(_UNREACHABLE_CODE_NOTE)
 
     # Dev/test scope: only mark FP when there is clear evidence
     is_dev_env = (context.environment or "").lower() in {"dev", "test", "ci", "development"}
@@ -202,7 +210,9 @@ def _deterministic_triage(
         group_id=group.group_id,
         is_valid=is_valid,
         false_positive_reason=false_positive_reason,
+        original_severity=original_sev,
         revised_priority=final_priority,
+        is_unreachable_code=is_unreachable_code,
         priority_reasoning=" ".join(reasoning_parts),
         validity_confidence_score=1.0,
         priority_confidence_score=1.0,
@@ -326,21 +336,22 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "CHAIN OF THOUGHT REASONING:",
         "You MUST first use the 'chain_of_thought' field to think step-by-step before deciding on the final fields:",
         "1. Start by analyzing the details of the finding (vulnerable component, files, packages, CVE descriptions, and CVSS scores).",
-        "2. Systematically evaluate the STRICT FALSE POSITIVE CRITERIA one-by-one (Rule A, Rule B, Rule C, Rule D) against the finding and system context. Output YES or NO for each rule.",
-        "3. Conclude if the finding qualifies as a false positive under any of these four rules. If you answered YES to any rule, the finding is a false positive (is_valid=False) with the corresponding reason. If you answered NO to all rules, it is a valid vulnerability (is_valid=True).",
-        "4. If it is valid, assign revised_priority by starting from Original Severity / CVSS and then adjusting it strictly using the CVE Description and System Context.",
-        "5. Assign validity_confidence_score and priority_confidence_score on a 0.0 to 1.0 scale using the confidence rubric below.",
+        "2. Systematically evaluate the strict rules one-by-one (Rule A, Rule B, Rule C, Rule D) against the finding and system context. Output YES or NO for each rule.",
+        "3. Conclude whether the finding is a false positive using only Rule A, Rule B, and Rule C. If Rule D is YES, set is_unreachable_code=True and call that out clearly, but do not set is_valid=False from reachability alone.",
+        "4. Always return original_severity exactly as shown in the DATA section. If the finding is valid, assign revised_priority by starting from Original Severity / CVSS and then adjusting it strictly using the CVE Description and System Context.",
+        "5. Set is_unreachable_code=True only when Reachability Analysis is explicitly FALSE. Otherwise set is_unreachable_code=False.",
+        "6. Assign validity_confidence_score and priority_confidence_score on a 0.0 to 1.0 scale using the confidence rubric below.",
         "",
         "STRICT FALSE POSITIVE CRITERIA:",
-        "Set an issue as a false positive (is_valid=False) ONLY if it satisfies at least one of the following four rules:",
+        "Set an issue as a false positive (is_valid=False) ONLY if it satisfies at least one of the following three rules:",
         "  Rule A: The vulnerability is invalid due to identification error by the scanner.",
         "   - Look at the CVE description and identify the exact software product, vendor, operating system, or language runtime that the CVE actually applies to",
         "   - Compare that to the File Path and System Context fields to determine if the CVE is truly relevant to this finding",
         "  Rule B: The vulnerability is valid, but the exploit strictly requires an OS or architecture that contradicts the SystemContext.",
         "  Rule C: The vulnerability is valid, but is only present in development code (e.g. tests, specs, dev-only tools) or code that is removed before production.",
-        "  Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive.",
+        "  Rule D: If Reachability Analysis is explicitly FALSE, the package is unreachable in this application. Set is_unreachable_code=True, but do not treat that fact alone as a false positive.",
         "",
-        "If the finding does NOT satisfy any of the above four rules, it MUST be considered a valid vulnerability (is_valid=True).",
+        "If the finding does NOT satisfy any of Rule A, Rule B, or Rule C, it MUST be considered a valid vulnerability (is_valid=True).",
         "For valid vulnerabilities, decide revised_priority by starting with Original Severity / CVSS, then:",
         "  - Downgrade if the CVE requires conditions such as public network exposure that contradict the System Context.",
         "  - Upgrade if Data Sensitivity is high and the CVE Description indicates data leakage or exposure risk.",
@@ -348,7 +359,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "",
         "CONFIDENCE SCORING RUBRIC:",
         "Assign validity_confidence_score and priority_confidence_score as numbers from 0.0 to 1.0.",
-        "  - validity_confidence_score = 1.0 for absolute proof such as Reachability Analysis explicitly FALSE.",
+        "  - validity_confidence_score = 1.0 for absolute proof such as a definitive CVE-to-technology mismatch or explicit out-of-scope evidence.",
         "  - validity_confidence_score = 0.8 for strong evidence such as a clear CVE-description mismatch.",
         "  - validity_confidence_score = 0.5 for ambiguous data, guesses, or transitive dependencies with uncertain reachability.",
         "  - priority_confidence_score = 1.0 when hard threat intel like EPSS or KEV clearly drives the priority.",
@@ -356,7 +367,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "  - priority_confidence_score = 0.5 when descriptions are vague and threat intel is unavailable.",
         "",
         "Assign a revised_priority using one of: CRITICAL, HIGH, MEDIUM, LOW, INFO, UNKNOWN.",
-        "Always return validity_confidence_score and priority_confidence_score.",
+        "Always return original_severity, revised_priority, is_unreachable_code, validity_confidence_score, and priority_confidence_score.",
         "Set triage_method to 'llm'.",
     ]
     return "\n".join(lines)
@@ -419,6 +430,7 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
         return _deterministic_triage(group, context)
 
     original_sev = _original_severity(group)
+    is_unreachable_code = group.is_reachable is False
     final_priority, guardrail_note, is_valid, fp_reason, priority_overridden = _apply_guardrails(
         priority=result.revised_priority,
         is_valid=result.is_valid,
@@ -428,9 +440,13 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
         original_severity=original_sev,
     )
 
+    result.original_severity = original_sev
     result.revised_priority = final_priority
+    result.is_unreachable_code = is_unreachable_code
     result.is_valid = is_valid
     result.false_positive_reason = fp_reason
+    if is_unreachable_code and _UNREACHABLE_CODE_NOTE not in result.priority_reasoning:
+        result.priority_reasoning = f"{result.priority_reasoning} {_UNREACHABLE_CODE_NOTE}".strip()
     if guardrail_note:
         result.priority_reasoning = result.priority_reasoning + " " + guardrail_note
     if priority_overridden:

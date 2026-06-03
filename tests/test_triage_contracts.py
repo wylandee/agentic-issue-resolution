@@ -71,7 +71,9 @@ def _make_triage_result(group: VulnerabilityGroup) -> TriageResult:
         chain_of_thought="test reasoning",
         group_id=group.group_id,
         is_valid=True,
+        original_severity=Severity.HIGH,
         revised_priority=Severity.HIGH,
+        is_unreachable_code=False,
         priority_reasoning="Original severity HIGH.",
         validity_confidence_score=1.0,
         priority_confidence_score=1.0,
@@ -224,6 +226,8 @@ class TestTriageResult:
         group = _make_group()
         result = _make_triage_result(group)
         assert result.is_valid is True
+        assert result.original_severity is Severity.HIGH
+        assert result.is_unreachable_code is False
         assert result.triage_method == "deterministic"
 
     def test_false_positive_requires_reason(self):
@@ -234,7 +238,9 @@ class TestTriageResult:
                 group_id=group.group_id,
                 is_valid=False,
                 # missing false_positive_reason
+                original_severity=Severity.LOW,
                 revised_priority=Severity.LOW,
+                is_unreachable_code=False,
                 priority_reasoning="Dev only.",
                 validity_confidence_score=1.0,
                 priority_confidence_score=1.0,
@@ -249,7 +255,9 @@ class TestTriageResult:
             group_id=group.group_id,
             is_valid=False,
             false_positive_reason="All findings are in test/ paths; dev-only dependency.",
+            original_severity=Severity.LOW,
             revised_priority=Severity.LOW,
+            is_unreachable_code=False,
             priority_reasoning="Dev only.",
             validity_confidence_score=1.0,
             priority_confidence_score=1.0,
@@ -265,7 +273,9 @@ class TestTriageResult:
             chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=True,
+            original_severity=Severity.HIGH,
             revised_priority="HIGH",  # type: ignore[arg-type]
+            is_unreachable_code=False,
             priority_reasoning="Test.",
             validity_confidence_score=1.0,
             priority_confidence_score=1.0,
@@ -280,6 +290,7 @@ class TestTriageResult:
         data = json.loads(result.model_dump_json())
         restored = TriageResult.model_validate(data)
         assert restored.group_id == result.group_id
+        assert restored.original_severity == result.original_severity
         assert restored.revised_priority == result.revised_priority
 
     def test_all_severity_values_accepted(self):
@@ -289,7 +300,9 @@ class TestTriageResult:
                 chain_of_thought="test reasoning",
                 group_id=group.group_id,
                 is_valid=True,
+                original_severity=sev,
                 revised_priority=sev,
+                is_unreachable_code=False,
                 priority_reasoning="Test.",
                 validity_confidence_score=1.0,
                 priority_confidence_score=1.0,
@@ -305,7 +318,9 @@ class TestTriageResult:
                 chain_of_thought="test reasoning",
                 group_id=group.group_id,
                 is_valid=True,
+                original_severity=Severity.HIGH,
                 revised_priority=Severity.HIGH,
+                is_unreachable_code=False,
                 priority_reasoning="Test.",
                 validity_confidence_score=1.5,
                 priority_confidence_score=1.0,

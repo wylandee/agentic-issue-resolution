@@ -125,6 +125,8 @@ class TestDeterministicTriage:
         assert result.triage_method == "deterministic"
         assert result.group_id == group.group_id
         assert result.recommended_issue_id == issue.id
+        assert result.original_severity == Severity.MEDIUM
+        assert result.is_unreachable_code is False
         assert result.validity_confidence_score == 1.0
         assert result.priority_confidence_score == 1.0
 
@@ -184,12 +186,25 @@ class TestDeterministicTriage:
         issue = _issue(severity=Severity.CRITICAL)
         group = _group(issue)
         result = run_triage(group, _context())
+        assert result.original_severity == Severity.CRITICAL
         assert result.revised_priority == Severity.CRITICAL
 
     def test_priority_reasoning_is_non_empty(self):
         group = _group(_issue())
         result = run_triage(group, _context())
         assert len(result.priority_reasoning) > 0
+
+    def test_unreachable_code_is_flagged_but_not_marked_false_positive(self):
+        issue = _issue(severity=Severity.HIGH)
+        group = _group(issue)
+        group.is_reachable = False
+
+        result = run_triage(group, _context())
+
+        assert result.is_valid is True
+        assert result.false_positive_reason is None
+        assert result.is_unreachable_code is True
+        assert "Reachability analysis shows the package is not imported" in result.priority_reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +257,9 @@ class TestLLMGuardrails:
             chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=True,
+            original_severity=group.issues[0].severity if group.issues else Severity.UNKNOWN,
             revised_priority=priority,
+            is_unreachable_code=False,
             priority_reasoning="LLM says LOW.",
             validity_confidence_score=0.6,
             priority_confidence_score=0.5,
@@ -277,6 +294,7 @@ class TestLLMGuardrails:
             result = run_triage(group, _context())
 
         assert result.revised_priority == Severity.MEDIUM
+        assert result.original_severity == Severity.MEDIUM
         assert result.priority_confidence_score == 0.5
 
     def test_llm_failure_falls_back_to_deterministic(self, monkeypatch):
@@ -325,7 +343,10 @@ class TestTriagePrompt:
             in prompt
         )
         assert (
-            "Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive."
+            "Rule D: If Reachability Analysis is explicitly FALSE, the package is unreachable in this application. Set is_unreachable_code=True, but do not treat that fact alone as a false positive."
             in prompt
         )
-        assert "Always return validity_confidence_score and priority_confidence_score." in prompt
+        assert (
+            "Always return original_severity, revised_priority, is_unreachable_code, validity_confidence_score, and priority_confidence_score."
+            in prompt
+        )

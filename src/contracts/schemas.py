@@ -898,11 +898,25 @@ class TriageResult(BaseModel):
     )
 
     # Priority
+    original_severity: Severity = Field(
+        default=Severity.UNKNOWN,
+        description=(
+            "Original scanner-reported severity retained from the source finding "
+            "before any contextual triage or guardrail adjustments."
+        ),
+    )
     revised_priority: Severity = Field(
         ...,
         description=(
             "Revised priority using the canonical Severity enum.  "
             "Guardrails clamp: KEV → CRITICAL; EPSS≥0.5 or HIGH/CRITICAL original → at least HIGH."
+        ),
+    )
+    is_unreachable_code: bool = Field(
+        default=False,
+        description=(
+            "True when reachability analysis shows the vulnerable package is not "
+            "imported by the application source code."
         ),
     )
     priority_reasoning: str = Field(
