@@ -68,10 +68,13 @@ def _make_group(issue: VulnerabilityIssue | None = None) -> VulnerabilityGroup:
 
 def _make_triage_result(group: VulnerabilityGroup) -> TriageResult:
     return TriageResult(
+        chain_of_thought="test reasoning",
         group_id=group.group_id,
         is_valid=True,
         revised_priority=Severity.HIGH,
         priority_reasoning="Original severity HIGH.",
+        validity_confidence_score=1.0,
+        priority_confidence_score=1.0,
         recommended_issue_id=group.representative_issue_id,
         triage_method="deterministic",
     )
@@ -227,11 +230,14 @@ class TestTriageResult:
         group = _make_group()
         with pytest.raises(ValidationError, match="false_positive_reason is required"):
             TriageResult(
+                chain_of_thought="test reasoning",
                 group_id=group.group_id,
                 is_valid=False,
                 # missing false_positive_reason
                 revised_priority=Severity.LOW,
                 priority_reasoning="Dev only.",
+                validity_confidence_score=1.0,
+                priority_confidence_score=1.0,
                 recommended_issue_id=group.representative_issue_id,
                 triage_method="deterministic",
             )
@@ -239,11 +245,14 @@ class TestTriageResult:
     def test_false_positive_with_reason(self):
         group = _make_group()
         result = TriageResult(
+            chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=False,
             false_positive_reason="All findings are in test/ paths; dev-only dependency.",
             revised_priority=Severity.LOW,
             priority_reasoning="Dev only.",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
             recommended_issue_id=group.representative_issue_id,
             triage_method="deterministic",
         )
@@ -253,10 +262,13 @@ class TestTriageResult:
     def test_severity_coercion_from_string(self):
         group = _make_group()
         result = TriageResult(
+            chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=True,
             revised_priority="HIGH",  # type: ignore[arg-type]
             priority_reasoning="Test.",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
             recommended_issue_id=group.representative_issue_id,
             triage_method="deterministic",
         )
@@ -274,14 +286,32 @@ class TestTriageResult:
         group = _make_group()
         for sev in Severity:
             r = TriageResult(
+                chain_of_thought="test reasoning",
                 group_id=group.group_id,
                 is_valid=True,
                 revised_priority=sev,
                 priority_reasoning="Test.",
+                validity_confidence_score=1.0,
+                priority_confidence_score=1.0,
                 recommended_issue_id=group.representative_issue_id,
                 triage_method="deterministic",
             )
             assert r.revised_priority == sev
+
+    def test_confidence_scores_are_bounded(self):
+        group = _make_group()
+        with pytest.raises(ValidationError):
+            TriageResult(
+                chain_of_thought="test reasoning",
+                group_id=group.group_id,
+                is_valid=True,
+                revised_priority=Severity.HIGH,
+                priority_reasoning="Test.",
+                validity_confidence_score=1.5,
+                priority_confidence_score=1.0,
+                recommended_issue_id=group.representative_issue_id,
+                triage_method="deterministic",
+            )
 
 
 # ---------------------------------------------------------------------------

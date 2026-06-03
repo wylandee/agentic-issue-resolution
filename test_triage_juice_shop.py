@@ -43,12 +43,11 @@ def run_jsonl_fp_test(jsonl_path: str):
     # 2. Define Context (Explicitly stating it is a Node.js app!)
     # Note: Double check if your schema expects `public_facing` or `is_public_facing`
     context = SystemContext(
-        is_public_facing=True,
+        public_facing=True,
         deployment_os="linux",          
         deployment_architecture="containerized",
         environment="production",
         primary_language="javascript/node.js v24.15",
-        description="This is a Node.js / JavaScript web application." 
     )
 
     # 3. Run the pipeline

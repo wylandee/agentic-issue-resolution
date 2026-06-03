@@ -202,11 +202,14 @@ class TestSelectIssuesForRemediation:
             issues=[issue],
         )
         triage = TriageResult(
+            chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=is_valid,
             false_positive_reason=fp_reason if not is_valid else None,
             revised_priority=priority,
             priority_reasoning="test",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
             recommended_issue_id=issue.id,
             triage_method="deterministic",
         )
@@ -279,10 +282,13 @@ class TestSelectIssuesForRemediation:
             issues=[issue],
         )
         triage = TriageResult(
+            chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=True,
             revised_priority=Severity.HIGH,
             priority_reasoning="test",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
             recommended_issue_id=issue.id,
             triage_method="deterministic",
         )

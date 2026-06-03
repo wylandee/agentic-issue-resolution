@@ -14,7 +14,7 @@ Covers:
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -91,8 +91,17 @@ def _epss_enrichment(epss: float = 0.7, cve: str = "CVE-2021-23337") -> CVEEnric
     )
 
 
-def _context(environment: str = "production") -> SystemContext:
-    return SystemContext(environment=environment)
+def _context(
+    environment: str = "production",
+    *,
+    public_facing: bool | None = None,
+    data_sensitivity: str | None = None,
+) -> SystemContext:
+    return SystemContext(
+        environment=environment,
+        public_facing=public_facing,
+        data_sensitivity=data_sensitivity,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +125,8 @@ class TestDeterministicTriage:
         assert result.triage_method == "deterministic"
         assert result.group_id == group.group_id
         assert result.recommended_issue_id == issue.id
+        assert result.validity_confidence_score == 1.0
+        assert result.priority_confidence_score == 1.0
 
     def test_no_evidence_means_valid(self):
         """Unknown evidence must never automatically become a false positive."""
@@ -132,17 +143,29 @@ class TestDeterministicTriage:
         assert result.revised_priority == Severity.CRITICAL
         assert result.is_valid is True  # KEV overrides any FP decision
 
-    def test_kev_clamps_critical_even_from_medium(self):
+    def test_kev_only_forces_critical_in_production(self):
         issue = _issue(severity=Severity.MEDIUM)
         group = _group(issue, enrichment=_kev_enrichment())
-        result = run_triage(group, _context())
-        assert result.revised_priority == Severity.CRITICAL
+        result = run_triage(group, _context(environment="staging"))
+        assert result.revised_priority == Severity.MEDIUM
 
     def test_high_epss_clamps_to_at_least_high(self):
         issue = _issue(severity=Severity.LOW)
         group = _group(issue, enrichment=_epss_enrichment(epss=0.6))
         result = run_triage(group, _context())
         assert result.revised_priority in (Severity.HIGH, Severity.CRITICAL)
+
+    def test_high_epss_public_facing_forces_critical(self):
+        issue = _issue(severity=Severity.LOW)
+        group = _group(issue, enrichment=_epss_enrichment(epss=0.6))
+        result = run_triage(group, _context(public_facing=True))
+        assert result.revised_priority == Severity.CRITICAL
+
+    def test_high_epss_high_sensitivity_forces_critical(self):
+        issue = _issue(severity=Severity.LOW)
+        group = _group(issue, enrichment=_epss_enrichment(epss=0.6))
+        result = run_triage(group, _context(data_sensitivity="HIGH"))
+        assert result.revised_priority == Severity.CRITICAL
 
     def test_low_epss_does_not_clamp(self):
         issue = _issue(severity=Severity.LOW)
@@ -151,11 +174,11 @@ class TestDeterministicTriage:
         # No guardrail should raise LOW above LOW in this case
         assert result.revised_priority in (Severity.LOW, Severity.MEDIUM)
 
-    def test_original_high_severity_clamps_to_at_least_high(self):
+    def test_internal_low_epss_high_severity_downgrades_to_medium(self):
         issue = _issue(severity=Severity.HIGH)
-        group = _group(issue, enrichment=None)
-        result = run_triage(group, _context())
-        assert result.revised_priority in (Severity.HIGH, Severity.CRITICAL)
+        group = _group(issue, enrichment=_epss_enrichment(epss=0.005))
+        result = run_triage(group, _context(public_facing=False))
+        assert result.revised_priority == Severity.MEDIUM
 
     def test_original_critical_severity_preserved(self):
         issue = _issue(severity=Severity.CRITICAL)
@@ -196,14 +219,12 @@ class TestDevScopeFalsePositive:
         result = run_triage(group, _context(environment="production"))
         assert result.is_valid is True
 
-    def test_kev_overrides_dev_false_positive(self):
-        """KEV membership means the issue must be valid even in dev environments."""
+    def test_kev_does_not_override_dev_false_positive_outside_production(self):
         issue = _issue(file_path="tests/unit/lodash_test.js")
         group = _group(issue, enrichment=_kev_enrichment())
         result = run_triage(group, _context(environment="test"))
-        # KEV guardrail should override any FP decision
-        assert result.is_valid is True
-        assert result.revised_priority == Severity.CRITICAL
+        assert result.is_valid is False
+        assert result.false_positive_reason is not None
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +239,13 @@ class TestLLMGuardrails:
         priority: Severity,
     ) -> TriageResult:
         return TriageResult(
+            chain_of_thought="test reasoning",
             group_id=group.group_id,
             is_valid=True,
             revised_priority=priority,
             priority_reasoning="LLM says LOW.",
+            validity_confidence_score=0.6,
+            priority_confidence_score=0.5,
             recommended_issue_id=group.representative_issue_id,
             triage_method="llm",
         )
@@ -240,6 +264,20 @@ class TestLLMGuardrails:
 
         assert result.revised_priority == Severity.CRITICAL
         assert "[Guardrail]" in result.priority_reasoning
+        assert result.priority_confidence_score == 1.0
+
+    def test_llm_no_priority_override_preserves_priority_confidence(self, monkeypatch):
+        monkeypatch.setenv("TRIAGE_LLM_ENABLED", "true")
+
+        issue = _issue(severity=Severity.MEDIUM)
+        group = _group(issue, enrichment=_epss_enrichment(epss=0.1))
+        llm_result = self._make_llm_result(group, Severity.MEDIUM)
+
+        with patch("src.triage.agent._llm_triage", return_value=llm_result):
+            result = run_triage(group, _context())
+
+        assert result.revised_priority == Severity.MEDIUM
+        assert result.priority_confidence_score == 0.5
 
     def test_llm_failure_falls_back_to_deterministic(self, monkeypatch):
         """When _llm_triage returns None, deterministic path must be used."""
@@ -273,6 +311,7 @@ class TestTriagePrompt:
             "Reachability Analysis: TRUE (Package is explicitly imported in application code)"
             in prompt
         )
+        assert "CONFIDENCE SCORING RUBRIC:" in prompt
 
     def test_prompt_rule_d_uses_explicit_false_reachability(self):
         issue = _issue()
@@ -289,3 +328,4 @@ class TestTriagePrompt:
             "Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive."
             in prompt
         )
+        assert "Always return validity_confidence_score and priority_confidence_score." in prompt

@@ -906,6 +906,24 @@ class TriageResult(BaseModel):
         min_length=1,
         description="Human-readable explanation of the revised priority.",
     )
+    validity_confidence_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "0.0 to 1.0 representing the certainty of the is_valid decision "
+            "based on hard evidence."
+        ),
+    )
+    priority_confidence_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "0.0 to 1.0 representing the certainty of the revised_priority "
+            "based on context and threat intel."
+        ),
+    )
 
     # Recommendation
     recommended_issue_id: UUID = Field(

@@ -1,5 +1,5 @@
 """
-agent.py — Triage agent for the Phase 4.0 triage layer.
+agent.py - Triage agent for the Phase 4.0 triage layer.
 
 Public API
 ----------
@@ -7,10 +7,9 @@ run_triage(group, context) -> TriageResult
     Produce a triage verdict for one ``VulnerabilityGroup``.
 
     Deterministic path (always active):
-      - Always valid by default (unknown evidence ≠ false positive).
-      - KEV membership → clamp revised_priority to CRITICAL.
-      - EPSS ≥ 0.5 or original severity HIGH/CRITICAL → at least HIGH.
-      - Dev/test scope explicitly set → may mark is_valid=False with reason.
+      - Always valid by default (unknown evidence != false positive).
+      - Dev/test scope explicitly set -> may mark is_valid=False with reason.
+      - Deterministic RBVM guardrails are always applied afterwards.
 
     LLM path (active when TRIAGE_LLM_ENABLED=true):
       - Uses LangChain ``with_structured_output(TriageResult)`` via OpenAI.
@@ -22,7 +21,6 @@ Environment variables
 TRIAGE_LLM_ENABLED   : "true" to activate LLM path (default: off)
 OPENAI_API_KEY       : Required when LLM path is active
 TRIAGE_LLM_MODEL     : OpenAI model name (default: "gpt-4o-mini")
-EPSS_CRITICAL_THRESHOLD : EPSS score that clamps to at least HIGH (default: 0.5)
 """
 
 from __future__ import annotations
@@ -30,7 +28,6 @@ from __future__ import annotations
 import logging
 import os
 from typing import Optional
-from uuid import UUID
 
 from src.contracts.schemas import (
     CVEEnrichment,
@@ -61,13 +58,6 @@ def _max_severity(*severities: Severity) -> Severity:
     return max(severities, key=lambda s: _SEVERITY_RANK[s])
 
 
-def _epss_threshold() -> float:
-    try:
-        return float(os.environ.get("EPSS_CRITICAL_THRESHOLD", "0.5"))
-    except ValueError:
-        return 0.5
-
-
 # ---------------------------------------------------------------------------
 # Deterministic triage core
 # ---------------------------------------------------------------------------
@@ -84,46 +74,69 @@ def _apply_guardrails(
     priority: Severity,
     is_valid: bool,
     false_positive_reason: Optional[str],
+    context: SystemContext,
     enrichment: Optional[CVEEnrichment],
     original_severity: Severity,
-) -> tuple[Severity, str, bool, Optional[str]]:
+) -> tuple[Severity, str, bool, Optional[str], bool]:
     """
-    Apply deterministic guardrails to a candidate triage verdict.
+    Apply deterministic RBVM guardrails to a candidate triage verdict.
 
-    Returns (revised_priority, reasoning_suffix, is_valid, false_positive_reason).
+    Returns
+    -------
+    tuple
+        (revised_priority, guardrail_notes, is_valid, false_positive_reason,
+        priority_overridden)
     """
     reasoning_parts: list[str] = []
-    epss_threshold = _epss_threshold()
+    starting_priority = priority
+    epss_score = enrichment.epss if enrichment else 0.0
+    environment = (context.environment or "").strip().lower()
+    data_sensitivity = (context.data_sensitivity or "").strip().lower()
 
-    # Rule 1: KEV → CRITICAL always
-    if enrichment and enrichment.in_kev:
-        if _SEVERITY_RANK[priority] < _SEVERITY_RANK[Severity.CRITICAL]:
-            reasoning_parts.append(
-                f"Clamped to CRITICAL: CVE appears in CISA KEV "
-                f"(added {enrichment.kev_date_added or 'unknown date'})."
-            )
+    # 1. Drop Everything Override
+    if enrichment and enrichment.in_kev and environment == "production":
         priority = Severity.CRITICAL
-        # KEV membership means it IS actively exploited → must be valid
         is_valid = True
         false_positive_reason = None
-
-    # Rule 2: EPSS ≥ threshold or original HIGH/CRITICAL → at least HIGH
-    elif (enrichment and enrichment.epss >= epss_threshold) or original_severity in (
-        Severity.HIGH,
-        Severity.CRITICAL,
-    ):
-        if _SEVERITY_RANK[priority] < _SEVERITY_RANK[Severity.HIGH]:
-            parts = []
-            if enrichment and enrichment.epss >= epss_threshold:
-                parts.append(f"EPSS={enrichment.epss:.3f} ≥ {epss_threshold}")
-            if original_severity in (Severity.HIGH, Severity.CRITICAL):
-                parts.append(f"original severity={original_severity.value}")
+        if starting_priority != Severity.CRITICAL:
             reasoning_parts.append(
-                f"Clamped to HIGH: {'; '.join(parts)}."
+                "[Guardrail] Forced to CRITICAL: CVE is in CISA KEV and the "
+                "environment is production."
             )
-        priority = _max_severity(priority, Severity.HIGH)
 
-    return priority, " ".join(reasoning_parts), is_valid, false_positive_reason
+    # 2. Imminent Threat Override
+    elif epss_score >= 0.36:
+        if context.public_facing is True or data_sensitivity == "high":
+            priority = Severity.CRITICAL
+            if starting_priority != Severity.CRITICAL:
+                reasoning_parts.append(
+                    "[Guardrail] Forced to CRITICAL: EPSS >= 0.36 and the app "
+                    "is public-facing or handles high-sensitivity data."
+                )
+        else:
+            upgraded_priority = _max_severity(priority, Severity.HIGH)
+            if upgraded_priority != starting_priority:
+                reasoning_parts.append(
+                    "[Guardrail] Forced to at least HIGH: EPSS >= 0.36 indicates "
+                    "imminent exploit risk."
+                )
+            priority = upgraded_priority
+
+    # 3. Floor Downgrade
+    elif (
+        epss_score < 0.01
+        and context.public_facing is False
+        and original_severity in (Severity.HIGH, Severity.CRITICAL)
+        and _SEVERITY_RANK[priority] > _SEVERITY_RANK[Severity.MEDIUM]
+    ):
+        priority = Severity.MEDIUM
+        reasoning_parts.append(
+            "[Guardrail] Downgraded to MEDIUM: EPSS < 0.01 for an internal app "
+            "indicates extremely low exploitability."
+        )
+
+    priority_overridden = priority != starting_priority
+    return priority, " ".join(reasoning_parts), is_valid, false_positive_reason, priority_overridden
 
 
 def _deterministic_triage(
@@ -164,11 +177,11 @@ def _deterministic_triage(
         base_priority = Severity.LOW
         reasoning_parts.append(false_positive_reason)
 
-    # Apply guardrails
-    final_priority, guardrail_note, is_valid, false_positive_reason = _apply_guardrails(
+    final_priority, guardrail_note, is_valid, false_positive_reason, _ = _apply_guardrails(
         priority=base_priority,
         is_valid=is_valid,
         false_positive_reason=false_positive_reason,
+        context=context,
         enrichment=enrichment,
         original_severity=original_sev,
     )
@@ -182,14 +195,17 @@ def _deterministic_triage(
                 f"(percentile {enrichment.epss_percentile:.3f})."
             )
         if enrichment.in_kev:
-            reasoning_parts.append("CVE is in CISA KEV — active exploitation confirmed.")
+            reasoning_parts.append("CVE is in CISA KEV; active exploitation risk is known.")
 
     return TriageResult(
+        chain_of_thought="Deterministic fallback path; no LLM reasoning used.",
         group_id=group.group_id,
         is_valid=is_valid,
         false_positive_reason=false_positive_reason,
         revised_priority=final_priority,
         priority_reasoning=" ".join(reasoning_parts),
+        validity_confidence_score=1.0,
+        priority_confidence_score=1.0,
         recommended_issue_id=group.representative_issue_id,
         triage_method="deterministic",
     )
@@ -204,7 +220,7 @@ def _build_cve_details_prompt(group: VulnerabilityGroup) -> str:
     if not group.cve_ids:
         return "  (No CVEs in this group)"
 
-    # Map CVE IDs (case-insensitive keys) to their descriptions and CVSS scores
+    # Map CVE IDs (case-insensitive keys) to their descriptions and CVSS scores.
     cve_details: dict[str, tuple[list[str], list[str]]] = {}
     for issue in group.issues:
         cve = issue.cve_id
@@ -213,13 +229,11 @@ def _build_cve_details_prompt(group: VulnerabilityGroup) -> str:
         cve = cve.upper().strip()
         if cve not in cve_details:
             cve_details[cve] = ([], [])
-        
-        # Description
+
         desc = issue.message
         if desc:
             cve_details[cve][0].append(desc.strip())
-        
-        # CVSS
+
         raw = issue.raw_payload or {}
         vuln = raw.get("vulnerability") or {}
         cvssv3 = vuln.get("cvssv3") or {}
@@ -314,7 +328,8 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "1. Start by analyzing the details of the finding (vulnerable component, files, packages, CVE descriptions, and CVSS scores).",
         "2. Systematically evaluate the STRICT FALSE POSITIVE CRITERIA one-by-one (Rule A, Rule B, Rule C, Rule D) against the finding and system context. Output YES or NO for each rule.",
         "3. Conclude if the finding qualifies as a false positive under any of these four rules. If you answered YES to any rule, the finding is a false positive (is_valid=False) with the corresponding reason. If you answered NO to all rules, it is a valid vulnerability (is_valid=True).",
-        "4. If it is valid, evaluate the appropriate priority based on original severity, EPSS, KEV, CVSS, and the system context details.",
+        "4. If it is valid, assign revised_priority by starting from Original Severity / CVSS and then adjusting it strictly using the CVE Description and System Context.",
+        "5. Assign validity_confidence_score and priority_confidence_score on a 0.0 to 1.0 scale using the confidence rubric below.",
         "",
         "STRICT FALSE POSITIVE CRITERIA:",
         "Set an issue as a false positive (is_valid=False) ONLY if it satisfies at least one of the following four rules:",
@@ -326,9 +341,22 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         "  Rule D: If Reachability Analysis is explicitly FALSE, the package is dead code in this application and this is a confirmed false positive.",
         "",
         "If the finding does NOT satisfy any of the above four rules, it MUST be considered a valid vulnerability (is_valid=True).",
-        "For valid vulnerabilities, decide an appropriate priority score (revised_priority) based on all the provided information (original severity, CVSS, EPSS, KEV, System Context, data sensitivity, public-facing, etc.).",
+        "For valid vulnerabilities, decide revised_priority by starting with Original Severity / CVSS, then:",
+        "  - Downgrade if the CVE requires conditions such as public network exposure that contradict the System Context.",
+        "  - Upgrade if Data Sensitivity is high and the CVE Description indicates data leakage or exposure risk.",
+        "  - Otherwise keep the priority aligned with the original severity and the concrete exploit conditions in the description.",
+        "",
+        "CONFIDENCE SCORING RUBRIC:",
+        "Assign validity_confidence_score and priority_confidence_score as numbers from 0.0 to 1.0.",
+        "  - validity_confidence_score = 1.0 for absolute proof such as Reachability Analysis explicitly FALSE.",
+        "  - validity_confidence_score = 0.8 for strong evidence such as a clear CVE-description mismatch.",
+        "  - validity_confidence_score = 0.5 for ambiguous data, guesses, or transitive dependencies with uncertain reachability.",
+        "  - priority_confidence_score = 1.0 when hard threat intel like EPSS or KEV clearly drives the priority.",
+        "  - priority_confidence_score = 0.8 for strong contextual alignment between the description and System Context.",
+        "  - priority_confidence_score = 0.5 when descriptions are vague and threat intel is unavailable.",
         "",
         "Assign a revised_priority using one of: CRITICAL, HIGH, MEDIUM, LOW, INFO, UNKNOWN.",
+        "Always return validity_confidence_score and priority_confidence_score.",
         "Set triage_method to 'llm'.",
     ]
     return "\n".join(lines)
@@ -346,7 +374,6 @@ def _llm_triage(
     """
     try:
         from langchain_openai import ChatOpenAI  # type: ignore[import]
-        from langchain_core.prompts import HumanMessagePromptTemplate, ChatPromptTemplate  # type: ignore[import]
     except ImportError:
         logger.warning(
             "LangChain/OpenAI packages not installed.  "
@@ -360,7 +387,6 @@ def _llm_triage(
         structured_llm = llm.with_structured_output(TriageResult)
         prompt_text = _build_triage_prompt(group, context)
         result: TriageResult = structured_llm.invoke(prompt_text)
-        # Ensure group_id and recommended_issue_id are consistent
         result.group_id = group.group_id
         result.recommended_issue_id = group.representative_issue_id
         result.triage_method = "llm"
@@ -382,19 +408,6 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
     When ``TRIAGE_LLM_ENABLED=true``, the LLM path is attempted first.
     Deterministic guardrails are applied afterwards regardless of which path
     produced the initial verdict.
-
-    Parameters
-    ----------
-    group:
-        The vulnerability group to triage.  ``group.enrichment`` should be
-        populated before calling this function.
-    context:
-        System-level metadata for contextualising the verdict.
-
-    Returns
-    -------
-    TriageResult
-        Always returns a valid ``TriageResult``; never raises.
     """
     llm_enabled = os.environ.get("TRIAGE_LLM_ENABLED", "false").lower() == "true"
     result: Optional[TriageResult] = None
@@ -403,24 +416,24 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
         result = _llm_triage(group, context)
 
     if result is None:
-        # Pure deterministic path (or LLM fallback)
         return _deterministic_triage(group, context)
 
-    # LLM produced a result — apply deterministic guardrails on top
     original_sev = _original_severity(group)
-    final_priority, guardrail_note, is_valid, fp_reason = _apply_guardrails(
+    final_priority, guardrail_note, is_valid, fp_reason, priority_overridden = _apply_guardrails(
         priority=result.revised_priority,
         is_valid=result.is_valid,
         false_positive_reason=result.false_positive_reason,
+        context=context,
         enrichment=group.enrichment,
         original_severity=original_sev,
     )
 
+    result.revised_priority = final_priority
+    result.is_valid = is_valid
+    result.false_positive_reason = fp_reason
     if guardrail_note:
-        # Guardrail overrode the LLM — append the note to the reasoning
-        result.revised_priority = final_priority
-        result.priority_reasoning = result.priority_reasoning + " [Guardrail] " + guardrail_note
-        result.is_valid = is_valid
-        result.false_positive_reason = fp_reason
+        result.priority_reasoning = result.priority_reasoning + " " + guardrail_note
+    if priority_overridden:
+        result.priority_confidence_score = 1.0
 
     return result
