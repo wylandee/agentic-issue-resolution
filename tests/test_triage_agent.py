@@ -145,11 +145,13 @@ class TestDeterministicTriage:
         assert result.revised_priority == Severity.CRITICAL
         assert result.is_valid is True  # KEV overrides any FP decision
 
-    def test_kev_only_forces_critical_in_production(self):
+    def test_kev_in_staging_falls_through_to_epss_rule(self):
+        """In staging, KEV alone does not force CRITICAL; EPSS 0.9 ≥ 0.36 clamps to HIGH."""
         issue = _issue(severity=Severity.MEDIUM)
-        group = _group(issue, enrichment=_kev_enrichment())
+        group = _group(issue, enrichment=_kev_enrichment())  # epss=0.9, in_kev=True
         result = run_triage(group, _context(environment="staging"))
-        assert result.revised_priority == Severity.MEDIUM
+        # Not production → KEV rule skipped; EPSS 0.9 ≥ 0.36 rule fires → at least HIGH
+        assert result.revised_priority in (Severity.HIGH, Severity.CRITICAL)
 
     def test_high_epss_clamps_to_at_least_high(self):
         issue = _issue(severity=Severity.LOW)

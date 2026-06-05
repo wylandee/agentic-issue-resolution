@@ -20,6 +20,9 @@ tree-sitter-typescript==0.21.*
 # --- Orchestrator ---
 langgraph>=1.2,<1.3
 
+# --- Docker Sandbox ---
+docker>=7.0.0
+
 # --- Triage (LLM path; optional — deterministic path works without these) ---
 langchain-openai>=0.3
 

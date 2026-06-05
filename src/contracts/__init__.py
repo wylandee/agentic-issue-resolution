@@ -18,6 +18,8 @@ from .schemas import (
     # Sub-models
     CWEEntry,
     LineRange,
+    # Sandbox contracts (Phase 3)
+    CommandResult,
     # Core domain models
     VulnerabilityIssue,
     LocalizedIssue,
@@ -45,6 +47,8 @@ __all__ = [
     "FixPlanStatus",
     "CWEEntry",
     "LineRange",
+    # Sandbox contracts (Phase 3)
+    "CommandResult",
     "VulnerabilityIssue",
     "LocalizedIssue",
     "FixPlan",

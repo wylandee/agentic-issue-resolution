@@ -116,6 +116,39 @@ class FixPlanStatus(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# CommandResult
+# ---------------------------------------------------------------------------
+
+
+class CommandResult(BaseModel):
+    """
+    Output of a command executed inside a ``DockerSandbox``.
+
+    Produced by ``src/runtime/sandbox_mgr.DockerSandbox.run``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    exit_code: int = Field(
+        ...,
+        description="Process exit code.  0 = success; 124 = timeout; other = failure.",
+    )
+    stdout: str = Field(
+        default="",
+        description="Captured standard output from the command.",
+    )
+    stderr: str = Field(
+        default="",
+        description="Captured standard error from the command.",
+    )
+    duration_seconds: float = Field(
+        ...,
+        ge=0.0,
+        description="Wall-clock time in seconds that the command ran inside the sandbox.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # FixPlan
 # ---------------------------------------------------------------------------
 
