@@ -276,6 +276,16 @@ class TestCVEIDExtraction:
         vuln = {"name": name}
         assert _extract_cve_id(vuln) == expected
 
+    def test_extract_cve_id_from_references(self):
+        vuln = {
+            "name": "GHSA-vpq2-c234-7xj6",
+            "references": [
+                {"url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"},
+                {"name": "some random reference"}
+            ]
+        }
+        assert _extract_cve_id(vuln) == "CVE-2020-15084"
+
 
 # ===========================================================================
 # odc_parser — parse_vulnerabilities

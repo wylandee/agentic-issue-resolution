@@ -178,10 +178,19 @@ def _parse_cwes(vulnerability: Dict[str, Any]) -> List[CWEEntry]:
 
 
 def _extract_cve_id(vulnerability: Dict[str, Any]) -> Optional[str]:
-    """Return CVE ID if the vuln name matches CVE format, else None."""
+    """Return CVE ID if the vuln name matches CVE format, else check references."""
     name = (vulnerability.get("name") or "").strip()
     if name.upper().startswith("CVE-"):
         return name.upper()
+
+    import re
+    cve_regex = re.compile(r'\b(CVE-\d{4}-\d{4,7})\b', re.IGNORECASE)
+    for ref in vulnerability.get("references") or []:
+        for key in ("url", "name"):
+            val = ref.get(key) or ""
+            match = cve_regex.search(val)
+            if match:
+                return match.group(1).upper()
     return None
 
 

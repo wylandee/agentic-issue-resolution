@@ -46,7 +46,7 @@ from src.contracts.schemas import CommandResult
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_IMAGE = "node:20-alpine"
+_DEFAULT_IMAGE = "node:22"
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 

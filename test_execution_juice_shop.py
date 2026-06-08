@@ -1,0 +1,114 @@
+import os
+import logging
+import uuid
+from src.contracts.schemas import EditRequest, VulnerabilityGroup, VulnerabilityIssue, IssueType, Severity
+from src.orchestrator.editor_node import run_editor_node
+from src.orchestrator.scanner_node import run_scanner_node
+from src.orchestrator.tester_node import run_tester_node
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+def test_stateless_execution_pipeline():
+    print("==================================================")
+    print("🛠️  STARTING STATELESS EXECUTION PIPELINE TEST")
+    print("==================================================")
+
+    repo_root = os.path.abspath("./data/clones/juice-shop")
+
+    # 1. MOCK THE LLM OUTPUT
+    # We will simulate the Remedy Agent successfully fixing express-jwt
+    print("\n[MOCK] Simulating LLM EditRequest...")
+    mock_edit = EditRequest(
+        repo_root=repo_root,
+        file_path="package.json",
+        old_text='    "express-jwt": "0.1.3",',
+        new_text='    "express-jwt": "6.0.0",',
+        dry_run=False,
+        rationale="Update express-jwt to safe version 6.0.0"
+    )
+
+    # 2. MOCK THE VULNERABILITY GROUP (So the Scanner knows what to look for)
+    mock_issue = VulnerabilityIssue(
+        id=str(uuid.uuid4()),
+        issue_type=IssueType.SCA,
+        source="odc",
+        file_path="package.json",
+        package_name="express-jwt",
+        cve_id="CVE-2020-15084",
+        severity=Severity.CRITICAL
+    )
+    mock_group = VulnerabilityGroup(
+        group_id="sca:express-jwt",
+        issue_type=IssueType.SCA,
+        vulnerable_component="express-jwt",
+        file_path="package.json",
+        cve_ids=["CVE-2020-15084"],
+        sources=["odc"],
+        representative_issue_id=mock_issue.id,
+        issues=[mock_issue]
+    )
+
+    # 3. INITIALIZE STATE
+    state = {
+        "repo_root": repo_root,
+        "valid_groups": [mock_group],
+        "edit_requests": [mock_edit],
+        "pending_files": {},
+        "retry_count": 0,
+        "max_retries": 3,
+        "test_failures": None,
+        "scan_failures": None,
+    }
+
+    # ---------------------------------------------------------
+    # NODE 1: THE EDITOR
+    # ---------------------------------------------------------
+    print("\n▶️  RUNNING EDITOR NODE...")
+    editor_result = run_editor_node(state)
+    
+    print(f"   ↳ Status: {editor_result.get('status')}")
+    if editor_result.get("test_failures"):
+        print(f"   ↳ Error : {editor_result['test_failures']}")
+        return # Stop test on failure
+
+    # Update state with extracted files
+    state["pending_files"] = editor_result.get("pending_files", {})
+    print(f"   ↳ Extracted {len(state['pending_files'])} file(s) into memory buffer.")
+    if "package-lock.json" in state["pending_files"]:
+        print("   ↳ SUCCESS: package-lock.json was successfully regenerated and extracted!")
+
+    # ---------------------------------------------------------
+    # NODE 2: THE SCANNER
+    # ---------------------------------------------------------
+    print("\n▶️  RUNNING SCANNER NODE...")
+    scanner_result = run_scanner_node(state)
+    
+    print(f"   ↳ Status: {scanner_result.get('status')}")
+    if scanner_result.get("scan_failures"):
+        print(f"   ↳ Error : {scanner_result['scan_failures']}")
+        # In a real LangGraph, this would route back to the LLM
+    else:
+        print("   ↳ SUCCESS: ODC Scan passed! CVE is gone.")
+
+    # Update state
+    state["scan_failures"] = scanner_result.get("scan_failures")
+
+    # ---------------------------------------------------------
+    # NODE 3: THE TESTER
+    # ---------------------------------------------------------
+    print("\n▶️  RUNNING TESTER NODE...")
+    tester_result = run_tester_node(state)
+    
+    print(f"   ↳ Status: {tester_result.get('status')}")
+    if tester_result.get("test_failures"):
+        print(f"   ↳ Error : {tester_result['test_failures']}")
+        # In a real LangGraph, this would route back to the LLM
+    else:
+        print("   ↳ SUCCESS: npm install and npm test passed!")
+
+    print("\n==================================================")
+    print("🏁 EXECUTION PIPELINE TEST COMPLETE")
+    print("==================================================")
+
+if __name__ == "__main__":
+    test_stateless_execution_pipeline()
