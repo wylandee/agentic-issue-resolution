@@ -34,6 +34,8 @@ from .schemas import (
     CVEEnrichment,
     VulnerabilityGroup,
     TriageResult,
+    # Phase 5 Remedy Agent
+    RemedyAgentOutput,
 )
 
 __all__ = [
@@ -62,4 +64,6 @@ __all__ = [
     "CVEEnrichment",
     "VulnerabilityGroup",
     "TriageResult",
+    # Phase 5 Remedy Agent
+    "RemedyAgentOutput",
 ]

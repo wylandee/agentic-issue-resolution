@@ -1013,3 +1013,31 @@ class TriageResult(BaseModel):
                 "false_positive_reason is required when is_valid=False."
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Remedy Agent contracts
+# ---------------------------------------------------------------------------
+
+
+class RemedyAgentOutput(BaseModel):
+    """
+    Structured output produced by the Phase 5 Remedy Agent LLM call.
+
+    The agent returns one or more ``EditRequest`` objects — one per target
+    file / vulnerability group — that the downstream executor applies via
+    ``src.tools.edit_tools.apply_edit``.
+
+    Used with LangChain ``with_structured_output(RemedyAgentOutput)`` so the
+    LLM response is automatically deserialized and validated.
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    edits: List[EditRequest] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of file edits to apply.  Each ``EditRequest`` "
+            "addresses one vulnerable component in the target repository."
+        ),
+    )
