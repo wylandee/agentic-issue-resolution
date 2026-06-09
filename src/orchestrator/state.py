@@ -121,8 +121,8 @@ class OrchestratorState(TypedDict, total=False):
     # ---- Remedy Agent outputs ----
     edit_requests: List[EditRequest]
 
-    # ---- In-memory file buffer (last-writer-wins) ----
-    pending_files: Dict[str, str]
+    # ---- Shared Docker workspace (last-writer-wins) ----
+    workspace_volume: Optional[str]
 
     # ---- Feedback from downstream validation ----
     test_failures: Optional[str]
@@ -169,7 +169,7 @@ def initial_orchestrator_state(
         "retry_count": 0,
         "max_retries": max_retries,
         "edit_requests": [],
-        "pending_files": {},
+        "workspace_volume": None,
         "test_failures": None,
         "scan_failures": None,
         "status": "pending",

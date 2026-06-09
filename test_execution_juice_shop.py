@@ -1,22 +1,22 @@
 import os
-import logging
 import uuid
-from src.contracts.schemas import EditRequest, VulnerabilityGroup, VulnerabilityIssue, IssueType, Severity
+import logging
+from src.contracts.schemas import EditRequest, VulnerabilityGroup, VulnerabilityIssue, IssueType, Severity, IssueSource
 from src.orchestrator.editor_node import run_editor_node
 from src.orchestrator.scanner_node import run_scanner_node
 from src.orchestrator.tester_node import run_tester_node
+from src.orchestrator.teardown_node import run_teardown_node
 
+# Set logging to INFO
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 def test_stateless_execution_pipeline():
     print("==================================================")
-    print("🛠️  STARTING STATELESS EXECUTION PIPELINE TEST")
+    print("🛠️  STARTING DOCKER VOLUME EXECUTION TEST")
     print("==================================================")
 
     repo_root = os.path.abspath("./data/clones/juice-shop")
 
-    # 1. MOCK THE LLM OUTPUT
-    # We will simulate the Remedy Agent successfully fixing express-jwt
     print("\n[MOCK] Simulating LLM EditRequest...")
     mock_edit = EditRequest(
         repo_root=repo_root,
@@ -27,7 +27,6 @@ def test_stateless_execution_pipeline():
         rationale="Update express-jwt to safe version 6.0.0"
     )
 
-    # 2. MOCK THE VULNERABILITY GROUP (So the Scanner knows what to look for)
     mock_issue = VulnerabilityIssue(
         id=str(uuid.uuid4()),
         issue_type=IssueType.SCA,
@@ -38,7 +37,7 @@ def test_stateless_execution_pipeline():
         severity=Severity.CRITICAL
     )
     mock_group = VulnerabilityGroup(
-        group_id="sca:express-jwt",
+        group_id="sca:package.json:express-jwt:UPDATE_VERSION",
         issue_type=IssueType.SCA,
         vulnerable_component="express-jwt",
         file_path="package.json",
@@ -48,16 +47,20 @@ def test_stateless_execution_pipeline():
         issues=[mock_issue]
     )
 
-    # 3. INITIALIZE STATE
+    # 3. INITIALIZE STATE (Updated for Docker Volumes)
     state = {
         "repo_root": repo_root,
         "valid_groups": [mock_group],
         "edit_requests": [mock_edit],
-        "pending_files": {},
         "retry_count": 0,
         "max_retries": 3,
         "test_failures": None,
         "scan_failures": None,
+        "status": "pending",
+        "workspace_volume": None,  # <--- NEW FIELD
+        "changed_files": [],
+        "change_diff": None,
+        "final_status": None
     }
 
     # ---------------------------------------------------------
@@ -65,46 +68,61 @@ def test_stateless_execution_pipeline():
     # ---------------------------------------------------------
     print("\n▶️  RUNNING EDITOR NODE...")
     editor_result = run_editor_node(state)
+    state.update(editor_result)  # Merges {"workspace_volume": "...", "status": "edited"} into state
     
-    print(f"   ↳ Status: {editor_result.get('status')}")
-    if editor_result.get("test_failures"):
-        print(f"   ↳ Error : {editor_result['test_failures']}")
-        return # Stop test on failure
+    print(f"   ↳ Status: {state.get('status')}")
+    if state.get("test_failures"):
+        print(f"   ↳ Error : {state['test_failures']}")
+        run_teardown_node(state)
+        return 
 
-    # Update state with extracted files
-    state["pending_files"] = editor_result.get("pending_files", {})
-    print(f"   ↳ Extracted {len(state['pending_files'])} file(s) into memory buffer.")
-    if "package-lock.json" in state["pending_files"]:
-        print("   ↳ SUCCESS: package-lock.json was successfully regenerated and extracted!")
+    print(f"   ↳ Docker Volume Created: {state.get('workspace_volume')}")
 
     # ---------------------------------------------------------
     # NODE 2: THE SCANNER
     # ---------------------------------------------------------
     print("\n▶️  RUNNING SCANNER NODE...")
     scanner_result = run_scanner_node(state)
+    state.update(scanner_result)
     
-    print(f"   ↳ Status: {scanner_result.get('status')}")
-    if scanner_result.get("scan_failures"):
-        print(f"   ↳ Error : {scanner_result['scan_failures']}")
-        # In a real LangGraph, this would route back to the LLM
+    print(f"   ↳ Status: {state.get('status')}")
+    if state.get("scan_failures"):
+        print(f"   ↳ Error : {state['scan_failures']}")
     else:
         print("   ↳ SUCCESS: ODC Scan passed! CVE is gone.")
-
-    # Update state
-    state["scan_failures"] = scanner_result.get("scan_failures")
 
     # ---------------------------------------------------------
     # NODE 3: THE TESTER
     # ---------------------------------------------------------
     print("\n▶️  RUNNING TESTER NODE...")
     tester_result = run_tester_node(state)
+    state.update(tester_result)
     
-    print(f"   ↳ Status: {tester_result.get('status')}")
-    if tester_result.get("test_failures"):
-        print(f"   ↳ Error : {tester_result['test_failures']}")
-        # In a real LangGraph, this would route back to the LLM
+    print(f"   ↳ Status: {state.get('status')}")
+    if state.get("test_failures"):
+        print(f"   ↳ Error : {state['test_failures']}")
     else:
-        print("   ↳ SUCCESS: npm install and npm test passed!")
+        print("   ↳ SUCCESS: npm test passed!")
+
+    # ---------------------------------------------------------
+    # NODE 4: THE TEARDOWN / DIFF REPORTER
+    # ---------------------------------------------------------
+    print("\n▶️  RUNNING TEARDOWN NODE...")
+    teardown_result = run_teardown_node(state)
+    state.update(teardown_result)
+    
+    print(f"   ↳ Final Status : {state.get('final_status')}")
+    
+    diff = state.get("change_diff")
+    if diff:
+        print("\n   [🔍 GENERATED GIT DIFF]")
+        print("   " + "-"*60)
+        lines = diff.split("\n")
+        for line in lines[:30]:
+            print(f"   | {line}")
+        if len(lines) > 30:
+            print("   | ... (diff truncated for terminal) ...")
+        print("   " + "-"*60)
 
     print("\n==================================================")
     print("🏁 EXECUTION PIPELINE TEST COMPLETE")

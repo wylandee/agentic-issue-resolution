@@ -106,7 +106,9 @@ def _resolve_target_file(
         return None, f"Group '{group.group_id}': no target file could be resolved."
 
     # Security checks
-    if os.path.isabs(candidate):
+    # ``os.path.isabs`` is platform-specific on Windows, so we also treat any
+    # explicit leading slash or backslash as absolute for repo-relative paths.
+    if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
         return None, (
             f"Group '{group.group_id}': rejected absolute file path '{candidate}'."
         )
