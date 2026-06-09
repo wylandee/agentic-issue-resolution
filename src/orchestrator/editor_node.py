@@ -121,7 +121,7 @@ def run_editor_node(state: OrchestratorState) -> Dict[str, Any]:
                 sandbox.write_file(file_path, patched)
 
             logger.info("editor_node: running npm install inside shared workspace.")
-            npm_result = sandbox.run("npm install --no-audit --no-fund", timeout=600)
+            npm_result = sandbox.run("npm install --package-lock=true", timeout=600)
             if npm_result.exit_code != 0:
                 failure_output = (
                     f"npm install failed (exit {npm_result.exit_code}).\n"

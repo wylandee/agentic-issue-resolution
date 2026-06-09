@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Set
@@ -40,6 +42,7 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
         "docker",
         "run",
         "--rm",
+        "-u", "root",
         "-v",
         f"{workspace_volume}:/scan",
         "-v",
@@ -55,6 +58,11 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
         "/scan",
         "--noupdate",
     ]
+
+    extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+
     logger.info("scanner_node: running ODC in Docker: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd,

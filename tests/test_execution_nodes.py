@@ -195,9 +195,36 @@ class TestScannerNode:
 
         cmd = mock_run.call_args[0][0]
         assert f"{state['workspace_volume']}:/scan" in cmd
-        assert "odc-cache:/usr/share/dependency-check/data" in cmd
+        expected_cache = str((Path(__file__).resolve().parents[1] / "data" / "cache").resolve())
+        assert f"{expected_cache}:/usr/share/dependency-check/data" in cmd
         assert "--noupdate" in cmd
         assert sandbox.read_file.called
+
+    def test_odc_command_falls_back_to_legacy_named_volume(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [_sca_group()])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+
+        proc = MagicMock(spec=subprocess.CompletedProcess)
+        proc.returncode = 0
+        proc.stdout = ""
+        proc.stderr = ""
+
+        sandbox = _sandbox_mock()
+        sandbox.read_file.return_value = json.dumps({"dependencies": []})
+
+        with patch("src.orchestrator.scanner_node._resolve_odc_cache_source", return_value="odc-cache"), patch(
+            "src.orchestrator.scanner_node.shutil.which", return_value="docker"
+        ), patch(
+            "src.orchestrator.scanner_node.subprocess.run",
+            return_value=proc,
+        ) as mock_run, patch(
+            "src.orchestrator.scanner_node.DockerSandbox",
+            return_value=sandbox,
+        ):
+            run_scanner_node(state)
+
+        cmd = mock_run.call_args[0][0]
+        assert "odc-cache:/usr/share/dependency-check/data" in cmd
 
     def test_report_with_remaining_target_cve_returns_scan_failed(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [_sca_group("CVE-2021-44228")])

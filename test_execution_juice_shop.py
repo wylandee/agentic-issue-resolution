@@ -7,6 +7,9 @@ from src.orchestrator.scanner_node import run_scanner_node
 from src.orchestrator.tester_node import run_tester_node
 from src.orchestrator.teardown_node import run_teardown_node
 
+from dotenv import load_dotenv
+
+load_dotenv()
 # Set logging to INFO
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
