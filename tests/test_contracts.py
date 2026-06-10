@@ -184,6 +184,14 @@ class TestVulnerabilityIssue:
         assert issue.package_name == "log4j-core"
         assert issue.ecosystem == "maven"
 
+    def test_ghsa_normalised_to_upper(self):
+        issue = _sca_issue(ghsa_id="ghsa-vpq2-c234-7xj6")
+        assert issue.ghsa_id == "GHSA-VPQ2-C234-7XJ6"
+
+    def test_invalid_ghsa_format(self):
+        with pytest.raises(ValidationError):
+            _sca_issue(ghsa_id="GHSA-123")
+
     def test_cve_normalised_to_upper(self):
         issue = _sca_issue(cve_id="cve-2021-44228")
         assert issue.cve_id == "CVE-2021-44228"
@@ -826,4 +834,3 @@ class TestFixPlan:
                 instruction="No fix available",
                 strategy_used="none",
             )
-

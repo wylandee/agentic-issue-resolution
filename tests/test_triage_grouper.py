@@ -35,6 +35,7 @@ def _sca(
     package_name: str = "lodash",
     file_path: str = "package.json",
     cve_id: str | None = "CVE-2021-23337",
+    ghsa_id: str | None = None,
     source: IssueSource = IssueSource.SEMGREP,
     severity: Severity = Severity.HIGH,
     fixed_version: str | None = None,
@@ -46,6 +47,7 @@ def _sca(
         severity=severity,
         package_name=package_name,
         cve_id=cve_id,
+        ghsa_id=ghsa_id,
         file_path=file_path,
         fixed_version=fixed_version,
         package_version=package_version,
@@ -208,6 +210,22 @@ class TestSCAGrouping:
         # Same component/file → one group; no CVE IDs expected
         assert len(groups) == 1
         assert groups[0].cve_ids == []
+
+    def test_ghsa_ids_are_deduplicated_at_group_level(self):
+        issues = [
+            _sca(cve_id=None, ghsa_id="GHSA-VPQ2-C234-7XJ6"),
+            _sca(cve_id=None, ghsa_id="ghsa-vpq2-c234-7xj6"),
+        ]
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+                (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
+            ],
+        )
+        assert len(groups) == 1
+        assert groups[0].cve_ids == []
+        assert groups[0].ghsa_ids == ["GHSA-VPQ2-C234-7XJ6"]
 
     def test_same_component_different_fix_strategies_split_groups(self):
         issues = [

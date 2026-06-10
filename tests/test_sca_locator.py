@@ -38,6 +38,7 @@ from src.contracts.schemas import CWEEntry
 from src.tools.odc_parser import (
     _ecosystem_from_purl,
     _extract_cve_id,
+    _extract_ghsa_id,
     _extract_severity,
     _package_name_from_purl,
     _parse_cwes,
@@ -287,6 +288,27 @@ class TestCVEIDExtraction:
         assert _extract_cve_id(vuln) == "CVE-2020-15084"
 
 
+class TestGHSAIDExtraction:
+    @pytest.mark.parametrize("name,expected", [
+        ("GHSA-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
+        ("ghsa-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
+        ("CVE-2021-23337", None),
+        ("", None),
+    ])
+    def test_extract_ghsa_id(self, name, expected):
+        vuln = {"name": name}
+        assert _extract_ghsa_id(vuln) == expected
+
+    def test_extract_ghsa_id_from_references(self):
+        vuln = {
+            "name": "random id",
+            "references": [
+                {"url": "https://github.com/advisories/GHSA-vpq2-c234-7xj6"},
+            ],
+        }
+        assert _extract_ghsa_id(vuln) == "GHSA-VPQ2-C234-7XJ6"
+
+
 # ===========================================================================
 # odc_parser — parse_vulnerabilities
 # ===========================================================================
@@ -320,8 +342,24 @@ class TestParseVulnerabilities:
         assert len(issues) == 1
         issue = issues[0]
         assert issue.cve_id is None
+        assert issue.ghsa_id == "GHSA-VPQ2-C234-7XJ6"
         assert issue.rule_id == "GHSA-vpq2-c234-7xj6"
         assert issue.package_name == "@tootallnate/once"
+
+    def test_ghsa_and_cve_are_both_preserved(self):
+        dep = _minimal_dep(
+            file_name="once:1.1.2",
+            purl="pkg:npm/once@1.1.2",
+            cve_name="GHSA-vpq2-c234-7xj6",
+        )
+        dep["vulnerabilities"][0]["references"] = [
+            {"url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"}
+        ]
+        issues = parse_vulnerabilities({"dependencies": [dep]})
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.cve_id == "CVE-2020-15084"
+        assert issue.ghsa_id == "GHSA-VPQ2-C234-7XJ6"
 
     def test_scoped_package_purl(self):
         dep = _minimal_dep(

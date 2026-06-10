@@ -304,6 +304,11 @@ class VulnerabilityIssue(BaseModel):
         pattern=r"^CVE-\d{4}-\d{4,}$",
         description="CVE identifier (SCA findings).",
     )
+    ghsa_id: Optional[str] = Field(
+        None,
+        pattern=r"^GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$",
+        description="GitHub Security Advisory identifier (SCA findings).",
+    )
     cwe: List[CWEEntry] = Field(
         default_factory=list,
         description="Associated CWE weakness entries.",
@@ -376,6 +381,14 @@ class VulnerabilityIssue(BaseModel):
     @field_validator("cve_id", mode="before")
     @classmethod
     def _normalise_cve(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().upper()
+        return s if s else None
+
+    @field_validator("ghsa_id", mode="before")
+    @classmethod
+    def _normalise_ghsa(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = str(v).strip().upper()
@@ -851,6 +864,10 @@ class VulnerabilityGroup(BaseModel):
     cve_ids: List[str] = Field(
         default_factory=list,
         description="Deduplicated list of CVE identifiers affecting this component.",
+    )
+    ghsa_ids: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated list of GHSA identifiers affecting this component.",
     )
     versions: List[str] = Field(
         default_factory=list,

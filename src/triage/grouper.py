@@ -260,10 +260,12 @@ def _group_sca(
 
     groups: Dict[str, VulnerabilityGroup] = {}
     for key, members in buckets.items():
-        # Deduplicate CVE IDs and versions
+        # Deduplicate CVE IDs, GHSA IDs, and versions
         seen_cves: list[str] = []
+        seen_ghsas: list[str] = []
         seen_versions: list[str] = []
         seen_cve_set: set[str] = set()
+        seen_ghsa_set: set[str] = set()
         seen_ver_set: set[str] = set()
         sources_set: set[IssueSource] = set()
 
@@ -277,6 +279,9 @@ def _group_sca(
             if issue.cve_id and issue.cve_id not in seen_cve_set:
                 seen_cves.append(issue.cve_id)
                 seen_cve_set.add(issue.cve_id)
+            if issue.ghsa_id and issue.ghsa_id not in seen_ghsa_set:
+                seen_ghsas.append(issue.ghsa_id)
+                seen_ghsa_set.add(issue.ghsa_id)
             if issue.package_version and issue.package_version not in seen_ver_set:
                 seen_versions.append(issue.package_version)
                 seen_ver_set.add(issue.package_version)
@@ -293,6 +298,7 @@ def _group_sca(
             vulnerable_component=component,
             file_path=group_file_path,
             cve_ids=seen_cves,
+            ghsa_ids=seen_ghsas,
             versions=seen_versions,
             sources=list(sources_set),
             representative_issue_id=rep.id,
@@ -331,6 +337,7 @@ def _group_sast(issues: List[VulnerabilityIssue]) -> Dict[str, VulnerabilityGrou
                 vulnerable_component=issue.rule_id,
                 file_path=issue.file_path,
                 cve_ids=[],         # SAST findings rarely carry a CVE
+                ghsa_ids=[],
                 versions=[],
                 sources=[issue.source],
                 representative_issue_id=issue.id,

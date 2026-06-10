@@ -194,6 +194,29 @@ def _extract_cve_id(vulnerability: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_ghsa_id(vulnerability: Dict[str, Any]) -> Optional[str]:
+    """Return GHSA ID if the vulnerability name or references contain one."""
+    import re
+
+    name = (vulnerability.get("name") or "").strip()
+    ghsa_regex = re.compile(
+        r"\b(GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})\b",
+        re.IGNORECASE,
+    )
+
+    match = ghsa_regex.search(name)
+    if match:
+        return match.group(1).upper()
+
+    for ref in vulnerability.get("references") or []:
+        for key in ("url", "name"):
+            val = ref.get(key) or ""
+            match = ghsa_regex.search(val)
+            if match:
+                return match.group(1).upper()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -253,6 +276,7 @@ def parse_vulnerabilities(
             severity = _extract_severity(vuln)
             cwes = _parse_cwes(vuln)
             cve_id = _extract_cve_id(vuln)
+            ghsa_id = _extract_ghsa_id(vuln)
             vuln_id = (vuln.get("name") or "").strip()
 
             issue = VulnerabilityIssue(
@@ -262,6 +286,7 @@ def parse_vulnerabilities(
                 base_ref=base_ref,
                 severity=severity,
                 cve_id=cve_id if cve_id else None,
+                ghsa_id=ghsa_id if ghsa_id else None,
                 rule_id=vuln_id if not cve_id else None,
                 cwe=cwes,
                 package_name=package_name or file_name or None,
@@ -305,7 +330,7 @@ def export_to_csv(issues: List[VulnerabilityIssue], output_path: Path) -> None:
                 {
                     "Dependency_Name": raw.get("fileName", ""),
                     "File_Path": raw.get("filePath", ""),
-                    "Vulnerability_ID": issue.cve_id or issue.rule_id or "",
+                    "Vulnerability_ID": issue.cve_id or issue.ghsa_id or issue.rule_id or "",
                     "Severity": issue.severity.value,
                     "PURL": issue.purl or "",
                     "Ecosystem": issue.ecosystem or "",

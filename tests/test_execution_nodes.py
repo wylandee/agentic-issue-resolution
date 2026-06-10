@@ -28,12 +28,16 @@ from src.orchestrator.tester_node import run_tester_node
 from src.orchestrator.workspace_sync_node import run_workspace_sync_node
 
 
-def _sca_group(cve_id: str = "CVE-2021-44228") -> VulnerabilityGroup:
+def _sca_group(
+    cve_id: str = "CVE-2021-44228",
+    ghsa_id: str | None = None,
+) -> VulnerabilityGroup:
     issue = VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
         cve_id=cve_id,
+        ghsa_id=ghsa_id,
         package_name="lodash",
         package_version="4.17.15",
     )
@@ -41,7 +45,8 @@ def _sca_group(cve_id: str = "CVE-2021-44228") -> VulnerabilityGroup:
         group_id="sca:package.json:lodash",
         issue_type=IssueType.SCA,
         vulnerable_component="lodash",
-        cve_ids=[cve_id],
+        cve_ids=[cve_id] if cve_id else [],
+        ghsa_ids=[ghsa_id] if ghsa_id else [],
         versions=["4.17.15"],
         sources=[IssueSource.ODC],
         representative_issue_id=issue.id,
@@ -275,6 +280,45 @@ class TestScannerNode:
 
         assert result["status"] == "scan_failed"
         assert "CVE-2021-44228" in result["scan_failures"]
+
+    def test_report_with_remaining_target_ghsa_returns_scan_failed(self, tmp_path):
+        state = initial_orchestrator_state(
+            str(tmp_path),
+            [_sca_group(cve_id=None, ghsa_id="GHSA-VPQ2-C234-7XJ6")],
+        )
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+
+        proc = MagicMock(spec=subprocess.CompletedProcess)
+        proc.returncode = 0
+        proc.stdout = ""
+        proc.stderr = ""
+
+        report = {
+            "dependencies": [
+                {
+                    "fileName": "once.tgz",
+                    "packages": [{"id": "pkg:npm/once@1.1.2"}],
+                    "vulnerabilities": [{"name": "GHSA-vpq2-c234-7xj6"}],
+                }
+            ]
+        }
+        sandbox = _sandbox_mock()
+        sandbox.read_file.return_value = json.dumps(report)
+
+        with patch(
+            "src.orchestrator.scanner_node.shutil.which",
+            return_value="docker",
+        ), patch(
+            "src.orchestrator.scanner_node.subprocess.run",
+            return_value=proc,
+        ), patch(
+            "src.orchestrator.scanner_node.DockerSandbox",
+            return_value=sandbox,
+        ):
+            result = run_scanner_node(state)
+
+        assert result["status"] == "scan_failed"
+        assert "GHSA-VPQ2-C234-7XJ6" in result["scan_failures"]
 
 
 class TestTesterNode:

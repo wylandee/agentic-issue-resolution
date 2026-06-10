@@ -89,6 +89,7 @@ def _resolve_target_file(
 def _build_group_section(group: VulnerabilityGroup, rel_path: str) -> str:
     """Render a structured description of one vulnerability group."""
     cve_list = ", ".join(group.cve_ids) if group.cve_ids else "none"
+    ghsa_list = ", ".join(group.ghsa_ids) if group.ghsa_ids else "none"
     versions = ", ".join(group.versions) if group.versions else "unknown"
     sources = ", ".join(s.value for s in group.sources) if group.sources else "unknown"
     rep_issue = next(
@@ -104,6 +105,7 @@ def _build_group_section(group: VulnerabilityGroup, rel_path: str) -> str:
             f"Target File   : {rel_path}",
             f"Component     : {group.vulnerable_component or 'unknown'}",
             f"CVEs          : {cve_list}",
+            f"GHSAs         : {ghsa_list}",
             f"Versions      : {versions}",
             f"Sources       : {sources}",
             f"Rep. Message  : {rep_msg}",

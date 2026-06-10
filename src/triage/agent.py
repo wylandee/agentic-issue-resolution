@@ -227,8 +227,8 @@ def _deterministic_triage(
 
 
 def _build_cve_details_prompt(group: VulnerabilityGroup) -> str:
-    if not group.cve_ids:
-        return "  (No CVEs in this group)"
+    if not group.cve_ids and not group.ghsa_ids:
+        return "  (No CVE or GHSA identifiers in this group)"
 
     # Map CVE IDs (case-insensitive keys) to their descriptions and CVSS scores.
     cve_details: dict[str, tuple[list[str], list[str]]] = {}
@@ -266,6 +266,8 @@ def _build_cve_details_prompt(group: VulnerabilityGroup) -> str:
         lines.append(f"  - CVE ID: {cve_upper}")
         lines.append(f"    CVSS Score: {cvss}")
         lines.append(f"    Description: {desc}")
+    for ghsa in sorted(group.ghsa_ids):
+        lines.append(f"  - GHSA ID: {ghsa.upper().strip()}")
     return "\n".join(lines)
 
 
@@ -284,6 +286,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
     )
 
     cve_list = ", ".join(group.cve_ids) if group.cve_ids else "none"
+    ghsa_list = ", ".join(group.ghsa_ids) if group.ghsa_ids else "none"
     sources = ", ".join(s.value for s in group.sources)
     original_sev = _original_severity(group)
     reachability_info = (
@@ -311,6 +314,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
         f"Component: {group.vulnerable_component or 'unknown'}",
         f"File: {group.file_path or 'N/A'}",
         f"CVEs: {cve_list}",
+        f"GHSAs: {ghsa_list}",
         f"Installed versions: {', '.join(group.versions) or 'unknown'}",
         f"Sources: {sources}",
         f"Original severity: {original_sev.value}",
