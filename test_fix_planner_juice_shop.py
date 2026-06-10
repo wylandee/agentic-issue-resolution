@@ -67,7 +67,7 @@ def test_planner_serper_path():
 
     print("✅ Found JSONL and Codebase. Testing Serper Path...\n")
 
-    targets = ["blaze", "moment"]
+    targets = ["sanitize-html", "lodash"]
     tested_packages = set()
 
     with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -98,7 +98,7 @@ def test_planner_serper_path():
                 tested_packages.add(pkg_name)
                 
                 # Stop once we have found and tested both targets
-                if len(tested_packages) >= 2:
+                if len(tested_packages) >= 10:
                     break
 
 if __name__ == "__main__":

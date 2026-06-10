@@ -1,7 +1,7 @@
 """
 teardown_node.py — Final cleanup node for the Phase 5 AppSec Orchestrator.
 
-This node optionally reads selected files back out of the shared Docker named
+This node optionally reads changed files back out of the shared Docker named
 volume to build a unified diff, then always attempts to delete the volume.
 """
 
@@ -16,9 +16,6 @@ from src.orchestrator.state import OrchestratorState
 from src.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 
 logger = logging.getLogger(__name__)
-
-_DIFF_TARGETS = ("package.json", "package-lock.json")
-
 
 def _close_client(client) -> None:
     close = getattr(client, "close", None)
@@ -48,13 +45,14 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     """
     LangGraph node — Teardown.
 
-    If the workflow reached ``status == "tested"``, reads updated package
-    manifests from the workspace volume, generates a unified diff, and then
+    If the workflow reached ``status == "tested"``, reads updated changed files
+    from the workspace volume, generates a unified diff, and then
     always attempts to remove the named volume.
     """
     repo_root_str: str = state.get("repo_root", "")
     workspace_volume: Optional[str] = state.get("workspace_volume")
     prior_status: str = state.get("status", "")
+    tracked_changed_files: List[str] = state.get("changed_files", [])
 
     changed_files: List[str] = []
     diff_chunks: List[str] = []
@@ -72,7 +70,11 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                     repo_root=None,
                     workspace_volume=workspace_volume,
                 ) as sandbox:
-                    for rel_path in _DIFF_TARGETS:
+                    seen_paths: set[str] = set()
+                    for rel_path in tracked_changed_files:
+                        if rel_path in seen_paths:
+                            continue
+                        seen_paths.add(rel_path)
                         updated_text = sandbox.read_file(rel_path)
                         if updated_text is None:
                             continue

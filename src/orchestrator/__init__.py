@@ -1,18 +1,33 @@
 """
-src/orchestrator — Phase 4.1 LangGraph remediation orchestrator.
+src.orchestrator - LangGraph remediation package for Phase 4.1 and Phase 5.
 
 Public entry points
 -------------------
-``build_remediation_graph()``  — compile the StateGraph into a runnable app.
-``run_remediation(...)``       — convenience wrapper: invoke the graph for one issue.
+Phase 4.1:
+``build_remediation_graph()``
+``remediation_engine``
+``run_remediation(...)``
 
-Import examples::
-
-    from src.orchestrator import run_remediation
-    from src.orchestrator.graph import build_remediation_graph, remediation_engine
-    from src.orchestrator.state import RemediationState
+Phase 5:
+``build_orchestrator_graph()``
+``orchestrator_engine``
+``run_orchestrator(...)``
 """
 
-from src.orchestrator.graph import build_remediation_graph, remediation_engine, run_remediation
+from src.orchestrator.graph import (
+    build_orchestrator_graph,
+    build_remediation_graph,
+    orchestrator_engine,
+    remediation_engine,
+    run_orchestrator,
+    run_remediation,
+)
 
-__all__ = ["build_remediation_graph", "remediation_engine", "run_remediation"]
+__all__ = [
+    "build_orchestrator_graph",
+    "build_remediation_graph",
+    "orchestrator_engine",
+    "remediation_engine",
+    "run_orchestrator",
+    "run_remediation",
+]
