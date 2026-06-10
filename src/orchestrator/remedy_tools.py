@@ -4,13 +4,26 @@ remedy_tools.py - Native workspace tools for the Phase 5 Remedy Agent.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 
 from langchain_core.tools import tool
 
 from src.runtime.sandbox_mgr import DockerSandbox
+
+logger = logging.getLogger(__name__)
+
+_NPM_INSTALL_TIMEOUT_SECONDS = 600
+_NPM_TEST_TIMEOUT_SECONDS = 600
+_ODC_TIMEOUT_SECONDS = 300
+_ODC_REPORT_NAME = "dependency-check-report.json"
+_ODC_CACHE_VOLUME = "odc-cache"
 
 
 def _validate_workspace_path(file_path: str) -> str:
@@ -39,9 +52,83 @@ def _detect_newline_style(text: str) -> str:
         return "\r\n"
     return "\n"
 
+def _read_report_from_workspace(sandbox: DockerSandbox) -> Optional[str]:
+    try:
+        return sandbox.read_file(_ODC_REPORT_NAME)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("remedy_tools: failed to read ODC report from workspace - %s", exc)
+        return None
 
-def build_agent_tools(sandbox: DockerSandbox, touched_files: Set[str]) -> List:
-    """Build the native LangChain tool set for the active workspace sandbox."""
+
+def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
+    try:
+        report = json.loads(report_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("remedy_tools: failed to decode ODC report JSON - %s", exc)
+        return None
+
+    try:
+        from src.tools.odc_parser import parse_vulnerabilities
+    except ImportError:
+        logger.warning("remedy_tools: src.tools.odc_parser not importable.")
+        return None
+
+    identifiers: Set[str] = set()
+    for issue in parse_vulnerabilities(report):
+        if issue.cve_id:
+            identifiers.add(issue.cve_id.upper().strip())
+        if issue.ghsa_id:
+            identifiers.add(issue.ghsa_id.upper().strip())
+    return identifiers
+
+
+def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "root",
+        "-v",
+        f"{workspace_volume}:/scan",
+        "-v",
+        f"{_ODC_CACHE_VOLUME}:/usr/share/dependency-check/data",
+        "owasp/dependency-check:latest",
+        "--project",
+        "sandbox_scan",
+        "--scan",
+        "/scan",
+        "--format",
+        "JSON",
+        "--out",
+        "/scan",
+        "--noupdate",
+    ]
+
+    extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+
+    logger.info("remedy_tools: running ODC in Docker: %s", " ".join(cmd))
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=_ODC_TIMEOUT_SECONDS,
+    )
+
+
+def build_agent_tools(
+    sandbox: DockerSandbox,
+    touched_files: Set[str],
+    target_cves: Set[str],
+) -> List:
+    """
+    Build the native LangChain tool set for the active workspace sandbox.
+
+    ``target_cves`` intentionally keeps its historical name, but the set may
+    contain both CVE and GHSA identifiers for scan validation parity.
+    """
 
     @tool
     def read_workspace_file(file_path: str) -> str:
@@ -94,13 +181,91 @@ def build_agent_tools(sandbox: DockerSandbox, touched_files: Set[str]) -> List:
                 "anchor."
             )
         if count > 1:
-            return (
-                "ERROR: old_text found multiple times. Make anchor more specific."
-            )
+            return "ERROR: old_text found multiple times. Make anchor more specific."
 
         updated = current_norm.replace(old_norm, new_norm, 1)
         sandbox.write_file(rel_path, _restore_newlines(updated, newline_style))
         touched_files.add(rel_path)
         return f"SUCCESS: File modified: {rel_path}"
 
-    return [read_workspace_file, deterministic_search_replace]
+    @tool
+    def run_dependency_install() -> str:
+        """Runs npm install to synchronize node_modules with package.json edits. MUST run after edits and before testing/scanning."""
+        result = sandbox.run(
+            "npm install --package-lock=true",
+            timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
+        )
+        if result.exit_code == 0:
+            return "SUCCESS: npm install completed successfully."
+        return (
+            f"FAILURE: npm install failed (exit {result.exit_code}).\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    @tool
+    def run_security_scan() -> str:
+        """Executes OWASP Dependency-Check on the workspace to verify if target CVEs are resolved."""
+        workspace_volume = getattr(sandbox, "_workspace_volume", None)
+        if not workspace_volume:
+            return "FAILURE: workspace_volume is unavailable for security scanning."
+        if shutil.which("docker") is None:
+            return "FAILURE: docker is not available on PATH, so Dependency-Check cannot run."
+
+        try:
+            proc = _run_odc(workspace_volume)
+        except FileNotFoundError:
+            return "FAILURE: docker is not available on PATH, so Dependency-Check cannot run."
+        except subprocess.TimeoutExpired:
+            return f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s."
+        except Exception as exc:  # noqa: BLE001
+            return f"FAILURE: Dependency-Check subprocess error - {exc}"
+
+        report_text = _read_report_from_workspace(sandbox)
+        found_identifiers = (
+            _parse_report_identifiers(report_text) if report_text is not None else None
+        )
+
+        if proc.returncode != 0 and found_identifiers is None:
+            return (
+                f"FAILURE: Dependency-Check exited {proc.returncode} and produced no "
+                "parseable report.\n"
+                f"stdout:\n{proc.stdout}\n"
+                f"stderr:\n{proc.stderr}"
+            )
+
+        if found_identifiers is None:
+            return (
+                f"FAILURE: Dependency-Check report was not parseable (exit {proc.returncode}).\n"
+                f"stderr:\n{proc.stderr}"
+            )
+
+        remaining = {identifier.upper().strip() for identifier in target_cves if identifier}
+        remaining &= found_identifiers
+        if remaining:
+            return (
+                "FAILURE: Dependency-Check still reports the following target "
+                f"vulnerability identifier(s): {', '.join(sorted(remaining))}"
+            )
+
+        return "SUCCESS: Dependency-Check found no remaining target vulnerability identifiers."
+
+    @tool
+    def run_unit_tests() -> str:
+        """Runs npm test inside the workspace to verify functionality."""
+        result = sandbox.run("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
+        if result.exit_code == 0:
+            return "SUCCESS: npm test passed."
+        return (
+            f"FAILURE: npm test failed (exit {result.exit_code}).\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    return [
+        read_workspace_file,
+        deterministic_search_replace,
+        run_dependency_install,
+        run_security_scan,
+        run_unit_tests,
+    ]

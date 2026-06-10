@@ -27,26 +27,12 @@ Phase 5 graph topology
       | workspace_ready
       v
     remedy_agent
-      | edits_completed
+      |
       v
-    workspace_sync
-      | dependencies_ready + SCA version bump
-      |------------------------------> scanner
-      | dependencies_ready without SCA version bump
-      /------------------------------> tester
-
-    workspace_sync
-      \\ dependency_sync_failed -----> remedy_agent
-
-    scanner
-      | scanned
-      |-----------------------> tester
-      / scan_failed ----------> remedy_agent
-
-    tester
-      | tested
-      |-----------------------> teardown -> END
-      / test_failed ----------> remedy_agent
+    teardown
+      |
+      v
+     END
 
 Public API
 ----------
@@ -80,16 +66,12 @@ from src.contracts.schemas import (
 from src.orchestrator.editor_node import run_workspace_builder_node
 from src.orchestrator.edit_request_builder import build_edit_request
 from src.orchestrator.remedy_agent import run_remedy_agent
-from src.orchestrator.scanner_node import run_scanner_node
 from src.orchestrator.state import (
-    DEFAULT_MAX_RETRIES,
     OrchestratorState,
     RemediationState,
     initial_orchestrator_state,
 )
 from src.orchestrator.teardown_node import run_teardown_node
-from src.orchestrator.tester_node import run_tester_node
-from src.orchestrator.workspace_sync_node import run_workspace_sync_node
 from src.tools.edit_tools import apply_edit
 
 log = logging.getLogger(__name__)
@@ -367,48 +349,6 @@ def route_after_workspace_builder(state: OrchestratorState) -> str:
 
 def route_after_remedy_agent(state: OrchestratorState) -> str:
     """Route Phase 5 flow after the Remedy Agent."""
-    if state.get("status") == "edits_completed":
-        return "workspace_sync"
-    return "teardown"
-
-
-def route_after_workspace_sync(state: OrchestratorState) -> str:
-    """Route Phase 5 flow after dependency sync."""
-    status = state.get("status")
-    if status == "dependency_sync_failed":
-        return "remedy_agent"
-    if status != "dependencies_ready":
-        return "teardown"
-
-    valid_groups: List[VulnerabilityGroup] = state.get("valid_groups", [])
-    requires_scan = any(
-        group.issue_type == IssueType.SCA
-        and group.fix_plan is not None
-        and group.fix_plan.status == FixPlanStatus.VERSION_FOUND
-        for group in valid_groups
-    )
-    if requires_scan:
-        return "scanner"
-    return "tester"
-
-
-def route_after_scanner(state: OrchestratorState) -> str:
-    """Route Phase 5 flow after the scanner node."""
-    status = state.get("status")
-    if status == "scanned":
-        return "tester"
-    if status == "scan_failed":
-        return "remedy_agent"
-    return "teardown"
-
-
-def route_after_tester(state: OrchestratorState) -> str:
-    """Route Phase 5 flow after the tester node."""
-    status = state.get("status")
-    if status == "tested":
-        return "teardown"
-    if status == "test_failed":
-        return "remedy_agent"
     return "teardown"
 
 
@@ -423,17 +363,11 @@ def build_orchestrator_graph():
 
     workflow.add_node("workspace_builder", run_workspace_builder_node)
     workflow.add_node("remedy_agent", run_remedy_agent)
-    workflow.add_node("workspace_sync", run_workspace_sync_node)
-    workflow.add_node("scanner", run_scanner_node)
-    workflow.add_node("tester", run_tester_node)
     workflow.add_node("teardown", run_teardown_node)
 
     workflow.add_edge(START, "workspace_builder")
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
     workflow.add_conditional_edges("remedy_agent", route_after_remedy_agent)
-    workflow.add_conditional_edges("workspace_sync", route_after_workspace_sync)
-    workflow.add_conditional_edges("scanner", route_after_scanner)
-    workflow.add_conditional_edges("tester", route_after_tester)
     workflow.add_edge("teardown", END)
 
     return workflow.compile()
@@ -445,13 +379,11 @@ orchestrator_engine = build_orchestrator_graph()
 def run_orchestrator(
     repo_root: str,
     valid_groups: List[VulnerabilityGroup],
-    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> OrchestratorState:
     """Convenience entry point for the Phase 5 orchestrator graph."""
     initial_state = initial_orchestrator_state(
         repo_root=repo_root,
         valid_groups=valid_groups,
-        max_retries=max_retries,
     )
     result: OrchestratorState = orchestrator_engine.invoke(initial_state)
     log.info(

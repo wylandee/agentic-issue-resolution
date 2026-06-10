@@ -1,9 +1,9 @@
 """
 remedy_agent.py - Phase 5 Remedy Agent node for the AppSec Orchestrator.
 
-The Remedy Agent now edits files directly inside the shared Docker workspace by
-using native LangChain tools. It no longer returns structured ``EditRequest``
-objects in the Phase 5 runtime path.
+The Remedy Agent edits files directly inside the shared Docker workspace by
+using native LangChain tools. It also performs dependency install, security
+scan, and unit test validation through those tools before finishing.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
@@ -93,7 +93,11 @@ def _build_group_section(group: VulnerabilityGroup, rel_path: str) -> str:
     versions = ", ".join(group.versions) if group.versions else "unknown"
     sources = ", ".join(s.value for s in group.sources) if group.sources else "unknown"
     rep_issue = next(
-        (issue for issue in group.issues if str(issue.id) == str(group.representative_issue_id)),
+        (
+            issue
+            for issue in group.issues
+            if str(issue.id) == str(group.representative_issue_id)
+        ),
         group.issues[0] if group.issues else None,
     )
     rep_msg = (rep_issue.message or "N/A") if rep_issue else "N/A"
@@ -135,39 +139,11 @@ def _build_fix_plan_section(group: VulnerabilityGroup) -> str:
     return "\n".join(lines)
 
 
-def _build_feedback_section(
-    install_failures: Optional[str],
-    test_failures: Optional[str],
-    scan_failures: Optional[str],
-    retry_count: int,
-    max_retries: int,
-) -> str:
-    """Build a failure-feedback section for retry prompts."""
-    lines = [
-        "A previous validation step failed. Self-correct using the current workspace state.",
-        f"Retry {retry_count} of {max_retries}.",
-        "",
-    ]
-    if install_failures:
-        lines += ["=== DEPENDENCY SYNC FAILURES ===", install_failures, ""]
-    if test_failures:
-        lines += ["=== UNIT TEST FAILURES ===", test_failures, ""]
-    if scan_failures:
-        lines += ["=== ODC SCAN FAILURES ===", scan_failures, ""]
-    return "\n".join(lines)
-
-
 def _build_prompt(
     resolved_groups: List[Tuple[VulnerabilityGroup, str]],
     repo_root: str,
-    install_failures: Optional[str],
-    test_failures: Optional[str],
-    scan_failures: Optional[str],
-    retry_count: int,
-    max_retries: int,
 ) -> str:
     """Assemble the full prompt for the tool-using Remedy Agent."""
-    has_feedback = bool(install_failures or test_failures or scan_failures)
     sections: List[str] = [
         "\n".join(
             [
@@ -177,21 +153,39 @@ def _build_prompt(
                 "Always read a file before editing it.",
                 "Use deterministic_search_replace for every change.",
                 "After each edit, read the file again to verify the result.",
-                "When all fixes are applied, stop calling tools and return a concise summary.",
+                (
+                    f"You have been assigned exactly {len(resolved_groups)} groups to fix. "
+                    "When and only when all tools report SUCCESS, stop calling tools and "
+                    "return a concise summary."
+                ),
             ]
         )
     ]
 
-    if has_feedback:
-        sections.append(
-            _build_feedback_section(
-                install_failures=install_failures,
-                test_failures=test_failures,
-                scan_failures=scan_failures,
-                retry_count=retry_count,
-                max_retries=max_retries,
-            )
+    sections.append(
+        "\n".join(
+            [
+                "REQUIRED STEP-BY-STEP SEQUENCE",
+                "1. Inspect the assigned target files with read_workspace_file.",
+                "2. Edit only the assigned target files with deterministic_search_replace.",
+                "3. Run run_dependency_install after edits and before scanning or testing.",
+                "4. Run run_security_scan after dependency installation succeeds.",
+                "5. Run run_unit_tests after the security scan succeeds.",
+            ]
         )
+    )
+
+    sections.append(
+        "\n".join(
+            [
+                "CRITICAL SAFETY RULES",
+                "Never edit files outside the allowed target files list.",
+                "Do not invent file contents; anchor every change to current workspace text.",
+                "Do not leave package.json or package-lock.json in invalid JSON state.",
+                "Never introduce trailing commas in package.json.",
+            ]
+        )
+    )
 
     sections.append(f"repo_root (host reference only): {repo_root}")
     sections.append(
@@ -237,26 +231,12 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
     """
     LangGraph node - Remedy Agent.
 
-    Uses native tools against the shared workspace volume to inspect and edit
-    vulnerable files directly inside Docker.
+    Uses native tools against the shared workspace volume to inspect, edit, and
+    validate vulnerable files directly inside Docker.
     """
     repo_root_str: str = state.get("repo_root", "")
     workspace_volume: Optional[str] = state.get("workspace_volume")
     valid_groups: List[VulnerabilityGroup] = state.get("valid_groups", [])
-    retry_count: int = state.get("retry_count", 0)
-    max_retries: int = state.get("max_retries", 3)
-    install_failures: Optional[str] = state.get("install_failures")
-    test_failures: Optional[str] = state.get("test_failures")
-    scan_failures: Optional[str] = state.get("scan_failures")
-
-    has_feedback = bool(install_failures or test_failures or scan_failures)
-    if has_feedback and retry_count >= max_retries:
-        logger.warning(
-            "Remedy Agent: retry_count=%d >= max_retries=%d - aborting.",
-            retry_count,
-            max_retries,
-        )
-        return {"status": "max_retries_exceeded"}
 
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
@@ -271,6 +251,7 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
 
     resolved_groups: List[Tuple[VulnerabilityGroup, str]] = []
     resolution_errors: List[str] = []
+    target_identifiers: Set[str] = set()
     for group in valid_groups:
         rel_path, resolve_err = _resolve_target_file(group, repo_root)
         if resolve_err:
@@ -278,6 +259,12 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
             resolution_errors.append(resolve_err)
             continue
         resolved_groups.append((group, rel_path))
+        for cve in group.cve_ids or []:
+            if cve:
+                target_identifiers.add(cve.upper().strip())
+        for ghsa in group.ghsa_ids or []:
+            if ghsa:
+                target_identifiers.add(ghsa.upper().strip())
 
     if not resolved_groups:
         errors = resolution_errors or [
@@ -307,28 +294,21 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
     prompt = _build_prompt(
         resolved_groups=resolved_groups,
         repo_root=repo_root_str,
-        install_failures=install_failures,
-        test_failures=test_failures,
-        scan_failures=scan_failures,
-        retry_count=retry_count,
-        max_retries=max_retries,
     )
 
     system_message = SystemMessage(
         content=(
-            "You must use tools for file inspection and edits. Only modify the "
-            "allowed target files. Never invent file contents."
+            "You must use tools for file inspection, edits, and validation. Only "
+            "modify the allowed target files. Never invent file contents."
         )
     )
     human_message = HumanMessage(content=prompt)
     new_messages.extend([system_message, human_message])
     conversation.extend([system_message, human_message])
 
-    new_retry_count = retry_count + 1 if has_feedback else retry_count
-
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            tools = build_agent_tools(sandbox, touched_files)
+            tools = build_agent_tools(sandbox, touched_files, target_identifiers)
             tool_map = {tool.name: tool for tool in tools}
             llm_with_tools = llm.bind_tools(tools)
 
@@ -344,8 +324,6 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
                         "changed_files": sorted(touched_files),
                         "status": "edits_completed" if touched_files else "no_changes_made",
                     }
-                    if new_retry_count != retry_count:
-                        result["retry_count"] = new_retry_count
                     if resolution_errors:
                         result["errors"] = resolution_errors
                     return result
@@ -357,27 +335,21 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         msg = f"Remedy Agent: sandbox or tool loop failed - {exc}"
         logger.exception("Remedy Agent: tool loop failed.")
-        result = {
+        return {
             "status": "remedy_failed",
             "errors": resolution_errors + [msg],
             "messages": new_messages,
             "changed_files": sorted(touched_files),
         }
-        if new_retry_count != retry_count:
-            result["retry_count"] = new_retry_count
-        return result
 
     msg = (
         f"Remedy Agent: exceeded maximum tool-call rounds ({_MAX_TOOL_CALL_ROUNDS}) "
         "without reaching a final answer."
     )
     logger.error(msg)
-    result = {
+    return {
         "status": "remedy_failed",
         "errors": resolution_errors + [msg],
         "messages": new_messages,
         "changed_files": sorted(touched_files),
     }
-    if new_retry_count != retry_count:
-        result["retry_count"] = new_retry_count
-    return result

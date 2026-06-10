@@ -5,17 +5,17 @@ Phase 4.1 (Legacy):
     ``RemediationState`` - single-issue, kept for the current Phase 4.1 graph.
 
 Phase 5:
-    ``OrchestratorState`` - group-level, looping state machine for the new
-    Triage -> Remedy Agent -> Sandbox -> Scan -> PR flow.
+    ``OrchestratorState`` - group-level state for the linear
+    workspace_builder -> remedy_agent -> teardown pipeline.
 
 Reducer notes
 -------------
 * ``errors`` uses ``operator.add`` in both states so each node can return
   only its new error strings and LangGraph will append them.
-* ``messages`` in ``OrchestratorState`` uses ``add_messages`` so each remedy
-  pass appends only the newly produced LLM and tool transcript.
-* ``changed_files`` uses ``operator.add`` so each remedy pass can report only
-  the files it newly modified.
+* ``messages`` in ``OrchestratorState`` uses ``add_messages`` so the remedy
+  agent appends only the newly produced LLM and tool transcript.
+* ``changed_files`` uses ``operator.add`` so each node can report only the
+  files it newly observed as changed.
 * All other fields use the default "last writer wins" semantics.
 """
 
@@ -58,13 +58,9 @@ class RemediationState(TypedDict, total=False):
     errors: Annotated[list[str], operator.add]
 
 
-DEFAULT_MAX_RETRIES: int = 3
-"""Default number of self-correction iterations the Remedy Agent may attempt."""
-
-
 class OrchestratorState(TypedDict, total=False):
     """
-    Full state schema for the Phase 5 autonomous remediation state machine.
+    Full state schema for the Phase 5 linear remediation pipeline.
 
     Required inputs
     ---------------
@@ -73,14 +69,10 @@ class OrchestratorState(TypedDict, total=False):
     valid_groups:
         Non-empty list of triaged ``VulnerabilityGroup`` records.
 
-    Retry / orchestration fields
-    ----------------------------
-    retry_count:
-        Incremented by the Remedy Agent when retry feedback is present.
-    max_retries:
-        Ceiling for ``retry_count``.
+    Orchestration fields
+    --------------------
     workspace_volume:
-        Docker named volume shared across builder, remedy, scan, test, teardown.
+        Docker named volume shared across builder, remedy agent, and teardown.
 
     Remedy transcript / outputs
     ---------------------------
@@ -88,31 +80,15 @@ class OrchestratorState(TypedDict, total=False):
         Accumulated conversation history including tool calls and tool results.
     changed_files:
         Repo-relative files successfully modified inside the workspace.
-
-    Validation feedback
-    -------------------
-    install_failures:
-        Captured stdout/stderr from failed dependency sync.
-    test_failures:
-        Captured stdout/stderr from failed unit tests.
-    scan_failures:
-        Captured stdout/stderr from failed ODC scans.
     """
 
     repo_root: str
     valid_groups: List[VulnerabilityGroup]
 
-    retry_count: int
-    max_retries: int
-
     messages: Annotated[List[AnyMessage], add_messages]
     changed_files: Annotated[List[str], operator.add]
 
     workspace_volume: Optional[str]
-
-    install_failures: Optional[str]
-    test_failures: Optional[str]
-    scan_failures: Optional[str]
 
     status: str
     errors: Annotated[List[str], operator.add]
@@ -121,20 +97,14 @@ class OrchestratorState(TypedDict, total=False):
 def initial_orchestrator_state(
     repo_root: str,
     valid_groups: List[VulnerabilityGroup],
-    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
     return {
         "repo_root": repo_root,
         "valid_groups": valid_groups,
-        "retry_count": 0,
-        "max_retries": max_retries,
         "messages": [],
         "changed_files": [],
         "workspace_volume": None,
-        "install_failures": None,
-        "test_failures": None,
-        "scan_failures": None,
         "status": "pending",
         "errors": [],
     }

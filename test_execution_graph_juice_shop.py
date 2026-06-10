@@ -18,18 +18,19 @@ import src.orchestrator.remedy_agent as remedy_agent
 
 load_dotenv()
 
-# Keep basic config so dependency modules (like LangGraph/Docker) can still log if needed
+# Keep basic logging configuration active so dependencies (Docker, LangGraph) can still log
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+
 # ============================================================================
-# 🪄 PROMPT INTERCEPTOR (Updated for Bulk resolved_groups)
+# 🪄 1. PROMPT INTERCEPTOR (Updated for Bulk resolved_groups)
 # ============================================================================
 original_build_prompt = remedy_agent._build_prompt
 
 def prompt_interceptor(*args, **kwargs):
     prompt = original_build_prompt(*args, **kwargs)
     
-    # args[0] is now resolved_groups: List[Tuple[VulnerabilityGroup, str]]
+    # Unpack resolved_groups (List[Tuple[VulnerabilityGroup, str]])
     resolved_groups = kwargs.get("resolved_groups") or args[0]
     group_ids = [g[0].group_id for g in resolved_groups]
 
@@ -45,6 +46,40 @@ def prompt_interceptor(*args, **kwargs):
     return prompt
 
 remedy_agent._build_prompt = prompt_interceptor
+
+
+# ============================================================================
+# 🪄 2. LIVE TOOL CALL INTERCEPTOR (NEW)
+# Prints each tool execution and its outcome LIVE as the LLM executes them
+# ============================================================================
+original_invoke_bound_tool = remedy_agent._invoke_bound_tool
+
+def invoke_bound_tool_interceptor(*args, **kwargs):
+    # args[0] is tool_map, args[1] is tool_call dict
+    tool_call = kwargs.get("tool_call") or args[1]
+    tool_name = tool_call.get("name", "")
+    tool_args = tool_call.get("args", {})
+    
+    print("\n" + "─"*60)
+    print(f"🛠️  [LIVE TOOL CALL]: {tool_name}")
+    print(f"   Args: {tool_args}")
+    print("─"*60)
+    
+    # Execute the actual tool
+    tool_message = original_invoke_bound_tool(*args, **kwargs)
+    
+    # Truncate long tool responses (like large file reads) for clean terminal printing
+    content_preview = tool_message.content[:200].replace("\n", " ")
+    if len(tool_message.content) > 200:
+        content_preview += " ... [TRUNCATED]"
+        
+    print(f"✅ [LIVE TOOL RESULT]: {content_preview}")
+    print("─"*60 + "\n")
+    
+    return tool_message
+
+# Apply the patch
+remedy_agent._invoke_bound_tool = invoke_bound_tool_interceptor
 
 
 def test_react_phase5_graph():
@@ -77,7 +112,7 @@ def test_react_phase5_graph():
     # ---------------------------------------------------------
     issue_lodash_set = VulnerabilityIssue(
         id=str(uuid.uuid4()), issue_type=IssueType.SCA, source="odc",
-        file_path="package.json", package_name="lodash.set", cve_id=None, severity=Severity.HIGH
+        file_path="package.json", package_name="lodash.set", ghsa_id="GHSA-p6mc-m468-83gw", severity=Severity.HIGH
     )
     plan_lodash_set = FixPlan(
         status=FixPlanStatus.VERSION_FOUND, strategy_used="npm_registry", fixed_version="4.3.2",
@@ -86,7 +121,7 @@ def test_react_phase5_graph():
     )
     group_lodash_set = VulnerabilityGroup(
         group_id="sca:package.json:lodash.set:UPDATE", issue_type=IssueType.SCA, vulnerable_component="lodash.set",
-        file_path="package.json", cve_ids=[], sources=["odc"],
+        file_path="package.json", ghsa_ids=["GHSA-rpr9-rxv7-x643"], sources=["odc"],
         representative_issue_id=issue_lodash_set.id, issues=[issue_lodash_set], fix_plan=plan_lodash_set
     )
 
@@ -95,7 +130,7 @@ def test_react_phase5_graph():
     # ---------------------------------------------------------
     issue_sanitize = VulnerabilityIssue(
         id=str(uuid.uuid4()), issue_type=IssueType.SCA, source="odc",
-        file_path="package.json", package_name="sanitize-html", cve_id=None, severity=Severity.HIGH
+        file_path="package.json", package_name="sanitize-html", ghsa_id="GHSA-rpr9-rxv7-x643", severity=Severity.HIGH
     )
     plan_sanitize = FixPlan(
         status=FixPlanStatus.VERSION_FOUND, strategy_used="osv_api", fixed_version="1.4.3",
@@ -104,7 +139,7 @@ def test_react_phase5_graph():
     )
     group_sanitize = VulnerabilityGroup(
         group_id="sca:package.json:sanitize-html:UPDATE", issue_type=IssueType.SCA, vulnerable_component="sanitize-html",
-        file_path="package.json", cve_ids=[], sources=["odc"],
+        file_path="package.json", ghsa_ids=["GHSA-rpr9-rxv7-x643"], sources=["odc"],
         representative_issue_id=issue_sanitize.id, issues=[issue_sanitize], fix_plan=plan_sanitize
     )
 
@@ -112,12 +147,18 @@ def test_react_phase5_graph():
     # GRAPH EXECUTION
     # ---------------------------------------------------------
     print(f"\n▶️  INVOKING ORCHESTRATOR FOR {repo_root}")
+    print("   Providing 3 Vulnerability Groups:")
+    print("   1. lodash (transitive)")
+    print("   2. lodash.set (transitive)")
+    print("   3. sanitize-html (direct)")
+    print("   " + "-"*60)
     
     final_state = run_orchestrator(
         repo_root=repo_root,
         valid_groups=[group_lodash, group_lodash_set, group_sanitize]
     )
     
+    print("   " + "-"*60)
     print("\n✅ GRAPH EXECUTION COMPLETE")
 
     # ---------------------------------------------------------
@@ -137,28 +178,24 @@ def test_react_phase5_graph():
             print(f"   | {err}")
 
     # =========================================================
-    #🕵️‍♂️ INSPECT THE LLM's ReAct CONVERSATION
+    # 🕵️‍♂️ INSPECT THE LLM's ReAct CONVERSATION
     # =========================================================
     messages = final_state.get("messages", [])
     if messages:
-        print("\n   [💬 AGENT TRANSCRIPT (Tools & Actions)]")
+        print("\n   [💬 AGENT TRANSCRIPT (Summary of final history)]")
         print("   " + "-"*60)
         for msg in messages:
-            # LLM's Tool Calls or final text
             if isinstance(msg, AIMessage):
                 if msg.content:
                     print(f"   🤖 LLM: {msg.content}")
                 for tool_call in getattr(msg, "tool_calls", []):
-                    print(f"   🛠️  CALLING TOOL: {tool_call['name']}")
+                    print(f"   🛠️  TOOL INSTRUCTION: {tool_call['name']}")
                     print(f"       Args: {tool_call['args']}")
-            
-            # Python's Tool Responses
             elif isinstance(msg, ToolMessage):
-                # Truncate long tool outputs (like file reads) for console viewing
                 content_preview = msg.content[:200].replace("\n", " ")
                 if len(msg.content) > 200:
                     content_preview += " ... [TRUNCATED]"
-                print(f"   ✅ TOOL RESULT: {content_preview}")
+                print(f"   ✅ TOOL OUTCOME: {content_preview}")
         print("   " + "-"*60)
 
     # Inspect the final diff generated by teardown_node

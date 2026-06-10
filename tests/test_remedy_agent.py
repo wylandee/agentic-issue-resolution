@@ -4,11 +4,13 @@ tests/test_remedy_agent.py - Unit tests for the Phase 5 Remedy Agent tool loop.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.contracts.schemas import (
+    CommandResult,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -21,12 +23,18 @@ from src.orchestrator.remedy_agent import run_remedy_agent
 from src.orchestrator.state import initial_orchestrator_state
 
 
-def _sca_group(*, file_path: str | None = None, manifest_file: str | None = None) -> VulnerabilityGroup:
+def _sca_group(
+    *,
+    file_path: str | None = None,
+    manifest_file: str | None = None,
+    ghsa_id: str | None = None,
+) -> VulnerabilityGroup:
     issue = VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
         cve_id="CVE-2021-44228",
+        ghsa_id=ghsa_id,
         package_name="lodash",
         package_version="4.17.15",
         file_path=file_path,
@@ -48,6 +56,7 @@ def _sca_group(*, file_path: str | None = None, manifest_file: str | None = None
         vulnerable_component="lodash",
         file_path=file_path,
         cve_ids=["CVE-2021-44228"],
+        ghsa_ids=[ghsa_id] if ghsa_id else [],
         versions=["4.17.15"],
         sources=[IssueSource.ODC],
         representative_issue_id=issue.id,
@@ -74,6 +83,7 @@ def _sandbox_mock():
     sandbox = MagicMock()
     sandbox.__enter__ = MagicMock(return_value=sandbox)
     sandbox.__exit__ = MagicMock(return_value=None)
+    sandbox._workspace_volume = "agent_workspace_deadbeef"
     return sandbox
 
 
@@ -81,7 +91,9 @@ class TestRemedyAgentGuards:
     def test_missing_workspace_volume_returns_failed(self, tmp_path):
         group = _sca_group(manifest_file="package.json")
         (tmp_path / "package.json").write_text('"lodash": "^4.17.15"\n', encoding="utf-8")
+
         result = run_remedy_agent(initial_orchestrator_state(str(tmp_path), [group]))
+
         assert result["status"] == "remedy_failed"
         assert any("workspace_volume" in err for err in result["errors"])
 
@@ -97,25 +109,13 @@ class TestRemedyAgentGuards:
         assert result["status"] == "remedy_failed"
         assert any("absolute" in err.lower() for err in result["errors"])
 
-    def test_retry_limit_uses_install_failures_feedback(self, tmp_path):
-        (tmp_path / "package.json").write_text('"lodash": "^4.17.15"\n', encoding="utf-8")
-        group = _sca_group(manifest_file="package.json")
-        state = initial_orchestrator_state(str(tmp_path), [group])
-        state["workspace_volume"] = "agent_workspace_deadbeef"
-        state["install_failures"] = "npm install failed"
-        state["retry_count"] = 3
-        state["max_retries"] = 3
-
-        with patch("src.orchestrator.remedy_agent.ChatOpenAI") as mock_cls:
-            result = run_remedy_agent(state)
-
-        mock_cls.assert_not_called()
-        assert result["status"] == "max_retries_exceeded"
-
 
 class TestRemedyAgentToolLoop:
-    def test_successful_tool_loop_modifies_workspace_and_returns_new_messages(self, tmp_path):
-        (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"^4.17.15"}}\n', encoding="utf-8")
+    def test_successful_tool_loop_runs_validation_sequence(self, tmp_path):
+        (tmp_path / "package.json").write_text(
+            '{"dependencies":{"lodash":"^4.17.15"}}\n',
+            encoding="utf-8",
+        )
         group = _sca_group(manifest_file="package.json")
         state = initial_orchestrator_state(str(tmp_path), [group])
         state["workspace_volume"] = "agent_workspace_deadbeef"
@@ -148,26 +148,81 @@ class TestRemedyAgentToolLoop:
                     }
                 ],
             ),
+            AIMessage(
+                content="installing",
+                tool_calls=[
+                    {
+                        "name": "run_dependency_install",
+                        "args": {},
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="scanning",
+                tool_calls=[
+                    {
+                        "name": "run_security_scan",
+                        "args": {},
+                        "id": "call-4",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="testing",
+                tool_calls=[
+                    {
+                        "name": "run_unit_tests",
+                        "args": {},
+                        "id": "call-5",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
             AIMessage(content="done"),
         )
 
         sandbox = _sandbox_mock()
-        sandbox.read_file.side_effect = [
-            '{"dependencies":{"lodash":"^4.17.15"}}\n',
-            '{"dependencies":{"lodash":"^4.17.15"}}\n',
+
+        def _read_file(path: str) -> str:
+            if path == "package.json":
+                return '{"dependencies":{"lodash":"^4.17.15"}}\n'
+            if path == "dependency-check-report.json":
+                return json.dumps({"dependencies": []})
+            raise AssertionError(f"unexpected path: {path}")
+
+        sandbox.read_file.side_effect = _read_file
+        sandbox.run.side_effect = [
+            CommandResult(exit_code=0, stdout="installed", stderr="", duration_seconds=1.0),
+            CommandResult(exit_code=0, stdout="passing", stderr="", duration_seconds=2.0),
         ]
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = ""
+        proc.stderr = ""
 
         with patch("src.orchestrator.remedy_agent.ChatOpenAI", return_value=llm), patch(
             "src.orchestrator.remedy_agent.DockerSandbox",
             return_value=sandbox,
+        ), patch(
+            "src.orchestrator.remedy_tools.shutil.which",
+            return_value="docker",
+        ), patch(
+            "src.orchestrator.remedy_tools.subprocess.run",
+            return_value=proc,
         ):
             result = run_remedy_agent(state)
 
-        assert bound.invoke.call_count == 3
+        assert bound.invoke.call_count == 6
         sandbox.write_file.assert_called_once()
+        sandbox.run.assert_any_call("npm install --package-lock=true", timeout=600)
+        sandbox.run.assert_any_call("npm test", timeout=600)
         assert result["status"] == "edits_completed"
         assert result["changed_files"] == ["package.json"]
-        assert len(result["messages"]) == 7
+        assert len(result["messages"]) == 13
 
     def test_no_tool_calls_returns_no_changes_made(self, tmp_path):
         (tmp_path / "package.json").write_text('"lodash": "^4.17.15"\n', encoding="utf-8")
@@ -187,22 +242,42 @@ class TestRemedyAgentToolLoop:
         assert result["status"] == "no_changes_made"
         assert result["changed_files"] == []
 
-    def test_retry_feedback_increments_retry_count(self, tmp_path):
-        (tmp_path / "package.json").write_text('"lodash": "^4.17.15"\n', encoding="utf-8")
-        group = _sca_group(manifest_file="package.json")
+    def test_prompt_and_tool_factory_include_sequence_and_target_identifiers(self, tmp_path):
+        (tmp_path / "package.json").write_text(
+            '{"dependencies":{"lodash":"^4.17.15"}}\n',
+            encoding="utf-8",
+        )
+        group = _sca_group(
+            manifest_file="package.json",
+            ghsa_id="GHSA-VPQ2-C234-7XJ6",
+        )
         state = initial_orchestrator_state(str(tmp_path), [group])
         state["workspace_volume"] = "agent_workspace_deadbeef"
-        state["install_failures"] = "npm install failed"
-        state["retry_count"] = 1
 
-        llm, _bound = _mock_llm_with_responses(AIMessage(content="done"))
+        llm, bound = _mock_llm_with_responses(AIMessage(content="done"))
         sandbox = _sandbox_mock()
+        fake_tool = MagicMock()
+        fake_tool.name = "read_workspace_file"
+        fake_tool.invoke.return_value = "unused"
 
         with patch("src.orchestrator.remedy_agent.ChatOpenAI", return_value=llm), patch(
             "src.orchestrator.remedy_agent.DockerSandbox",
             return_value=sandbox,
-        ):
+        ), patch(
+            "src.orchestrator.remedy_agent.build_agent_tools",
+            return_value=[fake_tool],
+        ) as mock_build_tools:
             result = run_remedy_agent(state)
 
+        prompt_message = bound.invoke.call_args_list[0].args[0][-1]
+        prompt_text = prompt_message.content
+        assert "REQUIRED STEP-BY-STEP SEQUENCE" in prompt_text
+        assert "run_dependency_install" in prompt_text
+        assert "run_security_scan" in prompt_text
+        assert "run_unit_tests" in prompt_text
+        assert "Never introduce trailing commas in package.json." in prompt_text
+        assert "exactly 1 groups to fix" in prompt_text
+
+        build_args = mock_build_tools.call_args[0]
+        assert build_args[2] == {"CVE-2021-44228", "GHSA-VPQ2-C234-7XJ6"}
         assert result["status"] == "no_changes_made"
-        assert result["retry_count"] == 2

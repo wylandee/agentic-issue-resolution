@@ -3,9 +3,8 @@ editor_node.py - Phase 5 workspace builder node for the AppSec Orchestrator.
 
 This module keeps the historical filename ``editor_node.py`` for migration
 compatibility, but its Phase 5 responsibility is now only to prepare the shared
-Docker named volume workspace. File edits are performed later by the Remedy
-Agent via native tools, and dependency installation happens in
-``workspace_sync_node.py``.
+Docker named volume workspace. File edits and validation are performed later by
+the Remedy Agent via native tools.
 """
 
 from __future__ import annotations
