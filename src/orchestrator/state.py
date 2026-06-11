@@ -32,6 +32,7 @@ from src.contracts.schemas import (
     EditResult,
     FixPlan,
     LocalizedIssue,
+    SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -84,6 +85,9 @@ class OrchestratorState(TypedDict, total=False):
 
     repo_root: str
     valid_groups: List[VulnerabilityGroup]
+    
+    issues: List[VulnerabilityIssue]
+    system_context: SystemContext
 
     messages: Annotated[List[AnyMessage], add_messages]
     changed_files: Annotated[List[str], operator.add]
@@ -97,9 +101,11 @@ class OrchestratorState(TypedDict, total=False):
 def initial_orchestrator_state(
     repo_root: str,
     valid_groups: List[VulnerabilityGroup],
+    issues: Optional[List[VulnerabilityIssue]] = None,
+    system_context: Optional[SystemContext] = None,
 ) -> Dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
-    return {
+    state: Dict[str, Any] = {
         "repo_root": repo_root,
         "valid_groups": valid_groups,
         "messages": [],
@@ -108,3 +114,8 @@ def initial_orchestrator_state(
         "status": "pending",
         "errors": [],
     }
+    if issues is not None:
+        state["issues"] = issues
+    if system_context is not None:
+        state["system_context"] = system_context
+    return state

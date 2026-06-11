@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langgraph.graph import END, START, StateGraph
 
@@ -61,7 +61,9 @@ from src.contracts.schemas import (
     FixPlanStatus,
     IssueType,
     LocalizedIssue,
+    SystemContext,
     VulnerabilityGroup,
+    VulnerabilityIssue,
 )
 from src.orchestrator.editor_node import run_workspace_builder_node
 from src.orchestrator.edit_request_builder import build_edit_request
@@ -73,6 +75,7 @@ from src.orchestrator.state import (
 )
 from src.orchestrator.teardown_node import run_teardown_node
 from src.tools.edit_tools import apply_edit
+from src.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -339,6 +342,43 @@ def run_remediation(
 # Phase 5 routing
 # ---------------------------------------------------------------------------
 
+def triage_node(state: OrchestratorState) -> Dict[str, Any]:
+    """Run the Phase 4 triage pipeline."""
+    issues = state.get("issues")
+    system_context = state.get("system_context")
+    repo_root = state.get("repo_root")
+    
+    if not issues or not system_context:
+        log.info("triage_node: issues or system_context not found, skipping triage.")
+        return {"status": "triage_skipped"}
+        
+    log.info("triage_node: running triage on %d issues.", len(issues))
+    
+    try:
+        results = run_triage_pipeline(issues, system_context, repo_root)
+        valid_groups = [group for group, result in results if result.is_valid]
+        log.info("triage_node: produced %d valid groups.", len(valid_groups))
+        
+        if not valid_groups:
+            return {"valid_groups": [], "status": "triage_completed_no_work"}
+            
+        return {"valid_groups": valid_groups, "status": "triage_completed"}
+    except Exception as exc:
+        log.exception("triage_node: triage pipeline raised")
+        return {
+            "valid_groups": [],
+            "status": "failed",
+            "errors": [f"triage_node raised: {exc}"],
+        }
+
+def route_after_triage(state: OrchestratorState) -> str:
+    """Route Phase 5 flow after the triage node."""
+    status = state.get("status")
+    if status == "triage_completed_no_work":
+        return "teardown"
+    if status == "failed":
+        return "teardown"
+    return "workspace_builder"
 
 def route_after_workspace_builder(state: OrchestratorState) -> str:
     """Route Phase 5 flow after the workspace builder node."""
@@ -361,11 +401,13 @@ def build_orchestrator_graph():
     """Compile and return the Phase 5 orchestrator StateGraph."""
     workflow = StateGraph(OrchestratorState)
 
+    workflow.add_node("triage", triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
     workflow.add_node("remedy_agent", run_remedy_agent)
     workflow.add_node("teardown", run_teardown_node)
 
-    workflow.add_edge(START, "workspace_builder")
+    workflow.add_edge(START, "triage")
+    workflow.add_conditional_edges("triage", route_after_triage)
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
     workflow.add_conditional_edges("remedy_agent", route_after_remedy_agent)
     workflow.add_edge("teardown", END)
@@ -379,17 +421,21 @@ orchestrator_engine = build_orchestrator_graph()
 def run_orchestrator(
     repo_root: str,
     valid_groups: List[VulnerabilityGroup],
+    issues: Optional[List[VulnerabilityIssue]] = None,
+    system_context: Optional[SystemContext] = None,
 ) -> OrchestratorState:
     """Convenience entry point for the Phase 5 orchestrator graph."""
     initial_state = initial_orchestrator_state(
         repo_root=repo_root,
         valid_groups=valid_groups,
+        issues=issues,
+        system_context=system_context,
     )
     result: OrchestratorState = orchestrator_engine.invoke(initial_state)
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",
         repo_root,
-        len(valid_groups),
+        len(result.get("valid_groups", [])),
         result.get("status"),
     )
     return result
