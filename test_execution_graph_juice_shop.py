@@ -49,13 +49,12 @@ remedy_agent._build_prompt = prompt_interceptor
 
 
 # ============================================================================
-# 🪄 2. LIVE TOOL CALL INTERCEPTOR (NEW)
-# Prints each tool execution and its outcome LIVE as the LLM executes them
+# 🪄 2. LIVE TOOL CALL INTERCEPTOR (Updated with Conditional Truncation)
+# Prints file reads compactly, but outputs full test/scan stdout in real-time
 # ============================================================================
 original_invoke_bound_tool = remedy_agent._invoke_bound_tool
 
 def invoke_bound_tool_interceptor(*args, **kwargs):
-    # args[0] is tool_map, args[1] is tool_call dict
     tool_call = kwargs.get("tool_call") or args[1]
     tool_name = tool_call.get("name", "")
     tool_args = tool_call.get("args", {})
@@ -68,14 +67,19 @@ def invoke_bound_tool_interceptor(*args, **kwargs):
     # Execute the actual tool
     tool_message = original_invoke_bound_tool(*args, **kwargs)
     
-    # Truncate long tool responses (like large file reads) for clean terminal printing
-    content_preview = tool_message.content[:200].replace("\n", " ")
-    if len(tool_message.content) > 200:
-        content_preview += " ... [TRUNCATED]"
+    # 🎛️ CONDITIONAL TRUNCATION:
+    if tool_name == "read_workspace_file":
+        # Keep file reads short and single-line
+        content_preview = tool_message.content[:200].replace("\n", " ")
+        if len(tool_message.content) > 200:
+            content_preview += " ... [TRUNCATED]"
+        print(f"   ✅ [LIVE TOOL RESULT]: {content_preview}")
+    else:
+        # Print the FULL output (retaining newlines, stack traces, and formatting)
+        # for install, scan, and unit test tools
+        print(f"   ✅ [LIVE TOOL RESULT]:\n{tool_message.content}")
         
-    print(f"✅ [LIVE TOOL RESULT]: {content_preview}")
     print("─"*60 + "\n")
-    
     return tool_message
 
 # Apply the patch
@@ -112,7 +116,7 @@ def test_react_phase5_graph():
     # ---------------------------------------------------------
     issue_lodash_set = VulnerabilityIssue(
         id=str(uuid.uuid4()), issue_type=IssueType.SCA, source="odc",
-        file_path="package.json", package_name="lodash.set", ghsa_id="GHSA-p6mc-m468-83gw", severity=Severity.HIGH
+        file_path="package.json", package_name="lodash.set", cve_id=None, severity=Severity.HIGH
     )
     plan_lodash_set = FixPlan(
         status=FixPlanStatus.VERSION_FOUND, strategy_used="npm_registry", fixed_version="4.3.2",
@@ -121,7 +125,7 @@ def test_react_phase5_graph():
     )
     group_lodash_set = VulnerabilityGroup(
         group_id="sca:package.json:lodash.set:UPDATE", issue_type=IssueType.SCA, vulnerable_component="lodash.set",
-        file_path="package.json", ghsa_ids=["GHSA-rpr9-rxv7-x643"], sources=["odc"],
+        file_path="package.json", cve_ids=[], sources=["odc"],
         representative_issue_id=issue_lodash_set.id, issues=[issue_lodash_set], fix_plan=plan_lodash_set
     )
 
@@ -130,7 +134,7 @@ def test_react_phase5_graph():
     # ---------------------------------------------------------
     issue_sanitize = VulnerabilityIssue(
         id=str(uuid.uuid4()), issue_type=IssueType.SCA, source="odc",
-        file_path="package.json", package_name="sanitize-html", ghsa_id="GHSA-rpr9-rxv7-x643", severity=Severity.HIGH
+        file_path="package.json", package_name="sanitize-html", cve_id=None, severity=Severity.HIGH
     )
     plan_sanitize = FixPlan(
         status=FixPlanStatus.VERSION_FOUND, strategy_used="osv_api", fixed_version="1.4.3",
@@ -139,7 +143,7 @@ def test_react_phase5_graph():
     )
     group_sanitize = VulnerabilityGroup(
         group_id="sca:package.json:sanitize-html:UPDATE", issue_type=IssueType.SCA, vulnerable_component="sanitize-html",
-        file_path="package.json", ghsa_ids=["GHSA-rpr9-rxv7-x643"], sources=["odc"],
+        file_path="package.json", cve_ids=[], sources=["odc"],
         representative_issue_id=issue_sanitize.id, issues=[issue_sanitize], fix_plan=plan_sanitize
     )
 
@@ -178,24 +182,30 @@ def test_react_phase5_graph():
             print(f"   | {err}")
 
     # =========================================================
-    # 🕵️‍♂️ INSPECT THE LLM's ReAct CONVERSATION
+    # 🕵️‍♂️ INSPECT THE LLM's ReAct CONVERSATION (Conditional Truncation)
     # =========================================================
     messages = final_state.get("messages", [])
     if messages:
         print("\n   [💬 AGENT TRANSCRIPT (Summary of final history)]")
         print("   " + "-"*60)
         for msg in messages:
+            # LLM's Tool Calls or final text
             if isinstance(msg, AIMessage):
                 if msg.content:
                     print(f"   🤖 LLM: {msg.content}")
                 for tool_call in getattr(msg, "tool_calls", []):
                     print(f"   🛠️  TOOL INSTRUCTION: {tool_call['name']}")
                     print(f"       Args: {tool_call['args']}")
+            
+            # Python's Tool Responses (with conditional truncation)
             elif isinstance(msg, ToolMessage):
-                content_preview = msg.content[:200].replace("\n", " ")
-                if len(msg.content) > 200:
-                    content_preview += " ... [TRUNCATED]"
-                print(f"   ✅ TOOL OUTCOME: {content_preview}")
+                if msg.name == "read_workspace_file":
+                    content_preview = msg.content[:200].replace("\n", " ")
+                    if len(msg.content) > 200:
+                        content_preview += " ... [TRUNCATED]"
+                    print(f"   ✅ TOOL OUTCOME: {content_preview}")
+                else:
+                    print(f"   ✅ TOOL OUTCOME:\n{msg.content}")
         print("   " + "-"*60)
 
     # Inspect the final diff generated by teardown_node

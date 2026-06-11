@@ -151,7 +151,7 @@ def _build_prompt(
                 "Use your tools to inspect and edit files inside the shared Docker workspace.",
                 "You may only modify the repo-relative target files listed below.",
                 "Always read a file before editing it.",
-                "Use deterministic_search_replace for every change.",
+                "Use modify_npm_dependency to update package.json, and deterministic_search_replace for other source code files.",
                 "After each edit, read the file again to verify the result.",
                 (
                     f"You have been assigned exactly {len(resolved_groups)} groups to fix. "
@@ -166,11 +166,10 @@ def _build_prompt(
         "\n".join(
             [
                 "REQUIRED STEP-BY-STEP SEQUENCE",
-                "1. Inspect the assigned target files with read_workspace_file.",
-                "2. Edit only the assigned target files with deterministic_search_replace.",
-                "3. Run run_dependency_install after edits and before scanning or testing.",
-                "4. Run run_security_scan after dependency installation succeeds.",
-                "5. Run run_unit_tests after the security scan succeeds.",
+                "1. Inspect: Read the assigned target files with read_workspace_file.",
+                "2. Modify Manifest: Use modify_npm_dependency to apply dependency upgrades and overrides. Do not edit package.json using deterministic_search_replace.",
+                "3. Sync: Run run_dependency_install to synchronize the changes.",
+                "4. Scan & Test: Run run_security_scan and run_unit_tests to verify the fixes.",
             ]
         )
     )
@@ -183,6 +182,24 @@ def _build_prompt(
                 "Do not invent file contents; anchor every change to current workspace text.",
                 "Do not leave package.json or package-lock.json in invalid JSON state.",
                 "Never introduce trailing commas in package.json.",
+                "Never use highly generic single characters (like '}' or '{') as your old_text.",
+                "Always ensure your old_text contains unique, context-rich surrounding lines (at least 2-3 lines of context) so that the tool finds exactly one match.",
+                "MANIFEST UPGRADE RULES (package.json / package-lock.json):",
+                "  - You MUST NOT use deterministic_search_replace to modify package.json or package-lock.json.",
+                "  - deterministic_search_replace is reserved strictly for non-manifest files (such as JavaScript/TypeScript source code or configuration scripts).",
+                "  - Use modify_npm_dependency to modify manifests with the appropriate dependency_type:",
+                "    * To update a direct production dependency (like sanitize-html), set dependency_type to 'dependencies'.",
+                "    * To pin a transitive dependency (like lodash or lodash.set) via overrides, set dependency_type to 'overrides'.",
+            ]
+        )
+    )
+
+    sections.append(
+        "\n".join(
+            [
+                "REVERT AND RESCUE PROTOCOLS",
+                "If you encounter structural failures (like syntax parser crashes during package installation) or find yourself in a loop of consecutive failures, you must call revert_workspace_file to reset the file to its original host baseline state rather than trying to incrementally repair broken syntax.",
+                "Immediately after calling revert_workspace_file, you must call read_workspace_file to inspect the fresh baseline content before attempting any edits again.",
             ]
         )
     )
@@ -308,12 +325,12 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            tools = build_agent_tools(sandbox, touched_files, target_identifiers)
+            tools = build_agent_tools(sandbox, touched_files, target_identifiers, repo_root)
             tool_map = {tool.name: tool for tool in tools}
             llm_with_tools = llm.bind_tools(tools)
 
             for _ in range(_MAX_TOOL_CALL_ROUNDS):
-                response = llm_with_tools.invoke(conversation)
+                response = llm_with_tools.invoke(list(conversation))
                 new_messages.append(response)
                 conversation.append(response)
 

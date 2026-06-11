@@ -1,4 +1,4 @@
-    """
+"""
 Tests for src/tools/fix_planner.py
 
 All network calls are mocked — no live internet required.

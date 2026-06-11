@@ -122,6 +122,7 @@ def build_agent_tools(
     sandbox: DockerSandbox,
     touched_files: Set[str],
     target_cves: Set[str],
+    host_repo_root: Path,
 ) -> List:
     """
     Build the native LangChain tool set for the active workspace sandbox.
@@ -251,6 +252,77 @@ def build_agent_tools(
         return "SUCCESS: Dependency-Check found no remaining target vulnerability identifiers."
 
     @tool
+    def revert_workspace_file(file_path: str) -> str:
+        """
+        Discard all edits made to a workspace file and restore it to its original host baseline state.
+        Use this tool to resolve "blind alley" corruption loops (like invalid JSON formatting or syntax errors).
+        """
+        try:
+            rel_path = _validate_workspace_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        baseline_file = host_repo_root / rel_path
+        if not baseline_file.is_file():
+            return f"ERROR: Baseline file '{rel_path}' does not exist on host."
+
+        try:
+            content = baseline_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            return f"ERROR: Baseline file '{rel_path}' is unreadable: {exc}"
+
+        try:
+            sandbox.write_file(rel_path, content)
+        except Exception as exc:
+            return f"ERROR: Failed to overwrite file in sandbox '{rel_path}': {exc}"
+
+        if rel_path in touched_files:
+            touched_files.remove(rel_path)
+
+        return f"SUCCESS: Reverted workspace file '{rel_path}' to its baseline state."
+
+    @tool
+    def modify_npm_dependency(
+        package_name: str,
+        target_version: str,
+        dependency_type: str,
+    ) -> str:
+        """
+        Natively modify npm dependencies, devDependencies, or overrides in package.json using npm pkg set.
+        This ensures perfect JSON syntax and structural validity without manual text search/replace.
+        """
+        import re
+        import shlex
+
+        # Check package_name and target_version for safety (allow alphanumeric, dots, hyphens, slashes, and @)
+        safe_pattern = re.compile(r"^[a-zA-Z0-9.\-/@]+$")
+        if not safe_pattern.match(package_name):
+            return f"ERROR: Invalid package_name '{package_name}'. Only alphanumeric characters, dots, hyphens, slashes, and @ signs are allowed."
+        if not safe_pattern.match(target_version):
+            return f"ERROR: Invalid target_version '{target_version}'. Only alphanumeric characters, dots, hyphens, slashes, and @ signs are allowed."
+
+        # Verify dependency_type
+        if dependency_type not in ("dependencies", "devDependencies", "overrides"):
+            return "ERROR: dependency_type must be strictly one of: 'dependencies', 'devDependencies', or 'overrides'."
+
+        # Build and execute the command safely
+        args = ["npm", "pkg", "set", f"{dependency_type}[{package_name}]={target_version}"]
+        cmd_str = shlex.join(args)
+
+        logger.info("remedy_tools: modifying npm dependency in sandbox: %s", cmd_str)
+        result = sandbox.run(cmd_str)
+
+        if result.exit_code == 0:
+            touched_files.add("package.json")
+            return f"SUCCESS: Natively updated {dependency_type}.{package_name} to {target_version} in package.json."
+        else:
+            return (
+                f"FAILURE: Failed to modify npm dependency (exit {result.exit_code}).\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    @tool
     def run_unit_tests() -> str:
         """Runs npm test inside the workspace to verify functionality."""
         result = sandbox.run("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
@@ -265,6 +337,8 @@ def build_agent_tools(
     return [
         read_workspace_file,
         deterministic_search_replace,
+        revert_workspace_file,
+        modify_npm_dependency,
         run_dependency_install,
         run_security_scan,
         run_unit_tests,

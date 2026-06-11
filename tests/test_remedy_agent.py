@@ -5,6 +5,7 @@ tests/test_remedy_agent.py - Unit tests for the Phase 5 Remedy Agent tool loop.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -277,7 +278,10 @@ class TestRemedyAgentToolLoop:
         assert "run_unit_tests" in prompt_text
         assert "Never introduce trailing commas in package.json." in prompt_text
         assert "exactly 1 groups to fix" in prompt_text
+        assert "modify_npm_dependency" in prompt_text
+        assert "deterministic_search_replace" in prompt_text
 
         build_args = mock_build_tools.call_args[0]
         assert build_args[2] == {"CVE-2021-44228", "GHSA-VPQ2-C234-7XJ6"}
+        assert build_args[3] == Path(str(tmp_path))
         assert result["status"] == "no_changes_made"
