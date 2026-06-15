@@ -25,6 +25,12 @@ _ODC_TIMEOUT_SECONDS = 300
 _ODC_REPORT_NAME = "dependency-check-report.json"
 _ODC_CACHE_VOLUME = "odc-cache"
 
+# Exploration tool limits
+_REPO_MAP_MAX_ENTRIES = 400       # max lines in read_repository_map output
+_SEARCH_MAX_BYTES = 32_768        # 32 KB output cap on search_codebase_pattern
+_SEARCH_TIMEOUT_SECONDS = 15      # per-grep timeout
+_INSPECT_TEXT_MAX_CHARS = 8_000   # character cap on inspect_ast_symbol node text
+
 
 def _validate_workspace_path(file_path: str) -> str:
     candidate = (file_path or "").strip()
@@ -334,6 +340,183 @@ def build_agent_tools(
             f"stderr:\n{result.stderr}"
         )
 
+    # ------------------------------------------------------------------
+    # Read-only codebase exploration tools
+    # ------------------------------------------------------------------
+
+    @tool
+    def read_repository_map() -> str:
+        """Return a deterministic ASCII tree of every file/directory in the workspace.
+
+        Use this as your FIRST action to understand repository structure before
+        searching for specific files or symbols. Output is capped at
+        400 entries to stay context-sized.
+        """
+        script = (
+            "find /workspace -not -path '*/node_modules/*' "
+            "-not -path '*/.git/*' "
+            "-not -name '*.map' "
+            "| sort"
+        )
+        result = sandbox.run(script, timeout=10)
+        if result.exit_code != 0:
+            return f"ERROR: Could not list workspace: {result.stderr.strip()}"
+
+        lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return "(workspace is empty)"
+
+        capped = lines[:_REPO_MAP_MAX_ENTRIES]
+        truncated = len(lines) > _REPO_MAP_MAX_ENTRIES
+        output = "\n".join(capped)
+        if truncated:
+            output += f"\n... (truncated, {len(lines) - _REPO_MAP_MAX_ENTRIES} more entries)"
+        return output
+
+    @tool
+    def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
+        """Lexical search for an extended-regex pattern across workspace files.
+
+        Args:
+            search_pattern: Extended regex (ERE) to search for. Must not be empty.
+            target_directory: Repo-relative subdirectory to search within.
+                              Defaults to "." (entire workspace). Must not be
+                              absolute or traverse outside the workspace.
+
+        Returns matched lines with file:line format, capped at 32 KB. Use this
+        to locate which file defines a symbol before calling inspect_ast_symbol,
+        or to verify a pattern appears after an edit.
+
+        Prefer inspect_ast_symbol over read_workspace_file for large source files.
+        """
+        if not search_pattern or not search_pattern.strip():
+            return "ERROR: search_pattern is required."
+
+        # Validate target_directory
+        td = (target_directory or ".").strip()
+        if td != ".":
+            try:
+                _validate_workspace_path(td)
+            except ValueError as exc:
+                return f"ERROR: {exc}"
+
+        # Build the grep command inside the sandbox (node:22, has grep with -E)
+        # Use single-quoted pattern passed via sh -c to avoid shell expansion issues.
+        safe_pattern = search_pattern.replace("'", "'\"'\"'")
+        search_root = f"/workspace/{td}" if td != "." else "/workspace"
+        cmd = (
+            f"grep -RInE "
+            f"--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
+            f"--include='*.mjs' --include='*.cjs' --include='*.json' "
+            f"--exclude-dir=node_modules --exclude-dir=.git "
+            f"-- '{safe_pattern}' '{search_root}'"
+        )
+
+        try:
+            result = sandbox.run(cmd, timeout=_SEARCH_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: search failed: {exc}"
+
+        if result.exit_code == 1 and not result.stdout.strip():
+            # grep exit 1 = no matches
+            return f"NO MATCH: Pattern '{search_pattern}' not found in '{td}'."
+
+        if result.exit_code not in (0, 1):
+            return (
+            f"ERROR: grep exited {result.exit_code}.\n"
+            f"stderr: {result.stderr.strip()[:500]}"
+        )
+
+        output = result.stdout
+        if len(output.encode()) > _SEARCH_MAX_BYTES:
+            # Truncate to byte budget and mark
+            truncated_output = output.encode()[:_SEARCH_MAX_BYTES].decode(errors="replace")
+            # Trim to last complete line
+            last_nl = truncated_output.rfind("\n")
+            truncated_output = truncated_output[:last_nl] if last_nl != -1 else truncated_output
+            output = truncated_output + "\n... (output truncated at 32 KB)"
+
+        return output.strip() or f"NO MATCH: Pattern '{search_pattern}' not found in '{td}'."
+
+    @tool
+    def inspect_ast_symbol(
+        file_path: str,
+        symbol_name: str,
+        line_hint: int = 0,
+    ) -> str:
+        """Extract the full source text of a named function, class, or method from a workspace file.
+
+        Prefer this over read_workspace_file when you need to inspect a specific
+        symbol in a large source file; it avoids loading the entire file into
+        context.
+
+        Args:
+            file_path: Repo-relative path to the source file (JS/TS only).
+            symbol_name: Exact name of the symbol to inspect (case-sensitive).
+            line_hint: Optional 1-indexed line number near the symbol. Used to
+                       disambiguate when the name appears multiple times.
+                       Pass 0 to omit.
+
+        Returns a structured report with the symbol's line range and source text,
+        or an ERROR string if the file cannot be read / parsed / found.
+        """
+        try:
+            rel_path = _validate_workspace_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        content = sandbox.read_file(rel_path)
+        if content is None:
+            return f"ERROR: Could not read '{rel_path}'. Verify the path exists."
+
+        try:
+            from src.tools.code_map import (
+                find_named_symbol,
+                language_for_path,
+                parse_source,
+            )
+        except ImportError:
+            return "ERROR: code_map module is unavailable."
+
+        lang = language_for_path(rel_path)
+        if lang is None:
+            return (
+                f"ERROR: No AST parser available for '{rel_path}'. "
+                "Only JS/TS files (.js, .jsx, .ts, .tsx, .mjs, .cjs) are supported."
+            )
+
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = parse_source(source_bytes, lang)
+        if tree is None:
+            return "ERROR: tree-sitter is unavailable; cannot parse AST."
+
+        hint = int(line_hint) if line_hint else None
+        try:
+            result = find_named_symbol(tree.root_node, symbol_name, source_bytes, line_hint=hint)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        except RuntimeError as exc:
+            return f"ERROR: {exc}"
+
+        if result is None:
+            return (
+                f"NOT FOUND: Symbol '{symbol_name}' not found in '{rel_path}'. "
+                "Use search_codebase_pattern to locate the correct file."
+            )
+
+        node_text = result["text"]
+        if len(node_text) > _INSPECT_TEXT_MAX_CHARS:
+            node_text = node_text[:_INSPECT_TEXT_MAX_CHARS] + "\n... (truncated)"
+
+        return (
+            f"SYMBOL: {result['symbol_name']}\n"
+            f"TYPE  : {result['node_type']}\n"
+            f"LINES : {result['start_line']}-{result['end_line']}\n"
+            f"FILE  : {rel_path}\n"
+            f"---\n"
+            f"{node_text}"
+        )
+
     return [
         read_workspace_file,
         deterministic_search_replace,
@@ -342,4 +525,7 @@ def build_agent_tools(
         run_dependency_install,
         run_security_scan,
         run_unit_tests,
+        read_repository_map,
+        search_codebase_pattern,
+        inspect_ast_symbol,
     ]

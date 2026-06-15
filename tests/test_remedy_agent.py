@@ -280,6 +280,14 @@ class TestRemedyAgentToolLoop:
         assert "exactly 1 groups to fix" in prompt_text
         assert "modify_npm_dependency" in prompt_text
         assert "deterministic_search_replace" in prompt_text
+        # Verify the codebase exploration funnel section is present
+        assert "CODEBASE EXPLORATION FUNNEL" in prompt_text
+        assert "read_repository_map" in prompt_text
+        assert "search_codebase_pattern" in prompt_text
+        assert "inspect_ast_symbol" in prompt_text
+        # Step numbers updated
+        assert "1. Map" in prompt_text
+        assert "2. Inspect" in prompt_text
 
         build_args = mock_build_tools.call_args[0]
         assert build_args[2] == {"CVE-2021-44228", "GHSA-VPQ2-C234-7XJ6"}

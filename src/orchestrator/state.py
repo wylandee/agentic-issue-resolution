@@ -95,6 +95,7 @@ class OrchestratorState(TypedDict, total=False):
     workspace_volume: Optional[str]
 
     status: str
+    diff: str
     errors: Annotated[List[str], operator.add]
 
 
@@ -112,6 +113,7 @@ def initial_orchestrator_state(
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
+        "diff": "",
         "errors": [],
     }
     if issues is not None:

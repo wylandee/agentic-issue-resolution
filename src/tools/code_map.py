@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -256,6 +256,111 @@ def find_enclosing_symbol(
                 best_size = node_size
 
     return best_name, best_type
+
+
+# Node types that are directly searchable by name in `find_named_symbol`.
+_NAMED_TYPES: Tuple[str, ...] = (
+    "function_declaration",
+    "function_expression",
+    "generator_function_declaration",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+    "class_declaration",
+    "class_expression",
+)
+
+
+def find_named_symbol(
+    root: "Node",  # type: ignore[name-defined]
+    symbol_name: str,
+    source_bytes: bytes,
+    *,
+    line_hint: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Find an AST node whose resolved name exactly matches *symbol_name*.
+
+    Args:
+        root: The ``tree_sitter.Node`` root of the parsed tree.
+        symbol_name: Exact name to search for (case-sensitive).
+        source_bytes: Raw source bytes — used to extract node text.
+        line_hint: 1-indexed line number. When multiple candidates are found
+            this is used to select the one whose range encloses or is nearest
+            to *line_hint*.
+
+    Returns:
+        A ``dict`` with keys:
+
+        - ``symbol_name`` (str) — matched name
+        - ``node_type`` (str) — tree-sitter node type string
+        - ``start_line`` (int) — 1-indexed
+        - ``end_line`` (int)   — 1-indexed
+        - ``text`` (str)       — raw node text (may be truncated in the caller)
+
+        Returns ``None`` when no match is found.
+        Raises ``ValueError`` on ambiguous matches that cannot be resolved
+        by *line_hint*.
+    """
+    if not _TREE_SITTER_AVAILABLE:
+        raise RuntimeError("tree-sitter is unavailable.")
+
+    candidates: List[Dict[str, Any]] = []
+
+    stack = list(root.children)
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children)
+
+        if node.type not in _NAMED_TYPES:
+            continue
+
+        name = _extract_node_name(node)
+        if name != symbol_name:
+            continue
+
+        raw = node.text
+        node_text = (
+            raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
+        )
+        candidates.append(
+            {
+                "symbol_name": name,
+                "node_type": node.type,
+                "start_line": node.start_point[0] + 1,  # 1-indexed
+                "end_line": node.end_point[0] + 1,      # 1-indexed
+                "text": node_text,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Multiple exact name matches — try to resolve by line_hint.
+    if line_hint is not None:
+        # Prefer a candidate whose range encloses the hint line.
+        enclosing = [
+            c for c in candidates if c["start_line"] <= line_hint <= c["end_line"]
+        ]
+        if len(enclosing) == 1:
+            return enclosing[0]
+        if len(enclosing) > 1:
+            # Among enclosing, prefer the innermost (smallest range).
+            return min(enclosing, key=lambda c: c["end_line"] - c["start_line"])
+
+        # No enclosing match — pick the nearest by start_line.
+        return min(candidates, key=lambda c: abs(c["start_line"] - line_hint))
+
+    # Unresolvable ambiguity: surface deterministic error with all ranges.
+    ranges = ", ".join(
+        f"L{c['start_line']}-{c['end_line']}" for c in sorted(candidates, key=lambda c: c["start_line"])
+    )
+    raise ValueError(
+        f"Ambiguous symbol '{symbol_name}': found {len(candidates)} definitions at "
+        f"{ranges}. Provide line_hint to disambiguate."
+    )
 
 
 def extract_imports(root: "Node", source_bytes: bytes) -> List[str]:  # type: ignore[name-defined]

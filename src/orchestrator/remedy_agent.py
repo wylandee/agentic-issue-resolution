@@ -166,10 +166,30 @@ def _build_prompt(
         "\n".join(
             [
                 "REQUIRED STEP-BY-STEP SEQUENCE",
-                "1. Inspect: Read the assigned target files with read_workspace_file.",
-                "2. Modify Manifest: Use modify_npm_dependency to apply dependency upgrades and overrides. Do not edit package.json using deterministic_search_replace.",
-                "3. Sync: Run run_dependency_install to synchronize the changes.",
-                "4. Scan & Test: Run run_security_scan and run_unit_tests to verify the fixes.",
+                "1. Map: Call read_repository_map to understand the workspace layout.",
+                "2. Inspect: Read the assigned target files with read_workspace_file (or inspect_ast_symbol for large files).",
+                "3. Modify Manifest: Use modify_npm_dependency to apply dependency upgrades and overrides. Do not edit package.json using deterministic_search_replace.",
+                "4. Sync: Run run_dependency_install to synchronize the changes.",
+                "5. Scan & Test: Run run_security_scan and run_unit_tests to verify the fixes.",
+            ]
+        )
+    )
+
+    sections.append(
+        "\n".join(
+            [
+                "CODEBASE EXPLORATION FUNNEL",
+                "When you need to locate or understand code before editing, follow this funnel:",
+                "  Step 1 — MAP   : Call read_repository_map (no args) to get the full workspace tree.",
+                "  Step 2 — SEARCH: Call search_codebase_pattern(search_pattern, target_directory) with an",
+                "                   ERE pattern to pinpoint the relevant file(s) and line numbers.",
+                "  Step 3 — INSPECT: Call inspect_ast_symbol(file_path, symbol_name, line_hint) to extract",
+                "                    the exact function/class body without loading the whole file.",
+                "Always prefer inspect_ast_symbol over read_workspace_file when working with large source",
+                "files (>200 lines). Only call read_workspace_file when you need the full file or the",
+                "target file is very small.",
+                "Never call search_codebase_pattern with an empty pattern.",
+                "Never call inspect_ast_symbol on non-JS/TS files.",
             ]
         )
     )

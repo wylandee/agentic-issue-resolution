@@ -39,6 +39,9 @@ class TestFactory:
             "run_dependency_install",
             "run_security_scan",
             "run_unit_tests",
+            "read_repository_map",
+            "search_codebase_pattern",
+            "inspect_ast_symbol",
         }
 
 
@@ -429,3 +432,225 @@ class TestRunUnitTests:
         assert result.startswith("FAILURE:")
         assert "AssertionError" in result
         assert "failing output" in result
+
+
+class TestReadRepositoryMap:
+    def test_returns_file_listing(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="/workspace/package.json\n/workspace/src/index.ts\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["read_repository_map"].invoke({})
+
+        assert "/workspace/package.json" in result
+        assert "/workspace/src/index.ts" in result
+        sandbox.run.assert_called_once()
+        call_cmd = sandbox.run.call_args[0][0]
+        assert "find /workspace" in call_cmd
+        assert "node_modules" in call_cmd
+
+    def test_caps_at_max_entries(self):
+        sandbox = MagicMock()
+        big_output = "\n".join(f"/workspace/file{i}.ts" for i in range(450))
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout=big_output,
+            stderr="",
+            duration_seconds=0.2,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["read_repository_map"].invoke({})
+
+        assert "truncated" in result
+        assert "50 more entries" in result
+
+    def test_error_from_sandbox_returns_error(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr="permission denied",
+            duration_seconds=0.0,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["read_repository_map"].invoke({})
+
+        assert "ERROR:" in result
+        assert "permission denied" in result
+
+    def test_empty_workspace_returns_placeholder(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.0,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["read_repository_map"].invoke({})
+
+        assert "empty" in result
+
+
+class TestSearchCodebasePattern:
+    def test_basic_match_returns_grep_output(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="/workspace/src/index.ts:10:const sanitizeHtml = require('sanitize-html');\n",
+            stderr="",
+            duration_seconds=0.3,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke(
+            {"search_pattern": "sanitizeHtml", "target_directory": "."}
+        )
+
+        assert "sanitizeHtml" in result
+        sandbox.run.assert_called_once()
+        cmd_called = sandbox.run.call_args[0][0]
+        assert "grep -RInE" in cmd_called
+        assert "sanitizeHtml" in cmd_called
+
+    def test_empty_pattern_returns_error(self):
+        sandbox = MagicMock()
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke(
+            {"search_pattern": "", "target_directory": "."}
+        )
+
+        assert "ERROR: search_pattern is required" in result
+        sandbox.run.assert_not_called()
+
+    def test_no_match_returns_no_match(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke(
+            {"search_pattern": "nonExistentSymbol"}
+        )
+
+        assert "NO MATCH" in result
+
+    def test_absolute_target_directory_rejected(self):
+        sandbox = MagicMock()
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke(
+            {"search_pattern": "foo", "target_directory": "/etc"}
+        )
+
+        assert "ERROR:" in result
+        sandbox.run.assert_not_called()
+
+    def test_output_truncated_at_32kb(self):
+        sandbox = MagicMock()
+        # Generate a big output string (>32 KB)
+        big_line = "x" * 100 + "\n"
+        big_output = big_line * 400  # ~40 KB
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout=big_output,
+            stderr="",
+            duration_seconds=0.5,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke({"search_pattern": "x"})
+
+        assert "truncated at 32 KB" in result
+        assert len(result.encode()) < 40_000  # well under 40 KB
+
+    def test_grep_error_returns_error(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=2,
+            stdout="",
+            stderr="grep: bad regex",
+            duration_seconds=0.1,
+        )
+        tools = _tool_map(sandbox)
+
+        result = tools["search_codebase_pattern"].invoke({"search_pattern": "[bad"})
+
+        assert "ERROR:" in result
+
+
+class TestInspectAstSymbol:
+    def test_absolute_path_rejected(self):
+        sandbox = MagicMock()
+        tools = _tool_map(sandbox)
+
+        result = tools["inspect_ast_symbol"].invoke(
+            {"file_path": "/etc/passwd", "symbol_name": "foo"}
+        )
+
+        assert "ERROR:" in result
+        assert "absolute" in result.lower()
+
+    def test_missing_file_returns_error(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = None
+        tools = _tool_map(sandbox)
+
+        result = tools["inspect_ast_symbol"].invoke(
+            {"file_path": "src/app.ts", "symbol_name": "myFn"}
+        )
+
+        assert "ERROR:" in result
+
+    def test_non_js_ts_file_returns_error(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "x = 1"
+        tools = _tool_map(sandbox)
+
+        result = tools["inspect_ast_symbol"].invoke(
+            {"file_path": "readme.md", "symbol_name": "myFn"}
+        )
+
+        assert "ERROR:" in result
+        assert "No AST parser available" in result
+
+    def test_symbol_not_found_returns_not_found(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "const x = 1;\n"
+        tools = _tool_map(sandbox)
+
+        result = tools["inspect_ast_symbol"].invoke(
+            {"file_path": "src/index.js", "symbol_name": "nonExistentFn"}
+        )
+
+        # Without tree-sitter this errors; with it, returns NOT FOUND or ERROR.
+        assert "NOT FOUND" in result or "ERROR" in result
+
+    def test_tree_sitter_unavailable_returns_error(self):
+        """Simulate tree-sitter being unavailable by patching parse_source to None."""
+        from unittest.mock import patch as _patch
+
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "function foo() { return 1; }\n"
+        tools = _tool_map(sandbox)
+
+        with _patch("src.tools.code_map.parse_source", return_value=None), \
+             _patch("src.tools.code_map.language_for_path", return_value=object()):
+            result = tools["inspect_ast_symbol"].invoke(
+                {"file_path": "src/index.js", "symbol_name": "foo"}
+            )
+
+        assert "ERROR" in result
