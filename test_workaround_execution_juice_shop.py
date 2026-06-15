@@ -101,7 +101,7 @@ def test_react_phase5_workaround_graph():
         id=str(uuid.uuid4()), 
         issue_type=IssueType.SCA, 
         source=IssueSource.ODC,
-        file_path="routes/verify.ts", 
+        file_path="package.json", 
         package_name="jsonwebtoken", 
         cve_id="CVE-2015-9235", 
         severity=Severity.HIGH
@@ -110,14 +110,14 @@ def test_react_phase5_workaround_graph():
         status=FixPlanStatus.WORKAROUND_FOUND, 
         strategy_used="serper", 
         fixed_version=None,
-        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability. Modify routes/verify.ts to explicitly specify algorithms: ["RS256"] when verifying JWTs to prevent algorithm confusion attacks.',
+        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability.',
         workaround_snippets=['jwt.verify(token, publicKey, { algorithms: ["RS256"] }, callback)']
     )
     group_jwt = VulnerabilityGroup(
-        group_id="sca:routes/verify.ts:jsonwebtoken:WORKAROUND", 
+        group_id="sca:package.json:jsonwebtoken:WORKAROUND", 
         issue_type=IssueType.SCA, 
         vulnerable_component="jsonwebtoken",
-        file_path="routes/verify.ts", 
+        file_path="package.json", 
         cve_ids=["CVE-2015-9235"], 
         sources=[IssueSource.ODC],
         representative_issue_id=issue_jwt.id, 
@@ -132,7 +132,7 @@ def test_react_phase5_workaround_graph():
         id=str(uuid.uuid4()), 
         issue_type=IssueType.SCA, 
         source=IssueSource.ODC,
-        file_path="lib/insecurity.ts", 
+        file_path="package.json", 
         package_name="express-jwt", 
         cve_id="CVE-2020-15084", 
         severity=Severity.CRITICAL
@@ -141,14 +141,14 @@ def test_react_phase5_workaround_graph():
         status=FixPlanStatus.WORKAROUND_FOUND, 
         strategy_used="serper", 
         fixed_version=None,
-        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability. In lib/insecurity.ts, update the expressJwt options to explicitly enforce algorithms (e.g. ["RS256"]).',
+        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability.',
         workaround_snippets=['expressJwt({ secret: publicKey, algorithms: ["RS256"] })']
     )
     group_express_jwt = VulnerabilityGroup(
-        group_id="sca:lib/insecurity.ts:express-jwt:WORKAROUND", 
+        group_id="sca:package.json:express-jwt:WORKAROUND", 
         issue_type=IssueType.SCA, 
         vulnerable_component="express-jwt",
-        file_path="lib/insecurity.ts", 
+        file_path="package.json", 
         cve_ids=["CVE-2020-15084"], 
         sources=[IssueSource.ODC],
         representative_issue_id=issue_express_jwt.id, 
@@ -163,7 +163,7 @@ def test_react_phase5_workaround_graph():
         id=str(uuid.uuid4()), 
         issue_type=IssueType.SCA, 
         source=IssueSource.ODC,
-        file_path="lib/insecurity.ts", 
+        file_path="package.json", 
         package_name="sanitize-html", 
         cve_id="CVE-2021-23424", 
         severity=Severity.HIGH
@@ -172,14 +172,14 @@ def test_react_phase5_workaround_graph():
         status=FixPlanStatus.WORKAROUND_FOUND, 
         strategy_used="serper", 
         fixed_version=None,
-        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability. In lib/insecurity.ts, supply custom options (such as disabling allowedTags and allowedAttributes) to sanitizeHtmlLib to avoid sanitization bypass.',
+        instruction='Analyze the provided workaround_snippets to determine if a code edit can safely mitigate this vulnerability.',
         workaround_snippets=['sanitizeHtml(html, { allowedTags: [], allowedAttributes: {} })']
     )
     group_sanitize = VulnerabilityGroup(
-        group_id="sca:lib/insecurity.ts:sanitize-html:WORKAROUND", 
+        group_id="sca:package.json:sanitize-html:WORKAROUND", 
         issue_type=IssueType.SCA, 
         vulnerable_component="sanitize-html",
-        file_path="lib/insecurity.ts", 
+        file_path="package.json", 
         cve_ids=["CVE-2021-23424"], 
         sources=[IssueSource.ODC],
         representative_issue_id=issue_sanitize.id, 

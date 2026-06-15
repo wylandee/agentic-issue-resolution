@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-from src.contracts.schemas import IssueType, VulnerabilityGroup
+from src.contracts.schemas import IssueType, VulnerabilityGroup, FixPlanStatus
 from src.orchestrator.remedy_tools import build_agent_tools
 from src.orchestrator.state import OrchestratorState
 from src.runtime.sandbox_mgr import DockerSandbox
@@ -144,23 +144,35 @@ def _build_prompt(
     repo_root: str,
 ) -> str:
     """Assemble the full prompt for the tool-using Remedy Agent."""
-    sections: List[str] = [
-        "\n".join(
-            [
-                "You are an autonomous application security engineer.",
-                "Use your tools to inspect and edit files inside the shared Docker workspace.",
-                "You may only modify the repo-relative target files listed below.",
-                "Always read a file before editing it.",
-                "Use modify_npm_dependency to update package.json, and deterministic_search_replace for other source code files.",
-                "After each edit, read the file again to verify the result.",
-                (
-                    f"You have been assigned exactly {len(resolved_groups)} groups to fix. "
-                    "When and only when all tools report SUCCESS, stop calling tools and "
-                    "return a concise summary."
-                ),
-            ]
-        )
+    has_workaround = any(
+        group.fix_plan and group.fix_plan.status == FixPlanStatus.WORKAROUND_FOUND
+        for group, _ in resolved_groups
+    )
+
+    first_section = [
+        "You are an autonomous application security engineer.",
+        "Use your tools to inspect and edit files inside the shared Docker workspace.",
     ]
+    if has_workaround:
+        first_section.extend([
+            "For version upgrades (strategy: version_found), you may only modify the manifest files (e.g. package.json).",
+            "For workarounds (strategy: workaround_found), you must first find where the vulnerable component is imported/used in the codebase (using search_codebase_pattern), and you are allowed to edit any source code files necessary to apply the workaround. Prioritize making minimal edits.",
+        ])
+    else:
+        first_section.append("You may only modify the repo-relative target files listed below.")
+
+    first_section.extend([
+        "Always read a file before editing it.",
+        "Use modify_npm_dependency to update package.json, and deterministic_search_replace for other source code files.",
+        "After each edit, read the file again to verify the result.",
+        (
+            f"You have been assigned exactly {len(resolved_groups)} groups to fix. "
+            "When and only when all tools report SUCCESS, stop calling tools and "
+            "return a concise summary."
+        ),
+    ])
+
+    sections: List[str] = ["\n".join(first_section)]
 
     sections.append(
         "\n".join(
@@ -194,11 +206,15 @@ def _build_prompt(
         )
     )
 
+    safety_rule = (
+        "Never edit files outside the allowed target files list." if not has_workaround else
+        "For non-workaround fixes, never edit files outside the allowed target files list. For workaround fixes, you may edit any source files that import/use the vulnerable component, but you must not edit unrelated files."
+    )
     sections.append(
         "\n".join(
             [
                 "CRITICAL SAFETY RULES",
-                "Never edit files outside the allowed target files list.",
+                safety_rule,
                 "Do not invent file contents; anchor every change to current workspace text.",
                 "Do not leave package.json or package-lock.json in invalid JSON state.",
                 "Never introduce trailing commas in package.json.",
@@ -217,6 +233,17 @@ def _build_prompt(
     sections.append(
         "\n".join(
             [
+                "WORKAROUND & SCANNER OVERRIDE RULES",
+                "If a Vulnerability Group is assigned the strategy 'WORKAROUND', you are mitigating the risk via application source code logic, NOT by upgrading the package version.",
+                "Therefore, run_security_scan will still flag these specific Workaround CVEs/GHSAs as present. This is an EXPECTED FALSE POSITIVE.",
+                "If the only vulnerabilities remaining in the security scan belong to WORKAROUND groups, you MUST evaluate the scan as a SUCCESS, do not revert, and finish your task.",
+            ]
+        )
+    )
+
+    sections.append(
+        "\n".join(
+            [
                 "REVERT AND RESCUE PROTOCOLS",
                 "If you encounter structural failures (like syntax parser crashes during package installation) or find yourself in a loop of consecutive failures, you must call revert_workspace_file to reset the file to its original host baseline state rather than trying to incrementally repair broken syntax.",
                 "Immediately after calling revert_workspace_file, you must call read_workspace_file to inspect the fresh baseline content before attempting any edits again.",
@@ -225,8 +252,12 @@ def _build_prompt(
     )
 
     sections.append(f"repo_root (host reference only): {repo_root}")
+    target_files_label = (
+        "Allowed target files (for version upgrades or initial reference):" if has_workaround else
+        "Allowed target files:"
+    )
     sections.append(
-        "Allowed target files:\n" + "\n".join(
+        f"{target_files_label}\n" + "\n".join(
             f"- {rel_path}" for _, rel_path in resolved_groups
         )
     )
@@ -333,12 +364,26 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
         repo_root=repo_root_str,
     )
 
-    system_message = SystemMessage(
-        content=(
+    has_workaround = any(
+        group.fix_plan and group.fix_plan.status == FixPlanStatus.WORKAROUND_FOUND
+        for group, _ in resolved_groups
+    )
+
+    if has_workaround:
+        system_content = (
+            "You must use tools for file inspection, edits, and validation. "
+            "For workaround fixes, you may search the codebase using search_codebase_pattern "
+            "to find where the vulnerable component is imported/used, and you are allowed to "
+            "modify any source files that import or interact with that component. "
+            "For non-workaround fixes, only modify the allowed target files. Never invent file contents."
+        )
+    else:
+        system_content = (
             "You must use tools for file inspection, edits, and validation. Only "
             "modify the allowed target files. Never invent file contents."
         )
-    )
+
+    system_message = SystemMessage(content=system_content)
     human_message = HumanMessage(content=prompt)
     new_messages.extend([system_message, human_message])
     conversation.extend([system_message, human_message])
