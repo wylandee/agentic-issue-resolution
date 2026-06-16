@@ -20,7 +20,7 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.remedy_agent import run_remedy_agent
+from src.orchestrator.remedy_agent import _build_prompt, run_remedy_agent
 from src.orchestrator.state import initial_orchestrator_state
 
 
@@ -293,3 +293,66 @@ class TestRemedyAgentToolLoop:
         assert build_args[2] == {"CVE-2021-44228", "GHSA-VPQ2-C234-7XJ6"}
         assert build_args[3] == Path(str(tmp_path))
         assert result["status"] == "no_changes_made"
+
+    def test_circuit_breaker_stops_when_sandbox_is_not_running(self, tmp_path):
+        (tmp_path / "package.json").write_text(
+            '{"dependencies":{"lodash":"^4.17.15"}}\n',
+            encoding="utf-8",
+        )
+        group = _sca_group(manifest_file="package.json")
+        state = initial_orchestrator_state(str(tmp_path), [group])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+
+        llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="installing",
+                tool_calls=[
+                    {
+                        "name": "run_dependency_install",
+                        "args": {},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="this should never be reached"),
+        )
+        sandbox = _sandbox_mock()
+        fake_tool = MagicMock()
+        fake_tool.name = "run_dependency_install"
+        fake_tool.invoke.return_value = (
+            "FAILURE: Sandbox is not running, so npm install cannot continue."
+        )
+
+        with patch("src.orchestrator.remedy_agent.ChatOpenAI", return_value=llm), patch(
+            "src.orchestrator.remedy_agent.DockerSandbox",
+            return_value=sandbox,
+        ), patch(
+            "src.orchestrator.remedy_agent.build_agent_tools",
+            return_value=[fake_tool],
+        ):
+            result = run_remedy_agent(state)
+
+        assert bound.invoke.call_count == 1
+        assert result["status"] == "remedy_failed"
+        assert any("Sandbox is not running," in err for err in result["errors"])
+
+
+class TestRemedyAgentPrompt:
+    def test_target_files_are_deduplicated_in_prompt(self):
+        group_a = _sca_group(manifest_file="package.json", ghsa_id="GHSA-VPQ2-C234-7XJ6")
+        group_b = _sca_group(manifest_file="package.json", ghsa_id="GHSA-RVG8-PWQ2-XJ7Q")
+        group_b.group_id = "sca:package.json:lodash-second"
+        group_b.ghsa_ids = ["GHSA-RVG8-PWQ2-XJ7Q"]
+        group_b.issues[0].ghsa_id = "GHSA-RVG8-PWQ2-XJ7Q"
+
+        prompt = _build_prompt(
+            resolved_groups=[(group_a, "package.json"), (group_b, "package.json")],
+            repo_root="D:/repo",
+        )
+
+        target_files_section = prompt.split("Allowed target files:\n", 1)[1].split(
+            "\n\n=== VULNERABILITY GROUP ===",
+            1,
+        )[0]
+        assert target_files_section.count("- package.json") == 1

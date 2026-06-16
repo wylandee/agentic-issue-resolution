@@ -227,7 +227,7 @@ class TestModifyNpmDependency:
 
         assert "SUCCESS:" in result
         assert "overrides.@scope/package-name" in result
-        sandbox.run.assert_called_once_with("npm pkg set overrides.@scope/package-name=1.2.3-beta.1")
+        sandbox.run.assert_called_once_with("npm pkg set overrides[@scope/package-name]=1.2.3-beta.1")
         assert touched_files == {"package.json"}
 
     def test_failure_returns_error_details(self):
@@ -252,7 +252,7 @@ class TestModifyNpmDependency:
         assert "FAILURE:" in result
         assert "exit 1" in result
         assert "some error" in result
-        sandbox.run.assert_called_once_with("npm pkg set dependencies.lodash=4.17.21")
+        sandbox.run.assert_called_once_with("npm pkg set dependencies[lodash]=4.17.21")
         assert "package.json" not in touched_files
 
 

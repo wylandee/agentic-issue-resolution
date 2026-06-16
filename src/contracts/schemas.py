@@ -394,6 +394,21 @@ class VulnerabilityIssue(BaseModel):
         s = str(v).strip().upper()
         return s if s else None
 
+    @model_validator(mode="after")
+    def _backfill_ghsa_from_rule_id(self) -> "VulnerabilityIssue":
+        """Populate ``ghsa_id`` when legacy/scanner inputs only set ``rule_id``."""
+        if self.ghsa_id or not self.rule_id:
+            return self
+
+        match = re.search(
+            r"\b(GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})\b",
+            self.rule_id,
+            re.IGNORECASE,
+        )
+        if match:
+            self.ghsa_id = match.group(1).upper()
+        return self
+
     @field_validator("severity", mode="before")
     @classmethod
     def _coerce_severity(cls, v: Any) -> Severity:

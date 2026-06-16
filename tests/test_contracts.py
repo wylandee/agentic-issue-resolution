@@ -188,6 +188,11 @@ class TestVulnerabilityIssue:
         issue = _sca_issue(ghsa_id="ghsa-vpq2-c234-7xj6")
         assert issue.ghsa_id == "GHSA-VPQ2-C234-7XJ6"
 
+    def test_ghsa_backfilled_from_rule_id(self):
+        issue = _sca_issue(cve_id=None, ghsa_id=None, rule_id="GHSA-vpq2-c234-7xj6")
+        assert issue.ghsa_id == "GHSA-VPQ2-C234-7XJ6"
+        assert issue.rule_id == "GHSA-vpq2-c234-7xj6"
+
     def test_invalid_ghsa_format(self):
         with pytest.raises(ValidationError):
             _sca_issue(ghsa_id="GHSA-123")

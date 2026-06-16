@@ -19,7 +19,7 @@ from src.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
 
-_NPM_INSTALL_TIMEOUT_SECONDS = 600
+_NPM_INSTALL_TIMEOUT_SECONDS = 900
 _NPM_TEST_TIMEOUT_SECONDS = 600
 _ODC_TIMEOUT_SECONDS = 300
 _ODC_REPORT_NAME = "dependency-check-report.json"

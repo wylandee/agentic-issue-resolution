@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "gpt-4o-mini"
 _MAX_TOOL_CALL_ROUNDS = 24
+_SANDBOX_NOT_RUNNING_MARKER = "Sandbox is not running,"
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -150,13 +151,13 @@ def _build_prompt(
     )
 
     first_section = [
-        "You are an autonomous application security engineer.",
+        "You are an expert autonomous application security engineer.",
         "Use your tools to inspect and edit files inside the shared Docker workspace.",
     ]
     if has_workaround:
         first_section.extend([
             "For version upgrades (strategy: version_found), you may only modify the manifest files (e.g. package.json).",
-            "For workarounds (strategy: workaround_found), you must first find where the vulnerable component is imported/used in the codebase (using search_codebase_pattern), and you are allowed to edit any source code files necessary to apply the workaround. Prioritize making minimal edits.",
+            "For workarounds (strategy: workaround_found), you must first find where the vulnerable componde files necessary to apply the workaround. Prioritize making minimal eent is imported/used in the codebase (using search_codebase_pattern), and you are allowed to edit any source codits.",
         ])
     else:
         first_section.append("You may only modify the repo-relative target files listed below.")
@@ -180,7 +181,7 @@ def _build_prompt(
                 "REQUIRED STEP-BY-STEP SEQUENCE",
                 "1. Map: Call read_repository_map to understand the workspace layout.",
                 "2. Inspect: Read the assigned target files with read_workspace_file (or inspect_ast_symbol for large files).",
-                "3. Modify Manifest: Use modify_npm_dependency to apply dependency upgrades and overrides. Do not edit package.json using deterministic_search_replace.",
+                "3. Modify Manifest: Use modify_npm_dependency to apply dependency upgrades and overrides. Do not edit package.json using deterministic_search_replace. Vulnerabilities in this project may exist in multiple locations (e.g., a root package.json and a frontend/package.json). The security scanner checks the entire repository recursively. You must ensure the vulnerability is patched in EVERY manifest file identified in the Repository Map where that component is declared, otherwise the security scan will continue to fail.",
                 "4. Sync: Run run_dependency_install to synchronize the changes.",
                 "5. Scan & Test: Run run_security_scan and run_unit_tests to verify the fixes.",
             ]
@@ -224,8 +225,9 @@ def _build_prompt(
                 "  - You MUST NOT use deterministic_search_replace to modify package.json or package-lock.json.",
                 "  - deterministic_search_replace is reserved strictly for non-manifest files (such as JavaScript/TypeScript source code or configuration scripts).",
                 "  - Use modify_npm_dependency to modify manifests with the appropriate dependency_type:",
-                "    * To update a direct production dependency (like sanitize-html), set dependency_type to 'dependencies'.",
-                "    * To pin a transitive dependency (like lodash or lodash.set) via overrides, set dependency_type to 'overrides'.",
+                "    * To update a direct production dependency, set dependency_type to 'dependencies'.",
+                "    * To update a direct development dependency, set dependency_type to 'devDependencies'.",
+                "    * To pin a transitive dependency via overrides, set dependency_type to 'overrides'.",
             ]
         )
     )
@@ -256,9 +258,10 @@ def _build_prompt(
         "Allowed target files (for version upgrades or initial reference):" if has_workaround else
         "Allowed target files:"
     )
+    unique_target_files = list(dict.fromkeys(rel_path for _, rel_path in resolved_groups))
     sections.append(
         f"{target_files_label}\n" + "\n".join(
-            f"- {rel_path}" for _, rel_path in resolved_groups
+            f"- {rel_path}" for rel_path in unique_target_files
         )
     )
 
@@ -414,6 +417,18 @@ def run_remedy_agent(state: OrchestratorState) -> Dict[str, Any]:
                     tool_message = _invoke_bound_tool(tool_map, tool_call)
                     new_messages.append(tool_message)
                     conversation.append(tool_message)
+                    if _SANDBOX_NOT_RUNNING_MARKER in tool_message.content:
+                        msg = (
+                            "Remedy Agent: stopping immediately because the sandbox "
+                            "is no longer running."
+                        )
+                        logger.error("%s Tool result: %s", msg, tool_message.content)
+                        return {
+                            "status": "remedy_failed",
+                            "errors": resolution_errors + [tool_message.content, msg],
+                            "messages": new_messages,
+                            "changed_files": sorted(touched_files),
+                        }
     except Exception as exc:  # noqa: BLE001
         msg = f"Remedy Agent: sandbox or tool loop failed - {exc}"
         logger.exception("Remedy Agent: tool loop failed.")

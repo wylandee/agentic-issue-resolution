@@ -1,19 +1,12 @@
 import os
-import uuid
 import logging
-import json
 from dotenv import load_dotenv
+from pydantic import TypeAdapter
 
 from langchain_core.messages import AIMessage, ToolMessage
 
 from src.contracts.schemas import (
-    VulnerabilityGroup, 
-    VulnerabilityIssue, 
-    IssueType, 
-    Severity, 
-    FixPlan, 
-    FixPlanStatus,
-    SystemContext
+    VulnerabilityGroup,
 )
 from src.orchestrator.graph import run_orchestrator
 import src.orchestrator.remedy_agent as remedy_agent
@@ -94,47 +87,41 @@ def test_react_full_graph_odc():
     print("==================================================")
 
     repo_root = os.path.abspath("./data/clones/juice-shop")
-    jsonl_path = "./data/odc_issues.jsonl"
+    triaged_groups_path = "./data/cache/triaged_groups.json"
 
-    if not os.path.exists(jsonl_path):
-        print(f"Error: Could not find JSONL file at {jsonl_path}")
+    if not os.path.exists(triaged_groups_path):
+        print(f"Error: Could not find triaged groups file at {triaged_groups_path}")
         return
 
-    # 1. INGESTION - 10 issues from odc_issues.jsonl
-    issues = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip(): 
-                continue
-            issues.append(VulnerabilityIssue(**json.loads(line)))
-            if len(issues) >= 10:
-                break
+    # 1. INGESTION - load pre-triaged groups from cache
+    with open(triaged_groups_path, "r", encoding="utf-8") as f:
+        valid_groups = TypeAdapter(list[VulnerabilityGroup]).validate_json(f.read())
 
-    print(f"\n[STEP 1] Ingested {len(issues)} raw vulnerabilities.")
-    for idx, issue in enumerate(issues):
-        print(f"   {idx+1}. {issue.package_name} (CVE: {issue.cve_id or 'None'}) - Severity: {issue.severity.value}")
-
-    # Set up SystemContext
-    context = SystemContext(
-        is_public_facing=True,
-        deployment_os="linux",
-        deployment_architecture="containerized",
-        environment="production",
-        primary_language="javascript/nodejs"
-    )
+    print(f"\n[STEP 1] Ingested {len(valid_groups)} triaged vulnerability groups.")
+    for idx, group in enumerate(valid_groups):
+        representative = next(
+            (issue for issue in group.issues if issue.id == group.representative_issue_id),
+            group.issues[0] if group.issues else None,
+        )
+        if representative is None:
+            print(f"   {idx+1}. {group.group_id} - No representative issue found")
+            continue
+        vuln_id = representative.cve_id or representative.ghsa_id or representative.rule_id or "None"
+        print(
+            f"   {idx+1}. {group.vulnerable_component or group.group_id} "
+            f"(Vuln: {vuln_id}) - Severity: {representative.severity.value}"
+        )
 
     # ---------------------------------------------------------
     # GRAPH EXECUTION
     # ---------------------------------------------------------
     print(f"\n▶️  INVOKING ORCHESTRATOR FOR {repo_root}")
-    print("   Providing 10 Vulnerability Issues + System Context for Triage & Execution")
+    print("   Providing pre-triaged Vulnerability Groups directly to execution")
     print("   " + "-"*60)
     
     final_state = run_orchestrator(
         repo_root=repo_root,
-        valid_groups=[],
-        issues=issues,
-        system_context=context
+        valid_groups=valid_groups,
     )
     
     print("   " + "-"*60)
