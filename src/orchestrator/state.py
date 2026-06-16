@@ -96,6 +96,8 @@ class OrchestratorState(TypedDict, total=False):
 
     status: str
     diff: str
+    langsmith_run_id: str
+    langsmith_trace_url: str
     errors: Annotated[List[str], operator.add]
 
 

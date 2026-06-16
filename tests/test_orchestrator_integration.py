@@ -211,8 +211,17 @@ class TestTriageNodeIntegration:
         system_context = SystemContext(scan_id="test")
         
         mock_engine.invoke.return_value = {"status": "completed", "valid_groups": [_group()]}
-        
-        result = run_orchestrator(str(tmp_path), valid_groups=[], issues=issues, system_context=system_context)
+
+        with patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(None, None),
+        ):
+            result = run_orchestrator(
+                str(tmp_path),
+                valid_groups=[],
+                issues=issues,
+                system_context=system_context,
+            )
         
         invoked_state = mock_engine.invoke.call_args[0][0]
         assert invoked_state["issues"] == issues

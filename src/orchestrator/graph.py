@@ -67,6 +67,10 @@ from src.contracts.schemas import (
 )
 from src.orchestrator.editor_node import run_workspace_builder_node
 from src.orchestrator.edit_request_builder import build_edit_request
+from src.orchestrator.langsmith_config import (
+    build_phase5_runnable_config,
+    resolve_phase5_trace_url,
+)
 from src.orchestrator.remedy_agent import run_remedy_agent
 from src.orchestrator.state import (
     OrchestratorState,
@@ -431,7 +435,16 @@ def run_orchestrator(
         issues=issues,
         system_context=system_context,
     )
-    result: OrchestratorState = orchestrator_engine.invoke(initial_state)
+    config, run_id = build_phase5_runnable_config(repo_root, valid_groups)
+    if config is None:
+        result: OrchestratorState = orchestrator_engine.invoke(initial_state)
+    else:
+        result = orchestrator_engine.invoke(initial_state, config)
+        result["langsmith_run_id"] = str(run_id)
+        trace_url = resolve_phase5_trace_url(run_id)
+        if trace_url:
+            result["langsmith_trace_url"] = trace_url
+
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",
         repo_root,

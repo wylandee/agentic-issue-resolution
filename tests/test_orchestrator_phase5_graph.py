@@ -116,7 +116,10 @@ class TestPhase5RunOrchestrator:
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
 
-        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine):
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(None, None),
+        ):
             result = run_orchestrator(str(tmp_path), groups)
 
         invoked_state = mock_engine.invoke.call_args[0][0]
@@ -125,6 +128,53 @@ class TestPhase5RunOrchestrator:
         assert invoked_state["messages"] == []
         assert invoked_state["changed_files"] == []
         assert result["status"] == "completed"
+
+    def test_run_orchestrator_passes_config_and_surfaces_trace_metadata(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        mock_engine = MagicMock()
+        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        run_id = uuid4()
+        config = {
+            "run_id": run_id,
+            "run_name": "phase5_orchestrator",
+            "tags": ["phase-5", "orchestrator", "langgraph"],
+            "metadata": {"repo_name": tmp_path.name},
+        }
+
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(config, run_id),
+        ), patch(
+            "src.orchestrator.graph.resolve_phase5_trace_url",
+            return_value="https://smith.langchain.com/o/test/projects/p/runs/r",
+        ):
+            result = run_orchestrator(str(tmp_path), groups)
+
+        invoked_state, invoked_config = mock_engine.invoke.call_args[0]
+        assert invoked_state["repo_root"] == str(tmp_path)
+        assert invoked_config == config
+        assert result["langsmith_run_id"] == str(run_id)
+        assert result["langsmith_trace_url"] == "https://smith.langchain.com/o/test/projects/p/runs/r"
+
+    def test_run_orchestrator_succeeds_when_trace_url_lookup_fails(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        mock_engine = MagicMock()
+        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        run_id = uuid4()
+        config = {"run_id": run_id}
+
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(config, run_id),
+        ), patch(
+            "src.orchestrator.graph.resolve_phase5_trace_url",
+            return_value=None,
+        ):
+            result = run_orchestrator(str(tmp_path), groups)
+
+        assert result["status"] == "completed"
+        assert result["langsmith_run_id"] == str(run_id)
+        assert "langsmith_trace_url" not in result
 
 
 class TestPhase5GraphIntegration:

@@ -1,6 +1,9 @@
 import os
 import logging
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from pydantic import TypeAdapter
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -11,7 +14,17 @@ from src.contracts.schemas import (
 from src.orchestrator.graph import run_orchestrator
 import src.orchestrator.remedy_agent as remedy_agent
 
-load_dotenv()
+from langsmith import Client
+tracing_env = os.environ.get("LANGSMITH_TRACING", "false").lower()
+print(f"1. LANGSMITH_TRACING is set to: {tracing_env}")
+
+# 2. Check if the API Key is valid by attempting to list projects
+try:
+    client = Client()
+    projects = list(client.list_projects())
+    print(f"2. Connectivity: SUCCESS. Found {len(projects)} projects in LangSmith.")
+except Exception as e:
+    print(f"2. Connectivity: FAILED. Error: {e}")
 
 # Keep basic logging configuration active so dependencies (Docker, LangGraph) can still log
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -81,6 +94,36 @@ def invoke_bound_tool_interceptor(*args, **kwargs):
 remedy_agent._invoke_bound_tool = invoke_bound_tool_interceptor
 
 
+DIRECT_GROUP_COUNT = 5
+TRANSITIVE_GROUP_COUNT = 5
+
+
+def _is_direct_group(group: VulnerabilityGroup) -> bool | None:
+    if not group.localized_issues:
+        return None
+    return group.localized_issues[0].is_direct_dependency
+
+
+def _select_balanced_groups(
+    groups: list[VulnerabilityGroup],
+    direct_count: int = DIRECT_GROUP_COUNT,
+    transitive_count: int = TRANSITIVE_GROUP_COUNT,
+) -> list[VulnerabilityGroup]:
+    direct_groups = [group for group in groups if _is_direct_group(group) is True]
+    transitive_groups = [group for group in groups if _is_direct_group(group) is False]
+
+    if len(direct_groups) < direct_count or len(transitive_groups) < transitive_count:
+        raise ValueError(
+            "Not enough triaged groups to build the requested direct/transitive sample: "
+            f"requested {direct_count} direct and {transitive_count} transitive, "
+            f"found {len(direct_groups)} direct and {len(transitive_groups)} transitive."
+        )
+
+    selected_direct = direct_groups[:direct_count]
+    selected_transitive = transitive_groups[:transitive_count]
+    return selected_direct + selected_transitive
+
+
 def test_react_full_graph_odc():
     print("==================================================")
     print("🤖 STARTING FULLY CONNECTED REACT LANGGRAPH TEST (TRIAGE + EXECUTION)")
@@ -97,7 +140,14 @@ def test_react_full_graph_odc():
     with open(triaged_groups_path, "r", encoding="utf-8") as f:
         valid_groups = TypeAdapter(list[VulnerabilityGroup]).validate_json(f.read())
 
-    print(f"\n[STEP 1] Ingested {len(valid_groups)} triaged vulnerability groups.")
+    valid_groups = _select_balanced_groups(valid_groups)
+    direct_count = sum(1 for group in valid_groups if _is_direct_group(group) is True)
+    transitive_count = sum(1 for group in valid_groups if _is_direct_group(group) is False)
+
+    print(
+        f"\n[STEP 1] Selected {len(valid_groups)} triaged vulnerability groups "
+        f"({direct_count} direct, {transitive_count} transitive)."
+    )
     for idx, group in enumerate(valid_groups):
         representative = next(
             (issue for issue in group.issues if issue.id == group.representative_issue_id),
@@ -107,9 +157,10 @@ def test_react_full_graph_odc():
             print(f"   {idx+1}. {group.group_id} - No representative issue found")
             continue
         vuln_id = representative.cve_id or representative.ghsa_id or representative.rule_id or "None"
+        dependency_kind = "direct" if _is_direct_group(group) else "transitive"
         print(
             f"   {idx+1}. {group.vulnerable_component or group.group_id} "
-            f"(Vuln: {vuln_id}) - Severity: {representative.severity.value}"
+            f"({dependency_kind}, Vuln: {vuln_id}) - Severity: {representative.severity.value}"
         )
 
     # ---------------------------------------------------------

@@ -23,6 +23,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from langsmith import traceable
+
 from src.contracts.schemas import CommandResult
 
 logger = logging.getLogger(__name__)
@@ -121,6 +123,7 @@ class DockerSandbox:
         self._client = None
         self._alive = False
 
+    @traceable(run_type="tool", name="docker_sandbox.start")
     def start(self) -> None:
         """Start the sandbox container and prepare ``/workspace``."""
         try:
@@ -182,6 +185,7 @@ class DockerSandbox:
 
         self._alive = True
 
+    @traceable(run_type="tool", name="docker_sandbox.teardown")
     def teardown(self) -> None:
         """
         Stop and remove the container. Idempotent and safe to call repeatedly.
@@ -222,6 +226,7 @@ class DockerSandbox:
         self.teardown()
         return None
 
+    @traceable(run_type="tool", name="docker_sandbox.run")
     def run(
         self,
         command: str,
@@ -325,6 +330,7 @@ class DockerSandbox:
             duration_seconds=round(duration, 3),
         )
 
+    @traceable(run_type="tool", name="docker_sandbox.write_file")
     def write_file(self, file_path: str, content: str) -> None:
         """Write *content* to *file_path* inside ``/workspace``."""
         if not self._alive or self._container is None:
@@ -347,6 +353,7 @@ class DockerSandbox:
         self._container.put_archive(parent_dir, buf.read())
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
 
+    @traceable(run_type="tool", name="docker_sandbox.read_file")
     def read_file(self, file_path: str) -> Optional[str]:
         """Read *file_path* from ``/workspace`` and return decoded text."""
         if not self._alive or self._container is None:

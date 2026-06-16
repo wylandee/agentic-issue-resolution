@@ -217,6 +217,14 @@ class TestSandboxRun:
         assert result.exit_code == 1
         assert "not running" in result.stderr
 
+    def test_traced_methods_remain_callable_when_sandbox_is_not_running(self, tmp_path):
+        sandbox = DockerSandbox(tmp_path)
+
+        assert sandbox.run("echo hi").stderr == "Sandbox is not running."
+        assert sandbox.read_file("package.json") is None
+        with pytest.raises(RuntimeError, match="Sandbox is not running."):
+            sandbox.write_file("package.json", "{}")
+
 
 def _tar_chunks(filename: str, content: str) -> list[bytes]:
     buf = io.BytesIO()
