@@ -129,6 +129,11 @@ class SubagentState(TypedDict, total=False):
     """
 
     repo_root: str
+    workspace_volume: str
+
+    target_groups: List[VulnerabilityGroup]
+    feedback_by_group: Dict[str, str]
+
     target_group: VulnerabilityGroup
     constraints_ledger: List[str]
     previous_feedback: Optional[str]
@@ -168,15 +173,37 @@ def initial_orchestrator_state(
     return state
 
 
-def initial_subagent_state(
+def initial_update_subagent_state(
     repo_root: str,
+    workspace_volume: str,
+    target_groups: List[VulnerabilityGroup],
+    constraints_ledger: List[str],
+    feedback_by_group: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Build a well-formed initial batch ``SubagentState`` dict."""
+    return {
+        "repo_root": repo_root,
+        "workspace_volume": workspace_volume,
+        "target_groups": list(target_groups),
+        "feedback_by_group": dict(feedback_by_group or {}),
+        "constraints_ledger": list(constraints_ledger),
+        "messages": [],
+        "changed_files": [],
+        "errors": [],
+    }
+
+
+def initial_workaround_subagent_state(
+    repo_root: str,
+    workspace_volume: str,
     target_group: VulnerabilityGroup,
     constraints_ledger: List[str],
     previous_feedback: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a well-formed initial ``SubagentState`` dict."""
+    """Build a well-formed single-group workaround ``SubagentState`` dict."""
     return {
         "repo_root": repo_root,
+        "workspace_volume": workspace_volume,
         "target_group": target_group,
         "constraints_ledger": list(constraints_ledger),
         "previous_feedback": previous_feedback,

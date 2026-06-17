@@ -57,7 +57,11 @@ def _initial_state(tmp_path: Path, issues: list[VulnerabilityIssue], system_cont
         "valid_groups": [],
         "issues": issues,
         "system_context": system_context,
-        "messages": [],
+        "constraints_ledger": [],
+        "retry_counts": {},
+        "group_strategies": {},
+        "qa_evaluations": {},
+        "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
@@ -77,7 +81,11 @@ class TestTriageNodeIntegration:
         state = {
             "repo_root": str(tmp_path),
             "valid_groups": [],
-            "messages": [],
+            "constraints_ledger": [],
+            "retry_counts": {},
+            "group_strategies": {},
+            "qa_evaluations": {},
+            "action_summaries": [],
             "changed_files": [],
             "workspace_volume": None,
             "status": "pending",
@@ -86,13 +94,11 @@ class TestTriageNodeIntegration:
         
         # We need to mock the rest of the nodes so we don't actually run them
         with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_remedy_agent") as mock_agent, \
              patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
              mock_ws.return_value = {"status": "workspace_ready"}
-             mock_agent.return_value = {"status": "edits_completed"}
              mock_teardown.return_value = {"status": "completed"}
              
              result = graph.invoke(state)
@@ -124,21 +130,19 @@ class TestTriageNodeIntegration:
         state = _initial_state(tmp_path, issues, system_context)
         
         with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_remedy_agent") as mock_agent, \
              patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
              mock_ws.return_value = {"status": "workspace_ready"}
-             mock_agent.return_value = {"status": "edits_completed"}
-             mock_teardown.return_value = {"status": "completed"}
+             mock_teardown.return_value = {"status": "phase5_refactor_blocked"}
              
              result = graph.invoke(state)
              
              mock_pipeline.assert_called_once_with(issues, system_context, str(tmp_path))
              assert group1.group_id in [g.group_id for g in result.get("valid_groups", [])]
              mock_ws.assert_called_once()
-             mock_agent.assert_called_once()
+             mock_teardown.assert_called_once()
 
     @patch("src.orchestrator.graph.run_triage_pipeline")
     def test_triage_completed_no_work(self, mock_pipeline, tmp_path: Path):
@@ -164,7 +168,6 @@ class TestTriageNodeIntegration:
         state = _initial_state(tmp_path, issues, system_context)
         
         with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_remedy_agent") as mock_agent, \
              patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
@@ -177,7 +180,6 @@ class TestTriageNodeIntegration:
              assert len(result.get("valid_groups", [])) == 0
              # Should skip workspace builder and go directly to teardown
              mock_ws.assert_not_called()
-             mock_agent.assert_not_called()
              mock_teardown.assert_called_once()
 
     @patch("src.orchestrator.graph.run_triage_pipeline")
@@ -190,7 +192,6 @@ class TestTriageNodeIntegration:
         state = _initial_state(tmp_path, issues, system_context)
         
         with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_remedy_agent") as mock_agent, \
              patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()

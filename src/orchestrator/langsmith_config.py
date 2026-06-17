@@ -17,7 +17,7 @@ from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import Client
 
 from src.contracts.schemas import VulnerabilityGroup
-from src.orchestrator.remedy_agent import _MAX_TOOL_CALL_ROUNDS
+from src.orchestrator.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def build_phase5_runnable_config(
             "repo_name": Path(repo_root).name,
             "repo_root": repo_root,
             "vulnerability_group_count": len(valid_groups),
-            "max_tool_call_rounds": _MAX_TOOL_CALL_ROUNDS,
+            "max_tool_call_rounds": MAX_SUBAGENT_TOOL_CALL_ROUNDS,
         },
     }
     return config, run_id

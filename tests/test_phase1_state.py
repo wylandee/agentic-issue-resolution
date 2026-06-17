@@ -16,7 +16,8 @@ from src.contracts.schemas import (
 from src.orchestrator.state import (
     RemediationState,
     initial_orchestrator_state,
-    initial_subagent_state,
+    initial_update_subagent_state,
+    initial_workaround_subagent_state,
     merge_dict_reducer,
 )
 
@@ -84,22 +85,50 @@ class TestInitialStateHelpers:
         assert state["errors"] == []
         assert "messages" not in state
 
-    def test_initial_subagent_state_initializes_ephemeral_fields(self, tmp_path):
+    def test_initial_update_subagent_state_initializes_ephemeral_fields(self, tmp_path):
         group = _group()
         constraints = ["lodash must remain >= 4.17.21"]
 
-        state = initial_subagent_state(
+        state = initial_update_subagent_state(
             str(tmp_path),
-            group,
+            "agent_workspace_deadbeef",
+            [group],
             constraints,
-            previous_feedback="Retry with an override instead of a direct bump.",
+            feedback_by_group={
+                group.group_id: "Retry with an override instead of a direct bump."
+            },
         )
 
         assert state["repo_root"] == str(tmp_path)
+        assert state["workspace_volume"] == "agent_workspace_deadbeef"
+        assert state["target_groups"] == [group]
+        assert state["constraints_ledger"] == constraints
+        assert state["constraints_ledger"] is not constraints
+        assert state["feedback_by_group"] == {
+            group.group_id: "Retry with an override instead of a direct bump."
+        }
+        assert state["messages"] == []
+        assert state["changed_files"] == []
+        assert state["errors"] == []
+
+    def test_initial_workaround_subagent_state_initializes_ephemeral_fields(self, tmp_path):
+        group = _group()
+        constraints = ["lodash must remain >= 4.17.21"]
+
+        state = initial_workaround_subagent_state(
+            str(tmp_path),
+            "agent_workspace_deadbeef",
+            group,
+            constraints,
+            previous_feedback="Fix the syntax error before returning.",
+        )
+
+        assert state["repo_root"] == str(tmp_path)
+        assert state["workspace_volume"] == "agent_workspace_deadbeef"
         assert state["target_group"] == group
         assert state["constraints_ledger"] == constraints
         assert state["constraints_ledger"] is not constraints
-        assert state["previous_feedback"] == "Retry with an override instead of a direct bump."
+        assert state["previous_feedback"] == "Fix the syntax error before returning."
         assert state["messages"] == []
         assert state["changed_files"] == []
         assert state["errors"] == []

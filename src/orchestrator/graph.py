@@ -71,7 +71,6 @@ from src.orchestrator.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
 )
-from src.orchestrator.remedy_agent import run_remedy_agent
 from src.orchestrator.state import (
     OrchestratorState,
     RemediationState,
@@ -82,6 +81,11 @@ from src.tools.edit_tools import apply_edit
 from src.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
+_PHASE5_REFACTOR_BLOCKED_STATUS = "phase5_refactor_blocked"
+_PHASE5_REFACTOR_BLOCKED_MESSAGE = (
+    "Phase 5 supervisor refactor in progress: the monolithic remedy agent has "
+    "been removed and Supervisor/QA routing is not implemented yet."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +400,14 @@ def route_after_remedy_agent(state: OrchestratorState) -> str:
     return "teardown"
 
 
+def remedy_phase_transition_node(_state: OrchestratorState) -> Dict[str, Any]:
+    """Explicit transitional blocker for the unfinished Phase 5 supervisor refactor."""
+    return {
+        "status": _PHASE5_REFACTOR_BLOCKED_STATUS,
+        "errors": [_PHASE5_REFACTOR_BLOCKED_MESSAGE],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 graph construction
 # ---------------------------------------------------------------------------
@@ -407,7 +419,7 @@ def build_orchestrator_graph():
 
     workflow.add_node("triage", triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
-    workflow.add_node("remedy_agent", run_remedy_agent)
+    workflow.add_node("remedy_agent", remedy_phase_transition_node)
     workflow.add_node("teardown", run_teardown_node)
 
     workflow.add_edge(START, "triage")

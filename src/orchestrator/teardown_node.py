@@ -98,7 +98,11 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                     _close_client(client)
 
     result: Dict[str, Any] = {
-        "status": "completed",
+        "status": (
+            "phase5_refactor_blocked"
+            if state.get("status") == "phase5_refactor_blocked"
+            else "completed"
+        ),
         "workspace_volume": None,
         "changed_files": changed_files,
         "diff": "".join(diff_chunks),

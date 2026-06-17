@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from src.contracts.schemas import IssueSource, IssueType, Severity, VulnerabilityGroup, VulnerabilityIssue
 from src.orchestrator.langsmith_config import build_phase5_runnable_config, resolve_phase5_trace_url
-from src.orchestrator.remedy_agent import _MAX_TOOL_CALL_ROUNDS
+from src.orchestrator.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
 
 
 def _group() -> VulnerabilityGroup:
@@ -56,7 +56,7 @@ class TestPhase5LangsmithConfig:
             "repo_name": "juice-shop",
             "repo_root": "D:/repos/juice-shop",
             "vulnerability_group_count": 2,
-            "max_tool_call_rounds": _MAX_TOOL_CALL_ROUNDS,
+            "max_tool_call_rounds": MAX_SUBAGENT_TOOL_CALL_ROUNDS,
         }
 
 

@@ -25,6 +25,8 @@ from src.orchestrator import (
     run_remediation,
 )
 from src.orchestrator.graph import (
+    _PHASE5_REFACTOR_BLOCKED_STATUS,
+    remedy_phase_transition_node,
     route_after_remedy_agent,
     route_after_workspace_builder,
 )
@@ -92,7 +94,11 @@ def _initial_state(tmp_path, groups):
     return {
         "repo_root": str(tmp_path),
         "valid_groups": groups,
-        "messages": [],
+        "constraints_ledger": [],
+        "retry_counts": {},
+        "group_strategies": {},
+        "qa_evaluations": {},
+        "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
@@ -125,7 +131,7 @@ class TestPhase5RunOrchestrator:
         invoked_state = mock_engine.invoke.call_args[0][0]
         assert invoked_state["repo_root"] == str(tmp_path)
         assert invoked_state["valid_groups"] == groups
-        assert invoked_state["messages"] == []
+        assert invoked_state["constraints_ledger"] == []
         assert invoked_state["changed_files"] == []
         assert result["status"] == "completed"
 
@@ -178,7 +184,7 @@ class TestPhase5RunOrchestrator:
 
 
 class TestPhase5GraphIntegration:
-    def test_success_path_routes_builder_to_remedy_to_teardown(self, tmp_path):
+    def test_workspace_builder_success_hits_transition_blocker_then_teardown(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
@@ -187,19 +193,14 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": "agent_workspace_deadbeef",
             }
         )
-        remedy = MagicMock(
+        teardown = MagicMock(
             return_value={
-                "status": "edits_completed",
-                "changed_files": ["package.json"],
-                "messages": [],
+                "status": _PHASE5_REFACTOR_BLOCKED_STATUS,
+                "workspace_volume": None,
             }
         )
-        teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
         with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), patch(
-            "src.orchestrator.graph.run_remedy_agent",
-            remedy,
-        ), patch(
             "src.orchestrator.graph.run_teardown_node",
             teardown,
         ):
@@ -207,9 +208,8 @@ class TestPhase5GraphIntegration:
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
-        assert remedy.call_count == 1
         assert teardown.call_count == 1
-        assert result["status"] == "completed"
+        assert result["status"] == _PHASE5_REFACTOR_BLOCKED_STATUS
 
     def test_workspace_builder_failure_still_tears_down(self, tmp_path):
         groups = [_group(IssueType.SAST, file_path="routes/login.ts")]
@@ -221,13 +221,9 @@ class TestPhase5GraphIntegration:
                 "errors": ["copy failed"],
             }
         )
-        remedy = MagicMock()
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
         with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), patch(
-            "src.orchestrator.graph.run_remedy_agent",
-            remedy,
-        ), patch(
             "src.orchestrator.graph.run_teardown_node",
             teardown,
         ):
@@ -235,34 +231,6 @@ class TestPhase5GraphIntegration:
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
-        assert remedy.call_count == 0
-        assert teardown.call_count == 1
-        assert result["status"] == "completed"
-
-    def test_remedy_failure_still_tears_down(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
-
-        workspace_builder = MagicMock(
-            return_value={
-                "status": "workspace_ready",
-                "workspace_volume": "agent_workspace_deadbeef",
-            }
-        )
-        remedy = MagicMock(return_value={"status": "remedy_failed", "errors": ["tool failed"]})
-        teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
-
-        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), patch(
-            "src.orchestrator.graph.run_remedy_agent",
-            remedy,
-        ), patch(
-            "src.orchestrator.graph.run_teardown_node",
-            teardown,
-        ):
-            graph = build_orchestrator_graph()
-            result = graph.invoke(_initial_state(tmp_path, groups))
-
-        assert workspace_builder.call_count == 1
-        assert remedy.call_count == 1
         assert teardown.call_count == 1
         assert result["status"] == "completed"
 
@@ -275,3 +243,11 @@ class TestPhase5Exports:
         assert callable(build_orchestrator_graph)
         assert orchestrator_engine is not None
         assert callable(run_orchestrator)
+
+
+class TestPhase5TransitionBlocker:
+    def test_transition_blocker_returns_explicit_failure(self):
+        result = remedy_phase_transition_node({})
+
+        assert result["status"] == _PHASE5_REFACTOR_BLOCKED_STATUS
+        assert result["errors"]
