@@ -15,6 +15,9 @@ from .schemas import (
     ValidationStatus,
     TrajectoryEventKind,
     FixPlanStatus,
+    FailureCategory,
+    RoutingStrategy,
+    AgentActionStatus,
     # Sub-models
     CWEEntry,
     LineRange,
@@ -34,6 +37,8 @@ from .schemas import (
     CVEEnrichment,
     VulnerabilityGroup,
     TriageResult,
+    QAEvaluation,
+    AgentActionSummary,
     # Phase 5 Remedy Agent
     RemedyAgentOutput,
 )
@@ -47,6 +52,9 @@ __all__ = [
     "ValidationStatus",
     "TrajectoryEventKind",
     "FixPlanStatus",
+    "FailureCategory",
+    "RoutingStrategy",
+    "AgentActionStatus",
     "CWEEntry",
     "LineRange",
     # Sandbox contracts (Phase 3)
@@ -64,6 +72,8 @@ __all__ = [
     "CVEEnrichment",
     "VulnerabilityGroup",
     "TriageResult",
+    "QAEvaluation",
+    "AgentActionSummary",
     # Phase 5 Remedy Agent
     "RemedyAgentOutput",
 ]

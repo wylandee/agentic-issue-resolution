@@ -22,14 +22,19 @@ import pytest
 from pydantic import ValidationError
 
 from src.contracts import (
+    AgentActionStatus,
+    AgentActionSummary,
     ASTNodeType,
     EditRequest,
     EditResult,
     EditStatus,
+    FailureCategory,
     IssueSource,
     IssueType,
     LocalizedIssue,
     PatchAttempt,
+    QAEvaluation,
+    RoutingStrategy,
     Severity,
     TrajectoryEvent,
     TrajectoryEventKind,
@@ -161,6 +166,101 @@ class TestSeverityCoercion:
             severity=raw,
         )
         assert issue.severity == expected
+
+
+# ===========================================================================
+# Phase 5 refactor enums and handoff models
+# ===========================================================================
+
+
+class TestPhase5RefactorEnums:
+    def test_failure_category_values(self):
+        assert FailureCategory.SECURITY_FLAG.value == "security_flag"
+        assert FailureCategory.PEER_CONFLICT.value == "peer_conflict"
+        assert FailureCategory.BREAKING_CHANGE.value == "breaking_change"
+
+    def test_routing_strategy_values(self):
+        assert RoutingStrategy.VERSION_BUMP.value == "version_bump"
+        assert RoutingStrategy.CODE_WORKAROUND.value == "code_workaround"
+
+    def test_agent_action_status_values(self):
+        assert AgentActionStatus.SUCCESS.value == "success"
+        assert AgentActionStatus.SURRENDER.value == "surrender"
+
+
+class TestQAEvaluation:
+    def test_passed_evaluation_accepts_no_failure_metadata(self):
+        evaluation = QAEvaluation(group_id="group-1", passed=True)
+        assert evaluation.failure_category is None
+        assert evaluation.retry_feedback is None
+
+    def test_passed_evaluation_rejects_failure_metadata(self):
+        with pytest.raises(ValidationError, match="passed=True"):
+            QAEvaluation(
+                group_id="group-1",
+                passed=True,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Try a different edit.",
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"group_id": "group-1", "passed": False, "retry_feedback": "Try again."},
+            {
+                "group_id": "group-1",
+                "passed": False,
+                "failure_category": FailureCategory.PEER_CONFLICT,
+            },
+            {
+                "group_id": "group-1",
+                "passed": False,
+                "failure_category": FailureCategory.PEER_CONFLICT,
+                "retry_feedback": "   ",
+            },
+        ],
+    )
+    def test_failed_evaluation_requires_category_and_feedback(self, kwargs):
+        with pytest.raises(ValidationError, match="passed=False"):
+            QAEvaluation(**kwargs)
+
+    def test_failed_evaluation_accepts_category_and_feedback(self):
+        evaluation = QAEvaluation(
+            group_id="group-1",
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="Update the call sites to match the new API.",
+        )
+        assert evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+
+    def test_json_round_trip(self):
+        evaluation = QAEvaluation(
+            group_id="group-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="The scanner still reports the vulnerable identifier.",
+        )
+        reloaded = QAEvaluation.model_validate_json(evaluation.model_dump_json())
+        assert reloaded == evaluation
+
+
+class TestAgentActionSummary:
+    def test_rejects_empty_summary(self):
+        with pytest.raises(ValidationError, match="summary"):
+            AgentActionSummary(
+                group_id="group-1",
+                status=AgentActionStatus.SUCCESS,
+                summary="   ",
+            )
+
+    def test_json_round_trip(self):
+        summary = AgentActionSummary(
+            group_id="group-1",
+            status=AgentActionStatus.SURRENDER,
+            summary="Unable to resolve the peer dependency conflict safely.",
+        )
+        reloaded = AgentActionSummary.model_validate_json(summary.model_dump_json())
+        assert reloaded == summary
 
 
 # ===========================================================================

@@ -21,14 +21,18 @@ def _sandbox_mock() -> MagicMock:
 
 
 class TestStateDefaults:
-    def test_orchestrator_state_initializes_linear_pipeline_fields(self, tmp_path):
+    def test_orchestrator_state_initializes_master_state_fields(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
 
-        assert state["messages"] == []
+        assert state["constraints_ledger"] == []
+        assert state["retry_counts"] == {}
+        assert state["group_strategies"] == {}
+        assert state["qa_evaluations"] == {}
+        assert state["action_summaries"] == []
         assert state["changed_files"] == []
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
-        assert "retry_count" not in state
+        assert "messages" not in state
 
 
 class TestWorkspaceBuilderNode:

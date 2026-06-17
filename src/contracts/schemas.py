@@ -115,6 +115,28 @@ class FixPlanStatus(str, Enum):
     NO_FIX = "no_fix"                     # All strategies exhausted, nothing found
 
 
+class FailureCategory(str, Enum):
+    """Strict QA failure categories used for supervisor retry routing."""
+
+    SECURITY_FLAG = "security_flag"
+    PEER_CONFLICT = "peer_conflict"
+    BREAKING_CHANGE = "breaking_change"
+
+
+class RoutingStrategy(str, Enum):
+    """Strict supervisor routing strategies for vulnerability groups."""
+
+    VERSION_BUMP = "version_bump"
+    CODE_WORKAROUND = "code_workaround"
+
+
+class AgentActionStatus(str, Enum):
+    """Strict terminal statuses returned by subagents."""
+
+    SUCCESS = "success"
+    SURRENDER = "surrender"
+
+
 # ---------------------------------------------------------------------------
 # CommandResult
 # ---------------------------------------------------------------------------
@@ -1045,6 +1067,65 @@ class TriageResult(BaseModel):
                 "false_positive_reason is required when is_valid=False."
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Remedy refactor contracts
+# ---------------------------------------------------------------------------
+
+
+class QAEvaluation(BaseModel):
+    """Structured QA Critic verdict for a single vulnerability group."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    group_id: str = Field(..., min_length=1)
+    passed: bool
+    failure_category: Optional[FailureCategory] = Field(
+        None,
+        description="Required when passed=False.",
+    )
+    retry_feedback: Optional[str] = Field(
+        None,
+        description="Required retry guidance when passed=False.",
+    )
+
+    @model_validator(mode="after")
+    def _check_pass_fail_payload(self) -> "QAEvaluation":
+        if self.passed:
+            if self.failure_category is not None or self.retry_feedback is not None:
+                raise ValueError(
+                    "passed=True requires failure_category=None and retry_feedback=None."
+                )
+            return self
+
+        if self.failure_category is None:
+            raise ValueError(
+                "passed=False requires a non-null failure_category."
+            )
+        if not self.retry_feedback or not self.retry_feedback.strip():
+            raise ValueError(
+                "passed=False requires a non-empty retry_feedback."
+            )
+        return self
+
+
+class AgentActionSummary(BaseModel):
+    """Condensed subagent outcome stored in supervisor state."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    group_id: str = Field(..., min_length=1)
+    status: AgentActionStatus
+    summary: str = Field(..., min_length=1)
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_must_be_non_empty(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("summary must be a non-empty natural-language string.")
+        return cleaned
 
 
 # ---------------------------------------------------------------------------

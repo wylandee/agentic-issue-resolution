@@ -5,15 +5,16 @@ Phase 4.1 (Legacy):
     ``RemediationState`` - single-issue, kept for the current Phase 4.1 graph.
 
 Phase 5:
-    ``OrchestratorState`` - group-level state for the linear
-    workspace_builder -> remedy_agent -> teardown pipeline.
+    ``OrchestratorState`` - supervisor master state for the hub-and-spoke
+    remedy architecture.
+    ``SubagentState`` - ephemeral private state for specialist subagents.
 
 Reducer notes
 -------------
 * ``errors`` uses ``operator.add`` in both states so each node can return
   only its new error strings and LangGraph will append them.
-* ``messages`` in ``OrchestratorState`` uses ``add_messages`` so the remedy
-  agent appends only the newly produced LLM and tool transcript.
+* ``messages`` exists only in ``SubagentState`` so subagent ReAct transcripts
+  stay isolated from the long-lived supervisor state.
 * ``changed_files`` uses ``operator.add`` so each node can report only the
   files it newly observed as changed.
 * All other fields use the default "last writer wins" semantics.
@@ -22,20 +23,37 @@ Reducer notes
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Mapping, Optional, TypeVar
 
 from langgraph.graph.message import AnyMessage, add_messages
 from typing_extensions import TypedDict
 
 from src.contracts.schemas import (
+    AgentActionSummary,
     EditRequest,
     EditResult,
     FixPlan,
     LocalizedIssue,
+    QAEvaluation,
+    RoutingStrategy,
     SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+def merge_dict_reducer(
+    left: Mapping[K, V] | None,
+    right: Mapping[K, V] | None,
+) -> Dict[K, V]:
+    """Merge dict-like values without mutating either input."""
+    merged: Dict[K, V] = dict(left or {})
+    if right:
+        merged.update(right)
+    return merged
 
 
 class RemediationState(TypedDict, total=False):
@@ -61,7 +79,7 @@ class RemediationState(TypedDict, total=False):
 
 class OrchestratorState(TypedDict, total=False):
     """
-    Full state schema for the Phase 5 linear remediation pipeline.
+    Full state schema for the Phase 5 supervisor master state.
 
     Required inputs
     ---------------
@@ -75,21 +93,23 @@ class OrchestratorState(TypedDict, total=False):
     workspace_volume:
         Docker named volume shared across builder, remedy agent, and teardown.
 
-    Remedy transcript / outputs
+    Supervisor memory / outputs
     ---------------------------
-    messages:
-        Accumulated conversation history including tool calls and tool results.
     changed_files:
-        Repo-relative files successfully modified inside the workspace.
+        Repo-relative files successfully modified across subagent runs.
     """
 
     repo_root: str
     valid_groups: List[VulnerabilityGroup]
-    
+
     issues: List[VulnerabilityIssue]
     system_context: SystemContext
 
-    messages: Annotated[List[AnyMessage], add_messages]
+    constraints_ledger: Annotated[List[str], operator.add]
+    retry_counts: Annotated[Dict[str, int], merge_dict_reducer]
+    group_strategies: Annotated[Dict[str, RoutingStrategy], merge_dict_reducer]
+    qa_evaluations: Annotated[Dict[str, QAEvaluation], merge_dict_reducer]
+    action_summaries: Annotated[List[AgentActionSummary], operator.add]
     changed_files: Annotated[List[str], operator.add]
 
     workspace_volume: Optional[str]
@@ -98,6 +118,25 @@ class OrchestratorState(TypedDict, total=False):
     diff: str
     langsmith_run_id: str
     langsmith_trace_url: str
+    errors: Annotated[List[str], operator.add]
+
+
+class SubagentState(TypedDict, total=False):
+    """
+    Ephemeral private state for one specialist subagent run.
+
+    This is the only Phase 5 state that carries localized ReAct messages.
+    """
+
+    repo_root: str
+    target_group: VulnerabilityGroup
+    constraints_ledger: List[str]
+    previous_feedback: Optional[str]
+
+    messages: Annotated[List[AnyMessage], add_messages]
+
+    action_summary: AgentActionSummary
+    changed_files: Annotated[List[str], operator.add]
     errors: Annotated[List[str], operator.add]
 
 
@@ -111,7 +150,11 @@ def initial_orchestrator_state(
     state: Dict[str, Any] = {
         "repo_root": repo_root,
         "valid_groups": valid_groups,
-        "messages": [],
+        "constraints_ledger": [],
+        "retry_counts": {},
+        "group_strategies": {},
+        "qa_evaluations": {},
+        "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
@@ -123,3 +166,21 @@ def initial_orchestrator_state(
     if system_context is not None:
         state["system_context"] = system_context
     return state
+
+
+def initial_subagent_state(
+    repo_root: str,
+    target_group: VulnerabilityGroup,
+    constraints_ledger: List[str],
+    previous_feedback: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a well-formed initial ``SubagentState`` dict."""
+    return {
+        "repo_root": repo_root,
+        "target_group": target_group,
+        "constraints_ledger": list(constraints_ledger),
+        "previous_feedback": previous_feedback,
+        "messages": [],
+        "changed_files": [],
+        "errors": [],
+    }
