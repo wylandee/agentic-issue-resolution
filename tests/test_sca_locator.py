@@ -633,7 +633,7 @@ class TestFindNearestManifest:
             "/src/frontend/package-lock.json?/elliptic:6.6.1",
         )
         assert manifest is not None
-        # Should resolve to a package.json (either frontend or root, whichever nearest)
+        assert manifest.parent.name == "frontend"
         assert manifest.name == "package.json"
 
     def test_empty_path_returns_none(self, tmp_repo):

@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -37,38 +37,109 @@ except ImportError:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment,misc]
 
 
-def _resolve_manifest_target(group: VulnerabilityGroup, repo_root: Path) -> Tuple[Optional[str], Optional[str]]:
-    candidate: Optional[str] = None
+def _candidate_manifest_paths(group: VulnerabilityGroup) -> List[str]:
+    """Return all candidate manifest paths for one grouped dependency target."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(value: str | None) -> None:
+        if not value:
+            return
+        candidate = value.replace("\\", "/")
+        if candidate in seen:
+            return
+        candidates.append(candidate)
+        seen.add(candidate)
+
     for localized_issue in group.localized_issues:
-        if localized_issue.manifest_file:
-            candidate = localized_issue.manifest_file
-            break
-    if not candidate:
-        candidate = group.file_path
-    if not candidate and group.issues:
-        candidate = group.issues[0].file_path
+        add_candidate(localized_issue.manifest_file)
 
-    if not candidate:
-        return None, f"Group '{group.group_id}': no manifest target could be resolved."
-    if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
-        return None, f"Group '{group.group_id}': rejected absolute manifest path '{candidate}'."
-    if ".." in Path(candidate).parts:
-        return None, f"Group '{group.group_id}': rejected path traversal in '{candidate}'."
+    for file_path in group.file_paths:
+        add_candidate(file_path)
 
-    abs_target = (repo_root / candidate).resolve()
-    try:
-        abs_target.relative_to(repo_root.resolve())
-    except ValueError:
-        return None, f"Group '{group.group_id}': manifest path '{candidate}' resolves outside repo_root."
-    if not abs_target.exists():
-        return None, f"Group '{group.group_id}': manifest path '{candidate}' does not exist in repo."
-    if abs_target.is_dir() or abs_target.name != "package.json":
-        return None, f"Group '{group.group_id}': manifest target '{candidate}' must be a package.json file."
-    return candidate.replace("\\", "/"), None
+    add_candidate(group.file_path)
+
+    for issue in group.issues:
+        if issue.file_path and Path(issue.file_path).name == "package.json":
+            add_candidate(issue.file_path)
+
+    return candidates
+
+
+def _resolve_manifest_targets(
+    group: VulnerabilityGroup,
+    repo_root: Path,
+) -> Tuple[List[str], List[str]]:
+    """Resolve all valid package.json targets for one vulnerability group."""
+    candidates = _candidate_manifest_paths(group)
+    if not candidates:
+        return [], [f"Group '{group.group_id}': no manifest target could be resolved."]
+
+    resolved_paths: List[str] = []
+    errors: List[str] = []
+
+    for candidate in candidates:
+        if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
+            errors.append(
+                f"Group '{group.group_id}': rejected absolute manifest path '{candidate}'."
+            )
+            continue
+        if ".." in Path(candidate).parts:
+            errors.append(
+                f"Group '{group.group_id}': rejected path traversal in '{candidate}'."
+            )
+            continue
+
+        abs_target = (repo_root / candidate).resolve()
+        try:
+            abs_target.relative_to(repo_root.resolve())
+        except ValueError:
+            errors.append(
+                f"Group '{group.group_id}': manifest path '{candidate}' resolves outside repo_root."
+            )
+            continue
+        if not abs_target.exists():
+            errors.append(
+                f"Group '{group.group_id}': manifest path '{candidate}' does not exist in repo."
+            )
+            continue
+        if abs_target.is_dir() or abs_target.name != "package.json":
+            errors.append(
+                f"Group '{group.group_id}': manifest target '{candidate}' must be a package.json file."
+            )
+            continue
+
+        resolved_paths.append(candidate.replace("\\", "/"))
+
+    return resolved_paths, errors
+
+
+def _format_manifest_paths(manifest_paths: Sequence[str]) -> str:
+    if not manifest_paths:
+        return "none"
+    if len(manifest_paths) == 1:
+        return manifest_paths[0]
+    return "\n".join(f"- {path}" for path in manifest_paths)
+
+
+def _build_package_manifest_map(
+    resolved_groups: Sequence[Tuple[VulnerabilityGroup, Sequence[str]]],
+) -> Dict[str, List[str]]:
+    """Build a per-package allowlist of manifest paths for tool enforcement."""
+    package_manifest_map: Dict[str, List[str]] = {}
+    for group, manifest_paths in resolved_groups:
+        package_name = (group.vulnerable_component or "").strip()
+        if not package_name:
+            continue
+        existing = package_manifest_map.setdefault(package_name, [])
+        for manifest_path in manifest_paths:
+            if manifest_path not in existing:
+                existing.append(manifest_path)
+    return package_manifest_map
 
 
 def _build_update_prompt(
-    resolved_groups: Sequence[Tuple[VulnerabilityGroup, str]],
+    resolved_groups: Sequence[Tuple[VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
     feedback_by_group: Dict[str, str],
 ) -> str:
@@ -80,6 +151,8 @@ def _build_update_prompt(
                 "You must inspect the repository map before making manifest changes.",
                 "Immediately after any manifest change, you must call validate_manifest_sync.",
                 "If validate_manifest_sync fails, you must resolve the peer conflict or invalid manifest state before finishing.",
+                "Every modify_npm_dependency call must include the exact manifest_path you intend to edit.",
+                "If the vulnerable component appears in multiple manifest paths, call modify_npm_dependency once for each manifest_path that declares it.",
                 "Never downgrade a package that is constrained by the constraints ledger.",
                 "Use revert_workspace_file if you reach a structurally bad manifest state.",
                 "Do not search the codebase and do not edit source code files.",
@@ -92,7 +165,7 @@ def _build_update_prompt(
     else:
         sections.append("Constraints ledger:\n- none")
 
-    for group, manifest_path in resolved_groups:
+    for group, manifest_paths in resolved_groups:
         feedback = feedback_by_group.get(group.group_id, "none")
         fix_plan = group.fix_plan
         sections.append(
@@ -100,7 +173,7 @@ def _build_update_prompt(
                 [
                     "=== TARGET GROUP ===",
                     f"Group ID      : {group.group_id}",
-                    f"Manifest Path : {manifest_path}",
+                    f"Manifest Path : {_format_manifest_paths(manifest_paths)}",
                     f"Component     : {group.vulnerable_component or 'unknown'}",
                     f"CVEs          : {', '.join(group.cve_ids) if group.cve_ids else 'none'}",
                     f"GHSAs         : {', '.join(group.ghsa_ids) if group.ghsa_ids else 'none'}",
@@ -173,14 +246,14 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         )
         return {"action_summary": summary, "changed_files": [], "errors": [msg]}
 
-    resolved_groups: List[Tuple[VulnerabilityGroup, str]] = []
+    resolved_groups: List[Tuple[VulnerabilityGroup, List[str]]] = []
     resolution_errors: List[str] = []
     for group in target_groups:
-        manifest_path, error = _resolve_manifest_target(group, repo_root)
-        if error:
-            resolution_errors.append(error)
+        manifest_paths, errors = _resolve_manifest_targets(group, repo_root)
+        resolution_errors.extend(errors)
+        if not manifest_paths:
             continue
-        resolved_groups.append((group, manifest_path))
+        resolved_groups.append((group, manifest_paths))
 
     if not resolved_groups:
         summary = AgentActionSummary(
@@ -220,11 +293,17 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            package_manifest_map = _build_package_manifest_map(resolved_groups)
             toolbelt = build_update_toolbelt(
                 sandbox,
                 touched_files,
                 repo_root,
-                target_manifest_paths=[path for _, path in resolved_groups],
+                target_manifest_paths=[
+                    manifest_path
+                    for _, manifest_paths in resolved_groups
+                    for manifest_path in manifest_paths
+                ],
+                package_manifest_paths=package_manifest_map,
             )
             runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
     except Exception as exc:  # noqa: BLE001

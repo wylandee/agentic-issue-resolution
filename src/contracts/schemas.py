@@ -349,7 +349,12 @@ class VulnerabilityIssue(BaseModel):
     # Location (populated for SAST; optional for SCA)
     file_path: Optional[str] = Field(
         None,
-        description="Repo-relative path to the affected source file.",
+        description=(
+            "Location string for the affected artifact. For SAST this is the "
+            "repo-relative source file path; for SCA this may be the raw "
+            "scanner-native lockfile or package path used later for manifest "
+            "localization."
+        ),
     )
     line_range: Optional[LineRange] = Field(
         None, description="Affected line range within ``file_path``."
@@ -524,6 +529,14 @@ class LocalizedIssue(BaseModel):
     localized_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )
+
+    @field_validator("manifest_file", mode="before")
+    @classmethod
+    def _normalise_manifest_file(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().replace("\\", "/").lstrip("/")
+        return s if s else None
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +909,14 @@ class VulnerabilityGroup(BaseModel):
         None,
         description="Repo-relative path to the affected file (may be None for SCA without location).",
     )
+    file_paths: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Deduplicated repo-relative file paths associated with this group. "
+            "For SCA groups this is the set of resolved manifest paths; for SAST "
+            "groups this is typically a singleton list containing file_path."
+        ),
+    )
 
     # CVE / version metadata (SCA-oriented; empty for pure SAST groups)
     cve_ids: List[str] = Field(
@@ -963,6 +984,41 @@ class VulnerabilityGroup(BaseModel):
     grouped_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )
+
+    @field_validator("file_path", mode="before")
+    @classmethod
+    def _normalise_group_file_path(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().replace("\\", "/").lstrip("/")
+        return s if s else None
+
+    @field_validator("file_paths", mode="before")
+    @classmethod
+    def _normalise_group_file_paths(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+
+        raw_values = value if isinstance(value, list) else [value]
+        normalised: List[str] = []
+        seen: set[str] = set()
+        for raw in raw_values:
+            if raw is None:
+                continue
+            path = str(raw).strip().replace("\\", "/").lstrip("/")
+            if not path or path in seen:
+                continue
+            normalised.append(path)
+            seen.add(path)
+        return normalised
+
+    @model_validator(mode="after")
+    def _sync_group_file_path_fields(self) -> "VulnerabilityGroup":
+        if self.file_path and self.file_path not in self.file_paths:
+            self.file_paths = [self.file_path, *self.file_paths]
+        elif not self.file_path and self.file_paths:
+            self.file_path = self.file_paths[0]
+        return self
 
 
 class TriageResult(BaseModel):

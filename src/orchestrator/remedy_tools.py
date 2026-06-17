@@ -8,7 +8,7 @@ import logging
 import os
 import shlex
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Dict, Iterable, List, Mapping, Set
 
 from langchain_core.tools import tool
 
@@ -57,6 +57,39 @@ def _workspace_dir_for_manifest(manifest_path: str) -> str:
     if parent in ("", "."):
         return "/workspace"
     return f"/workspace/{parent}"
+
+
+def _normalize_manifest_targets(target_manifest_paths: Iterable[str]) -> List[str]:
+    """Return stable, validated package.json targets for one update batch."""
+    manifest_paths = sorted(
+        {
+            _validate_workspace_path(path)
+            for path in target_manifest_paths
+            if path
+        }
+    )
+    invalid = [
+        path for path in manifest_paths if Path(path).name != "package.json"
+    ]
+    if invalid:
+        raise ValueError(
+            "All target manifest paths must point to package.json files. "
+            f"Invalid values: {invalid}"
+        )
+    return manifest_paths
+
+
+def _normalize_package_manifest_targets(
+    package_manifest_paths: Mapping[str, Iterable[str]],
+) -> Dict[str, List[str]]:
+    """Return validated package-to-manifest targets for one update batch."""
+    normalized: Dict[str, List[str]] = {}
+    for package_name, manifest_paths in package_manifest_paths.items():
+        package_key = (package_name or "").strip()
+        if not package_key:
+            raise ValueError("Package manifest target keys must be non-empty.")
+        normalized[package_key] = _normalize_manifest_targets(manifest_paths)
+    return normalized
 
 
 def _make_read_repository_map_tool(sandbox: DockerSandbox):
@@ -125,7 +158,15 @@ def _make_revert_workspace_file_tool(
 def _make_modify_npm_dependency_tool(
     sandbox: DockerSandbox,
     touched_files: Set[str],
+    package_manifest_paths: Mapping[str, Iterable[str]],
 ):
+    allowed_manifest_paths_by_package = {
+        package_name: set(manifest_paths)
+        for package_name, manifest_paths in _normalize_package_manifest_targets(
+            package_manifest_paths
+        ).items()
+    }
+
     @tool
     def modify_npm_dependency(
         package_name: str,
@@ -163,6 +204,19 @@ def _make_modify_npm_dependency_tool(
 
         if Path(rel_manifest).name != "package.json":
             return "ERROR: manifest_path must point to a package.json file."
+        allowed_manifest_paths = allowed_manifest_paths_by_package.get(package_name)
+        if not allowed_manifest_paths:
+            known_packages = ", ".join(sorted(allowed_manifest_paths_by_package))
+            return (
+                f"ERROR: package_name '{package_name}' is not an allowed target for "
+                f"this batch. Allowed package_name values: {known_packages}."
+            )
+        if rel_manifest not in allowed_manifest_paths:
+            allowed = ", ".join(sorted(allowed_manifest_paths))
+            return (
+                f"ERROR: manifest_path '{rel_manifest}' is not an allowed target for "
+                f"package '{package_name}'. Allowed manifest_path values: {allowed}."
+            )
 
         package_expr = f"{dependency_type}[{package_name}]={target_version}"
         npm_cmd = shlex.join(["npm", "pkg", "set", package_expr])
@@ -196,11 +250,7 @@ def _make_validate_manifest_sync_tool(
     sandbox: DockerSandbox,
     target_manifest_paths: Iterable[str],
 ):
-    manifest_paths = sorted({
-        _validate_workspace_path(path)
-        for path in target_manifest_paths
-        if path
-    })
+    manifest_paths = _normalize_manifest_targets(target_manifest_paths)
 
     @tool
     def validate_manifest_sync() -> str:
@@ -445,13 +495,19 @@ def build_update_toolbelt(
     touched_files: Set[str],
     host_repo_root: Path,
     target_manifest_paths: Iterable[str],
+    package_manifest_paths: Mapping[str, Iterable[str]],
 ) -> List:
     """Build the strict update-only toolbelt."""
+    manifest_paths = _normalize_manifest_targets(target_manifest_paths)
     return [
         _make_read_repository_map_tool(sandbox),
-        _make_modify_npm_dependency_tool(sandbox, touched_files),
+        _make_modify_npm_dependency_tool(
+            sandbox,
+            touched_files,
+            package_manifest_paths,
+        ),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_manifest_sync_tool(sandbox, target_manifest_paths),
+        _make_validate_manifest_sync_tool(sandbox, manifest_paths),
     ]
 
 

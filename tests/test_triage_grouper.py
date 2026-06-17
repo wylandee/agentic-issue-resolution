@@ -177,6 +177,29 @@ class TestSCAGrouping:
         )
         assert len(groups) == 2
 
+    def test_group_tracks_all_manifest_paths(self):
+        issues = [
+            _sca(package_name="lodash", file_path="/src/package-lock.json?/lodash:4.17.20"),
+            _sca(package_name="lodash", file_path="/frontend/package-lock.json?/lodash:4.17.20"),
+        ]
+        pairs = [
+            (
+                _localized(issues[0], manifest_file="package.json"),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
+            (
+                _localized(issues[1], manifest_file="frontend/package.json"),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
+        ]
+
+        groups = group_issues(issues, sca_issue_plans=pairs)
+
+        assert len(groups) == 2
+        assert groups[0].file_paths == ["frontend/package.json"] or groups[0].file_paths == ["package.json"]
+        all_group_paths = sorted(path for group in groups for path in group.file_paths)
+        assert all_group_paths == ["frontend/package.json", "package.json"]
+
     def test_representative_prefers_issue_with_fixed_version(self):
         no_fix = _sca(fixed_version=None)
         with_fix = _sca(fixed_version="4.17.21")
@@ -276,6 +299,7 @@ class TestSASTGrouping:
         assert g.issue_type == IssueType.SAST
         assert g.group_id.startswith("sast:")
         assert len(g.issues) == 1
+        assert g.file_paths == ["src/app.js"]
 
     def test_different_sast_locations_make_separate_groups(self):
         issues = [

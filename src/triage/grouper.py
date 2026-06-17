@@ -50,6 +50,20 @@ from src.contracts.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _dedupe_paths(paths: List[Optional[str]]) -> List[str]:
+    """Return stable, deduplicated non-empty repo-relative paths."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path:
+            continue
+        if path in seen:
+            continue
+        result.append(path)
+        seen.add(path)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Key builders
 # ---------------------------------------------------------------------------
@@ -290,13 +304,20 @@ def _group_sca(
         rep = _choose_representative_from_pairs(members)
         component = _component_from_issue(rep)
         group_fix_plan = _build_group_fix_plan(members)
-        group_file_path = localized_members[0].manifest_file or rep.file_path
+        group_file_paths = _dedupe_paths(
+            [
+                localized_issue.manifest_file or localized_issue.issue.file_path
+                for localized_issue in localized_members
+            ]
+        )
+        group_file_path = group_file_paths[0] if group_file_paths else (localized_members[0].manifest_file or rep.file_path)
 
         groups[key] = VulnerabilityGroup(
             group_id=key,
             issue_type=IssueType.SCA,
             vulnerable_component=component,
             file_path=group_file_path,
+            file_paths=group_file_paths,
             cve_ids=seen_cves,
             ghsa_ids=seen_ghsas,
             versions=seen_versions,
@@ -336,6 +357,7 @@ def _group_sast(issues: List[VulnerabilityIssue]) -> Dict[str, VulnerabilityGrou
                 issue_type=IssueType.SAST,
                 vulnerable_component=issue.rule_id,
                 file_path=issue.file_path,
+                file_paths=[issue.file_path] if issue.file_path else [],
                 cve_ids=[],         # SAST findings rarely carry a CVE
                 ghsa_ids=[],
                 versions=[],

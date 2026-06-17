@@ -44,6 +44,7 @@ def _sca_group(group_id: str = "sca:package.json:lodash", manifest_file: str = "
         issue_type=IssueType.SCA,
         vulnerable_component="lodash",
         file_path=manifest_file,
+        file_paths=[manifest_file],
         cve_ids=["CVE-2021-44228"],
         versions=["4.17.15"],
         sources=[IssueSource.ODC],
@@ -165,8 +166,11 @@ class TestUpdateSubagentWrapper:
             "src.orchestrator.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_target",
-            side_effect=[("package.json", None), ("frontend/package.json", None)],
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            side_effect=[
+                (["package.json"], []),
+                (["frontend/package.json"], []),
+            ],
         ), patch(
             "src.orchestrator.update_subagent.build_update_toolbelt",
             return_value=[tool_edit, tool_validate],
@@ -198,8 +202,8 @@ class TestUpdateSubagentWrapper:
             "src.orchestrator.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_target",
-            return_value=("package.json", None),
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            return_value=(["package.json"], []),
         ), patch(
             "src.orchestrator.update_subagent.build_update_toolbelt",
             return_value=[tool_edit],

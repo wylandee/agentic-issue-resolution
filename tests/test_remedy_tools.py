@@ -19,6 +19,7 @@ def _update_tool_map(
     touched_files=None,
     host_repo_root=None,
     manifest_paths=None,
+    package_manifest_paths=None,
 ):
     if touched_files is None:
         touched_files = set()
@@ -26,7 +27,15 @@ def _update_tool_map(
         host_repo_root = Path("/dummy/repo/root")
     if manifest_paths is None:
         manifest_paths = ["package.json"]
-    tools = build_update_toolbelt(sandbox, touched_files, host_repo_root, manifest_paths)
+    if package_manifest_paths is None:
+        package_manifest_paths = {"lodash": manifest_paths}
+    tools = build_update_toolbelt(
+        sandbox,
+        touched_files,
+        host_repo_root,
+        manifest_paths,
+        package_manifest_paths,
+    )
     return {tool.name: tool for tool in tools}
 
 
@@ -75,7 +84,11 @@ class TestModifyNpmDependency:
             duration_seconds=0.5,
         )
         touched_files = set()
-        tools = _update_tool_map(sandbox, touched_files=touched_files)
+        tools = _update_tool_map(
+            sandbox,
+            touched_files=touched_files,
+            manifest_paths=["frontend/package.json"],
+        )
 
         result = tools["modify_npm_dependency"].invoke(
             {
@@ -91,6 +104,107 @@ class TestModifyNpmDependency:
         assert touched_files == {"frontend/package.json"}
         sandbox.run.assert_called_once()
         assert "cd /workspace/frontend" in sandbox.run.call_args[0][0]
+
+    def test_rejects_manifest_outside_allowed_batch_targets(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json", "frontend/package.json"],
+            package_manifest_paths={"lodash": ["package.json"]},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "frontend/package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "not an allowed target for package 'lodash'" in result
+        assert "package.json" in result
+        sandbox.run.assert_not_called()
+
+    def test_rejects_manifest_not_allowed_for_package_in_mixed_batch(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json", "frontend/package.json"],
+            package_manifest_paths={
+                "lodash": ["package.json"],
+                "axios": ["frontend/package.json"],
+            },
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "frontend/package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "not an allowed target for package 'lodash'" in result
+        assert "package.json" in result
+        sandbox.run.assert_not_called()
+
+    def test_allows_package_specific_manifest_in_mixed_batch(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.5,
+        )
+        touched_files = set()
+        tools = _update_tool_map(
+            sandbox,
+            touched_files=touched_files,
+            manifest_paths=["package.json", "frontend/package.json"],
+            package_manifest_paths={
+                "lodash": ["package.json"],
+                "axios": ["frontend/package.json"],
+            },
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "axios",
+                "target_version": "1.7.4",
+                "dependency_type": "dependencies",
+                "manifest_path": "frontend/package.json",
+            }
+        )
+
+        assert result.startswith("SUCCESS:")
+        assert "frontend/package.json" in result
+        assert touched_files == {"frontend/package.json"}
+        sandbox.run.assert_called_once()
+
+    def test_rejects_unknown_package_name_for_batch(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json"],
+            package_manifest_paths={"lodash": ["package.json"]},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "express",
+                "target_version": "4.21.0",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "package_name 'express' is not an allowed target for this batch" in result
+        sandbox.run.assert_not_called()
 
     def test_invalid_manifest_path_rejected(self):
         sandbox = MagicMock()

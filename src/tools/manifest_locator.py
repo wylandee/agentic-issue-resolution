@@ -246,35 +246,37 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path
     # Strip the lockfile ancestry suffix if present
     raw_path = odc_file_path.split("?")[0].split("#")[0].strip()
 
-    # Try to make it relative to repo_root
-    # ODC often records paths with a leading /src/ that maps to the repo root
+    # Try to make it relative to repo_root. ODC often records paths with a
+    # leading /src/ that maps to the repo root, so we prefer the stripped form
+    # first and fall back to the raw form if needed.
     candidate_abs = Path(raw_path)
     if candidate_abs.is_absolute():
-        # Try stripping leading /src/ or /repo/ conventions
-        parts = candidate_abs.parts  # ('/', 'src', ...)
-        # Find repo_root name in the path or just take after first component
-        try:
-            # Remove the leading separator
-            rel_parts = parts[1:]  # drop '/'
-            # Walk: try stripping 1, 2, ... leading segments
-            for skip in range(len(rel_parts)):
-                trimmed = Path(*rel_parts[skip:]) if rel_parts[skip:] else None
-                if trimmed is None:
-                    break
-                candidate = (repo_root / trimmed).resolve()
-                if candidate.exists() or (repo_root / trimmed.parent).exists():
-                    start_dir = candidate.parent if candidate.is_file() else candidate
-                    break
-            else:
-                start_dir = repo_root
-        except Exception:
-            start_dir = repo_root
+        rel_parts = candidate_abs.parts[1:]  # drop the leading "/"
     else:
-        start_dir = (repo_root / raw_path).parent
+        rel_parts = candidate_abs.parts
+
+    variants = [Path(*rel_parts)] if rel_parts else []
+    if rel_parts and rel_parts[0].lower() in {"src", repo_root.name.lower()}:
+        stripped = Path(*rel_parts[1:])
+        if str(stripped):
+            variants.insert(0, stripped)
+
+    start_dir = repo_root
+    repo_resolved = repo_root.resolve()
+    for variant in variants:
+        current = (repo_root / variant).resolve()
+        while True:
+            if current.exists():
+                start_dir = current if current.is_dir() else current.parent
+                break
+            if current == repo_resolved or not current.is_relative_to(repo_resolved):
+                break
+            current = current.parent
+        if start_dir != repo_root:
+            break
 
     # Walk up from start_dir looking for package.json
     current = start_dir.resolve()
-    repo_resolved = repo_root.resolve()
     while True:
         manifest = current / "package.json"
         if manifest.exists():

@@ -174,6 +174,7 @@ class TestVulnerabilityGroup:
             representative_issue_id=issue.id,
         )
         assert group.cve_ids == []
+        assert group.file_paths == []
         assert group.versions == []
         assert group.sources == []
         assert group.issues == []
@@ -188,6 +189,7 @@ class TestVulnerabilityGroup:
             group_id="sca:pkg.json:lodash",
             issue_type=IssueType.SCA,
             vulnerable_component="lodash",
+            file_paths=["package.json", "frontend/package.json"],
             representative_issue_id=issue.id,
             issues=[issue],
             cve_ids=["CVE-2021-23337"],
@@ -195,6 +197,8 @@ class TestVulnerabilityGroup:
         )
         assert len(group.cve_ids) == 1
         assert len(group.sources) == 2
+        assert group.file_path == "package.json"
+        assert group.file_paths == ["package.json", "frontend/package.json"]
 
     def test_json_round_trip(self):
         issue = _make_issue()
@@ -203,6 +207,7 @@ class TestVulnerabilityGroup:
         restored = VulnerabilityGroup.model_validate(data)
         assert restored.group_id == group.group_id
         assert restored.representative_issue_id == group.representative_issue_id
+        assert restored.file_paths == group.file_paths
 
     def test_enrichment_can_be_attached(self):
         issue = _make_issue()
@@ -232,6 +237,36 @@ class TestVulnerabilityGroup:
         group = _make_group(issue)
         group.is_reachable = False
         assert group.is_reachable is False
+
+    def test_file_path_and_file_paths_stay_in_sync(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            representative_issue_id=issue.id,
+            file_paths=["frontend/package.json"],
+        )
+        assert group.file_path == "frontend/package.json"
+        assert group.file_paths == ["frontend/package.json"]
+
+    def test_windows_style_paths_normalize_to_forward_slashes(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            representative_issue_id=issue.id,
+            file_path="frontend\\package.json",
+            file_paths=["frontend\\package.json", "\\frontend\\package.json"],
+        )
+        localized = LocalizedIssue(
+            issue=issue,
+            manifest_file="frontend\\package.json",
+            localization_confidence=1.0,
+        )
+
+        assert group.file_path == "frontend/package.json"
+        assert group.file_paths == ["frontend/package.json"]
+        assert localized.manifest_file == "frontend/package.json"
 
 
 # ---------------------------------------------------------------------------

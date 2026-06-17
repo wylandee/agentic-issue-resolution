@@ -29,7 +29,7 @@ TEST_REPO_ROOT = Path(
 )
 TARGET_GROUP_IDS = (
     "sca:package.json:express-jwt:UPDATE_VERSION",
-    "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    "sca:frontend/package.json:ws:UPDATE_VERSION",
 )
 
 
