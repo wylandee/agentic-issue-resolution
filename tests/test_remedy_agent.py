@@ -24,6 +24,7 @@ from src.orchestrator.state import (
     initial_workaround_subagent_state,
 )
 from src.orchestrator.update_subagent import run_update_subagent_node
+from src.orchestrator.workaround_subagent import _build_workaround_prompt, run_workaround_subagent_node
 from src.orchestrator.workaround_subagent import run_workaround_subagent_node
 
 
@@ -214,6 +215,18 @@ class TestUpdateSubagentWrapper:
 
 
 class TestWorkaroundSubagentWrapper:
+    def test_workaround_prompt_includes_snippets(self):
+        group = _sast_group()
+        prompt = _build_workaround_prompt(
+            group,
+            ["express must remain >= 4.22.1"],
+            previous_feedback="Keep the change narrow.",
+        )
+
+        assert "Workaround snippets:" in prompt
+        assert "Escape the user input before rendering." in prompt
+        assert "Keep the change narrow." in prompt
+
     def test_success_requires_validation_after_code_edit(self):
         group = _sast_group()
         repo_root = _repo_root()

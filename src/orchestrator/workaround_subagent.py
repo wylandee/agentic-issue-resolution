@@ -20,6 +20,8 @@ from src.orchestrator.subagent_runtime import (
 )
 from src.runtime.sandbox_mgr import DockerSandbox
 
+from langsmith import traceable
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "gpt-4o-mini"
@@ -71,6 +73,17 @@ def _build_workaround_prompt(
             ]
         )
     )
+    if fix_plan and fix_plan.workaround_snippets:
+        sections.append(
+            "\n".join(
+                [
+                    "Workaround snippets:",
+                    *[f"- {snippet}" for snippet in fix_plan.workaround_snippets],
+                ]
+            )
+        )
+    else:
+        sections.append("Workaround snippets:\n- none")
     return "\n\n".join(sections)
 
 
@@ -94,7 +107,7 @@ def _build_action_summary(
         summary = f"{outcome} for {group_id}; changed files: {changed_label}."
     return AgentActionSummary(group_id=group_id, status=summary_status, summary=summary)
 
-
+@traceable(name="Workaround_Subagent_Test_Run") # for langsmith testing
 def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     """Run the single-group workaround subagent on ``SubagentState``."""
     repo_root_str = state.get("repo_root", "")
