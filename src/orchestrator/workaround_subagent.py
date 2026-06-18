@@ -42,11 +42,13 @@ def _build_workaround_prompt(
         "\n".join(
             [
                 "You are a code security specialist operating inside a shared Docker workspace.",
-                "You must inspect the repository map first and use AST-guided context gathering before editing.",
-                "You may only inspect and edit source files.",
-                "After every modified file, you must run validate_code_syntax on that file.",
-                "If syntax validation fails, you must repair the file or revert it before finishing.",
-                "Do not modify package manifests and do not call heavy QA tools.",
+                "You must strictly follow this Standard Operating Procedure (SOP):",
+                "1. ALWAYS use relative file paths (e.g., 'frontend/src/app.ts'). NEVER use absolute paths starting with '/' or '/workspace'.",
+                "2. When using search_codebase_pattern, ALWAYS start your search from the repository root ('.') to ensure you don't miss files, unless you are 100% certain of the directory.",
+                "3. NEVER use inspect_ast_symbol on a file unless search_codebase_pattern has explicitly confirmed the file exists and contains the vulnerable logic.",
+                "4. After every modified file, you must run validate_code_syntax on that file.",
+                "5. If syntax validation fails, you must repair the file or revert it before finishing.",
+                "Do not modify package manifests and do not call heavy QA tools."
             ]
         )
     ]

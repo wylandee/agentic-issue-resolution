@@ -467,9 +467,7 @@ def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
             cmd = f"node -c {shlex.quote(f'/workspace/{rel_path}')}"
         elif suffix in {".ts", ".tsx", ".jsx"}:
             cmd = (
-                "npx tsc --noEmit --pretty false --skipLibCheck "
-                "--noResolve --allowJs --checkJs false --jsx preserve "
-                f"{shlex.quote(rel_path)}"
+                f"npx --yes esbuild {shlex.quote(rel_path)} --outfile=/dev/null"
             )
         else:
             return (
