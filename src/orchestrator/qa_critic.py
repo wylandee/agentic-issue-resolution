@@ -1,11 +1,14 @@
 """
-qa_critic.py - Standalone QA evaluator node for the Phase 5 orchestrator.
+qa_critic.py - Agentic QA evaluator node for the Phase 5 orchestrator.
 
-The QA Critic:
-  1. Opens the shared workspace volume (read-only for heavy tools).
-  2. Runs npm install, OWASP Dependency-Check, and npm test exactly once.
-  3. Generates a host-vs-workspace diff (no .git in the Docker volume).
-  4. Calls a single-shot structured LLM to produce per-group ``QAEvaluation``.
+The QA Critic is a bounded ReAct agent that:
+  1. Runs npm install, OWASP Dependency-Check, and npm test exactly once via
+     one-shot-guarded execution tools.
+  2. Optionally calls read-only review tools (diff, file reads, pattern search,
+     AST inspection, log queries) when failures or ambiguous signals need
+     investigation.
+  3. Calls a single-shot structured LLM per group to produce QAEvaluation
+     objects after the agent review phase completes.
 
 Heavy QA commands (install, scan, tests) are intentionally *not* exposed as
 tools to the update or workaround subagents; they live here only.
@@ -16,26 +19,26 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import subprocess
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langsmith import traceable
 
 from src.contracts.schemas import (
     AgentActionSummary,
     FailureCategory,
-    FixPlanStatus,
     QAEvaluation,
-    RoutingStrategy,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
+from src.orchestrator.subagent_runtime import run_bounded_subagent_loop
 from src.runtime.sandbox_mgr import DockerSandbox
-
-from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,8 @@ _DIFF_CHAR_BUDGET = 8_000
 _TEST_LOG_TAIL_LINES = 60
 _STDERR_TAIL_LINES = 30
 _INSTALL_LOG_TAIL_LINES = 80
+_FILE_READ_MAX_CHARS = 8_000
+_LOG_QUERY_MAX_CHARS = 6_000
 
 # Exclusion patterns for workspace diff
 _DIFF_EXCLUDE_DIRS = frozenset({
@@ -143,7 +148,7 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
 
 
 # ---------------------------------------------------------------------------
-# QA runner helpers
+# QA runner helpers (deterministic, called by tool wrappers)
 # ---------------------------------------------------------------------------
 
 
@@ -278,13 +283,16 @@ def _generate_workspace_diff(
         ``changed_file_paths`` is the full list of repo-relative paths that changed
         (retained even when the diff text itself is truncated).
     """
+    if not candidate_changed_files:
+        return "(no changed files were provided; diff is empty)", []
+
     host_root = Path(host_repo_root)
     changed_files: List[str] = []
     diff_parts: List[str] = []
 
     # Deduplicate files while preserving order.
-    seen = set()
-    unique_candidates = []
+    seen: Set[str] = set()
+    unique_candidates: List[str] = []
     for f in candidate_changed_files:
         if f not in seen:
             seen.add(f)
@@ -331,10 +339,16 @@ def _generate_workspace_diff(
                 fromfile=f"a/{rel_path}",
                 tofile=f"b/{rel_path}",
                 lineterm="",
-                ))
+            ))
             diff_parts.append("".join(diff_lines))
 
     full_diff = "\n".join(diff_parts)
+    if not full_diff:
+        return (
+            "(diff is empty — workspace matches host baseline for all candidate files)",
+            changed_files,
+        )
+
     if len(full_diff) > _DIFF_CHAR_BUDGET:
         full_diff = full_diff[:_DIFF_CHAR_BUDGET] + "\n... (diff truncated)"
 
@@ -366,121 +380,322 @@ def _collect_target_identifiers(groups: List[VulnerabilityGroup]) -> Set[str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM critic
+# Path safety helper (used by review tools)
 # ---------------------------------------------------------------------------
 
 
-def _build_group_prompt(
-    group: VulnerabilityGroup,
-    strategy: Optional[str],
-    relevant_summaries: List[AgentActionSummary],
-    install_ok: bool,
-    install_summary: str,
-    scan_ok: bool,
-    scan_summary: str,
-    remaining_identifiers: Set[str],
-    test_ok: bool,
-    test_summary: str,
-    diff_text: str,
-    changed_files: List[str],
+def _validate_qa_path(file_path: str) -> str:
+    """Validate a repo-relative path for QA read-only review tools."""
+    candidate = (file_path or "").strip()
+    if not candidate:
+        raise ValueError("file_path is required.")
+    if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
+        raise ValueError(f"Rejected absolute file path '{candidate}'.")
+    if ".." in Path(candidate).parts:
+        raise ValueError(f"Rejected path traversal in '{candidate}'.")
+    return candidate.replace("\\", "/")
+
+
+# ---------------------------------------------------------------------------
+# Execution results cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _QAExecutionResults:
+    """Cache for one-shot execution tool results. Populated during the agent loop."""
+
+    install: Optional[Tuple[bool, str]] = None          # (ok, summary)
+    scan: Optional[Tuple[bool, str, Set[str]]] = None   # (ok, summary, remaining_ids)
+    tests: Optional[Tuple[bool, str]] = None            # (ok, summary)
+
+
+# ---------------------------------------------------------------------------
+# QA toolbelt
+# ---------------------------------------------------------------------------
+
+
+def build_qa_toolbelt(
+    sandbox: DockerSandbox,
+    workspace_volume: str,
+    target_identifiers: Set[str],
+    candidate_changed_files: List[str],
+    host_repo_root: Optional[str],
+) -> Tuple[List, _QAExecutionResults]:
+    """
+    Build the QA-only toolbelt with one-shot execution tools and read-only review tools.
+
+    Execution tools (run_dependency_install, run_security_scan, run_unit_tests) are
+    one-shot guarded: the first call performs the real work and caches the result;
+    subsequent calls return the cached result immediately.
+
+    Review tools (generate_workspace_diff, list_changed_files, read_file_context,
+    search_codebase_pattern, inspect_ast_symbol, query_qa_logs) are always callable
+    and never modify workspace state.
+
+    Returns:
+        (tools_list, results_cache)
+        ``results_cache`` can be inspected after the agent loop to verify which
+        execution tools were actually called and what they returned.
+    """
+    from src.orchestrator.remedy_tools import (
+        _make_inspect_ast_symbol_tool,
+        _make_search_codebase_pattern_tool,
+    )
+
+    results = _QAExecutionResults()
+
+    # ------------------------------------------------------------------
+    # Execution tools (one-shot guarded)
+    # ------------------------------------------------------------------
+
+    @tool
+    def run_dependency_install() -> str:
+        """
+        Run 'npm install --package-lock=true' inside the workspace.
+        Must be called first, before run_security_scan and run_unit_tests.
+        Repeated calls return the cached result immediately.
+        """
+        if results.install is not None:
+            _, summary = results.install
+            return f"[CACHED — already run] {summary}"
+        ok, summary = _run_install(sandbox)
+        results.install = (ok, summary)
+        return summary
+
+    @tool
+    def run_security_scan() -> str:
+        """
+        Run OWASP Dependency-Check against the workspace and check for remaining
+        target CVE/GHSA identifiers.
+        Must be called after run_dependency_install.
+        Repeated calls return the cached result immediately.
+        """
+        if results.scan is not None:
+            _, summary, _ = results.scan
+            return f"[CACHED — already run] {summary}"
+        ok, summary, remaining = _run_security_scan(
+            sandbox, workspace_volume, target_identifiers
+        )
+        results.scan = (ok, summary, remaining)
+        return summary
+
+    @tool
+    def run_unit_tests() -> str:
+        """
+        Run 'npm test' inside the workspace.
+        Must be called after run_security_scan.
+        Repeated calls return the cached result immediately.
+        """
+        if results.tests is not None:
+            _, summary = results.tests
+            return f"[CACHED — already run] {summary}"
+        ok, summary = _run_unit_tests(sandbox)
+        results.tests = (ok, summary)
+        return summary
+
+    # ------------------------------------------------------------------
+    # Review tools (read-only, always callable)
+    # ------------------------------------------------------------------
+
+    @tool
+    def list_changed_files() -> str:
+        """
+        List the repo-relative file paths that the remedy agents reported as changed.
+        Use this before generate_workspace_diff or read_file_context to understand
+        the remediation scope.
+        """
+        if not candidate_changed_files:
+            return "(no changed files were reported by remedy agents)"
+        return "\n".join(f"  - {f}" for f in candidate_changed_files)
+
+    @tool
+    def generate_workspace_diff() -> str:
+        """
+        Generate a unified diff of only the remedy-agent-reported changed files,
+        comparing the host baseline to the current sandbox workspace.
+        Call this when a workaround/scan paradox needs investigation or when a
+        CODE_WORKAROUND group requires diff-based peer review.
+        """
+        if host_repo_root is None:
+            return "ERROR: host_repo_root is not available; cannot generate diff."
+        diff_text, _ = _generate_workspace_diff(
+            host_repo_root, sandbox, candidate_changed_files
+        )
+        return diff_text
+
+    @tool
+    def read_file_context(file_path: str) -> str:
+        """
+        Read the current content of a workspace file for review.
+        Only accepts repo-relative paths; absolute paths and '..' traversal are rejected.
+        """
+        try:
+            rel_path = _validate_qa_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        content = sandbox.read_file(rel_path)
+        if content is None:
+            return f"ERROR: File '{rel_path}' not found in workspace."
+        if len(content) > _FILE_READ_MAX_CHARS:
+            content = content[:_FILE_READ_MAX_CHARS] + "\n... (truncated)"
+        return content
+
+    @tool
+    def query_qa_logs(log_type: str) -> str:
+        """
+        Return the bounded log output for a specific QA execution phase.
+        log_type must be one of: 'install', 'scan', 'tests'.
+        Use this instead of re-running a tool when you need a longer excerpt
+        of a previously-run command's output.
+        """
+        if log_type == "install":
+            if results.install is None:
+                return "ERROR: run_dependency_install has not been called yet."
+            _, summary = results.install
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        if log_type == "scan":
+            if results.scan is None:
+                return "ERROR: run_security_scan has not been called yet."
+            _, summary, _ = results.scan
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        if log_type == "tests":
+            if results.tests is None:
+                return "ERROR: run_unit_tests has not been called yet."
+            _, summary = results.tests
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
+
+    tools = [
+        run_dependency_install,
+        run_security_scan,
+        run_unit_tests,
+        list_changed_files,
+        generate_workspace_diff,
+        read_file_context,
+        _make_search_codebase_pattern_tool(sandbox),
+        _make_inspect_ast_symbol_tool(sandbox),
+        query_qa_logs,
+    ]
+    return tools, results
+
+
+# ---------------------------------------------------------------------------
+# QA agent system prompt
+# ---------------------------------------------------------------------------
+
+
+def _build_qa_system_prompt(
+    valid_groups: List[VulnerabilityGroup],
+    group_strategies: Dict[str, str],
+    action_summaries: List[AgentActionSummary],
+    candidate_changed_files: List[str],
 ) -> str:
-    """Build a structured prompt for evaluating a single vulnerability group."""
-    fix_plan = group.fix_plan
-    fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
-    fix_plan_instruction = fix_plan.instruction if fix_plan else "(none)"
+    """Build the system prompt for the bounded QA agent loop."""
+    groups_text_parts = []
+    for group in valid_groups:
+        strategy = group_strategies.get(group.group_id, "(unknown)")
+        fix_plan = group.fix_plan
+        fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+        fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+        cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
+        ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
 
-    cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
-    ghsas = ", ".join(group.ghsa_ids) if group.ghsa_ids else "(none)"
+        relevant_summaries = [s for s in action_summaries if s.group_id == group.group_id]
+        summaries_text = "\n".join(
+            f"    - {s.status.value}: {s.summary}" for s in relevant_summaries
+        ) or "    (none)"
 
-    summaries_text = "\n".join(
-        f"  - group={s.group_id} status={s.status.value}: {s.summary}"
-        for s in relevant_summaries
-    ) or "  (none)"
+        groups_text_parts.append(
+            f"  GROUP: {group.group_id}\n"
+            f"    Component   : {group.vulnerable_component or '(unknown)'}\n"
+            f"    Strategy    : {strategy}\n"
+            f"    CVEs        : {cves}\n"
+            f"    GHSAs       : {ghsas}\n"
+            f"    Fix Status  : {fix_plan_status}\n"
+            f"    Instruction : {fix_instruction}\n"
+            f"    Agent Summaries:\n{summaries_text}"
+        )
 
-    remaining_text = ", ".join(sorted(remaining_identifiers)) if remaining_identifiers else "(none)"
-    changed_files_text = "\n".join(f"  - {f}" for f in changed_files) or "  (none)"
+    groups_text = "\n\n".join(groups_text_parts)
+    changed_files_text = (
+        "\n".join(f"  - {f}" for f in candidate_changed_files)
+        if candidate_changed_files
+        else "  (none)"
+    )
 
-    return f"""You are a QA Critic evaluating whether a security remediation was successful.
+    return f"""You are a QA Critic Agent performing a structured security remediation review.
 
-## Group: {group.group_id}
-- Component: {group.vulnerable_component or '(unknown)'}
-- Issue Type: {group.issue_type.value}
-- CVEs: {cves}
-- GHSAs: {ghsas}
-- Fix Plan Status: {fix_plan_status}
-- Fix Plan Instruction: {fix_plan_instruction}
-- Routing Strategy: {strategy or '(unknown)'}
+## Vulnerability Groups Under Review
+{groups_text}
 
-## Agent Action Summaries
-{summaries_text}
-
-## Install Result
-- Success: {install_ok}
-- Summary: {install_summary[:2000]}
-
-## Security Scan Result
-- Success: {scan_ok}
-- Summary: {scan_summary[:2000]}
-- Remaining Target Identifiers: {remaining_text}
-
-## Unit Test Result
-- Success: {test_ok}
-- Summary: {test_summary[:3000]}
-
-## Workspace Diff (changed files)
+## Files Changed by Remedy Agents
 {changed_files_text}
 
-## Workspace Diff (content, capped)
-```
-{diff_text}
-```
+## Required Execution Sequence
+You MUST call the following three tools in this exact order before using any review tools:
+1. `run_dependency_install` — installs dependencies and surfaces install errors
+2. `run_security_scan` — runs OWASP Dependency-Check and checks for remaining CVEs/GHSAs
+3. `run_unit_tests` — runs the full test suite
 
-## Evaluation Rules
+Each execution tool is one-shot guarded: repeated calls return the cached result.
+Do NOT skip or reorder these three steps.
 
-1. **Version bump groups** (strategy=VERSION_BUMP): Pass only when:
-   - Install succeeds (ERESOLVE/EBADENGINE → PEER_CONFLICT).
-   - Scanner reports zero remaining target identifiers (otherwise SECURITY_FLAG).
-   - Unit tests pass (regressions → BREAKING_CHANGE).
+## Review Tools (Conditional — Call Only When Needed)
+After running all three execution tools, use review tools only if failures or ambiguous
+signals require investigation:
+- `list_changed_files` — list the files the remedy agents modified
+- `generate_workspace_diff` — diff changed files vs. host baseline (for workaround/scan paradox)
+- `read_file_context` — read a specific workspace file
+- `search_codebase_pattern` — regex search across workspace source files
+- `inspect_ast_symbol` — extract a named function or class from a file
+- `query_qa_logs` — retrieve the bounded log output for install, scan, or tests
 
-2. **Code workaround groups** (strategy=CODE_WORKAROUND): Pass when:
-   - The diff clearly neutralizes the vulnerable code path.
-   - Normal (non-security-exploit) tests still pass.
-   - Scanner may still report findings — this is an EXPECTED FALSE POSITIVE for
-     CODE_WORKAROUND; suppress scanner findings if the diff proves the path is
-     blocked.
-   - If the diff does NOT prove the path is blocked, classify as SECURITY_FLAG.
+If all three execution tools pass cleanly (install OK, zero remaining identifiers, tests OK),
+you MAY finalize without calling any review tools.
 
-3. **CTF/exploit tests**: Failing exploit-specific tests can mean success ONLY
-   when the diff clearly neutralizes the exploit AND normal tests are not broken.
+## Final Evaluation Rules
+Produce one verdict per group after completing your review:
 
-4. **Failure categories**:
-   - PEER_CONFLICT: ERESOLVE, EBADENGINE, or dependency-tree conflict in install.
-   - BREAKING_CHANGE: regression/API breakage in tests.
-   - SECURITY_FLAG: unresolved scanner evidence or unblocked vulnerable path.
+1. **VERSION_BUMP groups**: Pass only when:
+   - Install succeeds (ERESOLVE/EBADENGINE → PEER_CONFLICT)
+   - Scanner reports zero remaining target identifiers (otherwise SECURITY_FLAG)
+   - Unit tests pass (regressions → BREAKING_CHANGE)
 
-Return a QAEvaluation for group_id="{group.group_id}" with:
-- passed: true/false
-- failure_category: null when passed=true; otherwise PEER_CONFLICT, BREAKING_CHANGE, or SECURITY_FLAG
-- retry_feedback: null when passed=true; otherwise specific, actionable guidance for the agent
+2. **CODE_WORKAROUND groups**: Pass when:
+   - The workspace diff clearly neutralizes the vulnerable code path
+   - Normal (non-exploit) tests still pass
+   - Scanner may still report findings — suppress as EXPECTED FALSE POSITIVE only when
+     the diff proves the path is blocked; otherwise → SECURITY_FLAG
+   - Failing exploit-specific tests are acceptable if the diff proves the path is blocked
+
+3. **Failure categories**:
+   - PEER_CONFLICT: ERESOLVE, EBADENGINE, or dependency-tree conflict in install
+   - BREAKING_CHANGE: regression or API breakage in unit tests
+   - SECURITY_FLAG: unresolved scanner evidence or unblocked vulnerable path
+
+When finished with your review, clearly state your final conclusions per group.
+The structured evaluation will be extracted from your analysis afterward.
 """
 
 
-def _run_llm_critic(
-    groups: List[VulnerabilityGroup],
+# ---------------------------------------------------------------------------
+# Per-group structured evaluation (called after agent loop)
+# ---------------------------------------------------------------------------
+
+
+def _extract_group_evaluations(
+    valid_groups: List[VulnerabilityGroup],
     group_strategies: Dict[str, str],
     action_summaries: List[AgentActionSummary],
-    install_ok: bool,
-    install_summary: str,
-    scan_ok: bool,
-    scan_summary: str,
-    remaining_identifiers: Set[str],
-    test_ok: bool,
-    test_summary: str,
-    diff_text: str,
-    changed_files: List[str],
+    results: _QAExecutionResults,
+    agent_transcript: str,
 ) -> Dict[str, QAEvaluation]:
     """
-    Run a single-shot structured LLM evaluation for each group.
+    Run a single-shot structured LLM call per group to extract a QAEvaluation.
+
+    Accepts the full agent loop transcript (tool events + final text) and
+    per-group context, and uses structured output to produce a typed verdict.
 
     Returns a mapping of group_id -> QAEvaluation.
     """
@@ -489,29 +704,76 @@ def _run_llm_critic(
     model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(QAEvaluation)
 
+    install_ok, install_summary = results.install or (
+        False, "run_dependency_install was not called."
+    )
+    if results.scan is not None:
+        scan_ok, scan_summary, remaining_identifiers = results.scan
+    else:
+        scan_ok, scan_summary, remaining_identifiers = (
+            False, "run_security_scan was not called.", set()
+        )
+    test_ok, test_summary = results.tests or (False, "run_unit_tests was not called.")
+
     evaluations: Dict[str, QAEvaluation] = {}
 
-    for group in groups:
-        strategy = group_strategies.get(group.group_id)
+    for group in valid_groups:
+        strategy = group_strategies.get(group.group_id, "(unknown)")
+        fix_plan = group.fix_plan
+        fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+        fix_plan_instruction = fix_plan.instruction if fix_plan else "(none)"
+        cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
+        ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
 
-        relevant_summaries = [
-            s for s in action_summaries if s.group_id == group.group_id
-        ]
+        relevant_summaries = [s for s in action_summaries if s.group_id == group.group_id]
+        summaries_text = "\n".join(
+            f"  - {s.status.value}: {s.summary}" for s in relevant_summaries
+        ) or "  (none)"
 
-        prompt = _build_group_prompt(
-            group=group,
-            strategy=strategy,
-            relevant_summaries=relevant_summaries,
-            install_ok=install_ok,
-            install_summary=install_summary,
-            scan_ok=scan_ok,
-            scan_summary=scan_summary,
-            remaining_identifiers=remaining_identifiers,
-            test_ok=test_ok,
-            test_summary=test_summary,
-            diff_text=diff_text,
-            changed_files=changed_files,
+        remaining_text = (
+            ", ".join(sorted(remaining_identifiers)) if remaining_identifiers else "(none)"
         )
+
+        prompt = f"""You are a QA Critic extracting a structured verdict for one vulnerability group.
+
+## Group: {group.group_id}
+- Component: {group.vulnerable_component or '(unknown)'}
+- Issue Type: {group.issue_type.value}
+- CVEs: {cves}
+- GHSAs: {ghsas}
+- Fix Plan Status: {fix_plan_status}
+- Fix Plan Instruction: {fix_plan_instruction}
+- Routing Strategy: {strategy}
+
+## Agent Action Summaries
+{summaries_text}
+
+## Execution Results
+- Install Success: {install_ok}
+- Install Summary: {install_summary[:2000]}
+- Scan Success: {scan_ok}
+- Scan Summary: {scan_summary[:2000]}
+- Remaining Target Identifiers: {remaining_text}
+- Tests Success: {test_ok}
+- Tests Summary: {test_summary[:3000]}
+
+## QA Agent Review Transcript
+{agent_transcript[:6000]}
+
+## Evaluation Rules
+1. VERSION_BUMP: Pass only when install succeeds, zero remaining target identifiers,
+   and tests pass.
+2. CODE_WORKAROUND: Pass when diff proves vulnerable path is blocked and normal tests pass.
+   Suppress scanner findings as false positives ONLY when the diff proves blocking.
+3. PEER_CONFLICT: ERESOLVE, EBADENGINE, or dependency-tree conflict.
+4. BREAKING_CHANGE: regression or API breakage in tests.
+5. SECURITY_FLAG: unresolved scanner evidence or unblocked vulnerable path.
+
+Return a QAEvaluation for group_id="{group.group_id}" with:
+- passed: true/false
+- failure_category: null when passed=true; otherwise PEER_CONFLICT, BREAKING_CHANGE, or SECURITY_FLAG
+- retry_feedback: null when passed=true; otherwise specific, actionable guidance for the agent
+"""
 
         try:
             evaluation: QAEvaluation = llm.invoke(prompt)
@@ -522,7 +784,6 @@ def _run_llm_critic(
                 group.group_id,
                 exc,
             )
-            # Synthesise a failure evaluation so the supervisor can route.
             evaluations[group.group_id] = QAEvaluation(
                 group_id=group.group_id,
                 passed=False,
@@ -540,25 +801,26 @@ def _run_llm_critic(
 # Node entry point
 # ---------------------------------------------------------------------------
 
-@traceable(name="qa_critic") # for testing only
+
+@traceable(name="qa_critic")
 def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     """
-    LangGraph node: run the deterministic QA pipeline and evaluate each group.
+    LangGraph node: run the agentic QA pipeline and evaluate each group.
 
-    Runs exactly once per orchestrator invocation:
-      1. npm install
-      2. OWASP Dependency-Check
-      3. npm test
-      4. workspace diff (host vs sandbox)
-    Then calls the LLM critic per group.
+    The QA agent loop:
+      1. Must call run_dependency_install, run_security_scan, run_unit_tests (in order).
+      2. May call read-only review tools when failures or ambiguous signals need
+         investigation.
+      3. After the loop, per-group QAEvaluation is extracted via structured LLM output.
 
-    Returns updates to ``OrchestratorState``.
+    Returns updates to OrchestratorState.
     """
     valid_groups: List[VulnerabilityGroup] = state.get("valid_groups") or []
     workspace_volume: Optional[str] = state.get("workspace_volume")
     repo_root: Optional[str] = state.get("repo_root")
     action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
     group_strategies: Dict[str, str] = state.get("group_strategies") or {}
+    candidate_changed_files: List[str] = state.get("changed_files") or []
 
     if not valid_groups:
         logger.info("qa_critic: no valid groups — skipping QA.")
@@ -596,42 +858,62 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         len(target_identifiers),
     )
 
-    # ------------------------------------------------------------------
-    # Open sandbox and run QA pipeline (exactly once)
-    # ------------------------------------------------------------------
     errors: List[str] = []
+    loop_result = None
+    results: Optional[_QAExecutionResults] = None
+
+    # ------------------------------------------------------------------
+    # Open sandbox and run bounded QA agent loop
+    # ------------------------------------------------------------------
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            # 1. Install
-            logger.info("qa_critic: running npm install.")
-            install_ok, install_summary = _run_install(sandbox)
-            if not install_ok:
-                logger.warning("qa_critic: install failed — %s", install_summary[:200])
-
-            # 2. Security scan
-            logger.info("qa_critic: running OWASP Dependency-Check.")
-            scan_ok, scan_summary, remaining_identifiers = _run_security_scan(
-                sandbox, workspace_volume, target_identifiers
+            tools, results = build_qa_toolbelt(
+                sandbox=sandbox,
+                workspace_volume=workspace_volume,
+                target_identifiers=target_identifiers,
+                candidate_changed_files=candidate_changed_files,
+                host_repo_root=repo_root,
             )
-            if not scan_ok:
-                logger.warning("qa_critic: scan failed — %s", scan_summary[:200])
 
-            # 3. Unit tests
-            logger.info("qa_critic: running npm test.")
-            test_ok, test_summary = _run_unit_tests(sandbox)
-            if not test_ok:
-                logger.warning("qa_critic: tests failed — %s", test_summary[:200])
+            system_prompt = _build_qa_system_prompt(
+                valid_groups=valid_groups,
+                group_strategies=group_strategies,
+                action_summaries=action_summaries,
+                candidate_changed_files=candidate_changed_files,
+            )
 
-            # 4. Workspace diff
-            logger.info("qa_critic: generating workspace diff.")
-            if repo_root:
-                diff_text, changed_files = _generate_workspace_diff(
-                    repo_root,
-                    sandbox,
-                    state.get("changed_files") or [],
-                )
-            else:
-                diff_text, changed_files = "", []
+            from langchain_openai import ChatOpenAI
+
+            model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+            llm = ChatOpenAI(model=model_name, temperature=0)
+
+            initial_messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(
+                    content=(
+                        "Begin your QA review now. "
+                        "Call run_dependency_install, run_security_scan, and run_unit_tests "
+                        "in order first. Then use review tools only if needed. "
+                        "When finished, state your final conclusions per group."
+                    )
+                ),
+            ]
+
+            logger.info("qa_critic: starting bounded QA agent loop.")
+            loop_result = run_bounded_subagent_loop(
+                llm=llm,
+                tools=tools,
+                initial_messages=initial_messages,
+                touched_files=set(),
+            )
+            logger.info(
+                "qa_critic: agent loop complete. final_text_len=%d tool_events=%d",
+                len(loop_result.final_text),
+                len(loop_result.tool_events),
+            )
+
+            if loop_result.errors:
+                errors.extend(loop_result.errors)
 
     except RuntimeError as exc:
         err = f"qa_critic: Docker sandbox unavailable — {exc}"
@@ -655,22 +937,64 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         }
 
     # ------------------------------------------------------------------
-    # LLM evaluation (one call per group, outside sandbox context)
+    # Verify that all required execution tools were called by the agent
     # ------------------------------------------------------------------
-    logger.info("qa_critic: running LLM critic for %d groups.", len(valid_groups))
-    qa_evaluations = _run_llm_critic(
-        groups=valid_groups,
+    assert results is not None  # guarded by the except above
+    missing_tools = []
+    if results.install is None:
+        missing_tools.append("run_dependency_install")
+    if results.scan is None:
+        missing_tools.append("run_security_scan")
+    if results.tests is None:
+        missing_tools.append("run_unit_tests")
+
+    if missing_tools:
+        err = (
+            f"qa_critic: agent did not call required execution tool(s): "
+            f"{', '.join(missing_tools)}. Cannot produce a valid evaluation."
+        )
+        logger.error(err)
+        errors.append(err)
+        failed_evals = {
+            g.group_id: QAEvaluation(
+                group_id=g.group_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback=(
+                    f"QA agent failed to run required execution tool(s): "
+                    f"{', '.join(missing_tools)}. This is an infrastructure failure. "
+                    "Please retry."
+                ),
+            )
+            for g in valid_groups
+        }
+        return {
+            "qa_evaluations": failed_evals,
+            "eval_status": "failures_detected",
+            "status": "qa_failed",
+            "errors": errors,
+            "changed_files": candidate_changed_files,
+        }
+
+    # ------------------------------------------------------------------
+    # Build agent transcript and extract per-group structured evaluations
+    # ------------------------------------------------------------------
+    assert loop_result is not None
+    transcript_parts = []
+    for event in loop_result.tool_events:
+        transcript_parts.append(f"[TOOL: {event.name}]\n{event.content[:1000]}")
+    transcript_parts.append(f"[AGENT FINAL]\n{loop_result.final_text}")
+    agent_transcript = "\n\n".join(transcript_parts)
+
+    logger.info(
+        "qa_critic: extracting structured evaluations for %d groups.", len(valid_groups)
+    )
+    qa_evaluations = _extract_group_evaluations(
+        valid_groups=valid_groups,
         group_strategies=group_strategies,
         action_summaries=action_summaries,
-        install_ok=install_ok,
-        install_summary=install_summary,
-        scan_ok=scan_ok,
-        scan_summary=scan_summary,
-        remaining_identifiers=remaining_identifiers,
-        test_ok=test_ok,
-        test_summary=test_summary,
-        diff_text=diff_text,
-        changed_files=changed_files,
+        results=results,
+        agent_transcript=agent_transcript,
     )
 
     all_passed = all(ev.passed for ev in qa_evaluations.values())
@@ -687,6 +1011,6 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         "qa_evaluations": qa_evaluations,
         "eval_status": eval_status,
         "status": "qa_completed",
-        "changed_files": changed_files,
+        "changed_files": candidate_changed_files,
         "errors": errors,
     }

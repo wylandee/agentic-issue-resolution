@@ -9,9 +9,13 @@ Covers:
   - remaining target identifier detection
   - unit test success/failure extraction
   - host-vs-workspace diff generation
-  - one install, one scan, one test run per QA node invocation
-  - .with_structured_output(QAEvaluation) usage
-  - all-pass and mixed-failure eval_status
+  - one-shot guards on execution tools
+  - toolbelt composition (execution + review tools; no edit tools)
+  - review tool path safety (read_file_context rejects absolute/traversal paths)
+  - generate_workspace_diff returns empty-diff note when no candidates given
+  - qa_failed when agent skips a required execution tool
+  - .with_structured_output(QAEvaluation) usage in _extract_group_evaluations
+  - all-pass and mixed-failure eval_status via agent loop mocking
   - QA tools are NOT present in update/workaround subagent toolbelts
 """
 from __future__ import annotations
@@ -43,7 +47,9 @@ from src.orchestrator.qa_critic import (
     _ODC_CACHE_VOLUME,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
+    _QAExecutionResults,
     _collect_target_identifiers,
+    _extract_group_evaluations,
     _generate_workspace_diff,
     _parse_report_identifiers,
     _read_report_from_workspace,
@@ -51,6 +57,8 @@ from src.orchestrator.qa_critic import (
     _run_odc,
     _run_security_scan,
     _run_unit_tests,
+    _validate_qa_path,
+    build_qa_toolbelt,
     run_qa_critic_node,
 )
 
@@ -486,9 +494,341 @@ class TestGenerateWorkspaceDiff:
         assert "app.js" in diff_text
         assert "other.js" not in diff_text
 
+    def test_empty_candidates_returns_empty_diff_note(self, tmp_path):
+        """When no candidate files are given, diff returns an empty-diff note."""
+        sandbox = MagicMock()
+        diff_text, changed = _generate_workspace_diff(str(tmp_path), sandbox, [])
+        assert changed == []
+        assert "empty" in diff_text.lower() or "no changed files" in diff_text.lower()
+        sandbox.read_file.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
-# run_qa_critic_node
+# build_qa_toolbelt — toolbelt composition
+# ---------------------------------------------------------------------------
+
+
+class TestBuildQaToolbelt:
+    """Verify the QA toolbelt has the right tools and no dangerous edit tools."""
+
+    _EXECUTION_TOOL_NAMES = {
+        "run_dependency_install",
+        "run_security_scan",
+        "run_unit_tests",
+    }
+    _REVIEW_TOOL_NAMES = {
+        "list_changed_files",
+        "generate_workspace_diff",
+        "read_file_context",
+        "search_codebase_pattern",
+        "inspect_ast_symbol",
+        "query_qa_logs",
+    }
+    _FORBIDDEN_TOOL_NAMES = {
+        "deterministic_search_replace",
+        "modify_npm_dependency",
+        "revert_workspace_file",
+        "validate_manifest_sync",
+        "validate_code_syntax",
+    }
+
+    def _make_toolbelt(self, candidate_changed_files=None):
+        sandbox = MagicMock()
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers={"CVE-2021-23337"},
+            candidate_changed_files=candidate_changed_files or ["package.json"],
+            host_repo_root="/tmp/repo",
+        )
+        return tools, results
+
+    def test_contains_all_execution_tools(self):
+        tools, _ = self._make_toolbelt()
+        tool_names = {t.name for t in tools}
+        assert self._EXECUTION_TOOL_NAMES.issubset(tool_names)
+
+    def test_contains_all_review_tools(self):
+        tools, _ = self._make_toolbelt()
+        tool_names = {t.name for t in tools}
+        assert self._REVIEW_TOOL_NAMES.issubset(tool_names)
+
+    def test_does_not_contain_edit_tools(self):
+        tools, _ = self._make_toolbelt()
+        tool_names = {t.name for t in tools}
+        for forbidden in self._FORBIDDEN_TOOL_NAMES:
+            assert forbidden not in tool_names, f"Forbidden tool '{forbidden}' found in QA toolbelt"
+
+    def test_returns_empty_results_cache_initially(self):
+        _, results = self._make_toolbelt()
+        assert results.install is None
+        assert results.scan is None
+        assert results.tests is None
+
+
+# ---------------------------------------------------------------------------
+# One-shot execution tool guards
+# ---------------------------------------------------------------------------
+
+
+class TestQAExecutionToolGuards:
+    """Verify that each execution tool caches its result and returns [CACHED] on repeat calls."""
+
+    def _make_toolbelt_with_mock_helpers(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0, stdout="ok", stderr="", duration_seconds=0.5
+        )
+        sandbox.read_file.return_value = None
+
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("src.orchestrator.qa_critic._run_odc") as mock_odc, \
+             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+            mock_odc.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            tools, results = build_qa_toolbelt(
+                sandbox=sandbox,
+                workspace_volume="test-vol",
+                target_identifiers=set(),
+                candidate_changed_files=["package.json"],
+                host_repo_root="/tmp/repo",
+            )
+        return tools, results, sandbox
+
+    def _get_tool(self, tools, name):
+        for t in tools:
+            if t.name == name:
+                return t
+        raise KeyError(f"Tool '{name}' not found")
+
+    def test_run_dependency_install_caches_result(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0, stdout="ok", stderr="", duration_seconds=0.5
+        )
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],
+            host_repo_root=None,
+        )
+        install_tool = self._get_tool(tools, "run_dependency_install")
+
+        first = install_tool.invoke({})
+        second = install_tool.invoke({})
+
+        assert results.install is not None
+        assert "[CACHED" in second
+        # Underlying sandbox.run called only once
+        assert sandbox.run.call_count == 1
+
+    def test_run_security_scan_caches_result(self):
+        sandbox = MagicMock()
+        with patch("shutil.which", return_value=None):
+            tools, results = build_qa_toolbelt(
+                sandbox=sandbox,
+                workspace_volume="test-vol",
+                target_identifiers={"CVE-2021-23337"},
+                candidate_changed_files=[],
+                host_repo_root=None,
+            )
+        scan_tool = self._get_tool(tools, "run_security_scan")
+
+        first = scan_tool.invoke({})
+        second = scan_tool.invoke({})
+
+        assert results.scan is not None
+        assert "[CACHED" in second
+
+    def test_run_unit_tests_caches_result(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0, stdout="ok", stderr="", duration_seconds=0.5
+        )
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],
+            host_repo_root=None,
+        )
+        test_tool = self._get_tool(tools, "run_unit_tests")
+
+        first = test_tool.invoke({})
+        second = test_tool.invoke({})
+
+        assert results.tests is not None
+        assert "[CACHED" in second
+        assert sandbox.run.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Review tool safety
+# ---------------------------------------------------------------------------
+
+
+class TestQAReviewToolSafety:
+    """Verify read_file_context rejects dangerous paths."""
+
+    def _get_read_file_tool(self, sandbox=None):
+        if sandbox is None:
+            sandbox = MagicMock()
+        tools, _ = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],
+            host_repo_root=None,
+        )
+        for t in tools:
+            if t.name == "read_file_context":
+                return t
+        raise KeyError("read_file_context not found")
+
+    def test_rejects_absolute_path(self):
+        tool = self._get_read_file_tool()
+        result = tool.invoke({"file_path": "/etc/passwd"})
+        assert "ERROR" in result
+        assert "absolute" in result.lower()
+
+    def test_rejects_path_traversal(self):
+        tool = self._get_read_file_tool()
+        result = tool.invoke({"file_path": "../../etc/passwd"})
+        assert "ERROR" in result
+
+    def test_returns_file_content_for_valid_path(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "const x = 1;\n"
+        tool = self._get_read_file_tool(sandbox)
+
+        result = tool.invoke({"file_path": "src/app.js"})
+        assert "const x = 1;" in result
+        sandbox.read_file.assert_called_once_with("src/app.js")
+
+    def test_returns_error_when_file_not_found(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = None
+        tool = self._get_read_file_tool(sandbox)
+
+        result = tool.invoke({"file_path": "nonexistent.js"})
+        assert "ERROR" in result
+        assert "not found" in result.lower()
+
+
+class TestValidateQaPath:
+    """Unit tests for the _validate_qa_path helper."""
+
+    def test_accepts_relative_path(self):
+        assert _validate_qa_path("src/app.js") == "src/app.js"
+
+    def test_accepts_nested_relative_path(self):
+        assert _validate_qa_path("a/b/c.ts") == "a/b/c.ts"
+
+    def test_rejects_empty_string(self):
+        with pytest.raises(ValueError, match="required"):
+            _validate_qa_path("")
+
+    def test_rejects_absolute_path(self):
+        with pytest.raises(ValueError, match="absolute"):
+            _validate_qa_path("/etc/passwd")
+
+    def test_rejects_path_traversal(self):
+        with pytest.raises(ValueError, match="traversal"):
+            _validate_qa_path("../../secret")
+
+    def test_normalizes_backslashes(self):
+        assert _validate_qa_path("src\\app.js") == "src/app.js"
+
+
+# ---------------------------------------------------------------------------
+# generate_workspace_diff as review tool (no candidates)
+# ---------------------------------------------------------------------------
+
+
+class TestQADiffToolNoCandidates:
+    """Verify generate_workspace_diff tool returns an informative note when no candidates exist."""
+
+    def test_empty_candidates_returns_informative_note(self):
+        sandbox = MagicMock()
+        tools, _ = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],  # empty
+            host_repo_root="/tmp/repo",
+        )
+        diff_tool = next(t for t in tools if t.name == "generate_workspace_diff")
+        result = diff_tool.invoke({})
+        # Should mention no changed files, not crash
+        assert "empty" in result.lower() or "no changed files" in result.lower()
+        sandbox.read_file.assert_not_called()
+
+    def test_no_host_repo_root_returns_error(self):
+        sandbox = MagicMock()
+        tools, _ = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=["src/app.js"],
+            host_repo_root=None,  # not set
+        )
+        diff_tool = next(t for t in tools if t.name == "generate_workspace_diff")
+        result = diff_tool.invoke({})
+        assert "ERROR" in result
+
+
+# ---------------------------------------------------------------------------
+# query_qa_logs tool
+# ---------------------------------------------------------------------------
+
+
+class TestQueryQaLogs:
+    """Verify query_qa_logs returns cached data and handles missing runs correctly."""
+
+    def _get_query_tool(self):
+        sandbox = MagicMock()
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],
+            host_repo_root=None,
+        )
+        tool = next(t for t in tools if t.name == "query_qa_logs")
+        return tool, results
+
+    def test_returns_error_when_install_not_run(self):
+        tool, _ = self._get_query_tool()
+        result = tool.invoke({"log_type": "install"})
+        assert "ERROR" in result
+
+    def test_returns_cached_install_log(self):
+        tool, results = self._get_query_tool()
+        results.install = (True, "npm install output here")
+        result = tool.invoke({"log_type": "install"})
+        assert "npm install output here" in result
+
+    def test_returns_cached_scan_log(self):
+        tool, results = self._get_query_tool()
+        results.scan = (True, "scan output here", set())
+        result = tool.invoke({"log_type": "scan"})
+        assert "scan output here" in result
+
+    def test_returns_cached_tests_log(self):
+        tool, results = self._get_query_tool()
+        results.tests = (True, "test output here")
+        result = tool.invoke({"log_type": "tests"})
+        assert "test output here" in result
+
+    def test_invalid_log_type_returns_error(self):
+        tool, _ = self._get_query_tool()
+        result = tool.invoke({"log_type": "unknown"})
+        assert "ERROR" in result
+
+
+# ---------------------------------------------------------------------------
+# run_qa_critic_node — agentic loop integration
 # ---------------------------------------------------------------------------
 
 
@@ -500,6 +840,7 @@ def _make_minimal_state(
     workspace_volume="test-vol",
     repo_root="/tmp/repo",
     group_strategies=None,
+    changed_files=None,
 ):
     resolved_groups = [_make_group()] if groups is _MISSING else groups
     return {
@@ -508,69 +849,89 @@ def _make_minimal_state(
         "repo_root": repo_root,
         "action_summaries": [],
         "group_strategies": group_strategies or {},
+        "changed_files": changed_files or [],
     }
 
 
+def _make_loop_result(final_text="QA review complete.", tool_events=None, errors=None):
+    """Build a mock SubagentRuntimeResult."""
+    from src.orchestrator.subagent_runtime import SubagentRuntimeResult, ToolEvent
+
+    return SubagentRuntimeResult(
+        final_text=final_text,
+        tool_events=tool_events or [],
+        changed_files=[],
+        errors=errors or [],
+    )
+
+
+def _make_fully_populated_results(ok=True):
+    """Build a _QAExecutionResults with all three phases filled in."""
+    r = _QAExecutionResults()
+    r.install = (ok, "npm install succeeded." if ok else "npm install FAILED")
+    r.scan = (ok, "Dependency-Check OK." if ok else "scan FAILED", set())
+    r.tests = (ok, "npm test passed." if ok else "npm test FAILED")
+    return r
+
+
 class TestRunQACriticNode:
-    """Tests for the full node entry point."""
+    """Tests for the full node entry point (agent loop mocked)."""
 
-    def _patch_all_helpers(
+    def _patch_node(
         self,
-        install_ok=True,
-        scan_ok=True,
-        test_ok=True,
-        remaining_ids=None,
+        results=None,
+        loop_result=None,
         llm_evals=None,
+        group=None,
     ):
-        """Return a dict of patches suitable for use with contextlib.ExitStack."""
-        remaining_ids = remaining_ids or set()
-
-        group = _make_group()
+        """
+        Return patches for the node's two main external dependencies:
+        - run_bounded_subagent_loop → returns loop_result
+        - build_qa_toolbelt → returns (tools, results)
+        - _extract_group_evaluations → returns llm_evals
+        - DockerSandbox → context manager mock
+        """
+        if group is None:
+            group = _make_group()
+        if results is None:
+            results = _make_fully_populated_results(ok=True)
+        if loop_result is None:
+            loop_result = _make_loop_result()
         if llm_evals is None:
             llm_evals = {group.group_id: QAEvaluation(group_id=group.group_id, passed=True)}
 
+        mock_sandbox = MagicMock()
+        mock_sandbox.__enter__ = MagicMock(return_value=mock_sandbox)
+        mock_sandbox.__exit__ = MagicMock(return_value=None)
+
         return {
-            "install": patch(
-                "src.orchestrator.qa_critic._run_install",
-                return_value=(install_ok, "install ok" if install_ok else "install FAILED"),
-            ),
-            "scan": patch(
-                "src.orchestrator.qa_critic._run_security_scan",
-                return_value=(scan_ok, "scan ok" if scan_ok else "scan FAILED", remaining_ids),
-            ),
-            "test": patch(
-                "src.orchestrator.qa_critic._run_unit_tests",
-                return_value=(test_ok, "tests passed" if test_ok else "tests FAILED"),
-            ),
-            "diff": patch(
-                "src.orchestrator.qa_critic._generate_workspace_diff",
-                return_value=("diff text", ["package.json"]),
-            ),
-            "llm": patch(
-                "src.orchestrator.qa_critic._run_llm_critic",
-                return_value=llm_evals,
-            ),
             "sandbox": patch(
                 "src.orchestrator.qa_critic.DockerSandbox",
-                return_value=MagicMock(__enter__=MagicMock(return_value=MagicMock()),
-                                       __exit__=MagicMock(return_value=None)),
+                return_value=mock_sandbox,
             ),
+            "toolbelt": patch(
+                "src.orchestrator.qa_critic.build_qa_toolbelt",
+                return_value=([], results),
+            ),
+            "loop": patch(
+                "src.orchestrator.qa_critic.run_bounded_subagent_loop",
+                return_value=loop_result,
+            ),
+            "evals": patch(
+                "src.orchestrator.qa_critic._extract_group_evaluations",
+                return_value=llm_evals,
+            ),
+            "llm": patch("langchain_openai.ChatOpenAI"),
         }
 
     def test_all_passed_returns_all_passed_eval_status(self):
         group = _make_group()
         state = _make_minimal_state(groups=[group])
         evals = {group.group_id: QAEvaluation(group_id=group.group_id, passed=True)}
+        patches = self._patch_node(group=group, llm_evals=evals)
 
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._run_security_scan", return_value=(True, "ok", set())), \
-             patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._generate_workspace_diff", return_value=("", [])), \
-             patch("src.orchestrator.qa_critic._run_llm_critic", return_value=evals), \
-             patch("src.orchestrator.qa_critic.DockerSandbox") as MockSandbox:
-            MockSandbox.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            MockSandbox.return_value.__exit__ = MagicMock(return_value=None)
-
+        with patches["sandbox"], patches["toolbelt"], patches["loop"], \
+             patches["evals"], patches["llm"]:
             result = run_qa_critic_node(state)
 
         assert result["eval_status"] == "all_passed"
@@ -589,17 +950,10 @@ class TestRunQACriticNode:
                 retry_feedback="CVE still present.",
             )
         }
+        patches = self._patch_node(group=group, llm_evals=evals)
 
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._run_security_scan",
-                   return_value=(False, "scan failed", {"CVE-2021-23337"})), \
-             patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._generate_workspace_diff", return_value=("", [])), \
-             patch("src.orchestrator.qa_critic._run_llm_critic", return_value=evals), \
-             patch("src.orchestrator.qa_critic.DockerSandbox") as MockSandbox:
-            MockSandbox.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            MockSandbox.return_value.__exit__ = MagicMock(return_value=None)
-
+        with patches["sandbox"], patches["toolbelt"], patches["loop"], \
+             patches["evals"], patches["llm"]:
             result = run_qa_critic_node(state)
 
         assert result["eval_status"] == "failures_detected"
@@ -626,102 +980,210 @@ class TestRunQACriticNode:
         group = _make_group()
         state = _make_minimal_state(groups=[group])
 
-        with patch("src.orchestrator.qa_critic.DockerSandbox") as MockSandbox:
-            MockSandbox.return_value.__enter__ = MagicMock(
-                side_effect=RuntimeError("Docker daemon unreachable: ...")
-            )
-            MockSandbox.return_value.__exit__ = MagicMock(return_value=None)
+        mock_sandbox = MagicMock()
+        mock_sandbox.__enter__ = MagicMock(
+            side_effect=RuntimeError("Docker daemon unreachable")
+        )
+        mock_sandbox.__exit__ = MagicMock(return_value=None)
 
+        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox):
             result = run_qa_critic_node(state)
 
         assert result["status"] == "qa_failed"
         assert result["eval_status"] == "failures_detected"
 
-    def test_install_scan_test_each_called_exactly_once(self):
+    def test_changed_files_propagated_from_state(self):
         group = _make_group()
-        state = _make_minimal_state(groups=[group])
+        state = _make_minimal_state(
+            groups=[group],
+            changed_files=["package.json", "src/app.ts"],
+        )
         evals = {group.group_id: QAEvaluation(group_id=group.group_id, passed=True)}
+        patches = self._patch_node(group=group, llm_evals=evals)
 
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")) as mock_install, \
-             patch("src.orchestrator.qa_critic._run_security_scan",
-                   return_value=(True, "ok", set())) as mock_scan, \
-             patch("src.orchestrator.qa_critic._run_unit_tests",
-                   return_value=(True, "ok")) as mock_test, \
-             patch("src.orchestrator.qa_critic._generate_workspace_diff", return_value=("", [])), \
-             patch("src.orchestrator.qa_critic._run_llm_critic", return_value=evals), \
-             patch("src.orchestrator.qa_critic.DockerSandbox") as MockSandbox:
-            MockSandbox.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            MockSandbox.return_value.__exit__ = MagicMock(return_value=None)
-
-            run_qa_critic_node(state)
-
-        assert mock_install.call_count == 1
-        assert mock_scan.call_count == 1
-        assert mock_test.call_count == 1
-
-    def test_changed_files_propagated_from_diff(self):
-        group = _make_group()
-        state = _make_minimal_state(groups=[group])
-        evals = {group.group_id: QAEvaluation(group_id=group.group_id, passed=True)}
-
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._run_security_scan",
-                   return_value=(True, "ok", set())), \
-             patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")), \
-             patch("src.orchestrator.qa_critic._generate_workspace_diff",
-                   return_value=("some diff", ["package.json", "src/app.ts"])), \
-             patch("src.orchestrator.qa_critic._run_llm_critic", return_value=evals), \
-             patch("src.orchestrator.qa_critic.DockerSandbox") as MockSandbox:
-            MockSandbox.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            MockSandbox.return_value.__exit__ = MagicMock(return_value=None)
-
+        with patches["sandbox"], patches["toolbelt"], patches["loop"], \
+             patches["evals"], patches["llm"]:
             result = run_qa_critic_node(state)
 
         assert "package.json" in result["changed_files"]
         assert "src/app.ts" in result["changed_files"]
 
+    def test_loop_errors_propagated_to_result(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        loop_result = _make_loop_result(errors=["Subagent exceeded max rounds."])
+        evals = {group.group_id: QAEvaluation(group_id=group.group_id, passed=True)}
+        patches = self._patch_node(group=group, loop_result=loop_result, llm_evals=evals)
+
+        with patches["sandbox"], patches["toolbelt"], patches["loop"], \
+             patches["evals"], patches["llm"]:
+            result = run_qa_critic_node(state)
+
+        assert any("max rounds" in e.lower() or "exceeded" in e.lower() for e in result["errors"])
+
 
 # ---------------------------------------------------------------------------
-# LLM critic structured output check
+# Missing execution tools → qa_failed
 # ---------------------------------------------------------------------------
 
 
-class TestLlmCriticStructuredOutput:
+class TestQAMissingExecutionTools:
+    """Verify qa_failed is returned when the agent skips a required tool."""
+
+    def _run_with_partial_results(self, results: _QAExecutionResults):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+
+        mock_sandbox = MagicMock()
+        mock_sandbox.__enter__ = MagicMock(return_value=mock_sandbox)
+        mock_sandbox.__exit__ = MagicMock(return_value=None)
+
+        loop_result = _make_loop_result()
+
+        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox), \
+             patch("src.orchestrator.qa_critic.build_qa_toolbelt", return_value=([], results)), \
+             patch("src.orchestrator.qa_critic.run_bounded_subagent_loop", return_value=loop_result), \
+             patch("langchain_openai.ChatOpenAI"):
+            return run_qa_critic_node(state), group
+
+    def test_missing_install_returns_qa_failed(self):
+        results = _QAExecutionResults()
+        results.scan = (True, "ok", set())
+        results.tests = (True, "ok")
+        # install is None
+
+        result, group = self._run_with_partial_results(results)
+
+        assert result["status"] == "qa_failed"
+        assert result["eval_status"] == "failures_detected"
+        assert result["qa_evaluations"][group.group_id].passed is False
+        assert any("run_dependency_install" in e for e in result["errors"])
+
+    def test_missing_scan_returns_qa_failed(self):
+        results = _QAExecutionResults()
+        results.install = (True, "ok")
+        results.tests = (True, "ok")
+        # scan is None
+
+        result, group = self._run_with_partial_results(results)
+
+        assert result["status"] == "qa_failed"
+        assert any("run_security_scan" in e for e in result["errors"])
+
+    def test_missing_tests_returns_qa_failed(self):
+        results = _QAExecutionResults()
+        results.install = (True, "ok")
+        results.scan = (True, "ok", set())
+        # tests is None
+
+        result, group = self._run_with_partial_results(results)
+
+        assert result["status"] == "qa_failed"
+        assert any("run_unit_tests" in e for e in result["errors"])
+
+    def test_all_tools_missing_lists_all_in_error(self):
+        results = _QAExecutionResults()
+        # All None
+
+        result, _ = self._run_with_partial_results(results)
+
+        assert result["status"] == "qa_failed"
+        error_text = " ".join(result["errors"])
+        assert "run_dependency_install" in error_text
+        assert "run_security_scan" in error_text
+        assert "run_unit_tests" in error_text
+
+
+# ---------------------------------------------------------------------------
+# _extract_group_evaluations (replaces TestLlmCriticStructuredOutput)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractGroupEvaluations:
+    """The extraction step must call .with_structured_output(QAEvaluation) per group."""
+
     def test_uses_with_structured_output_for_qa_evaluation(self):
-        """The LLM must be called with .with_structured_output(QAEvaluation)."""
-        from src.orchestrator.qa_critic import _run_llm_critic
         from src.contracts.schemas import AgentActionSummary, AgentActionStatus
 
         group = _make_group()
         mock_eval = QAEvaluation(group_id=group.group_id, passed=True)
 
+        results = _make_fully_populated_results(ok=True)
+
         with patch("langchain_openai.ChatOpenAI") as MockChatOpenAI:
             mock_llm_instance = MagicMock()
-            mock_llm_instance.invoke.return_value = mock_eval
             mock_structured = MagicMock()
             mock_structured.invoke.return_value = mock_eval
             mock_llm_instance.with_structured_output.return_value = mock_structured
             MockChatOpenAI.return_value = mock_llm_instance
 
-            result = _run_llm_critic(
-                groups=[group],
+            result = _extract_group_evaluations(
+                valid_groups=[group],
                 group_strategies={group.group_id: "version_bump"},
                 action_summaries=[],
-                install_ok=True,
-                install_summary="ok",
-                scan_ok=True,
-                scan_summary="ok",
-                remaining_identifiers=set(),
-                test_ok=True,
-                test_summary="ok",
-                diff_text="",
-                changed_files=[],
+                results=results,
+                agent_transcript="Agent concluded all is well.",
             )
 
-        # Verify that with_structured_output was called with QAEvaluation
         mock_llm_instance.with_structured_output.assert_called_once_with(QAEvaluation)
         assert group.group_id in result
         assert result[group.group_id].passed is True
+
+    def test_handles_llm_exception_gracefully(self):
+        group = _make_group()
+        results = _make_fully_populated_results(ok=True)
+
+        with patch("langchain_openai.ChatOpenAI") as MockChatOpenAI:
+            mock_llm_instance = MagicMock()
+            mock_structured = MagicMock()
+            mock_structured.invoke.side_effect = RuntimeError("LLM quota exceeded")
+            mock_llm_instance.with_structured_output.return_value = mock_structured
+            MockChatOpenAI.return_value = mock_llm_instance
+
+            result = _extract_group_evaluations(
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                results=results,
+                agent_transcript="",
+            )
+
+        assert group.group_id in result
+        ev = result[group.group_id]
+        assert ev.passed is False
+        assert ev.failure_category == FailureCategory.SECURITY_FLAG
+        assert "exception" in ev.retry_feedback.lower()
+
+    def test_uses_cached_execution_results_in_prompt(self):
+        """Verify that missing results produce the correct fallback messages."""
+        group = _make_group()
+        results = _QAExecutionResults()  # all None — nothing was called
+
+        with patch("langchain_openai.ChatOpenAI") as MockChatOpenAI:
+            mock_llm_instance = MagicMock()
+            mock_structured = MagicMock()
+            captured_prompts = []
+            mock_eval = QAEvaluation(group_id=group.group_id, passed=False,
+                                     failure_category=FailureCategory.SECURITY_FLAG,
+                                     retry_feedback="tools not called")
+            def capture_invoke(prompt):
+                captured_prompts.append(prompt)
+                return mock_eval
+            mock_structured.invoke.side_effect = capture_invoke
+            mock_llm_instance.with_structured_output.return_value = mock_structured
+            MockChatOpenAI.return_value = mock_llm_instance
+
+            _extract_group_evaluations(
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                results=results,
+                agent_transcript="",
+            )
+
+        assert captured_prompts
+        prompt_text = captured_prompts[0]
+        assert "was not called" in prompt_text
 
 
 # ---------------------------------------------------------------------------
