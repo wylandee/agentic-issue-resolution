@@ -33,9 +33,11 @@ from src.contracts.schemas import (
     EditRequest,
     EditResult,
     FixPlan,
+    GroupRemediationStatus,
     LocalizedIssue,
     QAEvaluation,
     RoutingStrategy,
+    SupervisorDecision,
     SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -108,11 +110,19 @@ class OrchestratorState(TypedDict, total=False):
     constraints_ledger: Annotated[List[str], operator.add]
     retry_counts: Annotated[Dict[str, int], merge_dict_reducer]
     group_strategies: Annotated[Dict[str, RoutingStrategy], merge_dict_reducer]
+    group_statuses: Annotated[Dict[str, GroupRemediationStatus], merge_dict_reducer]
     qa_evaluations: Annotated[Dict[str, QAEvaluation], merge_dict_reducer]
     action_summaries: Annotated[List[AgentActionSummary], operator.add]
     changed_files: Annotated[List[str], operator.add]
 
     workspace_volume: Optional[str]
+
+    # Supervisor routing fields
+    next_routing_step: str
+    active_target_group_ids: List[str]
+    feedback_by_group: Annotated[Dict[str, str], merge_dict_reducer]
+    supervisor_instructions: str
+    eval_status: str
 
     status: str
     diff: str
@@ -158,11 +168,17 @@ def initial_orchestrator_state(
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
+        "group_statuses": {},
         "qa_evaluations": {},
         "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
+        "next_routing_step": "",
+        "active_target_group_ids": [],
+        "feedback_by_group": {},
+        "supervisor_instructions": "",
+        "eval_status": "",
         "diff": "",
         "errors": [],
     }

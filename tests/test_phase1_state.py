@@ -4,12 +4,14 @@ from src.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
+    GroupRemediationStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
     QAEvaluation,
     RoutingStrategy,
     Severity,
+    SupervisorDecision,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -79,10 +81,17 @@ class TestInitialStateHelpers:
         assert state["constraints_ledger"] == []
         assert state["retry_counts"] == {}
         assert state["group_strategies"] == {}
+        assert state["group_statuses"] == {}
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
         assert state["changed_files"] == []
         assert state["errors"] == []
+        # Supervisor routing defaults
+        assert state["next_routing_step"] == ""
+        assert state["active_target_group_ids"] == []
+        assert state["feedback_by_group"] == {}
+        assert state["supervisor_instructions"] == ""
+        assert state["eval_status"] == ""
         assert "messages" not in state
 
     def test_initial_update_subagent_state_initializes_ephemeral_fields(self, tmp_path):

@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -135,6 +135,16 @@ class AgentActionStatus(str, Enum):
 
     SUCCESS = "success"
     SURRENDER = "surrender"
+
+
+class GroupRemediationStatus(str, Enum):
+    """Lifecycle status for one vulnerability group in the remediation pipeline."""
+
+    PENDING = "pending"                              # Not yet touched by any subagent
+    OPTIMISTICALLY_FIXED = "optimistically_fixed"    # Subagent succeeded; awaiting QA
+    QA_PASSED = "qa_passed"                          # QA explicitly passed; terminal success
+    NEEDS_RETRY = "needs_retry"                      # QA failed; will be re-routed
+    UNFIXABLE = "unfixable"                          # Max retries exhausted; terminal failure
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1192,88 @@ class AgentActionSummary(BaseModel):
         if not cleaned:
             raise ValueError("summary must be a non-empty natural-language string.")
         return cleaned
+
+
+class SupervisorDecision(BaseModel):
+    """
+    Structured LLM output from the Supervisor Node.
+
+    Controls hub-and-spoke routing in the Phase 5 orchestrator graph.
+    Pydantic validators enforce routing invariants:
+    - ``workaround_subagent`` requires exactly one ``target_group_id``.
+    - ``update_subagent`` requires at least one ``target_group_id``.
+    - ``qa_critic`` and ``teardown`` require empty ``target_group_ids``.
+    - ``unfixable_group_ids`` and ``target_group_ids`` must not overlap.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    next_node: Literal[
+        "update_subagent", "workaround_subagent", "qa_critic", "teardown"
+    ] = Field(
+        ...,
+        description="The next node to route to in the orchestrator graph.",
+    )
+    updated_strategies: Dict[str, "RoutingStrategy"] = Field(
+        default_factory=dict,
+        description="Strategy pivots for specific group IDs (e.g. VERSION_BUMP → CODE_WORKAROUND).",
+    )
+    target_group_ids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Group IDs to send to the next subagent node. "
+            "Empty for qa_critic and teardown. "
+            "Exactly one entry for workaround_subagent. "
+            "One or more for update_subagent."
+        ),
+    )
+    unfixable_group_ids: List[str] = Field(
+        default_factory=list,
+        description="Group IDs that have hit MAX_RETRIES and should be marked unfixable.",
+    )
+    new_constraints: List[str] = Field(
+        default_factory=list,
+        description="New constraint strings to append to the constraints ledger.",
+    )
+    feedback_by_group: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Group-specific retry guidance keyed by group_id.",
+    )
+    instructions: str = Field(
+        ...,
+        min_length=1,
+        description="Default guidance applied to target groups without specific feedback.",
+    )
+    decision_reason: str = Field(
+        ...,
+        min_length=1,
+        description="Concise audit explanation of why this routing decision was made.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_routing_invariants(self) -> "SupervisorDecision":
+        node = self.next_node
+        targets = self.target_group_ids
+        unfixable = self.unfixable_group_ids
+
+        if node == "workaround_subagent" and len(targets) != 1:
+            raise ValueError(
+                f"workaround_subagent requires exactly 1 target_group_id, got {len(targets)}."
+            )
+        if node == "update_subagent" and len(targets) < 1:
+            raise ValueError(
+                "update_subagent requires at least 1 target_group_id."
+            )
+        if node in ("qa_critic", "teardown") and targets:
+            raise ValueError(
+                f"{node} must have empty target_group_ids, got {targets}."
+            )
+        overlap = set(unfixable) & set(targets)
+        if overlap:
+            raise ValueError(
+                f"unfixable_group_ids and target_group_ids must not overlap. Overlap: {overlap}"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

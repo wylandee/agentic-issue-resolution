@@ -25,9 +25,6 @@ from src.orchestrator import (
     run_remediation,
 )
 from src.orchestrator.graph import (
-    _PHASE5_REFACTOR_BLOCKED_STATUS,
-    remedy_phase_transition_node,
-    route_after_remedy_agent,
     route_after_workspace_builder,
 )
 
@@ -97,23 +94,30 @@ def _initial_state(tmp_path, groups):
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
+        "group_statuses": {},
         "qa_evaluations": {},
         "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
+        "next_routing_step": "",
+        "active_target_group_ids": [],
+        "feedback_by_group": {},
+        "supervisor_instructions": "",
+        "eval_status": "",
         "errors": [],
     }
 
 
 class TestPhase5Routing:
-    def test_route_after_workspace_builder(self):
-        assert route_after_workspace_builder({"status": "workspace_ready"}) == "remedy_agent"
+    def test_route_after_workspace_builder_routes_to_supervisor(self):
+        assert route_after_workspace_builder({"status": "workspace_ready"}) == "supervisor"
+
+    def test_route_after_workspace_builder_failure_routes_to_teardown(self):
         assert route_after_workspace_builder({"status": "workspace_build_failed"}) == "teardown"
 
-    def test_route_after_remedy_agent_always_goes_to_teardown(self):
-        for status in ("edits_completed", "no_changes_made", "remedy_failed"):
-            assert route_after_remedy_agent({"status": status}) == "teardown"
+    def test_route_after_workspace_builder_unknown_status_routes_to_teardown(self):
+        assert route_after_workspace_builder({"status": "something_else"}) == "teardown"
 
 
 class TestPhase5RunOrchestrator:
@@ -133,6 +137,8 @@ class TestPhase5RunOrchestrator:
         assert invoked_state["valid_groups"] == groups
         assert invoked_state["constraints_ledger"] == []
         assert invoked_state["changed_files"] == []
+        assert invoked_state["group_statuses"] == {}
+        assert invoked_state["next_routing_step"] == ""
         assert result["status"] == "completed"
 
     def test_run_orchestrator_passes_config_and_surfaces_trace_metadata(self, tmp_path):
@@ -184,7 +190,8 @@ class TestPhase5RunOrchestrator:
 
 
 class TestPhase5GraphIntegration:
-    def test_workspace_builder_success_hits_transition_blocker_then_teardown(self, tmp_path):
+    def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
+        """After workspace_builder succeeds, supervisor routes, then teardown runs."""
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
@@ -193,23 +200,37 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": "agent_workspace_deadbeef",
             }
         )
+        # Supervisor routes directly to teardown (simulates no workable groups)
+        supervisor = MagicMock(
+            return_value={
+                "status": "supervisor_routed",
+                "next_routing_step": "teardown",
+                "active_target_group_ids": [],
+                "group_statuses": {},
+                "group_strategies": {},
+                "retry_counts": {},
+                "constraints_ledger": [],
+                "feedback_by_group": {},
+                "supervisor_instructions": "done",
+            }
+        )
         teardown = MagicMock(
             return_value={
-                "status": _PHASE5_REFACTOR_BLOCKED_STATUS,
+                "status": "completed",
                 "workspace_volume": None,
             }
         )
 
-        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), patch(
-            "src.orchestrator.graph.run_teardown_node",
-            teardown,
-        ):
+        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), \
+             patch("src.orchestrator.graph.run_supervisor_node", supervisor), \
+             patch("src.orchestrator.graph.run_teardown_node", teardown):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
+        assert supervisor.call_count == 1
         assert teardown.call_count == 1
-        assert result["status"] == _PHASE5_REFACTOR_BLOCKED_STATUS
+        assert result["status"] == "completed"
 
     def test_workspace_builder_failure_still_tears_down(self, tmp_path):
         groups = [_group(IssueType.SAST, file_path="routes/login.ts")]
@@ -223,16 +244,123 @@ class TestPhase5GraphIntegration:
         )
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
-        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), patch(
-            "src.orchestrator.graph.run_teardown_node",
-            teardown,
-        ):
+        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), \
+             patch("src.orchestrator.graph.run_teardown_node", teardown):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
         assert teardown.call_count == 1
         assert result["status"] == "completed"
+
+    def test_supervisor_routes_to_update_subagent_then_back(self, tmp_path):
+        """Supervisor routes to update_subagent once, then supervisor routes to teardown."""
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        gid = groups[0].group_id
+
+        workspace_builder = MagicMock(return_value={
+            "status": "workspace_ready",
+            "workspace_volume": "vol123",
+        })
+
+        call_count = {"n": 0}
+
+        def supervisor_side_effect(state):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return {
+                    "status": "supervisor_routed",
+                    "next_routing_step": "update_subagent",
+                    "active_target_group_ids": [gid],
+                    "group_statuses": {},
+                    "group_strategies": {},
+                    "retry_counts": {},
+                    "constraints_ledger": [],
+                    "feedback_by_group": {},
+                    "supervisor_instructions": "bump it",
+                }
+            return {
+                "status": "supervisor_routed",
+                "next_routing_step": "teardown",
+                "active_target_group_ids": [],
+                "group_statuses": {},
+                "group_strategies": {},
+                "retry_counts": {},
+                "constraints_ledger": [],
+                "feedback_by_group": {},
+                "supervisor_instructions": "done",
+            }
+
+        supervisor = MagicMock(side_effect=supervisor_side_effect)
+        update_subagent = MagicMock(return_value={"errors": [], "group_statuses": {}})
+        teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
+
+        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), \
+             patch("src.orchestrator.graph.run_supervisor_node", supervisor), \
+             patch("src.orchestrator.graph.run_update_subagent_node", update_subagent), \
+             patch("src.orchestrator.graph.run_teardown_node", teardown):
+            graph = build_orchestrator_graph()
+            result = graph.invoke(_initial_state(tmp_path, groups))
+
+        assert supervisor.call_count == 2
+        assert teardown.call_count == 1
+
+    def test_supervisor_routes_to_qa_critic_then_back(self, tmp_path):
+        """Supervisor routes to qa_critic once, then to teardown."""
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+
+        workspace_builder = MagicMock(return_value={
+            "status": "workspace_ready",
+            "workspace_volume": "vol123",
+        })
+
+        call_count = {"n": 0}
+
+        def supervisor_side_effect(state):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return {
+                    "status": "supervisor_routed",
+                    "next_routing_step": "qa_critic",
+                    "active_target_group_ids": [],
+                    "group_statuses": {},
+                    "group_strategies": {},
+                    "retry_counts": {},
+                    "constraints_ledger": [],
+                    "feedback_by_group": {},
+                    "supervisor_instructions": "run qa",
+                }
+            return {
+                "status": "supervisor_routed",
+                "next_routing_step": "teardown",
+                "active_target_group_ids": [],
+                "group_statuses": {},
+                "group_strategies": {},
+                "retry_counts": {},
+                "constraints_ledger": [],
+                "feedback_by_group": {},
+                "supervisor_instructions": "done",
+            }
+
+        supervisor = MagicMock(side_effect=supervisor_side_effect)
+        qa_critic = MagicMock(return_value={
+            "qa_evaluations": {},
+            "eval_status": "all_passed",
+            "status": "qa_completed",
+            "errors": [],
+        })
+        teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
+
+        with patch("src.orchestrator.graph.run_workspace_builder_node", workspace_builder), \
+             patch("src.orchestrator.graph.run_supervisor_node", supervisor), \
+             patch("src.orchestrator.graph.run_qa_critic_node", qa_critic), \
+             patch("src.orchestrator.graph.run_teardown_node", teardown):
+            graph = build_orchestrator_graph()
+            result = graph.invoke(_initial_state(tmp_path, groups))
+
+        assert supervisor.call_count == 2
+        assert qa_critic.call_count == 1
+        assert teardown.call_count == 1
 
 
 class TestPhase5Exports:
@@ -244,10 +372,6 @@ class TestPhase5Exports:
         assert orchestrator_engine is not None
         assert callable(run_orchestrator)
 
-
-class TestPhase5TransitionBlocker:
-    def test_transition_blocker_returns_explicit_failure(self):
-        result = remedy_phase_transition_node({})
-
-        assert result["status"] == _PHASE5_REFACTOR_BLOCKED_STATUS
-        assert result["errors"]
+    def test_graph_compiles_without_error(self):
+        graph = build_orchestrator_graph()
+        assert graph is not None

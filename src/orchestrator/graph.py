@@ -17,22 +17,27 @@ Phase 4.1 graph topology
       |
     END
 
-Phase 5 graph topology
-----------------------
+Phase 5 graph topology (hub-and-spoke)
+---------------------------------------
 ::
 
     START
       |
+    triage
+      | triage_completed / failed | no_work -> teardown
     workspace_builder
-      | workspace_ready
-      v
-    remedy_agent
+      | workspace_ready / failed -> teardown
+    supervisor  <-----------------------------------+
+      |                                            |
+      +-> update_subagent ----------------------->-+
+      |                                            |
+      +-> workaround_subagent ------------------->-+
+      |                                            |
+      +-> qa_critic ------------------------------>+
       |
-      v
-    teardown
-      |
-      v
-     END
+      +-> teardown
+           |
+          END
 
 Public API
 ----------
@@ -56,9 +61,11 @@ from typing import Any, Dict, List, Optional
 from langgraph.graph import END, START, StateGraph
 
 from src.contracts.schemas import (
+    AgentActionStatus,
     EditStatus,
     FixPlan,
     FixPlanStatus,
+    GroupRemediationStatus,
     IssueType,
     LocalizedIssue,
     SystemContext,
@@ -71,21 +78,22 @@ from src.orchestrator.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
 )
+from src.orchestrator.qa_critic import run_qa_critic_node
 from src.orchestrator.state import (
     OrchestratorState,
     RemediationState,
     initial_orchestrator_state,
+    initial_update_subagent_state,
+    initial_workaround_subagent_state,
 )
+from src.orchestrator.supervisor_node import run_supervisor_node, supervisor_router
 from src.orchestrator.teardown_node import run_teardown_node
+from src.orchestrator.update_subagent import run_update_subagent_node
+from src.orchestrator.workaround_subagent import run_workaround_subagent_node
 from src.tools.edit_tools import apply_edit
 from src.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
-_PHASE5_REFACTOR_BLOCKED_STATUS = "phase5_refactor_blocked"
-_PHASE5_REFACTOR_BLOCKED_MESSAGE = (
-    "Phase 5 supervisor refactor in progress: the monolithic remedy agent has "
-    "been removed and Supervisor/QA routing is not implemented yet."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -347,29 +355,30 @@ def run_remediation(
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 routing
+# Phase 5 triage node and routing
 # ---------------------------------------------------------------------------
+
 
 def triage_node(state: OrchestratorState) -> Dict[str, Any]:
     """Run the Phase 4 triage pipeline."""
     issues = state.get("issues")
     system_context = state.get("system_context")
     repo_root = state.get("repo_root")
-    
+
     if not issues or not system_context:
         log.info("triage_node: issues or system_context not found, skipping triage.")
         return {"status": "triage_skipped"}
-        
+
     log.info("triage_node: running triage on %d issues.", len(issues))
-    
+
     try:
         results = run_triage_pipeline(issues, system_context, repo_root)
         valid_groups = [group for group, result in results if result.is_valid]
         log.info("triage_node: produced %d valid groups.", len(valid_groups))
-        
+
         if not valid_groups:
             return {"valid_groups": [], "status": "triage_completed_no_work"}
-            
+
         return {"valid_groups": valid_groups, "status": "triage_completed"}
     except Exception as exc:
         log.exception("triage_node: triage pipeline raised")
@@ -379,33 +388,163 @@ def triage_node(state: OrchestratorState) -> Dict[str, Any]:
             "errors": [f"triage_node raised: {exc}"],
         }
 
+
 def route_after_triage(state: OrchestratorState) -> str:
     """Route Phase 5 flow after the triage node."""
     status = state.get("status")
-    if status == "triage_completed_no_work":
-        return "teardown"
-    if status == "failed":
+    if status in ("triage_completed_no_work", "failed"):
         return "teardown"
     return "workspace_builder"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 wrapper nodes
+# ---------------------------------------------------------------------------
+
+
+def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
+    """
+    Bridge OrchestratorState → SubagentState for the batch dependency update subagent.
+
+    Reads ``active_target_group_ids`` from state to select the target groups,
+    calls ``run_update_subagent_node``, then merges results back into the
+    orchestrator state and updates ``group_statuses``.
+    """
+    active_ids = set(state.get("active_target_group_ids", []))
+    target_groups = [
+        g for g in state.get("valid_groups", []) if g.group_id in active_ids
+    ]
+
+    if not target_groups:
+        msg = "update_subagent: no valid groups found for active_target_group_ids."
+        log.warning(msg)
+        return {"errors": [msg]}
+
+    subagent_state = initial_update_subagent_state(
+        repo_root=state.get("repo_root", ""),
+        workspace_volume=state.get("workspace_volume", ""),
+        target_groups=target_groups,
+        constraints_ledger=list(state.get("constraints_ledger", [])),
+        feedback_by_group=dict(state.get("feedback_by_group", {})),
+    )
+
+    result = run_update_subagent_node(subagent_state)
+
+    from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
+    summary = result.get("action_summary")
+    succeeded = (
+        isinstance(summary, AgentActionSummary)
+        and summary.status == AgentActionStatus.SUCCESS
+    )
+    new_statuses = {
+        g.group_id: (
+            GroupRemediationStatus.OPTIMISTICALLY_FIXED
+            if succeeded
+            else GroupRemediationStatus.NEEDS_RETRY
+        )
+        for g in target_groups
+    }
+
+    out: Dict[str, Any] = {
+        "group_statuses": new_statuses,
+        "errors": result.get("errors", []),
+    }
+    if result.get("changed_files"):
+        out["changed_files"] = result["changed_files"]
+    if summary is not None:
+        out["action_summaries"] = [summary]
+    return out
+
+
+def run_workaround_subagent_from_orchestrator(
+    state: OrchestratorState,
+) -> Dict[str, Any]:
+    """
+    Bridge OrchestratorState → SubagentState for the single-group workaround subagent.
+
+    Takes the first entry of ``active_target_group_ids``, builds a
+    ``SubagentState``, calls ``run_workaround_subagent_node``, then merges
+    results back and updates ``group_statuses``.
+    """
+    active_ids = list(state.get("active_target_group_ids", []))
+    if not active_ids:
+        msg = "workaround_subagent: active_target_group_ids is empty."
+        log.warning(msg)
+        return {"errors": [msg]}
+
+    group_id = active_ids[0]
+    group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
+    target_group = group_by_id.get(group_id)
+
+    if target_group is None:
+        msg = f"workaround_subagent: group '{group_id}' not found in valid_groups."
+        log.warning(msg)
+        return {"errors": [msg]}
+
+    feedback_by_group = dict(state.get("feedback_by_group", {}))
+    subagent_state = initial_workaround_subagent_state(
+        repo_root=state.get("repo_root", ""),
+        workspace_volume=state.get("workspace_volume", ""),
+        target_group=target_group,
+        constraints_ledger=list(state.get("constraints_ledger", [])),
+        previous_feedback=feedback_by_group.get(group_id),
+    )
+
+    result = run_workaround_subagent_node(subagent_state)
+
+    from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
+    summary = result.get("action_summary")
+    succeeded = (
+        isinstance(summary, AgentActionSummary)
+        and summary.status == AgentActionStatus.SUCCESS
+    )
+    new_statuses = {
+        group_id: (
+            GroupRemediationStatus.OPTIMISTICALLY_FIXED
+            if succeeded
+            else GroupRemediationStatus.NEEDS_RETRY
+        )
+    }
+
+    out: Dict[str, Any] = {
+        "group_statuses": new_statuses,
+        "errors": result.get("errors", []),
+    }
+    if result.get("changed_files"):
+        out["changed_files"] = result["changed_files"]
+    if summary is not None:
+        out["action_summaries"] = [summary]
+    return out
+
+
+def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
+    """
+    Run the QA Critic against the current OrchestratorState.
+
+    ``changed_files`` accumulated in state are passed transparently to the
+    QA Critic (it reads them from state).  The wrapper does NOT re-emit
+    ``changed_files`` in its return dict to avoid double-counting via the
+    ``operator.add`` reducer.
+    """
+    result = run_qa_critic_node(state)
+    return {
+        "qa_evaluations": result.get("qa_evaluations", {}),
+        "eval_status": result.get("eval_status", ""),
+        "status": result.get("status", "qa_completed"),
+        "errors": result.get("errors", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 routing
+# ---------------------------------------------------------------------------
+
 
 def route_after_workspace_builder(state: OrchestratorState) -> str:
     """Route Phase 5 flow after the workspace builder node."""
     if state.get("status") == "workspace_ready":
-        return "remedy_agent"
+        return "supervisor"
     return "teardown"
-
-
-def route_after_remedy_agent(state: OrchestratorState) -> str:
-    """Route Phase 5 flow after the Remedy Agent."""
-    return "teardown"
-
-
-def remedy_phase_transition_node(_state: OrchestratorState) -> Dict[str, Any]:
-    """Explicit transitional blocker for the unfinished Phase 5 supervisor refactor."""
-    return {
-        "status": _PHASE5_REFACTOR_BLOCKED_STATUS,
-        "errors": [_PHASE5_REFACTOR_BLOCKED_MESSAGE],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -419,13 +558,19 @@ def build_orchestrator_graph():
 
     workflow.add_node("triage", triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
-    workflow.add_node("remedy_agent", remedy_phase_transition_node)
+    workflow.add_node("supervisor", run_supervisor_node)
+    workflow.add_node("update_subagent", run_update_subagent_from_orchestrator)
+    workflow.add_node("workaround_subagent", run_workaround_subagent_from_orchestrator)
+    workflow.add_node("qa_critic", run_qa_critic_from_orchestrator)
     workflow.add_node("teardown", run_teardown_node)
 
     workflow.add_edge(START, "triage")
     workflow.add_conditional_edges("triage", route_after_triage)
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
-    workflow.add_conditional_edges("remedy_agent", route_after_remedy_agent)
+    workflow.add_conditional_edges("supervisor", supervisor_router)
+    workflow.add_edge("update_subagent", "supervisor")
+    workflow.add_edge("workaround_subagent", "supervisor")
+    workflow.add_edge("qa_critic", "supervisor")
     workflow.add_edge("teardown", END)
 
     return workflow.compile()

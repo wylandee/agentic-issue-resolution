@@ -291,7 +291,7 @@ class TestValidateCodeSyntax:
         result = tools["validate_code_syntax"].invoke({"file_path": "src/index.ts"})
 
         assert result.startswith("SUCCESS:")
-        assert "npx tsc --noEmit" in sandbox.run.call_args[0][0]
+        assert "esbuild" in sandbox.run.call_args[0][0]
 
     def test_failure_surfaces_syntax_output(self):
         sandbox = MagicMock()

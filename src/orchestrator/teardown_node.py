@@ -10,7 +10,8 @@ from __future__ import annotations
 import difflib
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+import re
 
 from src.orchestrator.state import OrchestratorState
 from src.runtime.sandbox_mgr import DockerSandbox, get_docker_client
@@ -41,6 +42,56 @@ def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
         )
     )
 
+def _revert_unfixable_packages_in_json(original_text: str, updated_text: str, unfixable_packages: Set[str]) -> str:
+    import json
+    try:
+        orig_obj = json.loads(original_text)
+        upd_obj = json.loads(updated_text)
+        
+        indent = 2
+        for line in updated_text.splitlines():
+            if line.startswith(" ") or line.startswith("\t"):
+                indent = len(line) - len(line.lstrip())
+                if "\t" in line:
+                    indent = "\t"
+                break
+
+        dep_keys = {"dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "overrides", "resolutions"}
+        
+        for pkg in unfixable_packages:
+            for key in dep_keys:
+                if key in upd_obj and isinstance(upd_obj[key], dict) and pkg in upd_obj[key]:
+                    if key in orig_obj and isinstance(orig_obj.get(key), dict) and pkg in orig_obj[key]:
+                        upd_obj[key][pkg] = orig_obj[key][pkg]
+                    else:
+                        del upd_obj[key][pkg]
+                    
+                    if not upd_obj[key] and (key not in orig_obj or not orig_obj[key]):
+                        del upd_obj[key]
+            
+            if "pnpm" in upd_obj and isinstance(upd_obj["pnpm"], dict) and "overrides" in upd_obj["pnpm"]:
+                if pkg in upd_obj["pnpm"]["overrides"]:
+                    if "pnpm" in orig_obj and isinstance(orig_obj.get("pnpm"), dict) and "overrides" in orig_obj["pnpm"] and pkg in orig_obj["pnpm"]["overrides"]:
+                        upd_obj["pnpm"]["overrides"][pkg] = orig_obj["pnpm"]["overrides"][pkg]
+                    else:
+                        del upd_obj["pnpm"]["overrides"][pkg]
+                    if not upd_obj["pnpm"]["overrides"] and ("pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})):
+                        del upd_obj["pnpm"]["overrides"]
+                        
+        return json.dumps(upd_obj, indent=indent) + "\n"
+    except Exception:
+        for pkg in unfixable_packages:
+            pattern = r'("' + re.escape(pkg) + r'"\s*:\s*"[^"]*")'
+            orig_matches = re.findall(pattern, original_text)
+            upd_matches = re.findall(pattern, updated_text)
+            
+            if len(orig_matches) == 1 and len(upd_matches) == 1:
+                updated_text = updated_text.replace(upd_matches[0], orig_matches[0])
+            elif len(orig_matches) > 1 and len(orig_matches) == len(upd_matches):
+                for orig_m, upd_m in zip(orig_matches, upd_matches):
+                    updated_text = updated_text.replace(upd_m, orig_m, 1)
+        return updated_text
+
 
 def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     """
@@ -58,6 +109,35 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     errors: List[str] = []
     client = None
 
+    valid_groups = state.get("valid_groups", [])
+    group_statuses = state.get("group_statuses", {})
+    
+    passed_files: Set[str] = set()
+    unfixable_files: Set[str] = set()
+    unfixable_packages: Set[str] = set()
+
+    from src.contracts.schemas import GroupRemediationStatus
+
+    for g in valid_groups:
+        files = set()
+        if getattr(g, "file_path", None):
+            files.add(g.file_path)
+        for p in getattr(g, "file_paths", []):
+            files.add(p)
+        for li in getattr(g, "localized_issues", []):
+            if getattr(li, "manifest_file", None):
+                files.add(li.manifest_file)
+        
+        status = group_statuses.get(g.group_id)
+        if status == GroupRemediationStatus.QA_PASSED:
+            passed_files.update(files)
+        elif status == GroupRemediationStatus.UNFIXABLE:
+            unfixable_files.update(files)
+            if getattr(g, "vulnerable_component", None):
+                unfixable_packages.add(g.vulnerable_component)
+    
+    files_to_exclude = unfixable_files - passed_files
+
     try:
         if changed_files and workspace_volume and repo_root_str:
             repo_root = Path(repo_root_str)
@@ -72,10 +152,18 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                         workspace_volume=workspace_volume,
                     ) as sandbox:
                         for rel_path in changed_files:
+                            if rel_path in files_to_exclude:
+                                continue
                             updated_text = sandbox.read_file(rel_path)
                             if updated_text is None:
                                 continue
                             original_text = _read_host_text(repo_root, rel_path)
+                            
+                            if rel_path.endswith(".json") and unfixable_packages:
+                                updated_text = _revert_unfixable_packages_in_json(
+                                    original_text, updated_text, unfixable_packages
+                                )
+                                
                             diff_text = _build_diff(rel_path, original_text, updated_text)
                             if diff_text:
                                 diff_chunks.append(diff_text)
@@ -98,11 +186,7 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                     _close_client(client)
 
     result: Dict[str, Any] = {
-        "status": (
-            "phase5_refactor_blocked"
-            if state.get("status") == "phase5_refactor_blocked"
-            else "completed"
-        ),
+        "status": "completed",
         "workspace_volume": None,
         "changed_files": changed_files,
         "diff": "".join(diff_chunks),

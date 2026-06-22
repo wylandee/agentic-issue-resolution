@@ -235,8 +235,8 @@ def _run_security_scan(
 
     if remaining:
         summary = (
-            "FAILURE: Dependency-Check still reports the following target "
-            f"identifier(s): {', '.join(sorted(remaining))}"
+            "FAILURE: Dependency-Check found unresolved target vulnerabilities. "
+            "Refer to the individual group evaluation context for specific identifiers."
         )
         return False, summary, remaining
 
@@ -654,28 +654,7 @@ signals require investigation:
 If all three execution tools pass cleanly (install OK, zero remaining identifiers, tests OK),
 you MAY finalize without calling any review tools.
 
-## Final Evaluation Rules
-Produce one verdict per group after completing your review:
-
-1. **VERSION_BUMP groups**: Pass only when:
-   - Install succeeds (ERESOLVE/EBADENGINE → PEER_CONFLICT)
-   - Scanner reports zero remaining target identifiers (otherwise SECURITY_FLAG)
-   - Unit tests pass (regressions → BREAKING_CHANGE)
-
-2. **CODE_WORKAROUND groups**: Pass when:
-   - The workspace diff clearly neutralizes the vulnerable code path
-   - Normal (non-exploit) tests still pass
-   - Scanner may still report findings — suppress as EXPECTED FALSE POSITIVE only when
-     the diff proves the path is blocked; otherwise → SECURITY_FLAG
-   - Failing exploit-specific tests are acceptable if the diff proves the path is blocked
-
-3. **Failure categories**:
-   - PEER_CONFLICT: ERESOLVE, EBADENGINE, or dependency-tree conflict in install
-   - BREAKING_CHANGE: regression or API breakage in unit tests
-   - SECURITY_FLAG: unresolved scanner evidence or unblocked vulnerable path
-
-When finished with your review, clearly state your final conclusions per group.
-The structured evaluation will be extracted from your analysis afterward.
+When finished with your review, simply state that you have finished gathering evidence. Do NOT assign final verdicts or failure categories to the groups yourself. The structured evaluation will be performed by a separate component that has access to the per-group remaining identifiers.
 """
 
 
@@ -725,13 +704,20 @@ def _extract_group_evaluations(
         cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
         ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
 
-        relevant_summaries = [s for s in action_summaries if s.group_id == group.group_id]
+        relevant_summaries = [s for s in action_summaries if group.group_id in s.group_id]
         summaries_text = "\n".join(
             f"  - {s.status.value}: {s.summary}" for s in relevant_summaries
         ) or "  (none)"
 
+        group_identifiers = set()
+        if group.cve_ids:
+            group_identifiers.update(cve.upper() for cve in group.cve_ids)
+        if group.ghsa_ids:
+            group_identifiers.update(ghsa.upper() for ghsa in group.ghsa_ids)
+            
+        group_remaining = group_identifiers & remaining_identifiers
         remaining_text = (
-            ", ".join(sorted(remaining_identifiers)) if remaining_identifiers else "(none)"
+            ", ".join(sorted(group_remaining)) if group_remaining else "(none)"
         )
 
         prompt = f"""You are a QA Critic extracting a structured verdict for one vulnerability group.
@@ -766,8 +752,8 @@ def _extract_group_evaluations(
 2. CODE_WORKAROUND: Pass when diff proves vulnerable path is blocked and normal tests pass.
    Suppress scanner findings as false positives ONLY when the diff proves blocking.
 3. PEER_CONFLICT: ERESOLVE, EBADENGINE, or dependency-tree conflict.
-4. BREAKING_CHANGE: regression or API breakage in tests.
-5. SECURITY_FLAG: unresolved scanner evidence or unblocked vulnerable path.
+4. BREAKING_CHANGE: regression or API breakage in tests. (Prioritize this over SECURITY_FLAG if tests fail but Remaining Target Identifiers is "(none)").
+5. SECURITY_FLAG: unresolved scanner evidence ("Remaining Target Identifiers" is not none).
 
 Return a QAEvaluation for group_id="{group.group_id}" with:
 - passed: true/false
@@ -894,7 +880,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
                         "Begin your QA review now. "
                         "Call run_dependency_install, run_security_scan, and run_unit_tests "
                         "in order first. Then use review tools only if needed. "
-                        "When finished, state your final conclusions per group."
+                        "When finished, simply state that you have finished gathering evidence."
                     )
                 ),
             ]

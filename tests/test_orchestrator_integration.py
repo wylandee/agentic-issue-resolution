@@ -130,11 +130,19 @@ class TestTriageNodeIntegration:
         state = _initial_state(tmp_path, issues, system_context)
         
         with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
+             patch("src.orchestrator.graph.run_supervisor_node") as mock_supervisor, \
              patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
              mock_ws.return_value = {"status": "workspace_ready"}
+             mock_supervisor.return_value = {
+                 "status": "supervisor_routed",
+                 "next_routing_step": "teardown",
+                 "active_target_group_ids": [],
+                 "feedback_by_group": {},
+                 "supervisor_instructions": "done",
+             }
              mock_teardown.return_value = {"status": "phase5_refactor_blocked"}
              
              result = graph.invoke(state)
@@ -142,6 +150,7 @@ class TestTriageNodeIntegration:
              mock_pipeline.assert_called_once_with(issues, system_context, str(tmp_path))
              assert group1.group_id in [g.group_id for g in result.get("valid_groups", [])]
              mock_ws.assert_called_once()
+             mock_supervisor.assert_called_once()
              mock_teardown.assert_called_once()
 
     @patch("src.orchestrator.graph.run_triage_pipeline")
