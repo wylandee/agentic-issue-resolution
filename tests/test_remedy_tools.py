@@ -206,6 +206,80 @@ class TestModifyNpmDependency:
         assert "package_name 'express' is not an allowed target for this batch" in result
         sandbox.run.assert_not_called()
 
+    def test_allows_exact_artifact_alias_for_groupid_prefixed_package(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.5,
+        )
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json"],
+            package_manifest_paths={"org.webjars.npm:lodash.set": ["package.json"]},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash.set",
+                "target_version": "4.3.2",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("SUCCESS:")
+        sandbox.run.assert_called_once()
+        assert "dependencies[lodash.set]=4.3.2" in sandbox.run.call_args[0][0]
+
+    def test_rejects_broad_substring_when_only_more_specific_package_is_allowed(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json"],
+            package_manifest_paths={"org.webjars.npm:lodash.set": ["package.json"]},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "package_name 'lodash' is not an allowed target for this batch" in result
+        sandbox.run.assert_not_called()
+
+    def test_rejects_ambiguous_artifact_alias(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json"],
+            package_manifest_paths={
+                "org.example:shared-lib": ["package.json"],
+                "com.other:shared-lib": ["package.json"],
+            },
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "shared-lib",
+                "target_version": "1.2.3",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "ambiguous" in result
+        assert "org.example:shared-lib" in result
+        assert "com.other:shared-lib" in result
+        sandbox.run.assert_not_called()
+
     def test_invalid_manifest_path_rejected(self):
         sandbox = MagicMock()
         tools = _update_tool_map(sandbox)

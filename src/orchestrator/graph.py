@@ -530,6 +530,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     return {
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),
+        "qa_investigation_report": result.get("qa_investigation_report", ""),
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
     }

@@ -346,6 +346,7 @@ class TestPhase5GraphIntegration:
         qa_critic = MagicMock(return_value={
             "qa_evaluations": {},
             "eval_status": "all_passed",
+            "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
             "status": "qa_completed",
             "errors": [],
         })
@@ -361,6 +362,7 @@ class TestPhase5GraphIntegration:
         assert supervisor.call_count == 2
         assert qa_critic.call_count == 1
         assert teardown.call_count == 1
+        assert result["qa_investigation_report"].startswith("# INVESTIGATIVE REPORT")
 
 
 class TestPhase5Exports:

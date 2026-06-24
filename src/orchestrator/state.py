@@ -123,6 +123,7 @@ class OrchestratorState(TypedDict, total=False):
     feedback_by_group: Annotated[Dict[str, str], merge_dict_reducer]
     supervisor_instructions: str
     eval_status: str
+    qa_investigation_report: str
 
     status: str
     diff: str
@@ -179,6 +180,7 @@ def initial_orchestrator_state(
         "feedback_by_group": {},
         "supervisor_instructions": "",
         "eval_status": "",
+        "qa_investigation_report": "",
         "diff": "",
         "errors": [],
     }

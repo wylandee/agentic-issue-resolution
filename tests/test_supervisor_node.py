@@ -332,6 +332,33 @@ class TestRunSupervisorNodeQAUpdates:
         )
         result = run_supervisor_node(state)
         assert result["group_statuses"]["g1"] == GroupRemediationStatus.QA_PASSED
+        assert result["constraints_ledger"] == ["test-pkg: keep resolved version at 1.2.3"]
+
+    def test_qa_completed_passed_workaround_adds_constraint(self):
+        g1 = _sast_group("g1")
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            qa_evaluations={"g1": QAEvaluation(group_id="g1", passed=True)},
+            group_strategies={"g1": RoutingStrategy.CODE_WORKAROUND},
+            group_statuses={"g1": GroupRemediationStatus.OPTIMISTICALLY_FIXED},
+        )
+        result = run_supervisor_node(state)
+        assert result["group_statuses"]["g1"] == GroupRemediationStatus.QA_PASSED
+        assert result["constraints_ledger"] == ["test-func: preserve validated security workaround"]
+
+    def test_qa_completed_passed_does_not_duplicate_existing_constraint(self):
+        g1 = _sca_group("g1")
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            qa_evaluations={"g1": QAEvaluation(group_id="g1", passed=True)},
+            group_statuses={"g1": GroupRemediationStatus.OPTIMISTICALLY_FIXED},
+            constraints_ledger=["test-pkg: keep resolved version at 1.2.3"],
+        )
+        result = run_supervisor_node(state)
+        assert result["group_statuses"]["g1"] == GroupRemediationStatus.QA_PASSED
+        assert result["constraints_ledger"] == []
 
     def test_qa_completed_failed_updates_status_and_retry_count(self):
         g1 = _sca_group("g1")
@@ -540,4 +567,3 @@ class TestRunSupervisorNodeActionSummaryUpdates:
         result = run_supervisor_node(state)
         # G1's status MUST NOT be overwritten back to OPTIMISTICALLY_FIXED by its historical summary.
         assert result["group_statuses"]["g1"] == GroupRemediationStatus.NEEDS_RETRY
-

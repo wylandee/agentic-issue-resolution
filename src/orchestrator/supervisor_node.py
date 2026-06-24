@@ -84,6 +84,21 @@ _WORKABLE_STATUSES = frozenset({
 })
 
 
+def _constraint_entry_for_group(
+    group: VulnerabilityGroup,
+    strategy: RoutingStrategy,
+) -> str:
+    """Build a deterministic constraints-ledger entry for a QA-passed group."""
+    component = (group.vulnerable_component or group.group_id).strip()
+    fix_plan = group.fix_plan
+
+    if strategy == RoutingStrategy.VERSION_BUMP:
+        fixed_version = (fix_plan.fixed_version if fix_plan else None) or "unknown"
+        return f"{component}: keep resolved version at {fixed_version}"
+
+    return f"{component}: preserve validated security workaround"
+
+
 def _deterministic_routing(
     valid_groups: List[VulnerabilityGroup],
     group_strategies: Dict[str, RoutingStrategy],
@@ -313,6 +328,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         }
 
     group_by_id: Dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
+    existing_constraints: List[str] = list(state.get("constraints_ledger", []))
 
     # ------------------------------------------------------------------
     # 1. Normalise strategies
@@ -371,6 +387,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     qa_evaluations: Dict[str, QAEvaluation] = dict(state.get("qa_evaluations", {}))
     retry_counts: Dict[str, int] = dict(state.get("retry_counts", {}))
+    auto_new_constraints: List[str] = []
 
     if state.get("status") == "qa_completed":
         for group_id, evaluation in qa_evaluations.items():
@@ -381,6 +398,16 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 continue
             if evaluation.passed:
                 group_statuses[group_id] = GroupRemediationStatus.QA_PASSED
+                constraint = _constraint_entry_for_group(
+                    group_by_id[group_id],
+                    group_strategies.get(group_id, derive_initial_strategy(group_by_id[group_id])),
+                )
+                if (
+                    constraint
+                    and constraint not in existing_constraints
+                    and constraint not in auto_new_constraints
+                ):
+                    auto_new_constraints.append(constraint)
             else:
                 # 4. Increment retry count when newly entering NEEDS_RETRY
                 group_statuses[group_id] = GroupRemediationStatus.NEEDS_RETRY
@@ -535,6 +562,15 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         decision.target_group_ids,
     )
 
+    returned_constraints: List[str] = list(auto_new_constraints)
+    for constraint in decision.new_constraints:
+        if (
+            constraint
+            and constraint not in existing_constraints
+            and constraint not in returned_constraints
+        ):
+            returned_constraints.append(constraint)
+
     # ------------------------------------------------------------------
     # 10. Return state patch
     # ------------------------------------------------------------------
@@ -548,7 +584,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "group_statuses": group_statuses,
         "retry_counts": retry_counts,
         # constraints_ledger uses operator.add — return only the NEW entries
-        "constraints_ledger": list(decision.new_constraints),
+        "constraints_ledger": returned_constraints,
     }
 
 
