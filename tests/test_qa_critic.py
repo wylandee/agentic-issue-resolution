@@ -46,6 +46,7 @@ from src.orchestrator.qa_critic import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
     _ODC_CACHE_VOLUME,
+    _ODC_HTML_REPORT_NAME,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
     _QAExecutionResults,
@@ -290,6 +291,15 @@ class TestRunOdc:
             _, kwargs = mock_run.call_args
             assert kwargs.get("timeout") == _ODC_TIMEOUT_SECONDS
 
+    def test_requests_html_output_in_addition_to_json(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _run_odc("test-vol")
+            args = mock_run.call_args[0][0]
+            assert args.count("--format") == 2
+            assert "JSON" in args
+            assert "HTML" in args
+
     def test_raises_timeout_expired_on_slow_docker(self):
         with patch("subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd=["docker"], timeout=300)
@@ -319,6 +329,28 @@ class TestRunSecurityScan:
 
         assert ok is True
         assert remaining == set()
+        assert _ODC_HTML_REPORT_NAME in str(sandbox.read_file.call_args_list[0])
+
+    def test_summary_includes_saved_report_paths(self):
+        sandbox = MagicMock()
+        target = {"CVE-2021-23337"}
+
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch(
+                 "src.orchestrator.qa_critic._persist_workspace_report_to_host",
+                 side_effect=[
+                     Path("data/cache/qa_reports/dependency-check-report-1234567890.html"),
+                     Path("data/cache/qa_reports/dependency-check-report.json"),
+                 ],
+             ), \
+             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+            ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
+
+        assert ok is True
+        assert remaining == set()
+        assert "HTML report saved to:" in summary
+        assert "dependency-check-report-1234567890.html" in summary
 
     def test_failure_when_docker_not_available(self):
         sandbox = MagicMock()

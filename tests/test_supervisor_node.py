@@ -140,14 +140,30 @@ class TestSupervisorDecisionSchema:
                 decision_reason="test",
             )
 
-    def test_qa_critic_and_teardown_reject_non_empty_targets(self):
+    def test_update_subagent_rejects_more_than_ten_targets(self):
         with pytest.raises(ValidationError):
             SupervisorDecision(
-                next_node="qa_critic",
-                target_group_ids=["g1"],
+                next_node="update_subagent",
+                target_group_ids=[f"g{i}" for i in range(11)],
                 instructions="test",
                 decision_reason="test",
             )
+
+    def test_qa_critic_requires_non_empty_targets_and_teardown_rejects_them(self):
+        with pytest.raises(ValidationError):
+            SupervisorDecision(
+                next_node="qa_critic",
+                target_group_ids=[],
+                instructions="test",
+                decision_reason="test",
+            )
+        decision = SupervisorDecision(
+            next_node="qa_critic",
+            target_group_ids=["g1"],
+            instructions="test",
+            decision_reason="test",
+        )
+        assert decision.target_group_ids == ["g1"]
         with pytest.raises(ValidationError):
             SupervisorDecision(
                 next_node="teardown",
@@ -232,6 +248,16 @@ class TestRunSupervisorNodeVersionBump:
         assert result["next_routing_step"] == "update_subagent"
         assert set(result["active_target_group_ids"]) == {"g1", "g2"}
 
+    def test_deterministic_routing_caps_update_batch_at_ten(self):
+        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
+        state = _base_state(groups)
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "update_subagent"
+        assert len(result["active_target_group_ids"]) == 10
+        assert result["active_target_group_ids"] == [f"g{i}" for i in range(10)]
+
 
 class TestRunSupervisorNodeWorkaround:
     @patch("langchain_openai.ChatOpenAI")
@@ -266,7 +292,7 @@ class TestRunSupervisorNodeToQA:
         mock_llm = MagicMock()
         mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
             next_node="qa_critic",
-            target_group_ids=[],
+            target_group_ids=["g1"],
             instructions="test",
             decision_reason="test",
         )
@@ -274,7 +300,30 @@ class TestRunSupervisorNodeToQA:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_group_ids"] == []
+        assert result["active_target_group_ids"] == ["g1"]
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_current_optimistically_fixed_batch_routes_to_qa_before_more_updates(self, mock_chat):
+        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
+        state = _base_state(
+            groups,
+            active_target_group_ids=[f"g{i}" for i in range(10)],
+            group_statuses={f"g{i}": GroupRemediationStatus.OPTIMISTICALLY_FIXED for i in range(10)},
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
+            next_node="update_subagent",
+            target_group_ids=["g10", "g11"],
+            instructions="test",
+            decision_reason="test",
+        )
+        mock_chat.return_value = mock_llm
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "qa_critic"
+        assert result["active_target_group_ids"] == [f"g{i}" for i in range(10)]
 
 
 class TestRunSupervisorNodeToTeardown:
@@ -567,3 +616,12 @@ class TestRunSupervisorNodeActionSummaryUpdates:
         result = run_supervisor_node(state)
         # G1's status MUST NOT be overwritten back to OPTIMISTICALLY_FIXED by its historical summary.
         assert result["group_statuses"]["g1"] == GroupRemediationStatus.NEEDS_RETRY
+
+
+class TestSupervisorPrompt:
+    def test_prompt_instructs_llm_to_cap_update_batches_at_ten(self):
+        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
+        prompt = build_supervisor_prompt(_base_state(groups))
+
+        assert "batches of at most 10" in prompt
+        assert "Never send more than 10 target_group_ids to update_subagent" in prompt

@@ -41,7 +41,8 @@ from src.orchestrator.state import OrchestratorState
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 2
+MAX_RETRIES: int = 1
+UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
     "update_subagent",
@@ -105,6 +106,8 @@ def _deterministic_routing(
     group_statuses: Dict[str, GroupRemediationStatus],
     retry_counts: Dict[str, int],
     qa_evaluations: Dict[str, QAEvaluation],
+    active_target_group_ids: Optional[List[str]] = None,
+    current_status: str = "",
 ) -> SupervisorDecision:
     """
     Pure-Python fallback routing used when the LLM call fails.
@@ -127,6 +130,22 @@ def _deterministic_routing(
         )
 
     # All non-terminal groups are optimistically_fixed → qa_critic
+    active_target_ids = set(active_target_group_ids or [])
+    current_batch = [g for g in valid_groups if g.group_id in active_target_ids]
+    if current_status != "qa_completed" and current_batch and all(
+        group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
+        == GroupRemediationStatus.OPTIMISTICALLY_FIXED
+        for g in current_batch
+    ):
+        return SupervisorDecision(
+            next_node="qa_critic",
+            target_group_ids=[g.group_id for g in current_batch],
+            instructions="Run QA on the current remediated batch before starting more remediation.",
+            decision_reason=(
+                f"Routing the current batch of {len(current_batch)} optimistically fixed group(s) to QA."
+            ),
+        )
+
     all_optimistic = all(
         group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
         == GroupRemediationStatus.OPTIMISTICALLY_FIXED
@@ -135,9 +154,9 @@ def _deterministic_routing(
     if all_optimistic:
         return SupervisorDecision(
             next_node="qa_critic",
-            target_group_ids=[],
-            instructions="All active groups are optimistically fixed. Running QA evaluation.",
-            decision_reason="Routing to QA after all non-terminal groups have been tentatively remediated.",
+            target_group_ids=[g.group_id for g in non_terminal],
+            instructions="Run QA on the remaining optimistically fixed groups.",
+            decision_reason="Routing all remaining optimistically fixed groups to QA.",
         )
 
     # Collect groups that still need work
@@ -153,18 +172,19 @@ def _deterministic_routing(
         if group_strategies.get(g.group_id) == RoutingStrategy.VERSION_BUMP
     ]
     if version_bump:
+        batch = version_bump[:UPDATE_BATCH_SIZE]
         feedback_by_group: Dict[str, str] = {}
-        for g in version_bump:
+        for g in batch:
             eval_ = qa_evaluations.get(g.group_id)
             if eval_ and eval_.retry_feedback:
                 feedback_by_group[g.group_id] = eval_.retry_feedback
         return SupervisorDecision(
             next_node="update_subagent",
-            target_group_ids=[g.group_id for g in version_bump],
+            target_group_ids=[g.group_id for g in batch],
             feedback_by_group=feedback_by_group,
-            instructions="Apply the required version bump(s) in the package manifest(s).",
+            instructions="Apply the required version bump(s) in the package manifest(s) for this batch only.",
             decision_reason=(
-                f"Routing {len(version_bump)} VERSION_BUMP group(s) to update_subagent."
+                f"Routing {len(batch)} VERSION_BUMP group(s) to update_subagent (batch size cap {UPDATE_BATCH_SIZE})."
             ),
         )
 
@@ -275,18 +295,19 @@ def build_supervisor_prompt(state: OrchestratorState) -> str:
         f"## QA Evaluation Status: {eval_status or 'none'}",
         "",
         "## Routing Rules (follow strictly)",
-        "1. Batch ALL pending/needs_retry VERSION_BUMP groups together → update_subagent.",
+        f"1. Send pending/needs_retry VERSION_BUMP groups to update_subagent in batches of at most {UPDATE_BATCH_SIZE}. Never send more than {UPDATE_BATCH_SIZE} target_group_ids to update_subagent in one decision.",
         "2. Send EXACTLY ONE pending/needs_retry CODE_WORKAROUND group → workaround_subagent.",
-        "3. When ALL non-terminal groups are optimistically_fixed → qa_critic. Do NOT route optimistically_fixed groups to subagents.",
+        "3. After a subagent succeeds for the current active batch, route that exact optimistically_fixed batch to qa_critic before starting another remediation batch. Do NOT route optimistically_fixed groups back to subagents.",
         "4. When ALL non-terminal groups are qa_passed OR all are unfixable → teardown.",
         "5. If a needs_retry group has PEER_CONFLICT: pivot the affected group strategy to CODE_WORKAROUND.",
         "6. If a needs_retry group has BREAKING_CHANGE: add a version constraint + pivot to CODE_WORKAROUND with refactor feedback.",
         "7. If a needs_retry group has SECURITY_FLAG: retry with current strategy (unless MAX_RETRIES=3 reached).",
         f"8. Any group with {MAX_RETRIES}+ retries should appear in unfixable_group_ids, not targets.",
-        "9. unfixable, qa_passed, and optimistically_fixed groups MUST NOT appear in target_group_ids.",
-        "10. qa_critic and teardown MUST have empty target_group_ids.",
+        "9. unfixable, qa_passed, and optimistically_fixed groups MUST NOT appear in update_subagent or workaround_subagent target_group_ids.",
+        "10. qa_critic target_group_ids MUST contain exactly the batch being evaluated.",
         "11. workaround_subagent MUST have exactly one target_group_id.",
-        "12. If a group is qa_passed, append its successful version bump or workaround to the constraints ledger via new_constraints.",
+        f"12. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_group_ids.",
+        "13. If a group is qa_passed, append its successful version bump or workaround to the constraints ledger via new_constraints.",
     ]
 
     return "\n".join(lines)
@@ -441,10 +462,32 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "qa_evaluations": qa_evaluations,
     }
 
+    active_target_group_ids = list(state.get("active_target_group_ids") or [])
+
     # ------------------------------------------------------------------
     # 7. LLM structured call
     # ------------------------------------------------------------------
     decision: Optional[SupervisorDecision] = None
+    if state.get("status") != "qa_completed" and active_target_group_ids:
+        active_batch = [
+            group
+            for group in valid_groups
+            if group.group_id in set(active_target_group_ids)
+        ]
+        if active_batch and all(
+            group_statuses.get(group.group_id, GroupRemediationStatus.PENDING)
+            == GroupRemediationStatus.OPTIMISTICALLY_FIXED
+            for group in active_batch
+        ):
+            decision = SupervisorDecision(
+                next_node="qa_critic",
+                target_group_ids=[group.group_id for group in active_batch],
+                instructions="Run QA on the current remediated batch before starting more remediation.",
+                decision_reason=(
+                    f"Routing the current batch of {len(active_batch)} optimistically fixed group(s) to QA."
+                ),
+            )
+
     try:
         from langchain_openai import ChatOpenAI  # type: ignore[import]
 
@@ -465,12 +508,38 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             "supervisor: LLM call failed (%s) — using deterministic fallback.", exc
         )
 
+    if state.get("status") != "qa_completed" and active_target_group_ids:
+        active_batch = [
+            group
+            for group in valid_groups
+            if group.group_id in set(active_target_group_ids)
+        ]
+        if active_batch and all(
+            group_statuses.get(group.group_id, GroupRemediationStatus.PENDING)
+            == GroupRemediationStatus.OPTIMISTICALLY_FIXED
+            for group in active_batch
+        ):
+            decision = SupervisorDecision(
+                next_node="qa_critic",
+                target_group_ids=[group.group_id for group in active_batch],
+                instructions="Run QA on the current remediated batch before starting more remediation.",
+                decision_reason=(
+                    f"Routing the current batch of {len(active_batch)} optimistically fixed group(s) to QA."
+                ),
+            )
+
     # ------------------------------------------------------------------
     # 8. Validate and clamp the LLM decision (or use deterministic fallback)
     # ------------------------------------------------------------------
     if decision is None:
         decision = _deterministic_routing(
-            valid_groups, group_strategies, group_statuses, retry_counts, qa_evaluations
+            valid_groups,
+            group_strategies,
+            group_statuses,
+            retry_counts,
+            qa_evaluations,
+            active_target_group_ids=active_target_group_ids,
+            current_status=str(state.get("status") or ""),
         )
         logger.info(
             "supervisor: deterministic fallback → next_node=%s", decision.next_node
@@ -509,6 +578,19 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
             needs_fallback = True
 
+        if not needs_fallback and decision.next_node == "update_subagent" and len(valid_target_ids) > UPDATE_BATCH_SIZE:
+            logger.warning(
+                "supervisor: update_subagent supports at most %d targets, got %d â€” falling back.",
+                UPDATE_BATCH_SIZE,
+                len(valid_target_ids),
+            )
+            needs_fallback = True
+        if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
+            logger.warning(
+                "supervisor: qa_critic needs at least 1 target, got 0 â€” falling back."
+            )
+            needs_fallback = True
+
         if needs_fallback:
             decision = _deterministic_routing(
                 valid_groups,
@@ -516,6 +598,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 group_statuses,
                 retry_counts,
                 qa_evaluations,
+                active_target_group_ids=active_target_group_ids,
+                current_status=str(state.get("status") or ""),
             )
         else:
             try:
@@ -543,6 +627,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     group_statuses,
                     retry_counts,
                     qa_evaluations,
+                    active_target_group_ids=active_target_group_ids,
+                    current_status=str(state.get("status") or ""),
                 )
 
     # ------------------------------------------------------------------

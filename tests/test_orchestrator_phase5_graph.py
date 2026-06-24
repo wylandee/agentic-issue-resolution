@@ -26,6 +26,7 @@ from src.orchestrator import (
 )
 from src.orchestrator.graph import (
     route_after_workspace_builder,
+    run_qa_critic_from_orchestrator,
 )
 
 
@@ -363,6 +364,31 @@ class TestPhase5GraphIntegration:
         assert qa_critic.call_count == 1
         assert teardown.call_count == 1
         assert result["qa_investigation_report"].startswith("# INVESTIGATIVE REPORT")
+
+    def test_qa_wrapper_scopes_valid_groups_to_active_batch(self, tmp_path):
+        groups = [
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        ]
+        state = _initial_state(tmp_path, groups)
+        state["active_target_group_ids"] = [groups[1].group_id]
+
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {},
+                "eval_status": "all_passed",
+                "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+
+        with patch("src.orchestrator.graph.run_qa_critic_node", qa_critic):
+            result = run_qa_critic_from_orchestrator(state)
+
+        scoped_state = qa_critic.call_args[0][0]
+        assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
+        assert result["status"] == "qa_completed"
 
 
 class TestPhase5Exports:

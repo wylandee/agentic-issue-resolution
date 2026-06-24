@@ -92,17 +92,6 @@ def _normalize_package_manifest_targets(
     return normalized
 
 
-def _package_name_aliases(package_name: str) -> Set[str]:
-    """Return exact safe aliases for one allowed package key."""
-    normalized = (package_name or "").strip()
-    aliases = {normalized}
-    if ":" in normalized:
-        group_id, artifact_id = normalized.split(":", 1)
-        if group_id and artifact_id:
-            aliases.add(artifact_id)
-    return aliases
-
-
 def _make_read_repository_map_tool(sandbox: DockerSandbox):
     @tool
     def read_repository_map() -> str:
@@ -177,10 +166,6 @@ def _make_modify_npm_dependency_tool(
             package_manifest_paths
         ).items()
     }
-    allowed_packages_by_alias: Dict[str, Set[str]] = {}
-    for canonical_package in allowed_manifest_paths_by_package:
-        for alias in _package_name_aliases(canonical_package):
-            allowed_packages_by_alias.setdefault(alias, set()).add(canonical_package)
 
     @tool
     def modify_npm_dependency(
@@ -219,26 +204,18 @@ def _make_modify_npm_dependency_tool(
 
         if Path(rel_manifest).name != "package.json":
             return "ERROR: manifest_path must point to a package.json file."
-        allowed_package_keys = allowed_packages_by_alias.get(package_name, set())
-        if not allowed_package_keys:
+        allowed_manifest_paths = allowed_manifest_paths_by_package.get(package_name)
+        if not allowed_manifest_paths:
             known_packages = ", ".join(sorted(allowed_manifest_paths_by_package))
             return (
                 f"ERROR: package_name '{package_name}' is not an allowed target for "
                 f"this batch. Allowed package_name values: {known_packages}."
             )
-        if len(allowed_package_keys) > 1:
-            matching = ", ".join(sorted(allowed_package_keys))
-            return (
-                f"ERROR: package_name '{package_name}' is ambiguous for this batch. "
-                f"Use one of the exact package identifiers: {matching}."
-            )
-        allowed_package = next(iter(allowed_package_keys))
-        allowed_manifest_paths = allowed_manifest_paths_by_package[allowed_package]
         if rel_manifest not in allowed_manifest_paths:
             allowed = ", ".join(sorted(allowed_manifest_paths))
             return (
                 f"ERROR: manifest_path '{rel_manifest}' is not an allowed target for "
-                f"package '{allowed_package}'. Allowed manifest_path values: {allowed}."
+                f"package '{package_name}'. Allowed manifest_path values: {allowed}."
             )
 
         package_expr = f"{dependency_type}[{package_name}]={target_version}"

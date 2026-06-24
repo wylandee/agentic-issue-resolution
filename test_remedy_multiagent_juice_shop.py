@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.contracts.schemas import FixPlanStatus, VulnerabilityGroup
+from src.contracts.schemas import VulnerabilityGroup
 from src.orchestrator.graph import run_orchestrator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -21,6 +21,22 @@ TEST_REPO_ROOT = Path(
     )
 )
 
+# 3 Direct Dependencies & 2 Transitive Dependencies selected from triaged_groups.json
+TARGET_GROUP_IDS = (
+    # Direct
+    # "sca:package.json:jsonwebtoken:UPDATE_VERSION",
+    # "sca:package.json:express-jwt:UPDATE_VERSION",
+    # "sca:package.json:sanitize-html:UPDATE_VERSION",
+    # "sca:package.json:socket.io:UPDATE_VERSION",
+    # Transitive
+    #"sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    #"sca:package.json:base64url:UPDATE_VERSION",
+    #"sca:frontend/package.json:ws:UPDATE_VERSION",
+    #"sca:frontend/package.json:elliptic:UPDATE_VERSION",
+    #"sca:package.json:cookie:UPDATE_VERSION",
+
+)
+
 
 def _load_vulnerability_groups() -> list[VulnerabilityGroup]:
     if not TRIAGED_GROUPS_JSON.is_file():
@@ -28,11 +44,21 @@ def _load_vulnerability_groups() -> list[VulnerabilityGroup]:
 
     raw_groups = json.loads(TRIAGED_GROUPS_JSON.read_text(encoding="utf-8"))
     groups = [VulnerabilityGroup.model_validate(group) for group in raw_groups]
-    return [
-        group
-        for group in groups
-        if not group.fix_plan or group.fix_plan.status != FixPlanStatus.NO_FIX
-    ]
+    by_id = {group.group_id: group for group in groups}
+
+    selected: list[VulnerabilityGroup] = []
+    missing: list[str] = []
+    for group_id in TARGET_GROUP_IDS:
+        group = by_id.get(group_id)
+        if group is None:
+            missing.append(group_id)
+            continue
+        selected.append(group)
+
+    if missing:
+        raise ValueError(f"Could not find these target groups in triaged_groups.json: {missing}")
+
+    return selected
 
 
 def main() -> None:
@@ -50,15 +76,15 @@ def main() -> None:
     try:
         valid_groups = _load_vulnerability_groups()
     except Exception as exc:
-        logger.exception("Failed to load triaged groups: %s", exc)
+        logger.exception("Failed to load target groups: %s", exc)
         return
 
-    logger.info(
-        "Loaded %d vulnerability groups from triaged_groups.json for the Remedy Phase:",
-        len(valid_groups),
-    )
+    logger.info("Selected %d target groups from triaged_groups.json for the Remedy Phase:", len(valid_groups))
     for group in valid_groups:
-        logger.info(" - %s (%s)", group.group_id, group.vulnerable_component)
+        dep_type = "Direct" if "package.json:" in group.group_id and group.vulnerable_component in (
+            "jsonwebtoken", "express-jwt", "sanitize-html"
+        ) else "Transitive"
+        logger.info(" - %s (%s) [%s]", group.group_id, group.vulnerable_component, dep_type)
 
     logger.info("=" * 60)
     logger.info("STARTING PHASE 5 REMEDY ENGINE (Multi-Agent Flow)")

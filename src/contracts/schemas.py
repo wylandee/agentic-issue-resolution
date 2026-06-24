@@ -1201,8 +1201,9 @@ class SupervisorDecision(BaseModel):
     Controls hub-and-spoke routing in the Phase 5 orchestrator graph.
     Pydantic validators enforce routing invariants:
     - ``workaround_subagent`` requires exactly one ``target_group_id``.
-    - ``update_subagent`` requires at least one ``target_group_id``.
-    - ``qa_critic`` and ``teardown`` require empty ``target_group_ids``.
+    - ``update_subagent`` requires 1-10 ``target_group_ids``.
+    - ``qa_critic`` requires one or more ``target_group_ids`` for batch QA.
+    - ``teardown`` requires empty ``target_group_ids``.
     - ``unfixable_group_ids`` and ``target_group_ids`` must not overlap.
     """
 
@@ -1222,9 +1223,10 @@ class SupervisorDecision(BaseModel):
         default_factory=list,
         description=(
             "Group IDs to send to the next subagent node. "
-            "Empty for qa_critic and teardown. "
+            "One or more for qa_critic. "
+            "Empty for teardown. "
             "Exactly one entry for workaround_subagent. "
-            "One or more for update_subagent."
+            "One to ten entries for update_subagent."
         ),
     )
     unfixable_group_ids: List[str] = Field(
@@ -1264,7 +1266,15 @@ class SupervisorDecision(BaseModel):
             raise ValueError(
                 "update_subagent requires at least 1 target_group_id."
             )
-        if node in ("qa_critic", "teardown") and targets:
+        if node == "update_subagent" and len(targets) > 10:
+            raise ValueError(
+                f"update_subagent supports at most 10 target_group_ids, got {len(targets)}."
+            )
+        if node == "qa_critic" and len(targets) < 1:
+            raise ValueError(
+                "qa_critic requires at least 1 target_group_id."
+            )
+        if node == "teardown" and targets:
             raise ValueError(
                 f"{node} must have empty target_group_ids, got {targets}."
             )

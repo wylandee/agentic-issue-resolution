@@ -521,12 +521,25 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     """
     Run the QA Critic against the current OrchestratorState.
 
-    ``changed_files`` accumulated in state are passed transparently to the
-    QA Critic (it reads them from state).  The wrapper does NOT re-emit
-    ``changed_files`` in its return dict to avoid double-counting via the
-    ``operator.add`` reducer.
+    When ``active_target_group_ids`` is populated, QA is scoped to that
+    current batch only. ``changed_files`` accumulated in state are passed
+    transparently to the QA Critic (it reads them from state). The wrapper
+    does NOT re-emit ``changed_files`` in its return dict to avoid
+    double-counting via the ``operator.add`` reducer.
     """
-    result = run_qa_critic_node(state)
+    active_ids = set(state.get("active_target_group_ids", []))
+    scoped_state = state
+    if active_ids:
+        scoped_groups = [
+            group for group in state.get("valid_groups", []) if group.group_id in active_ids
+        ]
+        if scoped_groups:
+            scoped_state = {
+                **state,
+                "valid_groups": scoped_groups,
+            }
+
+    result = run_qa_critic_node(scoped_state)
     return {
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),

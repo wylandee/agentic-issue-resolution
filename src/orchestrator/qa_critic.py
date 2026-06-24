@@ -23,6 +23,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -51,7 +52,9 @@ _NPM_INSTALL_TIMEOUT_SECONDS = 900
 _NPM_TEST_TIMEOUT_SECONDS = 600
 _ODC_TIMEOUT_SECONDS = 300
 _ODC_REPORT_NAME = "dependency-check-report.json"
+_ODC_HTML_REPORT_NAME = "dependency-check-report.html"
 _ODC_CACHE_VOLUME = "odc-cache"
+_ODC_DEBUG_DIR = Path("data/cache/qa_reports")
 
 # LLM context budget limits
 _DIFF_CHAR_BUDGET = 8_000
@@ -71,7 +74,7 @@ _DIFF_EXCLUDE_DIRS = frozenset({
     ".cache",
 })
 _DIFF_EXCLUDE_SUFFIXES = frozenset({".map", ".lock"})
-_DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, "dependency-check-report.html"})
+_DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,41 @@ def _read_report_from_workspace(sandbox: DockerSandbox) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("qa_critic: failed to read ODC report from workspace â€” %s", exc)
         return None
+
+def _persist_workspace_report_to_host(
+    sandbox: DockerSandbox,
+    workspace_name: str,
+    host_path: Path,
+) -> Optional[Path]:
+    """Copy a Dependency-Check report from the workspace volume onto the host."""
+    try:
+        content = sandbox.read_file(workspace_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: failed to read %s from workspace - %s", workspace_name, exc)
+        return None
+
+    if content is None:
+        return None
+
+    try:
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+        host_path.write_text(content, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "qa_critic: failed to persist %s to host path %s - %s",
+            workspace_name,
+            host_path,
+            exc,
+        )
+        return None
+
+    return host_path.resolve()
+
+
+def _next_html_report_host_path() -> Path:
+    """Return a unique host-side HTML report path for one QA scan."""
+    timestamp_ms = int(time.time() * 1000)
+    return _ODC_DEBUG_DIR / f"dependency-check-report-{timestamp_ms}.html"
 
 
 def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
@@ -130,6 +168,8 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
         "/scan",
         "--format",
         "JSON",
+        "--format",
+        "HTML",
         "--out",
         "/scan",
         "--noupdate",
@@ -209,6 +249,22 @@ def _run_security_scan(
         msg = f"FAILURE: Dependency-Check subprocess error â€” {exc}"
         return False, msg, set()
 
+    saved_html_report = _persist_workspace_report_to_host(
+        sandbox,
+        _ODC_HTML_REPORT_NAME,
+        _next_html_report_host_path(),
+    )
+    saved_json_report = _persist_workspace_report_to_host(
+        sandbox,
+        _ODC_REPORT_NAME,
+        _ODC_DEBUG_DIR / _ODC_REPORT_NAME,
+    )
+    report_location_note = ""
+    if saved_html_report is not None:
+        report_location_note = f"\nHTML report saved to: {saved_html_report}"
+        if saved_json_report is not None:
+            report_location_note += f"\nJSON report saved to: {saved_json_report}"
+
     report_text = _read_report_from_workspace(sandbox)
     found_identifiers = (
         _parse_report_identifiers(report_text) if report_text is not None else None
@@ -221,6 +277,7 @@ def _run_security_scan(
             f"stdout:\n{proc.stdout[:2000]}\n"
             f"stderr:\n{proc.stderr[:2000]}"
         )
+        summary += report_location_note
         return False, summary, set()
 
     if found_identifiers is None:
@@ -229,6 +286,7 @@ def _run_security_scan(
             f"(exit {proc.returncode}).\n"
             f"stderr:\n{proc.stderr[:2000]}"
         )
+        summary += report_location_note
         return False, summary, set()
 
     remaining = {ident.upper().strip() for ident in target_identifiers if ident}
@@ -240,9 +298,12 @@ def _run_security_scan(
             "FAILURE: Dependency-Check found unresolved target vulnerabilities. "
             f"Remaining identifiers: {remaining_text}"
         )
+        summary += report_location_note
         return False, summary, remaining
 
-    return True, "Dependency-Check found no remaining target vulnerability identifiers.", set()
+    summary = "Dependency-Check found no remaining target vulnerability identifiers."
+    summary += report_location_note
+    return True, summary, set()
 
 
 def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
