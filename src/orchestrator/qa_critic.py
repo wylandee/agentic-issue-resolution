@@ -1,14 +1,28 @@
 """
 qa_critic.py - Agentic QA evaluator node for the Phase 5 orchestrator.
 
-The QA Critic is a bounded ReAct agent that:
-  1. Runs npm install, OWASP Dependency-Check, and npm test exactly once via
-     one-shot-guarded execution tools.
-  2. Optionally calls read-only review tools (diff, file reads, pattern search,
-     AST inspection, log queries) when failures or ambiguous signals need
-     investigation.
-  3. Calls a single-shot structured LLM per group to produce QAEvaluation
-     objects after the agent review phase completes.
+The QA Critic now follows a map-reduce architecture:
+
+  Step 0 — Global Execution (deterministic Python):
+    run_dependency_install → run_security_scan → run_unit_tests, called exactly
+    once via direct Python helpers, with no LLM tools involved.
+
+  Map — Individual Investigators:
+    One bounded ReAct agent per vulnerability group, given a group-scoped
+    prompt and a read-only review toolbelt.  Each agent answers only for its
+    assigned group.
+
+  Reduce — Batch Judge:
+    One ChatOpenAI.with_structured_output(BatchQAResult) call across all
+    group investigation texts, producing a holistic_report and exactly one
+    QAEvaluation per group.
+
+  Python Guardrails:
+    Normalize, validate, and fill missing/duplicate/unknown evaluations
+    deterministically.  Enforce scanner and install-error policies.
+
+The node's external contract (run_qa_critic_node, run_qa_critic_from_orchestrator,
+state key outputs) is unchanged — graph wiring requires no modifications.
 
 Heavy QA commands (install, scan, tests) are intentionally *not* exposed as
 tools to the update or workaround subagents; they live here only.
@@ -24,7 +38,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -34,6 +48,7 @@ from langsmith import traceable
 
 from src.contracts.schemas import (
     AgentActionSummary,
+    BatchQAResult,
     FailureCategory,
     QAEvaluation,
     VulnerabilityGroup,
@@ -76,6 +91,9 @@ _DIFF_EXCLUDE_DIRS = frozenset({
 _DIFF_EXCLUDE_SUFFIXES = frozenset({".map", ".lock"})
 _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
+# Install error patterns that indicate peer/engine conflicts
+_PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EBADENGINE", "peer dep", "peer tree")
+
 
 # ---------------------------------------------------------------------------
 # Legacy ODC helpers (ported from old remedy_tools.py)
@@ -87,7 +105,7 @@ def _read_report_from_workspace(sandbox: DockerSandbox) -> Optional[str]:
     try:
         return sandbox.read_file(_ODC_REPORT_NAME)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to read ODC report from workspace â€” %s", exc)
+        logger.warning("qa_critic: failed to read ODC report from workspace — %s", exc)
         return None
 
 def _persist_workspace_report_to_host(
@@ -131,7 +149,7 @@ def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
     try:
         report = json.loads(report_text)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to decode ODC report JSON â€” %s", exc)
+        logger.warning("qa_critic: failed to decode ODC report JSON — %s", exc)
         return None
 
     try:
@@ -189,7 +207,7 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
 
 
 # ---------------------------------------------------------------------------
-# QA runner helpers (deterministic, called by tool wrappers)
+# QA runner helpers (deterministic, called by tool wrappers and global execution)
 # ---------------------------------------------------------------------------
 
 
@@ -246,7 +264,7 @@ def _run_security_scan(
         msg = f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s."
         return False, msg, set()
     except Exception as exc:  # noqa: BLE001
-        msg = f"FAILURE: Dependency-Check subprocess error â€” {exc}"
+        msg = f"FAILURE: Dependency-Check subprocess error — {exc}"
         return False, msg, set()
 
     saved_html_report = _persist_workspace_report_to_host(
@@ -408,7 +426,7 @@ def _generate_workspace_diff(
     full_diff = "\n".join(diff_parts)
     if not full_diff:
         return (
-            "(diff is empty â€” workspace matches host baseline for all candidate files)",
+            "(diff is empty — workspace matches host baseline for all candidate files)",
             changed_files,
         )
 
@@ -466,16 +484,46 @@ def _validate_qa_path(file_path: str) -> str:
 
 @dataclass
 class _QAExecutionResults:
-    """Cache for one-shot execution tool results. Populated during the agent loop."""
+    """Cache for global execution phase results."""
 
     install: Optional[Tuple[bool, str]] = None          # (ok, summary)
     scan: Optional[Tuple[bool, str, Set[str]]] = None   # (ok, summary, remaining_ids)
     tests: Optional[Tuple[bool, str]] = None            # (ok, summary)
 
 
+# ---------------------------------------------------------------------------
+# Map phase dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GroupInvestigation:
+    """Investigation output for a single vulnerability group (Map phase)."""
+
+    group_id: str
+    investigation_text: str
+    tool_transcript: str
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchInvestigationArtifact:
+    """All Map phase outputs consumed by the Reduce phase."""
+
+    results: _QAExecutionResults
+    investigations_by_group: Dict[str, GroupInvestigation]
+    holistic_report: str = ""   # filled after reduce phase
+    errors: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Backcompat dataclasses (kept for legacy path and tests)
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class GroupInvestigationSection:
-    """Parsed report block for one vulnerability group."""
+    """Parsed report block for one vulnerability group (backcompat)."""
 
     group_id: str
     raw_text: str
@@ -497,7 +545,7 @@ class GroupInvestigationSection:
 
 @dataclass
 class ParsedInvestigationReport:
-    """Markdown investigative report parsed into shared and per-group sections."""
+    """Markdown investigative report parsed into shared and per-group sections (backcompat)."""
 
     raw_report: str
     shared_install_analysis: str
@@ -508,7 +556,7 @@ class ParsedInvestigationReport:
 
 @dataclass
 class GroupEvidencePacket:
-    """Group-scoped evidence passed to the Judge phase."""
+    """Group-scoped evidence passed to the Judge phase (backcompat)."""
 
     group: VulnerabilityGroup
     strategy: str
@@ -529,7 +577,7 @@ class GroupEvidencePacket:
 
 @dataclass
 class InvestigationArtifact:
-    """Outputs of the Investigator phase consumed by the Judge phase."""
+    """Outputs of the Investigator phase consumed by the Judge phase (backcompat)."""
 
     report_text: str
     parsed_report: ParsedInvestigationReport
@@ -740,7 +788,7 @@ def _parse_investigation_report(
     report_text: str,
     valid_groups: List[VulnerabilityGroup],
 ) -> ParsedInvestigationReport:
-    """Parse the investigator markdown report into shared and per-group sections."""
+    """Parse the investigator markdown report into shared and per-group sections (backcompat)."""
     known_group_ids = {group.group_id for group in valid_groups}
     errors: List[str] = []
     warnings: List[str] = []
@@ -808,7 +856,38 @@ def _parse_investigation_report(
 
 
 # ---------------------------------------------------------------------------
-# QA toolbelt
+# Step 0: Global Execution (deterministic Python, no LLM tools)
+# ---------------------------------------------------------------------------
+
+
+def _run_global_execution(
+    sandbox: DockerSandbox,
+    workspace_volume: str,
+    target_identifiers: Set[str],
+) -> _QAExecutionResults:
+    """
+    Run install, security scan, and unit tests exactly once via direct Python calls.
+
+    No LLM tool wrappers are involved — execution is deterministic and sequential.
+    Results are stored in a _QAExecutionResults cache for downstream use.
+    """
+    results = _QAExecutionResults()
+
+    logger.info("qa_critic: [Step 0] running npm install.")
+    results.install = _run_install(sandbox)
+    install_ok, _ = results.install
+
+    logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
+    results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+
+    logger.info("qa_critic: [Step 0] running unit tests.")
+    results.tests = _run_unit_tests(sandbox)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# QA toolbelt (backcompat: execution + review tools together)
 # ---------------------------------------------------------------------------
 
 
@@ -821,6 +900,10 @@ def build_qa_toolbelt(
 ) -> Tuple[List, _QAExecutionResults]:
     """
     Build the QA-only toolbelt with one-shot execution tools and read-only review tools.
+
+    This function is retained for backward compatibility.  The new map-reduce pipeline
+    uses _run_global_execution (Step 0) for execution and build_qa_review_toolbelt for
+    the read-only review toolbelt given to individual investigators.
 
     Execution tools (run_dependency_install, run_security_scan, run_unit_tests) are
     one-shot guarded: the first call performs the real work and caches the result;
@@ -857,7 +940,7 @@ def build_qa_toolbelt(
         """
         if results.install is not None:
             _, summary = results.install
-            return f"[CACHED â€” already run] {summary}"
+            return f"[CACHED — already run] {summary}"
         ok, summary = _run_install(sandbox)
         results.install = (ok, summary)
         return summary
@@ -872,7 +955,7 @@ def build_qa_toolbelt(
         """
         if results.scan is not None:
             _, summary, _ = results.scan
-            return f"[CACHED â€” already run] {summary}"
+            return f"[CACHED — already run] {summary}"
         if results.install is None:
             return (
                 "ERROR: run_security_scan must be called after "
@@ -893,7 +976,7 @@ def build_qa_toolbelt(
         """
         if results.tests is not None:
             _, summary = results.tests
-            return f"[CACHED â€” already run] {summary}"
+            return f"[CACHED — already run] {summary}"
         if results.scan is None:
             return (
                 "ERROR: run_unit_tests must be called after run_security_scan."
@@ -1017,7 +1100,694 @@ def build_qa_toolbelt(
 
 
 # ---------------------------------------------------------------------------
-# QA agent system prompt
+# Map phase: read-only review toolbelt for individual investigators
+# ---------------------------------------------------------------------------
+
+
+def build_qa_review_toolbelt(
+    sandbox: DockerSandbox,
+    candidate_changed_files: List[str],
+    host_repo_root: Optional[str],
+    results: _QAExecutionResults,
+) -> List:
+    """
+    Build a read-only review toolbelt for individual group investigators.
+
+    This toolbelt contains NO execution tools.  The results cache is pre-populated
+    by _run_global_execution (Step 0) before any investigator runs.
+
+    Tools: list_changed_files, generate_workspace_diff, read_file_context,
+           search_codebase_pattern, inspect_ast_symbol, query_qa_logs.
+    """
+    from src.orchestrator.remedy_tools import (
+        _make_inspect_ast_symbol_tool,
+        _make_search_codebase_pattern_tool,
+    )
+
+    search_tool = _make_search_codebase_pattern_tool(sandbox)
+    inspect_tool = _make_inspect_ast_symbol_tool(sandbox)
+
+    @tool
+    def list_changed_files() -> str:
+        """
+        List the repo-relative file paths that the remedy agents reported as changed.
+        """
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        if not candidate_changed_files:
+            return "(no changed files were reported by remedy agents)"
+        return "\n".join(f"  - {f}" for f in candidate_changed_files)
+
+    @tool
+    def generate_workspace_diff() -> str:
+        """
+        Generate a unified diff of remedy-agent-reported changed files vs. host baseline.
+        """
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        if host_repo_root is None:
+            return "ERROR: host_repo_root is not available; cannot generate diff."
+        diff_text, _ = _generate_workspace_diff(
+            host_repo_root, sandbox, candidate_changed_files
+        )
+        return diff_text
+
+    @tool
+    def read_file_context(file_path: str) -> str:
+        """
+        Read the current content of a workspace file for review.
+        Only accepts repo-relative paths; absolute paths and '..' traversal are rejected.
+        """
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        try:
+            rel_path = _validate_qa_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        content = sandbox.read_file(rel_path)
+        if content is None:
+            return f"ERROR: File '{rel_path}' not found in workspace."
+        if len(content) > _FILE_READ_MAX_CHARS:
+            content = content[:_FILE_READ_MAX_CHARS] + "\n... (truncated)"
+        return content
+
+    @tool
+    def query_qa_logs(log_type: str) -> str:
+        """
+        Return cached QA log output. log_type: 'install', 'scan', or 'tests'.
+        """
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        if log_type == "install":
+            if results.install is None:
+                return "ERROR: run_dependency_install has not been called yet."
+            _, summary = results.install
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        if log_type == "scan":
+            if results.scan is None:
+                return "ERROR: run_security_scan has not been called yet."
+            _, summary, _ = results.scan
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        if log_type == "tests":
+            if results.tests is None:
+                return "ERROR: run_unit_tests has not been called yet."
+            _, summary = results.tests
+            return summary[:_LOG_QUERY_MAX_CHARS]
+        return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
+
+    @tool
+    def search_codebase_pattern(root_dir: str = ".", pattern: str = "") -> str:
+        """Search the workspace for a regex pattern in source files."""
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        return str(search_tool.invoke({"root_dir": root_dir, "pattern": pattern}))
+
+    @tool
+    def inspect_ast_symbol(file_path: str, symbol_name: str) -> str:
+        """Inspect a specific named symbol in a workspace source file."""
+        review_error = _review_ready_error(results)
+        if review_error:
+            return review_error
+        return str(inspect_tool.invoke({"file_path": file_path, "symbol_name": symbol_name}))
+
+    return [
+        list_changed_files,
+        generate_workspace_diff,
+        read_file_context,
+        search_codebase_pattern,
+        inspect_ast_symbol,
+        query_qa_logs,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Map phase: individual investigator prompt builder
+# ---------------------------------------------------------------------------
+
+
+def _build_individual_investigator_prompt(
+    group: VulnerabilityGroup,
+    strategy: str,
+    results: _QAExecutionResults,
+    group_remaining_ids: List[str],
+    candidate_changed_files: List[str],
+    action_summaries: List[AgentActionSummary],
+) -> str:
+    """Build a group-scoped system prompt for one individual investigator."""
+    fix_plan = group.fix_plan
+    fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+    fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+    cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
+    ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
+
+    install_ok, install_summary = results.install or (False, "not run")
+    scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
+    tests_ok, tests_summary = results.tests or (False, "not run")
+
+    summaries_text = "\n".join(
+        f"  - {s.status.value}: {s.summary}" for s in action_summaries
+    ) or "  (none)"
+
+    changed_files_text = (
+        "\n".join(f"  - {f}" for f in candidate_changed_files)
+        if candidate_changed_files
+        else "  (none)"
+    )
+
+    remaining_text = (
+        ", ".join(group_remaining_ids) if group_remaining_ids else "(none — scanner cleared this group)"
+    )
+
+    return f"""You are a QA Investigator Agent assigned to review exactly ONE vulnerability group.
+
+## Your Assigned Group
+- Group ID       : {group.group_id}
+- Component      : {group.vulnerable_component or '(unknown)'}
+- Issue Type     : {group.issue_type.value}
+- Routing Strategy: {strategy}
+- CVEs           : {cves}
+- GHSAs          : {ghsas}
+- Fix Plan Status: {fix_plan_status}
+- Fix Instruction: {fix_instruction}
+
+## Agent Action Summaries for This Group
+{summaries_text}
+
+## Global Execution Results (already completed — do NOT re-run)
+- Install: {'SUCCESS' if install_ok else 'FAILED'}
+  {install_summary[:1500]}
+
+- Security Scan: {'SUCCESS' if scan_ok else 'FAILED'}
+  {scan_summary[:1500]}
+
+- Unit Tests: {'SUCCESS' if tests_ok else 'FAILED'}
+  {tests_summary[:2000]}
+
+## This Group's Deterministic Remaining Scanner Identifiers
+{remaining_text}
+
+## Files Changed by Remedy Agents (all groups combined)
+{changed_files_text}
+
+## Your Task
+You are investigating ONLY this group ({group.group_id}). Use the provided review tools
+(list_changed_files, generate_workspace_diff, read_file_context, search_codebase_pattern,
+inspect_ast_symbol, query_qa_logs) as needed to answer the following questions.
+
+All three execution tools (install, scan, tests) have ALREADY been run globally.
+Do NOT attempt to call run_dependency_install, run_security_scan, or run_unit_tests —
+they are not available to you.
+
+## Questions to Answer
+1. Package/Domain Purpose: What does this package/component do? What domain does it serve?
+2. Relevant Global Failures: Which (if any) of the install/scan/test failures are relevant to this group's domain?
+3. Plausible Causation: Did this group's remediation plausibly cause the observed install or test failures? Reason deductively.
+4. Scanner Findings: Do the deterministic remaining scanner identifiers above indicate this group still has unresolved vulnerabilities?
+5. Workaround Path Review (if CODE_WORKAROUND): Does the changed code plausibly block the vulnerable execution path? Inspect the diff or relevant files.
+6. Exoneration or Uncertainty: Explicitly state whether this group is exonerated from failures attributed to other groups, or whether there is genuine uncertainty.
+
+## Output Format
+Write a free-form Markdown investigation report answering the 6 questions above.
+Be specific. Reference exact test names, file names, or scanner identifiers where possible.
+End with a one-sentence summary verdict for this group.
+
+Do NOT assign a final pass/fail verdict — that is the Batch Judge's responsibility.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Map phase: run individual investigators (one per group)
+# ---------------------------------------------------------------------------
+
+
+def _run_individual_investigations(
+    valid_groups: List[VulnerabilityGroup],
+    group_strategies: Dict[str, str],
+    action_summaries: List[AgentActionSummary],
+    candidate_changed_files: List[str],
+    sandbox: DockerSandbox,
+    repo_root: Optional[str],
+    results: _QAExecutionResults,
+) -> Dict[str, GroupInvestigation]:
+    """
+    Map phase: run one bounded ReAct investigator per vulnerability group.
+
+    Investigators run sequentially to avoid concurrent Docker/workspace access.
+    Each investigator receives a group-scoped prompt and a read-only review toolbelt.
+    On crash or max-rounds exceeded, a fallback investigation is synthesized from
+    deterministic results for that group only.
+
+    Returns:
+        Dict[group_id, GroupInvestigation]
+    """
+    from langchain_openai import ChatOpenAI
+
+    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    known_group_ids = {group.group_id for group in valid_groups}
+    investigations: Dict[str, GroupInvestigation] = {}
+
+    for group in valid_groups:
+        strategy = group_strategies.get(group.group_id, "version_bump")
+
+        remaining_scan = results.scan[2] if results.scan else set()
+        group_remaining_ids = _group_remaining_identifiers(group, remaining_scan)
+
+        relevant_summaries = _relevant_action_summaries(
+            action_summaries, group.group_id, known_group_ids
+        )
+
+        # Narrow candidate files to those mentioned in action summaries for this group,
+        # falling back to the full batch list if none are found.
+        narrowed_files: List[str] = []
+        for s in relevant_summaries:
+            pass  # Action summaries don't carry file lists in current schema; use batch list
+        group_candidate_files = candidate_changed_files  # use full batch list
+
+        system_prompt = _build_individual_investigator_prompt(
+            group=group,
+            strategy=strategy,
+            results=results,
+            group_remaining_ids=group_remaining_ids,
+            candidate_changed_files=group_candidate_files,
+            action_summaries=relevant_summaries,
+        )
+
+        review_tools = build_qa_review_toolbelt(
+            sandbox=sandbox,
+            candidate_changed_files=group_candidate_files,
+            host_repo_root=repo_root,
+            results=results,
+        )
+
+        llm = ChatOpenAI(model=model_name, temperature=0)
+        initial_messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=(
+                    f"Please investigate group '{group.group_id}' now. "
+                    "Use review tools as needed, then write your Markdown investigation report."
+                )
+            ),
+        ]
+
+        logger.info("qa_critic: [Map] starting investigator for group '%s'.", group.group_id)
+        try:
+            loop_result = run_bounded_subagent_loop(
+                llm=llm,
+                tools=review_tools,
+                initial_messages=initial_messages,
+                touched_files=set(),
+            )
+            investigation_text = (loop_result.final_text or "").strip()
+            transcript_parts = []
+            for event in loop_result.tool_events:
+                transcript_parts.append(f"[TOOL: {event.name}]\n{event.content[:1000]}")
+            transcript_parts.append(f"[AGENT FINAL]\n{investigation_text}")
+            tool_transcript = "\n\n".join(transcript_parts)
+            errors = list(loop_result.errors)
+
+            if not investigation_text:
+                errors.append(
+                    f"qa_critic: investigator for group '{group.group_id}' returned empty output; "
+                    "using fallback."
+                )
+                investigation_text = _build_fallback_investigation_for_group(
+                    group=group,
+                    strategy=strategy,
+                    results=results,
+                    group_remaining_ids=group_remaining_ids,
+                    reason="Investigator returned empty output.",
+                )
+
+            investigations[group.group_id] = GroupInvestigation(
+                group_id=group.group_id,
+                investigation_text=investigation_text,
+                tool_transcript=tool_transcript,
+                errors=errors,
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = f"qa_critic: investigator for group '{group.group_id}' crashed: {exc}"
+            logger.error(err)
+            fallback_text = _build_fallback_investigation_for_group(
+                group=group,
+                strategy=strategy,
+                results=results,
+                group_remaining_ids=group_remaining_ids,
+                reason=f"Investigator crashed: {exc}",
+            )
+            investigations[group.group_id] = GroupInvestigation(
+                group_id=group.group_id,
+                investigation_text=fallback_text,
+                tool_transcript="",
+                errors=[err],
+            )
+        logger.info(
+            "qa_critic: [Map] investigator for '%s' complete. text_len=%d",
+            group.group_id,
+            len(investigations[group.group_id].investigation_text),
+        )
+
+    return investigations
+
+
+def _build_fallback_investigation_for_group(
+    group: VulnerabilityGroup,
+    strategy: str,
+    results: _QAExecutionResults,
+    group_remaining_ids: List[str],
+    reason: str,
+) -> str:
+    """Synthesize a minimal investigation for a single group when the investigator fails."""
+    install_ok, _ = results.install or (False, "not run")
+    tests_ok, _ = results.tests or (False, "not run")
+    scan_ok = results.scan[0] if results.scan else False
+
+    remaining_text = ", ".join(group_remaining_ids) if group_remaining_ids else "none"
+    scan_status = "still_flagged" if group_remaining_ids else ("cleared" if scan_ok else "scan_failed")
+
+    return (
+        f"## Fallback Investigation: {group.group_id}\n\n"
+        f"**Reason:** {reason}\n\n"
+        f"**Component:** {group.vulnerable_component or '(unknown)'}\n"
+        f"**Strategy:** {strategy}\n"
+        f"**Target Identifiers:** {', '.join(sorted(_group_target_identifiers(group))) or 'none'}\n\n"
+        f"**Deterministic Results:**\n"
+        f"- Install: {'SUCCESS' if install_ok else 'FAILED'}\n"
+        f"- Security Scan: {'SUCCESS' if scan_ok else 'FAILED'}\n"
+        f"- Scan Status for this group: {scan_status}\n"
+        f"- Remaining Scanner Identifiers: {remaining_text}\n"
+        f"- Unit Tests: {'PASSED' if tests_ok else 'FAILED'}\n\n"
+        f"**Summary:** Fallback investigation synthesized from deterministic results only. "
+        f"No investigator prose was available."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reduce phase: batch judge
+# ---------------------------------------------------------------------------
+
+
+def _build_batch_judge_prompt(
+    valid_groups: List[VulnerabilityGroup],
+    group_strategies: Dict[str, str],
+    action_summaries: List[AgentActionSummary],
+    results: _QAExecutionResults,
+    investigations_by_group: Dict[str, GroupInvestigation],
+) -> str:
+    """Build the single comprehensive prompt for the batch judge."""
+    known_group_ids = {group.group_id for group in valid_groups}
+
+    install_ok, install_summary = results.install or (False, "not run")
+    scan_ok, scan_summary, remaining_global = results.scan or (False, "not run", set())
+    tests_ok, tests_summary = results.tests or (False, "not run")
+
+    # Detect install conflict type for guardrail hint
+    install_conflict_hint = ""
+    if not install_ok:
+        for pattern in _PEER_CONFLICT_PATTERNS:
+            if pattern.lower() in install_summary.lower():
+                install_conflict_hint = (
+                    f"\n⚠️  Install failure contains '{pattern}' — "
+                    "VERSION_BUMP failures should be categorized as PEER_CONFLICT."
+                )
+                break
+
+    group_sections = []
+    for group in valid_groups:
+        strategy = group_strategies.get(group.group_id, "version_bump")
+        fix_plan = group.fix_plan
+        fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+        fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+        cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
+        ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
+        group_remaining = _group_remaining_identifiers(group, remaining_global)
+        remaining_text = ", ".join(group_remaining) if group_remaining else "(none)"
+
+        relevant_summaries = _relevant_action_summaries(
+            action_summaries, group.group_id, known_group_ids
+        )
+        summaries_text = "\n".join(
+            f"    - {s.status.value}: {s.summary}" for s in relevant_summaries
+        ) or "    (none)"
+
+        investigation = investigations_by_group.get(group.group_id)
+        investigation_text = (
+            investigation.investigation_text if investigation else "(no investigation available)"
+        )
+
+        group_sections.append(
+            f"---\n"
+            f"### Group: {group.group_id}\n"
+            f"- Component      : {group.vulnerable_component or '(unknown)'}\n"
+            f"- Strategy       : {strategy}\n"
+            f"- CVEs           : {cves}\n"
+            f"- GHSAs          : {ghsas}\n"
+            f"- Fix Plan Status: {fix_plan_status}\n"
+            f"- Fix Instruction: {fix_instruction}\n"
+            f"- **Remaining Scanner Identifiers (deterministic):** {remaining_text}\n"
+            f"- Agent Action Summaries:\n{summaries_text}\n\n"
+            f"**Individual Investigation:**\n{investigation_text}\n"
+        )
+
+    all_group_sections = "\n".join(group_sections)
+
+    return f"""You are the Batch Judge in a map-reduce QA evaluation pipeline.
+
+You have received individual investigation reports for {len(valid_groups)} vulnerability group(s).
+Your job is to synthesize these into a holistic report and emit exactly one QAEvaluation per group.
+
+## Global Execution Results
+
+### Install
+- Success: {install_ok}
+- Summary: {install_summary[:2000]}{install_conflict_hint}
+
+### Security Scan
+- Success: {scan_ok}
+- Summary: {scan_summary[:2000]}
+
+### Unit Tests
+- Success: {tests_ok}
+- Summary: {tests_summary[:3000]}
+
+## Individual Group Investigations
+
+{all_group_sections}
+
+## Evaluation Rules
+
+1. **VERSION_BUMP passes** only when:
+   - Install succeeded, AND
+   - This group's Remaining Scanner Identifiers is "(none)", AND
+   - Tests pass OR the investigation explicitly attributes test failures to a DIFFERENT group and exonerates this one.
+
+2. **CODE_WORKAROUND may pass** even when scanner still flags vulnerabilities, if:
+   - The code review or diff proves the vulnerable execution path is blocked, AND
+   - Tests pass OR the investigation exonerates this group from test failures.
+   - Trust the workaround code review for CODE_WORKAROUND groups.
+
+3. Use **PEER_CONFLICT** for install failures caused by dependency conflicts (ERESOLVE, EBADENGINE, peer tree).
+
+4. Use **BREAKING_CHANGE** for test regressions or behavior changes caused by this group's remediation.
+
+5. Use **SECURITY_FLAG** for unresolved scanner evidence or flawed workaround logic.
+
+6. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
+
+7. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
+
+## Output Requirements
+
+Return a BatchQAResult with:
+- `holistic_report`: A markdown narrative listing: (a) responsible groups, (b) possibly responsible groups, (c) exonerated groups. Reference specific test names, scanner IDs, or diff evidence.
+- `evaluations`: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group.
+  - Each evaluation must have: group_id (exact), passed (bool), failure_category (null if passed), retry_feedback (null if passed, specific actionable guidance if failed).
+
+You MUST emit exactly {len(valid_groups)} evaluations, one for each group ID listed above.
+"""
+
+
+def _run_batch_judge(
+    valid_groups: List[VulnerabilityGroup],
+    group_strategies: Dict[str, str],
+    action_summaries: List[AgentActionSummary],
+    results: _QAExecutionResults,
+    investigations_by_group: Dict[str, GroupInvestigation],
+) -> BatchQAResult:
+    """
+    Reduce phase: one structured LLM call across all group investigations.
+
+    Uses ChatOpenAI.with_structured_output(BatchQAResult) exactly once.
+    On LLM failure, synthesizes a failed BatchQAResult for all groups.
+    """
+    from langchain_openai import ChatOpenAI
+
+    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(BatchQAResult)
+
+    prompt = _build_batch_judge_prompt(
+        valid_groups=valid_groups,
+        group_strategies=group_strategies,
+        action_summaries=action_summaries,
+        results=results,
+        investigations_by_group=investigations_by_group,
+    )
+
+    logger.info("qa_critic: [Reduce] invoking batch judge for %d groups.", len(valid_groups))
+    try:
+        batch_result: BatchQAResult = llm.invoke(prompt)
+        logger.info(
+            "qa_critic: [Reduce] batch judge returned %d evaluations.",
+            len(batch_result.evaluations),
+        )
+        return batch_result
+    except Exception as exc:  # noqa: BLE001
+        logger.error("qa_critic: batch judge LLM failed — %s", exc)
+        fallback_evals = [
+            QAEvaluation(
+                group_id=group.group_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback=(
+                    f"Batch QA Judge LLM failed entirely: {exc}. "
+                    "Cannot evaluate this group; please retry."
+                ),
+            )
+            for group in valid_groups
+        ]
+        return BatchQAResult(
+            holistic_report=(
+                f"## Batch Judge Failure\n\nThe batch judge LLM call failed: {exc}\n\n"
+                "All groups marked as failed with SECURITY_FLAG pending retry."
+            ),
+            evaluations=fallback_evals,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Python guardrails
+# ---------------------------------------------------------------------------
+
+
+def _apply_guardrails(
+    valid_groups: List[VulnerabilityGroup],
+    batch_result: BatchQAResult,
+    results: _QAExecutionResults,
+    group_strategies: Dict[str, str],
+) -> Tuple[Dict[str, QAEvaluation], List[str]]:
+    """
+    Normalize and validate BatchQAResult evaluations into a Dict[group_id, QAEvaluation].
+
+    Guardrails applied (in order):
+    1. Unknown group_ids in evaluations are dropped with an error.
+    2. Duplicate evaluations: keep the first, log an error.
+    3. Missing groups: synthesize passed=False / SECURITY_FLAG evaluation.
+    4. Deterministic scanner guardrail for VERSION_BUMP groups:
+       If remaining scanner identifiers exist → force passed=False / SECURITY_FLAG.
+       CODE_WORKAROUND groups are exempt (trust the workaround code review).
+    5. Install error guardrail: if install failed with ERESOLVE/EBADENGINE/peer text,
+       downgrade BREAKING_CHANGE to PEER_CONFLICT for VERSION_BUMP groups.
+
+    Returns:
+        (evaluations_dict, error_list)
+    """
+    known_group_ids = {group.group_id for group in valid_groups}
+    errors: List[str] = []
+
+    # Phase 1: deduplicate and filter unknown group_ids
+    seen: Set[str] = set()
+    normalized: Dict[str, QAEvaluation] = {}
+    for evaluation in batch_result.evaluations:
+        gid = evaluation.group_id
+        if gid not in known_group_ids:
+            errors.append(
+                f"qa_critic guardrail: batch judge emitted evaluation for unknown group '{gid}'; dropped."
+            )
+            continue
+        if gid in seen:
+            errors.append(
+                f"qa_critic guardrail: duplicate evaluation for group '{gid}'; keeping first."
+            )
+            continue
+        seen.add(gid)
+        normalized[gid] = evaluation
+
+    # Phase 2: fill missing groups
+    for group in valid_groups:
+        if group.group_id not in normalized:
+            errors.append(
+                f"qa_critic guardrail: batch judge omitted group '{group.group_id}'; synthesizing failure."
+            )
+            normalized[group.group_id] = QAEvaluation(
+                group_id=group.group_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Batch QA Judge omitted this group; retry required.",
+            )
+
+    # Phase 3: deterministic scanner guardrail
+    remaining_global: Set[str] = results.scan[2] if results.scan else set()
+    for group in valid_groups:
+        strategy = group_strategies.get(group.group_id, "version_bump")
+        group_remaining = _group_remaining_identifiers(group, remaining_global)
+        if not group_remaining:
+            continue  # Scanner cleared this group — no guardrail needed.
+        if strategy == "code_workaround":
+            continue  # Trust the workaround code review — exempt from forced failure.
+        # VERSION_BUMP with remaining identifiers → force failed.
+        current = normalized[group.group_id]
+        if current.passed:
+            errors.append(
+                f"qa_critic guardrail: group '{group.group_id}' (VERSION_BUMP) has remaining "
+                f"scanner identifiers {group_remaining} but judge marked passed=True; "
+                "forcing passed=False / SECURITY_FLAG."
+            )
+            normalized[group.group_id] = QAEvaluation(
+                group_id=group.group_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback=(
+                    f"Scanner still detects unresolved identifiers: {', '.join(group_remaining)}. "
+                    "The version bump did not fully resolve the vulnerability. "
+                    "Check that the correct version was applied."
+                ),
+            )
+
+    # Phase 4: install conflict guardrail — map BREAKING_CHANGE → PEER_CONFLICT
+    install_ok = results.install[0] if results.install else True
+    if not install_ok:
+        install_summary = results.install[1] if results.install else ""
+        is_peer_conflict = any(
+            p.lower() in install_summary.lower() for p in _PEER_CONFLICT_PATTERNS
+        )
+        if is_peer_conflict:
+            for group in valid_groups:
+                strategy = group_strategies.get(group.group_id, "version_bump")
+                if strategy != "version_bump":
+                    continue
+                current = normalized[group.group_id]
+                if not current.passed and current.failure_category == FailureCategory.BREAKING_CHANGE:
+                    normalized[group.group_id] = QAEvaluation(
+                        group_id=group.group_id,
+                        passed=False,
+                        failure_category=FailureCategory.PEER_CONFLICT,
+                        retry_feedback=(
+                            (current.retry_feedback or "")
+                            + " [Guardrail: install failure contains peer conflict indicators; "
+                            "reclassified from BREAKING_CHANGE to PEER_CONFLICT.]"
+                        ),
+                    )
+
+    return normalized, errors
+
+
+# ---------------------------------------------------------------------------
+# QA agent system prompt (backcompat — used by legacy _run_investigator_phase)
 # ---------------------------------------------------------------------------
 
 
@@ -1027,7 +1797,7 @@ def _build_qa_system_prompt(
     action_summaries: List[AgentActionSummary],
     candidate_changed_files: List[str],
 ) -> str:
-    """Build the system prompt for the bounded QA agent loop."""
+    """Build the system prompt for the bounded QA agent loop (backcompat)."""
     known_group_ids = {group.group_id for group in valid_groups}
     groups_text_parts = []
     for group in valid_groups:
@@ -1082,7 +1852,7 @@ You MUST call the following three tools in this exact order before using any rev
 Each execution tool is one-shot guarded: repeated calls return the cached result.
 Do NOT skip or reorder these three steps.
 
-## Review Tools (Conditional â€” Call Only When Needed)
+## Review Tools (Conditional — Call Only When Needed)
 After running all three execution tools, use review tools only if failures or ambiguous
 signals require investigation:
 - `list_changed_files` — list the files the remedy agents modified
@@ -1144,10 +1914,7 @@ Rules:
 
 
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Investigator and Judge helpers
+# Backcompat: Investigator and Judge helpers (old single-agent path)
 # ---------------------------------------------------------------------------
 
 
@@ -1159,7 +1926,7 @@ def _build_group_evidence_packet(
     parsed_report: ParsedInvestigationReport,
     group: VulnerabilityGroup,
 ) -> GroupEvidencePacket:
-    """Build the Judge packet for one vulnerability group."""
+    """Build the Judge packet for one vulnerability group (backcompat)."""
     known_group_ids = {candidate.group_id for candidate in valid_groups}
     strategy = group_strategies.get(group.group_id, "(unknown)")
     fix_plan = group.fix_plan
@@ -1213,7 +1980,7 @@ def _run_investigator_phase(
     workspace_volume: str,
     target_identifiers: Set[str],
 ) -> InvestigationArtifact:
-    """Run the bounded QA investigator agent and parse its final report."""
+    """Run the bounded QA investigator agent and parse its final report (backcompat)."""
     tools, results = build_qa_toolbelt(
         sandbox=sandbox,
         workspace_volume=workspace_volume,
@@ -1298,7 +2065,7 @@ def _run_judge_phase(
     action_summaries: List[AgentActionSummary],
     investigation: InvestigationArtifact,
 ) -> Dict[str, QAEvaluation]:
-    """Run the zero-shot Judge once per vulnerability group."""
+    """Run the zero-shot Judge once per vulnerability group (backcompat)."""
     from langchain_openai import ChatOpenAI
 
     model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
@@ -1431,7 +2198,13 @@ def _extract_group_evaluations(
 @traceable(name="qa_critic")
 def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     """
-    LangGraph node: run the two-phase QA pipeline and evaluate each group.
+    LangGraph node: run the map-reduce QA pipeline and evaluate each group.
+
+    Pipeline:
+      Step 0 — Global Execution (deterministic Python, no LLM tools)
+      Map     — One bounded ReAct investigator per group (read-only tools)
+      Reduce  — One batch judge call (with_structured_output(BatchQAResult))
+      Guards  — Python guardrails normalize and validate evaluations
     """
     valid_groups: List[VulnerabilityGroup] = state.get("valid_groups") or []
     workspace_volume: Optional[str] = state.get("workspace_volume")
@@ -1440,7 +2213,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     group_strategies: Dict[str, str] = state.get("group_strategies") or {}
     candidate_changed_files: List[str] = state.get("changed_files") or []
 
-    if not valid_groups:
+    if not valid_groups and not state.get("force_qa"):
         logger.info("qa_critic: no valid groups - skipping QA.")
         return {
             "qa_evaluations": {},
@@ -1481,16 +2254,72 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     errors: List[str] = []
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            investigation = _run_investigator_phase(
+            # ------------------------------------------------------------------
+            # Step 0: Global Execution (deterministic Python, exactly once)
+            # ------------------------------------------------------------------
+            results = _run_global_execution(
+                sandbox=sandbox,
+                workspace_volume=workspace_volume,
+                target_identifiers=target_identifiers,
+            )
+
+            # ------------------------------------------------------------------
+            # Pipeline completeness guard
+            # ------------------------------------------------------------------
+            missing_tools: List[str] = []
+            if results.install is None:
+                missing_tools.append("run_dependency_install")
+            if results.scan is None:
+                missing_tools.append("run_security_scan")
+            if results.tests is None:
+                missing_tools.append("run_unit_tests")
+            if missing_tools:
+                missing_list = ", ".join(missing_tools)
+                err = (
+                    f"qa_critic: global execution did not complete all required steps; "
+                    f"missing: {missing_list}."
+                )
+                logger.error(err)
+                errors.append(err)
+                for tool_name in missing_tools:
+                    errors.append(
+                        f"qa_critic: required tool '{tool_name}' did not produce a result."
+                    )
+                failed_evals = {
+                    group.group_id: QAEvaluation(
+                        group_id=group.group_id,
+                        passed=False,
+                        failure_category=FailureCategory.SECURITY_FLAG,
+                        retry_feedback=(
+                            f"QA global execution incomplete: {missing_list} did not run. "
+                            "Please retry."
+                        ),
+                    )
+                    for group in valid_groups
+                }
+                return {
+                    "qa_evaluations": failed_evals,
+                    "eval_status": "failures_detected",
+                    "status": "qa_failed",
+                    "errors": errors,
+                    "changed_files": [],
+                    "qa_investigation_report": "",
+                }
+
+            # ------------------------------------------------------------------
+            # Map: Individual Investigators (one per group, sequential)
+            # ------------------------------------------------------------------
+            investigations_by_group = _run_individual_investigations(
                 valid_groups=valid_groups,
                 group_strategies=group_strategies,
                 action_summaries=action_summaries,
                 candidate_changed_files=candidate_changed_files,
                 sandbox=sandbox,
                 repo_root=repo_root,
-                workspace_volume=workspace_volume,
-                target_identifiers=target_identifiers,
+                results=results,
             )
+
+
     except RuntimeError as exc:
         err = f"qa_critic: Docker sandbox unavailable - {exc}"
         logger.error(err)
@@ -1513,55 +2342,31 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
             "qa_investigation_report": "",
         }
 
-    results = investigation.results
-    errors.extend(investigation.errors)
+    # Collect errors from map phase
+    for investigation in investigations_by_group.values():
+        errors.extend(investigation.errors)
 
-    missing_tools: List[str] = []
-    if results.install is None:
-        missing_tools.append("run_dependency_install")
-    if results.scan is None:
-        missing_tools.append("run_security_scan")
-    if results.tests is None:
-        missing_tools.append("run_unit_tests")
-
-    if missing_tools:
-        err = (
-            "qa_critic: agent did not call required execution tool(s): "
-            f"{', '.join(missing_tools)}. Cannot produce a valid evaluation."
-        )
-        logger.error(err)
-        errors.append(err)
-        failed_evals = {
-            group.group_id: QAEvaluation(
-                group_id=group.group_id,
-                passed=False,
-                failure_category=FailureCategory.SECURITY_FLAG,
-                retry_feedback=(
-                    "QA agent failed to run required execution tool(s): "
-                    f"{', '.join(missing_tools)}. This is an infrastructure failure. "
-                    "Please retry."
-                ),
-            )
-            for group in valid_groups
-        }
-        return {
-            "qa_evaluations": failed_evals,
-            "eval_status": "failures_detected",
-            "status": "qa_failed",
-            "errors": errors,
-            "changed_files": candidate_changed_files,
-            "qa_investigation_report": investigation.report_text,
-        }
-
-    logger.info(
-        "qa_critic: extracting structured evaluations for %d groups.", len(valid_groups)
-    )
-    qa_evaluations = _run_judge_phase(
+    # ------------------------------------------------------------------
+    # Reduce: Batch Judge (one LLM call for all groups)
+    # ------------------------------------------------------------------
+    batch_result = _run_batch_judge(
         valid_groups=valid_groups,
         group_strategies=group_strategies,
         action_summaries=action_summaries,
-        investigation=investigation,
+        results=results,
+        investigations_by_group=investigations_by_group,
     )
+
+    # ------------------------------------------------------------------
+    # Python Guardrails
+    # ------------------------------------------------------------------
+    qa_evaluations, guardrail_errors = _apply_guardrails(
+        valid_groups=valid_groups,
+        batch_result=batch_result,
+        results=results,
+        group_strategies=group_strategies,
+    )
+    errors.extend(guardrail_errors)
 
     all_passed = all(evaluation.passed for evaluation in qa_evaluations.values())
     eval_status = "all_passed" if all_passed else "failures_detected"
@@ -1579,5 +2384,5 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         "status": "qa_completed",
         "changed_files": candidate_changed_files,
         "errors": errors,
-        "qa_investigation_report": investigation.report_text,
+        "qa_investigation_report": batch_result.holistic_report,
     }

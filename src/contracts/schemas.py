@@ -1176,6 +1176,26 @@ class QAEvaluation(BaseModel):
         return self
 
 
+class BatchQAResult(BaseModel):
+    """Structured output from the map-reduce batch judge phase."""
+
+    model_config = ConfigDict(frozen=True)
+
+    holistic_report: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Free-form markdown holistic report synthesizing all individual "
+            "investigations into a unified narrative, listing responsible, "
+            "possibly responsible, and exonerated groups."
+        ),
+    )
+    evaluations: List[QAEvaluation] = Field(
+        default_factory=list,
+        description="Exactly one QAEvaluation per vulnerability group in the batch.",
+    )
+
+
 class AgentActionSummary(BaseModel):
     """Condensed subagent outcome stored in supervisor state."""
 

@@ -38,6 +38,7 @@ from .schemas import (
     VulnerabilityGroup,
     TriageResult,
     QAEvaluation,
+    BatchQAResult,
     AgentActionSummary,
     # Phase 5 Remedy Agent
     RemedyAgentOutput,
@@ -73,6 +74,7 @@ __all__ = [
     "VulnerabilityGroup",
     "TriageResult",
     "QAEvaluation",
+    "BatchQAResult",
     "AgentActionSummary",
     # Phase 5 Remedy Agent
     "RemedyAgentOutput",

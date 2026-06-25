@@ -24,16 +24,20 @@ TEST_REPO_ROOT = Path(
 # 3 Direct Dependencies & 2 Transitive Dependencies selected from triaged_groups.json
 TARGET_GROUP_IDS = (
     # Direct
-    # "sca:package.json:jsonwebtoken:UPDATE_VERSION",
-    # "sca:package.json:express-jwt:UPDATE_VERSION",
+     "sca:package.json:jsonwebtoken:UPDATE_VERSION",
+     "sca:package.json:express-jwt:UPDATE_VERSION",
     # "sca:package.json:sanitize-html:UPDATE_VERSION",
     # "sca:package.json:socket.io:UPDATE_VERSION",
     # Transitive
-    #"sca:package.json:@tootallnate/once:UPDATE_VERSION",
-    #"sca:package.json:base64url:UPDATE_VERSION",
-    #"sca:frontend/package.json:ws:UPDATE_VERSION",
-    #"sca:frontend/package.json:elliptic:UPDATE_VERSION",
-    #"sca:package.json:cookie:UPDATE_VERSION",
+    #"sca:package.json:@tootallnate/once:UPDATE_VERSION", # Happy path
+    #"sca:package.json:base64url:UPDATE_VERSION", # Happy path
+    "sca:frontend/package.json:ws:UPDATE_VERSION",
+    "sca:frontend/package.json:elliptic:UPDATE_VERSION",
+    #"sca:package.json:cookie:UPDATE_VERSION", # Happy path
+    #"sca:package.json:lodash.set:UPDATE_VERSION",
+    #"sca:package.json:nanoid:UPDATE_VERSION", # Happy path
+    #"sca:package.json:http-cache-semantics:UPDATE_VERSION", # Happy path
+    "sca:package.json:serialize-javascript:UPDATE_VERSION",
 
 )
 

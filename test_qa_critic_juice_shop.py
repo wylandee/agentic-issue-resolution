@@ -191,10 +191,8 @@ def main() -> None:
         logger.error("Repo root does not exist: %s", repo_root)
         return
 
-    target_groups = _build_test_groups()
+    target_groups = []
     logger.info("Prepared %d test groups for QA evaluation.", len(target_groups))
-    for group in target_groups:
-        logger.info(" - %s (%s)", group.group_id, group.vulnerable_component)
 
     workspace_state = initial_orchestrator_state(str(repo_root), target_groups)
     logger.info("Starting workspace builder...")
@@ -211,40 +209,10 @@ def main() -> None:
     qa_state = {
         **workspace_state,
         "workspace_volume": workspace_volume,
-        "group_strategies": {
-            "sca:package.json:jsonwebtoken:WORKAROUND": RoutingStrategy.CODE_WORKAROUND,
-            "sca:package.json:express-jwt:WORKAROUND": RoutingStrategy.CODE_WORKAROUND,
-            "sca:package.json:sanitize-html:WORKAROUND": RoutingStrategy.CODE_WORKAROUND,
-            "sca:frontend/package.json:ws:UPDATE_VERSION": RoutingStrategy.VERSION_BUMP,
-        },
-        "action_summaries": [
-            AgentActionSummary(
-                group_id="sca:package.json:jsonwebtoken:WORKAROUND",
-                status=AgentActionStatus.SUCCESS,
-                summary="Mocked workaround: added algorithms: ['RS256'] configuration.",
-            ),
-            AgentActionSummary(
-                group_id="sca:package.json:express-jwt:WORKAROUND",
-                status=AgentActionStatus.SUCCESS,
-                summary="Mocked workaround: configured expressJwt with explicit algorithms.",
-            ),
-            AgentActionSummary(
-                group_id="sca:package.json:sanitize-html:WORKAROUND",
-                status=AgentActionStatus.SUCCESS,
-                summary="Mocked workaround: explicitly configured sanitizeHtml call options.",
-            ),
-            AgentActionSummary(
-                group_id="sca:frontend/package.json:ws:UPDATE_VERSION",
-                status=AgentActionStatus.SUCCESS,
-                summary="Mocked version bump: upgraded ws dependency in frontend/package.json.",
-            ),
-        ],
-        "changed_files": [
-            "package.json",
-            "routes/verify.ts",
-            "lib/insecurity.ts",
-            "frontend/package.json",
-        ],
+        "group_strategies": {},
+        "action_summaries": [],
+        "changed_files": [],
+        "force_qa": True,
     }
 
     qa_result = None
