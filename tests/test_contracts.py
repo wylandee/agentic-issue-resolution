@@ -190,14 +190,14 @@ class TestPhase5RefactorEnums:
 
 class TestQAEvaluation:
     def test_passed_evaluation_accepts_no_failure_metadata(self):
-        evaluation = QAEvaluation(group_id="group-1", passed=True)
+        evaluation = QAEvaluation(task_id="group-1", passed=True)
         assert evaluation.failure_category is None
         assert evaluation.retry_feedback is None
 
     def test_passed_evaluation_rejects_failure_metadata(self):
         with pytest.raises(ValidationError, match="passed=True"):
             QAEvaluation(
-                group_id="group-1",
+                task_id="group-1",
                 passed=True,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback="Try a different edit.",
@@ -206,14 +206,14 @@ class TestQAEvaluation:
     @pytest.mark.parametrize(
         "kwargs",
         [
-            {"group_id": "group-1", "passed": False, "retry_feedback": "Try again."},
+            {"task_id": "group-1", "passed": False, "retry_feedback": "Try again."},
             {
-                "group_id": "group-1",
+                "task_id": "group-1",
                 "passed": False,
                 "failure_category": FailureCategory.PEER_CONFLICT,
             },
             {
-                "group_id": "group-1",
+                "task_id": "group-1",
                 "passed": False,
                 "failure_category": FailureCategory.PEER_CONFLICT,
                 "retry_feedback": "   ",
@@ -226,7 +226,7 @@ class TestQAEvaluation:
 
     def test_failed_evaluation_accepts_category_and_feedback(self):
         evaluation = QAEvaluation(
-            group_id="group-1",
+            task_id="group-1",
             passed=False,
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="Update the call sites to match the new API.",
@@ -235,7 +235,7 @@ class TestQAEvaluation:
 
     def test_json_round_trip(self):
         evaluation = QAEvaluation(
-            group_id="group-1",
+            task_id="group-1",
             passed=False,
             failure_category=FailureCategory.SECURITY_FLAG,
             retry_feedback="The scanner still reports the vulnerable identifier.",
@@ -248,14 +248,14 @@ class TestAgentActionSummary:
     def test_rejects_empty_summary(self):
         with pytest.raises(ValidationError, match="summary"):
             AgentActionSummary(
-                group_id="group-1",
+                task_id="group-1",
                 status=AgentActionStatus.SUCCESS,
                 summary="   ",
             )
 
     def test_json_round_trip(self):
         summary = AgentActionSummary(
-            group_id="group-1",
+            task_id="group-1",
             status=AgentActionStatus.SURRENDER,
             summary="Unable to resolve the peer dependency conflict safely.",
         )

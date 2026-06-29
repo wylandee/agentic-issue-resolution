@@ -239,7 +239,7 @@ def _build_action_summary(
         summary = f"{outcome} for {group_label}; changed files: {changed_label}. Final note: {final_note}"
     else:
         summary = f"{outcome} for {group_label}; changed files: {changed_label}."
-    return AgentActionSummary(group_id="batch:" + group_label, status=summary_status, summary=summary)
+    return AgentActionSummary(task_id="batch:" + group_label, status=summary_status, summary=summary)
 
 @traceable(name="Update_Subagent_Test_Run") # for langsmith testing
 def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
@@ -254,7 +254,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     if not repo_root_str or not repo_root.is_dir():
         msg = f"Update Subagent: repo_root '{repo_root_str}' is not a valid directory."
         summary = AgentActionSummary(
-            group_id="batch:unknown",
+            task_id="batch:unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because repo_root was invalid.",
         )
@@ -263,7 +263,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     if not workspace_volume:
         msg = "Update Subagent: workspace_volume is missing from state."
         summary = AgentActionSummary(
-            group_id="batch:unknown",
+            task_id="batch:unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because workspace_volume was missing.",
         )
@@ -280,7 +280,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     if not resolved_groups:
         summary = AgentActionSummary(
-            group_id="batch:unknown",
+            task_id="batch:unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because no manifest targets could be resolved.",
         )
@@ -289,7 +289,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     if ChatOpenAI is None:
         msg = "Update Subagent: 'langchain-openai' is not installed."
         summary = AgentActionSummary(
-            group_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
+            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because the LLM client is unavailable.",
         )
@@ -301,7 +301,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
         summary = AgentActionSummary(
-            group_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
+            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because the LLM failed to initialize.",
         )
@@ -338,7 +338,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
         summary = AgentActionSummary(
-            group_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
+            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
             status=AgentActionStatus.SURRENDER,
             summary="Stopped because the sandbox or tool loop failed.",
         )

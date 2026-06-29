@@ -18,6 +18,8 @@ from .schemas import (
     FailureCategory,
     RoutingStrategy,
     AgentActionStatus,
+    GroupRemediationStatus,
+    TaskStatus,
     # Sub-models
     CWEEntry,
     LineRange,
@@ -40,6 +42,9 @@ from .schemas import (
     QAEvaluation,
     BatchQAResult,
     AgentActionSummary,
+    SupervisorDecision,
+    # Phase 5 Task Queue
+    RemediationTask,
     # Phase 5 Remedy Agent
     RemedyAgentOutput,
 )
@@ -56,6 +61,8 @@ __all__ = [
     "FailureCategory",
     "RoutingStrategy",
     "AgentActionStatus",
+    "GroupRemediationStatus",
+    "TaskStatus",
     "CWEEntry",
     "LineRange",
     # Sandbox contracts (Phase 3)
@@ -76,6 +83,9 @@ __all__ = [
     "QAEvaluation",
     "BatchQAResult",
     "AgentActionSummary",
+    "SupervisorDecision",
+    # Phase 5 Task Queue
+    "RemediationTask",
     # Phase 5 Remedy Agent
     "RemedyAgentOutput",
 ]

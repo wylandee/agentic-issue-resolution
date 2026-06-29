@@ -130,7 +130,7 @@ def _build_action_summary(
         summary = f"{outcome} for {group_id}; changed files: {changed_label}. Final note: {final_note}"
     else:
         summary = f"{outcome} for {group_id}; changed files: {changed_label}."
-    return AgentActionSummary(group_id=group_id, status=summary_status, summary=summary)
+    return AgentActionSummary(task_id=group_id, status=summary_status, summary=summary)
 
 @traceable(name="Workaround_Subagent_Test_Run") # for langsmith testing
 def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
@@ -144,7 +144,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
         summary = AgentActionSummary(
-            group_id=target_group.group_id if target_group else "unknown",
+            task_id=target_group.group_id if target_group else "unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because repo_root was invalid.",
         )
@@ -156,7 +156,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     if not workspace_volume:
         summary = AgentActionSummary(
-            group_id=target_group.group_id if target_group else "unknown",
+            task_id=target_group.group_id if target_group else "unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because workspace_volume was missing.",
         )
@@ -168,7 +168,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     if target_group is None:
         summary = AgentActionSummary(
-            group_id="unknown",
+            task_id="unknown",
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because no target group was provided.",
         )
@@ -180,7 +180,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     if ChatOpenAI is None:
         summary = AgentActionSummary(
-            group_id=target_group.group_id,
+            task_id=target_group.group_id,
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because the LLM client is unavailable.",
         )
@@ -195,7 +195,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
         summary = AgentActionSummary(
-            group_id=target_group.group_id,
+            task_id=target_group.group_id,
             status=AgentActionStatus.SURRENDER,
             summary="Stopped before execution because the LLM failed to initialize.",
         )
@@ -220,7 +220,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
             runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
     except Exception as exc:  # noqa: BLE001
         summary = AgentActionSummary(
-            group_id=target_group.group_id,
+            task_id=target_group.group_id,
             status=AgentActionStatus.SURRENDER,
             summary="Stopped because the sandbox or tool loop failed.",
         )

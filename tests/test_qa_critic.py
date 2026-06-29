@@ -1009,7 +1009,7 @@ class TestRunQACriticNode:
         if batch_result is None:
             batch_result = BatchQAResult(
                 holistic_report="All groups passed.",
-                evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+                evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
             )
 
         investigations = {
@@ -1049,7 +1049,7 @@ class TestRunQACriticNode:
         state = _make_minimal_state(groups=[group])
         batch_result = BatchQAResult(
             holistic_report="All groups passed.",
-            evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         patches = self._patch_node(group=group, batch_result=batch_result)
 
@@ -1069,7 +1069,7 @@ class TestRunQACriticNode:
             holistic_report="Group failed.",
             evaluations=[
                 QAEvaluation(
-                    group_id=group.group_id,
+                    task_id=group.group_id,
                     passed=False,
                     failure_category=FailureCategory.SECURITY_FLAG,
                     retry_feedback="CVE still present.",
@@ -1125,7 +1125,7 @@ class TestRunQACriticNode:
         )
         batch_result = BatchQAResult(
             holistic_report="ok",
-            evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         patches = self._patch_node(group=group, batch_result=batch_result)
 
@@ -1148,7 +1148,7 @@ class TestRunQACriticNode:
         }
         batch_result = BatchQAResult(
             holistic_report="ok",
-            evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         mock_sandbox = MagicMock()
         mock_sandbox.__enter__ = MagicMock(return_value=mock_sandbox)
@@ -1191,7 +1191,7 @@ class TestQAMissingExecutionTools:
         }
         batch_result = BatchQAResult(
             holistic_report="ok",
-            evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
 
         with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox), \
@@ -1264,7 +1264,7 @@ class TestExtractGroupEvaluations:
         from src.contracts.schemas import AgentActionSummary, AgentActionStatus
 
         group = _make_group()
-        mock_eval = QAEvaluation(group_id=group.group_id, passed=True)
+        mock_eval = QAEvaluation(task_id=group.group_id, passed=True)
 
         results = _make_fully_populated_results(ok=True)
 
@@ -1321,7 +1321,7 @@ class TestExtractGroupEvaluations:
             mock_llm_instance = MagicMock()
             mock_structured = MagicMock()
             captured_prompts = []
-            mock_eval = QAEvaluation(group_id=group.group_id, passed=False,
+            mock_eval = QAEvaluation(task_id=group.group_id, passed=False,
                                      failure_category=FailureCategory.SECURITY_FLAG,
                                      retry_feedback="tools not called")
             def capture_invoke(prompt):
@@ -1457,7 +1457,7 @@ class TestJudgePhaseIsolation:
             def capture(prompt):
                 captured_prompts.append(prompt)
                 gid = "group-a" if "Group ID: group-a" in prompt else "group-b"
-                return QAEvaluation(group_id=gid, passed=True)
+                return QAEvaluation(task_id=gid, passed=True)
 
             mock_structured.invoke.side_effect = capture
             mock_llm_instance.with_structured_output.return_value = mock_structured
@@ -1532,7 +1532,7 @@ class TestBatchQAResultSchema:
     def test_valid_batch_result_accepted(self):
         result = BatchQAResult(
             holistic_report="All groups passed.",
-            evaluations=[QAEvaluation(group_id="g1", passed=True)],
+            evaluations=[QAEvaluation(task_id="g1", passed=True)],
         )
         assert result.holistic_report == "All groups passed."
         assert len(result.evaluations) == 1
@@ -1745,7 +1745,7 @@ class TestRunBatchJudge:
         invs = {group.group_id: GroupInvestigation(group.group_id, "ok", "")}
         expected = BatchQAResult(
             holistic_report="All passed.",
-            evaluations=[QAEvaluation(group_id=group.group_id, passed=True)],
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         with patch("langchain_openai.ChatOpenAI") as MockLLM:
             mi = MagicMock()
@@ -1796,7 +1796,7 @@ class TestApplyGuardrails:
     def test_valid_passes_through(self):
         g = _make_group()
         batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(group_id=g.group_id, passed=True)])
+                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
                                           results=self._res(), group_strategies={g.group_id: "version_bump"})
         assert evals[g.group_id].passed is True and not errors
@@ -1804,8 +1804,8 @@ class TestApplyGuardrails:
     def test_unknown_group_id_dropped(self):
         g = _make_group(group_id="real")
         batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id="real", passed=True),
-            QAEvaluation(group_id="ghost", passed=False,
+            QAEvaluation(task_id="real", passed=True),
+            QAEvaluation(task_id="ghost", passed=False,
                          failure_category=FailureCategory.SECURITY_FLAG, retry_feedback="x"),
         ])
         evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
@@ -1815,8 +1815,8 @@ class TestApplyGuardrails:
     def test_duplicate_keeps_first(self):
         g = _make_group()
         batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id=g.group_id, passed=True),
-            QAEvaluation(group_id=g.group_id, passed=False,
+            QAEvaluation(task_id=g.group_id, passed=True),
+            QAEvaluation(task_id=g.group_id, passed=False,
                          failure_category=FailureCategory.SECURITY_FLAG, retry_feedback="second"),
         ])
         evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
@@ -1826,7 +1826,7 @@ class TestApplyGuardrails:
     def test_missing_group_synthesized(self):
         g1, g2 = _make_group(group_id="g1"), _make_group(group_id="g2")
         batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(group_id="g1", passed=True)])
+                              evaluations=[QAEvaluation(task_id="g1", passed=True)])
         evals, errors = _apply_guardrails(valid_groups=[g1, g2], batch_result=batch,
                                           results=self._res(), group_strategies={})
         assert evals["g2"].passed is False and evals["g2"].failure_category == FailureCategory.SECURITY_FLAG
@@ -1834,7 +1834,7 @@ class TestApplyGuardrails:
     def test_version_bump_remaining_forces_fail(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
         batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(group_id=g.group_id, passed=True)])
+                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
                                      results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
                                      group_strategies={g.group_id: "version_bump"})
@@ -1844,7 +1844,7 @@ class TestApplyGuardrails:
     def test_code_workaround_remaining_allowed_pass(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
         batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(group_id=g.group_id, passed=True)])
+                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
                                      results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
                                      group_strategies={g.group_id: "code_workaround"})
@@ -1853,7 +1853,7 @@ class TestApplyGuardrails:
     def test_eresolve_remaps_breaking_to_peer_conflict(self):
         g = _make_group()
         batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id=g.group_id, passed=False,
+            QAEvaluation(task_id=g.group_id, passed=False,
                          failure_category=FailureCategory.BREAKING_CHANGE, retry_feedback="x")
         ])
         evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
@@ -1864,7 +1864,7 @@ class TestApplyGuardrails:
     def test_eresolve_exempt_for_code_workaround(self):
         g = _make_group()
         batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id=g.group_id, passed=False,
+            QAEvaluation(task_id=g.group_id, passed=False,
                          failure_category=FailureCategory.BREAKING_CHANGE, retry_feedback="x")
         ])
         evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
@@ -1887,7 +1887,7 @@ class TestRunQACriticNodeMapReduce:
         if batch_result is None:
             batch_result = BatchQAResult(
                 holistic_report="All passed.",
-                evaluations=[QAEvaluation(group_id=g.group_id, passed=True) for g in groups],
+                evaluations=[QAEvaluation(task_id=g.group_id, passed=True) for g in groups],
             )
         mock_sb = MagicMock()
         mock_sb.__enter__ = MagicMock(return_value=mock_sb)
@@ -1905,7 +1905,7 @@ class TestRunQACriticNodeMapReduce:
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
         br = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id="g1", passed=True), QAEvaluation(group_id="g2", passed=True)])
+            QAEvaluation(task_id="g1", passed=True), QAEvaluation(task_id="g2", passed=True)])
         _, _, mm, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         mm.assert_called_once()
 
@@ -1916,7 +1916,7 @@ class TestRunQACriticNodeMapReduce:
     def test_holistic_report_in_output(self):
         g = _make_group()
         br = BatchQAResult(holistic_report="## Holistic.",
-                           evaluations=[QAEvaluation(group_id=g.group_id, passed=True)])
+                           evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         result, _, _, _ = self._run([g], batch_result=br)
         assert result["qa_investigation_report"] == "## Holistic."
 
@@ -1924,7 +1924,7 @@ class TestRunQACriticNodeMapReduce:
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
         br = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(group_id="g1", passed=True), QAEvaluation(group_id="g2", passed=True)])
+            QAEvaluation(task_id="g1", passed=True), QAEvaluation(task_id="g2", passed=True)])
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert result["eval_status"] == "all_passed" and result["status"] == "qa_completed"
 
@@ -1932,7 +1932,7 @@ class TestRunQACriticNodeMapReduce:
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
         br = BatchQAResult(holistic_report="ok",
-                           evaluations=[QAEvaluation(group_id="g1", passed=True)])  # g2 missing
+                           evaluations=[QAEvaluation(task_id="g1", passed=True)])  # g2 missing
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert "g2" in result["qa_evaluations"] and result["qa_evaluations"]["g2"].passed is False
 

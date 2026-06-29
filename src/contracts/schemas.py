@@ -147,6 +147,16 @@ class GroupRemediationStatus(str, Enum):
     UNFIXABLE = "unfixable"                          # Max retries exhausted; terminal failure
 
 
+class TaskStatus(str, Enum):
+    """Lifecycle status for one RemediationTask in the task queue."""
+
+    PENDING = "pending"                              # Not yet dispatched to any worker
+    OPTIMISTICALLY_FIXED = "optimistically_fixed"    # Worker succeeded; awaiting QA verdict
+    QA_PASSED = "qa_passed"                          # QA explicitly passed; terminal success
+    NEEDS_RETRY = "needs_retry"                      # QA failed; will be re-routed by supervisor
+    UNFIXABLE = "unfixable"                          # Max retries exhausted; terminal failure
+
+
 # ---------------------------------------------------------------------------
 # CommandResult
 # ---------------------------------------------------------------------------
@@ -1141,11 +1151,11 @@ class TriageResult(BaseModel):
 
 
 class QAEvaluation(BaseModel):
-    """Structured QA Critic verdict for a single vulnerability group."""
+    """Structured QA Critic verdict for a single remediation task."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    group_id: str = Field(..., min_length=1)
+    task_id: str = Field(..., min_length=1)
     passed: bool
     failure_category: Optional[FailureCategory] = Field(
         None,
@@ -1201,7 +1211,7 @@ class AgentActionSummary(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    group_id: str = Field(..., min_length=1)
+    task_id: str = Field(..., min_length=1)
     status: AgentActionStatus
     summary: str = Field(..., min_length=1)
 
@@ -1220,11 +1230,11 @@ class SupervisorDecision(BaseModel):
 
     Controls hub-and-spoke routing in the Phase 5 orchestrator graph.
     Pydantic validators enforce routing invariants:
-    - ``workaround_subagent`` requires exactly one ``target_group_id``.
-    - ``update_subagent`` requires 1-10 ``target_group_ids``.
-    - ``qa_critic`` requires one or more ``target_group_ids`` for batch QA.
-    - ``teardown`` requires empty ``target_group_ids``.
-    - ``unfixable_group_ids`` and ``target_group_ids`` must not overlap.
+    - ``workaround_subagent`` requires exactly one ``target_task_id``.
+    - ``update_subagent`` requires 1-10 ``target_task_ids``.
+    - ``qa_critic`` requires one or more ``target_task_ids`` for batch QA.
+    - ``teardown`` requires empty ``target_task_ids``.
+    - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -1235,36 +1245,36 @@ class SupervisorDecision(BaseModel):
         ...,
         description="The next node to route to in the orchestrator graph.",
     )
-    updated_strategies: Dict[str, "RoutingStrategy"] = Field(
+    updated_task_strategies: Dict[str, "RoutingStrategy"] = Field(
         default_factory=dict,
-        description="Strategy pivots for specific group IDs (e.g. VERSION_BUMP → CODE_WORKAROUND).",
+        description="Strategy pivots for specific task IDs (e.g. VERSION_BUMP → CODE_WORKAROUND).",
     )
-    target_group_ids: List[str] = Field(
+    target_task_ids: List[str] = Field(
         default_factory=list,
         description=(
-            "Group IDs to send to the next subagent node. "
+            "Task IDs to send to the next worker node. "
             "One or more for qa_critic. "
             "Empty for teardown. "
             "Exactly one entry for workaround_subagent. "
             "One to ten entries for update_subagent."
         ),
     )
-    unfixable_group_ids: List[str] = Field(
+    unfixable_task_ids: List[str] = Field(
         default_factory=list,
-        description="Group IDs that have hit MAX_RETRIES and should be marked unfixable.",
+        description="Task IDs that have hit MAX_RETRIES and should be marked unfixable.",
     )
     new_constraints: List[str] = Field(
         default_factory=list,
         description="New constraint strings to append to the constraints ledger.",
     )
-    feedback_by_group: Dict[str, str] = Field(
+    feedback_by_task: Dict[str, str] = Field(
         default_factory=dict,
-        description="Group-specific retry guidance keyed by group_id.",
+        description="Task-specific retry guidance keyed by task_id.",
     )
     instructions: str = Field(
         ...,
         min_length=1,
-        description="Default guidance applied to target groups without specific feedback.",
+        description="Default guidance applied to target tasks without specific feedback.",
     )
     decision_reason: str = Field(
         ...,
@@ -1275,35 +1285,85 @@ class SupervisorDecision(BaseModel):
     @model_validator(mode="after")
     def _validate_routing_invariants(self) -> "SupervisorDecision":
         node = self.next_node
-        targets = self.target_group_ids
-        unfixable = self.unfixable_group_ids
+        targets = self.target_task_ids
+        unfixable = self.unfixable_task_ids
 
         if node == "workaround_subagent" and len(targets) != 1:
             raise ValueError(
-                f"workaround_subagent requires exactly 1 target_group_id, got {len(targets)}."
+                f"workaround_subagent requires exactly 1 target_task_id, got {len(targets)}."
             )
         if node == "update_subagent" and len(targets) < 1:
             raise ValueError(
-                "update_subagent requires at least 1 target_group_id."
+                "update_subagent requires at least 1 target_task_id."
             )
         if node == "update_subagent" and len(targets) > 10:
             raise ValueError(
-                f"update_subagent supports at most 10 target_group_ids, got {len(targets)}."
+                f"update_subagent supports at most 10 target_task_ids, got {len(targets)}."
             )
         if node == "qa_critic" and len(targets) < 1:
             raise ValueError(
-                "qa_critic requires at least 1 target_group_id."
+                "qa_critic requires at least 1 target_task_id."
             )
         if node == "teardown" and targets:
             raise ValueError(
-                f"{node} must have empty target_group_ids, got {targets}."
+                f"{node} must have empty target_task_ids, got {targets}."
             )
         overlap = set(unfixable) & set(targets)
         if overlap:
             raise ValueError(
-                f"unfixable_group_ids and target_group_ids must not overlap. Overlap: {overlap}"
+                f"unfixable_task_ids and target_task_ids must not overlap. Overlap: {overlap}"
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Task Queue contracts
+# ---------------------------------------------------------------------------
+
+
+class RemediationTask(BaseModel):
+    """
+    A single unit of work in the Phase 5 task queue.
+
+    Created by the supervisor from a ``VulnerabilityGroup`` and carried
+    through the orchestrator lifecycle.  Tasks are the primary key for
+    supervisor decisions, QA evaluations, and action summaries.
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    task_id: str = Field(
+        ...,
+        min_length=1,
+        description="Unique task identifier (e.g. 'task-1').",
+    )
+    parent_group_id: str = Field(
+        ...,
+        min_length=1,
+        description="The ``VulnerabilityGroup.group_id`` this task remediates.",
+    )
+    strategy: RoutingStrategy = Field(
+        ...,
+        description="Routing strategy: VERSION_BUMP or CODE_WORKAROUND.",
+    )
+    instruction: str = Field(
+        default="",
+        description="Exact supervisor-written instruction for the worker agent.",
+    )
+    status: TaskStatus = Field(
+        default=TaskStatus.PENDING,
+        description="Current lifecycle status of this task.",
+    )
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of times this task has been retried after QA failure.",
+    )
+    ancestry_depth: int = Field(
+        default=0,
+        ge=0,
+        description="How many parent tasks spawned this task (0 = initial task).",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -36,9 +36,11 @@ from src.contracts.schemas import (
     GroupRemediationStatus,
     LocalizedIssue,
     QAEvaluation,
+    RemediationTask,
     RoutingStrategy,
     SupervisorDecision,
     SystemContext,
+    TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -99,6 +101,8 @@ class OrchestratorState(TypedDict, total=False):
     ---------------------------
     changed_files:
         Repo-relative files successfully modified across subagent runs.
+    task_queue:
+        Dict mapping task_id → RemediationTask; the primary unit of Phase 5 work.
     """
 
     repo_root: str
@@ -115,12 +119,17 @@ class OrchestratorState(TypedDict, total=False):
     action_summaries: Annotated[List[AgentActionSummary], operator.add]
     changed_files: Annotated[List[str], operator.add]
 
+    # Phase 5 Task Queue (primary orchestration unit)
+    task_queue: Annotated[Dict[str, RemediationTask], merge_dict_reducer]
+    active_target_task_ids: List[str]
+
     workspace_volume: Optional[str]
 
     # Supervisor routing fields
     next_routing_step: str
     active_target_group_ids: List[str]
     feedback_by_group: Annotated[Dict[str, str], merge_dict_reducer]
+    feedback_by_task: Annotated[Dict[str, str], merge_dict_reducer]
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
@@ -144,6 +153,7 @@ class SubagentState(TypedDict, total=False):
 
     target_groups: List[VulnerabilityGroup]
     feedback_by_group: Dict[str, str]
+    feedback_by_task: Dict[str, str]
 
     target_group: VulnerabilityGroup
     constraints_ledger: List[str]
@@ -173,11 +183,14 @@ def initial_orchestrator_state(
         "qa_evaluations": {},
         "action_summaries": [],
         "changed_files": [],
+        "task_queue": {},
+        "active_target_task_ids": [],
         "workspace_volume": None,
         "status": "pending",
         "next_routing_step": "",
         "active_target_group_ids": [],
         "feedback_by_group": {},
+        "feedback_by_task": {},
         "supervisor_instructions": "",
         "eval_status": "",
         "qa_investigation_report": "",

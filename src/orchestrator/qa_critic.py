@@ -615,18 +615,18 @@ def _resolve_action_summary_group_ids(
     known_group_ids: Set[str],
 ) -> List[str]:
     """Resolve which exact group_ids an AgentActionSummary applies to."""
-    raw_group_id = (summary.group_id or "").strip()
-    if not raw_group_id:
+    raw_task_id = (summary.task_id or "").strip()
+    if not raw_task_id:
         return []
-    if raw_group_id.startswith("batch:"):
-        payload = raw_group_id[len("batch:"):]
+    if raw_task_id.startswith("batch:"):
+        payload = raw_task_id[len("batch:"):]
         resolved = []
         for part in payload.split(","):
             candidate = part.strip()
             if candidate and candidate in known_group_ids:
                 resolved.append(candidate)
         return resolved
-    return [raw_group_id] if raw_group_id in known_group_ids else []
+    return [raw_task_id] if raw_task_id in known_group_ids else []
 
 
 def _relevant_action_summaries(
@@ -1701,7 +1701,7 @@ def _run_batch_judge(
         logger.error("qa_critic: batch judge LLM failed — %s", exc)
         fallback_evals = [
             QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
@@ -1754,7 +1754,7 @@ def _apply_guardrails(
     seen: Set[str] = set()
     normalized: Dict[str, QAEvaluation] = {}
     for evaluation in batch_result.evaluations:
-        gid = evaluation.group_id
+        gid = evaluation.task_id
         if gid not in known_group_ids:
             errors.append(
                 f"qa_critic guardrail: batch judge emitted evaluation for unknown group '{gid}'; dropped."
@@ -1775,7 +1775,7 @@ def _apply_guardrails(
                 f"qa_critic guardrail: batch judge omitted group '{group.group_id}'; synthesizing failure."
             )
             normalized[group.group_id] = QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback="Batch QA Judge omitted this group; retry required.",
@@ -1799,7 +1799,7 @@ def _apply_guardrails(
                 "forcing passed=False / SECURITY_FLAG."
             )
             normalized[group.group_id] = QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
@@ -1824,7 +1824,7 @@ def _apply_guardrails(
                 current = normalized[group.group_id]
                 if not current.passed and current.failure_category == FailureCategory.BREAKING_CHANGE:
                     normalized[group.group_id] = QAEvaluation(
-                        group_id=group.group_id,
+                        task_id=group.group_id,
                         passed=False,
                         failure_category=FailureCategory.PEER_CONFLICT,
                         retry_feedback=(
@@ -2197,7 +2197,7 @@ Return a QAEvaluation for group_id="{group.group_id}" with:
                 exc,
             )
             evaluations[group.group_id] = QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
@@ -2308,7 +2308,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         logger.error(err)
         failed_evals = {
             group.group_id: QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback="QA infrastructure failure: workspace_volume is missing.",
@@ -2370,7 +2370,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
                     )
                 failed_evals = {
                     group.group_id: QAEvaluation(
-                        group_id=group.group_id,
+                        task_id=group.group_id,
                         passed=False,
                         failure_category=FailureCategory.SECURITY_FLAG,
                         retry_feedback=(
@@ -2409,7 +2409,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         errors.append(err)
         failed_evals = {
             group.group_id: QAEvaluation(
-                group_id=group.group_id,
+                task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback="QA infrastructure failure: Docker sandbox could not start.",

@@ -9,9 +9,7 @@ decision, and returns a state patch that wires the next hop.
 Public API
 ----------
 MAX_RETRIES : int
-    Maximum number of QA-fail-retry cycles before a group is marked unfixable.
-derive_initial_strategy(group) -> RoutingStrategy
-    Pure function: decides VERSION_BUMP vs CODE_WORKAROUND from the fix plan.
+    Maximum number of QA-fail-retry cycles before a task is marked unfixable.
 build_supervisor_prompt(state) -> str
     Builds the structured prompt text for the LLM decision.
 run_supervisor_node(state) -> Dict[str, Any]
@@ -30,18 +28,19 @@ from src.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
-    FixPlanStatus,
-    GroupRemediationStatus,
     QAEvaluation,
+    RemediationTask,
     RoutingStrategy,
     SupervisorDecision,
+    TaskStatus,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
+from src.orchestrator.task_utils import build_initial_remediation_task
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 2
+MAX_RETRIES: int = 1 # Keep at 1 for testing
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -53,60 +52,44 @@ _VALID_NEXT_NODES: Set[str] = {
 _DEFAULT_MODEL = "gpt-4o-mini"
 
 # ---------------------------------------------------------------------------
-# Strategy derivation
-# ---------------------------------------------------------------------------
-
-
-def derive_initial_strategy(group: VulnerabilityGroup) -> RoutingStrategy:
-    """
-    Derive the initial routing strategy from a group's fix plan.
-
-    Returns ``VERSION_BUMP`` only when the fix plan has ``status=VERSION_FOUND``
-    (i.e. a safe pinned version is available).  All other plans — workaround,
-    no-fix, or absent — map to ``CODE_WORKAROUND``.
-    """
-    fix_plan = group.fix_plan
-    if fix_plan is not None and fix_plan.status == FixPlanStatus.VERSION_FOUND:
-        return RoutingStrategy.VERSION_BUMP
-    return RoutingStrategy.CODE_WORKAROUND
-
-
-# ---------------------------------------------------------------------------
-# Deterministic fallback router
+# Task status helpers
 # ---------------------------------------------------------------------------
 
 _TERMINAL_STATUSES = frozenset({
-    GroupRemediationStatus.QA_PASSED,
-    GroupRemediationStatus.UNFIXABLE,
+    TaskStatus.QA_PASSED,
+    TaskStatus.UNFIXABLE,
 })
 _WORKABLE_STATUSES = frozenset({
-    GroupRemediationStatus.PENDING,
-    GroupRemediationStatus.NEEDS_RETRY,
+    TaskStatus.PENDING,
+    TaskStatus.NEEDS_RETRY,
 })
 
 
-def _constraint_entry_for_group(
+def _constraint_entry_for_task(
+    task: RemediationTask,
     group: VulnerabilityGroup,
-    strategy: RoutingStrategy,
 ) -> str:
-    """Build a deterministic constraints-ledger entry for a QA-passed group."""
-    component = (group.vulnerable_component or group.group_id).strip()
+    """Build a deterministic constraints-ledger entry for a QA-passed task."""
+    component = (group.vulnerable_component or task.parent_group_id).strip()
     fix_plan = group.fix_plan
 
-    if strategy == RoutingStrategy.VERSION_BUMP:
+    if task.strategy == RoutingStrategy.VERSION_BUMP:
         fixed_version = (fix_plan.fixed_version if fix_plan else None) or "unknown"
         return f"{component}: keep resolved version at {fixed_version}"
 
     return f"{component}: preserve validated security workaround"
 
 
+# ---------------------------------------------------------------------------
+# Deterministic fallback router
+# ---------------------------------------------------------------------------
+
+
 def _deterministic_routing(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, RoutingStrategy],
-    group_statuses: Dict[str, GroupRemediationStatus],
-    retry_counts: Dict[str, int],
+    task_queue: Dict[str, RemediationTask],
+    group_by_id: Dict[str, VulnerabilityGroup],
     qa_evaluations: Dict[str, QAEvaluation],
-    active_target_group_ids: Optional[List[str]] = None,
+    active_target_task_ids: Optional[List[str]] = None,
     current_status: str = "",
 ) -> SupervisorDecision:
     """
@@ -114,108 +97,91 @@ def _deterministic_routing(
 
     Implements the same priority rules described in the supervisor prompt.
     """
-    non_terminal = [
-        g for g in valid_groups
-        if group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
-        not in _TERMINAL_STATUSES
-    ]
+    tasks = list(task_queue.values())
+    non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
 
-    # All groups are terminal → teardown
+    # All tasks are terminal → teardown
     if not non_terminal:
         return SupervisorDecision(
             next_node="teardown",
-            target_group_ids=[],
-            instructions="All groups are terminal. Proceeding to teardown.",
-            decision_reason="No actionable groups remain.",
+            target_task_ids=[],
+            instructions="All tasks are terminal. Proceeding to teardown.",
+            decision_reason="No actionable tasks remain.",
         )
 
-    # All non-terminal groups are optimistically_fixed → qa_critic
-    active_target_ids = set(active_target_group_ids or [])
-    current_batch = [g for g in valid_groups if g.group_id in active_target_ids]
+    # If active batch is all optimistically_fixed → route to qa_critic
+    active_target_ids = set(active_target_task_ids or [])
+    current_batch = [t for t in tasks if t.task_id in active_target_ids]
     if current_status != "qa_completed" and current_batch and all(
-        group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
-        == GroupRemediationStatus.OPTIMISTICALLY_FIXED
-        for g in current_batch
+        t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in current_batch
     ):
         return SupervisorDecision(
             next_node="qa_critic",
-            target_group_ids=[g.group_id for g in current_batch],
+            target_task_ids=[t.task_id for t in current_batch],
             instructions="Run QA on the current remediated batch before starting more remediation.",
             decision_reason=(
-                f"Routing the current batch of {len(current_batch)} optimistically fixed group(s) to QA."
+                f"Routing the current batch of {len(current_batch)} optimistically fixed task(s) to QA."
             ),
         )
 
     all_optimistic = all(
-        group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
-        == GroupRemediationStatus.OPTIMISTICALLY_FIXED
-        for g in non_terminal
+        t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal
     )
     if all_optimistic:
         return SupervisorDecision(
             next_node="qa_critic",
-            target_group_ids=[g.group_id for g in non_terminal],
-            instructions="Run QA on the remaining optimistically fixed groups.",
-            decision_reason="Routing all remaining optimistically fixed groups to QA.",
+            target_task_ids=[t.task_id for t in non_terminal],
+            instructions="Run QA on the remaining optimistically fixed tasks.",
+            decision_reason="Routing all remaining optimistically fixed tasks to QA.",
         )
 
-    # Collect groups that still need work
-    workable = [
-        g for g in non_terminal
-        if group_statuses.get(g.group_id, GroupRemediationStatus.PENDING)
-        in _WORKABLE_STATUSES
-    ]
+    # Collect tasks that still need work
+    workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
 
-    # VERSION_BUMP groups batch to update_subagent
-    version_bump = [
-        g for g in workable
-        if group_strategies.get(g.group_id) == RoutingStrategy.VERSION_BUMP
-    ]
+    # VERSION_BUMP tasks batch to update_subagent
+    version_bump = [t for t in workable if t.strategy == RoutingStrategy.VERSION_BUMP]
     if version_bump:
         batch = version_bump[:UPDATE_BATCH_SIZE]
-        feedback_by_group: Dict[str, str] = {}
-        for g in batch:
-            eval_ = qa_evaluations.get(g.group_id)
+        feedback_by_task: Dict[str, str] = {}
+        for t in batch:
+            eval_ = qa_evaluations.get(t.task_id)
             if eval_ and eval_.retry_feedback:
-                feedback_by_group[g.group_id] = eval_.retry_feedback
+                feedback_by_task[t.task_id] = eval_.retry_feedback
         return SupervisorDecision(
             next_node="update_subagent",
-            target_group_ids=[g.group_id for g in batch],
-            feedback_by_group=feedback_by_group,
+            target_task_ids=[t.task_id for t in batch],
+            feedback_by_task=feedback_by_task,
             instructions="Apply the required version bump(s) in the package manifest(s) for this batch only.",
             decision_reason=(
-                f"Routing {len(batch)} VERSION_BUMP group(s) to update_subagent (batch size cap {UPDATE_BATCH_SIZE})."
+                f"Routing {len(batch)} VERSION_BUMP task(s) to update_subagent (batch size cap {UPDATE_BATCH_SIZE})."
             ),
         )
 
-    # CODE_WORKAROUND groups: send exactly one at a time to workaround_subagent
-    workaround = [
-        g for g in workable
-        if group_strategies.get(g.group_id) == RoutingStrategy.CODE_WORKAROUND
-    ]
+    # CODE_WORKAROUND tasks: send exactly one at a time to workaround_subagent
+    workaround = [t for t in workable if t.strategy == RoutingStrategy.CODE_WORKAROUND]
     if workaround:
         target = workaround[0]
-        eval_ = qa_evaluations.get(target.group_id)
+        eval_ = qa_evaluations.get(target.task_id)
         feedback: Dict[str, str] = {}
         if eval_ and eval_.retry_feedback:
-            feedback[target.group_id] = eval_.retry_feedback
+            feedback[target.task_id] = eval_.retry_feedback
         return SupervisorDecision(
             next_node="workaround_subagent",
-            target_group_ids=[target.group_id],
-            feedback_by_group=feedback,
+            target_task_ids=[target.task_id],
+            feedback_by_task=feedback,
             instructions="Apply the minimal safe code workaround for this vulnerability.",
             decision_reason=(
-                f"Routing group '{target.group_id}' to workaround_subagent."
+                f"Routing task '{target.task_id}' to workaround_subagent."
             ),
         )
 
-    # Unexpected: no workable groups found → teardown as safe default
+    # Unexpected: no workable tasks found → teardown as safe default
     return SupervisorDecision(
         next_node="teardown",
-        target_group_ids=[],
-        instructions="No actionable groups remain.",
+        target_task_ids=[],
+        instructions="No actionable tasks remain.",
         decision_reason=(
-            "Deterministic fallback: no workable groups found, routing to teardown."
+            "Deterministic fallback: no workable tasks found, routing to teardown."
         ),
     )
 
@@ -228,47 +194,45 @@ def _deterministic_routing(
 def build_supervisor_prompt(state: OrchestratorState) -> str:
     """Build the structured LLM prompt for the Supervisor decision."""
     valid_groups: List[VulnerabilityGroup] = state.get("valid_groups", [])
-    group_strategies: Dict[str, RoutingStrategy] = state.get("group_strategies", {})
-    group_statuses: Dict[str, GroupRemediationStatus] = state.get("group_statuses", {})
-    retry_counts: Dict[str, int] = state.get("retry_counts", {})
+    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
     constraints_ledger: List[str] = state.get("constraints_ledger", [])
     action_summaries: List[AgentActionSummary] = state.get("action_summaries", [])
     qa_evaluations: Dict[str, QAEvaluation] = state.get("qa_evaluations", {})
     eval_status: str = state.get("eval_status", "")
 
+    group_by_id = {g.group_id: g for g in valid_groups}
+
     lines = [
         "You are the Supervisor Agent of an AppSec remediation pipeline.",
         "Produce a single SupervisorDecision to route the next graph step.",
         "",
-        "## Vulnerability Groups",
+        "## Remediation Tasks",
     ]
 
-    for group in valid_groups:
-        gid = group.group_id
-        strategy = group_strategies.get(gid, RoutingStrategy.CODE_WORKAROUND)
-        status = group_statuses.get(gid, GroupRemediationStatus.PENDING)
-        retries = retry_counts.get(gid, 0)
-        fix_plan = group.fix_plan
-        cves = ", ".join(group.cve_ids) if group.cve_ids else "none"
-        ghsas = ", ".join(group.ghsa_ids) if group.ghsa_ids else "none"
-        eval_ = qa_evaluations.get(gid)
+    for task in task_queue.values():
+        group = group_by_id.get(task.parent_group_id)
+        fix_plan = group.fix_plan if group else None
+        cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
+        ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
+        eval_ = qa_evaluations.get(task.task_id)
 
         lines += [
             "",
-            f"### Group: {gid}",
-            f"- Component    : {group.vulnerable_component or 'unknown'}",
-            f"- Issue Type   : {group.issue_type.value}",
-            f"- CVEs         : {cves}",
-            f"- GHSAs        : {ghsas}",
-            f"- Fix Plan     : {fix_plan.status.value if fix_plan else 'none'}",
-            f"- Strategy     : {strategy.value}",
-            f"- Status       : {status.value}",
-            f"- Retries Used : {retries}/{MAX_RETRIES}",
+            f"### Task: {task.task_id}",
+            f"- Parent Group  : {task.parent_group_id}",
+            f"- Component     : {group.vulnerable_component if group else 'unknown'}",
+            f"- Issue Type    : {group.issue_type.value if group else 'unknown'}",
+            f"- CVEs          : {cves}",
+            f"- GHSAs         : {ghsas}",
+            f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
+            f"- Strategy      : {task.strategy.value}",
+            f"- Status        : {task.status.value}",
+            f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
         ]
-        if eval_ and status != GroupRemediationStatus.OPTIMISTICALLY_FIXED:
+        if eval_ and task.status != TaskStatus.OPTIMISTICALLY_FIXED:
             cat = eval_.failure_category.value if eval_.failure_category else "none"
             lines.append(
-                f"- Last QA      : passed={eval_.passed}, category={cat}, "
+                f"- Last QA       : passed={eval_.passed}, category={cat}, "
                 f"feedback={eval_.retry_feedback}"
             )
 
@@ -287,7 +251,7 @@ def build_supervisor_prompt(state: OrchestratorState) -> str:
     ]
     for summary in action_summaries[-10:]:
         lines.append(
-            f"- [{summary.group_id}] {summary.status.value}: {summary.summary}"
+            f"- [{summary.task_id}] {summary.status.value}: {summary.summary}"
         )
     if not action_summaries:
         lines.append("- (none)")
@@ -297,19 +261,19 @@ def build_supervisor_prompt(state: OrchestratorState) -> str:
         f"## QA Evaluation Status: {eval_status or 'none'}",
         "",
         "## Routing Rules (follow strictly)",
-        f"1. Send pending/needs_retry VERSION_BUMP groups to update_subagent in batches of at most {UPDATE_BATCH_SIZE}. Never send more than {UPDATE_BATCH_SIZE} target_group_ids to update_subagent in one decision.",
-        "2. Send EXACTLY ONE pending/needs_retry CODE_WORKAROUND group → workaround_subagent.",
-        "3. After a subagent succeeds for the current active batch, route that exact optimistically_fixed batch to qa_critic before starting another remediation batch. Do NOT route optimistically_fixed groups back to subagents.",
-        "4. When ALL non-terminal groups are qa_passed OR all are unfixable → teardown.",
-        "5. If a needs_retry group has PEER_CONFLICT: pivot the affected group strategy to CODE_WORKAROUND.",
-        "6. If a needs_retry group has BREAKING_CHANGE: add a version constraint + pivot to CODE_WORKAROUND with refactor feedback.",
-        "7. If a needs_retry group has SECURITY_FLAG: retry with current strategy (unless MAX_RETRIES=3 reached).",
-        f"8. Any group with {MAX_RETRIES}+ retries should appear in unfixable_group_ids, not targets.",
-        "9. unfixable, qa_passed, and optimistically_fixed groups MUST NOT appear in update_subagent or workaround_subagent target_group_ids.",
-        "10. qa_critic target_group_ids MUST contain exactly the batch being evaluated.",
-        "11. workaround_subagent MUST have exactly one target_group_id.",
-        f"12. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_group_ids.",
-        "13. If a group is qa_passed, append its successful version bump or workaround to the constraints ledger via new_constraints.",
+        f"1. Send pending/needs_retry VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}. Never send more than {UPDATE_BATCH_SIZE} target_task_ids to update_subagent in one decision.",
+        "2. Send EXACTLY ONE pending/needs_retry CODE_WORKAROUND task → workaround_subagent.",
+        "3. After a subagent succeeds for the current active batch, route that exact optimistically_fixed batch to qa_critic before starting another remediation batch. Do NOT route optimistically_fixed tasks back to subagents.",
+        "4. When ALL non-terminal tasks are qa_passed OR all are unfixable → teardown.",
+        "5. If a needs_retry task has PEER_CONFLICT: pivot the affected task strategy to CODE_WORKAROUND.",
+        "6. If a needs_retry task has BREAKING_CHANGE: add a version constraint + pivot to CODE_WORKAROUND with refactor feedback.",
+        "7. If a needs_retry task has SECURITY_FLAG: retry with current strategy (unless MAX_RETRIES reached).",
+        f"8. Any task with {MAX_RETRIES}+ retries should appear in unfixable_task_ids, not targets.",
+        "9. unfixable, qa_passed, and optimistically_fixed tasks MUST NOT appear in update_subagent or workaround_subagent target_task_ids.",
+        "10. qa_critic target_task_ids MUST contain exactly the batch being evaluated.",
+        "11. workaround_subagent MUST have exactly one target_task_id.",
+        f"12. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
+        "13. If a task is qa_passed, append its successful version bump or workaround to the constraints ledger via new_constraints.",
     ]
 
     return "\n".join(lines)
@@ -326,16 +290,17 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
     Execution order
     ---------------
-    1. Normalise strategies: fill missing entries via ``derive_initial_strategy``.
-    2. Initialise statuses:  fill missing entries with ``PENDING``.
-    3. Update statuses from QA (only when ``status == "qa_completed"``).
-    4. Increment retry counts for groups newly entering ``NEEDS_RETRY``.
-    5. Mark ``UNFIXABLE`` any group whose retry count has reached MAX_RETRIES.
-    6. Build prompt from normalised state snapshot.
-    7. Call ``ChatOpenAI.with_structured_output(SupervisorDecision)``; on any
-       exception fall back to ``_deterministic_routing``.
+    1. Normalize task_queue: create initial RemediationTask entries for any
+       valid_groups not yet represented.
+    2. Update task statuses from subagent action summaries.
+    3. Update task statuses from QA evaluations (only when status == "qa_completed").
+    4. Increment retry_count for tasks newly entering NEEDS_RETRY.
+    5. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
+    6. Build prompt from normalized state snapshot.
+    7. Call ChatOpenAI.with_structured_output(SupervisorDecision); on any
+       exception fall back to _deterministic_routing.
     8. Validate and clamp the decision (reject unknown IDs, enforce per-node
-       target cardinality).  Fall back to deterministic routing if clamping
+       target cardinality). Fall back to deterministic routing if clamping
        leaves the decision invalid.
     9. Apply strategy updates and unfixable marks from the decision.
     10. Return state patch.
@@ -346,7 +311,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         return {
             "status": "supervisor_routed",
             "next_routing_step": "teardown",
-            "active_target_group_ids": [],
+            "active_target_task_ids": [],
             "supervisor_instructions": "No groups to process.",
         }
 
@@ -354,103 +319,101 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     existing_constraints: List[str] = list(state.get("constraints_ledger", []))
 
     # ------------------------------------------------------------------
-    # 1. Normalise strategies
+    # 1. Normalize task_queue: ensure every valid_group has a task
     # ------------------------------------------------------------------
-    group_strategies: Dict[str, RoutingStrategy] = dict(state.get("group_strategies", {}))
+    task_queue: Dict[str, RemediationTask] = dict(state.get("task_queue", {}))
+    existing_group_ids = {t.parent_group_id for t in task_queue.values()}
+    next_task_index = len(task_queue) + 1
     for group in valid_groups:
-        if group.group_id not in group_strategies:
-            group_strategies[group.group_id] = derive_initial_strategy(group)
+        if group.group_id not in existing_group_ids:
+            task_id = f"task-{next_task_index}"
+            task_queue[task_id] = build_initial_remediation_task(group, task_id)
+            next_task_index += 1
+
+    # Build a reverse lookup: parent_group_id → task
+    task_by_group_id: Dict[str, RemediationTask] = {
+        t.parent_group_id: t for t in task_queue.values()
+    }
 
     # ------------------------------------------------------------------
-    # 2. Initialise statuses
+    # 2. Update task statuses from subagent action summaries
     # ------------------------------------------------------------------
-    group_statuses: Dict[str, GroupRemediationStatus] = dict(
-        state.get("group_statuses", {})
-    )
-    for group in valid_groups:
-        if group.group_id not in group_statuses:
-            group_statuses[group.group_id] = GroupRemediationStatus.PENDING
-
-    # ------------------------------------------------------------------
-    # 2.5. Update statuses from subagent action summaries
-    # ------------------------------------------------------------------
-    active_targets = set(state.get("active_target_group_ids") or [])
+    active_target_task_ids = list(state.get("active_target_task_ids") or [])
+    active_targets = set(active_target_task_ids)
     action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
-    
+
     if active_targets and action_summaries:
         summary = action_summaries[-1]
-        summary_group_id = summary.group_id
-        if summary_group_id.startswith("batch:"):
-            content = summary_group_id[len("batch:"):]
-            gids = [gid.strip() for gid in content.split(",") if gid.strip()]
+        tid = summary.task_id
+        # Support batch: prefix (task_id is "batch:<tid1>,<tid2>")
+        if tid.startswith("batch:"):
+            content = tid[len("batch:"):]
+            tids = [t.strip() for t in content.split(",") if t.strip()]
         else:
-            gids = [summary_group_id.strip()]
+            tids = [tid.strip()]
 
-        for gid in gids:
-            if gid not in group_by_id or gid not in active_targets:
+        for t_id in tids:
+            resolved_t_id = t_id
+            if t_id not in task_queue and t_id in task_by_group_id:
+                resolved_t_id = task_by_group_id[t_id].task_id
+
+            if resolved_t_id not in task_queue or resolved_t_id not in active_targets:
                 continue
-            prev = group_statuses.get(gid, GroupRemediationStatus.PENDING)
-            if prev in (GroupRemediationStatus.QA_PASSED, GroupRemediationStatus.UNFIXABLE):
+            task = task_queue[resolved_t_id]
+            if task.status in (TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE):
                 continue
             if summary.status == AgentActionStatus.SUCCESS:
-                group_statuses[gid] = GroupRemediationStatus.OPTIMISTICALLY_FIXED
+                task.status = TaskStatus.OPTIMISTICALLY_FIXED
             else:
-                group_statuses[gid] = GroupRemediationStatus.NEEDS_RETRY
-                # Subagent failed/surrendered; increment retry count here to prevent infinite loop
-                retry_counts = state.get("retry_counts", {})
-                if "retry_counts" not in locals():
-                    # We initialize the dictionary in step 3, but if we need it here, let's make sure it's available.
-                    pass
-                # Wait, retry_counts is defined in step 3. I should fetch it here or modify state later.
-                # Let's initialize it here so we can mutate it.
-                pass
+                task.status = TaskStatus.NEEDS_RETRY
+                task.retry_count += 1
 
     # ------------------------------------------------------------------
-    # 3. Update statuses from QA evaluations
+    # 3. Update task statuses from QA evaluations
     # ------------------------------------------------------------------
     qa_evaluations: Dict[str, QAEvaluation] = dict(state.get("qa_evaluations", {}))
-    retry_counts: Dict[str, int] = dict(state.get("retry_counts", {}))
     auto_new_constraints: List[str] = []
 
     if state.get("status") == "qa_completed":
-        for group_id, evaluation in qa_evaluations.items():
-            if group_id not in group_by_id:
+        for eval_task_id, evaluation in qa_evaluations.items():
+            resolved_t_id = eval_task_id
+            if eval_task_id not in task_queue and eval_task_id in task_by_group_id:
+                resolved_t_id = task_by_group_id[eval_task_id].task_id
+                
+            if resolved_t_id not in task_queue:
                 continue
-            prev = group_statuses.get(group_id, GroupRemediationStatus.PENDING)
-            if prev in (GroupRemediationStatus.UNFIXABLE, GroupRemediationStatus.QA_PASSED):
+            task = task_queue[resolved_t_id]
+            if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
                 continue
             if evaluation.passed:
-                group_statuses[group_id] = GroupRemediationStatus.QA_PASSED
-                constraint = _constraint_entry_for_group(
-                    group_by_id[group_id],
-                    group_strategies.get(group_id, derive_initial_strategy(group_by_id[group_id])),
-                )
-                if (
-                    constraint
-                    and constraint not in existing_constraints
-                    and constraint not in auto_new_constraints
-                ):
-                    auto_new_constraints.append(constraint)
+                task.status = TaskStatus.QA_PASSED
+                group = group_by_id.get(task.parent_group_id)
+                if group:
+                    constraint = _constraint_entry_for_task(task, group)
+                    if (
+                        constraint
+                        and constraint not in existing_constraints
+                        and constraint not in auto_new_constraints
+                    ):
+                        auto_new_constraints.append(constraint)
             else:
-                # 4. Increment retry count when newly entering NEEDS_RETRY
-                group_statuses[group_id] = GroupRemediationStatus.NEEDS_RETRY
-                retry_counts[group_id] = retry_counts.get(group_id, 0) + 1
+                # 4. Increment retry_count when newly entering NEEDS_RETRY
+                task.status = TaskStatus.NEEDS_RETRY
+                task.retry_count += 1
 
     # ------------------------------------------------------------------
-    # 5. Mark unfixable groups
+    # 5. Mark UNFIXABLE tasks
     # ------------------------------------------------------------------
-    for group_id, status_val in list(group_statuses.items()):
-        if group_id not in group_by_id:
-            continue
+    for task_id, task in task_queue.items():
         if (
-            status_val == GroupRemediationStatus.NEEDS_RETRY
-            and retry_counts.get(group_id, 0) >= MAX_RETRIES
+            task.status == TaskStatus.NEEDS_RETRY
+            and task.retry_count >= MAX_RETRIES
         ):
-            group_statuses[group_id] = GroupRemediationStatus.UNFIXABLE
+            task.status = TaskStatus.UNFIXABLE
             logger.info(
-                "supervisor: group '%s' marked UNFIXABLE after %d retries.",
-                group_id,
-                retry_counts[group_id],
+                "supervisor: task '%s' marked UNFIXABLE after %d retries.",
+                task_id,
+                task.retry_count,
             )
 
     # ------------------------------------------------------------------
@@ -458,75 +421,78 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     prompt_state: OrchestratorState = {  # type: ignore[typeddict-item]
         **state,
-        "group_strategies": group_strategies,
-        "group_statuses": group_statuses,
-        "retry_counts": retry_counts,
+        "task_queue": task_queue,
         "qa_evaluations": qa_evaluations,
     }
 
-    active_target_group_ids = list(state.get("active_target_group_ids") or [])
-
     # ------------------------------------------------------------------
-    # 7. LLM structured call
+    # 7. Short-circuit: if active batch is all optimistically_fixed → qa_critic
     # ------------------------------------------------------------------
     decision: Optional[SupervisorDecision] = None
-    if state.get("status") != "qa_completed" and active_target_group_ids:
-        active_batch = [
-            group
-            for group in valid_groups
-            if group.group_id in set(active_target_group_ids)
-        ]
+    if state.get("status") != "qa_completed" and active_target_task_ids:
+        active_batch = [task_queue[t] for t in active_target_task_ids if t in task_queue]
         if active_batch and all(
-            group_statuses.get(group.group_id, GroupRemediationStatus.PENDING)
-            == GroupRemediationStatus.OPTIMISTICALLY_FIXED
-            for group in active_batch
+            t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in active_batch
         ):
             decision = SupervisorDecision(
                 next_node="qa_critic",
-                target_group_ids=[group.group_id for group in active_batch],
+                target_task_ids=[t.task_id for t in active_batch],
                 instructions="Run QA on the current remediated batch before starting more remediation.",
                 decision_reason=(
-                    f"Routing the current batch of {len(active_batch)} optimistically fixed group(s) to QA."
+                    f"Routing the current batch of {len(active_batch)} optimistically fixed task(s) to QA."
                 ),
             )
 
-    try:
-        from langchain_openai import ChatOpenAI  # type: ignore[import]
+    # ------------------------------------------------------------------
+    # 7b. Short-circuit: all remaining tasks are optimistically_fixed
+    # ------------------------------------------------------------------
+    if decision is None:
+        tasks = list(task_queue.values())
+        non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
+        if non_terminal and all(t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal):
+            decision = SupervisorDecision(
+                next_node="qa_critic",
+                target_task_ids=[t.task_id for t in non_terminal],
+                instructions="Run QA on the remaining optimistically fixed tasks.",
+                decision_reason="Routing all remaining optimistically fixed tasks to QA.",
+            )
 
-        model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
-        llm = ChatOpenAI(model=model_name, temperature=0)
-        structured_llm = llm.with_structured_output(SupervisorDecision, method="function_calling")
-        prompt_text = build_supervisor_prompt(prompt_state)
-        logger.info("supervisor: invoking structured LLM for routing decision.")
-        decision = structured_llm.invoke(prompt_text)
-        logger.info(
-            "supervisor: LLM decision → next_node=%s targets=%s reason=%s",
-            decision.next_node,
-            decision.target_group_ids,
-            decision.decision_reason,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "supervisor: LLM call failed (%s) — using deterministic fallback.", exc
-        )
+    # ------------------------------------------------------------------
+    # 8. LLM structured call (only if short-circuit didn't fire)
+    # ------------------------------------------------------------------
+    if decision is None:
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-    if state.get("status") != "qa_completed" and active_target_group_ids:
-        active_batch = [
-            group
-            for group in valid_groups
-            if group.group_id in set(active_target_group_ids)
-        ]
+            model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
+            llm = ChatOpenAI(model=model_name, temperature=0)
+            structured_llm = llm.with_structured_output(SupervisorDecision, method="function_calling")
+            prompt_text = build_supervisor_prompt(prompt_state)
+            logger.info("supervisor: invoking structured LLM for routing decision.")
+            decision = structured_llm.invoke(prompt_text)
+            logger.info(
+                "supervisor: LLM decision → next_node=%s targets=%s reason=%s",
+                decision.next_node,
+                decision.target_task_ids,
+                decision.decision_reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "supervisor: LLM call failed (%s) — using deterministic fallback.", exc
+            )
+
+    # Re-apply short-circuit post-LLM (LLM may have overridden it incorrectly)
+    if state.get("status") != "qa_completed" and active_target_task_ids:
+        active_batch = [task_queue[t] for t in active_target_task_ids if t in task_queue]
         if active_batch and all(
-            group_statuses.get(group.group_id, GroupRemediationStatus.PENDING)
-            == GroupRemediationStatus.OPTIMISTICALLY_FIXED
-            for group in active_batch
+            t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in active_batch
         ):
             decision = SupervisorDecision(
                 next_node="qa_critic",
-                target_group_ids=[group.group_id for group in active_batch],
+                target_task_ids=[t.task_id for t in active_batch],
                 instructions="Run QA on the current remediated batch before starting more remediation.",
                 decision_reason=(
-                    f"Routing the current batch of {len(active_batch)} optimistically fixed group(s) to QA."
+                    f"Routing the current batch of {len(active_batch)} optimistically fixed task(s) to QA."
                 ),
             )
 
@@ -535,35 +501,32 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     if decision is None:
         decision = _deterministic_routing(
-            valid_groups,
-            group_strategies,
-            group_statuses,
-            retry_counts,
+            task_queue,
+            group_by_id,
             qa_evaluations,
-            active_target_group_ids=active_target_group_ids,
+            active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
         )
         logger.info(
             "supervisor: deterministic fallback → next_node=%s", decision.next_node
         )
     else:
-        known_ids = set(group_by_id.keys())
-        terminal_statuses = _TERMINAL_STATUSES
+        known_task_ids = set(task_queue.keys())
 
-        # Remove unknown, terminal, or optimistically_fixed group IDs from targets
+        # Remove unknown, terminal, or optimistically_fixed task IDs from targets
         valid_target_ids = []
-        for gid in decision.target_group_ids:
-            if gid not in known_ids:
+        for t_id in decision.target_task_ids:
+            if t_id not in known_task_ids:
                 continue
-            status = group_statuses.get(gid)
-            if status in terminal_statuses:
+            t_status = task_queue[t_id].status
+            if t_status in _TERMINAL_STATUSES:
                 continue
-            # If routing to a subagent, the group MUST NOT be optimistically_fixed
-            if decision.next_node in ("update_subagent", "workaround_subagent") and status == GroupRemediationStatus.OPTIMISTICALLY_FIXED:
+            if decision.next_node in ("update_subagent", "workaround_subagent") and t_status == TaskStatus.OPTIMISTICALLY_FIXED:
                 continue
-            valid_target_ids.append(gid)
+            valid_target_ids.append(t_id)
+
         valid_unfixable_ids = [
-            gid for gid in decision.unfixable_group_ids if gid in known_ids
+            t_id for t_id in decision.unfixable_task_ids if t_id in known_task_ids
         ]
 
         # Enforce cardinality constraints — fall back if violated
@@ -582,39 +545,37 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
         if not needs_fallback and decision.next_node == "update_subagent" and len(valid_target_ids) > UPDATE_BATCH_SIZE:
             logger.warning(
-                "supervisor: update_subagent supports at most %d targets, got %d â€” falling back.",
+                "supervisor: update_subagent supports at most %d targets, got %d — falling back.",
                 UPDATE_BATCH_SIZE,
                 len(valid_target_ids),
             )
             needs_fallback = True
         if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
             logger.warning(
-                "supervisor: qa_critic needs at least 1 target, got 0 â€” falling back."
+                "supervisor: qa_critic needs at least 1 target, got 0 — falling back."
             )
             needs_fallback = True
 
         if needs_fallback:
             decision = _deterministic_routing(
-                valid_groups,
-                group_strategies,
-                group_statuses,
-                retry_counts,
+                task_queue,
+                group_by_id,
                 qa_evaluations,
-                active_target_group_ids=active_target_group_ids,
+                active_target_task_ids=active_target_task_ids,
                 current_status=str(state.get("status") or ""),
             )
         else:
             try:
                 decision = SupervisorDecision(
                     next_node=decision.next_node,
-                    updated_strategies=decision.updated_strategies,
-                    target_group_ids=valid_target_ids,
-                    unfixable_group_ids=valid_unfixable_ids,
+                    updated_task_strategies=decision.updated_task_strategies,
+                    target_task_ids=valid_target_ids,
+                    unfixable_task_ids=valid_unfixable_ids,
                     new_constraints=decision.new_constraints,
-                    feedback_by_group={
+                    feedback_by_task={
                         k: v
-                        for k, v in decision.feedback_by_group.items()
-                        if k in known_ids
+                        for k, v in decision.feedback_by_task.items()
+                        if k in known_task_ids
                     },
                     instructions=decision.instructions,
                     decision_reason=decision.decision_reason,
@@ -624,30 +585,28 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     "supervisor: decision rebuild failed (%s) — falling back.", exc
                 )
                 decision = _deterministic_routing(
-                    valid_groups,
-                    group_strategies,
-                    group_statuses,
-                    retry_counts,
+                    task_queue,
+                    group_by_id,
                     qa_evaluations,
-                    active_target_group_ids=active_target_group_ids,
+                    active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                 )
 
     # ------------------------------------------------------------------
     # 9. Apply strategy updates and unfixable marks from decision
     # ------------------------------------------------------------------
-    for group_id, new_strategy in decision.updated_strategies.items():
-        if group_id in group_by_id:
-            group_strategies[group_id] = new_strategy
+    for t_id, new_strategy in decision.updated_task_strategies.items():
+        if t_id in task_queue:
+            task_queue[t_id].strategy = new_strategy
 
-    for group_id in decision.unfixable_group_ids:
-        if group_id in group_by_id:
-            group_statuses[group_id] = GroupRemediationStatus.UNFIXABLE
+    for t_id in decision.unfixable_task_ids:
+        if t_id in task_queue:
+            task_queue[t_id].status = TaskStatus.UNFIXABLE
 
     logger.info(
         "supervisor: routing to '%s' with targets=%s",
         decision.next_node,
-        decision.target_group_ids,
+        decision.target_task_ids,
     )
 
     returned_constraints: List[str] = list(auto_new_constraints)
@@ -659,18 +618,32 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         ):
             returned_constraints.append(constraint)
 
+    # Build feedback_by_group for backward compat with subagent bridge nodes
+    # (maps parent_group_id → feedback so bridge nodes can still look up by group)
+    feedback_by_task = dict(decision.feedback_by_task)
+    feedback_by_group: Dict[str, str] = {}
+    for t_id, fb in feedback_by_task.items():
+        if t_id in task_queue:
+            gid = task_queue[t_id].parent_group_id
+            feedback_by_group[gid] = fb
+
     # ------------------------------------------------------------------
     # 10. Return state patch
     # ------------------------------------------------------------------
     return {
         "status": "supervisor_routed",
         "next_routing_step": decision.next_node,
-        "active_target_group_ids": list(decision.target_group_ids),
-        "feedback_by_group": dict(decision.feedback_by_group),
+        "active_target_task_ids": list(decision.target_task_ids),
+        # Keep active_target_group_ids populated for bridge nodes that still use it
+        "active_target_group_ids": [
+            task_queue[t].parent_group_id
+            for t in decision.target_task_ids
+            if t in task_queue
+        ],
+        "feedback_by_task": feedback_by_task,
+        "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
-        "group_strategies": group_strategies,
-        "group_statuses": group_statuses,
-        "retry_counts": retry_counts,
+        "task_queue": task_queue,
         # constraints_ledger uses operator.add — return only the NEW entries
         "constraints_ledger": returned_constraints,
     }

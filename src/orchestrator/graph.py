@@ -65,10 +65,11 @@ from src.contracts.schemas import (
     EditStatus,
     FixPlan,
     FixPlanStatus,
-    GroupRemediationStatus,
     IssueType,
     LocalizedIssue,
+    RemediationTask,
     SystemContext,
+    TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -406,26 +407,46 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
     """
     Bridge OrchestratorState → SubagentState for the batch dependency update subagent.
 
-    Reads ``active_target_group_ids`` from state to select the target groups,
-    calls ``run_update_subagent_node``, then merges results back into the
-    orchestrator state and updates ``group_statuses``.
+    Reads ``active_target_task_ids`` from state to select the target tasks,
+    resolves the associated VulnerabilityGroups, calls ``run_update_subagent_node``,
+    then merges results back into the orchestrator state via task_queue.
     """
-    active_ids = set(state.get("active_target_group_ids", []))
-    target_groups = [
-        g for g in state.get("valid_groups", []) if g.group_id in active_ids
-    ]
+    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    active_task_ids = list(state.get("active_target_task_ids", []))
+
+    # Fall back to active_target_group_ids for backward compat during migration
+    if not active_task_ids:
+        active_task_ids = list(state.get("active_target_group_ids", []))
+
+    # Resolve VulnerabilityGroups from task_queue
+    group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
+    target_groups = []
+    task_ids_for_groups: Dict[str, str] = {}  # group_id -> task_id
+    for t_id in active_task_ids:
+        task = task_queue.get(t_id)
+        if task is None:
+            # Fallback: treat t_id as a group_id directly
+            g = group_by_id.get(t_id)
+            if g:
+                target_groups.append(g)
+        else:
+            g = group_by_id.get(task.parent_group_id)
+            if g:
+                target_groups.append(g)
+                task_ids_for_groups[g.group_id] = t_id
 
     if not target_groups:
-        msg = "update_subagent: no valid groups found for active_target_group_ids."
+        msg = "update_subagent: no valid groups found for active_target_task_ids."
         log.warning(msg)
         return {"errors": [msg]}
 
+    feedback_by_group = dict(state.get("feedback_by_group", {}))
     subagent_state = initial_update_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
         target_groups=target_groups,
         constraints_ledger=list(state.get("constraints_ledger", [])),
-        feedback_by_group=dict(state.get("feedback_by_group", {})),
+        feedback_by_group=feedback_by_group,
     )
 
     result = run_update_subagent_node(subagent_state)
@@ -436,17 +457,20 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         isinstance(summary, AgentActionSummary)
         and summary.status == AgentActionStatus.SUCCESS
     )
-    new_statuses = {
-        g.group_id: (
-            GroupRemediationStatus.OPTIMISTICALLY_FIXED
-            if succeeded
-            else GroupRemediationStatus.NEEDS_RETRY
-        )
-        for g in target_groups
-    }
+
+    # Update task statuses in task_queue patch
+    new_task_status = TaskStatus.OPTIMISTICALLY_FIXED if succeeded else TaskStatus.NEEDS_RETRY
+    task_queue_patch: Dict[str, RemediationTask] = {}
+    for g in target_groups:
+        t_id = task_ids_for_groups.get(g.group_id)
+        if t_id and t_id in task_queue:
+            # Mutate a copy via attribute update
+            task = task_queue[t_id]
+            task.status = new_task_status
+            task_queue_patch[t_id] = task
 
     out: Dict[str, Any] = {
-        "group_statuses": new_statuses,
+        "task_queue": task_queue_patch,
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
@@ -462,22 +486,36 @@ def run_workaround_subagent_from_orchestrator(
     """
     Bridge OrchestratorState → SubagentState for the single-group workaround subagent.
 
-    Takes the first entry of ``active_target_group_ids``, builds a
-    ``SubagentState``, calls ``run_workaround_subagent_node``, then merges
-    results back and updates ``group_statuses``.
+    Takes the first entry of ``active_target_task_ids``, resolves the associated
+    VulnerabilityGroup, calls ``run_workaround_subagent_node``, then merges
+    results back and updates task_queue.
     """
-    active_ids = list(state.get("active_target_group_ids", []))
-    if not active_ids:
-        msg = "workaround_subagent: active_target_group_ids is empty."
+    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    active_task_ids = list(state.get("active_target_task_ids", []))
+
+    # Fall back to active_target_group_ids for backward compat
+    if not active_task_ids:
+        active_task_ids = list(state.get("active_target_group_ids", []))
+
+    if not active_task_ids:
+        msg = "workaround_subagent: active_target_task_ids is empty."
         log.warning(msg)
         return {"errors": [msg]}
 
-    group_id = active_ids[0]
+    t_id = active_task_ids[0]
+    task = task_queue.get(t_id)
     group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
-    target_group = group_by_id.get(group_id)
+
+    # Resolve target group
+    if task is not None:
+        target_group = group_by_id.get(task.parent_group_id)
+    else:
+        # Fallback: treat t_id as a group_id directly
+        target_group = group_by_id.get(t_id)
+        task = None
 
     if target_group is None:
-        msg = f"workaround_subagent: group '{group_id}' not found in valid_groups."
+        msg = f"workaround_subagent: could not resolve group for task '{t_id}'."
         log.warning(msg)
         return {"errors": [msg]}
 
@@ -487,7 +525,7 @@ def run_workaround_subagent_from_orchestrator(
         workspace_volume=state.get("workspace_volume", ""),
         target_group=target_group,
         constraints_ledger=list(state.get("constraints_ledger", [])),
-        previous_feedback=feedback_by_group.get(group_id),
+        previous_feedback=feedback_by_group.get(target_group.group_id),
     )
 
     result = run_workaround_subagent_node(subagent_state)
@@ -498,16 +536,15 @@ def run_workaround_subagent_from_orchestrator(
         isinstance(summary, AgentActionSummary)
         and summary.status == AgentActionStatus.SUCCESS
     )
-    new_statuses = {
-        group_id: (
-            GroupRemediationStatus.OPTIMISTICALLY_FIXED
-            if succeeded
-            else GroupRemediationStatus.NEEDS_RETRY
-        )
-    }
+    new_task_status = TaskStatus.OPTIMISTICALLY_FIXED if succeeded else TaskStatus.NEEDS_RETRY
+
+    task_queue_patch: Dict[str, RemediationTask] = {}
+    if task is not None and t_id in task_queue:
+        task.status = new_task_status
+        task_queue_patch[t_id] = task
 
     out: Dict[str, Any] = {
-        "group_statuses": new_statuses,
+        "task_queue": task_queue_patch,
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
@@ -521,17 +558,30 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     """
     Run the QA Critic against the current OrchestratorState.
 
-    When ``active_target_group_ids`` is populated, QA is scoped to that
-    current batch only. ``changed_files`` accumulated in state are passed
-    transparently to the QA Critic (it reads them from state). The wrapper
-    does NOT re-emit ``changed_files`` in its return dict to avoid
-    double-counting via the ``operator.add`` reducer.
+    When ``active_target_task_ids`` is populated, QA is scoped to the
+    corresponding VulnerabilityGroups only. The wrapper does NOT re-emit
+    ``changed_files`` in its return dict to avoid double-counting via the
+    ``operator.add`` reducer.
     """
-    active_ids = set(state.get("active_target_group_ids", []))
+    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    active_task_ids = set(state.get("active_target_task_ids", []))
+
+    # Fall back to active_target_group_ids
+    if not active_task_ids:
+        active_task_ids = set(state.get("active_target_group_ids", []))
+
     scoped_state = state
-    if active_ids:
+    if active_task_ids:
+        # Resolve parent group IDs from tasks; fallback treats IDs as group IDs
+        target_group_ids: set[str] = set()
+        for t_id in active_task_ids:
+            task = task_queue.get(t_id)
+            if task is not None:
+                target_group_ids.add(task.parent_group_id)
+            else:
+                target_group_ids.add(t_id)  # fallback: treat as group ID
         scoped_groups = [
-            group for group in state.get("valid_groups", []) if group.group_id in active_ids
+            group for group in state.get("valid_groups", []) if group.group_id in target_group_ids
         ]
         if scoped_groups:
             scoped_state = {

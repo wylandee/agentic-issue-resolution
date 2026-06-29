@@ -109,14 +109,17 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     errors: List[str] = []
     client = None
 
+    task_queue = state.get("task_queue", {})
     valid_groups = state.get("valid_groups", [])
-    group_statuses = state.get("group_statuses", {})
-    
+    # Build a lookup from parent_group_id to task status
+    from src.contracts.schemas import TaskStatus
+    task_by_group: dict = {}
+    for task in task_queue.values():
+        task_by_group[task.parent_group_id] = task
+
     passed_files: Set[str] = set()
     unfixable_files: Set[str] = set()
     unfixable_packages: Set[str] = set()
-
-    from src.contracts.schemas import GroupRemediationStatus
 
     for g in valid_groups:
         files = set()
@@ -127,15 +130,16 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
         for li in getattr(g, "localized_issues", []):
             if getattr(li, "manifest_file", None):
                 files.add(li.manifest_file)
-        
-        status = group_statuses.get(g.group_id)
-        if status == GroupRemediationStatus.QA_PASSED:
-            passed_files.update(files)
-        elif status == GroupRemediationStatus.UNFIXABLE:
-            unfixable_files.update(files)
-            if getattr(g, "vulnerable_component", None):
-                unfixable_packages.add(g.vulnerable_component)
-    
+
+        task = task_by_group.get(g.group_id)
+        if task is not None:
+            if task.status == TaskStatus.QA_PASSED:
+                passed_files.update(files)
+            elif task.status == TaskStatus.UNFIXABLE:
+                unfixable_files.update(files)
+                if getattr(g, "vulnerable_component", None):
+                    unfixable_packages.add(g.vulnerable_component)
+
     files_to_exclude = unfixable_files - passed_files
 
     try:

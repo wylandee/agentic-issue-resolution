@@ -167,12 +167,12 @@ class TestLegacyCompatibilityGuard:
 class TestStateContractExamples:
     def test_phase1_contract_examples_fit_master_state_maps(self):
         summary = AgentActionSummary(
-            group_id="group-1",
+            task_id="group-1",
             status=AgentActionStatus.SUCCESS,
             summary="Updated lodash via an overrides entry in package.json.",
         )
         evaluation = QAEvaluation(
-            group_id="group-1",
+            task_id="group-1",
             passed=False,
             failure_category=FailureCategory.PEER_CONFLICT,
             retry_feedback="Retry with a compatible manifest-wide batch update.",
