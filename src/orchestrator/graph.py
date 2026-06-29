@@ -418,59 +418,36 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
     if not active_task_ids:
         active_task_ids = list(state.get("active_target_group_ids", []))
 
-    # Resolve VulnerabilityGroups from task_queue
     group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
+    target_tasks = []
     target_groups = []
-    task_ids_for_groups: Dict[str, str] = {}  # group_id -> task_id
     for t_id in active_task_ids:
         task = task_queue.get(t_id)
-        if task is None:
-            # Fallback: treat t_id as a group_id directly
-            g = group_by_id.get(t_id)
-            if g:
-                target_groups.append(g)
-        else:
+        if task is not None:
+            target_tasks.append(task)
             g = group_by_id.get(task.parent_group_id)
-            if g:
+            if g is not None:
                 target_groups.append(g)
-                task_ids_for_groups[g.group_id] = t_id
 
-    if not target_groups:
-        msg = "update_subagent: no valid groups found for active_target_task_ids."
+    if not target_tasks:
+        msg = "update_subagent: no valid tasks found for active_target_task_ids."
         log.warning(msg)
         return {"errors": [msg]}
 
-    feedback_by_group = dict(state.get("feedback_by_group", {}))
+    feedback_by_task = dict(state.get("feedback_by_task", {}))
     subagent_state = initial_update_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
+        target_tasks=target_tasks,
         target_groups=target_groups,
         constraints_ledger=list(state.get("constraints_ledger", [])),
-        feedback_by_group=feedback_by_group,
+        feedback_by_task=feedback_by_task,
     )
 
     result = run_update_subagent_node(subagent_state)
 
     from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
-    summary = result.get("action_summary")
-    succeeded = (
-        isinstance(summary, AgentActionSummary)
-        and summary.status == AgentActionStatus.SUCCESS
-    )
-
-    # Update task statuses in task_queue patch
-    new_task_status = TaskStatus.OPTIMISTICALLY_FIXED if succeeded else TaskStatus.NEEDS_RETRY
-    task_queue_patch: Dict[str, RemediationTask] = {}
-    for g in target_groups:
-        t_id = task_ids_for_groups.get(g.group_id)
-        if t_id and t_id in task_queue:
-            # Mutate a copy via attribute update
-            task = task_queue[t_id]
-            task.status = new_task_status
-            task_queue_patch[t_id] = task
-
     out: Dict[str, Any] = {
-        "task_queue": task_queue_patch,
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
@@ -504,53 +481,40 @@ def run_workaround_subagent_from_orchestrator(
 
     t_id = active_task_ids[0]
     task = task_queue.get(t_id)
-    group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
 
-    # Resolve target group
-    if task is not None:
-        target_group = group_by_id.get(task.parent_group_id)
-    else:
-        # Fallback: treat t_id as a group_id directly
-        target_group = group_by_id.get(t_id)
-        task = None
+    if task is None:
+        msg = f"workaround_subagent: could not resolve task '{t_id}'."
+        log.warning(msg)
+        return {"errors": [msg]}
+
+    group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
+    target_group = group_by_id.get(task.parent_group_id)
 
     if target_group is None:
         msg = f"workaround_subagent: could not resolve group for task '{t_id}'."
         log.warning(msg)
         return {"errors": [msg]}
 
-    feedback_by_group = dict(state.get("feedback_by_group", {}))
+    feedback_by_task = dict(state.get("feedback_by_task", {}))
     subagent_state = initial_workaround_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
+        target_task=task,
         target_group=target_group,
         constraints_ledger=list(state.get("constraints_ledger", [])),
-        previous_feedback=feedback_by_group.get(target_group.group_id),
+        previous_feedback=feedback_by_task.get(task.task_id),
     )
 
     result = run_workaround_subagent_node(subagent_state)
 
     from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
-    summary = result.get("action_summary")
-    succeeded = (
-        isinstance(summary, AgentActionSummary)
-        and summary.status == AgentActionStatus.SUCCESS
-    )
-    new_task_status = TaskStatus.OPTIMISTICALLY_FIXED if succeeded else TaskStatus.NEEDS_RETRY
-
-    task_queue_patch: Dict[str, RemediationTask] = {}
-    if task is not None and t_id in task_queue:
-        task.status = new_task_status
-        task_queue_patch[t_id] = task
-
     out: Dict[str, Any] = {
-        "task_queue": task_queue_patch,
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
-    if summary is not None:
-        out["action_summaries"] = [summary]
+    if summaries:
+        out["action_summaries"] = summaries
     return out
 
 

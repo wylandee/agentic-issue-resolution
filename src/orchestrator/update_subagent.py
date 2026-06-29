@@ -149,11 +149,11 @@ def _format_manifest_paths(manifest_paths: Sequence[str]) -> str:
 
 
 def _build_package_manifest_map(
-    resolved_groups: Sequence[Tuple[VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
 ) -> Dict[str, List[str]]:
     """Build a per-package allowlist of manifest paths for tool enforcement."""
     package_manifest_map: Dict[str, List[str]] = {}
-    for group, manifest_paths in resolved_groups:
+    for _, group, manifest_paths in resolved_tasks:
         package_name = (group.vulnerable_component or "").strip()
         if not package_name:
             continue
@@ -165,9 +165,9 @@ def _build_package_manifest_map(
 
 
 def _build_update_prompt(
-    resolved_groups: Sequence[Tuple[VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
-    feedback_by_group: Dict[str, str],
+    feedback_by_task: Dict[str, str],
 ) -> str:
     sections = [
         "\n".join(
@@ -191,19 +191,16 @@ def _build_update_prompt(
     else:
         sections.append("Constraints ledger:\n- none")
 
-    for group, manifest_paths in resolved_groups:
-        feedback = feedback_by_group.get(group.group_id, "none")
-        fix_plan = group.fix_plan
+    for task, group, manifest_paths in resolved_tasks:
+        feedback = feedback_by_task.get(task.task_id, "none")
         sections.append(
             "\n".join(
                 [
-                    "=== TARGET GROUP ===",
-                    f"Group ID      : {group.group_id}",
+                    "=== TARGET ===",
+                    f"Task ID       : {task.task_id}",
                     f"Manifest Path : {_format_manifest_paths(manifest_paths)}",
                     f"Component     : {group.vulnerable_component or 'unknown'}",
-                    f"Fix Status    : {fix_plan.status.value if fix_plan else 'none'}",
-                    f"Fixed Version : {fix_plan.fixed_version if fix_plan else 'N/A'}",
-                    f"Instruction   : {fix_plan.instruction if fix_plan else 'Derive the safest manifest update.'}",
+                    f"Instruction   : {task.instruction or 'Derive the safest manifest update.'}",
                     f"QA Feedback   : {feedback}",
                 ]
             )
@@ -220,14 +217,13 @@ def _build_update_prompt(
     return "\n\n".join(sections)
 
 
-def _build_action_summary(
-    group_ids: Sequence[str],
+def _build_action_summaries(
+    task_ids: Sequence[str],
     changed_files: Sequence[str],
     final_text: str,
     succeeded: bool,
-) -> AgentActionSummary:
+) -> List[AgentActionSummary]:
     summary_status = AgentActionStatus.SUCCESS if succeeded else AgentActionStatus.SURRENDER
-    group_label = ", ".join(group_ids) if group_ids else "no groups"
     changed_label = ", ".join(changed_files) if changed_files else "no files"
     outcome = (
         "Completed validated manifest updates"
@@ -236,85 +232,78 @@ def _build_action_summary(
     )
     final_note = final_text.strip()
     if final_note:
-        summary = f"{outcome} for {group_label}; changed files: {changed_label}. Final note: {final_note}"
+        summary_text = f"{outcome}; changed files: {changed_label}. Final note: {final_note}"
     else:
-        summary = f"{outcome} for {group_label}; changed files: {changed_label}."
-    return AgentActionSummary(task_id="batch:" + group_label, status=summary_status, summary=summary)
+        summary_text = f"{outcome}; changed files: {changed_label}."
+    
+    return [
+        AgentActionSummary(task_id=t_id, status=summary_status, summary=summary_text)
+        for t_id in task_ids
+    ]
+
+def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> List[AgentActionSummary]:
+    return [
+        AgentActionSummary(task_id=t_id, status=AgentActionStatus.SURRENDER, summary=message)
+        for t_id in task_ids
+    ]
 
 @traceable(name="Update_Subagent_Test_Run") # for langsmith testing
 def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     """Run the batch dependency update subagent on ``SubagentState``."""
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
+    target_tasks = list(state.get("target_tasks", []))
     target_groups = list(state.get("target_groups", []))
     constraints_ledger = list(state.get("constraints_ledger", []))
-    feedback_by_group = dict(state.get("feedback_by_group", {}))
+    feedback_by_task = dict(state.get("feedback_by_task", {}))
+    all_task_ids = [t.task_id for t in target_tasks]
 
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
         msg = f"Update Subagent: repo_root '{repo_root_str}' is not a valid directory."
-        summary = AgentActionSummary(
-            task_id="batch:unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because repo_root was invalid.",
-        )
-        return {"action_summary": summary, "changed_files": [], "errors": [msg]}
+        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because repo_root was invalid.")
+        return {"action_summaries": summaries, "changed_files": [], "errors": [msg]}
 
     if not workspace_volume:
         msg = "Update Subagent: workspace_volume is missing from state."
-        summary = AgentActionSummary(
-            task_id="batch:unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because workspace_volume was missing.",
-        )
-        return {"action_summary": summary, "changed_files": [], "errors": [msg]}
+        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because workspace_volume was missing.")
+        return {"action_summaries": summaries, "changed_files": [], "errors": [msg]}
 
-    resolved_groups: List[Tuple[VulnerabilityGroup, List[str]]] = []
+    resolved_tasks: List[Tuple[RemediationTask, VulnerabilityGroup, List[str]]] = []
     resolution_errors: List[str] = []
-    for group in target_groups:
+    for task, group in zip(target_tasks, target_groups):
         manifest_paths, errors = _resolve_manifest_targets(group, repo_root)
         resolution_errors.extend(errors)
         if not manifest_paths:
             continue
-        resolved_groups.append((group, manifest_paths))
+        resolved_tasks.append((task, group, manifest_paths))
 
-    if not resolved_groups:
-        summary = AgentActionSummary(
-            task_id="batch:unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because no manifest targets could be resolved.",
-        )
-        return {"action_summary": summary, "changed_files": [], "errors": resolution_errors}
+    if not resolved_tasks:
+        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because no manifest targets could be resolved.")
+        return {"action_summaries": summaries, "changed_files": [], "errors": resolution_errors}
 
+    resolved_task_ids = [t.task_id for t, _, _ in resolved_tasks]
     if ChatOpenAI is None:
         msg = "Update Subagent: 'langchain-openai' is not installed."
-        summary = AgentActionSummary(
-            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because the LLM client is unavailable.",
-        )
-        return {"action_summary": summary, "changed_files": [], "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped before execution because the LLM client is unavailable.")
+        return {"action_summaries": summaries, "changed_files": [], "errors": resolution_errors + [msg]}
 
     model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
-        summary = AgentActionSummary(
-            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because the LLM failed to initialize.",
-        )
-        return {"action_summary": summary, "changed_files": [], "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped before execution because the LLM failed to initialize.")
+        return {"action_summaries": summaries, "changed_files": [], "errors": resolution_errors + [msg]}
 
     touched_files: set[str] = set()
     
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
-    skinny_resolved_groups = [
-        (_create_skinny_subagent_group(g), paths) for g, paths in resolved_groups
+    skinny_resolved_tasks = [
+        (t, _create_skinny_subagent_group(g), paths) for t, g, paths in resolved_tasks
     ]
     
-    prompt = _build_update_prompt(skinny_resolved_groups, filtered_ledger, feedback_by_group)
+    prompt = _build_update_prompt(skinny_resolved_tasks, filtered_ledger, feedback_by_task)
     initial_messages = [
         SystemMessage(content="Use only dependency-management tools and validate manifest synchronization after changes."),
         HumanMessage(content=prompt),
@@ -322,14 +311,14 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            package_manifest_map = _build_package_manifest_map(skinny_resolved_groups)
+            package_manifest_map = _build_package_manifest_map(skinny_resolved_tasks)
             toolbelt = build_update_toolbelt(
                 sandbox,
                 touched_files,
                 repo_root,
                 target_manifest_paths=[
                     manifest_path
-                    for _, manifest_paths in skinny_resolved_groups
+                    for _, _, manifest_paths in skinny_resolved_tasks
                     for manifest_path in manifest_paths
                 ],
                 package_manifest_paths=package_manifest_map,
@@ -337,26 +326,22 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
             runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
-        summary = AgentActionSummary(
-            task_id="batch:" + ",".join(group.group_id for group, _ in resolved_groups),
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped because the sandbox or tool loop failed.",
-        )
-        return {"action_summary": summary, "changed_files": sorted(touched_files), "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped because the sandbox or tool loop failed.")
+        return {"action_summaries": summaries, "changed_files": sorted(touched_files), "errors": resolution_errors + [msg]}
 
     succeeded = bool(runtime.changed_files) and has_successful_validation_after_last_edit(
         runtime.tool_events,
         edit_tool_name="modify_npm_dependency",
         validation_tool_name="validate_manifest_sync",
     )
-    summary = _build_action_summary(
-        [group.group_id for group, _ in resolved_groups],
+    summaries = _build_action_summaries(
+        resolved_task_ids,
         runtime.changed_files,
         runtime.final_text,
         succeeded,
     )
     return {
-        "action_summary": summary,
+        "action_summaries": summaries,
         "changed_files": runtime.changed_files,
         "errors": resolution_errors + runtime.errors,
     }

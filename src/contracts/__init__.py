@@ -20,6 +20,9 @@ from .schemas import (
     AgentActionStatus,
     GroupRemediationStatus,
     TaskStatus,
+    # Constants
+    MAX_ANCESTRY_DEPTH,
+    MAX_TASK_QUEUE_SIZE,
     # Sub-models
     CWEEntry,
     LineRange,
@@ -44,6 +47,7 @@ from .schemas import (
     AgentActionSummary,
     SupervisorDecision,
     # Phase 5 Task Queue
+    TaskSpawnRequest,
     RemediationTask,
     # Phase 5 Remedy Agent
     RemedyAgentOutput,
@@ -63,6 +67,9 @@ __all__ = [
     "AgentActionStatus",
     "GroupRemediationStatus",
     "TaskStatus",
+    # Constants
+    "MAX_ANCESTRY_DEPTH",
+    "MAX_TASK_QUEUE_SIZE",
     "CWEEntry",
     "LineRange",
     # Sandbox contracts (Phase 3)
@@ -85,6 +92,7 @@ __all__ = [
     "AgentActionSummary",
     "SupervisorDecision",
     # Phase 5 Task Queue
+    "TaskSpawnRequest",
     "RemediationTask",
     # Phase 5 Remedy Agent
     "RemedyAgentOutput",

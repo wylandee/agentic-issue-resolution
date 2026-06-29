@@ -59,6 +59,7 @@ def _filter_constraints_ledger(
 
 
 def _build_workaround_prompt(
+    target_task: Any,  # RemediationTask (imported dynamically or typed properly)
     target_group: VulnerabilityGroup,
     constraints_ledger: List[str],
     previous_feedback: str | None,
@@ -87,13 +88,12 @@ def _build_workaround_prompt(
     sections.append(
         "\n".join(
             [
-                "=== TARGET GROUP ===",
-                f"Group ID      : {target_group.group_id}",
+                "=== TARGET ===",
+                f"Task ID       : {target_task.task_id}",
                 f"Issue Type    : {target_group.issue_type.value}",
                 f"Component     : {target_group.vulnerable_component or 'unknown'}",
                 f"Initial File  : {target_group.file_path or 'none'}",
-                f"Fix Status    : {fix_plan.status.value if fix_plan else 'none'}",
-                f"Instruction   : {fix_plan.instruction if fix_plan else 'Derive the smallest safe code change.'}",
+                f"Instruction   : {target_task.instruction or 'Derive the smallest safe code change.'}",
                 f"QA Feedback   : {previous_feedback or 'none'}",
             ]
         )
@@ -112,12 +112,12 @@ def _build_workaround_prompt(
     return "\n\n".join(sections)
 
 
-def _build_action_summary(
-    group_id: str,
+def _build_action_summaries(
+    task_id: str,
     changed_files: List[str],
     final_text: str,
     succeeded: bool,
-) -> AgentActionSummary:
+) -> List[AgentActionSummary]:
     summary_status = AgentActionStatus.SUCCESS if succeeded else AgentActionStatus.SURRENDER
     changed_label = ", ".join(changed_files) if changed_files else "no files"
     outcome = (
@@ -127,65 +127,55 @@ def _build_action_summary(
     )
     final_note = final_text.strip()
     if final_note:
-        summary = f"{outcome} for {group_id}; changed files: {changed_label}. Final note: {final_note}"
+        summary_text = f"{outcome}; changed files: {changed_label}. Final note: {final_note}"
     else:
-        summary = f"{outcome} for {group_id}; changed files: {changed_label}."
-    return AgentActionSummary(task_id=group_id, status=summary_status, summary=summary)
+        summary_text = f"{outcome}; changed files: {changed_label}."
+    return [AgentActionSummary(task_id=task_id, status=summary_status, summary=summary_text)]
+
+def _build_surrender_summaries(task_id: str, message: str) -> List[AgentActionSummary]:
+    return [AgentActionSummary(task_id=task_id, status=AgentActionStatus.SURRENDER, summary=message)]
 
 @traceable(name="Workaround_Subagent_Test_Run") # for langsmith testing
 def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     """Run the single-group workaround subagent on ``SubagentState``."""
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
+    target_task = state.get("target_task")
     target_group = state.get("target_group")
     constraints_ledger = list(state.get("constraints_ledger", []))
     previous_feedback = state.get("previous_feedback")
+    
+    t_id = target_task.task_id if target_task else "unknown"
 
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
-        summary = AgentActionSummary(
-            task_id=target_group.group_id if target_group else "unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because repo_root was invalid.",
-        )
+        summaries = _build_surrender_summaries(t_id, "Stopped before execution because repo_root was invalid.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": [],
             "errors": [f"Workaround Subagent: repo_root '{repo_root_str}' is not a valid directory."],
         }
 
     if not workspace_volume:
-        summary = AgentActionSummary(
-            task_id=target_group.group_id if target_group else "unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because workspace_volume was missing.",
-        )
+        summaries = _build_surrender_summaries(t_id, "Stopped before execution because workspace_volume was missing.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": [],
             "errors": ["Workaround Subagent: workspace_volume is missing from state."],
         }
 
-    if target_group is None:
-        summary = AgentActionSummary(
-            task_id="unknown",
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because no target group was provided.",
-        )
+    if target_task is None or target_group is None:
+        summaries = _build_surrender_summaries(t_id, "Stopped before execution because no target task/group was provided.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": [],
-            "errors": ["Workaround Subagent: target_group is missing from state."],
+            "errors": ["Workaround Subagent: target_task or target_group is missing from state."],
         }
 
     if ChatOpenAI is None:
-        summary = AgentActionSummary(
-            task_id=target_group.group_id,
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because the LLM client is unavailable.",
-        )
+        summaries = _build_surrender_summaries(t_id, "Stopped before execution because the LLM client is unavailable.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": [],
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
@@ -194,13 +184,9 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
-        summary = AgentActionSummary(
-            task_id=target_group.group_id,
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped before execution because the LLM failed to initialize.",
-        )
+        summaries = _build_surrender_summaries(t_id, "Stopped before execution because the LLM failed to initialize.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": [],
             "errors": [f"Workaround Subagent: failed to initialize LLM - {exc}."],
         }
@@ -208,7 +194,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     touched_files: set[str] = set()
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_group)
     skinny_group = _create_skinny_subagent_group(target_group)
-    prompt = _build_workaround_prompt(skinny_group, filtered_ledger, previous_feedback)
+    prompt = _build_workaround_prompt(target_task, skinny_group, filtered_ledger, previous_feedback)
     initial_messages = [
         SystemMessage(content="Use only source-code tools and validate syntax after each modified file."),
         HumanMessage(content=prompt),
@@ -219,13 +205,9 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
             toolbelt = build_workaround_toolbelt(sandbox, touched_files, repo_root)
             runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
     except Exception as exc:  # noqa: BLE001
-        summary = AgentActionSummary(
-            task_id=target_group.group_id,
-            status=AgentActionStatus.SURRENDER,
-            summary="Stopped because the sandbox or tool loop failed.",
-        )
+        summaries = _build_surrender_summaries(t_id, "Stopped because the sandbox or tool loop failed.")
         return {
-            "action_summary": summary,
+            "action_summaries": summaries,
             "changed_files": sorted(touched_files),
             "errors": [f"Workaround Subagent: sandbox or tool loop failed - {exc}"],
         }
@@ -235,14 +217,14 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         edit_tool_name="deterministic_search_replace",
         validation_tool_name="validate_code_syntax",
     )
-    summary = _build_action_summary(
-        target_group.group_id,
+    summaries = _build_action_summaries(
+        t_id,
         runtime.changed_files,
         runtime.final_text,
         succeeded,
     )
     return {
-        "action_summary": summary,
+        "action_summaries": summaries,
         "changed_files": runtime.changed_files,
         "errors": runtime.errors,
     }

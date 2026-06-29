@@ -130,6 +130,14 @@ class RoutingStrategy(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 orchestrator caps
+# ---------------------------------------------------------------------------
+
+MAX_ANCESTRY_DEPTH: int = 3
+MAX_TASK_QUEUE_SIZE: int = 20
+
+
 class AgentActionStatus(str, Enum):
     """Strict terminal statuses returned by subagents."""
 
@@ -1281,6 +1289,28 @@ class SupervisorDecision(BaseModel):
         min_length=1,
         description="Concise audit explanation of why this routing decision was made.",
     )
+    revised_instructions: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Supervisor-revised instruction text per task_id. "
+            "Replaces the task's current instruction when non-empty. "
+            "All values must be non-empty strings."
+        ),
+    )
+    spawn_requests: List["TaskSpawnRequest"] = Field(
+        default_factory=list,
+        description=(
+            "Requests to spawn new child tasks. "
+            "The Python guardrail layer materializes actual RemediationTask objects."
+        ),
+    )
+    task_status_updates: Dict[str, "TaskStatus"] = Field(
+        default_factory=dict,
+        description=(
+            "Manual status overrides keyed by task_id. "
+            "Only QA_PASSED and UNFIXABLE are permitted; all other values are rejected."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_routing_invariants(self) -> "SupervisorDecision":
@@ -1313,7 +1343,60 @@ class SupervisorDecision(BaseModel):
             raise ValueError(
                 f"unfixable_task_ids and target_task_ids must not overlap. Overlap: {overlap}"
             )
+        # Validate revised_instructions keys are non-empty strings
+        for k, v in self.revised_instructions.items():
+            if not k.strip():
+                raise ValueError("revised_instructions keys must be non-empty task IDs.")
+            if not v.strip():
+                raise ValueError(f"revised_instructions['{k}'] must be a non-empty instruction.")
+        # Validate task_status_updates values are only QA_PASSED or UNFIXABLE
+        _allowed = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+        for tid, status in self.task_status_updates.items():
+            if status not in _allowed:
+                raise ValueError(
+                    f"task_status_updates['{tid}'] = '{status}' is not allowed; "
+                    "only QA_PASSED and UNFIXABLE may be set by the LLM."
+                )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Task Queue contracts
+# ---------------------------------------------------------------------------
+
+
+class TaskSpawnRequest(BaseModel):
+    """
+    A request from the supervisor to spawn a new child ``RemediationTask``.
+
+    The supervisor submits these inside ``SupervisorDecision.spawn_requests``;
+    the Python guardrail layer materializes the actual ``RemediationTask`` by
+    assigning ``task_id``, ``parent_group_id``, ``status``, ``retry_count``,
+    and ``ancestry_depth``. The LLM never creates raw ``RemediationTask``
+    objects directly.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    parent_task_id: str = Field(
+        ...,
+        min_length=1,
+        description="The task_id of the parent task that is spawning this child.",
+    )
+    strategy: RoutingStrategy = Field(
+        ...,
+        description="Routing strategy for the child task.",
+    )
+    instruction: str = Field(
+        ...,
+        min_length=1,
+        description="Exact instruction for the child task worker agent.",
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        description="Audit reason explaining why this child task is being spawned.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1424,13 @@ class RemediationTask(BaseModel):
         ...,
         min_length=1,
         description="The ``VulnerabilityGroup.group_id`` this task remediates.",
+    )
+    parent_task_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The task_id of the parent task that spawned this task. "
+            "None for initial (depth-0) tasks."
+        ),
     )
     strategy: RoutingStrategy = Field(
         ...,

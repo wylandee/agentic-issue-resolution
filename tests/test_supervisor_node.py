@@ -558,20 +558,25 @@ class TestRunSupervisorNodeActionSummaryUpdates:
         result = run_supervisor_node(state)
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
 
-    def test_handles_batch_prefix_in_action_summary(self):
+    def test_handles_multiple_action_summaries(self):
         g1 = _sca_group("g1")
         g2 = _sca_group("g2")
         task1 = _make_task("task-1", "g1", status=TaskStatus.PENDING)
         task2 = _make_task("task-2", "g2", status=TaskStatus.PENDING)
-        summary = AgentActionSummary(
-            task_id="batch:task-1, task-2",
+        summary1 = AgentActionSummary(
+            task_id="task-1",
             status=AgentActionStatus.SUCCESS,
-            summary="fixed batch",
+            summary="fixed task-1",
+        )
+        summary2 = AgentActionSummary(
+            task_id="task-2",
+            status=AgentActionStatus.SUCCESS,
+            summary="fixed task-2",
         )
         state = _base_state(
             [g1, g2],
             task_queue={"task-1": task1, "task-2": task2},
-            action_summaries=[summary],
+            action_summaries=[summary1, summary2],
             active_target_task_ids=["task-1", "task-2"],
         )
         result = run_supervisor_node(state)
@@ -728,7 +733,7 @@ class TestSupervisorPrompt:
         prompt = build_supervisor_prompt(_base_state(groups))
 
         assert "batches of at most 10" in prompt
-        assert "Never send more than 10 target_task_ids to update_subagent" in prompt
+        assert "update_subagent MUST have between 1 and 10 target_task_ids" in prompt
 
     def test_prompt_includes_task_ids(self):
         g1 = _sca_group("g1")
