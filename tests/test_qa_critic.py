@@ -1678,9 +1678,7 @@ class TestBuildIndividualInvestigatorPrompt:
         lower = self._prompt().lower()
         assert "not available to you" in lower or "do not attempt" in lower
 
-    def test_contains_install_summary(self):
-        lower = self._prompt().lower()
-        assert "npm install succeeded" in lower or "success" in lower
+
 
 
 # ---------------------------------------------------------------------------

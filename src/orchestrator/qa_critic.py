@@ -642,6 +642,62 @@ def _relevant_action_summaries(
     return relevant
 
 
+def _trim_action_summary_text(summary_text: str, group: VulnerabilityGroup) -> str:
+    """Trim batch action summary text to only mention the target group's component."""
+    group_id = group.group_id
+    match = re.search(r"(updates for |edits for )(.+?)(;|$)", summary_text)
+    if match:
+        groups_list_str = match.group(2)
+        if "," in groups_list_str:
+            groups = [g.strip() for g in groups_list_str.split(",")]
+            if group_id in groups:
+                summary_text = summary_text.replace(groups_list_str, group_id, 1)
+
+    # Collect possible match keywords for this group
+    keywords = set()
+    if group.vulnerable_component:
+        keywords.add(group.vulnerable_component.lower())
+    for cve in group.cve_ids or []:
+        if cve:
+            keywords.add(cve.lower())
+    for ghsa in group.ghsa_ids or []:
+        if ghsa:
+            keywords.add(ghsa.lower())
+    for issue in group.issues or []:
+        if issue.cve_id:
+            keywords.add(issue.cve_id.lower())
+        if issue.ghsa_id:
+            keywords.add(issue.ghsa_id.lower())
+
+    if not keywords:
+        return summary_text
+
+    lines = summary_text.splitlines()
+    trimmed_lines = []
+    for line in lines:
+        stripped = line.strip()
+        is_bullet = stripped.startswith(("-", "*", "+")) or re.match(r"^\d+\.", stripped)
+        is_action_verb = any(
+            stripped.lower().startswith(verb)
+            for verb in ["updated", "added", "fixed", "upgraded", "downgraded", "removed"]
+        )
+        if is_bullet or is_action_verb:
+            line_lower = stripped.lower()
+            has_kw = False
+            for kw in keywords:
+                # Custom word boundary matching to handle special characters like @ or - in package names
+                pattern = rf"(?:^|[^a-zA-Z0-9_@.-]){re.escape(kw)}(?:$|[^a-zA-Z0-9_.-])"
+                if re.search(pattern, line_lower):
+                    has_kw = True
+                    break
+            if has_kw:
+                trimmed_lines.append(line)
+        else:
+            trimmed_lines.append(line)
+
+    return "\n".join(trimmed_lines)
+
+
 def _parse_report_bullets(block_text: str) -> Dict[str, str]:
     """Parse markdown '- Label: value' bullets, preserving wrapped lines."""
     fields: Dict[str, str] = {}
@@ -1263,6 +1319,12 @@ def _build_individual_investigator_prompt(
         ", ".join(group_remaining_ids) if group_remaining_ids else "(none — scanner cleared this group)"
     )
 
+    trimmed_summaries = []
+    for s in action_summaries:
+        trimmed_text = _trim_action_summary_text(s.summary, group)
+        trimmed_summaries.append(f"  - {s.status.value}: {trimmed_text}")
+    summaries_text = "\n".join(trimmed_summaries) or "  (none)"
+
     return f"""You are a QA Investigator Agent assigned to review exactly ONE vulnerability group.
 
 ## Your Assigned Group
@@ -1278,21 +1340,8 @@ def _build_individual_investigator_prompt(
 ## Agent Action Summaries for This Group
 {summaries_text}
 
-## Global Execution Results (already completed — do NOT re-run)
-- Install: {'SUCCESS' if install_ok else 'FAILED'}
-  {install_summary[:1500]}
-
-- Security Scan: {'SUCCESS' if scan_ok else 'FAILED'}
-  {scan_summary[:1500]}
-
-- Unit Tests: {'SUCCESS' if tests_ok else 'FAILED'}
-  {tests_summary[:2000]}
-
 ## This Group's Deterministic Remaining Scanner Identifiers
 {remaining_text}
-
-## Files Changed by Remedy Agents (all groups combined)
-{changed_files_text}
 
 ## Your Task
 You are investigating ONLY this group ({group.group_id}). Use the provided review tools
@@ -1531,9 +1580,11 @@ def _build_batch_judge_prompt(
         relevant_summaries = _relevant_action_summaries(
             action_summaries, group.group_id, known_group_ids
         )
-        summaries_text = "\n".join(
-            f"    - {s.status.value}: {s.summary}" for s in relevant_summaries
-        ) or "    (none)"
+        trimmed_summaries = []
+        for s in relevant_summaries:
+            trimmed_text = _trim_action_summary_text(s.summary, group)
+            trimmed_summaries.append(f"    - {s.status.value}: {trimmed_text}")
+        summaries_text = "\n".join(trimmed_summaries) or "    (none)"
 
         investigation = investigations_by_group.get(group.group_id)
         investigation_text = (
@@ -1813,9 +1864,11 @@ def _build_qa_system_prompt(
             group.group_id,
             known_group_ids,
         )
-        summaries_text = "\n".join(
-            f"    - {s.status.value}: {s.summary}" for s in relevant_summaries
-        ) or "    (none)"
+        trimmed_summaries = []
+        for s in relevant_summaries:
+            trimmed_text = _trim_action_summary_text(s.summary, group)
+            trimmed_summaries.append(f"    - {s.status.value}: {trimmed_text}")
+        summaries_text = "\n".join(trimmed_summaries) or "    (none)"
 
         groups_text_parts.append(
             f"  GROUP: {group.group_id}\n"
@@ -2156,6 +2209,33 @@ Return a QAEvaluation for group_id="{group.group_id}" with:
     return evaluations
 
 
+def _create_skinny_qa_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
+    """Create a skinny copy of a group for QA evaluator agents."""
+    return group.model_copy(update={
+        "issues": [],
+        "localized_issues": [],
+    })
+
+
+def _filter_recent_action_summaries(
+    action_summaries: List[AgentActionSummary],
+    valid_groups: List[VulnerabilityGroup]
+) -> List[AgentActionSummary]:
+    """Extract ONLY the most recently appended summary for each group_id."""
+    known_group_ids = {g.group_id for g in valid_groups}
+    recent_summaries = []
+    seen_ids = set()
+    for summary in reversed(action_summaries):
+        gids = _resolve_action_summary_group_ids(summary, known_group_ids)
+        new_gids = set(gids) - seen_ids
+        if new_gids:
+            recent_summaries.insert(0, summary)
+            seen_ids.update(new_gids)
+        if seen_ids == known_group_ids:
+            break
+    return recent_summaries
+
+
 # ---------------------------------------------------------------------------
 # Compatibility wrapper and node entry point
 # ---------------------------------------------------------------------------
@@ -2250,6 +2330,9 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         len(valid_groups),
         len(target_identifiers),
     )
+
+    valid_groups = [_create_skinny_qa_group(g) for g in valid_groups]
+    action_summaries = _filter_recent_action_summaries(action_summaries, valid_groups)
 
     errors: List[str] = []
     try:

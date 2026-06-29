@@ -66,6 +66,32 @@ def _candidate_manifest_paths(group: VulnerabilityGroup) -> List[str]:
     return candidates
 
 
+def _create_skinny_subagent_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
+    """Create a skinny copy of a group for execution agents."""
+    return group.model_copy(update={
+        "cve_ids": [],
+        "ghsa_ids": [],
+        "versions": [],
+        "issues": [],
+    })
+
+
+def _filter_constraints_ledger(
+    constraints_ledger: Sequence[str],
+    target_groups: Sequence[VulnerabilityGroup]
+) -> List[str]:
+    """Filter ledger to only include constraints matching the target components."""
+    components = [g.vulnerable_component for g in target_groups if g.vulnerable_component]
+    if not components:
+        return list(constraints_ledger)
+    
+    filtered = []
+    for constraint in constraints_ledger:
+        if any(comp in constraint for comp in components):
+            filtered.append(constraint)
+    return filtered
+
+
 def _resolve_manifest_targets(
     group: VulnerabilityGroup,
     repo_root: Path,
@@ -175,9 +201,6 @@ def _build_update_prompt(
                     f"Group ID      : {group.group_id}",
                     f"Manifest Path : {_format_manifest_paths(manifest_paths)}",
                     f"Component     : {group.vulnerable_component or 'unknown'}",
-                    f"CVEs          : {', '.join(group.cve_ids) if group.cve_ids else 'none'}",
-                    f"GHSAs         : {', '.join(group.ghsa_ids) if group.ghsa_ids else 'none'}",
-                    f"Versions      : {', '.join(group.versions) if group.versions else 'unknown'}",
                     f"Fix Status    : {fix_plan.status.value if fix_plan else 'none'}",
                     f"Fixed Version : {fix_plan.fixed_version if fix_plan else 'N/A'}",
                     f"Instruction   : {fix_plan.instruction if fix_plan else 'Derive the safest manifest update.'}",
@@ -285,7 +308,13 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         return {"action_summary": summary, "changed_files": [], "errors": resolution_errors + [msg]}
 
     touched_files: set[str] = set()
-    prompt = _build_update_prompt(resolved_groups, constraints_ledger, feedback_by_group)
+    
+    filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
+    skinny_resolved_groups = [
+        (_create_skinny_subagent_group(g), paths) for g, paths in resolved_groups
+    ]
+    
+    prompt = _build_update_prompt(skinny_resolved_groups, filtered_ledger, feedback_by_group)
     initial_messages = [
         SystemMessage(content="Use only dependency-management tools and validate manifest synchronization after changes."),
         HumanMessage(content=prompt),
@@ -293,14 +322,14 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            package_manifest_map = _build_package_manifest_map(resolved_groups)
+            package_manifest_map = _build_package_manifest_map(skinny_resolved_groups)
             toolbelt = build_update_toolbelt(
                 sandbox,
                 touched_files,
                 repo_root,
                 target_manifest_paths=[
                     manifest_path
-                    for _, manifest_paths in resolved_groups
+                    for _, manifest_paths in skinny_resolved_groups
                     for manifest_path in manifest_paths
                 ],
                 package_manifest_paths=package_manifest_map,

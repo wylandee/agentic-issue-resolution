@@ -32,6 +32,32 @@ except ImportError:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment,misc]
 
 
+def _create_skinny_subagent_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
+    """Create a skinny copy of a group for execution agents."""
+    return group.model_copy(update={
+        "cve_ids": [],
+        "ghsa_ids": [],
+        "versions": [],
+        "issues": [],
+    })
+
+
+def _filter_constraints_ledger(
+    constraints_ledger: List[str],
+    target_group: VulnerabilityGroup
+) -> List[str]:
+    """Filter ledger to only include constraints matching the target component."""
+    comp = target_group.vulnerable_component
+    if not comp:
+        return list(constraints_ledger)
+    
+    filtered = []
+    for constraint in constraints_ledger:
+        if comp in constraint:
+            filtered.append(constraint)
+    return filtered
+
+
 def _build_workaround_prompt(
     target_group: VulnerabilityGroup,
     constraints_ledger: List[str],
@@ -66,9 +92,6 @@ def _build_workaround_prompt(
                 f"Issue Type    : {target_group.issue_type.value}",
                 f"Component     : {target_group.vulnerable_component or 'unknown'}",
                 f"Initial File  : {target_group.file_path or 'none'}",
-                f"CVEs          : {', '.join(target_group.cve_ids) if target_group.cve_ids else 'none'}",
-                f"GHSAs         : {', '.join(target_group.ghsa_ids) if target_group.ghsa_ids else 'none'}",
-                f"Versions      : {', '.join(target_group.versions) if target_group.versions else 'unknown'}",
                 f"Fix Status    : {fix_plan.status.value if fix_plan else 'none'}",
                 f"Instruction   : {fix_plan.instruction if fix_plan else 'Derive the smallest safe code change.'}",
                 f"QA Feedback   : {previous_feedback or 'none'}",
@@ -183,7 +206,9 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         }
 
     touched_files: set[str] = set()
-    prompt = _build_workaround_prompt(target_group, constraints_ledger, previous_feedback)
+    filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_group)
+    skinny_group = _create_skinny_subagent_group(target_group)
+    prompt = _build_workaround_prompt(skinny_group, filtered_ledger, previous_feedback)
     initial_messages = [
         SystemMessage(content="Use only source-code tools and validate syntax after each modified file."),
         HumanMessage(content=prompt),

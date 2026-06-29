@@ -41,7 +41,7 @@ from src.orchestrator.state import OrchestratorState
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 1
+MAX_RETRIES: int = 2
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -250,6 +250,7 @@ def build_supervisor_prompt(state: OrchestratorState) -> str:
         retries = retry_counts.get(gid, 0)
         fix_plan = group.fix_plan
         cves = ", ".join(group.cve_ids) if group.cve_ids else "none"
+        ghsas = ", ".join(group.ghsa_ids) if group.ghsa_ids else "none"
         eval_ = qa_evaluations.get(gid)
 
         lines += [
@@ -258,6 +259,7 @@ def build_supervisor_prompt(state: OrchestratorState) -> str:
             f"- Component    : {group.vulnerable_component or 'unknown'}",
             f"- Issue Type   : {group.issue_type.value}",
             f"- CVEs         : {cves}",
+            f"- GHSAs        : {ghsas}",
             f"- Fix Plan     : {fix_plan.status.value if fix_plan else 'none'}",
             f"- Strategy     : {strategy.value}",
             f"- Status       : {status.value}",
