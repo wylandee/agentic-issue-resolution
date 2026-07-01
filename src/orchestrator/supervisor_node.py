@@ -996,7 +996,14 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     if decision is None:
         tasks = list(task_queue.values())
         non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
-        if non_terminal and all(t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal):
+        if not non_terminal:
+            decision = SupervisorDecision(
+                next_node="teardown",
+                target_task_ids=[],
+                instructions="All tasks are terminal. Proceeding to teardown.",
+                decision_reason="No actionable tasks remain.",
+            )
+        elif all(t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal):
             decision = SupervisorDecision(
                 next_node="qa_critic",
                 target_task_ids=[t.task_id for t in non_terminal],

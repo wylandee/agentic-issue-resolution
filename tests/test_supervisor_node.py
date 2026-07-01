@@ -794,6 +794,57 @@ class TestRunSupervisorMaxRetries:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert "task-1" not in result["active_target_task_ids"]
 
+    @patch("langchain_openai.ChatOpenAI")
+    def test_all_terminal_after_retry_cap_skips_router_and_tears_down(self, mock_chat):
+        g1 = _sca_group("g1")
+        g2 = _sca_group("g2")
+        g3 = _sca_group("g3")
+        task1 = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+        task2 = _make_task(
+            "task-2",
+            "g2",
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=MAX_RETRIES - 1,
+        )
+        task3 = _make_task(
+            "task-3",
+            "g3",
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=MAX_RETRIES - 1,
+        )
+        summaries = [
+            AgentActionSummary(
+                task_id="task-2",
+                status=AgentActionStatus.SURRENDER,
+                summary="No viable manifest update remains.",
+            ),
+            AgentActionSummary(
+                task_id="task-3",
+                status=AgentActionStatus.SURRENDER,
+                summary="No viable manifest update remains.",
+            ),
+        ]
+        state = _base_state(
+            [g1, g2, g3],
+            task_queue={
+                "task-1": task1,
+                "task-2": task2,
+                "task-3": task3,
+            },
+            action_summaries=summaries,
+            active_target_task_ids=["task-2", "task-3"],
+            status="supervisor_entered",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "teardown"
+        assert result["active_target_task_ids"] == []
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
+        assert result["task_queue"]["task-3"].status == TaskStatus.UNFIXABLE
+        mock_chat.assert_not_called()
+
 
 # ===========================================================================
 # run_supervisor_node — strategy pivots
