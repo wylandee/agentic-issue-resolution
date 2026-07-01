@@ -1648,9 +1648,11 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 
 5. Use **SECURITY_FLAG** for unresolved scanner evidence or flawed workaround logic.
 
-6. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
+6. If a group has BOTH unresolved scanner evidence AND is plausibly causing unit test failures, choose **SECURITY_FLAG** as the single failure_category. Mention the test regression in retry_feedback and the holistic report, but do not label the group BREAKING_CHANGE.
 
-7. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
+7. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
+
+8. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
 
 ## Output Requirements
 
@@ -1792,21 +1794,28 @@ def _apply_guardrails(
             continue  # Trust the workaround code review — exempt from forced failure.
         # VERSION_BUMP with remaining identifiers → force failed.
         current = normalized[group.group_id]
-        if current.passed:
+        if current.passed or current.failure_category == FailureCategory.BREAKING_CHANGE:
             errors.append(
                 f"qa_critic guardrail: group '{group.group_id}' (VERSION_BUMP) has remaining "
-                f"scanner identifiers {group_remaining} but judge marked passed=True; "
+                f"scanner identifiers {group_remaining} but judge did not prioritize SECURITY_FLAG; "
                 "forcing passed=False / SECURITY_FLAG."
             )
+            retry_feedback = (
+                f"Scanner still detects unresolved identifiers: {', '.join(group_remaining)}. "
+                "The version bump did not fully resolve the vulnerability. "
+                "Check that the correct version was applied."
+            )
+            if current.failure_category == FailureCategory.BREAKING_CHANGE and current.retry_feedback:
+                retry_feedback = (
+                    retry_feedback
+                    + " Test regressions may also be present, but SECURITY_FLAG takes precedence until the unresolved scanner findings are cleared. "
+                    + current.retry_feedback
+                )
             normalized[group.group_id] = QAEvaluation(
                 task_id=group.group_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
-                retry_feedback=(
-                    f"Scanner still detects unresolved identifiers: {', '.join(group_remaining)}. "
-                    "The version bump did not fully resolve the vulnerability. "
-                    "Check that the correct version was applied."
-                ),
+                retry_feedback=retry_feedback,
             )
 
     # Phase 4: install conflict guardrail — map BREAKING_CHANGE → PEER_CONFLICT
@@ -2179,7 +2188,8 @@ def _run_judge_phase(
 3. Use PEER_CONFLICT for install failures caused by dependency conflicts such as ERESOLVE, EBADENGINE, or peer tree incompatibilities.
 4. Use BREAKING_CHANGE for test regressions or behavior changes caused by this group's remediation.
 5. Use SECURITY_FLAG for unresolved scanner evidence or flawed workaround logic.
-6. Judge only this group. Ignore any missing data about other groups.
+6. If this group has both unresolved scanner evidence and plausible test regressions, choose SECURITY_FLAG as the single failure_category and mention the regressions in retry_feedback.
+7. Judge only this group. Ignore any missing data about other groups.
 
 Return a QAEvaluation for group_id="{group.group_id}" with:
 - passed: true/false

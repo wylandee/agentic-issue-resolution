@@ -429,6 +429,47 @@ class TestRunSupervisorNodeToTeardown:
 
 
 class TestRunSupervisorNodeQAUpdates:
+    @patch("src.orchestrator.supervisor_node._run_planner_phase")
+    @patch("langchain_openai.ChatOpenAI")
+    def test_qa_failed_retry_invokes_planner_before_router(self, mock_chat, mock_planner):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", status=TaskStatus.NEEDS_RETRY)
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="retry with better update evidence",
+                )
+            },
+        )
+
+        router_llm = MagicMock()
+        structured = MagicMock()
+        mock_chat.return_value = router_llm
+        router_llm.with_structured_output.return_value = structured
+        structured.invoke.return_value = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=["task-1"],
+            revised_instructions={
+                "task-1": "Investigate patched releases or override paths for test-pkg."
+            },
+            instructions="route retry task",
+            decision_reason="planner kept update remediation active",
+        )
+        mock_planner.return_value = "Strategy Scratchpad\nretry update path still open"
+
+        run_supervisor_node(state)
+
+        mock_planner.assert_called_once()
+        prompt_text = structured.invoke.call_args[0][0]
+        assert "Strategy Scratchpad" in prompt_text
+        assert "retry update path still open" in prompt_text
+
     def test_qa_completed_passed_marks_task_qa_passed(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -516,6 +557,114 @@ class TestRunSupervisorNodeQAUpdates:
         # Status should NOT become QA_PASSED because status != "qa_completed"
         # It will route to qa_critic since task is OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_failed_group_keyed_qa_eval_replans_active_child_task(self, mock_chat):
+        g1 = _sca_group("g1")
+        parent = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+        child = _make_task("task-2", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            task_queue={
+                "task-2": child,
+                "task-1": parent,
+            },
+            active_target_task_ids=["task-2"],
+            qa_evaluations={
+                "g1": QAEvaluation(
+                    task_id="g1",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="retry the active child task",
+                )
+            },
+        )
+
+        router_llm = MagicMock()
+        structured = MagicMock()
+        mock_chat.return_value = router_llm
+        router_llm.with_structured_output.return_value = structured
+        structured.invoke.return_value = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=["task-2"],
+            revised_instructions={
+                "task-2": 'Update "test-pkg" in package.json to version "1.2.4".'
+            },
+            instructions="retry child",
+            decision_reason="replan the active retry task",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
+        assert result["task_queue"]["task-2"].retry_count == 1
+        assert result["task_queue"]["task-2"].instruction == 'Update "test-pkg" in package.json to version "1.2.4".'
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_retry_update_without_revised_instruction_falls_back_to_high_level_retry(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task(
+            "task-1",
+            "g1",
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        task.instruction = 'Update "test-pkg" in package.json to version "1.2.3".'
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+        )
+
+        router_llm = MagicMock()
+        structured = MagicMock()
+        mock_chat.return_value = router_llm
+        router_llm.with_structured_output.return_value = structured
+        structured.invoke.return_value = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=["task-1"],
+            instructions="Retry with current strategy.",
+            decision_reason="retry the failed version bump",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
+        assert result["task_queue"]["task-1"].instruction.startswith("Investigate")
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
+        assert any("rejected update_subagent retry dispatch" in err for err in result["errors"])
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_pending_update_task_can_seed_instruction_from_revised_instructions(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", status=TaskStatus.PENDING)
+        task.instruction = ""
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+        )
+
+        router_llm = MagicMock()
+        structured = MagicMock()
+        mock_chat.return_value = router_llm
+        router_llm.with_structured_output.return_value = structured
+        structured.invoke.return_value = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=["task-1"],
+            revised_instructions={
+                "task-1": 'Update "test-pkg" in package.json to version "1.2.4".'
+            },
+            instructions="seed the initial task instruction",
+            decision_reason="planner provided an exact version",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["task_queue"]["task-1"].instruction == 'Update "test-pkg" in package.json to version "1.2.4".'
 
 
 # ===========================================================================
@@ -653,7 +802,7 @@ class TestRunSupervisorMaxRetries:
 
 class TestRunSupervisorNodePeerConflict:
     @patch("langchain_openai.ChatOpenAI")
-    def test_llm_updated_strategy_pivot_applied(self, mock_chat):
+    def test_llm_strategy_pivot_spawns_child_and_routes_child(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
         state = _base_state(
@@ -667,12 +816,81 @@ class TestRunSupervisorNodePeerConflict:
             next_node="workaround_subagent",
             target_task_ids=["task-1"],
             updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
+            revised_instructions={"task-1": "Implement a code workaround for the unresolved peer conflict."},
             instructions="test",
             decision_reason="test",
         )
 
         result = run_supervisor_node(state)
-        assert result["task_queue"]["task-1"].strategy == RoutingStrategy.CODE_WORKAROUND
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+        assert result["task_queue"]["task-1"].strategy == RoutingStrategy.VERSION_BUMP
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+        assert result["task_queue"]["task-2"].parent_task_id == "task-1"
+        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+        assert result["task_queue"]["task-2"].instruction == "Implement a code workaround for the unresolved peer conflict."
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_breaking_change_pivot_marks_parent_passed_and_routes_child(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="jsonwebtoken v9 broke runtime expectations",
+                )
+            },
+        )
+
+        mock_llm = MagicMock()
+        mock_chat.return_value = mock_llm
+        mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=["task-1"],
+            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
+            revised_instructions={"task-1": "Implement a compatibility workaround for the new jsonwebtoken API."},
+            instructions="test",
+            decision_reason="spawn a workaround child after the validated version bump caused regressions",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-2"].parent_task_id == "task-1"
+        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_strategy_pivot_without_child_instruction_fails_closed(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+        )
+
+        mock_llm = MagicMock()
+        mock_chat.return_value = mock_llm
+        mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=["task-1"],
+            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
+            instructions="retry with a workaround",
+            decision_reason="pivot the task after the retry failed",
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
+        assert "task-2" not in result["task_queue"]
+        assert any("rejected strategy pivot without task-specific child instructions" in err for err in result["errors"])
 
 
 # ===========================================================================
@@ -742,3 +960,10 @@ class TestSupervisorPrompt:
         prompt = build_supervisor_prompt(state)
         assert "task-1" in prompt
         assert "g1" in prompt
+
+    def test_prompt_enforces_security_flag_update_and_breaking_change_workaround(self):
+        g1 = _sca_group("g1")
+        prompt = build_supervisor_prompt(_base_state([g1]))
+
+        assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
+        assert "BREAKING_CHANGE follow-on remediation must use CODE_WORKAROUND strategy" in prompt

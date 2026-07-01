@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Mapping, Set
 from langchain_core.tools import tool
 
 from src.runtime.sandbox_mgr import DockerSandbox
+from src.tools.registry_tools import view_npm_package_versions
 
 logger = logging.getLogger(__name__)
 
@@ -494,10 +495,11 @@ def build_update_toolbelt(
     host_repo_root: Path,
     target_manifest_paths: Iterable[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
+    enable_registry_lookup: bool = False,
 ) -> List:
     """Build the strict update-only toolbelt."""
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
-    return [
+    toolbelt = [
         _make_read_repository_map_tool(sandbox),
         _make_modify_npm_dependency_tool(
             sandbox,
@@ -507,6 +509,9 @@ def build_update_toolbelt(
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
         _make_validate_manifest_sync_tool(sandbox, manifest_paths),
     ]
+    if enable_registry_lookup:
+        toolbelt.append(view_npm_package_versions)
+    return toolbelt
 
 
 def build_workaround_toolbelt(

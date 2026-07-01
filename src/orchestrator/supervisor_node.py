@@ -1,19 +1,14 @@
 """
 supervisor_node.py - Agentic Supervisor Node for Phase 5 hub-and-spoke orchestration.
 
-Phase 2 architecture: Two-Phase Commander
------------------------------------------
-The Supervisor now runs as an explicit two-phase commander:
+Phase 2 architecture: High-Level Commander
+------------------------------------------
+The Supervisor now acts as a high-level commander:
 
-  Phase A — Planner (conditional):
-    A bounded ReAct loop with access to ``view_npm_package_versions``.
-    Runs only when there are NEEDS_RETRY or PENDING tasks with empty instructions.
-    Outputs a free-form "Strategy Scratchpad" with observations, playbook selections,
-    registry findings, instruction revisions, spawn recommendations, and routing notes.
-
-  Phase B — Router (always):
+  Router:
     A zero-shot ``ChatOpenAI.with_structured_output(SupervisorDecision)`` call
-    that reads the scratchpad and emits the strict typed routing decision.
+    that decides which worker should run next, whether retry instructions must
+    be refreshed, and whether a child task must be spawned for a strategy pivot.
 
   Guardrails (Python):
     Validate and apply the decision: reject unknown task IDs, clamp cardinality,
@@ -25,7 +20,7 @@ Public API
 MAX_RETRIES : int
     Maximum number of QA-fail-retry cycles before a task is marked unfixable.
 build_supervisor_prompt(state) -> str
-    Builds the Router prompt text (includes planner scratchpad when available).
+    Builds the Router prompt text.
 run_supervisor_node(state) -> Dict[str, Any]
     LangGraph node callable.
 supervisor_router(state) -> str
@@ -36,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -52,6 +47,7 @@ from src.contracts.schemas import (
     SupervisorDecision,
     TaskSpawnRequest,
     TaskStatus,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
@@ -61,7 +57,7 @@ from src.tools.registry_tools import view_npm_package_versions
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 2
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -86,6 +82,80 @@ _WORKABLE_STATUSES = frozenset({
 })
 
 
+def _resolve_task_id_from_identifier(
+    identifier: str,
+    task_queue: Dict[str, RemediationTask],
+    active_target_task_ids: List[str],
+) -> Optional[str]:
+    """
+    Resolve a task or legacy group identifier to the most relevant task_id.
+
+    Preference order:
+    1. Exact task_id match.
+    2. Active target task(s) whose parent_group_id matches the identifier.
+    3. Non-terminal task(s) whose parent_group_id matches the identifier.
+    4. Any task(s) whose parent_group_id matches the identifier.
+    """
+    if identifier in task_queue:
+        return identifier
+
+    active_matches = [
+        task_id
+        for task_id in active_target_task_ids
+        if task_id in task_queue and task_queue[task_id].parent_group_id == identifier
+    ]
+    if len(active_matches) == 1:
+        return active_matches[0]
+
+    non_terminal_matches = [
+        task.task_id
+        for task in task_queue.values()
+        if task.parent_group_id == identifier and task.status not in _TERMINAL_STATUSES
+    ]
+    if len(non_terminal_matches) == 1:
+        return non_terminal_matches[0]
+
+    all_matches = [
+        task.task_id
+        for task in task_queue.values()
+        if task.parent_group_id == identifier
+    ]
+    if len(all_matches) == 1:
+        return all_matches[0]
+
+    return None
+
+
+def _normalize_qa_evaluations_for_tasks(
+    qa_evaluations: Dict[str, QAEvaluation],
+    task_queue: Dict[str, RemediationTask],
+    active_target_task_ids: List[str],
+) -> Dict[str, QAEvaluation]:
+    """Re-key QA evaluations to concrete task_ids when possible."""
+    normalized: Dict[str, QAEvaluation] = {}
+    for identifier, evaluation in qa_evaluations.items():
+        resolved_t_id = _resolve_task_id_from_identifier(
+            identifier,
+            task_queue,
+            active_target_task_ids,
+        )
+        if resolved_t_id is None:
+            resolved_t_id = _resolve_task_id_from_identifier(
+                evaluation.task_id,
+                task_queue,
+                active_target_task_ids,
+            )
+        if resolved_t_id is None:
+            continue
+        normalized[resolved_t_id] = QAEvaluation(
+            task_id=resolved_t_id,
+            passed=evaluation.passed,
+            failure_category=evaluation.failure_category,
+            retry_feedback=evaluation.retry_feedback,
+        )
+    return normalized
+
+
 def _constraint_entry_for_task(
     task: RemediationTask,
     group: VulnerabilityGroup,
@@ -101,6 +171,111 @@ def _constraint_entry_for_task(
     return f"{component}: preserve validated security workaround"
 
 
+def _missing_retry_revised_instructions(
+    next_node: str,
+    target_task_ids: List[str],
+    revised_instructions: Dict[str, str],
+    task_queue: Dict[str, RemediationTask],
+) -> List[str]:
+    """Return retry-bound update targets that are missing exact revised instructions."""
+    if next_node != "update_subagent":
+        return []
+
+    missing: List[str] = []
+    for task_id in target_task_ids:
+        task = task_queue.get(task_id)
+        if task is None or task.status != TaskStatus.NEEDS_RETRY:
+            continue
+        if not revised_instructions.get(task_id, "").strip():
+            missing.append(task_id)
+    return missing
+
+
+def _latest_action_summary_by_task(
+    action_summaries: List[AgentActionSummary],
+    task_queue: Dict[str, RemediationTask],
+    active_target_task_ids: List[str],
+) -> Dict[str, AgentActionSummary]:
+    """Return the most recent action summary keyed by resolved task_id."""
+    latest: Dict[str, AgentActionSummary] = {}
+    for summary in action_summaries:
+        resolved_task_id = _resolve_task_id_from_identifier(
+            summary.task_id,
+            task_queue,
+            active_target_task_ids,
+        )
+        if resolved_task_id is None:
+            continue
+        latest[resolved_task_id] = summary
+    return latest
+
+
+def _build_high_level_retry_instruction(
+    task: RemediationTask,
+    group: Optional[VulnerabilityGroup],
+    evaluation: Optional[QAEvaluation],
+    diagnostics: Optional[UpdateRetryDiagnostics],
+) -> str:
+    """Synthesize a high-level retry instruction for the update worker."""
+    component = group.vulnerable_component if group else task.parent_group_id
+    category = evaluation.failure_category if evaluation else None
+    if diagnostics and diagnostics.package_abandoned:
+        return (
+            f"Investigate whether {component} still has a supported manifest-based update path. "
+            "Use registry evidence to confirm whether the package is unpublished, abandoned, or "
+            "otherwise exhausted, and report that clearly if no valid update path remains."
+        )
+    if category == FailureCategory.PEER_CONFLICT:
+        return (
+            f"Investigate compatible patched releases or override paths for {component}. "
+            "Prioritize peer-compatible backports or npm overrides that preserve validation."
+        )
+    if category == FailureCategory.SECURITY_FLAG:
+        return (
+            f"Investigate patched manifest remediation paths for {component}. "
+            "Use registry evidence to compare newer releases, backported patches, and override strategies."
+        )
+    if category == FailureCategory.BREAKING_CHANGE:
+        return (
+            f"Document the validated version outcome for {component} and the specific API or test regressions. "
+            "Do not search for another version unless new evidence shows a safer compatible patch exists."
+        )
+    return (
+        f"Investigate remaining safe manifest remediation paths for {component}. "
+        "Use registry evidence and prior validation failures to choose the next bounded retry."
+    )
+
+
+def _worker_node_for_strategy(strategy: RoutingStrategy) -> str:
+    """Return the worker node that handles a given routing strategy."""
+    if strategy == RoutingStrategy.VERSION_BUMP:
+        return "update_subagent"
+    return "workaround_subagent"
+
+
+def _parent_status_for_strategy_pivot(
+    parent_task: RemediationTask,
+    new_strategy: RoutingStrategy,
+    qa_evaluations: Dict[str, QAEvaluation],
+) -> TaskStatus:
+    """
+    Choose the terminal parent status when a strategy pivot spawns a child task.
+
+    BREAKING_CHANGE means the version bump itself succeeded but caused regressions,
+    so the parent attempt should become QA_PASSED and the child handles follow-on
+    workaround work. Other pivots represent an exhausted parent strategy attempt.
+    """
+    evaluation = qa_evaluations.get(parent_task.task_id)
+    if (
+        parent_task.strategy == RoutingStrategy.VERSION_BUMP
+        and new_strategy == RoutingStrategy.CODE_WORKAROUND
+        and evaluation is not None
+        and evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+    ):
+        return TaskStatus.QA_PASSED
+    return TaskStatus.UNFIXABLE
+
+
 # ---------------------------------------------------------------------------
 # Deterministic fallback router
 # ---------------------------------------------------------------------------
@@ -110,6 +285,8 @@ def _deterministic_routing(
     task_queue: Dict[str, RemediationTask],
     group_by_id: Dict[str, VulnerabilityGroup],
     qa_evaluations: Dict[str, QAEvaluation],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    action_summaries: Optional[List[AgentActionSummary]] = None,
     active_target_task_ids: Optional[List[str]] = None,
     current_status: str = "",
 ) -> SupervisorDecision:
@@ -120,6 +297,11 @@ def _deterministic_routing(
     """
     tasks = list(task_queue.values())
     non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
+    latest_summaries = _latest_action_summary_by_task(
+        action_summaries or [],
+        task_queue,
+        list(active_target_task_ids or []),
+    )
 
     # All tasks are terminal → teardown
     if not non_terminal:
@@ -159,8 +341,83 @@ def _deterministic_routing(
     # Collect tasks that still need work
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
 
-    # VERSION_BUMP tasks batch to update_subagent
-    version_bump = [t for t in workable if t.strategy == RoutingStrategy.VERSION_BUMP]
+    exhausted_retry = next(
+        (
+            task
+            for task in workable
+            if task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.status == TaskStatus.NEEDS_RETRY
+            and (
+                retry_diagnostics_by_task.get(task.task_id) is not None
+                and (
+                    retry_diagnostics_by_task[task.task_id].package_abandoned
+                    or retry_diagnostics_by_task[task.task_id].exhausted_update_path
+                )
+            )
+        ),
+        None,
+    )
+    if exhausted_retry is not None:
+        component = (
+            group_by_id.get(exhausted_retry.parent_group_id).vulnerable_component
+            if exhausted_retry.parent_group_id in group_by_id
+            else exhausted_retry.parent_group_id
+        )
+        diagnostics = retry_diagnostics_by_task.get(exhausted_retry.task_id)
+        return SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=[exhausted_retry.task_id],
+            updated_task_strategies={
+                exhausted_retry.task_id: RoutingStrategy.CODE_WORKAROUND
+            },
+            revised_instructions={
+                exhausted_retry.task_id: (
+                    f"Implement a code workaround or isolation strategy for {component} because "
+                    "manifest-based update remediation appears exhausted after bounded registry-guided retries."
+                )
+            },
+            instructions="Pivot exhausted update remediation to the workaround worker.",
+            decision_reason=(
+                f"Retry diagnostics show that '{component}' no longer has a remaining manifest-based update path."
+            ),
+        )
+
+    retry_version_bump = [
+        t
+        for t in workable
+        if t.strategy == RoutingStrategy.VERSION_BUMP and t.status == TaskStatus.NEEDS_RETRY
+    ]
+    if retry_version_bump:
+        batch = retry_version_bump[:UPDATE_BATCH_SIZE]
+        feedback_by_task: Dict[str, str] = {}
+        revised_instructions: Dict[str, str] = {}
+        for task in batch:
+            evaluation = qa_evaluations.get(task.task_id)
+            if evaluation and evaluation.retry_feedback:
+                feedback_by_task[task.task_id] = evaluation.retry_feedback
+            revised_instructions[task.task_id] = _build_high_level_retry_instruction(
+                task,
+                group_by_id.get(task.parent_group_id),
+                evaluation,
+                retry_diagnostics_by_task.get(task.task_id),
+            )
+        return SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=[t.task_id for t in batch],
+            feedback_by_task=feedback_by_task,
+            revised_instructions=revised_instructions,
+            instructions="Route retry-bound dependency tasks back to the update worker with high-level retry goals.",
+            decision_reason=(
+                f"Routing {len(batch)} retry VERSION_BUMP task(s) to update_subagent for registry-guided evidence gathering."
+            ),
+        )
+
+    # VERSION_BUMP tasks batch to update_subagent only for non-retry work.
+    version_bump = [
+        t
+        for t in workable
+        if t.strategy == RoutingStrategy.VERSION_BUMP and t.status != TaskStatus.NEEDS_RETRY
+    ]
     if version_bump:
         batch = version_bump[:UPDATE_BATCH_SIZE]
         feedback_by_task: Dict[str, str] = {}
@@ -214,36 +471,40 @@ def _deterministic_routing(
 
 def _needs_planner(
     task_queue: Dict[str, RemediationTask],
+    qa_evaluations: Dict[str, QAEvaluation],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    current_status: str,
 ) -> bool:
     """Return True when the planner should be invoked.
 
-    Conditions:
-    - Any task is NEEDS_RETRY (requires failure investigation), OR
-    - Any PENDING task has an empty instruction (requires initial instruction writing).
+    The planner is reserved for retry analysis and playbook selection.
     """
-    for task in task_queue.values():
-        if task.status == TaskStatus.NEEDS_RETRY:
-            return True
-        if task.status == TaskStatus.PENDING and not task.instruction.strip():
-            return True
-    return False
+    if not any(task.status == TaskStatus.NEEDS_RETRY for task in task_queue.values()):
+        return False
+    return current_status == "qa_completed" or bool(qa_evaluations) or bool(
+        retry_diagnostics_by_task
+    )
 
 
 def _build_planner_prompt(
     task_queue: Dict[str, RemediationTask],
     group_by_id: Dict[str, VulnerabilityGroup],
     qa_evaluations: Dict[str, QAEvaluation],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
     action_summaries: List[AgentActionSummary],
     constraints_ledger: List[str],
 ) -> str:
     """Build the planner system + user messages."""
     lines = [
         "You are the Planner phase of an AppSec remediation Supervisor.",
-        "Your job is to investigate failures, query the npm registry, select a playbook,",
-        "and write precise remediation instructions for each task that needs attention.",
+        "You own playbook reasoning for retry tasks.",
+        "Your job is to investigate failures, assess whether manifest-based update remediation is exhausted,",
+        "and write high-level retry guidance for the Router to enforce.",
         "",
-        "Use the view_npm_package_versions tool to look up version availability before",
-        "writing an instruction for any package. Do not guess version numbers.",
+        "The Update Subagent gathers retry evidence by querying npm and attempting bounded manifest changes.",
+        "Do not decide exact dependency versions for the worker unless you are only verifying ambiguous evidence.",
+        "Use view_npm_package_versions only when retry diagnostics are missing, inconsistent, or ambiguous.",
+        "The default source of truth is the existing retry diagnostics, not a second full registry search.",
         "",
         "## Task Queue",
     ]
@@ -254,6 +515,7 @@ def _build_planner_prompt(
         ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
         component = group.vulnerable_component if group else task.parent_group_id
         eval_ = qa_evaluations.get(task.task_id)
+        diagnostics = retry_diagnostics_by_task.get(task.task_id)
 
         lines += [
             "",
@@ -272,6 +534,17 @@ def _build_planner_prompt(
             lines += [
                 f"- Last QA Failed: category={cat}",
                 f"  Feedback: {eval_.retry_feedback}",
+            ]
+        diagnostics = retry_diagnostics_by_task.get(task.task_id)
+        if diagnostics is not None:
+            attempted = ", ".join(diagnostics.attempted_versions) or "none"
+            candidates = ", ".join(diagnostics.candidate_versions_considered[:10]) or "none"
+            lines += [
+                f"- Retry Diags  : registry={diagnostics.registry_query_performed}, exhausted={diagnostics.exhausted_update_path}, abandoned={diagnostics.package_abandoned}",
+                f"  Attempted: {attempted}",
+                f"  Candidates: {candidates}",
+                f"  Latest Seen: {diagnostics.latest_version_seen or 'unknown'}",
+                f"  Failure Reason: {diagnostics.failure_reason or 'none'}",
             ]
 
     lines += [
@@ -294,46 +567,29 @@ def _build_planner_prompt(
 
     lines += [
         "",
+        "## Planner Playbooks",
+        "- SECURITY_FLAG: keep the task on update remediation unless retry diagnostics show the update path is exhausted.",
+        "- PEER_CONFLICT: keep the task on update remediation unless retry diagnostics show no compatible patch or override path remains.",
+        "- BREAKING_CHANGE: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
+        "- package_abandoned=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
+        "- exhausted_update_path=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
+        "- A strategy pivot must be expressed as a child-task recommendation, not as an in-place worker retry.",
+        "",
         "## Queue Caps",
         f"- MAX_TASK_QUEUE_SIZE = {MAX_TASK_QUEUE_SIZE} (current: {len(task_queue)})",
         f"- MAX_ANCESTRY_DEPTH = {MAX_ANCESTRY_DEPTH}",
         "",
-        "## 5 Supervisor Playbooks (apply the appropriate one per failed task)",
-        "",
-        "### Playbook 1: SECURITY_FLAG (Scanner still detects CVE after version bump)",
-        "  - Query registry for the package. Find the absolute latest version.",
-        "  - If not on latest: write instruction to force an 'overrides' block at repo root.",
-        "  - If already on latest and scanner still flags: pivot strategy to CODE_WORKAROUND.",
-        "  - Instruction must specify the exact version and manifest file path.",
-        "",
-        "### Playbook 2: PEER_CONFLICT (ERESOLVE or npm peer tree conflict)",
-        "  - Query registry to check if a safe backported patch exists in a lower major.",
-        "  - If backport available: instruct update_subagent to use that specific version.",
-        "  - If no safe backport: pivot strategy to CODE_WORKAROUND.",
-        "  - Instruction must explain what conflict to avoid.",
-        "",
-        "### Playbook 3: BREAKING_CHANGE (Tests fail after bump)",
-        "  - Mark the version bump as successful (use task_status_updates: task-X = QA_PASSED).",
-        "  - Add the locked version to new_constraints.",
-        "  - Spawn a CODE_WORKAROUND child task (if depth < MAX_ANCESTRY_DEPTH) to fix broken APIs.",
-        "  - Spawn instruction must name the specific broken test and API calls to refactor.",
-        "",
-        "### Playbook 4: Abandoned Package (404 from registry or stale publish date)",
-        "  - If registry returns 404 or last publish was 5+ years ago: pivot to CODE_WORKAROUND.",
-        "  - Instruction must describe the sanitization or wrapper to add around the library.",
-        "",
-        "### Playbook 5: EBADENGINE (Node.js version mismatch)",
-        "  - Query registry for an older compatible patch that supports the sandbox Node version.",
-        "  - If found: write instruction with that version. If not: pivot to CODE_WORKAROUND.",
-        "",
         "## Output Format",
         "Write a 'Strategy Scratchpad' with these sections for each task needing attention:",
-        "  1. Observations (what failed and why)",
+        "  1. Observations",
         "  2. Playbook selected",
-        "  3. Registry findings (if you queried)",
-        "  4. Revised instruction text",
-        "  5. Spawn recommendations (if BREAKING_CHANGE requires a child task)",
+        "  3. Update-path assessment",
+        "  4. Revised high-level instruction text",
+        "  5. Strategy pivot recommendation (same-task retry or workaround child)",
         "  6. Routing notes",
+        "",
+        "Use high-level retry instructions, not exact version pins.",
+        "Good example: Investigate compatible patched releases or override paths for ws; if the update path is exhausted, recommend a workaround child task.",
     ]
 
     return "\n".join(lines)
@@ -343,13 +599,19 @@ def _run_planner_phase(
     task_queue: Dict[str, RemediationTask],
     group_by_id: Dict[str, VulnerabilityGroup],
     qa_evaluations: Dict[str, QAEvaluation],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
     action_summaries: List[AgentActionSummary],
     constraints_ledger: List[str],
     llm: Any,
 ) -> str:
     """Run the bounded planner ReAct loop. Returns the scratchpad text."""
     planner_prompt = _build_planner_prompt(
-        task_queue, group_by_id, qa_evaluations, action_summaries, constraints_ledger
+        task_queue,
+        group_by_id,
+        qa_evaluations,
+        retry_diagnostics_by_task,
+        action_summaries,
+        constraints_ledger,
     )
     tools = [view_npm_package_versions]
     initial_messages = [
@@ -364,6 +626,8 @@ def _run_planner_phase(
             touched_files=set(),
         )
         scratchpad = result.final_text.strip()
+        if scratchpad.startswith("<MagicMock"):
+            scratchpad = ""
         if result.errors:
             logger.warning("supervisor planner: %d error(s): %s", len(result.errors), result.errors)
         return scratchpad or "(Planner produced no output.)"
@@ -384,23 +648,21 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
     constraints_ledger: List[str] = state.get("constraints_ledger", [])
     action_summaries: List[AgentActionSummary] = state.get("action_summaries", [])
     qa_evaluations: Dict[str, QAEvaluation] = state.get("qa_evaluations", {})
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = state.get(
+        "retry_diagnostics_by_task", {}
+    )
     eval_status: str = state.get("eval_status", "")
 
     group_by_id = {g.group_id: g for g in valid_groups}
 
     lines = [
         "You are the Router phase of an AppSec remediation Supervisor.",
-        "Produce a single SupervisorDecision to route the next graph step.",
-        "Follow the Routing Rules strictly.",
+        "Produce exactly one SupervisorDecision to route the next graph step.",
+        "The Planner owns playbook and strategy reasoning.",
+        "You only translate planner intent and current task state into routing.",
+        "Do not invent dependency-version strategy beyond what the planner scratchpad and retry diagnostics support.",
         "",
     ]
-
-    if scratchpad:
-        lines += [
-            "## Planner Scratchpad (use these findings to write instructions and spawn tasks)",
-            scratchpad,
-            "",
-        ]
 
     lines.append("## Remediation Tasks")
 
@@ -410,6 +672,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
         ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
         eval_ = qa_evaluations.get(task.task_id)
+        diagnostics = retry_diagnostics_by_task.get(task.task_id)
 
         lines += [
             "",
@@ -434,6 +697,20 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
                 f"- Last QA       : passed={eval_.passed}, category={cat}, "
                 f"feedback={eval_.retry_feedback}"
             )
+        if diagnostics is not None:
+            lines.append(
+                f"- Retry Diags   : registry={diagnostics.registry_query_performed}, "
+                f"latest={diagnostics.latest_version_seen or 'unknown'}, "
+                f"exhausted={diagnostics.exhausted_update_path}, "
+                f"abandoned={diagnostics.package_abandoned}"
+            )
+            if diagnostics.planning_answers:
+                lines.append(
+                    "- Planning Answers: "
+                    + "; ".join(
+                        f"{key}={value}" for key, value in diagnostics.planning_answers.items()
+                    )
+                )
 
     lines += [
         "",
@@ -459,26 +736,30 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "",
         f"## QA Evaluation Status: {eval_status or 'none'}",
         "",
+        "## Planner Scratchpad",
+        scratchpad or "(none)",
+        "",
         f"## Queue Caps: {len(task_queue)}/{MAX_TASK_QUEUE_SIZE} tasks used, depth cap = {MAX_ANCESTRY_DEPTH}",
         "",
-        "## Routing Rules (follow strictly)",
-        f"1. Send pending/needs_retry VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
-        "   Use revised_instructions to set the exact instruction per task from the planner scratchpad.",
-        "2. Send EXACTLY ONE pending/needs_retry CODE_WORKAROUND task → workaround_subagent.",
-        "3. After a subagent succeeds for the current active batch, route that exact optimistically_fixed batch to qa_critic.",
-        "4. When ALL non-terminal tasks are qa_passed OR all are unfixable → teardown.",
-        "5. PEER_CONFLICT → pivot strategy to CODE_WORKAROUND via updated_task_strategies.",
-        "6. BREAKING_CHANGE → mark parent QA_PASSED via task_status_updates, lock version via new_constraints, spawn child task.",
-        "7. SECURITY_FLAG → retry with current strategy; use revised_instructions with the exact version from planner.",
-        f"8. Any task with {MAX_RETRIES}+ retries → unfixable_task_ids.",
-        "9. unfixable, qa_passed, and optimistically_fixed tasks MUST NOT appear in worker target_task_ids.",
-        "10. qa_critic target_task_ids MUST contain exactly the batch being evaluated.",
-        "11. workaround_subagent MUST have exactly one target_task_id.",
-        f"12. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
-        "13. task_status_updates may only set QA_PASSED or UNFIXABLE; no other values allowed.",
-        "14. revised_instructions values must be non-empty strings.",
-        f"15. spawn_requests: parent depth must be < {MAX_ANCESTRY_DEPTH}; total queue size must stay ≤ {MAX_TASK_QUEUE_SIZE}.",
-        "16. If a task is qa_passed, append its successful version bump or workaround to new_constraints.",
+        "## Router Rules (follow strictly)",
+        f"1. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
+        f"2. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
+        "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry.",
+        "4. Retry revised_instructions are high-level directives, not exact version pins.",
+        "5. Same-strategy retries reuse the same task.",
+        "6. Any strategy pivot must spawn a child task; do not mutate the parent task's strategy in place.",
+        "7. SECURITY_FLAG and PEER_CONFLICT remain update remediation first unless the planner indicates the update path is exhausted.",
+        "8. BREAKING_CHANGE follow-on remediation must use CODE_WORKAROUND strategy.",
+        "9. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
+        "10. After a worker succeeds for the current active batch, route that batch to qa_critic.",
+        "11. When no actionable non-terminal tasks remain, route to teardown.",
+        f"12. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
+        "13. unfixable, qa_passed, and optimistically_fixed tasks must not appear in worker target_task_ids.",
+        "14. task_status_updates may only set QA_PASSED or UNFIXABLE.",
+        f"15. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
+        "16. workaround_subagent MUST have exactly one target_task_id.",
+        "17. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
+        f"18. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
     ]
 
     return "\n".join(lines)
@@ -494,7 +775,7 @@ def _materialize_spawn_requests(
     task_queue: Dict[str, RemediationTask],
     group_by_id: Dict[str, VulnerabilityGroup],
     errors: List[str],
-) -> Dict[str, RemediationTask]:
+) -> Tuple[Dict[str, RemediationTask], Dict[str, List[str]]]:
     """Validate and materialize spawn requests into new RemediationTask objects.
 
     Returns a dict of new task_id → RemediationTask to be merged into task_queue.
@@ -502,6 +783,7 @@ def _materialize_spawn_requests(
     """
     next_index = len(task_queue) + 1
     new_tasks: Dict[str, RemediationTask] = {}
+    child_ids_by_parent: Dict[str, List[str]] = {}
     current_queue_size = len(task_queue)
 
     for req in spawn_requests:
@@ -547,6 +829,7 @@ def _materialize_spawn_requests(
             ancestry_depth=child_depth,
         )
         new_tasks[child_task_id] = new_task
+        child_ids_by_parent.setdefault(req.parent_task_id, []).append(child_task_id)
         logger.info(
             "supervisor: spawned child task '%s' (parent='%s', depth=%d, strategy=%s) — %s",
             child_task_id,
@@ -556,7 +839,7 @@ def _materialize_spawn_requests(
             req.reason,
         )
 
-    return new_tasks
+    return new_tasks, child_ids_by_parent
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +849,7 @@ def _materialize_spawn_requests(
 
 def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     """
-    LangGraph node — Supervisor (Phase 2: Two-Phase Commander).
+    LangGraph node — Supervisor commander for Phase 5 orchestration.
 
     Execution stages
     ----------------
@@ -576,14 +859,12 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
     4. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
     5. Short-circuit: if active batch is all optimistically_fixed → qa_critic.
-    6. Planner phase: run only when NEEDS_RETRY or PENDING tasks with empty
-       instructions exist. Uses view_npm_package_versions tool.
-    7. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
-    8. Guardrails: reject unknown IDs, enforce cardinality, fall back to
+    6. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
+    7. Guardrails: reject unknown IDs, enforce cardinality, fall back to
        deterministic routing if invalid.
-    9. Apply guarded: revised_instructions, strategy updates, status overrides,
+    8. Apply guarded: revised_instructions, strategy updates, status overrides,
        unfixable marks, new constraints, and materialized spawn requests.
-    10. Return state patch.
+    9. Return state patch.
     """
     valid_groups: List[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
@@ -597,6 +878,9 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
     group_by_id: Dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
     existing_constraints: List[str] = list(state.get("constraints_ledger", []))
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = dict(
+        state.get("retry_diagnostics_by_task", {})
+    )
     errors: List[str] = list(state.get("errors") or [])
 
     # ------------------------------------------------------------------
@@ -615,11 +899,6 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             task_queue[task_id] = build_initial_remediation_task(group, task_id)
             next_task_index += 1
 
-    # Build a reverse lookup: parent_group_id → task
-    task_by_group_id: Dict[str, RemediationTask] = {
-        t.parent_group_id: t for t in task_queue.values()
-    }
-
     # ------------------------------------------------------------------
     # 2. Ingest subagent action summaries (active targets only)
     # ------------------------------------------------------------------
@@ -630,9 +909,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     if active_targets and action_summaries:
         recent_summaries = {}
         for summary in action_summaries:
-            resolved_t_id = summary.task_id
-            if summary.task_id not in task_queue and summary.task_id in task_by_group_id:
-                resolved_t_id = task_by_group_id[summary.task_id].task_id
+            resolved_t_id = _resolve_task_id_from_identifier(
+                summary.task_id,
+                task_queue,
+                active_target_task_ids,
+            )
+            if resolved_t_id is None:
+                continue
             if resolved_t_id in active_targets:
                 recent_summaries[resolved_t_id] = summary
 
@@ -649,17 +932,15 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 3. Ingest QA results (active targets only, when qa_completed)
     # ------------------------------------------------------------------
-    qa_evaluations: Dict[str, QAEvaluation] = dict(state.get("qa_evaluations", {}))
+    qa_evaluations: Dict[str, QAEvaluation] = _normalize_qa_evaluations_for_tasks(
+        dict(state.get("qa_evaluations", {})),
+        task_queue,
+        active_target_task_ids,
+    )
     auto_new_constraints: List[str] = []
 
     if state.get("status") == "qa_completed":
-        for eval_task_id, evaluation in qa_evaluations.items():
-            resolved_t_id = eval_task_id
-            if eval_task_id not in task_queue and eval_task_id in task_by_group_id:
-                resolved_t_id = task_by_group_id[eval_task_id].task_id
-
-            if resolved_t_id not in task_queue:
-                continue
+        for resolved_t_id, evaluation in qa_evaluations.items():
             task = task_queue[resolved_t_id]
             if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
                 continue
@@ -724,45 +1005,31 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
 
     # ------------------------------------------------------------------
-    # 6. Planner phase (only when needed, only when LLM is available)
+    # 6. Router phase (structured LLM call)
     # ------------------------------------------------------------------
-    scratchpad = ""
-    if decision is None:
-        planner_needed = _needs_planner(task_queue)
-        if planner_needed:
-            try:
-                from langchain_openai import ChatOpenAI  # type: ignore[import]
-
-                model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
-                planner_llm = ChatOpenAI(model=model_name, temperature=0)
-                scratchpad = _run_planner_phase(
-                    task_queue=task_queue,
-                    group_by_id=group_by_id,
-                    qa_evaluations=qa_evaluations,
-                    action_summaries=action_summaries,
-                    constraints_ledger=existing_constraints,
-                    llm=planner_llm,
-                )
-                logger.info(
-                    "supervisor: planner completed (%d chars scratchpad).", len(scratchpad)
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "supervisor: planner LLM initialization failed (%s) — skipping planner.", exc
-                )
-        else:
-            scratchpad = "(No replanning needed — no failed or uninitialized tasks.)"
-            logger.info("supervisor: planner skipped (no failed/uninstructed tasks).")
-
-    # ------------------------------------------------------------------
-    # 7. Router phase (structured LLM call)
-    # ------------------------------------------------------------------
+    planner_scratchpad = ""
     if decision is None:
         try:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
 
             model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
             router_llm = ChatOpenAI(model=model_name, temperature=0)
+            if _needs_planner(
+                task_queue,
+                qa_evaluations,
+                retry_diagnostics_by_task,
+                str(state.get("status") or ""),
+            ):
+                logger.info("supervisor: invoking planner phase for retry analysis.")
+                planner_scratchpad = _run_planner_phase(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries,
+                    existing_constraints,
+                    router_llm,
+                )
             structured_llm = router_llm.with_structured_output(
                 SupervisorDecision, method="function_calling"
             )
@@ -770,8 +1037,12 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 **state,
                 "task_queue": task_queue,
                 "qa_evaluations": qa_evaluations,
+                "retry_diagnostics_by_task": retry_diagnostics_by_task,
             }
-            prompt_text = build_supervisor_prompt(prompt_state, scratchpad=scratchpad)
+            prompt_text = build_supervisor_prompt(
+                prompt_state,
+                scratchpad=planner_scratchpad,
+            )
             logger.info("supervisor: invoking structured router LLM.")
             decision = structured_llm.invoke(prompt_text)
             logger.info(
@@ -801,13 +1072,19 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
 
     # ------------------------------------------------------------------
-    # 8. Guardrails: validate and clamp (or deterministic fallback)
+    # 7. Guardrails: validate and clamp (or deterministic fallback)
     # ------------------------------------------------------------------
+    pivot_spawn_requests: List[TaskSpawnRequest] = []
+    pivot_parent_status_by_parent: Dict[str, TaskStatus] = {}
+    pivot_target_parent_ids: Set[str] = set()
+
     if decision is None:
         decision = _deterministic_routing(
             task_queue,
             group_by_id,
             qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
         )
@@ -854,6 +1131,26 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 len(valid_target_ids),
             )
             needs_fallback = True
+        if (
+            not needs_fallback
+            and decision.next_node == "update_subagent"
+            and valid_target_ids
+        ):
+            has_retry_targets = any(
+                task_queue[t_id].status == TaskStatus.NEEDS_RETRY
+                or task_queue[t_id].retry_count > 0
+                for t_id in valid_target_ids
+            )
+            has_first_pass_targets = any(
+                task_queue[t_id].status != TaskStatus.NEEDS_RETRY
+                and task_queue[t_id].retry_count == 0
+                for t_id in valid_target_ids
+            )
+            if has_retry_targets and has_first_pass_targets:
+                logger.warning(
+                    "supervisor: update_subagent batch mixed first-pass and retry tasks — falling back."
+                )
+                needs_fallback = True
         if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
             logger.warning(
                 "supervisor: qa_critic needs at least 1 target, got 0 — falling back."
@@ -865,6 +1162,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 task_queue,
                 group_by_id,
                 qa_evaluations,
+                retry_diagnostics_by_task,
+                action_summaries=action_summaries,
                 active_target_task_ids=active_target_task_ids,
                 current_status=str(state.get("status") or ""),
             )
@@ -880,6 +1179,36 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 for k, v in decision.feedback_by_task.items()
                 if k in known_task_ids
             }
+            clean_updated_task_strategies = {
+                k: v
+                for k, v in decision.updated_task_strategies.items()
+                if k in known_task_ids and task_queue[k].status not in _TERMINAL_STATUSES
+            }
+            missing_retry_revisions = _missing_retry_revised_instructions(
+                decision.next_node,
+                valid_target_ids,
+                clean_revised_instructions,
+                task_queue,
+            )
+            if missing_retry_revisions:
+                errors.append(
+                    "supervisor: rejected update_subagent retry dispatch without task-specific "
+                    f"revised_instructions for {missing_retry_revisions}."
+                )
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                )
+                valid_target_ids = list(decision.target_task_ids)
+                valid_unfixable_ids = list(decision.unfixable_task_ids)
+                clean_revised_instructions = dict(decision.revised_instructions)
+                clean_feedback = dict(decision.feedback_by_task)
+                clean_updated_task_strategies = dict(decision.updated_task_strategies)
 
             # Validate task_status_updates — only known tasks, only terminal statuses
             clean_status_updates: Dict[str, TaskStatus] = {}
@@ -898,20 +1227,104 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     continue
                 clean_status_updates[t_id] = new_status
 
+            pivot_strategy_updates = {
+                task_id: new_strategy
+                for task_id, new_strategy in clean_updated_task_strategies.items()
+                if task_queue[task_id].strategy != new_strategy
+            }
+            targeted_pivot_ids = [
+                task_id for task_id in valid_target_ids if task_id in pivot_strategy_updates
+            ]
+            incompatible_targeted_pivots = [
+                task_id
+                for task_id in targeted_pivot_ids
+                if decision.next_node != _worker_node_for_strategy(
+                    pivot_strategy_updates[task_id]
+                )
+            ]
+            missing_pivot_instructions = [
+                task_id
+                for task_id in targeted_pivot_ids
+                if not clean_revised_instructions.get(task_id, "").strip()
+            ]
+            if incompatible_targeted_pivots:
+                errors.append(
+                    "supervisor: rejected strategy pivot because next_node does not match "
+                    f"the child strategy for {incompatible_targeted_pivots}."
+                )
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                )
+                valid_target_ids = list(decision.target_task_ids)
+                valid_unfixable_ids = list(decision.unfixable_task_ids)
+                clean_revised_instructions = dict(decision.revised_instructions)
+                clean_feedback = dict(decision.feedback_by_task)
+                clean_updated_task_strategies = dict(decision.updated_task_strategies)
+                clean_status_updates = dict(decision.task_status_updates)
+                pivot_strategy_updates = {}
+                targeted_pivot_ids = []
+            if not incompatible_targeted_pivots and missing_pivot_instructions:
+                errors.append(
+                    "supervisor: rejected strategy pivot without task-specific child "
+                    f"instructions for {missing_pivot_instructions}."
+                )
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                )
+                valid_target_ids = list(decision.target_task_ids)
+                valid_unfixable_ids = list(decision.unfixable_task_ids)
+                clean_revised_instructions = dict(decision.revised_instructions)
+                clean_feedback = dict(decision.feedback_by_task)
+                clean_updated_task_strategies = dict(decision.updated_task_strategies)
+                clean_status_updates = dict(decision.task_status_updates)
+                pivot_strategy_updates = {}
+                targeted_pivot_ids = []
+
+            for task_id, new_strategy in pivot_strategy_updates.items():
+                child_instruction = clean_revised_instructions.pop(task_id, "").strip()
+                if not child_instruction:
+                    continue
+                pivot_spawn_requests.append(
+                    TaskSpawnRequest(
+                        parent_task_id=task_id,
+                        strategy=new_strategy,
+                        instruction=child_instruction,
+                        reason=(
+                            "Auto-spawned due to strategy pivot from "
+                            f"{task_queue[task_id].strategy.value} to {new_strategy.value}. "
+                            f"{decision.decision_reason}"
+                        ),
+                    )
+                )
+                pivot_parent_status_by_parent[task_id] = _parent_status_for_strategy_pivot(
+                    task_queue[task_id],
+                    new_strategy,
+                    qa_evaluations,
+                )
+            pivot_target_parent_ids = set(targeted_pivot_ids)
+
             try:
                 decision = SupervisorDecision(
                     next_node=decision.next_node,
-                    updated_task_strategies={
-                        k: v
-                        for k, v in decision.updated_task_strategies.items()
-                        if k in known_task_ids
-                    },
+                    updated_task_strategies={},
                     target_task_ids=valid_target_ids,
                     unfixable_task_ids=valid_unfixable_ids,
                     new_constraints=decision.new_constraints,
                     feedback_by_task=clean_feedback,
                     revised_instructions=clean_revised_instructions,
-                    spawn_requests=decision.spawn_requests,
+                    spawn_requests=[*pivot_spawn_requests, *decision.spawn_requests],
                     task_status_updates=clean_status_updates,
                     instructions=decision.instructions,
                     decision_reason=decision.decision_reason,
@@ -920,29 +1333,34 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 logger.warning(
                     "supervisor: decision rebuild failed (%s) — falling back.", exc
                 )
+                pivot_spawn_requests = []
+                pivot_parent_status_by_parent = {}
+                pivot_target_parent_ids = set()
                 decision = _deterministic_routing(
                     task_queue,
                     group_by_id,
                     qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                 )
 
     # ------------------------------------------------------------------
-    # 9. Apply guarded updates to task_queue
+    # 8. Apply guarded updates to task_queue
     # ------------------------------------------------------------------
 
-    # 9a. Apply revised_instructions (copy-on-write per task)
+    # 8a. Apply revised_instructions (copy-on-write per task)
     for t_id, new_instr in decision.revised_instructions.items():
         if t_id in task_queue and new_instr.strip():
             task_queue[t_id] = task_queue[t_id].model_copy(update={"instruction": new_instr})
 
-    # 9b. Apply strategy pivots
+    # 8b. Apply direct strategy pivots (currently reserved for no-op / legacy cases)
     for t_id, new_strategy in decision.updated_task_strategies.items():
         if t_id in task_queue:
             task_queue[t_id] = task_queue[t_id].model_copy(update={"strategy": new_strategy})
 
-    # 9c. Apply guarded task status overrides (only QA_PASSED and UNFIXABLE)
+    # 8c. Apply guarded task status overrides (only QA_PASSED and UNFIXABLE)
     _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
     for t_id, new_status in decision.task_status_updates.items():
         if t_id in task_queue and new_status in _allowed_statuses:
@@ -954,29 +1372,67 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     new_status.value,
                 )
 
-    # 9d. Apply unfixable marks from decision
+    # 8d. Apply unfixable marks from decision
     for t_id in decision.unfixable_task_ids:
         if t_id in task_queue:
             task_queue[t_id] = task_queue[t_id].model_copy(update={"status": TaskStatus.UNFIXABLE})
 
-    # 9e. Materialize spawn requests
+    # 8e. Materialize spawn requests
+    child_ids_by_parent: Dict[str, List[str]] = {}
     if decision.spawn_requests:
-        new_tasks = _materialize_spawn_requests(
+        new_tasks, child_ids_by_parent = _materialize_spawn_requests(
             spawn_requests=list(decision.spawn_requests),
             task_queue=task_queue,
             group_by_id=group_by_id,
             errors=errors,
         )
         task_queue.update(new_tasks)
+        for parent_task_id, child_ids in child_ids_by_parent.items():
+            if (
+                child_ids
+                and parent_task_id in pivot_parent_status_by_parent
+                and parent_task_id in task_queue
+                and task_queue[parent_task_id].status not in _TERMINAL_STATUSES
+            ):
+                task_queue[parent_task_id] = task_queue[parent_task_id].model_copy(
+                    update={"status": pivot_parent_status_by_parent[parent_task_id]}
+                )
+
+    resolved_target_task_ids: List[str] = []
+    remapped_feedback_by_task: Dict[str, str] = {}
+    for task_id in decision.target_task_ids:
+        if task_id in pivot_target_parent_ids:
+            child_ids = child_ids_by_parent.get(task_id, [])
+            if child_ids:
+                child_task_id = child_ids[0]
+                resolved_target_task_ids.append(child_task_id)
+                if task_id in decision.feedback_by_task:
+                    remapped_feedback_by_task[child_task_id] = decision.feedback_by_task[task_id]
+            else:
+                errors.append(
+                    "supervisor: dropped strategy-pivot target because child task could not "
+                    f"be spawned for parent '{task_id}'."
+                )
+            continue
+        resolved_target_task_ids.append(task_id)
+        if task_id in decision.feedback_by_task:
+            remapped_feedback_by_task[task_id] = decision.feedback_by_task[task_id]
+
+    resolved_next_node = decision.next_node
+    if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"} and not resolved_target_task_ids:
+        errors.append(
+            "supervisor: routing fell back to teardown because no dispatchable target tasks remained."
+        )
+        resolved_next_node = "teardown"
 
     logger.info(
         "supervisor: routing to '%s' with targets=%s",
-        decision.next_node,
-        decision.target_task_ids,
+        resolved_next_node,
+        resolved_target_task_ids,
     )
 
     # ------------------------------------------------------------------
-    # 9f. Collect new constraints
+    # 8f. Collect new constraints
     # ------------------------------------------------------------------
     returned_constraints: List[str] = list(auto_new_constraints)
     for constraint in decision.new_constraints:
@@ -988,7 +1444,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             returned_constraints.append(constraint)
 
     # Build feedback_by_group for bridge node backward compat
-    feedback_by_task = dict(decision.feedback_by_task)
+    feedback_by_task = remapped_feedback_by_task
     feedback_by_group: Dict[str, str] = {}
     for t_id, fb in feedback_by_task.items():
         if t_id in task_queue:
@@ -996,16 +1452,16 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             feedback_by_group[gid] = fb
 
     # ------------------------------------------------------------------
-    # 10. Return state patch
+    # 9. Return state patch
     # ------------------------------------------------------------------
     return {
         "status": "supervisor_routed",
-        "next_routing_step": decision.next_node,
-        "active_target_task_ids": list(decision.target_task_ids),
+        "next_routing_step": resolved_next_node,
+        "active_target_task_ids": resolved_target_task_ids,
         # Keep active_target_group_ids populated for bridge nodes that still use it
         "active_target_group_ids": [
             task_queue[t].parent_group_id
-            for t in decision.target_task_ids
+            for t in resolved_target_task_ids
             if t in task_queue
         ],
         "feedback_by_task": feedback_by_task,

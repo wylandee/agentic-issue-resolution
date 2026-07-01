@@ -20,10 +20,11 @@ from src.contracts.schemas import (
     VulnerabilityIssue,
 )
 from src.orchestrator.state import (
+    _derive_legacy_task_from_group,
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
-from src.orchestrator.update_subagent import run_update_subagent_node
+from src.orchestrator.update_subagent import _build_update_prompt, run_update_subagent_node
 from src.orchestrator.workaround_subagent import _build_workaround_prompt, run_workaround_subagent_node
 from src.orchestrator.workaround_subagent import run_workaround_subagent_node
 
@@ -113,6 +114,72 @@ def _repo_root() -> str:
 
 
 class TestUpdateSubagentWrapper:
+    def test_update_prompt_prioritizes_task_instruction_and_retry_context(self):
+        group = _sca_group()
+        task = _derive_legacy_task_from_group(group)
+        task.instruction = 'Add or update "overrides": {"lodash": "4.17.22"} in package.json.'
+        prompt = _build_update_prompt(
+            [(task, group, ["package.json"])],
+            ["lodash must remain >= 4.17.21"],
+            {},
+            {},
+        )
+
+        assert "## Task Context" in prompt
+        assert "Supervisor's Revised Instruction" in prompt
+        assert "Why The Previous Attempt Failed" in prompt
+        assert "QA Feedback:" in prompt
+        assert "Previous Worker Outcome:" in prompt
+        assert "4.17.22" in prompt
+        assert "authoritative directive" in prompt
+        assert "First-pass mode:" in prompt
+        assert "First-pass planning questions:" in prompt
+        assert "What exact version or override does the Task Instruction require?" in prompt
+        assert "Reasoning Summary" in prompt
+
+    def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
+        group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")
+        group_b = _sca_group("sca:frontend/package.json:ws", "frontend/package.json")
+        task_a = _derive_legacy_task_from_group(group_a)
+        task_b = _derive_legacy_task_from_group(group_b)
+        task_a.task_id = "task-1"
+        task_b.task_id = "task-2"
+        task_a.retry_count = 1
+        task_b.retry_count = 1
+        task_a.instruction = 'Update "jsonwebtoken" in package.json to version "9.0.0".'
+        task_b.instruction = 'Add or update "overrides": {"ws": "8.20.1"} in package.json.'
+        prompt = _build_update_prompt(
+            [
+                (task_a, group_a, ["package.json"]),
+                (task_b, group_b, ["frontend/package.json"]),
+            ],
+            [],
+            {
+                "task-1": "Retry exact version bump from planner.",
+                "task-2": "Retry with npm overrides instead of a direct dependency edit.",
+            },
+            {
+                "task-1": "Previous attempt hit an ERESOLVE conflict.",
+                "task-2": "Previous attempt validated the wrong manifest path.",
+            },
+        )
+
+        assert "Smart Planning & Rescue" in prompt
+        assert 'Supervisor\'s Revised Instruction: Update "jsonwebtoken" in package.json to version "9.0.0".' in prompt
+        assert 'Supervisor\'s Revised Instruction: Add or update "overrides": {"ws": "8.20.1"} in package.json.' in prompt
+        assert "QA Feedback: Retry exact version bump from planner." in prompt
+        assert "QA Feedback: Retry with npm overrides instead of a direct dependency edit." in prompt
+        assert "Previous Worker Outcome: Previous attempt hit an ERESOLVE conflict." in prompt
+        assert "view_npm_package_versions" in prompt
+        assert "## Task Context" in prompt
+        assert "## Prior Retry Diagnostics" in prompt
+        assert "## Planning Questions" in prompt
+        assert "What version or override path did the last fix attempt use?" in prompt
+        assert "What is the latest version currently available according to npm?" in prompt
+        assert "If the latest available version was already attempted and no untried candidates remain" in prompt
+        assert "For each target below, the Task Instruction remains authoritative." in prompt
+        assert "Planning Answers" in prompt
+
     def test_success_requires_validation_after_manifest_edit(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
         group_b = _sca_group("sca:frontend/package.json:lodash", "frontend/package.json")
@@ -182,6 +249,16 @@ class TestUpdateSubagentWrapper:
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert "messages" not in result
         assert "package.json" in result["changed_files"]
+        assert len(result["action_summaries"]) == 2
+
+        summary_by_task = {
+            summary.task_id: summary.summary
+            for summary in result["action_summaries"]
+        }
+        assert "frontend/package.json" not in summary_by_task[group_a.group_id]
+        assert "package.json" in summary_by_task[group_a.group_id]
+        assert "Final note:" not in summary_by_task[group_a.group_id]
+        assert "frontend/package.json" in summary_by_task[group_b.group_id]
 
     def test_no_validation_success_becomes_surrender(self):
         group = _sca_group()
@@ -213,6 +290,250 @@ class TestUpdateSubagentWrapper:
 
         assert result["action_summary"].status == AgentActionStatus.SURRENDER
 
+    def test_retry_success_without_registry_lookup_becomes_surrender(self):
+        group = _sca_group()
+        repo_root = _repo_root()
+        state = initial_update_subagent_state(
+            repo_root,
+            "agent_workspace_deadbeef",
+            [group],
+            [],
+            previous_action_summaries_by_task={group.group_id: "Previous version bump failed validation."},
+        )
+        state["target_tasks"][0].retry_count = 1
+
+        llm, _bound = _mock_llm_with_responses(
+            AIMessage(
+                content="updating",
+                tool_calls=[
+                    {
+                        "name": "modify_npm_dependency",
+                        "args": {
+                            "package_name": "lodash",
+                            "target_version": "4.17.21",
+                            "dependency_type": "dependencies",
+                            "manifest_path": "package.json",
+                        },
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="validating",
+                tool_calls=[
+                    {
+                        "name": "validate_manifest_sync",
+                        "args": {},
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        )
+        sandbox = _sandbox_mock()
+        tool_edit = MagicMock()
+        tool_edit.name = "modify_npm_dependency"
+        tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
+        tool_validate = MagicMock()
+        tool_validate.name = "validate_manifest_sync"
+        tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
+
+        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "src.orchestrator.update_subagent.DockerSandbox",
+            return_value=sandbox,
+        ), patch(
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            return_value=(["package.json"], []),
+        ), patch(
+            "src.orchestrator.update_subagent.build_update_toolbelt",
+            return_value=[tool_edit, tool_validate],
+        ):
+            result = run_update_subagent_node(state)
+
+        assert result["action_summary"].status == AgentActionStatus.SURRENDER
+        assert any("retry batch reported success without calling view_npm_package_versions" in err for err in result["errors"])
+
+    def test_retry_diagnostics_capture_planning_answers(self):
+        group = _sca_group()
+        repo_root = _repo_root()
+        state = initial_update_subagent_state(
+            repo_root,
+            "agent_workspace_deadbeef",
+            [group],
+            [],
+        )
+        state["target_tasks"][0].retry_count = 1
+
+        llm, _bound = _mock_llm_with_responses(
+            AIMessage(
+                content="registry lookup",
+                tool_calls=[
+                    {
+                        "name": "view_npm_package_versions",
+                        "args": {"package_name": "lodash"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="updating",
+                tool_calls=[
+                    {
+                        "name": "modify_npm_dependency",
+                        "args": {
+                            "package_name": "lodash",
+                            "target_version": "4.17.21",
+                            "dependency_type": "dependencies",
+                            "manifest_path": "package.json",
+                        },
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="validating",
+                tool_calls=[
+                    {
+                        "name": "validate_manifest_sync",
+                        "args": {},
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        )
+        sandbox = _sandbox_mock()
+        tool_lookup = MagicMock()
+        tool_lookup.name = "view_npm_package_versions"
+        tool_lookup.invoke.return_value = (
+            "# NPM Registry Report: lodash\n"
+            "## dist-tags\n"
+            "  latest: 4.17.21\n"
+            "\n"
+            "## Last 1 Published Versions (newest first)\n"
+            "  4.17.21  (2024-01-01)\n"
+        )
+        tool_edit = MagicMock()
+        tool_edit.name = "modify_npm_dependency"
+        tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
+        tool_validate = MagicMock()
+        tool_validate.name = "validate_manifest_sync"
+        tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
+
+        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "src.orchestrator.update_subagent.DockerSandbox",
+            return_value=sandbox,
+        ), patch(
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            return_value=(["package.json"], []),
+        ), patch(
+            "src.orchestrator.update_subagent.build_update_toolbelt",
+            return_value=[tool_lookup, tool_edit, tool_validate],
+        ):
+            result = run_update_subagent_node(state)
+
+        diagnostics = result["retry_diagnostics_by_task"][group.group_id]
+        assert diagnostics.planning_answers["1_last_fix_attempt"] == "4.17.21"
+        assert diagnostics.planning_answers["3_latest_version_available"] == "4.17.21"
+        assert "4.17.21" in diagnostics.planning_answers["8_next_candidate"]
+
+    def test_retry_diagnostics_capture_reasoning_summary(self):
+        group = _sca_group()
+        repo_root = _repo_root()
+        state = initial_update_subagent_state(
+            repo_root,
+            "agent_workspace_deadbeef",
+            [group],
+            [],
+        )
+        state["target_tasks"][0].retry_count = 1
+
+        llm, _bound = _mock_llm_with_responses(
+            AIMessage(
+                content="registry lookup",
+                tool_calls=[
+                    {
+                        "name": "view_npm_package_versions",
+                        "args": {"package_name": "lodash"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="updating",
+                tool_calls=[
+                    {
+                        "name": "modify_npm_dependency",
+                        "args": {
+                            "package_name": "lodash",
+                            "target_version": "4.17.21",
+                            "dependency_type": "dependencies",
+                            "manifest_path": "package.json",
+                        },
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="validating",
+                tool_calls=[
+                    {
+                        "name": "validate_manifest_sync",
+                        "args": {},
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content=(
+                    "Reasoning Summary\n"
+                    "- Latest candidate was 4.17.21.\n"
+                    "- No safer override was needed.\n"
+                    "- Validation passed after the bump."
+                )
+            ),
+        )
+        sandbox = _sandbox_mock()
+        tool_lookup = MagicMock()
+        tool_lookup.name = "view_npm_package_versions"
+        tool_lookup.invoke.return_value = (
+            "# NPM Registry Report: lodash\n"
+            "## dist-tags\n"
+            "  latest: 4.17.21\n"
+            "\n"
+            "## Last 1 Published Versions (newest first)\n"
+            "  4.17.21  (2024-01-01)\n"
+        )
+        tool_edit = MagicMock()
+        tool_edit.name = "modify_npm_dependency"
+        tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
+        tool_validate = MagicMock()
+        tool_validate.name = "validate_manifest_sync"
+        tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
+
+        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "src.orchestrator.update_subagent.DockerSandbox",
+            return_value=sandbox,
+        ), patch(
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            return_value=(["package.json"], []),
+        ), patch(
+            "src.orchestrator.update_subagent.build_update_toolbelt",
+            return_value=[tool_lookup, tool_edit, tool_validate],
+        ):
+            result = run_update_subagent_node(state)
+
+        diagnostics = result["retry_diagnostics_by_task"][group.group_id]
+        assert diagnostics.reasoning_summary.startswith("Reasoning Summary")
+        assert "Latest candidate was 4.17.21" in diagnostics.reasoning_summary
 
 class TestWorkaroundSubagentWrapper:
     def test_workaround_prompt_includes_snippets(self):

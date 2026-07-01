@@ -1232,6 +1232,83 @@ class AgentActionSummary(BaseModel):
         return cleaned
 
 
+class UpdateRetryDiagnostics(BaseModel):
+    """Structured retry evidence emitted by the update subagent per task."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(..., min_length=1)
+    registry_query_performed: bool = False
+    attempted_versions: List[str] = Field(default_factory=list)
+    candidate_versions_considered: List[str] = Field(default_factory=list)
+    selected_version: Optional[str] = None
+    latest_version_seen: Optional[str] = None
+    used_overrides: bool = False
+    package_abandoned: bool = False
+    exhausted_update_path: bool = False
+    failure_reason: str = ""
+    reasoning_summary: str = ""
+    planning_answers: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator(
+        "attempted_versions",
+        "candidate_versions_considered",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_version_lists(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("version lists must be lists of strings.")
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("version lists must contain only strings.")
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+        return cleaned
+
+    @field_validator("selected_version", "latest_version_seen", mode="before")
+    @classmethod
+    def _normalize_optional_version(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("version fields must be strings when provided.")
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("failure_reason", "reasoning_summary", mode="before")
+    @classmethod
+    def _normalize_text_field(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("text fields must be strings.")
+        return value.strip()
+
+    @field_validator("planning_answers", mode="before")
+    @classmethod
+    def _normalize_planning_answers(cls, value: Any) -> Dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("planning_answers must be a mapping of strings to strings.")
+        cleaned: Dict[str, str] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("planning_answers keys must be non-empty strings.")
+            if not isinstance(item, str):
+                raise ValueError("planning_answers values must be strings.")
+            cleaned[key.strip()] = item.strip()
+        return cleaned
+
+
 class SupervisorDecision(BaseModel):
     """
     Structured LLM output from the Supervisor Node.
@@ -1255,7 +1332,10 @@ class SupervisorDecision(BaseModel):
     )
     updated_task_strategies: Dict[str, "RoutingStrategy"] = Field(
         default_factory=dict,
-        description="Strategy pivots for specific task IDs (e.g. VERSION_BUMP → CODE_WORKAROUND).",
+        description=(
+            "Requested strategy pivots keyed by parent task_id. "
+            "The supervisor realizes these as child-task spawns rather than mutating the parent task in place."
+        ),
     )
     target_task_ids: List[str] = Field(
         default_factory=list,
@@ -1282,7 +1362,10 @@ class SupervisorDecision(BaseModel):
     instructions: str = Field(
         ...,
         min_length=1,
-        description="Default guidance applied to target tasks without specific feedback.",
+        description=(
+            "Supervisor audit/routing rationale for this decision. "
+            "This is not the authoritative worker instruction for retry-bound tasks."
+        ),
     )
     decision_reason: str = Field(
         ...,
@@ -1294,7 +1377,8 @@ class SupervisorDecision(BaseModel):
         description=(
             "Supervisor-revised instruction text per task_id. "
             "Replaces the task's current instruction when non-empty. "
-            "All values must be non-empty strings."
+            "All values must be non-empty strings. "
+            "Retry-bound worker dispatches rely on these task-specific instructions."
         ),
     )
     spawn_requests: List["TaskSpawnRequest"] = Field(

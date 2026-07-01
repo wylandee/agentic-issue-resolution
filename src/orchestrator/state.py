@@ -33,6 +33,7 @@ from src.contracts.schemas import (
     EditRequest,
     EditResult,
     FixPlan,
+    FixPlanStatus,
     GroupRemediationStatus,
     LocalizedIssue,
     QAEvaluation,
@@ -41,6 +42,7 @@ from src.contracts.schemas import (
     SupervisorDecision,
     SystemContext,
     TaskStatus,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -58,6 +60,47 @@ def merge_dict_reducer(
     if right:
         merged.update(right)
     return merged
+
+
+def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask:
+    """Build a synthetic task for legacy group-based subagent callers."""
+    fix_plan = group.fix_plan
+    strategy = (
+        RoutingStrategy.VERSION_BUMP
+        if fix_plan is not None and fix_plan.status == FixPlanStatus.VERSION_FOUND
+        else RoutingStrategy.CODE_WORKAROUND
+    )
+    instruction = fix_plan.instruction if fix_plan is not None else ""
+    return RemediationTask(
+        task_id=group.group_id,
+        parent_group_id=group.group_id,
+        strategy=strategy,
+        instruction=instruction,
+        status=TaskStatus.PENDING,
+        retry_count=0,
+        ancestry_depth=0,
+    )
+
+
+def _derive_feedback_by_group(
+    target_tasks: List[RemediationTask],
+    target_groups: List[VulnerabilityGroup],
+    feedback_by_task: Optional[Mapping[str, str]],
+) -> Dict[str, str]:
+    """Translate task-keyed feedback into group-keyed feedback when possible."""
+    feedback_by_group: Dict[str, str] = {}
+    task_map = {task.task_id: task for task in target_tasks}
+    group_map = {group.group_id: group for group in target_groups}
+
+    for task_id, feedback in dict(feedback_by_task or {}).items():
+        task = task_map.get(task_id)
+        if task is not None:
+            feedback_by_group[task.parent_group_id] = feedback
+            continue
+        if task_id in group_map:
+            feedback_by_group[task_id] = feedback
+
+    return feedback_by_group
 
 
 class RemediationState(TypedDict, total=False):
@@ -117,6 +160,9 @@ class OrchestratorState(TypedDict, total=False):
     group_statuses: Annotated[Dict[str, GroupRemediationStatus], merge_dict_reducer]
     qa_evaluations: Annotated[Dict[str, QAEvaluation], merge_dict_reducer]
     action_summaries: Annotated[List[AgentActionSummary], operator.add]
+    retry_diagnostics_by_task: Annotated[
+        Dict[str, UpdateRetryDiagnostics], merge_dict_reducer
+    ]
     changed_files: Annotated[List[str], operator.add]
 
     # Phase 5 Task Queue (primary orchestration unit)
@@ -155,6 +201,8 @@ class SubagentState(TypedDict, total=False):
     target_groups: List[VulnerabilityGroup]
     feedback_by_group: Dict[str, str]
     feedback_by_task: Dict[str, str]
+    previous_action_summaries_by_task: Dict[str, str]
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics]
 
     target_task: RemediationTask
     target_group: VulnerabilityGroup
@@ -184,6 +232,7 @@ def initial_orchestrator_state(
         "group_statuses": {},
         "qa_evaluations": {},
         "action_summaries": [],
+        "retry_diagnostics_by_task": {},
         "changed_files": [],
         "task_queue": {},
         "active_target_task_ids": [],
@@ -209,19 +258,70 @@ def initial_orchestrator_state(
 def initial_update_subagent_state(
     repo_root: str,
     workspace_volume: str,
-    target_tasks: List[RemediationTask],
-    target_groups: List[VulnerabilityGroup],
-    constraints_ledger: List[str],
+    target_tasks: List[RemediationTask] | List[VulnerabilityGroup],
+    target_groups: List[VulnerabilityGroup] | List[str],
+    constraints_ledger: Optional[List[str]] = None,
     feedback_by_task: Optional[Dict[str, str]] = None,
+    feedback_by_group: Optional[Dict[str, str]] = None,
+    previous_action_summaries_by_task: Optional[Dict[str, str]] = None,
+    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
 ) -> Dict[str, Any]:
-    """Build a well-formed initial batch ``SubagentState`` dict."""
+    """
+    Build a well-formed initial batch ``SubagentState`` dict.
+
+    Supports both the current task-based signature and the legacy
+    group-based signature used by older tests and callers:
+
+    - new: ``(repo_root, workspace_volume, target_tasks, target_groups, constraints_ledger, ...)``
+    - old: ``(repo_root, workspace_volume, target_groups, constraints_ledger, ...)``
+    """
+    legacy_mode = bool(target_tasks) and isinstance(list(target_tasks)[0], VulnerabilityGroup)
+    if legacy_mode:
+        legacy_groups = list(target_tasks)
+        target_groups_list = legacy_groups
+        target_tasks_list = [
+            _derive_legacy_task_from_group(group)
+            for group in legacy_groups
+        ]
+        constraints_list = list(target_groups)
+        legacy_feedback = (
+            dict(constraints_ledger)
+            if isinstance(constraints_ledger, Mapping)
+            else {}
+        )
+        feedback_by_group_dict = dict(feedback_by_group or legacy_feedback)
+        feedback_by_task_dict = dict(
+            feedback_by_task
+            or feedback_by_group_dict
+        )
+        previous_summaries_dict = dict(previous_action_summaries_by_task or {})
+        retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
+    else:
+        target_tasks_list = list(target_tasks)
+        target_groups_list = list(target_groups)
+        constraints_list = list(constraints_ledger)
+        feedback_by_task_dict = dict(feedback_by_task or {})
+        previous_summaries_dict = dict(previous_action_summaries_by_task or {})
+        retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
+        feedback_by_group_dict = dict(
+            feedback_by_group
+            or _derive_feedback_by_group(
+                target_tasks_list,
+                target_groups_list,
+                feedback_by_task_dict,
+            )
+        )
+
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
-        "target_tasks": list(target_tasks),
-        "target_groups": list(target_groups),
-        "feedback_by_task": dict(feedback_by_task or {}),
-        "constraints_ledger": list(constraints_ledger),
+        "target_tasks": target_tasks_list,
+        "target_groups": target_groups_list,
+        "feedback_by_group": feedback_by_group_dict,
+        "feedback_by_task": feedback_by_task_dict,
+        "previous_action_summaries_by_task": previous_summaries_dict,
+        "retry_diagnostics_by_task": retry_diagnostics_dict,
+        "constraints_ledger": constraints_list,
         "messages": [],
         "changed_files": [],
         "errors": [],
@@ -231,18 +331,35 @@ def initial_update_subagent_state(
 def initial_workaround_subagent_state(
     repo_root: str,
     workspace_volume: str,
-    target_task: RemediationTask,
-    target_group: VulnerabilityGroup,
-    constraints_ledger: List[str],
+    target_task: RemediationTask | VulnerabilityGroup,
+    target_group: VulnerabilityGroup | List[str],
+    constraints_ledger: Optional[List[str]] = None,
     previous_feedback: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a well-formed single-task workaround ``SubagentState`` dict."""
+    """
+    Build a well-formed single-task workaround ``SubagentState`` dict.
+
+    Supports both the current task-based signature and the legacy
+    group-based signature:
+
+    - new: ``(repo_root, workspace_volume, target_task, target_group, constraints_ledger, ...)``
+    - old: ``(repo_root, workspace_volume, target_group, constraints_ledger, ...)``
+    """
+    if constraints_ledger is None:
+        target_group_obj = target_task
+        target_task_obj = _derive_legacy_task_from_group(target_group_obj)
+        constraints_list = list(target_group)
+    else:
+        target_task_obj = target_task
+        target_group_obj = target_group
+        constraints_list = list(constraints_ledger)
+
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
-        "target_task": target_task,
-        "target_group": target_group,
-        "constraints_ledger": list(constraints_ledger),
+        "target_task": target_task_obj,
+        "target_group": target_group_obj,
+        "constraints_ledger": constraints_list,
         "previous_feedback": previous_feedback,
         "messages": [],
         "changed_files": [],

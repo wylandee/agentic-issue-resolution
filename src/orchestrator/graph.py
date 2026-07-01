@@ -435,6 +435,9 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         return {"errors": [msg]}
 
     feedback_by_task = dict(state.get("feedback_by_task", {}))
+    latest_action_summary_by_task: Dict[str, str] = {}
+    for summary in state.get("action_summaries", []) or []:
+        latest_action_summary_by_task[summary.task_id] = summary.summary
     subagent_state = initial_update_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
@@ -442,18 +445,26 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         target_groups=target_groups,
         constraints_ledger=list(state.get("constraints_ledger", [])),
         feedback_by_task=feedback_by_task,
+        previous_action_summaries_by_task=latest_action_summary_by_task,
+        retry_diagnostics_by_task=dict(state.get("retry_diagnostics_by_task", {})),
     )
 
     result = run_update_subagent_node(subagent_state)
 
-    from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
     out: Dict[str, Any] = {
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
-    if summary is not None:
-        out["action_summaries"] = [summary]
+    summaries = list(result.get("action_summaries", []))
+    if not summaries:
+        summary = result.get("action_summary")
+        if summary is not None:
+            summaries = [summary]
+    if summaries:
+        out["action_summaries"] = summaries
+    if result.get("retry_diagnostics_by_task"):
+        out["retry_diagnostics_by_task"] = result["retry_diagnostics_by_task"]
     return out
 
 
@@ -507,12 +518,16 @@ def run_workaround_subagent_from_orchestrator(
 
     result = run_workaround_subagent_node(subagent_state)
 
-    from src.contracts.schemas import AgentActionSummary  # local import avoids cycle
     out: Dict[str, Any] = {
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
+    summaries = list(result.get("action_summaries", []))
+    if not summaries:
+        summary = result.get("action_summary")
+        if summary is not None:
+            summaries = [summary]
     if summaries:
         out["action_summaries"] = summaries
     return out

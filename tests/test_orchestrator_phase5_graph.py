@@ -8,11 +8,14 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from src.contracts.schemas import (
+    AgentActionStatus,
+    AgentActionSummary,
     FixPlan,
     FixPlanStatus,
     IssueSource,
     IssueType,
     Severity,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -26,8 +29,10 @@ from src.orchestrator import (
 )
 from src.orchestrator.graph import (
     route_after_workspace_builder,
+    run_update_subagent_from_orchestrator,
     run_qa_critic_from_orchestrator,
 )
+from src.orchestrator.task_utils import build_initial_remediation_task
 
 
 def _issue(issue_type: IssueType, file_path: str | None = None) -> VulnerabilityIssue:
@@ -191,6 +196,62 @@ class TestPhase5RunOrchestrator:
 
 
 class TestPhase5GraphIntegration:
+    def test_update_wrapper_preserves_exact_task_instruction(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
+        state = _initial_state(tmp_path, groups)
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+        state["supervisor_instructions"] = "Use registry lookup to find a safe compatible remediation."
+        state["action_summaries"] = [
+            AgentActionSummary(
+                task_id="task-1",
+                status=AgentActionStatus.SURRENDER,
+                summary="Previous version bump failed manifest validation.",
+            )
+        ]
+
+        update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
+
+        with patch("src.orchestrator.graph.run_update_subagent_node", update_subagent):
+            run_update_subagent_from_orchestrator(state)
+
+        subagent_state = update_subagent.call_args[0][0]
+        assert subagent_state["target_tasks"][0].instruction == 'Update "lodash" in package.json to version "4.17.22".'
+        assert subagent_state["previous_action_summaries_by_task"]["task-1"] == "Previous version bump failed manifest validation."
+        assert "supervisor_instruction" not in subagent_state
+
+    def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        state = _initial_state(tmp_path, groups)
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+
+        diagnostics = UpdateRetryDiagnostics(
+            task_id="task-1",
+            registry_query_performed=True,
+            attempted_versions=["4.17.22"],
+            candidate_versions_considered=["4.17.22", "4.17.21"],
+            latest_version_seen="4.17.22",
+            exhausted_update_path=False,
+        )
+        update_subagent = MagicMock(
+            return_value={
+                "errors": [],
+                "action_summaries": [],
+                "retry_diagnostics_by_task": {"task-1": diagnostics},
+            }
+        )
+
+        with patch("src.orchestrator.graph.run_update_subagent_node", update_subagent):
+            result = run_update_subagent_from_orchestrator(state)
+
+        assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
+
     def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
         """After workspace_builder succeeds, supervisor routes, then teardown runs."""
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

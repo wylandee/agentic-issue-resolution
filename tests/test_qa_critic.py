@@ -1872,6 +1872,26 @@ class TestApplyGuardrails:
                                      group_strategies={g.group_id: "code_workaround"})
         assert evals[g.group_id].failure_category == FailureCategory.BREAKING_CHANGE
 
+    def test_remaining_scanner_reclassifies_breaking_change_to_security_flag(self):
+        g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
+        batch = BatchQAResult(holistic_report="ok", evaluations=[
+            QAEvaluation(
+                task_id=g.group_id,
+                passed=False,
+                failure_category=FailureCategory.BREAKING_CHANGE,
+                retry_feedback="JWT unit tests failed after the version bump.",
+            )
+        ])
+        evals, errors = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
+            group_strategies={g.group_id: "version_bump"},
+        )
+        assert evals[g.group_id].failure_category == FailureCategory.SECURITY_FLAG
+        assert "JWT unit tests failed" in (evals[g.group_id].retry_feedback or "")
+        assert any("did not prioritize SECURITY_FLAG" in err for err in errors)
+
 
 # ---------------------------------------------------------------------------
 # run_qa_critic_node — map-reduce integration

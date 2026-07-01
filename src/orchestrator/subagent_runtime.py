@@ -154,3 +154,24 @@ def has_successful_validation_after_last_edit(
         if event.name == validation_tool_name and event.content.startswith("SUCCESS:"):
             return True
     return False
+
+
+def has_tool_call_before_first_successful_edit(
+    tool_events: Sequence[ToolEvent],
+    lookup_tool_name: str,
+    edit_tool_name: str,
+) -> bool:
+    """Return whether a given tool was called before the first successful edit."""
+    first_successful_edit_index = -1
+    for index, event in enumerate(tool_events):
+        if event.name == edit_tool_name and event.content.startswith("SUCCESS:"):
+            first_successful_edit_index = index
+            break
+
+    if first_successful_edit_index < 0:
+        return False
+
+    for event in tool_events[:first_successful_edit_index]:
+        if event.name == lookup_tool_name:
+            return True
+    return False

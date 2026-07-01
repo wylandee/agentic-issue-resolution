@@ -20,6 +20,7 @@ def _update_tool_map(
     host_repo_root=None,
     manifest_paths=None,
     package_manifest_paths=None,
+    enable_registry_lookup=False,
 ):
     if touched_files is None:
         touched_files = set()
@@ -35,6 +36,7 @@ def _update_tool_map(
         host_repo_root,
         manifest_paths,
         package_manifest_paths,
+        enable_registry_lookup=enable_registry_lookup,
     )
     return {tool.name: tool for tool in tools}
 
@@ -72,6 +74,12 @@ class TestToolbeltFactories:
             "revert_workspace_file",
             "validate_code_syntax",
         }
+
+    def test_retry_update_toolbelt_includes_registry_lookup(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(sandbox, enable_registry_lookup=True)
+
+        assert "view_npm_package_versions" in tools
 
 
 class TestModifyNpmDependency:

@@ -243,6 +243,9 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path
     For lockfile-path notation (``/src/package-lock.json?...``), the directory
     of the lockfile is used as the starting point.
     """
+    if not odc_file_path.strip():
+        return None
+
     # Strip the lockfile ancestry suffix if present
     raw_path = odc_file_path.split("?")[0].split("#")[0].strip()
 
@@ -250,8 +253,9 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path
     # leading /src/ that maps to the repo root, so we prefer the stripped form
     # first and fall back to the raw form if needed.
     candidate_abs = Path(raw_path)
-    if candidate_abs.is_absolute():
-        rel_parts = candidate_abs.parts[1:]  # drop the leading "/"
+    has_root_prefix = raw_path.startswith(("/", "\\"))
+    if candidate_abs.is_absolute() or has_root_prefix:
+        rel_parts = candidate_abs.parts[1:]  # drop the leading "/" or "\"
     else:
         rel_parts = candidate_abs.parts
 
@@ -261,22 +265,42 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path
         if str(stripped):
             variants.insert(0, stripped)
 
-    start_dir = repo_root
+    start_dir = repo_root.resolve()
     repo_resolved = repo_root.resolve()
+    fallback_dir = start_dir
+    fallback_depth = -1
     for variant in variants:
-        current = (repo_root / variant).resolve()
+        candidate = (repo_root / variant)
+        current = candidate.resolve()
+        if current.exists():
+            start_dir = current if current.is_dir() else current.parent
+            break
         while True:
-            if current.exists():
-                start_dir = current if current.is_dir() else current.parent
+            try:
+                current.relative_to(repo_resolved)
+            except ValueError:
                 break
-            if current == repo_resolved or not current.is_relative_to(repo_resolved):
+
+            if current.exists():
+                resolved_dir = current if current.is_dir() else current.parent
+                try:
+                    depth = len(resolved_dir.relative_to(repo_resolved).parts)
+                except ValueError:
+                    depth = -1
+                if depth > fallback_depth:
+                    fallback_dir = resolved_dir
+                    fallback_depth = depth
+                break
+
+            if current == repo_resolved:
                 break
             current = current.parent
-        if start_dir != repo_root:
-            break
+    else:
+        if fallback_depth >= 0:
+            start_dir = fallback_dir
 
     # Walk up from start_dir looking for package.json
-    current = start_dir.resolve()
+    current = start_dir
     while True:
         manifest = current / "package.json"
         if manifest.exists():

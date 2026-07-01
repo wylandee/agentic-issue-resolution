@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.contracts.schemas import AgentActionStatus, AgentActionSummary, VulnerabilityGroup
 from src.orchestrator.remedy_tools import build_workaround_toolbelt
-from src.orchestrator.state import SubagentState
+from src.orchestrator.state import SubagentState, _derive_legacy_task_from_group
 from src.orchestrator.subagent_runtime import (
     has_successful_validation_after_last_edit,
     run_bounded_subagent_loop,
@@ -60,10 +60,16 @@ def _filter_constraints_ledger(
 
 def _build_workaround_prompt(
     target_task: Any,  # RemediationTask (imported dynamically or typed properly)
-    target_group: VulnerabilityGroup,
-    constraints_ledger: List[str],
-    previous_feedback: str | None,
+    target_group: VulnerabilityGroup | List[str],
+    constraints_ledger: List[str] | None = None,
+    previous_feedback: str | None = None,
 ) -> str:
+    if isinstance(target_group, list):
+        constraints_ledger = list(target_group)
+        target_group = target_task
+        target_task = _derive_legacy_task_from_group(target_group)
+
+    constraints_ledger = list(constraints_ledger or [])
     fix_plan = target_group.fix_plan
     sections = [
         "\n".join(
@@ -152,6 +158,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because repo_root was invalid.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": [],
             "errors": [f"Workaround Subagent: repo_root '{repo_root_str}' is not a valid directory."],
         }
@@ -160,6 +167,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because workspace_volume was missing.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": [],
             "errors": ["Workaround Subagent: workspace_volume is missing from state."],
         }
@@ -168,6 +176,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because no target task/group was provided.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": [],
             "errors": ["Workaround Subagent: target_task or target_group is missing from state."],
         }
@@ -176,6 +185,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because the LLM client is unavailable.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": [],
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
@@ -187,6 +197,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because the LLM failed to initialize.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": [],
             "errors": [f"Workaround Subagent: failed to initialize LLM - {exc}."],
         }
@@ -208,6 +219,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(t_id, "Stopped because the sandbox or tool loop failed.")
         return {
             "action_summaries": summaries,
+            "action_summary": summaries[0],
             "changed_files": sorted(touched_files),
             "errors": [f"Workaround Subagent: sandbox or tool loop failed - {exc}"],
         }
@@ -225,6 +237,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     )
     return {
         "action_summaries": summaries,
+        "action_summary": summaries[0],
         "changed_files": runtime.changed_files,
         "errors": runtime.errors,
     }
