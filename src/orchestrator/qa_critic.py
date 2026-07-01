@@ -78,6 +78,9 @@ _STDERR_TAIL_LINES = 30
 _INSTALL_LOG_TAIL_LINES = 80
 _FILE_READ_MAX_CHARS = 8_000
 _LOG_QUERY_MAX_CHARS = 6_000
+_TEST_FAILURE_MAX_ITEMS = 8
+_TEST_FAILURE_CONTEXT_LINES = 12
+_TEST_FAILURE_EXCERPT_CHARS = 500
 
 # Exclusion patterns for workspace diff
 _DIFF_EXCLUDE_DIRS = frozenset({
@@ -93,6 +96,16 @@ _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
 # Install error patterns that indicate peer/engine conflicts
 _PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EBADENGINE", "peer dep", "peer tree")
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+_MOCHA_FAILURE_RE = re.compile(r"^\s*(\d+)\)\s+(.+)$")
+_JEST_FAILURE_RE = re.compile(r"^\s*[●✕×]\s+(.+)$")
+_TAP_FAILURE_RE = re.compile(r"^\s*not ok\b(?:\s+\d+)?\s*-?\s*(.+)?$")
+_SUBTEST_RE = re.compile(r"^\s*# Subtest:\s+(.+)$")
+_FAIL_LINE_RE = re.compile(r"^\s*FAIL\b(?:\s+(.+))?$")
+_EXCEPTION_RE = re.compile(
+    r"(AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|Error):"
+)
+_STACK_NOISE_RE = re.compile(r"^\s*(at\s+.+|\^\s*|[-]{3,}|\s*operator:\s+.+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +337,239 @@ def _run_security_scan(
     return True, summary, set()
 
 
+@dataclass
+class _TestFailureBlock:
+    """Condensed failure block extracted from raw test output."""
+
+    title: str
+    excerpt: str
+    source: str
+    start_line: int
+    end_line: int
+    score: int
+
+
+def _strip_ansi(value: str) -> str:
+    """Remove ANSI color/control sequences from test output."""
+    return _ANSI_ESCAPE_RE.sub("", value or "")
+
+
+def _normalize_log_lines(text: str) -> List[str]:
+    """Normalize raw log text into plain lines for deterministic parsing."""
+    normalized = _strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.splitlines()
+
+
+def _block_matches_failure_header(line: str) -> bool:
+    """Return whether a line is a strong failure-block boundary."""
+    return bool(
+        _MOCHA_FAILURE_RE.match(line)
+        or _JEST_FAILURE_RE.match(line)
+        or _TAP_FAILURE_RE.match(line)
+        or _FAIL_LINE_RE.match(line)
+    )
+
+
+def _score_failure_lines(title: str, excerpt: str, source: str) -> int:
+    """Score extracted failure blocks so high-signal items survive caps first."""
+    score = 0
+    lowered_title = title.lower()
+    lowered_excerpt = excerpt.lower()
+    if _MOCHA_FAILURE_RE.match(title):
+        score += 100
+    if _JEST_FAILURE_RE.match(title):
+        score += 100
+    if _TAP_FAILURE_RE.match(title):
+        score += 95
+    if "subtest" in lowered_title:
+        score += 90
+    if _EXCEPTION_RE.search(excerpt):
+        score += 70
+    if _FAIL_LINE_RE.match(title):
+        score += 50
+    if "stderr" in source:
+        score -= 5
+    if "assertionerror" in lowered_excerpt or "typeerror" in lowered_excerpt:
+        score += 15
+    return score
+
+
+def _capture_failure_excerpt(
+    lines: List[str],
+    start_index: int,
+    title_line: str,
+) -> Tuple[str, int]:
+    """Capture a bounded high-signal excerpt starting at one failure marker."""
+    captured: List[str] = []
+    end_index = start_index
+    for index in range(start_index, min(len(lines), start_index + _TEST_FAILURE_CONTEXT_LINES)):
+        line = lines[index].rstrip()
+        if index > start_index and _block_matches_failure_header(line):
+            break
+        if index > start_index and not line.strip():
+            break
+        if index > start_index and _STACK_NOISE_RE.match(line):
+            continue
+        captured.append(line)
+        end_index = index
+
+    excerpt = "\n".join(captured).strip()
+    if not excerpt:
+        excerpt = title_line.strip()
+    if len(excerpt) > _TEST_FAILURE_EXCERPT_CHARS:
+        excerpt = excerpt[:_TEST_FAILURE_EXCERPT_CHARS].rstrip() + "... (truncated)"
+    return excerpt, end_index
+
+
+def _extract_failure_blocks(text: str, source: str = "stdout") -> List[_TestFailureBlock]:
+    """Extract bounded failure blocks from raw test output using grep-like regex scanning."""
+    lines = _normalize_log_lines(text)
+    blocks: List[_TestFailureBlock] = []
+    index = 0
+    pending_subtest: Optional[str] = None
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        title: Optional[str] = None
+
+        if not stripped:
+            index += 1
+            continue
+
+        subtest_match = _SUBTEST_RE.match(line)
+        if subtest_match:
+            pending_subtest = subtest_match.group(1).strip()
+            index += 1
+            continue
+
+        mocha_match = _MOCHA_FAILURE_RE.match(line)
+        if mocha_match:
+            title = mocha_match.group(2).strip()
+
+        if title is None:
+            jest_match = _JEST_FAILURE_RE.match(line)
+            if jest_match:
+                title = jest_match.group(1).strip()
+
+        if title is None:
+            tap_match = _TAP_FAILURE_RE.match(line)
+            if tap_match:
+                tap_title = (tap_match.group(1) or "").strip()
+                title = tap_title or pending_subtest or stripped
+                pending_subtest = None
+
+        if title is None:
+            fail_match = _FAIL_LINE_RE.match(line)
+            if fail_match:
+                title = (fail_match.group(1) or "").strip() or stripped
+
+        if title is None and _EXCEPTION_RE.search(line):
+            title = pending_subtest or stripped
+
+        if title is None:
+            index += 1
+            continue
+
+        excerpt, end_index = _capture_failure_excerpt(lines, index, stripped)
+        score = _score_failure_lines(stripped, excerpt, source)
+        blocks.append(
+            _TestFailureBlock(
+                title=title,
+                excerpt=excerpt,
+                source=source,
+                start_line=index,
+                end_line=end_index,
+                score=score,
+            )
+        )
+        index = end_index + 1
+
+    return blocks
+
+
+def _dedupe_failure_blocks(blocks: List[_TestFailureBlock]) -> List[_TestFailureBlock]:
+    """Drop overlapping or repeated failure blocks while keeping the highest-signal copy."""
+    deduped: List[_TestFailureBlock] = []
+    seen_signatures: Set[Tuple[str, str]] = set()
+    occupied_ranges: List[Tuple[int, int, str]] = []
+
+    for block in sorted(blocks, key=lambda item: (-item.score, item.start_line)):
+        signature = (
+            block.title.strip().lower(),
+            block.excerpt.strip().lower(),
+        )
+        if signature in seen_signatures:
+            continue
+        overlaps = any(
+            block.source == existing_source
+            and not (block.end_line < existing_start or block.start_line > existing_end)
+            for existing_start, existing_end, existing_source in occupied_ranges
+        )
+        if overlaps:
+            continue
+        deduped.append(block)
+        seen_signatures.add(signature)
+        occupied_ranges.append((block.start_line, block.end_line, block.source))
+
+    return sorted(deduped, key=lambda item: (0 if item.source == "stdout" else 1, item.start_line))
+
+
+def _fallback_raw_tail(exit_code: int, stdout: str, stderr: str) -> str:
+    """Return the legacy bounded raw-tail fallback when no structured failures are detected."""
+    stdout_tail = "\n".join(stdout.splitlines()[-_TEST_LOG_TAIL_LINES:])
+    stderr_tail = "\n".join(stderr.splitlines()[-_STDERR_TAIL_LINES:])
+    return (
+        f"npm test FAILED (exit {exit_code}).\n"
+        f"stdout tail:\n{stdout_tail}\n"
+        f"stderr tail:\n{stderr_tail}"
+    )
+
+
+def _format_failure_summary(exit_code: int, blocks: List[_TestFailureBlock]) -> str:
+    """Format extracted test failures into a compact LLM-facing summary."""
+    visible_blocks = blocks[:_TEST_FAILURE_MAX_ITEMS]
+    lines = [
+        f"npm test FAILED (exit {exit_code}).",
+        f"Detected Failures: {len(blocks)}",
+        "",
+        "Failing Tests:",
+    ]
+    for index, block in enumerate(visible_blocks, start=1):
+        source_hint = f" [{block.source}]" if block.source == "stderr" else ""
+        lines.append(f"{index}. {block.title}{source_hint}")
+        excerpt_lines = block.excerpt.splitlines()
+        if excerpt_lines and block.title in excerpt_lines[0]:
+            excerpt_body = "\n".join(excerpt_lines[1:]).strip()
+        else:
+            excerpt_body = block.excerpt
+        if excerpt_body:
+            lines.append(excerpt_body)
+        lines.append("")
+    if len(blocks) > len(visible_blocks):
+        lines.append(
+            f"... and {len(blocks) - len(visible_blocks)} more failures omitted"
+        )
+
+    summary = "\n".join(lines).strip()
+    if len(summary) > _LOG_QUERY_MAX_CHARS:
+        summary = summary[:_LOG_QUERY_MAX_CHARS].rstrip() + "\n... (summary truncated)"
+    return summary
+
+
+def _summarize_failed_test_output(exit_code: int, stdout: str, stderr: str) -> str:
+    """Condense raw npm test output into a bounded failure-focused summary."""
+    blocks = _dedupe_failure_blocks(
+        [
+            *_extract_failure_blocks(stdout, source="stdout"),
+            *_extract_failure_blocks(stderr, source="stderr"),
+        ]
+    )
+    if not blocks:
+        return _fallback_raw_tail(exit_code, stdout, stderr)
+    return _format_failure_summary(exit_code, blocks)
+
+
 def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
     """
     Run ``npm test`` inside the workspace.
@@ -335,13 +581,10 @@ def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
     if result.exit_code == 0:
         return True, "npm test passed."
 
-    # Extract a bounded log tail for LLM context.
-    stdout_tail = "\n".join(result.stdout.splitlines()[-_TEST_LOG_TAIL_LINES:])
-    stderr_tail = "\n".join(result.stderr.splitlines()[-_STDERR_TAIL_LINES:])
-    summary = (
-        f"npm test FAILED (exit {result.exit_code}).\n"
-        f"stdout tail:\n{stdout_tail}\n"
-        f"stderr tail:\n{stderr_tail}"
+    summary = _summarize_failed_test_output(
+        result.exit_code,
+        result.stdout,
+        result.stderr,
     )
     return False, summary
 

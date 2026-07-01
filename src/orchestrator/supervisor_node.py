@@ -276,6 +276,27 @@ def _parent_status_for_strategy_pivot(
     return TaskStatus.UNFIXABLE
 
 
+def _terminalize_pivot_parents(
+    task_queue: Dict[str, RemediationTask],
+    parent_ids: List[str],
+    strategy_by_parent: Dict[str, RoutingStrategy],
+    qa_evaluations: Dict[str, QAEvaluation],
+) -> None:
+    """Mark pivoted parent tasks terminal so they cannot be re-routed to update work."""
+    for parent_id in parent_ids:
+        parent_task = task_queue.get(parent_id)
+        new_strategy = strategy_by_parent.get(parent_id)
+        if parent_task is None or new_strategy is None:
+            continue
+        terminal_status = _parent_status_for_strategy_pivot(
+            parent_task,
+            new_strategy,
+            qa_evaluations,
+        )
+        if parent_task.status not in _TERMINAL_STATUSES:
+            task_queue[parent_id] = parent_task.model_copy(update={"status": terminal_status})
+
+
 # ---------------------------------------------------------------------------
 # Deterministic fallback router
 # ---------------------------------------------------------------------------
@@ -341,6 +362,47 @@ def _deterministic_routing(
     # Collect tasks that still need work
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
 
+    breaking_change_retry = next(
+        (
+            task
+            for task in workable
+            if task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.status == TaskStatus.NEEDS_RETRY
+            and qa_evaluations.get(task.task_id) is not None
+            and qa_evaluations[task.task_id].failure_category == FailureCategory.BREAKING_CHANGE
+        ),
+        None,
+    )
+    if breaking_change_retry is not None:
+        component = (
+            group_by_id.get(breaking_change_retry.parent_group_id).vulnerable_component
+            if breaking_change_retry.parent_group_id in group_by_id
+            else breaking_change_retry.parent_group_id
+        )
+        return SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=[breaking_change_retry.task_id],
+            spawn_requests=[
+                TaskSpawnRequest(
+                    parent_task_id=breaking_change_retry.task_id,
+                    strategy=RoutingStrategy.CODE_WORKAROUND,
+                    instruction=(
+                        f"Implement a compatibility workaround for {component} to preserve "
+                        "the validated upgrade while addressing the breaking change."
+                    ),
+                    reason=(
+                        "Deterministic fallback: BREAKING_CHANGE requires follow-on "
+                        "code workaround remediation in a child task."
+                    ),
+                )
+            ],
+            instructions="Spawn a workaround child task for the breaking-change follow-on remediation.",
+            decision_reason=(
+                f"QA reported BREAKING_CHANGE for '{component}', so the validated version bump "
+                "must remain on the parent while a child handles the workaround."
+            ),
+        )
+
     exhausted_retry = next(
         (
             task
@@ -367,15 +429,20 @@ def _deterministic_routing(
         return SupervisorDecision(
             next_node="workaround_subagent",
             target_task_ids=[exhausted_retry.task_id],
-            updated_task_strategies={
-                exhausted_retry.task_id: RoutingStrategy.CODE_WORKAROUND
-            },
-            revised_instructions={
-                exhausted_retry.task_id: (
-                    f"Implement a code workaround or isolation strategy for {component} because "
-                    "manifest-based update remediation appears exhausted after bounded registry-guided retries."
+            spawn_requests=[
+                TaskSpawnRequest(
+                    parent_task_id=exhausted_retry.task_id,
+                    strategy=RoutingStrategy.CODE_WORKAROUND,
+                    instruction=(
+                        f"Implement a code workaround or isolation strategy for {component} because "
+                        "manifest-based update remediation appears exhausted after bounded registry-guided retries."
+                    ),
+                    reason=(
+                        "Deterministic fallback: exhausted manifest remediation must pivot "
+                        "to a workaround child task."
+                    ),
                 )
-            },
+            ],
             instructions="Pivot exhausted update remediation to the workaround worker.",
             decision_reason=(
                 f"Retry diagnostics show that '{component}' no longer has a remaining manifest-based update path."
@@ -747,9 +814,9 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry.",
         "4. Retry revised_instructions are high-level directives, not exact version pins.",
         "5. Same-strategy retries reuse the same task.",
-        "6. Any strategy pivot must spawn a child task; do not mutate the parent task's strategy in place.",
+        "6. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
         "7. SECURITY_FLAG and PEER_CONFLICT remain update remediation first unless the planner indicates the update path is exhausted.",
-        "8. BREAKING_CHANGE follow-on remediation must use CODE_WORKAROUND strategy.",
+        "8. BREAKING_CHANGE follow-on remediation must use a CODE_WORKAROUND child task via spawn_requests.",
         "9. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
         "10. After a worker succeeds for the current active batch, route that batch to qa_critic.",
         "11. When no actionable non-terminal tasks remain, route to teardown.",
@@ -760,6 +827,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "16. workaround_subagent MUST have exactly one target_task_id.",
         "17. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
         f"18. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
+        "19. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
     ]
 
     return "\n".join(lines)
@@ -1081,7 +1149,6 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
     # ------------------------------------------------------------------
-    pivot_spawn_requests: List[TaskSpawnRequest] = []
     pivot_parent_status_by_parent: Dict[str, TaskStatus] = {}
     pivot_target_parent_ids: Set[str] = set()
 
@@ -1098,6 +1165,23 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         logger.info(
             "supervisor: deterministic fallback → next_node=%s", decision.next_node
         )
+        fallback_pivot_strategy_by_parent = {
+            req.parent_task_id: req.strategy
+            for req in decision.spawn_requests
+            if req.parent_task_id in task_queue
+            and task_queue[req.parent_task_id].strategy != req.strategy
+        }
+        for parent_id, new_strategy in fallback_pivot_strategy_by_parent.items():
+            pivot_parent_status_by_parent[parent_id] = _parent_status_for_strategy_pivot(
+                task_queue[parent_id],
+                new_strategy,
+                qa_evaluations,
+            )
+        pivot_target_parent_ids = {
+            task_id
+            for task_id in decision.target_task_ids
+            if task_id in fallback_pivot_strategy_by_parent
+        }
     else:
         known_task_ids = set(task_queue.keys())
 
@@ -1234,89 +1318,104 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     continue
                 clean_status_updates[t_id] = new_status
 
-            pivot_strategy_updates = {
+            clean_spawn_requests = [
+                req
+                for req in decision.spawn_requests
+                if req.parent_task_id in known_task_ids
+                and task_queue[req.parent_task_id].status not in _TERMINAL_STATUSES
+            ]
+            pivot_strategy_by_parent: Dict[str, RoutingStrategy] = {
+                req.parent_task_id: req.strategy
+                for req in clean_spawn_requests
+                if task_queue[req.parent_task_id].strategy != req.strategy
+            }
+            legacy_pivot_strategy_updates = {
                 task_id: new_strategy
                 for task_id, new_strategy in clean_updated_task_strategies.items()
                 if task_queue[task_id].strategy != new_strategy
+                and task_id not in pivot_strategy_by_parent
             }
-            targeted_pivot_ids = [
-                task_id for task_id in valid_target_ids if task_id in pivot_strategy_updates
-            ]
-            incompatible_targeted_pivots = [
-                task_id
-                for task_id in targeted_pivot_ids
-                if decision.next_node != _worker_node_for_strategy(
-                    pivot_strategy_updates[task_id]
-                )
-            ]
-            missing_pivot_instructions = [
-                task_id
-                for task_id in targeted_pivot_ids
-                if not clean_revised_instructions.get(task_id, "").strip()
-            ]
-            if incompatible_targeted_pivots:
-                errors.append(
-                    "supervisor: rejected strategy pivot because next_node does not match "
-                    f"the child strategy for {incompatible_targeted_pivots}."
-                )
-                decision = _deterministic_routing(
-                    task_queue,
-                    group_by_id,
-                    qa_evaluations,
-                    retry_diagnostics_by_task,
-                    action_summaries=action_summaries,
-                    active_target_task_ids=active_target_task_ids,
-                    current_status=str(state.get("status") or ""),
-                )
-                valid_target_ids = list(decision.target_task_ids)
-                valid_unfixable_ids = list(decision.unfixable_task_ids)
-                clean_revised_instructions = dict(decision.revised_instructions)
-                clean_feedback = dict(decision.feedback_by_task)
-                clean_updated_task_strategies = dict(decision.updated_task_strategies)
-                clean_status_updates = dict(decision.task_status_updates)
-                pivot_strategy_updates = {}
-                targeted_pivot_ids = []
-            if not incompatible_targeted_pivots and missing_pivot_instructions:
-                errors.append(
-                    "supervisor: rejected strategy pivot without task-specific child "
-                    f"instructions for {missing_pivot_instructions}."
-                )
-                decision = _deterministic_routing(
-                    task_queue,
-                    group_by_id,
-                    qa_evaluations,
-                    retry_diagnostics_by_task,
-                    action_summaries=action_summaries,
-                    active_target_task_ids=active_target_task_ids,
-                    current_status=str(state.get("status") or ""),
-                )
-                valid_target_ids = list(decision.target_task_ids)
-                valid_unfixable_ids = list(decision.unfixable_task_ids)
-                clean_revised_instructions = dict(decision.revised_instructions)
-                clean_feedback = dict(decision.feedback_by_task)
-                clean_updated_task_strategies = dict(decision.updated_task_strategies)
-                clean_status_updates = dict(decision.task_status_updates)
-                pivot_strategy_updates = {}
-                targeted_pivot_ids = []
-
-            for task_id, new_strategy in pivot_strategy_updates.items():
+            malformed_pivot_parent_ids: List[str] = []
+            for task_id, new_strategy in legacy_pivot_strategy_updates.items():
                 child_instruction = clean_revised_instructions.pop(task_id, "").strip()
                 if not child_instruction:
+                    malformed_pivot_parent_ids.append(task_id)
                     continue
-                pivot_spawn_requests.append(
+                clean_spawn_requests.append(
                     TaskSpawnRequest(
                         parent_task_id=task_id,
                         strategy=new_strategy,
                         instruction=child_instruction,
                         reason=(
-                            "Auto-spawned due to strategy pivot from "
+                            "Auto-converted legacy strategy pivot from "
                             f"{task_queue[task_id].strategy.value} to {new_strategy.value}. "
                             f"{decision.decision_reason}"
                         ),
                     )
                 )
-                pivot_parent_status_by_parent[task_id] = _parent_status_for_strategy_pivot(
-                    task_queue[task_id],
+                pivot_strategy_by_parent[task_id] = new_strategy
+
+            targeted_pivot_ids = [
+                task_id for task_id in valid_target_ids if task_id in pivot_strategy_by_parent
+            ]
+            incompatible_targeted_pivots = [
+                task_id
+                for task_id in targeted_pivot_ids
+                if decision.next_node != _worker_node_for_strategy(
+                    pivot_strategy_by_parent[task_id]
+                )
+            ]
+            pivot_validation_failed = bool(malformed_pivot_parent_ids or incompatible_targeted_pivots)
+            if pivot_validation_failed:
+                if malformed_pivot_parent_ids:
+                    errors.append(
+                        "supervisor: rejected strategy pivot without task-specific child "
+                        f"instructions for {malformed_pivot_parent_ids}."
+                    )
+                if incompatible_targeted_pivots:
+                    errors.append(
+                        "supervisor: rejected strategy pivot because next_node does not match "
+                        f"the child strategy for {incompatible_targeted_pivots}."
+                    )
+                failed_parent_ids = list({
+                    *malformed_pivot_parent_ids,
+                    *incompatible_targeted_pivots,
+                })
+                _terminalize_pivot_parents(
+                    task_queue,
+                    failed_parent_ids,
+                    pivot_strategy_by_parent | legacy_pivot_strategy_updates,
+                    qa_evaluations,
+                )
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                )
+                valid_target_ids = list(decision.target_task_ids)
+                valid_unfixable_ids = list(decision.unfixable_task_ids)
+                clean_revised_instructions = dict(decision.revised_instructions)
+                clean_feedback = dict(decision.feedback_by_task)
+                clean_updated_task_strategies = dict(decision.updated_task_strategies)
+                clean_status_updates = dict(decision.task_status_updates)
+                clean_spawn_requests = list(decision.spawn_requests)
+                pivot_strategy_by_parent = {
+                    req.parent_task_id: req.strategy
+                    for req in clean_spawn_requests
+                    if req.parent_task_id in task_queue
+                    and task_queue[req.parent_task_id].strategy != req.strategy
+                }
+                targeted_pivot_ids = [
+                    task_id for task_id in valid_target_ids if task_id in pivot_strategy_by_parent
+                ]
+
+            for parent_id, new_strategy in pivot_strategy_by_parent.items():
+                pivot_parent_status_by_parent[parent_id] = _parent_status_for_strategy_pivot(
+                    task_queue[parent_id],
                     new_strategy,
                     qa_evaluations,
                 )
@@ -1331,7 +1430,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     new_constraints=decision.new_constraints,
                     feedback_by_task=clean_feedback,
                     revised_instructions=clean_revised_instructions,
-                    spawn_requests=[*pivot_spawn_requests, *decision.spawn_requests],
+                    spawn_requests=clean_spawn_requests,
                     task_status_updates=clean_status_updates,
                     instructions=decision.instructions,
                     decision_reason=decision.decision_reason,
@@ -1340,7 +1439,6 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 logger.warning(
                     "supervisor: decision rebuild failed (%s) — falling back.", exc
                 )
-                pivot_spawn_requests = []
                 pivot_parent_status_by_parent = {}
                 pivot_target_parent_ids = set()
                 decision = _deterministic_routing(
@@ -1394,15 +1492,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             errors=errors,
         )
         task_queue.update(new_tasks)
-        for parent_task_id, child_ids in child_ids_by_parent.items():
+        for parent_task_id, terminal_status in pivot_parent_status_by_parent.items():
             if (
-                child_ids
-                and parent_task_id in pivot_parent_status_by_parent
-                and parent_task_id in task_queue
+                parent_task_id in task_queue
                 and task_queue[parent_task_id].status not in _TERMINAL_STATUSES
             ):
                 task_queue[parent_task_id] = task_queue[parent_task_id].model_copy(
-                    update={"status": pivot_parent_status_by_parent[parent_task_id]}
+                    update={"status": terminal_status}
                 )
 
     resolved_target_task_ids: List[str] = []

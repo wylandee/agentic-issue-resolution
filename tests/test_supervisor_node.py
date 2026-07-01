@@ -29,7 +29,9 @@ from src.contracts.schemas import (
     RoutingStrategy,
     Severity,
     SupervisorDecision,
+    TaskSpawnRequest,
     TaskStatus,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -866,8 +868,14 @@ class TestRunSupervisorNodePeerConflict:
         mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
             next_node="workaround_subagent",
             target_task_ids=["task-1"],
-            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
-            revised_instructions={"task-1": "Implement a code workaround for the unresolved peer conflict."},
+            spawn_requests=[
+                TaskSpawnRequest(
+                    parent_task_id="task-1",
+                    strategy=RoutingStrategy.CODE_WORKAROUND,
+                    instruction="Implement a code workaround for the unresolved peer conflict.",
+                    reason="peer conflict requires a workaround child task",
+                )
+            ],
             instructions="test",
             decision_reason="test",
         )
@@ -903,8 +911,14 @@ class TestRunSupervisorNodePeerConflict:
         mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
             next_node="workaround_subagent",
             target_task_ids=["task-1"],
-            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
-            revised_instructions={"task-1": "Implement a compatibility workaround for the new jsonwebtoken API."},
+            spawn_requests=[
+                TaskSpawnRequest(
+                    parent_task_id="task-1",
+                    strategy=RoutingStrategy.CODE_WORKAROUND,
+                    instruction="Implement a compatibility workaround for the new jsonwebtoken API.",
+                    reason="breaking change requires validated upgrade plus workaround child",
+                )
+            ],
             instructions="test",
             decision_reason="spawn a workaround child after the validated version bump caused regressions",
         )
@@ -938,10 +952,71 @@ class TestRunSupervisorNodePeerConflict:
 
         result = run_supervisor_node(state)
 
-        assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["next_routing_step"] == "teardown"
+        assert result["active_target_task_ids"] == []
         assert "task-2" not in result["task_queue"]
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert any("rejected strategy pivot without task-specific child instructions" in err for err in result["errors"])
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_breaking_change_fallback_spawns_child_instead_of_retrying_parent(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="jsonwebtoken v9 broke runtime expectations",
+                )
+            },
+        )
+
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-2"].parent_task_id == "task-1"
+        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_exhausted_update_path_fallback_spawns_child_and_terminalizes_parent(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    registry_query_performed=True,
+                    attempted_versions=["9.0.3"],
+                    candidate_versions_considered=["9.0.3"],
+                    selected_version=None,
+                    latest_version_seen="9.0.3",
+                    used_overrides=False,
+                    package_abandoned=False,
+                    exhausted_update_path=True,
+                    failure_reason="latest version already attempted",
+                )
+            },
+        )
+
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+        assert result["task_queue"]["task-2"].parent_task_id == "task-1"
+        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
 
 
 # ===========================================================================
@@ -1017,4 +1092,4 @@ class TestSupervisorPrompt:
         prompt = build_supervisor_prompt(_base_state([g1]))
 
         assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
-        assert "BREAKING_CHANGE follow-on remediation must use CODE_WORKAROUND strategy" in prompt
+        assert "BREAKING_CHANGE follow-on remediation must use a CODE_WORKAROUND child task via spawn_requests" in prompt

@@ -76,6 +76,8 @@ from src.orchestrator.qa_critic import (
     _run_odc,
     _run_security_scan,
     _run_unit_tests,
+    _summarize_failed_test_output,
+    _extract_failure_blocks,
     _validate_qa_path,
     build_qa_review_toolbelt,
     build_qa_toolbelt,
@@ -203,13 +205,20 @@ class TestRunUnitTests:
             "npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS
         )
 
-    def test_failure_includes_stdout_tail(self):
-        long_stdout = "\n".join(f"line {i}" for i in range(200))
+    def test_failure_returns_condensed_detected_failures(self):
+        stdout = "\n".join(
+            [
+                "some setup noise",
+                "1) verify jwtChallenges challenge tracking",
+                "AssertionError: expected true to equal false",
+                "    at Context.<anonymous> (test/server/jwt.spec.ts:10:5)",
+            ]
+        )
         sandbox = _make_sandbox(
             run_side_effects=[
                 CommandResult(
                     exit_code=1,
-                    stdout=long_stdout,
+                    stdout=stdout,
                     stderr="some error",
                     duration_seconds=5.0,
                 )
@@ -219,14 +228,95 @@ class TestRunUnitTests:
 
         assert ok is False
         assert "FAILED" in summary
-        # Should include tail of stdout, not the entire thing
-        assert "line 199" in summary  # last line always present
+        assert "Failing Tests:" in summary
+        assert "verify jwtChallenges challenge tracking" in summary
+        assert "AssertionError" in summary
 
     def test_uses_npm_test_timeout(self):
         sandbox = _make_sandbox()
         _run_unit_tests(sandbox)
         _, kwargs = sandbox.run.call_args
         assert kwargs.get("timeout") == _NPM_TEST_TIMEOUT_SECONDS
+
+
+class TestTestFailureExtraction:
+    def test_extracts_mocha_numbered_failures(self):
+        text = "\n".join(
+            [
+                "  1) verify jwtChallenges challenge tracking",
+                "     AssertionError: expected true to equal false",
+            ]
+        )
+        blocks = _extract_failure_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0].title == "verify jwtChallenges challenge tracking"
+        assert "AssertionError" in blocks[0].excerpt
+
+    def test_extracts_jest_vitest_style_failure_headers(self):
+        text = "\n".join(
+            [
+                "● basket service > calculates discount",
+                "AssertionError: expected 3 to be 4",
+            ]
+        )
+        blocks = _extract_failure_blocks(text)
+        assert len(blocks) == 1
+        assert "basket service > calculates discount" in blocks[0].title
+
+    def test_extracts_tap_style_failure_with_subtest_context(self):
+        text = "\n".join(
+            [
+                "# Subtest: api login returns 401",
+                "not ok 3 -",
+                "  error: expected 401 but got 200",
+            ]
+        )
+        blocks = _extract_failure_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0].title == "api login returns 401"
+        assert "expected 401 but got 200" in blocks[0].excerpt
+
+    def test_extracts_exception_only_output(self):
+        text = "\n".join(
+            [
+                "TypeError: Cannot read properties of undefined (reading 'id')",
+                "    at routes/login.ts:12:7",
+            ]
+        )
+        blocks = _extract_failure_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0].title.startswith("TypeError:")
+
+    def test_deduplicates_overlapping_failure_markers(self):
+        text = "\n".join(
+            [
+                "1) verify jwtChallenges challenge tracking",
+                "AssertionError: expected true to equal false",
+                "    at Context.<anonymous> (test/server/jwt.spec.ts:10:5)",
+            ]
+        )
+        summary = _summarize_failed_test_output(1, text, text)
+        assert summary.count("verify jwtChallenges challenge tracking") == 1
+
+    def test_large_noisy_output_is_condensed(self):
+        repeated = "\n".join(
+            [
+                f"{i}) failure {i}\nAssertionError: broken expectation {i}"
+                for i in range(1, 15)
+            ]
+        )
+        summary = _summarize_failed_test_output(1, repeated, "")
+        assert "Detected Failures:" in summary
+        assert "... and " in summary
+        assert len(summary) <= 6200
+
+    def test_alien_output_falls_back_to_raw_tail(self):
+        stdout = "\n".join(f"line {i}" for i in range(120))
+        stderr = "unstructured crash"
+        summary = _summarize_failed_test_output(1, stdout, stderr)
+        assert "stdout tail:" in summary
+        assert "line 119" in summary
+        assert "stderr tail:" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -1643,6 +1733,17 @@ class TestBuildQaReviewToolbelt:
         results.install = (True, "npm install output here")
         tool = next(t for t in tools if t.name == "query_qa_logs")
         assert "npm install output here" in tool.invoke({"log_type": "install"})
+
+    def test_query_qa_logs_returns_condensed_test_summary(self):
+        tools, results = self._build(prepopulate=True)
+        results.tests = (
+            False,
+            "npm test FAILED (exit 1).\nDetected Failures: 1\n\nFailing Tests:\n1. jwt challenge\nAssertionError: boom",
+        )
+        tool = next(t for t in tools if t.name == "query_qa_logs")
+        result = tool.invoke({"log_type": "tests"})
+        assert "Detected Failures: 1" in result
+        assert "jwt challenge" in result
 
 
 # ---------------------------------------------------------------------------

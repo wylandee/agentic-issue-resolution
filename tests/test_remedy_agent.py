@@ -127,15 +127,15 @@ class TestUpdateSubagentWrapper:
 
         assert "## Task Context" in prompt
         assert "Supervisor's Revised Instruction" in prompt
-        assert "Why The Previous Attempt Failed" in prompt
-        assert "QA Feedback:" in prompt
-        assert "Previous Worker Outcome:" in prompt
+        assert "Why The Previous Attempt Failed" not in prompt
+        assert "QA Feedback:" not in prompt
+        assert "Previous Worker Outcome:" not in prompt
         assert "4.17.22" in prompt
         assert "authoritative directive" in prompt
         assert "First-pass mode:" in prompt
-        assert "First-pass planning questions:" in prompt
-        assert "What exact version or override does the Task Instruction require?" in prompt
-        assert "Reasoning Summary" in prompt
+        assert "First-pass planning questions:" not in prompt
+        assert "Planning Answers" not in prompt
+        assert "Reasoning Summary" not in prompt
 
     def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
         group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")

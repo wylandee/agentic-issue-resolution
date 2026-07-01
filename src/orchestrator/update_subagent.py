@@ -243,18 +243,8 @@ def _build_update_prompt(
                     "First-pass mode:",
                     "- This is an initial execution batch.",
                     "- Execute the Task Instruction exactly as written.",
-                    "- Think through the planning questions below before making any manifest edit. You do not need to reveal your private reasoning.",
-                    "- Include a visible 'Planning Answers' section in your final answer with one-line answers to the checklist below.",
-                    "- At the end, include a short 'Reasoning Summary' section that explains why the requested edit was appropriate.",
                     "- Do not use view_npm_package_versions or invent alternate versions.",
                     "- If the exact requested manifest remediation cannot validate, revert and surrender.",
-                    "",
-                    "First-pass planning questions:",
-                    "1. What exact version or override does the Task Instruction require?",
-                    "2. Which manifest_path must be edited for this target?",
-                    "3. Does the component appear in multiple manifest paths that all need the same change?",
-                    "4. Does the constraints ledger block the requested change?",
-                    "5. After the edit, has validate_manifest_sync succeeded?",
                 ]
             )
         )
@@ -274,60 +264,73 @@ def _build_update_prompt(
                 f"attempted={attempted}; candidates={candidates}; "
                 f"latest_seen={latest_seen}; exhausted={diagnostics.exhausted_update_path}"
             )
-        retry_answers = [
-            "1. What version or override path did the last fix attempt use?",
-            f"2. What attempted_versions are already recorded for this task? {diagnostics.attempted_versions if diagnostics else 'none'}",
-            f"3. What is the latest version currently available according to npm? {diagnostics.latest_version_seen if diagnostics and diagnostics.latest_version_seen else 'unknown'}",
-            f"4. Which candidate versions from npm have not been attempted yet? {', '.join(version for version in (diagnostics.candidate_versions_considered if diagnostics else []) if version not in set(diagnostics.attempted_versions if diagnostics else [])) or 'none'}",
-            f"5. Is the vulnerable package a direct dependency or does it need npm overrides? {'npm overrides' if diagnostics and diagnostics.used_overrides else 'direct dependency version bump'}",
-            f"6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target? {feedback if feedback != 'none' else previous_outcome}",
-            f"7. Does the constraints ledger forbid any downgrade or conflicting change? {'yes' if constraints_ledger else 'no blocking constraints recorded'}",
-            f"8. Which untried candidate is the safest next compatible remediation to validate now, or is there no viable update candidate left? {diagnostics.selected_version if diagnostics and diagnostics.selected_version else 'see registry candidates'}",
-            f"9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward? {previous_outcome}",
-            "10. If the latest available version was already attempted and no untried candidates remain, the update path is exhausted.",
-        ]
-        sections.append(
-            "\n".join(
-                [
-                    "## Task Context",
-                    f"- Task ID: {task.task_id}",
-                    f"- Component: {group.vulnerable_component or 'unknown'}",
-                    f"- Manifest Path: {_format_manifest_paths(manifest_paths)}",
-                    f"- Supervisor's Revised Instruction: {task.instruction or 'Derive the safest manifest update.'}",
-                    "",
-                    "## Why The Previous Attempt Failed",
-                    f"- QA Feedback: {feedback}",
-                    f"- Previous Worker Outcome: {previous_outcome}",
-                    "",
-                    "## Prior Retry Diagnostics",
-                    diagnostics_text,
-                    "",
-                    "## Constraints Ledger (DO NOT VIOLATE)",
-                    constraints_text,
-                    "",
-                    "## Standard Operating Procedure (SOP)",
-                    "You must act autonomously to find a working solution. Follow these steps strictly:",
-                    "",
-                    f"1. **Reconnaissance:** You MUST use the `view_npm_package_versions` tool on `{group.vulnerable_component or 'unknown'}` to see the actual, historical versions published to the NPM registry. Do NOT hallucinate version numbers.",
-                    "2. **Analysis:** Evaluate the registry versions against the QA feedback and the prior retry diagnostics.",
-                    "   - *If PEER_CONFLICT (ERESOLVE):* Your last version bump was too high. Look for a backported security patch or a lower compatible version that satisfies peers.",
-                    "   - *If SECURITY_FLAG:* The previous version used is still vulnerable. You must find a HIGHER version.", 
-                    "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version, do NOT re-apply it. Re-applying the same version will fail QA again.",
-                    "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
-                    "4. **Validation:** Immediately after editing, you MUST call `validate_manifest_sync`.",
-                    "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
-                    "6. **Clean Room Surrender:** If you have exhausted all logical versions and cannot resolve the conflict without violating the Constraints Ledger, or if the package is abandoned (no patch exists), you MUST use `revert_workspace_file` to undo your broken changes, then return \"Surrender: No viable version exists.\"",
-                    "",
-                    "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when `validate_manifest_sync` succeeds, or you have executed a Clean Room Surrender.",
-                    "",
-                    "## Planning Questions",
-                    "\n".join(retry_answers),
-                    "",
-                    "## Planning Answers",
-                    "Provide a short visible answer for each planning question before you make any manifest edit.",
-                ]
+        if retry_batch:
+            retry_answers = [
+                "1. What version or override path did the last fix attempt use?",
+                f"2. What attempted_versions are already recorded for this task? {diagnostics.attempted_versions if diagnostics else 'none'}",
+                f"3. What is the latest version currently available according to npm? {diagnostics.latest_version_seen if diagnostics and diagnostics.latest_version_seen else 'unknown'}",
+                f"4. Which candidate versions from npm have not been attempted yet? {', '.join(version for version in (diagnostics.candidate_versions_considered if diagnostics else []) if version not in set(diagnostics.attempted_versions if diagnostics else [])) or 'none'}",
+                f"5. Is the vulnerable package a direct dependency or does it need npm overrides? {'npm overrides' if diagnostics and diagnostics.used_overrides else 'direct dependency version bump'}",
+                f"6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target? {feedback if feedback != 'none' else previous_outcome}",
+                f"7. Does the constraints ledger forbid any downgrade or conflicting change? {'yes' if constraints_ledger else 'no blocking constraints recorded'}",
+                f"8. Which untried candidate is the safest next compatible remediation to validate now, or is there no viable update candidate left? {diagnostics.selected_version if diagnostics and diagnostics.selected_version else 'see registry candidates'}",
+                f"9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward? {previous_outcome}",
+                "10. If the latest available version was already attempted and no untried candidates remain, the update path is exhausted.",
+            ]
+            sections.append(
+                "\n".join(
+                    [
+                        "## Task Context",
+                        f"- Task ID: {task.task_id}",
+                        f"- Component: {group.vulnerable_component or 'unknown'}",
+                        f"- Manifest Path: {_format_manifest_paths(manifest_paths)}",
+                        f"- Supervisor's Revised Instruction: {task.instruction or 'Derive the safest manifest update.'}",
+                        "",
+                        "## Why The Previous Attempt Failed",
+                        f"- QA Feedback: {feedback}",
+                        f"- Previous Worker Outcome: {previous_outcome}",
+                        "",
+                        "## Prior Retry Diagnostics",
+                        diagnostics_text,
+                        "",
+                        "## Constraints Ledger (DO NOT VIOLATE)",
+                        constraints_text,
+                        "",
+                        "## Standard Operating Procedure (SOP)",
+                        "You must act autonomously to find a working solution. Follow these steps strictly:",
+                        "",
+                        f"1. **Reconnaissance:** You MUST use the `view_npm_package_versions` tool on `{group.vulnerable_component or 'unknown'}` to see the actual, historical versions published to the NPM registry. Do NOT hallucinate version numbers.",
+                        "2. **Analysis:** Evaluate the registry versions against the QA feedback and the prior retry diagnostics.",
+                        "   - *If PEER_CONFLICT (ERESOLVE):* Your last version bump was too high. Look for a backported security patch or a lower compatible version that satisfies peers.",
+                        "   - *If SECURITY_FLAG:* The previous version used is still vulnerable. You must find a HIGHER version.",
+                        "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version, do NOT re-apply it. Re-applying the same version will fail QA again.",
+                        "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
+                        "4. **Validation:** Immediately after editing, you MUST call `validate_manifest_sync`.",
+                        "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
+                        "6. **Clean Room Surrender:** If you have exhausted all logical versions and cannot resolve the conflict without violating the Constraints Ledger, or if the package is abandoned (no patch exists), you MUST use `revert_workspace_file` to undo your broken changes, then return \"Surrender: No viable version exists.\"",
+                        "",
+                        "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when `validate_manifest_sync` succeeds, or you have executed a Clean Room Surrender.",
+                        "",
+                        "## Planning Questions",
+                        "\n".join(retry_answers),
+                        "",
+                        "## Planning Answers",
+                        "Provide a short visible answer for each planning question before you make any manifest edit.",
+                    ]
+                )
             )
-        )
+        else:
+            sections.append(
+                "\n".join(
+                    [
+                        "## Task Context",
+                        f"- Task ID: {task.task_id}",
+                        f"- Component: {group.vulnerable_component or 'unknown'}",
+                        f"- Manifest Path: {_format_manifest_paths(manifest_paths)}",
+                        f"- Supervisor's Revised Instruction: {task.instruction or 'Derive the safest manifest update.'}",
+                    ]
+                )
+            )
 
     sections.append(
         "\n".join(
