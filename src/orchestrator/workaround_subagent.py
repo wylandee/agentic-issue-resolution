@@ -153,6 +153,18 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     
     t_id = target_task.task_id if target_task else "unknown"
 
+    if os.environ.get("REMEDY_BYPASS_WORKAROUND_SUBAGENT", "true").lower() in ("1", "true", "yes"):
+        summaries = _build_surrender_summaries(
+            t_id,
+            "Workaround subagent bypassed: marked unfixable (workaround functionality currently inactive)."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0],
+            "changed_files": [],
+            "errors": [],
+        }
+
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
         summaries = _build_surrender_summaries(t_id, "Stopped before execution because repo_root was invalid.")

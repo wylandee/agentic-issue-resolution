@@ -57,7 +57,7 @@ from src.tools.registry_tools import view_npm_package_versions
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 2
+MAX_RETRIES: int = 3
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -993,6 +993,11 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 continue
             if summary.status == AgentActionStatus.SUCCESS:
                 task.status = TaskStatus.OPTIMISTICALLY_FIXED
+            elif (
+                task.strategy == RoutingStrategy.CODE_WORKAROUND
+                or "Workaround subagent bypassed" in summary.summary
+            ):
+                task.status = TaskStatus.UNFIXABLE
             else:
                 task.status = TaskStatus.NEEDS_RETRY
                 task.retry_count += 1

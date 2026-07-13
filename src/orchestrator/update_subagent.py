@@ -216,7 +216,7 @@ def _build_update_prompt(
                 "Every modify_npm_dependency call must include the exact manifest_path you intend to edit.",
                 "If the vulnerable component appears in multiple manifest paths, call modify_npm_dependency once for each manifest_path that declares it.",
                 "Never downgrade a package that is constrained by the constraints ledger.",
-                "Use revert_workspace_file if you reach a structurally bad manifest state.",
+                "Use revert_workspace_file if you reach a structurally bad manifest state. For package.json files, specify the package_name parameter to revert only that specific dependency.",
                 "Do not search the codebase and do not edit source code files.",
                 "For each target below, the Task Instruction is the authoritative directive.",
             ]
@@ -233,6 +233,46 @@ def _build_update_prompt(
                     'You are now in the "Smart Planning & Rescue" phase.',
                     "",
                     "For each target below, the Task Instruction remains authoritative.",
+                ]
+            )
+        )
+        sections.append(
+            "\n".join(
+                [
+                    "## Standard Operating Procedure (SOP)",
+                    "You must act autonomously to find a working solution. Follow these steps strictly:",
+                    "",
+                    "1. **Reconnaissance:** You MUST use the `view_npm_package_versions` tool on the target component to see the actual, historical versions published to the NPM registry. Do NOT hallucinate version numbers.",
+                    "2. **Analysis & Selection:** Evaluate the registry versions against the QA feedback and prior retry diagnostics.",
+                    "   - **LATEST-FIRST RULE:** After viewing the NPM registry, you MUST attempt the LATEST version found on the npm registry (`latest` dist-tag or newest published version) instead of selecting the next newest version from the attempted version.",
+                    "   - *If PEER_CONFLICT (ERESOLVE):* Only if the latest version was already attempted and caused a peer conflict should you select an untried compatible backported security patch or lower compatible version.",
+                    "   - *If SECURITY_FLAG:* Attempt the latest version from the registry unless it was already attempted.",
+                    "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version and that version was already attempted, do NOT re-apply it. Re-applying the same version will fail QA again.",
+                    "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
+                    "4. **Validation:** Immediately after editing, you MUST call `validate_manifest_sync`.",
+                    "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
+                    "6. **Clean Room Surrender & Exhaustion:**",
+                    "   - In a multi-target batch, if one package cannot be resolved due to a peer conflict, you MUST call `revert_workspace_file(file_path, package_name='failing_package')` ONLY for that specific failing package. Preserve and validate the manifest updates for all other successful packages in the batch.",
+                    "   - If the latest version on the NPM registry was already attempted and still failed QA due to an unresolved vulnerability (`SECURITY_FLAG`), do NOT re-attempt it or try older versions. Immediately perform a Clean Room Surrender for that package and explicitly state 'update path is exhausted' in your Reasoning Summary.",
+                    "",
+                    "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when `validate_manifest_sync` succeeds, or you have executed a Clean Room Surrender.",
+                ]
+            )
+        )
+        sections.append(
+            "\n".join(
+                [
+                    "## Shared Planning Questions (for reference)",
+                    "1. What version or override path did the last fix attempt use?",
+                    "2. What attempted_versions are already recorded for this task?",
+                    "3. What is the latest version currently available according to npm?",
+                    "4. Which candidate versions from npm have not been attempted yet?",
+                    "5. Is the vulnerable package a direct dependency or does it need npm overrides?",
+                    "6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target?",
+                    "7. Does the constraints ledger forbid any downgrade or conflicting change?",
+                    "8. What version should be attempted next? (You MUST prioritize attempting the latest version found on the npm registry rather than stepping incrementally from the attempted version)",
+                    "9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward?",
+                    "10. If the latest available version on the NPM registry was already attempted (unless resolving a peer conflict), the update path is exhausted. Explicitly state 'update path is exhausted' in your Reasoning Summary.",
                 ]
             )
         )
@@ -265,15 +305,35 @@ def _build_update_prompt(
                 f"latest_seen={latest_seen}; exhausted={diagnostics.exhausted_update_path}"
             )
         if retry_batch:
+            attempted_set = set(diagnostics.attempted_versions) if diagnostics else set()
+            latest_seen = diagnostics.latest_version_seen if diagnostics else None
+            candidate_choices = [
+                version
+                for version in (diagnostics.candidate_versions_considered if diagnostics else [])
+                if version not in attempted_set
+            ]
+            if latest_seen and latest_seen in attempted_set:
+                next_version_hint = (
+                    f"NONE (latest version '{latest_seen}' already attempted — surrender required)"
+                    if not candidate_choices
+                    else candidate_choices[0]
+                )
+            elif latest_seen:
+                next_version_hint = latest_seen
+            elif candidate_choices:
+                next_version_hint = candidate_choices[0]
+            else:
+                next_version_hint = "see registry candidates"
+
             retry_answers = [
                 "1. What version or override path did the last fix attempt use?",
                 f"2. What attempted_versions are already recorded for this task? {diagnostics.attempted_versions if diagnostics else 'none'}",
                 f"3. What is the latest version currently available according to npm? {diagnostics.latest_version_seen if diagnostics and diagnostics.latest_version_seen else 'unknown'}",
-                f"4. Which candidate versions from npm have not been attempted yet? {', '.join(version for version in (diagnostics.candidate_versions_considered if diagnostics else []) if version not in set(diagnostics.attempted_versions if diagnostics else [])) or 'none'}",
+                f"4. Which candidate versions from npm have not been attempted yet? {', '.join(candidate_choices) or 'none'}",
                 f"5. Is the vulnerable package a direct dependency or does it need npm overrides? {'npm overrides' if diagnostics and diagnostics.used_overrides else 'direct dependency version bump'}",
                 f"6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target? {feedback if feedback != 'none' else previous_outcome}",
                 f"7. Does the constraints ledger forbid any downgrade or conflicting change? {'yes' if constraints_ledger else 'no blocking constraints recorded'}",
-                f"8. Which untried candidate is the safest next compatible remediation to validate now, or is there no viable update candidate left? {diagnostics.selected_version if diagnostics and diagnostics.selected_version else 'see registry candidates'}",
+                f"8. What version should be attempted next? (You MUST prioritize attempting the latest version found on the npm registry rather than stepping incrementally from the attempted version) {next_version_hint}",
                 f"9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward? {previous_outcome}",
                 "10. If the latest available version was already attempted and no untried candidates remain, the update path is exhausted.",
             ]
@@ -293,29 +353,9 @@ def _build_update_prompt(
                         "## Prior Retry Diagnostics",
                         diagnostics_text,
                         "",
-                        "## Constraints Ledger (DO NOT VIOLATE)",
-                        constraints_text,
-                        "",
-                        "## Standard Operating Procedure (SOP)",
-                        "You must act autonomously to find a working solution. Follow these steps strictly:",
-                        "",
-                        f"1. **Reconnaissance:** You MUST use the `view_npm_package_versions` tool on `{group.vulnerable_component or 'unknown'}` to see the actual, historical versions published to the NPM registry. Do NOT hallucinate version numbers.",
-                        "2. **Analysis:** Evaluate the registry versions against the QA feedback and the prior retry diagnostics.",
-                        "   - *If PEER_CONFLICT (ERESOLVE):* Your last version bump was too high. Look for a backported security patch or a lower compatible version that satisfies peers.",
-                        "   - *If SECURITY_FLAG:* The previous version used is still vulnerable. You must find a HIGHER version.",
-                        "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version, do NOT re-apply it. Re-applying the same version will fail QA again.",
-                        "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
-                        "4. **Validation:** Immediately after editing, you MUST call `validate_manifest_sync`.",
-                        "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
-                        "6. **Clean Room Surrender:** If you have exhausted all logical versions and cannot resolve the conflict without violating the Constraints Ledger, or if the package is abandoned (no patch exists), you MUST use `revert_workspace_file` to undo your broken changes, then return \"Surrender: No viable version exists.\"",
-                        "",
-                        "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when `validate_manifest_sync` succeeds, or you have executed a Clean Room Surrender.",
-                        "",
-                        "## Planning Questions",
-                        "\n".join(retry_answers),
-                        "",
-                        "## Planning Answers",
+                        f"## Planning Answers (for Task {task.task_id})",
                         "Provide a short visible answer for each planning question before you make any manifest edit.",
+                        "\n".join(retry_answers),
                     ]
                 )
             )
@@ -343,18 +383,59 @@ def _build_update_prompt(
     return "\n\n".join(sections)
 
 
+def _was_package_reverted(
+    group: VulnerabilityGroup,
+    tool_events: Optional[Sequence[Any]],
+) -> bool:
+    if not tool_events:
+        return False
+    pkg = (group.vulnerable_component or "").strip()
+    reverted = False
+    for event in tool_events:
+        name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
+        content = getattr(event, "content", "")
+        if name == "modify_npm_dependency":
+            if args.get("package_name") == pkg and content.startswith("SUCCESS:"):
+                reverted = False
+        elif name == "revert_workspace_file" and content.startswith("SUCCESS:"):
+            revert_pkg = args.get("package_name")
+            if revert_pkg == pkg or not revert_pkg:
+                reverted = True
+    return reverted
+
+
+def _was_package_modified(
+    group: VulnerabilityGroup,
+    tool_events: Optional[Sequence[Any]],
+) -> bool:
+    if not tool_events:
+        return False
+    pkg = (group.vulnerable_component or "").strip()
+    modified = False
+    for event in tool_events:
+        name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
+        content = str(getattr(event, "content", ""))
+        if name == "modify_npm_dependency" and args.get("package_name") == pkg:
+            if content.startswith("SUCCESS:") or content == "SUCCESS":
+                modified = True
+            else:
+                modified = False
+        elif name == "revert_workspace_file" and (content.startswith("SUCCESS:") or content == "SUCCESS"):
+            revert_pkg = args.get("package_name")
+            if revert_pkg == pkg or not revert_pkg:
+                modified = False
+    return modified
+
+
 def _build_action_summaries(
     resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
     final_text: str,
     succeeded: bool,
+    tool_events: Optional[Sequence[Any]] = None,
 ) -> List[AgentActionSummary]:
-    summary_status = AgentActionStatus.SUCCESS if succeeded else AgentActionStatus.SURRENDER
-    outcome = (
-        "Completed validated manifest updates"
-        if succeeded
-        else "Stopped without a validated manifest update"
-    )
     final_note = final_text.strip()
     normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
     include_final_note = bool(final_note) and len(resolved_tasks) == 1
@@ -368,6 +449,16 @@ def _build_action_summaries(
             for path in manifest_paths
             if path.replace("\\", "/") in normalized_changed_files
         ]
+        pkg_reverted = _was_package_reverted(group, tool_events)
+        pkg_modified = _was_package_modified(group, tool_events) if tool_events is not None else (bool(relevant_changed_files) and not pkg_reverted)
+        task_succeeded = succeeded and pkg_modified
+        summary_status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
+        outcome = (
+            "Completed validated manifest updates"
+            if task_succeeded
+            else "Stopped without a validated manifest update (reverted/surrendered)"
+        )
+
         changed_label = ", ".join(relevant_changed_files or manifest_paths or ["no files"])
         summary_text = f"{outcome} for {component} in {manifest_label}; changed files: {changed_label}."
         if include_final_note:
@@ -400,6 +491,9 @@ def _parse_registry_report_versions(report_text: str) -> Tuple[Sequence[str], st
         latest_match = _REGISTRY_LATEST_TAG_RE.match(line)
         if latest_match:
             latest_version = latest_match.group(1).strip()
+            if latest_version and latest_version not in seen:
+                seen.add(latest_version)
+                candidates.append(latest_version)
             continue
 
         version_match = _REGISTRY_VERSION_LINE_RE.match(line)
@@ -509,17 +603,35 @@ def _build_retry_diagnostics(
         untried_candidates = [
             version for version in candidate_versions if version not in attempted_set
         ]
+        is_peer_conflict = "peer" in (joined_errors + " " + lowered_final_text) or "eresolve" in (joined_errors + " " + lowered_final_text)
+        reasoning_summary = _extract_reasoning_summary(final_text)
+        if not reasoning_summary and prior:
+            reasoning_summary = prior.reasoning_summary
+
         exhausted_update_path = bool(prior.exhausted_update_path) if prior else False
-        if package_abandoned:
-            exhausted_update_path = True
-        elif (
+        reasoned_exhausted = any(
+            phrase in (lowered_final_text + " " + reasoning_summary.lower())
+            for phrase in [
+                "exhausted",
+                "update path is exhausted",
+                "no further version",
+                "no other version",
+                "no valid candidate",
+                "already attempted the latest",
+                "already attempted latest",
+                "latest version has been attempted",
+                "latest version was already attempted",
+            ]
+        )
+        reverted_on_retry = _is_retry_task(task) and _was_package_reverted(group, tool_events)
+        latest_attempted_on_retry = (
             _is_retry_task(task)
-            and not succeeded
-            and registry_query_performed
             and latest_version_seen is not None
             and latest_version_seen in attempted_set
-            and not untried_candidates
-        ):
+        )
+        if package_abandoned or reasoned_exhausted:
+            exhausted_update_path = True
+        elif (reverted_on_retry or latest_attempted_on_retry) and not is_peer_conflict:
             exhausted_update_path = True
 
         failure_reason = ""
@@ -527,9 +639,6 @@ def _build_retry_diagnostics(
             failure_reason = joined_errors or final_text.strip()
         elif prior and prior.failure_reason and not selected_version:
             failure_reason = prior.failure_reason
-        reasoning_summary = _extract_reasoning_summary(final_text)
-        if not reasoning_summary and prior:
-            reasoning_summary = prior.reasoning_summary
 
         candidate_choices = [
             version for version in candidate_versions if version not in attempted_set
@@ -557,8 +666,17 @@ def _build_retry_diagnostics(
                 else "no blocking constraints recorded"
             ),
             "8_next_candidate": (
-                selected_version
-                or (candidate_choices[0] if candidate_choices else latest_version_seen or "none")
+                latest_version_seen
+                if (latest_version_seen and latest_version_seen not in attempted_set)
+                else (
+                    candidate_choices[0]
+                    if candidate_choices
+                    else (
+                        f"NONE (latest version '{latest_version_seen}' already attempted)"
+                        if latest_version_seen in attempted_set
+                        else "none"
+                    )
+                )
             ),
         }
 
@@ -664,9 +782,23 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         prior_retry_diagnostics_by_task,
     )
     initial_messages = [
-        SystemMessage(content="Use only dependency-management tools and validate manifest synchronization after changes."),
+        SystemMessage(
+            content=(
+                "Use only dependency-management tools and validate manifest synchronization after changes. "
+                "You MUST output your planning answers under the '## Planning Answers' section before making any manifest edits."
+            )
+        ),
         HumanMessage(content=prompt),
     ]
+
+    attempted_versions_by_package: Dict[str, Set[str]] = {}
+    for task, group, _ in skinny_resolved_tasks:
+        pkg_name = (group.vulnerable_component or "").strip()
+        diag = prior_retry_diagnostics_by_task.get(task.task_id)
+        if pkg_name and diag and diag.attempted_versions:
+            attempted_versions_by_package[pkg_name] = set(diag.attempted_versions)
+
+    planning_state = {"submitted": False} if retry_batch else None
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
@@ -682,8 +814,17 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
                 ],
                 package_manifest_paths=package_manifest_map,
                 enable_registry_lookup=retry_batch,
+                attempted_versions_by_package=attempted_versions_by_package,
+                require_planning_answers=retry_batch,
+                planning_state=planning_state,
             )
-            runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
+            runtime = run_bounded_subagent_loop(
+                llm,
+                toolbelt,
+                initial_messages,
+                touched_files,
+                planning_state=planning_state,
+            )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
         summaries = _build_surrender_summaries(resolved_task_ids, "Stopped because the sandbox or tool loop failed.")
@@ -719,6 +860,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         runtime.changed_files,
         runtime.final_text,
         succeeded,
+        tool_events=runtime.tool_events,
     )
     return {
         "action_summaries": summaries,

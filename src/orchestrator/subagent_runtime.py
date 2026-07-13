@@ -70,6 +70,7 @@ def run_bounded_subagent_loop(
     tools: Sequence[Any],
     initial_messages: Sequence[Any],
     touched_files: Set[str],
+    planning_state: Optional[Dict[str, bool]] = None,
 ) -> SubagentRuntimeResult:
     """Run a bounded tool-calling loop for one specialized subagent."""
     tool_map = {tool.name: tool for tool in tools}
@@ -84,6 +85,10 @@ def run_bounded_subagent_loop(
         response = llm_with_tools.invoke(list(conversation))
         conversation.append(response)
         final_text = str(getattr(response, "content", "") or "")
+        if planning_state is not None:
+            lowered = final_text.lower()
+            if "planning answers" in lowered or "1. what version" in lowered:
+                planning_state["submitted"] = True
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
@@ -107,7 +112,8 @@ def run_bounded_subagent_loop(
             inferred_path = _infer_changed_file(event)
             if inferred_path:
                 if event.name == "revert_workspace_file":
-                    observed_changed_files.discard(inferred_path)
+                    if inferred_path not in touched_files:
+                        observed_changed_files.discard(inferred_path)
                 else:
                     observed_changed_files.add(inferred_path)
 

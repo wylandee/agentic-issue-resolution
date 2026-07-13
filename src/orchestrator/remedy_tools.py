@@ -8,7 +8,7 @@ import logging
 import os
 import shlex
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set
 
 from langchain_core.tools import tool
 
@@ -127,9 +127,11 @@ def _make_revert_workspace_file_tool(
     host_repo_root: Path,
 ):
     @tool
-    def revert_workspace_file(file_path: str) -> str:
+    def revert_workspace_file(file_path: str, package_name: Optional[str] = None) -> str:
         """
         Restore a workspace file to its original host baseline state.
+
+        If package_name is provided and the file is package.json, only revert the specified package's version to baseline.
         """
         try:
             rel_path = _validate_workspace_path(file_path)
@@ -144,6 +146,58 @@ def _make_revert_workspace_file_tool(
             content = baseline_file.read_text(encoding="utf-8")
         except Exception as exc:
             return f"ERROR: Baseline file '{rel_path}' is unreadable: {exc}"
+
+        if package_name:
+            if not rel_path.endswith("package.json"):
+                return "ERROR: package_name can only be specified for package.json files."
+
+            import json
+            try:
+                baseline_data = json.loads(content)
+            except Exception as exc:
+                return f"ERROR: Failed to parse baseline package.json: {exc}"
+
+            sandbox_content = sandbox.read_file(rel_path)
+            if not sandbox_content:
+                return f"ERROR: Sandbox file '{rel_path}' is missing or unreadable."
+
+            try:
+                sandbox_data = json.loads(sandbox_content)
+            except Exception as exc:
+                return f"ERROR: Failed to parse sandbox package.json: {exc}"
+
+            if not isinstance(baseline_data, dict) or not isinstance(sandbox_data, dict):
+                return "ERROR: package.json is not a valid JSON object."
+
+            reverted_any = False
+            for dep_type in ("dependencies", "devDependencies", "overrides"):
+                baseline_deps = baseline_data.get(dep_type)
+                sandbox_deps = sandbox_data.get(dep_type)
+
+                if isinstance(baseline_deps, dict) and package_name in baseline_deps:
+                    if not isinstance(sandbox_deps, dict):
+                        sandbox_data[dep_type] = {}
+                        sandbox_deps = sandbox_data[dep_type]
+                    sandbox_deps[package_name] = baseline_deps[package_name]
+                    reverted_any = True
+                else:
+                    if isinstance(sandbox_deps, dict) and package_name in sandbox_deps:
+                        del sandbox_deps[package_name]
+                        reverted_any = True
+
+            if not reverted_any:
+                return f"NOTE: Package '{package_name}' was not found/modified in '{rel_path}'."
+
+            try:
+                new_content = json.dumps(sandbox_data, indent=2) + "\n"
+                sandbox.write_file(rel_path, new_content)
+            except Exception as exc:
+                return f"ERROR: Failed to write updated package.json to sandbox: {exc}"
+
+            if sandbox_data == baseline_data:
+                touched_files.discard(rel_path)
+
+            return f"SUCCESS: Reverted dependency '{package_name}' in '{rel_path}' to its baseline state."
 
         try:
             sandbox.write_file(rel_path, content)
@@ -160,6 +214,9 @@ def _make_modify_npm_dependency_tool(
     sandbox: DockerSandbox,
     touched_files: Set[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
+    attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
+    require_planning_answers: bool = False,
+    planning_state: Optional[Dict[str, bool]] = None,
 ):
     allowed_manifest_paths_by_package = {
         package_name: set(manifest_paths)
@@ -179,6 +236,22 @@ def _make_modify_npm_dependency_tool(
         Modify dependencies, devDependencies, or overrides in a package.json.
         """
         import re
+
+        if require_planning_answers and planning_state and not planning_state.get("submitted", False):
+            return (
+                "ERROR: You MUST output your planning answers under the '## Planning Answers' section "
+                "in your message BEFORE calling modify_npm_dependency. First explain your answers to "
+                "questions 1-10 in your text response, then invoke modify_npm_dependency."
+            )
+
+        if attempted_versions_by_package:
+            attempted = attempted_versions_by_package.get(package_name, set())
+            if target_version in attempted:
+                return (
+                    f"ERROR: Version '{target_version}' was ALREADY ATTEMPTED for package '{package_name}' "
+                    f"and failed QA or structural validation. Do NOT re-attempt an already tried version. "
+                    f"Attempted versions: {sorted(attempted)}. Either attempt an untried candidate or perform a Clean Room Surrender."
+                )
 
         safe_pattern = re.compile(r"^[a-zA-Z0-9.\-/@~^*]+$")
         if not safe_pattern.match(package_name):
@@ -496,6 +569,9 @@ def build_update_toolbelt(
     target_manifest_paths: Iterable[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
     enable_registry_lookup: bool = False,
+    attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
+    require_planning_answers: bool = False,
+    planning_state: Optional[Dict[str, bool]] = None,
 ) -> List:
     """Build the strict update-only toolbelt."""
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
@@ -505,6 +581,9 @@ def build_update_toolbelt(
             sandbox,
             touched_files,
             package_manifest_paths,
+            attempted_versions_by_package=attempted_versions_by_package,
+            require_planning_answers=require_planning_answers,
+            planning_state=planning_state,
         ),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
         _make_validate_manifest_sync_tool(sandbox, manifest_paths),

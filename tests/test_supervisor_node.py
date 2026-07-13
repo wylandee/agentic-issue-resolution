@@ -709,6 +709,23 @@ class TestRunSupervisorNodeActionSummaryUpdates:
         result = run_supervisor_node(state)
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
 
+    def test_updates_workaround_task_to_unfixable_on_surrender(self):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", strategy=RoutingStrategy.CODE_WORKAROUND, status=TaskStatus.PENDING)
+        summary = AgentActionSummary(
+            task_id="task-1",
+            status=AgentActionStatus.SURRENDER,
+            summary="Workaround subagent bypassed",
+        )
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+            action_summaries=[summary],
+            active_target_task_ids=["task-1"],
+        )
+        result = run_supervisor_node(state)
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+
     def test_handles_multiple_action_summaries(self):
         g1 = _sca_group("g1")
         g2 = _sca_group("g2")

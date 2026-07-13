@@ -21,6 +21,9 @@ def _update_tool_map(
     manifest_paths=None,
     package_manifest_paths=None,
     enable_registry_lookup=False,
+    attempted_versions_by_package=None,
+    require_planning_answers=False,
+    planning_state=None,
 ):
     if touched_files is None:
         touched_files = set()
@@ -37,6 +40,9 @@ def _update_tool_map(
         manifest_paths,
         package_manifest_paths,
         enable_registry_lookup=enable_registry_lookup,
+        attempted_versions_by_package=attempted_versions_by_package,
+        require_planning_answers=require_planning_answers,
+        planning_state=planning_state,
     )
     return {tool.name: tool for tool in tools}
 
@@ -228,6 +234,165 @@ class TestModifyNpmDependency:
         )
 
         assert result == "ERROR: manifest_path must point to a package.json file."
+
+    def test_rejects_already_attempted_version(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            attempted_versions_by_package={"lodash": {"4.17.21"}},
+        )
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        assert result.startswith("ERROR:")
+        assert "ALREADY ATTEMPTED" in result
+
+    def test_rejects_missing_planning_answers(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            require_planning_answers=True,
+            planning_state={"submitted": False},
+        )
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        assert result.startswith("ERROR:")
+        assert "output your planning answers" in result
+
+
+class TestRevertWorkspaceFile:
+    def test_revert_entire_file_success(self, tmp_path):
+        sandbox = MagicMock()
+        touched_files = {"src/index.js"}
+
+        host_repo = tmp_path / "host"
+        host_repo.mkdir()
+        baseline_file = host_repo / "src" / "index.js"
+        baseline_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_file.write_text("console.log('original');", encoding="utf-8")
+
+        tools = _workaround_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
+
+        result = tools["revert_workspace_file"].invoke({"file_path": "src/index.js"})
+
+        assert result.startswith("SUCCESS:")
+        sandbox.write_file.assert_called_once_with("src/index.js", "console.log('original');")
+        assert "src/index.js" not in touched_files
+
+    def test_revert_package_json_package_name_provided(self, tmp_path):
+        sandbox = MagicMock()
+        touched_files = {"package.json"}
+
+        host_repo = tmp_path / "host"
+        host_repo.mkdir()
+        baseline_file = host_repo / "package.json"
+        baseline_json = {
+            "dependencies": {
+                "lodash": "4.17.20",
+                "axios": "0.21.1"
+            },
+            "devDependencies": {
+                "jest": "26.6.3"
+            }
+        }
+        import json
+        baseline_file.write_text(json.dumps(baseline_json, indent=2), encoding="utf-8")
+
+        sandbox_json = {
+            "dependencies": {
+                "lodash": "4.17.21",
+                "axios": "0.22.0",
+                "newpkg": "1.0.0"
+            },
+            "devDependencies": {
+                "jest": "27.0.0"
+            }
+        }
+        sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
+
+        tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
+
+        result = tools["revert_workspace_file"].invoke({
+            "file_path": "package.json",
+            "package_name": "axios"
+        })
+
+        assert result.startswith("SUCCESS:")
+        assert sandbox.write_file.called
+        written_content = sandbox.write_file.call_args[0][1]
+        written_json = json.loads(written_content)
+
+        assert written_json["dependencies"]["lodash"] == "4.17.21"
+        assert written_json["dependencies"]["axios"] == "0.21.1"
+        assert written_json["devDependencies"]["jest"] == "27.0.0"
+        assert written_json["dependencies"]["newpkg"] == "1.0.0"
+        assert "package.json" in touched_files
+
+    def test_revert_package_json_package_name_removes_added_package(self, tmp_path):
+        sandbox = MagicMock()
+        touched_files = {"package.json"}
+
+        host_repo = tmp_path / "host"
+        host_repo.mkdir()
+        baseline_file = host_repo / "package.json"
+        baseline_json = {
+            "dependencies": {
+                "lodash": "4.17.20"
+            }
+        }
+        import json
+        baseline_file.write_text(json.dumps(baseline_json, indent=2), encoding="utf-8")
+
+        sandbox_json = {
+            "dependencies": {
+                "lodash": "4.17.20",
+                "newpkg": "1.0.0"
+            }
+        }
+        sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
+
+        tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
+
+        result = tools["revert_workspace_file"].invoke({
+            "file_path": "package.json",
+            "package_name": "newpkg"
+        })
+
+        assert result.startswith("SUCCESS:")
+        written_content = sandbox.write_file.call_args[0][1]
+        written_json = json.loads(written_content)
+
+        assert "newpkg" not in written_json["dependencies"]
+        assert "package.json" not in touched_files
+
+    def test_revert_non_package_json_with_package_name_rejected(self, tmp_path):
+        sandbox = MagicMock()
+        host_repo = tmp_path / "host"
+        host_repo.mkdir()
+        baseline_file = host_repo / "src" / "index.js"
+        baseline_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_file.write_text("console.log('original');", encoding="utf-8")
+
+        tools = _workaround_tool_map(sandbox, host_repo_root=host_repo)
+
+        result = tools["revert_workspace_file"].invoke({
+            "file_path": "src/index.js",
+            "package_name": "axios"
+        })
+
+        assert result.startswith("ERROR:")
+        assert "only be specified for package.json files" in result
 
 
 class TestValidateManifestSync:
