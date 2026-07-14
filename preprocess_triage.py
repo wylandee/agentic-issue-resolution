@@ -19,7 +19,7 @@ def main():
     # 1. Define paths
     input_path = os.path.abspath("./data/odc_issues.jsonl")
     output_dir = os.path.abspath("./data/cache")
-    output_path = os.path.join(output_dir, "triaged_groups.json")
+    output_path = os.path.join(output_dir, "triaged_groups_latest.json")
     repo_root = os.path.abspath("./data/clones/juice-shop")
     
     logger.info(f"Input path: {input_path}")
