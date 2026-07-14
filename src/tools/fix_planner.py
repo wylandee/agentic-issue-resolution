@@ -15,12 +15,23 @@ It does **not**:
 Public API
 ----------
 ``plan_fix(localized_issue) -> dict``
-    Runs the 5-step waterfall and returns a plain ``dict`` whose keys mirror
+    Fetches the npm latest version first, then falls back to Serper workaround
+    search and returns a plain ``dict`` whose keys mirror
     the ``FixPlan`` Pydantic model.  The dict is also always constructable
     as a ``FixPlan`` for typed downstream consumers.
+``plan_fix_legacy(localized_issue) -> dict``
+    Runs the original local-regex -> OSV -> npm-registry -> Serper waterfall.
 
-Waterfall steps
----------------
+Default planner steps
+---------------------
+1. **npm_registry** — fetch the ``latest`` dist-tag from the npm registry.
+   Only attempted for npm/javascript ecosystem packages.
+2. **serper** — Google Search via Serper.dev for workaround snippets.
+   Silently skipped if ``SERPER_API_KEY`` is not set.
+3. **none** — all strategies exhausted; return a ``no_fix`` plan.
+
+Legacy waterfall steps
+----------------------
 1. **local_regex** — scan ``issue.message`` for a version hint
    (e.g. "Update to version 3.0.0 or later").
 2. **osv_api** — query OSV querybatch; follow up with GET /v1/vulns/{id}
@@ -31,8 +42,8 @@ Waterfall steps
    Silently skipped if ``SERPER_API_KEY`` is not set.
 5. **none** — all strategies exhausted; return a ``no_fix`` plan.
 
-All network failures are caught, logged, and trigger continuation to the
-next waterfall step.
+All network failures are caught, logged, and trigger continuation to the next
+planner step.
 """
 
 from __future__ import annotations
@@ -439,7 +450,7 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> Optional[List[s
 
 def plan_fix(localized_issue: LocalizedIssue) -> dict:
     """
-    Run the 5-step fix-planner waterfall for one ``LocalizedIssue``.
+    Plan one SCA fix by trying npm latest first, then Serper fallback.
 
     Returns a plain ``dict`` that mirrors the ``FixPlan`` Pydantic model and
     is always constructable as one:
@@ -458,11 +469,63 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     manifest_file = localized_issue.manifest_file
 
     # ------------------------------------------------------------------
+    # Step 1: npm registry — latest dist-tag (npm/javascript only)
+    # ------------------------------------------------------------------
+    if package_name and _is_npm_issue(issue):
+        fixed = _fetch_npm_latest(package_name)
+        if fixed:
+            log.info("[fix_planner] Step 1 (npm_registry): found %s → %s", package_name, fixed)
+            return _version_plan(
+                package_name, fixed, package_manager, is_direct, manifest_file,
+                strategy="npm_registry",
+            )
+
+    # ------------------------------------------------------------------
+    # Step 2: Serper web search for workarounds
+    # ------------------------------------------------------------------
+    snippets = _search_serper_workarounds(issue, package_name)
+    if snippets:
+        log.info("[fix_planner] Step 2 (serper): found %d workaround snippets", len(snippets))
+        return {
+            "status": FixPlanStatus.WORKAROUND_FOUND.value,
+            "fixed_version": None,
+            "workaround_snippets": snippets,
+            "instruction": _WORKAROUND_INSTRUCTION,
+            "strategy_used": "serper",
+        }
+
+    # ------------------------------------------------------------------
+    # Step 3: no fix found
+    # ------------------------------------------------------------------
+    log.warning("[fix_planner] Step 3 (none): no fix found for %s", package_name)
+    return {
+        "status": FixPlanStatus.NO_FIX.value,
+        "fixed_version": None,
+        "workaround_snippets": None,
+        "instruction": _NO_FIX_INSTRUCTION,
+        "strategy_used": "none",
+    }
+
+
+def plan_fix_legacy(localized_issue: LocalizedIssue) -> dict:
+    """
+    Run the original 5-step fix-planner waterfall for one ``LocalizedIssue``.
+
+    This is kept for callers that still need local-regex or OSV-first planning.
+    New triage uses ``plan_fix``.
+    """
+    issue = localized_issue.issue
+    package_name = _package_name_from_issue(issue)
+    package_manager = localized_issue.package_manager
+    is_direct = localized_issue.is_direct_dependency
+    manifest_file = localized_issue.manifest_file
+
+    # ------------------------------------------------------------------
     # Step 1: local regex — scan the advisory message for a version hint
     # ------------------------------------------------------------------
     fixed = _extract_local_version(issue.message)
     if fixed:
-        log.info("[fix_planner] Step 1 (local_regex): found %s → %s", package_name, fixed)
+        log.info("[fix_planner:legacy] Step 1 (local_regex): found %s → %s", package_name, fixed)
         return _version_plan(
             package_name, fixed, package_manager, is_direct, manifest_file,
             strategy="local_regex",
@@ -473,14 +536,14 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     # ------------------------------------------------------------------
     fixed, osv_workarounds = _query_osv_fixed_version(issue)
     if fixed:
-        log.info("[fix_planner] Step 2 (osv_api): found %s → %s", package_name, fixed)
+        log.info("[fix_planner:legacy] Step 2 (osv_api): found %s → %s", package_name, fixed)
         return _version_plan(
             package_name, fixed, package_manager, is_direct, manifest_file,
             strategy="osv_api",
         )
     if osv_workarounds:
         log.info(
-            "[fix_planner] Step 2 (osv_api): found %d workaround snippets for %s",
+            "[fix_planner:legacy] Step 2 (osv_api): found %d workaround snippets for %s",
             len(osv_workarounds),
             package_name,
         )
@@ -498,7 +561,7 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     if package_name and _is_npm_issue(issue):
         fixed = _fetch_npm_latest(package_name)
         if fixed:
-            log.info("[fix_planner] Step 3 (npm_registry): found %s → %s", package_name, fixed)
+            log.info("[fix_planner:legacy] Step 3 (npm_registry): found %s → %s", package_name, fixed)
             return _version_plan(
                 package_name, fixed, package_manager, is_direct, manifest_file,
                 strategy="npm_registry",
@@ -509,7 +572,7 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     # ------------------------------------------------------------------
     snippets = _search_serper_workarounds(issue, package_name)
     if snippets:
-        log.info("[fix_planner] Step 4 (serper): found %d workaround snippets", len(snippets))
+        log.info("[fix_planner:legacy] Step 4 (serper): found %d workaround snippets", len(snippets))
         return {
             "status": FixPlanStatus.WORKAROUND_FOUND.value,
             "fixed_version": None,
@@ -521,7 +584,7 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     # ------------------------------------------------------------------
     # Step 5: no fix found
     # ------------------------------------------------------------------
-    log.warning("[fix_planner] Step 5 (none): no fix found for %s", package_name)
+    log.warning("[fix_planner:legacy] Step 5 (none): no fix found for %s", package_name)
     return {
         "status": FixPlanStatus.NO_FIX.value,
         "fixed_version": None,

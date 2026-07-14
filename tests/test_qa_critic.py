@@ -65,6 +65,7 @@ from src.orchestrator.qa_critic import (
     _extract_group_evaluations,
     _group_scan_status,
     _generate_workspace_diff,
+    _detect_test_suite_plans,
     _parse_investigation_report,
     _parse_report_identifiers,
     _read_report_from_workspace,
@@ -78,6 +79,7 @@ from src.orchestrator.qa_critic import (
     _run_unit_tests,
     _summarize_failed_test_output,
     _extract_failure_blocks,
+    _normalize_node_tap_output,
     _validate_qa_path,
     build_qa_review_toolbelt,
     build_qa_toolbelt,
@@ -237,6 +239,175 @@ class TestRunUnitTests:
         _run_unit_tests(sandbox)
         _, kwargs = sandbox.run.call_args
         assert kwargs.get("timeout") == _NPM_TEST_TIMEOUT_SECONDS
+
+    def test_composite_suite_stops_after_first_failed_child(self):
+        root_package = {
+            "scripts": {
+                "test": "npm run test:server && npm run test:api",
+                "test:server": "mocha -r tsx --recursive test/server/**/*.ts",
+                "test:api": "node --import tsx --test \"test/api/**/*.test.ts\"",
+            }
+        }
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(
+                    exit_code=1,
+                    stdout=json.dumps(
+                        {
+                            "failures": [
+                                {
+                                    "fullTitle": "server rejects bad token",
+                                    "err": {
+                                        "name": "AssertionError",
+                                        "message": "expected 401",
+                                    },
+                                }
+                            ]
+                        }
+                    ),
+                    stderr="",
+                    duration_seconds=1.0,
+                )
+            ]
+        )
+        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+
+        ok, summary = _run_unit_tests(sandbox)
+
+        assert ok is False
+        assert "Failed Tests: 1" in summary
+        assert "server rejects bad token" in summary
+        assert sandbox.run.call_count == 1
+        sandbox.run.assert_called_once_with(
+            "npm run test:server -- --reporter json",
+            timeout=_NPM_TEST_TIMEOUT_SECONDS,
+        )
+
+    def test_composite_suite_all_children_passing_returns_passed(self):
+        root_package = {
+            "scripts": {
+                "test": "npm run test:server && npm run test:api",
+                "test:server": "mocha test/server/**/*.ts",
+                "test:api": "node --test \"test/api/**/*.test.ts\"",
+            }
+        }
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(exit_code=0, stdout="{}", stderr="", duration_seconds=1.0),
+                CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0),
+            ]
+        )
+        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+
+        ok, summary = _run_unit_tests(sandbox)
+
+        assert ok is True
+        assert summary == "npm test passed."
+        assert sandbox.run.call_count == 2
+
+    def test_unknown_project_uses_legacy_npm_test_text_parser(self):
+        root_package = {"scripts": {"test": "custom-test-runner --plain"}}
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(
+                    exit_code=1,
+                    stdout="1) legacy failure\nAssertionError: broken",
+                    stderr="",
+                    duration_seconds=1.0,
+                )
+            ]
+        )
+        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+
+        ok, summary = _run_unit_tests(sandbox)
+
+        assert ok is False
+        assert "Detected Failures:" in summary
+        sandbox.run.assert_called_once_with("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
+
+
+class TestStructuredTestDetection:
+    def test_detects_juice_shop_composite_test_strategies(self):
+        root_package = {
+            "scripts": {
+                "test": "npm run test:frontend && npm run test:server && npm run test:api",
+                "test:frontend": "cd frontend && npm run test",
+                "test:server": "mocha -r tsx --recursive test/server/**/*.ts",
+                "test:api": "node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \"test/api/**/*.test.ts\"",
+            }
+        }
+        frontend_package = {
+            "scripts": {"test": "ng test"},
+            "devDependencies": {"vitest": "^3.0.0"},
+        }
+        frontend_angular = {
+            "projects": {
+                "frontend": {
+                    "architect": {
+                        "test": {"builder": "@angular/build:unit-test"}
+                    }
+                }
+            }
+        }
+
+        sandbox = _make_sandbox()
+
+        def read_file(path):
+            if path == "package.json":
+                return json.dumps(root_package)
+            if path == "frontend/package.json":
+                return json.dumps(frontend_package)
+            if path == "frontend/angular.json":
+                return json.dumps(frontend_angular)
+            return None
+
+        sandbox.read_file.side_effect = read_file
+
+        plans = _detect_test_suite_plans(sandbox)
+
+        assert plans is not None
+        assert [plan.name for plan in plans] == ["frontend", "server", "api"]
+        assert [plan.runner for plan in plans] == ["angular_vitest", "mocha", "node_test"]
+
+    def test_unknown_shell_command_falls_back_to_text(self):
+        sandbox = _make_sandbox(
+            read_file_return=json.dumps({"scripts": {"test": "bash ./scripts/test-all.sh"}})
+        )
+
+        plans = _detect_test_suite_plans(sandbox)
+
+        assert plans is not None
+        assert plans[0].runner == "npm_text_fallback"
+
+
+class TestStructuredNodeTapNormalization:
+    def test_node_parent_suite_and_async_hook_are_diagnostics(self):
+        output = "\n".join(
+            [
+                "# Subtest: POST handles searchProducts tool call and returns follow-up response",
+                "not ok 5 - POST handles searchProducts tool call and returns follow-up response",
+                "  duration_ms: 15001.158",
+                "  type: 'test'",
+                "  failureType: 'testTimeoutFailure'",
+                "  error: 'test timed out after 15000ms'",
+                "# Subtest: /rest/chat",
+                "not ok 1 - /rest/chat",
+                "  type: 'suite'",
+                "  failureType: 'subtestsFailed'",
+                "  error: '1 subtest failed'",
+                "# Error: Test hook \"before\" at test/api/chat.test.ts:4:1079 generated asynchronous activity after the test ended.",
+                "# This activity created the error \"SyntaxError: Unexpected end of JSON input\"",
+            ]
+        )
+
+        failures, diagnostics = _normalize_node_tap_output(output, "", suite_name="api")
+
+        assert len(failures) == 1
+        assert failures[0].name == "POST handles searchProducts tool call and returns follow-up response"
+        assert failures[0].failure_type == "testTimeoutFailure"
+        assert len(diagnostics) == 2
+        assert any("subtestsFailed" in diagnostic.message for diagnostic in diagnostics)
+        assert any("asynchronous activity" in diagnostic.message for diagnostic in diagnostics)
 
 
 class TestTestFailureExtraction:

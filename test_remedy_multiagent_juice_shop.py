@@ -13,7 +13,7 @@ from src.orchestrator.graph import run_orchestrator
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("remedy_multiagent_test")
 
-TRIAGED_GROUPS_JSON = Path("data/cache/triaged_groups.json")
+TRIAGED_GROUPS_JSON = Path("data/cache/triaged_groups_latest.json")
 TEST_REPO_ROOT = Path(
     os.environ.get(
         "TEST_REPO_ROOT",
@@ -28,15 +28,15 @@ TARGET_GROUP_IDS = (
     #"sca:package.json:express-jwt:UPDATE_VERSION",
     #"sca:package.json:sanitize-html:UPDATE_VERSION",
     # "sca:package.json:socket.io:UPDATE_VERSION",
-    #"sca:package.json:notevil:UPDATE_VERSION",
+    "sca:package.json:notevil:UPDATE_VERSION",
     # Transitive
     "sca:package.json:@tootallnate/once:UPDATE_VERSION", # Happy path
-    "sca:package.json:base64url:UPDATE_VERSION", # Happy path
-    #"sca:frontend/package.json:ws:UPDATE_VERSION",
+    #"sca:package.json:base64url:UPDATE_VERSION", # Happy path
+    "sca:frontend/package.json:ws:UPDATE_VERSION",
     #"sca:frontend/package.json:elliptic:UPDATE_VERSION",
-    "sca:package.json:cookie:UPDATE_VERSION", # Happy path
+    #"sca:package.json:cookie:UPDATE_VERSION", # Happy path
     #"sca:package.json:lodash.set:UPDATE_VERSION",
-    "sca:package.json:nanoid:UPDATE_VERSION", # Happy path
+    #"sca:package.json:nanoid:UPDATE_VERSION", # Happy path
     "sca:package.json:http-cache-semantics:UPDATE_VERSION", # Happy path
     #"sca:package.json:serialize-javascript:UPDATE_VERSION",
 

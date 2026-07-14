@@ -349,6 +349,47 @@ class _TestFailureBlock:
     score: int
 
 
+@dataclass(frozen=True)
+class _TestSuitePlan:
+    """Detected child test-suite command and runner classification."""
+
+    name: str
+    runner: str
+    command: str
+
+
+@dataclass
+class _NormalizedTestFailure:
+    """One leaf test failure from a structured or runner-aware parser."""
+
+    name: str
+    message: str = ""
+    failure_type: str = ""
+    suite: str = ""
+
+
+@dataclass
+class _NormalizedTestDiagnostic:
+    """Runner-level diagnostic that should not inflate failed test counts."""
+
+    message: str
+    kind: str = "diagnostic"
+    suite: str = ""
+
+
+@dataclass
+class _NormalizedSuiteResult:
+    """Normalized result for one child test-suite command."""
+
+    name: str
+    runner: str
+    command: str
+    exit_code: int
+    failed_tests: List[_NormalizedTestFailure] = field(default_factory=list)
+    diagnostics: List[_NormalizedTestDiagnostic] = field(default_factory=list)
+    fallback_summary: str = ""
+
+
 def _strip_ansi(value: str) -> str:
     """Remove ANSI color/control sequences from test output."""
     return _ANSI_ESCAPE_RE.sub("", value or "")
@@ -570,13 +611,470 @@ def _summarize_failed_test_output(exit_code: int, stdout: str, stderr: str) -> s
     return _format_failure_summary(exit_code, blocks)
 
 
+def _workspace_json_file(sandbox: DockerSandbox, path: str) -> Optional[Dict[str, Any]]:
+    """Read one JSON file from the sandbox workspace, returning ``None`` on misses."""
+    try:
+        content = sandbox.read_file(path)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        parsed = json.loads(content)
+    except Exception:  # noqa: BLE001
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _split_script_chain(script: str) -> List[str]:
+    """Split simple npm ``&&`` chains while preserving each child command."""
+    return [part.strip() for part in (script or "").split("&&") if part.strip()]
+
+
+def _script_name_from_npm_run(command: str) -> Optional[str]:
+    """Return the script name from simple ``npm run <name>`` commands."""
+    match = re.match(
+        r"^\s*npm\s+(?:run|run-script)\s+(?:--silent\s+)?(?P<name>[^\s]+)",
+        command,
+    )
+    return match.group("name") if match else None
+
+
+def _read_package_json_for_cwd(sandbox: DockerSandbox, cwd: str) -> Optional[Dict[str, Any]]:
+    """Read package.json for a detected child-suite working directory."""
+    normalized_cwd = cwd.strip().strip("/\\")
+    package_path = "package.json" if not normalized_cwd else f"{normalized_cwd}/package.json"
+    return _workspace_json_file(sandbox, package_path)
+
+
+def _angular_project_uses_vitest(sandbox: DockerSandbox, cwd: str) -> bool:
+    """Best-effort check for Angular's Vitest-backed unit-test builder."""
+    package_json = _read_package_json_for_cwd(sandbox, cwd) or {}
+    dependency_sections = ("dependencies", "devDependencies", "peerDependencies")
+    if any(
+        "vitest" in (package_json.get(section) or {})
+        for section in dependency_sections
+        if isinstance(package_json.get(section), dict)
+    ):
+        return True
+
+    normalized_cwd = cwd.strip().strip("/\\")
+    angular_path = "angular.json" if not normalized_cwd else f"{normalized_cwd}/angular.json"
+    angular_json = _workspace_json_file(sandbox, angular_path) or {}
+    return "@angular/build:unit-test" in json.dumps(angular_json)
+
+
+def _classify_test_command(
+    sandbox: DockerSandbox,
+    command: str,
+    *,
+    cwd: str = "",
+    package_json: Optional[Dict[str, Any]] = None,
+    seen: Optional[Set[Tuple[str, str]]] = None,
+) -> str:
+    """Classify a test command into a supported structured strategy."""
+    seen = seen or set()
+    command = (command or "").strip()
+    lowered = command.lower()
+    current_key = (cwd, command)
+    if not command or current_key in seen:
+        return "npm_text_fallback"
+    seen.add(current_key)
+
+    cd_match = re.match(r"^\s*cd\s+(?P<cwd>[^\s&]+)\s+&&\s+(?P<rest>.+)$", command)
+    if cd_match:
+        child_cwd = cd_match.group("cwd").strip().strip("\"'")
+        base_cwd = cwd.rstrip("/\\")
+        next_cwd = f"{base_cwd}/{child_cwd}" if base_cwd else child_cwd
+        child_package = _read_package_json_for_cwd(sandbox, next_cwd)
+        return _classify_test_command(
+            sandbox,
+            cd_match.group("rest"),
+            cwd=next_cwd,
+            package_json=child_package,
+            seen=seen,
+        )
+
+    if "node " in f" {lowered}" and " --test" in f" {lowered}":
+        return "node_test"
+    if re.search(r"(^|\s)mocha(\s|$)", lowered):
+        return "mocha"
+    if re.search(r"(^|\s)vitest(\s|$)", lowered):
+        return "vitest"
+    if re.search(r"(^|\s)ng\s+test(\s|$)", lowered):
+        return "angular_vitest" if _angular_project_uses_vitest(sandbox, cwd) else "npm_text_fallback"
+
+    script_name = _script_name_from_npm_run(command)
+    scripts = (package_json or {}).get("scripts") if isinstance(package_json, dict) else None
+    if script_name and isinstance(scripts, dict) and isinstance(scripts.get(script_name), str):
+        return _classify_test_command(
+            sandbox,
+            scripts[script_name],
+            cwd=cwd,
+            package_json=package_json,
+            seen=seen,
+        )
+
+    return "npm_text_fallback"
+
+
+def _suite_name_from_command(command: str) -> str:
+    """Derive a concise display name for one child suite."""
+    script_name = _script_name_from_npm_run(command)
+    if script_name:
+        return script_name.replace("test:", "") or script_name
+    cd_match = re.match(r"^\s*cd\s+(?P<cwd>[^\s&]+)\s+&&", command)
+    if cd_match:
+        return cd_match.group("cwd").strip().strip("\"'")
+    return command.split()[0] if command.split() else "npm test"
+
+
+def _detect_test_suite_plans(sandbox: DockerSandbox) -> Optional[List[_TestSuitePlan]]:
+    """Detect npm test child suites from package.json, expanding simple ``&&`` chains."""
+    package_json = _workspace_json_file(sandbox, "package.json")
+    scripts = package_json.get("scripts") if isinstance(package_json, dict) else None
+    test_script = scripts.get("test") if isinstance(scripts, dict) else None
+    if not isinstance(test_script, str) or not test_script.strip():
+        return None
+
+    commands = _split_script_chain(test_script)
+    if not commands:
+        return None
+
+    plans: List[_TestSuitePlan] = []
+    for command in commands:
+        runner = _classify_test_command(sandbox, command, package_json=package_json)
+        plans.append(
+            _TestSuitePlan(
+                name=_suite_name_from_command(command),
+                runner=runner,
+                command=command,
+            )
+        )
+    return plans
+
+
+def _structured_command_for_plan(plan: _TestSuitePlan) -> str:
+    """Return a JSON-capable command when it is safe; otherwise preserve original."""
+    command = plan.command
+    lowered = command.lower()
+    if plan.runner == "mocha" and "--reporter" not in lowered:
+        separator = " -- " if _script_name_from_npm_run(command) else " "
+        return f"{command}{separator}--reporter json"
+    if plan.runner == "vitest" and "--reporter" not in lowered:
+        separator = " -- " if _script_name_from_npm_run(command) else " "
+        return f"{command}{separator}--reporter=json"
+    return command
+
+
+def _truncate_summary_text(value: str, limit: int = _TEST_FAILURE_EXCERPT_CHARS) -> str:
+    """Bound one message or excerpt for log-query output."""
+    value = (value or "").strip()
+    if len(value) > limit:
+        return value[:limit].rstrip() + "... (truncated)"
+    return value
+
+
+def _diagnostic_from_lines(lines: List[str], suite: str, kind: str = "diagnostic") -> _NormalizedTestDiagnostic:
+    """Build one bounded diagnostic message from raw runner lines."""
+    return _NormalizedTestDiagnostic(
+        message=_truncate_summary_text("\n".join(line.rstrip() for line in lines if line.strip())),
+        kind=kind,
+        suite=suite,
+    )
+
+
+def _normalize_node_tap_output(
+    stdout: str,
+    stderr: str,
+    *,
+    suite_name: str = "node_test",
+) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+    """Normalize Node test TAP output without counting parent suites as leaf failures."""
+    lines = _normalize_log_lines(f"{stdout or ''}\n{stderr or ''}")
+    failures: List[_NormalizedTestFailure] = []
+    diagnostics: List[_NormalizedTestDiagnostic] = []
+    pending_subtest: Optional[str] = None
+    seen_diagnostics: Set[str] = set()
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        subtest_match = _SUBTEST_RE.match(line)
+        if subtest_match:
+            pending_subtest = subtest_match.group(1).strip()
+            index += 1
+            continue
+
+        tap_match = _TAP_FAILURE_RE.match(line)
+        if not tap_match:
+            stripped = line.strip()
+            if stripped.startswith("# Error:") or "generated asynchronous activity after the test ended" in stripped:
+                diagnostic_lines = [stripped]
+                next_index = index + 1
+                while next_index < len(lines) and lines[next_index].strip().startswith("#"):
+                    diagnostic_lines.append(lines[next_index].strip())
+                    next_index += 1
+                diagnostic = _diagnostic_from_lines(diagnostic_lines, suite_name, kind="node_runner")
+                if diagnostic.message and diagnostic.message not in seen_diagnostics:
+                    diagnostics.append(diagnostic)
+                    seen_diagnostics.add(diagnostic.message)
+                index = next_index
+                continue
+            index += 1
+            continue
+
+        title = (tap_match.group(1) or "").strip() or pending_subtest or line.strip()
+        pending_subtest = None
+        block_lines = [line.rstrip()]
+        next_index = index + 1
+        while next_index < len(lines):
+            next_line = lines[next_index]
+            if (
+                _SUBTEST_RE.match(next_line)
+                or re.match(r"^\s*(?:ok|not ok)\b", next_line)
+                or next_line.strip().startswith("# Error:")
+            ):
+                break
+            block_lines.append(next_line.rstrip())
+            next_index += 1
+
+        block_text = "\n".join(block_lines)
+        failure_type_match = re.search(r"failureType:\s*'([^']+)'", block_text)
+        failure_type = failure_type_match.group(1) if failure_type_match else ""
+        type_match = re.search(r"type:\s*'([^']+)'", block_text)
+        test_type = type_match.group(1) if type_match else ""
+        message_match = re.search(r"error:\s*'([^']+)'", block_text)
+        message = message_match.group(1) if message_match else ""
+
+        if failure_type == "subtestsFailed" or test_type == "suite":
+            diagnostic = _diagnostic_from_lines(block_lines, suite_name, kind="node_parent_suite")
+            if diagnostic.message and diagnostic.message not in seen_diagnostics:
+                diagnostics.append(diagnostic)
+                seen_diagnostics.add(diagnostic.message)
+        else:
+            failures.append(
+                _NormalizedTestFailure(
+                    name=title,
+                    message=_truncate_summary_text(message or block_text),
+                    failure_type=failure_type,
+                    suite=suite_name,
+                )
+            )
+        index = next_index
+
+    return failures, diagnostics
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract a JSON object from reporter output that may contain extra log lines."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(stripped[start : end + 1])
+    except Exception:  # noqa: BLE001
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_mocha_json_output(
+    stdout: str,
+    stderr: str,
+    *,
+    suite_name: str = "mocha",
+) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+    """Normalize Mocha JSON reporter output."""
+    report = _extract_json_object(stdout) or _extract_json_object(stderr)
+    if not report:
+        return [], []
+    failures: List[_NormalizedTestFailure] = []
+    for item in report.get("failures") or []:
+        if not isinstance(item, dict):
+            continue
+        error = item.get("err") if isinstance(item.get("err"), dict) else {}
+        full_title = item.get("fullTitle") or item.get("title") or "mocha failure"
+        failures.append(
+            _NormalizedTestFailure(
+                name=str(full_title),
+                message=_truncate_summary_text(str(error.get("message") or "")),
+                failure_type=str(error.get("name") or ""),
+                suite=suite_name,
+            )
+        )
+    return failures, []
+
+
+def _iter_vitest_failures(node: Any) -> List[Dict[str, Any]]:
+    """Collect failed assertion nodes from Vitest JSON reporter-like structures."""
+    found: List[Dict[str, Any]] = []
+    if isinstance(node, dict):
+        status = str(node.get("status") or "").lower()
+        if status in {"failed", "fail"} and (node.get("name") or node.get("fullName")):
+            found.append(node)
+        for value in node.values():
+            found.extend(_iter_vitest_failures(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_iter_vitest_failures(value))
+    return found
+
+
+def _normalize_vitest_json_output(
+    stdout: str,
+    stderr: str,
+    *,
+    suite_name: str = "vitest",
+) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+    """Normalize Vitest JSON reporter output when available."""
+    report = _extract_json_object(stdout) or _extract_json_object(stderr)
+    if not report:
+        return [], []
+    failures: List[_NormalizedTestFailure] = []
+    for item in _iter_vitest_failures(report):
+        errors = item.get("errors") if isinstance(item.get("errors"), list) else []
+        first_error = errors[0] if errors and isinstance(errors[0], dict) else {}
+        failures.append(
+            _NormalizedTestFailure(
+                name=str(item.get("fullName") or item.get("name") or "vitest failure"),
+                message=_truncate_summary_text(str(first_error.get("message") or "")),
+                failure_type=str(first_error.get("name") or ""),
+                suite=suite_name,
+            )
+        )
+    return failures, []
+
+
+def _normalize_suite_result(
+    plan: _TestSuitePlan,
+    result: Any,
+    *,
+    command: str,
+) -> _NormalizedSuiteResult:
+    """Normalize one child-suite result into failed tests plus diagnostics."""
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    exit_code = int(getattr(result, "exit_code", 1))
+    failures: List[_NormalizedTestFailure] = []
+    diagnostics: List[_NormalizedTestDiagnostic] = []
+
+    if plan.runner == "node_test":
+        failures, diagnostics = _normalize_node_tap_output(stdout, stderr, suite_name=plan.name)
+    elif plan.runner == "mocha":
+        failures, diagnostics = _normalize_mocha_json_output(stdout, stderr, suite_name=plan.name)
+    elif plan.runner in {"vitest", "angular_vitest"}:
+        failures, diagnostics = _normalize_vitest_json_output(stdout, stderr, suite_name=plan.name)
+
+    fallback_summary = ""
+    if exit_code != 0 and not failures and not diagnostics:
+        fallback_summary = _summarize_failed_test_output(exit_code, stdout, stderr)
+
+    return _NormalizedSuiteResult(
+        name=plan.name,
+        runner=plan.runner,
+        command=command,
+        exit_code=exit_code,
+        failed_tests=failures,
+        diagnostics=diagnostics,
+        fallback_summary=fallback_summary,
+    )
+
+
+def _format_normalized_test_summary(suites: List[_NormalizedSuiteResult]) -> str:
+    """Format normalized suite results into the bounded query_qa_logs text contract."""
+    failed_suites = [suite for suite in suites if suite.exit_code != 0]
+    exit_code = failed_suites[-1].exit_code if failed_suites else 0
+    failed_tests = [failure for suite in suites for failure in suite.failed_tests]
+    diagnostics = [diagnostic for suite in suites for diagnostic in suite.diagnostics]
+    lines = [
+        f"npm test FAILED (exit {exit_code}).",
+        f"Failed Tests: {len(failed_tests)}",
+        f"Runner Diagnostics: {len(diagnostics)}",
+        "",
+        "Suites:",
+    ]
+    for suite in suites:
+        status = "passed" if suite.exit_code == 0 else "failed"
+        lines.append(
+            f"- {suite.name}: {status} ({suite.runner}, exit {suite.exit_code})"
+        )
+        lines.append(f"  command: {suite.command}")
+
+    if failed_tests:
+        lines.extend(["", "Failing Tests:"])
+        for index, failure in enumerate(failed_tests[:_TEST_FAILURE_MAX_ITEMS], start=1):
+            suffix = f" [{failure.suite}]" if failure.suite else ""
+            lines.append(f"{index}. {failure.name}{suffix}")
+            details = "\n".join(
+                part for part in [failure.failure_type, failure.message] if part
+            )
+            if details:
+                lines.append(details)
+            lines.append("")
+        if len(failed_tests) > _TEST_FAILURE_MAX_ITEMS:
+            lines.append(
+                f"... and {len(failed_tests) - _TEST_FAILURE_MAX_ITEMS} more failed tests omitted"
+            )
+
+    if diagnostics:
+        lines.extend(["", "Runner Diagnostics:"])
+        for index, diagnostic in enumerate(diagnostics[:_TEST_FAILURE_MAX_ITEMS], start=1):
+            suffix = f" [{diagnostic.suite}]" if diagnostic.suite else ""
+            lines.append(f"{index}. {diagnostic.kind}{suffix}")
+            lines.append(diagnostic.message)
+            lines.append("")
+        if len(diagnostics) > _TEST_FAILURE_MAX_ITEMS:
+            lines.append(
+                f"... and {len(diagnostics) - _TEST_FAILURE_MAX_ITEMS} more diagnostics omitted"
+            )
+
+    for suite in failed_suites:
+        if suite.fallback_summary:
+            lines.extend(["", suite.fallback_summary])
+
+    summary = "\n".join(lines).strip()
+    if len(summary) > _LOG_QUERY_MAX_CHARS:
+        summary = summary[:_LOG_QUERY_MAX_CHARS].rstrip() + "\n... (summary truncated)"
+    return summary
+
+
+def _run_detected_test_suites(
+    sandbox: DockerSandbox,
+    plans: List[_TestSuitePlan],
+) -> Tuple[bool, str]:
+    """Run detected child suites sequentially, preserving npm ``&&`` short-circuiting."""
+    suite_results: List[_NormalizedSuiteResult] = []
+    for plan in plans:
+        command = _structured_command_for_plan(plan)
+        result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
+        suite_result = _normalize_suite_result(plan, result, command=command)
+        suite_results.append(suite_result)
+        if suite_result.exit_code != 0:
+            return False, _format_normalized_test_summary(suite_results)
+    return True, "npm test passed."
+
+
 def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
     """
-    Run ``npm test`` inside the workspace.
+    Run workspace unit tests, preferring structured child-suite summaries.
 
     Returns:
         (success, summary_text)
     """
+    plans = _detect_test_suite_plans(sandbox)
+    if plans and any(plan.runner != "npm_text_fallback" for plan in plans):
+        return _run_detected_test_suites(sandbox, plans)
+
     result = sandbox.run("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
     if result.exit_code == 0:
         return True, "npm test passed."
