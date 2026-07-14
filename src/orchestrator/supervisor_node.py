@@ -57,7 +57,7 @@ from src.tools.registry_tools import view_npm_package_versions
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 2
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -80,6 +80,115 @@ _WORKABLE_STATUSES = frozenset({
     TaskStatus.PENDING,
     TaskStatus.NEEDS_RETRY,
 })
+
+
+def _dispatchable_task_ids_for_status(
+    task_queue: Dict[str, RemediationTask],
+    statuses: Set[TaskStatus],
+    preferred_ids: Optional[List[str]] = None,
+    strategy: Optional[RoutingStrategy] = None,
+    limit: Optional[int] = None,
+) -> List[str]:
+    """Return non-terminal task IDs matching status and optional strategy filters."""
+    ordered_ids = list(preferred_ids) if preferred_ids is not None else list(task_queue.keys())
+    dispatchable: List[str] = []
+    seen: Set[str] = set()
+
+    for task_id in ordered_ids:
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        if task.status in _TERMINAL_STATUSES:
+            continue
+        if task.status not in statuses:
+            continue
+        if strategy is not None and task.strategy != strategy:
+            continue
+        dispatchable.append(task_id)
+        if limit is not None and len(dispatchable) >= limit:
+            break
+
+    return dispatchable
+
+
+def _qa_ready_task_ids(
+    task_queue: Dict[str, RemediationTask],
+    preferred_ids: Optional[List[str]] = None,
+) -> List[str]:
+    return _dispatchable_task_ids_for_status(
+        task_queue,
+        {TaskStatus.OPTIMISTICALLY_FIXED},
+        preferred_ids=preferred_ids,
+    )
+
+
+def _is_exhausted_update_pivot_candidate(
+    task: RemediationTask,
+    diagnostics: Optional[UpdateRetryDiagnostics],
+) -> bool:
+    """Return True when a retry update task must pivot instead of retrying update."""
+    return (
+        task.strategy == RoutingStrategy.VERSION_BUMP
+        and task.status == TaskStatus.NEEDS_RETRY
+        and diagnostics is not None
+        and (diagnostics.package_abandoned or diagnostics.exhausted_update_path)
+    )
+
+
+def _update_worker_task_ids(
+    task_queue: Dict[str, RemediationTask],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    preferred_ids: Optional[List[str]] = None,
+    limit: Optional[int] = UPDATE_BATCH_SIZE,
+) -> List[str]:
+    task_ids = _dispatchable_task_ids_for_status(
+        task_queue,
+        set(_WORKABLE_STATUSES),
+        preferred_ids=preferred_ids,
+        strategy=RoutingStrategy.VERSION_BUMP,
+    )
+    dispatchable = [
+        task_id
+        for task_id in task_ids
+        if not _is_exhausted_update_pivot_candidate(
+            task_queue[task_id],
+            retry_diagnostics_by_task.get(task_id),
+        )
+    ]
+    if limit is not None:
+        return dispatchable[:limit]
+    return dispatchable
+
+
+def _normalize_target_task_ids_for_node(
+    next_node: str,
+    target_task_ids: List[str],
+    task_queue: Dict[str, RemediationTask],
+    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
+) -> List[str]:
+    """Clamp returned active targets to the lifecycle state accepted by next_node."""
+    retry_diagnostics_by_task = retry_diagnostics_by_task or {}
+    if next_node == "qa_critic":
+        return _qa_ready_task_ids(task_queue, preferred_ids=target_task_ids)
+    if next_node == "update_subagent":
+        return _update_worker_task_ids(
+            task_queue,
+            retry_diagnostics_by_task,
+            preferred_ids=target_task_ids,
+            limit=UPDATE_BATCH_SIZE,
+        )
+    if next_node == "workaround_subagent":
+        return _dispatchable_task_ids_for_status(
+            task_queue,
+            set(_WORKABLE_STATUSES),
+            preferred_ids=target_task_ids,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            limit=1,
+        )
+    return []
 
 
 def _resolve_task_id_from_identifier(
@@ -334,27 +443,25 @@ def _deterministic_routing(
         )
 
     # If active batch is all optimistically_fixed → route to qa_critic
-    active_target_ids = set(active_target_task_ids or [])
-    current_batch = [t for t in tasks if t.task_id in active_target_ids]
-    if current_status != "qa_completed" and current_batch and all(
-        t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in current_batch
-    ):
+    current_batch_qa_ready = _qa_ready_task_ids(
+        task_queue,
+        preferred_ids=list(active_target_task_ids or []),
+    )
+    if current_status != "qa_completed" and current_batch_qa_ready:
         return SupervisorDecision(
             next_node="qa_critic",
-            target_task_ids=[t.task_id for t in current_batch],
+            target_task_ids=current_batch_qa_ready,
             instructions="Run QA on the current remediated batch before starting more remediation.",
             decision_reason=(
-                f"Routing the current batch of {len(current_batch)} optimistically fixed task(s) to QA."
+                f"Routing {len(current_batch_qa_ready)} optimistically fixed task(s) from the current batch to QA."
             ),
         )
 
-    all_optimistic = all(
-        t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal
-    )
-    if all_optimistic:
+    all_qa_ready = _qa_ready_task_ids(task_queue)
+    if all_qa_ready:
         return SupervisorDecision(
             next_node="qa_critic",
-            target_task_ids=[t.task_id for t in non_terminal],
+            target_task_ids=all_qa_ready,
             instructions="Run QA on the remaining optimistically fixed tasks.",
             decision_reason="Routing all remaining optimistically fixed tasks to QA.",
         )
@@ -403,35 +510,25 @@ def _deterministic_routing(
             ),
         )
 
-    exhausted_retry = next(
-        (
-            task
-            for task in workable
-            if task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.status == TaskStatus.NEEDS_RETRY
-            and (
-                retry_diagnostics_by_task.get(task.task_id) is not None
-                and (
-                    retry_diagnostics_by_task[task.task_id].package_abandoned
-                    or retry_diagnostics_by_task[task.task_id].exhausted_update_path
-                )
-            )
-        ),
-        None,
-    )
-    if exhausted_retry is not None:
-        component = (
-            group_by_id.get(exhausted_retry.parent_group_id).vulnerable_component
-            if exhausted_retry.parent_group_id in group_by_id
-            else exhausted_retry.parent_group_id
+    exhausted_retries = [
+        task
+        for task in workable
+        if _is_exhausted_update_pivot_candidate(
+            task,
+            retry_diagnostics_by_task.get(task.task_id),
         )
-        diagnostics = retry_diagnostics_by_task.get(exhausted_retry.task_id)
-        return SupervisorDecision(
-            next_node="workaround_subagent",
-            target_task_ids=[exhausted_retry.task_id],
-            spawn_requests=[
+    ]
+    if exhausted_retries:
+        spawn_requests: List[TaskSpawnRequest] = []
+        for task in exhausted_retries:
+            component = (
+                group_by_id.get(task.parent_group_id).vulnerable_component
+                if task.parent_group_id in group_by_id
+                else task.parent_group_id
+            )
+            spawn_requests.append(
                 TaskSpawnRequest(
-                    parent_task_id=exhausted_retry.task_id,
+                    parent_task_id=task.task_id,
                     strategy=RoutingStrategy.CODE_WORKAROUND,
                     instruction=(
                         f"Implement a code workaround or isolation strategy for {component} because "
@@ -442,10 +539,14 @@ def _deterministic_routing(
                         "to a workaround child task."
                     ),
                 )
-            ],
-            instructions="Pivot exhausted update remediation to the workaround worker.",
+            )
+        return SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=[exhausted_retries[0].task_id],
+            spawn_requests=spawn_requests,
+            instructions="Pivot exhausted update remediation to workaround child tasks.",
             decision_reason=(
-                f"Retry diagnostics show that '{component}' no longer has a remaining manifest-based update path."
+                f"Retry diagnostics show {len(exhausted_retries)} update task(s) no longer have a remaining manifest-based update path."
             ),
         )
 
@@ -573,10 +674,15 @@ def _build_planner_prompt(
         "Use view_npm_package_versions only when retry diagnostics are missing, inconsistent, or ambiguous.",
         "The default source of truth is the existing retry diagnostics, not a second full registry search.",
         "",
-        "## Task Queue",
+        "## Actionable Retry Tasks",
+        "Write Strategy Scratchpad sections only for these NEEDS_RETRY tasks.",
     ]
 
-    for task in task_queue.values():
+    actionable_retry_tasks = [
+        task for task in task_queue.values() if task.status == TaskStatus.NEEDS_RETRY
+    ]
+
+    for task in actionable_retry_tasks:
         group = group_by_id.get(task.parent_group_id)
         cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
         ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
@@ -614,6 +720,42 @@ def _build_planner_prompt(
                 f"  Failure Reason: {diagnostics.failure_reason or 'none'}",
             ]
 
+    if not actionable_retry_tasks:
+        lines.append("- (none)")
+
+    terminal_tasks = [
+        task for task in task_queue.values() if task.status in _TERMINAL_STATUSES
+    ]
+    qa_ready_tasks = [
+        task for task in task_queue.values() if task.status == TaskStatus.OPTIMISTICALLY_FIXED
+    ]
+
+    lines += [
+        "",
+        "## QA-Ready Tasks (read-only for planner)",
+        "These tasks must go to QA before retry planning. Do not recommend retries, pivots, or spawn_requests for them.",
+    ]
+    if qa_ready_tasks:
+        for task in qa_ready_tasks:
+            group = group_by_id.get(task.parent_group_id)
+            component = group.vulnerable_component if group else task.parent_group_id
+            lines.append(f"- {task.task_id}: {component} ({task.status.value})")
+    else:
+        lines.append("- (none)")
+
+    lines += [
+        "",
+        "## Terminal History (read-only for planner)",
+        "These tasks are audit/history only. Do not recommend retries, pivots, spawn_requests, revised instructions, or routing for them.",
+    ]
+    if terminal_tasks:
+        for task in terminal_tasks:
+            group = group_by_id.get(task.parent_group_id)
+            component = group.vulnerable_component if group else task.parent_group_id
+            lines.append(f"- {task.task_id}: {component} ({task.status.value})")
+    else:
+        lines.append("- (none)")
+
     lines += [
         "",
         "## Constraints Ledger (must not violate these)",
@@ -640,6 +782,7 @@ def _build_planner_prompt(
         "- BREAKING_CHANGE: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
         "- package_abandoned=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
         "- exhausted_update_path=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
+        "- VERSION_BUMP + NEEDS_RETRY + exhausted_update_path=True must not be routed back to update_subagent.",
         "- A strategy pivot must be expressed as a child-task recommendation, not as an in-place worker retry.",
         "",
         "## Queue Caps",
@@ -647,7 +790,7 @@ def _build_planner_prompt(
         f"- MAX_ANCESTRY_DEPTH = {MAX_ANCESTRY_DEPTH}",
         "",
         "## Output Format",
-        "Write a 'Strategy Scratchpad' with these sections for each task needing attention:",
+        "Write a 'Strategy Scratchpad' with these sections for each actionable retry task only:",
         "  1. Observations",
         "  2. Playbook selected",
         "  3. Update-path assessment",
@@ -809,6 +952,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         f"## Queue Caps: {len(task_queue)}/{MAX_TASK_QUEUE_SIZE} tasks used, depth cap = {MAX_ANCESTRY_DEPTH}",
         "",
         "## Router Rules (follow strictly)",
+        "0. QA-ready tasks have priority: route optimistically_fixed tasks to qa_critic before planning retries or dispatching workers.",
         f"1. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
         f"2. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
         "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry.",
@@ -821,13 +965,16 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "10. After a worker succeeds for the current active batch, route that batch to qa_critic.",
         "11. When no actionable non-terminal tasks remain, route to teardown.",
         f"12. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
-        "13. unfixable, qa_passed, and optimistically_fixed tasks must not appear in worker target_task_ids.",
+        "13. unfixable and qa_passed tasks must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
         "14. task_status_updates may only set QA_PASSED or UNFIXABLE.",
         f"15. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
         "16. workaround_subagent MUST have exactly one target_task_id.",
         "17. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
         f"18. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
         "19. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
+        "20. Mixed worker batches must be split by task status before routing the next node.",
+        "21. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
+        "22. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
     ]
 
     return "\n".join(lines)
@@ -1039,6 +1186,10 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         if (
             task.status == TaskStatus.NEEDS_RETRY
             and task.retry_count >= MAX_RETRIES
+            and not _is_exhausted_update_pivot_candidate(
+                task,
+                retry_diagnostics_by_task.get(task_id),
+            )
         ):
             task.status = TaskStatus.UNFIXABLE
             logger.info(
@@ -1052,16 +1203,17 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     decision: Optional[SupervisorDecision] = None
     if state.get("status") != "qa_completed" and active_target_task_ids:
-        active_batch = [task_queue[t] for t in active_target_task_ids if t in task_queue]
-        if active_batch and all(
-            t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in active_batch
-        ):
+        active_qa_ready = _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=active_target_task_ids,
+        )
+        if active_qa_ready:
             decision = SupervisorDecision(
                 next_node="qa_critic",
-                target_task_ids=[t.task_id for t in active_batch],
+                target_task_ids=active_qa_ready,
                 instructions="Run QA on the current remediated batch before starting more remediation.",
                 decision_reason=(
-                    f"Routing the current batch of {len(active_batch)} optimistically fixed task(s) to QA."
+                    f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
                 ),
             )
 
@@ -1076,13 +1228,15 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 instructions="All tasks are terminal. Proceeding to teardown.",
                 decision_reason="No actionable tasks remain.",
             )
-        elif all(t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in non_terminal):
-            decision = SupervisorDecision(
-                next_node="qa_critic",
-                target_task_ids=[t.task_id for t in non_terminal],
-                instructions="Run QA on the remaining optimistically fixed tasks.",
-                decision_reason="Routing all remaining optimistically fixed tasks to QA.",
-            )
+        else:
+            qa_ready = _qa_ready_task_ids(task_queue)
+            if qa_ready:
+                decision = SupervisorDecision(
+                    next_node="qa_critic",
+                    target_task_ids=qa_ready,
+                    instructions="Run QA on the remaining optimistically fixed tasks.",
+                    decision_reason="Routing remaining optimistically fixed tasks to QA.",
+                )
 
     # ------------------------------------------------------------------
     # 6. Router phase (structured LLM call)
@@ -1138,16 +1292,17 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
     # Re-apply optimistic short-circuit post-LLM (guard against LLM overriding)
     if state.get("status") != "qa_completed" and active_target_task_ids:
-        active_batch = [task_queue[t] for t in active_target_task_ids if t in task_queue]
-        if active_batch and all(
-            t.status == TaskStatus.OPTIMISTICALLY_FIXED for t in active_batch
-        ):
+        active_qa_ready = _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=active_target_task_ids,
+        )
+        if active_qa_ready:
             decision = SupervisorDecision(
                 next_node="qa_critic",
-                target_task_ids=[t.task_id for t in active_batch],
+                target_task_ids=active_qa_ready,
                 instructions="Run QA on the current remediated batch before starting more remediation.",
                 decision_reason=(
-                    f"Routing the current batch of {len(active_batch)} optimistically fixed task(s) to QA."
+                    f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
                 ),
             )
 
@@ -1190,17 +1345,49 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     else:
         known_task_ids = set(task_queue.keys())
 
-        # Remove unknown, terminal, or optimistically_fixed task IDs from worker targets
-        valid_target_ids = []
-        for t_id in decision.target_task_ids:
-            if t_id not in known_task_ids:
-                continue
-            t_status = task_queue[t_id].status
-            if t_status in _TERMINAL_STATUSES:
-                continue
-            if decision.next_node in ("update_subagent", "workaround_subagent") and t_status == TaskStatus.OPTIMISTICALLY_FIXED:
-                continue
-            valid_target_ids.append(t_id)
+        raw_pivot_parent_ids = {
+            req.parent_task_id
+            for req in decision.spawn_requests
+            if req.parent_task_id in known_task_ids
+            and task_queue[req.parent_task_id].status not in _TERMINAL_STATUSES
+            and task_queue[req.parent_task_id].status in _WORKABLE_STATUSES
+            and task_queue[req.parent_task_id].strategy != req.strategy
+            and decision.next_node == _worker_node_for_strategy(req.strategy)
+        }
+        raw_pivot_parent_ids.update(
+            task_id
+            for task_id, new_strategy in decision.updated_task_strategies.items()
+            if task_id in known_task_ids
+            and task_queue[task_id].status not in _TERMINAL_STATUSES
+            and task_queue[task_id].status in _WORKABLE_STATUSES
+            and task_queue[task_id].strategy != new_strategy
+            and decision.next_node == _worker_node_for_strategy(new_strategy)
+        )
+
+        if decision.next_node == "qa_critic":
+            valid_target_ids = _qa_ready_task_ids(
+                task_queue,
+                preferred_ids=list(decision.target_task_ids),
+            )
+        elif decision.next_node == "update_subagent":
+            valid_target_ids = _update_worker_task_ids(
+                task_queue,
+                retry_diagnostics_by_task,
+                preferred_ids=list(decision.target_task_ids),
+                limit=UPDATE_BATCH_SIZE,
+            )
+        elif decision.next_node == "workaround_subagent":
+            valid_target_ids = []
+            for t_id in decision.target_task_ids:
+                if t_id not in known_task_ids:
+                    continue
+                task = task_queue[t_id]
+                if task.status in _TERMINAL_STATUSES or task.status not in _WORKABLE_STATUSES:
+                    continue
+                if task.strategy == RoutingStrategy.CODE_WORKAROUND or t_id in raw_pivot_parent_ids:
+                    valid_target_ids.append(t_id)
+        else:
+            valid_target_ids = []
 
         valid_unfixable_ids = [
             t_id for t_id in decision.unfixable_task_ids if t_id in known_task_ids
@@ -1263,6 +1450,23 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 active_target_task_ids=active_target_task_ids,
                 current_status=str(state.get("status") or ""),
             )
+            fallback_pivot_strategy_by_parent = {
+                req.parent_task_id: req.strategy
+                for req in decision.spawn_requests
+                if req.parent_task_id in task_queue
+                and task_queue[req.parent_task_id].strategy != req.strategy
+            }
+            for parent_id, new_strategy in fallback_pivot_strategy_by_parent.items():
+                pivot_parent_status_by_parent[parent_id] = _parent_status_for_strategy_pivot(
+                    task_queue[parent_id],
+                    new_strategy,
+                    qa_evaluations,
+                )
+            pivot_target_parent_ids = {
+                task_id
+                for task_id in decision.target_task_ids
+                if task_id in fallback_pivot_strategy_by_parent
+            }
         else:
             # Filter revised_instructions and feedback_by_task to known task IDs
             clean_revised_instructions = {
@@ -1527,11 +1731,24 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             remapped_feedback_by_task[task_id] = decision.feedback_by_task[task_id]
 
     resolved_next_node = decision.next_node
+    resolved_target_task_ids = _normalize_target_task_ids_for_node(
+        resolved_next_node,
+        resolved_target_task_ids,
+        task_queue,
+        retry_diagnostics_by_task,
+    )
+    remapped_feedback_by_task = {
+        task_id: feedback
+        for task_id, feedback in remapped_feedback_by_task.items()
+        if task_id in set(resolved_target_task_ids)
+    }
     if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"} and not resolved_target_task_ids:
         errors.append(
             "supervisor: routing fell back to teardown because no dispatchable target tasks remained."
         )
         resolved_next_node = "teardown"
+        resolved_target_task_ids = []
+        remapped_feedback_by_task = {}
 
     logger.info(
         "supervisor: routing to '%s' with targets=%s",

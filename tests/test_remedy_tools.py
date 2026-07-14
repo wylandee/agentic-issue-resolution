@@ -22,6 +22,7 @@ def _update_tool_map(
     package_manifest_paths=None,
     enable_registry_lookup=False,
     attempted_versions_by_package=None,
+    override_required_packages=None,
     require_planning_answers=False,
     planning_state=None,
 ):
@@ -41,6 +42,7 @@ def _update_tool_map(
         package_manifest_paths,
         enable_registry_lookup=enable_registry_lookup,
         attempted_versions_by_package=attempted_versions_by_package,
+        override_required_packages=override_required_packages,
         require_planning_answers=require_planning_answers,
         planning_state=planning_state,
     )
@@ -269,6 +271,58 @@ class TestModifyNpmDependency:
         )
         assert result.startswith("ERROR:")
         assert "output your planning answers" in result
+
+    def test_rejects_direct_dependency_edit_when_overrides_required(self):
+        sandbox = MagicMock()
+        tools = _update_tool_map(
+            sandbox,
+            package_manifest_paths={"cookie": ["package.json"]},
+            override_required_packages={"cookie"},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "cookie",
+                "target_version": "0.7.0",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+        assert "constrained to npm overrides" in result
+        assert "dependency_type='overrides'" in result
+        sandbox.run.assert_not_called()
+
+    def test_allows_override_edit_when_overrides_required(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.5,
+        )
+        touched_files = set()
+        tools = _update_tool_map(
+            sandbox,
+            touched_files=touched_files,
+            package_manifest_paths={"cookie": ["package.json"]},
+            override_required_packages={"cookie"},
+        )
+
+        result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "cookie",
+                "target_version": "0.7.0",
+                "dependency_type": "overrides",
+                "manifest_path": "package.json",
+            }
+        )
+
+        assert result.startswith("SUCCESS:")
+        assert "overrides.cookie" in result
+        assert touched_files == {"package.json"}
+        sandbox.run.assert_called_once()
 
 
 class TestRevertWorkspaceFile:

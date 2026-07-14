@@ -734,6 +734,52 @@ class TestUpdateSubagentWrapper:
             assert kwargs["attempted_versions_by_package"] == {"lodash": {"4.17.21"}}
             assert kwargs["require_planning_answers"] is True
 
+    def test_update_subagent_passes_override_required_packages_to_toolbelt(self):
+        group = _sca_group()
+        repo_root = _repo_root()
+        state = initial_update_subagent_state(
+            repo_root,
+            "agent_workspace_deadbeef",
+            [group],
+            [],
+            feedback_by_task={
+                group.group_id: "Retry with npm overrides instead of a direct dependency edit.",
+            },
+        )
+        state["target_tasks"][0].retry_count = 1
+        state["target_tasks"][0].instruction = (
+            'Add or update "overrides": {"lodash": "4.17.22"} in package.json.'
+        )
+        from src.orchestrator.update_subagent import UpdateRetryDiagnostics
+        state["retry_diagnostics_by_task"] = {
+            group.group_id: UpdateRetryDiagnostics(
+                task_id=group.group_id,
+                used_overrides=True,
+                planning_answers={"5_remediation_type": "npm overrides"},
+            )
+        }
+
+        llm = MagicMock()
+        sandbox = _sandbox_mock()
+        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "src.orchestrator.update_subagent.DockerSandbox",
+            return_value=sandbox,
+        ), patch(
+            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            return_value=(["package.json"], []),
+        ), patch(
+            "src.orchestrator.update_subagent.build_update_toolbelt",
+            return_value=[],
+        ) as mock_toolbelt, patch(
+            "src.orchestrator.update_subagent.run_bounded_subagent_loop",
+        ) as mock_loop:
+            mock_loop.return_value = MagicMock(changed_files=[], tool_events=[], final_text="done", errors=[])
+            run_update_subagent_node(state)
+
+            assert mock_toolbelt.call_count == 1
+            kwargs = mock_toolbelt.call_args.kwargs
+            assert kwargs["override_required_packages"] == {"lodash"}
+
     def test_retry_diagnostics_marks_exhausted_update_path_when_latest_attempted_without_peer_conflict(self):
         from src.contracts.schemas import RemediationTask, RoutingStrategy
         from src.orchestrator.subagent_runtime import ToolEvent
@@ -788,7 +834,12 @@ class TestUpdateSubagentWrapper:
                 name="modify_npm_dependency",
                 args={"package_name": "lodash", "target_version": "4.17.21"},
                 content="SUCCESS",
-            )
+            ),
+            ToolEvent(
+                name="validate_manifest_sync",
+                args={},
+                content="SUCCESS: Manifest synchronization succeeded for package.json.",
+            ),
         ]
         summaries = _build_action_summaries(
             [
@@ -800,6 +851,61 @@ class TestUpdateSubagentWrapper:
             succeeded=True,
             tool_events=tool_events,
         )
+        assert summaries[0].status == AgentActionStatus.SUCCESS
+        assert summaries[1].status == AgentActionStatus.SURRENDER
+
+    def test_build_action_summaries_keeps_validated_package_successful_even_when_batch_fails(self):
+        from src.contracts.schemas import AgentActionStatus
+        from src.orchestrator.subagent_runtime import ToolEvent
+        from src.orchestrator.update_subagent import _build_action_summaries
+
+        group1 = _sca_group()
+        group2 = _sca_group()
+        group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
+        group2.vulnerable_component = "ws"
+
+        tool_events = [
+            ToolEvent(
+                name="modify_npm_dependency",
+                args={
+                    "package_name": "lodash",
+                    "target_version": "4.17.21",
+                    "manifest_path": "package.json",
+                },
+                content="SUCCESS",
+            ),
+            ToolEvent(
+                name="validate_manifest_sync",
+                args={},
+                content="SUCCESS: Manifest synchronization succeeded for package.json.",
+            ),
+            ToolEvent(
+                name="modify_npm_dependency",
+                args={
+                    "package_name": "ws",
+                    "target_version": "8.20.1",
+                    "manifest_path": "package.json",
+                },
+                content="SUCCESS",
+            ),
+            ToolEvent(
+                name="revert_workspace_file",
+                args={"file_path": "package.json", "package_name": "ws"},
+                content="SUCCESS: Reverted package.json",
+            ),
+        ]
+
+        summaries = _build_action_summaries(
+            [
+                (MagicMock(task_id=group1.group_id), group1, ["package.json"]),
+                (MagicMock(task_id=group2.group_id), group2, ["package.json"]),
+            ],
+            changed_files=["package.json"],
+            final_text="Updated lodash, reverted ws after dependency conflict",
+            succeeded=False,
+            tool_events=tool_events,
+        )
+
         assert summaries[0].status == AgentActionStatus.SUCCESS
         assert summaries[1].status == AgentActionStatus.SURRENDER
 

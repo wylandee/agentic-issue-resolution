@@ -215,6 +215,7 @@ def _make_modify_npm_dependency_tool(
     touched_files: Set[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
     attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
+    override_required_packages: Optional[Iterable[str]] = None,
     require_planning_answers: bool = False,
     planning_state: Optional[Dict[str, bool]] = None,
 ):
@@ -223,6 +224,11 @@ def _make_modify_npm_dependency_tool(
         for package_name, manifest_paths in _normalize_package_manifest_targets(
             package_manifest_paths
         ).items()
+    }
+    override_required_package_names = {
+        package_name.strip()
+        for package_name in (override_required_packages or [])
+        if package_name and package_name.strip()
     }
 
     @tool
@@ -269,6 +275,15 @@ def _make_modify_npm_dependency_tool(
             return (
                 "ERROR: dependency_type must be strictly one of: "
                 "'dependencies', 'devDependencies', or 'overrides'."
+            )
+        if (
+            package_name in override_required_package_names
+            and dependency_type != "overrides"
+        ):
+            return (
+                f"ERROR: Package '{package_name}' is constrained to npm overrides for "
+                "this task. Retry modify_npm_dependency with dependency_type='overrides'. "
+                "No manifest changes were made."
             )
 
         try:
@@ -570,6 +585,7 @@ def build_update_toolbelt(
     package_manifest_paths: Mapping[str, Iterable[str]],
     enable_registry_lookup: bool = False,
     attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
+    override_required_packages: Optional[Iterable[str]] = None,
     require_planning_answers: bool = False,
     planning_state: Optional[Dict[str, bool]] = None,
 ) -> List:
@@ -582,6 +598,7 @@ def build_update_toolbelt(
             touched_files,
             package_manifest_paths,
             attempted_versions_by_package=attempted_versions_by_package,
+            override_required_packages=override_required_packages,
             require_planning_answers=require_planning_answers,
             planning_state=planning_state,
         ),

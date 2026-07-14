@@ -172,6 +172,47 @@ def _build_package_manifest_map(
     return package_manifest_map
 
 
+def _requires_override_remediation(
+    task: RemediationTask,
+    diagnostics: UpdateRetryDiagnostics | None = None,
+    feedback: str = "",
+    previous_outcome: str = "",
+) -> bool:
+    """Return whether this package must be edited through npm overrides."""
+    if diagnostics and diagnostics.used_overrides:
+        return True
+
+    text_parts = [
+        task.instruction or "",
+        feedback or "",
+        previous_outcome or "",
+    ]
+    if diagnostics:
+        text_parts.extend(
+            [
+                diagnostics.failure_reason,
+                diagnostics.reasoning_summary,
+                *diagnostics.planning_answers.values(),
+            ]
+        )
+    lowered = " ".join(part.lower() for part in text_parts if part)
+    return any(
+        marker in lowered
+        for marker in (
+            '"overrides"',
+            "'overrides'",
+            "npm override",
+            "npm overrides",
+            "use overrides",
+            "using overrides",
+            "via overrides",
+            "with overrides",
+            "transitive dependency",
+            "transitive-only",
+        )
+    )
+
+
 def _is_retry_task(task: RemediationTask) -> bool:
     return task.retry_count > 0 or task.status == TaskStatus.NEEDS_RETRY
 
@@ -429,11 +470,83 @@ def _was_package_modified(
     return modified
 
 
+def _has_successful_validation_for_package(
+    group: VulnerabilityGroup,
+    tool_events: Optional[Sequence[Any]],
+) -> bool:
+    """Return whether a package's final manifest state was validated successfully."""
+    if not tool_events:
+        return False
+
+    pkg = (group.vulnerable_component or "").strip()
+    last_successful_edit_index = -1
+
+    for index, event in enumerate(tool_events):
+        name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
+        content = str(getattr(event, "content", ""))
+        if (
+            name == "modify_npm_dependency"
+            and args.get("package_name") == pkg
+            and (content.startswith("SUCCESS:") or content == "SUCCESS")
+        ):
+            last_successful_edit_index = index
+
+    if last_successful_edit_index < 0:
+        return False
+
+    for event in tool_events[last_successful_edit_index + 1:]:
+        name = getattr(event, "name", "")
+        content = str(getattr(event, "content", ""))
+        if name == "validate_manifest_sync" and (
+            content.startswith("SUCCESS:") or content == "SUCCESS"
+        ):
+            return True
+
+    return False
+
+
+def _had_registry_lookup_before_package_edit(
+    group: VulnerabilityGroup,
+    tool_events: Optional[Sequence[Any]],
+) -> bool:
+    """Return whether retry-mode registry lookup happened before this package's first edit."""
+    if not tool_events:
+        return False
+
+    pkg = (group.vulnerable_component or "").strip()
+    first_successful_edit_index = -1
+
+    for index, event in enumerate(tool_events):
+        name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
+        content = str(getattr(event, "content", ""))
+        if (
+            name == "modify_npm_dependency"
+            and args.get("package_name") == pkg
+            and (content.startswith("SUCCESS:") or content == "SUCCESS")
+        ):
+            first_successful_edit_index = index
+            break
+
+    if first_successful_edit_index < 0:
+        return False
+
+    for event in tool_events[:first_successful_edit_index]:
+        name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
+        if name == "view_npm_package_versions" and args.get("package_name") == pkg:
+            return True
+
+    return False
+
+
 def _build_action_summaries(
     resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
     final_text: str,
     succeeded: bool,
+    retry_batch: bool = False,
     tool_events: Optional[Sequence[Any]] = None,
 ) -> List[AgentActionSummary]:
     final_note = final_text.strip()
@@ -450,8 +563,22 @@ def _build_action_summaries(
             if path.replace("\\", "/") in normalized_changed_files
         ]
         pkg_reverted = _was_package_reverted(group, tool_events)
-        pkg_modified = _was_package_modified(group, tool_events) if tool_events is not None else (bool(relevant_changed_files) and not pkg_reverted)
-        task_succeeded = succeeded and pkg_modified
+        pkg_modified = (
+            _was_package_modified(group, tool_events)
+            if tool_events is not None
+            else (bool(relevant_changed_files) and not pkg_reverted)
+        )
+        pkg_validated = (
+            _has_successful_validation_for_package(group, tool_events)
+            if tool_events is not None
+            else succeeded
+        )
+        pkg_had_retry_lookup = (
+            _had_registry_lookup_before_package_edit(group, tool_events)
+            if retry_batch and tool_events is not None
+            else True
+        )
+        task_succeeded = pkg_modified and pkg_validated and pkg_had_retry_lookup
         summary_status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
         outcome = (
             "Completed validated manifest updates"
@@ -792,11 +919,19 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     ]
 
     attempted_versions_by_package: Dict[str, Set[str]] = {}
+    override_required_packages: set[str] = set()
     for task, group, _ in skinny_resolved_tasks:
         pkg_name = (group.vulnerable_component or "").strip()
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
         if pkg_name and diag and diag.attempted_versions:
             attempted_versions_by_package[pkg_name] = set(diag.attempted_versions)
+        if pkg_name and _requires_override_remediation(
+            task,
+            diag,
+            feedback_by_task.get(task.task_id, ""),
+            previous_action_summaries_by_task.get(task.task_id, ""),
+        ):
+            override_required_packages.add(pkg_name)
 
     planning_state = {"submitted": False} if retry_batch else None
 
@@ -815,6 +950,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
                 package_manifest_paths=package_manifest_map,
                 enable_registry_lookup=retry_batch,
                 attempted_versions_by_package=attempted_versions_by_package,
+                override_required_packages=override_required_packages,
                 require_planning_answers=retry_batch,
                 planning_state=planning_state,
             )
@@ -860,6 +996,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         runtime.changed_files,
         runtime.final_text,
         succeeded,
+        retry_batch=retry_batch,
         tool_events=runtime.tool_events,
     )
     return {
