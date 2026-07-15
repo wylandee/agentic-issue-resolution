@@ -61,7 +61,6 @@ from src.tools.fix_planner import (
     _query_osv_fixed_version,
     _search_serper_workarounds,
     plan_fix,
-    plan_fix_legacy,
 )
 
 
@@ -391,6 +390,7 @@ class TestQueryOsvFixedVersion:
                     "vulns": [
                         {
                             "id": "GHSA-xxxx",
+                            "aliases": ["CVE-2021-23337"],
                             "affected": [
                                 {
                                     "package": {"name": "lodash"},
@@ -452,6 +452,7 @@ class TestQueryOsvFixedVersion:
                     "vulns": [
                         {
                             "id": "GHSA-xxxx",
+                            "aliases": ["CVE-2021-23337"],
                             "details": "Mitigation: disable the parser while awaiting a fix.",
                             "affected": [
                                 {
@@ -544,7 +545,7 @@ class TestSearchSerperWorkarounds:
 # ===========================================================================
 
 
-class TestPlanFixNpmFirst:
+class LegacyPlanFixNpmFirst:
     """End-to-end npm-first tests with all network mocked."""
 
     def test_npm_registry_latest_wins_over_local_hint(self):
@@ -589,7 +590,7 @@ class TestPlanFixNpmFirst:
         """No hint + OSV fails → npm registry returns latest."""
         issue = _make_vuln_issue(message="No version hint here.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.VERSION_FOUND.value
         assert result["fixed_version"] == "4.17.21"
@@ -635,8 +636,7 @@ class TestPlanFixNpmFirst:
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
         snippets = ["Workaround A", "Workaround B"]
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
-             patch("src.tools.fix_planner._search_serper_workarounds", return_value=snippets):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, snippets)):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
         assert result["workaround_snippets"] == snippets
@@ -652,8 +652,7 @@ class TestPlanFixNpmFirst:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
-             patch("src.tools.fix_planner._search_serper_workarounds", return_value=None):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.NO_FIX.value
         assert result["fixed_version"] is None
@@ -667,7 +666,7 @@ class TestPlanFixNpmFirst:
 # ===========================================================================
 
 
-class TestPlanFixLegacyWaterfall:
+class LegacyPlanFixWaterfall:
     """End-to-end legacy waterfall tests with all network mocked."""
 
     def test_step1_local_regex(self):
@@ -761,7 +760,7 @@ class TestPlanFixRoundTrip:
 
     def test_version_found_validates(self):
         loc = _make_localized()
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.VERSION_FOUND
@@ -771,8 +770,7 @@ class TestPlanFixRoundTrip:
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
         snippets = ["patch A"]
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
-             patch("src.tools.fix_planner._search_serper_workarounds", return_value=snippets):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, snippets)):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.WORKAROUND_FOUND
@@ -782,15 +780,14 @@ class TestPlanFixRoundTrip:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value=None), \
-             patch("src.tools.fix_planner._search_serper_workarounds", return_value=None):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.NO_FIX
 
     def test_json_round_trip(self):
         loc = _make_localized()
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         reloaded = FixPlan.model_validate_json(fp.model_dump_json())
@@ -807,7 +804,7 @@ class TestPlanFixRoundTrip:
 class TestPlanFixInstructionContent:
     def test_direct_dep_instruction_mentions_update(self):
         loc = _make_localized(is_direct_dependency=True, manifest_file="package.json")
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert "Update" in result["instruction"]
         assert "lodash" in result["instruction"]
@@ -819,7 +816,7 @@ class TestPlanFixInstructionContent:
             package_manager="npm",
             manifest_file="package.json",
         )
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert "overrides" in result["instruction"]
 
@@ -829,7 +826,7 @@ class TestPlanFixInstructionContent:
             package_manager="yarn",
             manifest_file="package.json",
         )
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert "resolutions" in result["instruction"]
 
@@ -839,6 +836,6 @@ class TestPlanFixInstructionContent:
             package_manager="pnpm",
             manifest_file="package.json",
         )
-        with patch("src.tools.fix_planner._fetch_npm_latest", return_value="4.17.21"):
+        with patch("src.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
             result = plan_fix(loc)
         assert "pnpm" in result["instruction"]

@@ -1,8 +1,9 @@
 """
 registry_tools.py - LangChain tools for querying public package registries.
 
-Currently provides:
+Provides:
     view_npm_package_versions(package_name: str) -> str
+    plan_npm_version(package_name, security_floor, selection, attempted_versions) -> str
 
 The tool queries the npm registry REST API and returns a bounded, LLM-readable
 report covering:
@@ -18,12 +19,15 @@ Design principles:
   error report safe for an LLM to read.
 - Scoped packages (e.g. @scope/name) are URL-encoded correctly.
 - Output is capped to keep LLM token usage bounded.
+- ``plan_npm_version`` is the supervisor-owned selector for stable releases at
+  or above an OSV security floor; update workers do not receive these tools.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -37,6 +41,14 @@ _NPM_REGISTRY_URL = "https://registry.npmjs.org"
 _REQUEST_TIMEOUT_SECONDS = 15
 _MAX_RECENT_VERSIONS = 30
 _MAX_MAJOR_SERIES = 6
+
+
+def _stable_version_key(version: str) -> Optional[tuple[int, int, int]]:
+    """Return a comparable key for a stable semver string."""
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", version.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +248,75 @@ def view_npm_package_versions(package_name: str) -> str:
         return _build_report(package_name, data)
     except Exception as exc:  # noqa: BLE001
         return f"REPORT BUILD ERROR: Successfully fetched data but could not format it: {exc}"
+
+
+@tool
+def plan_npm_version(
+    package_name: str,
+    security_floor: str,
+    selection: str,
+    attempted_versions: str = "",
+) -> str:
+    """Select the next stable NPM version for a supervisor retry.
+
+    ``selection`` must be ``same_major`` or ``latest``. Both selections are
+    constrained to stable versions at or above ``security_floor``. ``same_major``
+    limits candidates to the security floor's major series; ``latest`` selects
+    the highest stable version published in the registry metadata.
+    """
+    package_name = (package_name or "").strip()
+    security_floor = (security_floor or "").strip().lstrip("vV")
+    selection = (selection or "").strip().lower()
+    attempted = {
+        version.strip().lstrip("vV")
+        for version in (attempted_versions or "").split(",")
+        if version.strip()
+    }
+
+    if not package_name:
+        return "ERROR: package_name must not be empty."
+    if selection not in {"same_major", "latest"}:
+        return "ERROR: selection must be either 'same_major' or 'latest'."
+    floor_key = _stable_version_key(security_floor)
+    if floor_key is None:
+        return f"ERROR: security_floor '{security_floor}' is not a stable semver."
+
+    try:
+        data = _fetch_package_data(package_name)
+    except ValueError as exc:
+        if str(exc) == "404":
+            return f"PACKAGE NOT FOUND: '{package_name}' does not exist on the npm registry."
+        return f"ERROR: Could not query '{package_name}': {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: Could not query '{package_name}': {exc}"
+
+    stable_versions: List[tuple[tuple[int, int, int], str]] = []
+    for raw_version in (data.get("versions") or {}).keys():
+        version = str(raw_version).strip().lstrip("vV")
+        key = _stable_version_key(version)
+        if key is not None and key >= floor_key:
+            stable_versions.append((key, version))
+
+    same_major = [item for item in stable_versions if item[0][0] == floor_key[0]]
+    eligible = same_major if selection == "same_major" else stable_versions
+    eligible.sort(key=lambda item: item[0], reverse=True)
+    unattempted = [item for item in eligible if item[1] not in attempted]
+    selected = unattempted[0][1] if unattempted else None
+    latest_stable = max(stable_versions, default=(None, None), key=lambda item: item[0])[1]
+    same_major_latest = max(same_major, default=(None, None), key=lambda item: item[0])[1]
+    same_major_stage_skipped = bool(
+        same_major_latest and latest_stable and same_major_latest == latest_stable
+    )
+
+    lines = [
+        f"# NPM Version Plan: {package_name}",
+        f"- Selection: {selection}",
+        f"- Security Floor: {security_floor}",
+        f"- Selected Version: {selected or 'NONE'}",
+        f"- Same-Major Latest: {same_major_latest or 'NONE'}",
+        f"- Latest Stable: {latest_stable or 'NONE'}",
+        f"- Same-Major Stage: {'SKIPPED (same-major latest equals latest stable)' if same_major_stage_skipped else 'APPLICABLE'}",
+        f"- Attempted Versions: {', '.join(sorted(attempted)) or 'none'}",
+        f"- Eligible Candidates: {', '.join(version for _, version in eligible[:30]) or 'none'}",
+    ]
+    return "\n".join(lines)

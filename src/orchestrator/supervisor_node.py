@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -44,20 +45,22 @@ from src.contracts.schemas import (
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     SupervisorDecision,
+    SupervisorRetryPlan,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
-from src.orchestrator.subagent_runtime import run_bounded_subagent_loop
+from src.orchestrator.subagent_runtime import ToolEvent, run_bounded_subagent_loop
 from src.orchestrator.task_utils import build_initial_remediation_task
-from src.tools.registry_tools import view_npm_package_versions
+from src.tools.registry_tools import plan_npm_version
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 2
+MAX_RETRIES: int = 5
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: Set[str] = {
@@ -133,9 +136,577 @@ def _is_exhausted_update_pivot_candidate(
     return (
         task.strategy == RoutingStrategy.VERSION_BUMP
         and task.status == TaskStatus.NEEDS_RETRY
-        and diagnostics is not None
-        and (diagnostics.package_abandoned or diagnostics.exhausted_update_path)
+        and (
+            task.strategy_stage == SCARemediationStage.CODE_WORKAROUND
+            or (
+                diagnostics is not None
+                and (diagnostics.package_abandoned or diagnostics.exhausted_update_path)
+            )
+        )
     )
+
+
+def _next_sca_stage(stage: SCARemediationStage) -> SCARemediationStage:
+    """Advance one ordered SCA version strategy stage."""
+    if stage == SCARemediationStage.OSV_MINIMUM:
+        return SCARemediationStage.NPM_SAME_MAJOR
+    if stage == SCARemediationStage.NPM_SAME_MAJOR:
+        return SCARemediationStage.NPM_LATEST
+    return SCARemediationStage.CODE_WORKAROUND
+
+
+def _selection_for_stage(stage: SCARemediationStage) -> Optional[str]:
+    if stage == SCARemediationStage.NPM_SAME_MAJOR:
+        return "same_major"
+    if stage == SCARemediationStage.NPM_LATEST:
+        return "latest"
+    return None
+
+
+def _parse_planner_retry_plans(
+    scratchpad: str,
+    task_queue: Dict[str, RemediationTask],
+    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    group_by_id: Optional[Dict[str, VulnerabilityGroup]] = None,
+) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    """Parse planner markers and reconcile them into typed per-task plans.
+
+    The planner scratchpad remains useful audit evidence, but this function is
+    the only place where planner output becomes routing state.  In particular,
+    ``SELECTED_VERSION: NONE`` clears stale selections instead of leaving the
+    previous retry candidate active.
+    """
+    updated = dict(diagnostics_by_task)
+    plans: Dict[str, SupervisorRetryPlan] = {}
+    sections: Dict[str, List[str]] = {}
+    current_task: Optional[str] = None
+    for line in (scratchpad or "").splitlines():
+        task_match = re.search(r"(?:TASK|Task)\s*[:#]?\s*(task-[\w-]+)", line)
+        if task_match and task_match.group(1) in task_queue:
+            current_task = task_match.group(1)
+            sections.setdefault(current_task, []).append(line)
+            continue
+        if current_task:
+            sections[current_task].append(line)
+
+    for task_id, task in task_queue.items():
+        if task_id not in sections:
+            continue
+        section = "\n".join(sections.get(task_id, []))
+        selected_match = re.search(
+            r"(?:SELECTED[_ ]VERSION|Selected Version)\s*[:=]\s*([^\s,;]+)",
+            section,
+            re.IGNORECASE,
+        )
+        selected = None
+        if not selected_match:
+            # An incomplete planner section is not a state transition. Keep
+            # the last committed plan rather than clearing it accidentally.
+            continue
+        candidate = selected_match.group(1).strip().lstrip("vV")
+        selected = None if candidate.upper() == "NONE" else candidate
+
+        effective_stage = task.strategy_stage
+        stage_match = re.search(
+            r"EFFECTIVE[_ ]STAGE\s*[:=]\s*([a-z_]+)",
+            section,
+            re.IGNORECASE,
+        )
+        if stage_match:
+            try:
+                effective_stage = SCARemediationStage(stage_match.group(1).lower())
+            except ValueError:
+                pass
+        action_match = re.search(
+            r"ACTION\s*[:=]\s*(retry_update|pivot_workaround)",
+            section,
+            re.IGNORECASE,
+        )
+        action_hint = action_match.group(1).lower() if action_match else None
+
+        prior = updated.get(task_id)
+        if prior is None:
+            group = (group_by_id or {}).get(task.parent_group_id)
+            prior = UpdateRetryDiagnostics(
+                task_id=task_id,
+                strategy_stage=task.strategy_stage,
+                security_floor=(group.fix_plan.fixed_version if group and group.fix_plan else None),
+            )
+
+        attempted = list(prior.attempted_versions)
+        candidates = list(prior.candidate_versions_considered)
+        if selected and selected not in candidates:
+            candidates.insert(0, selected)
+
+        # Keep the latest registry fact when the planner states it in its
+        # scratchpad.  This is audit evidence as well as a safe deterministic
+        # fallback if the LLM selects a version that has already been tried.
+        latest_seen = prior.latest_version_seen
+        latest_matches = re.findall(
+            r"(?:latest\s+(?:stable\s+)?version|latest\s+stable)\s*(?:is|=|:|\(|-)\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)",
+            section,
+            re.IGNORECASE,
+        )
+        if latest_matches:
+            latest_seen = latest_matches[-1]
+            if latest_seen not in candidates:
+                candidates.append(latest_seen)
+
+        lowered = section.lower()
+        pivot_recommended = bool(
+            re.search(r"pivot[^\n]*(?:workaround|child)|workaround child", lowered)
+        )
+        same_major_equals_latest = bool(
+            re.search(
+                r"same[- ]major.*(?:equal|same as).*latest\s+stable|"
+                r"latest\s+stable.*same[- ]major.*(?:equal|same as)",
+                lowered,
+            )
+        )
+        latest_candidate_already_attempted = bool(
+            re.search(r"(?:same[- ]major|latest\s+stable).*already\s+attempted", lowered)
+            or re.search(r"already\s+attempted.*(?:same[- ]major|latest\s+stable)", lowered)
+        )
+        exhausted = bool(prior.exhausted_update_path)
+        if selected is None and (
+            action_hint == "pivot_workaround"
+            or
+            pivot_recommended
+            or "no new version" in lowered
+            or "no valid candidate" in lowered
+            or "only candidate" in lowered and "already been attempted" in lowered
+            or (
+                effective_stage == SCARemediationStage.NPM_LATEST
+                and same_major_equals_latest
+                and latest_candidate_already_attempted
+            )
+        ):
+            exhausted = True
+
+        if (
+            not stage_match
+            and
+            effective_stage == SCARemediationStage.NPM_SAME_MAJOR
+            and "same-major" in lowered
+            and (
+                "same-major stage: skipped" in lowered
+                or (
+                    "latest" in lowered
+                    and ("equal" in lowered or "same" in lowered or "skip" in lowered)
+                )
+            )
+        ):
+            effective_stage = SCARemediationStage.NPM_LATEST
+
+        # A planner's free-form pivot language cannot bypass the ordered
+        # version stages. Only an exhausted NPM_LATEST task may pivot; earlier
+        # stages must remain retryable update tasks.
+        if effective_stage != SCARemediationStage.NPM_LATEST:
+            exhausted = bool(prior.package_abandoned)
+
+        action = (
+            "pivot_workaround"
+            if (
+                (action_hint == "pivot_workaround" or exhausted)
+                and effective_stage == SCARemediationStage.NPM_LATEST
+            )
+            else "retry_update"
+        )
+        diagnostics = prior.model_copy(
+            update={
+                "strategy_stage": effective_stage,
+                "selected_version": selected,
+                "candidate_versions_considered": candidates,
+                "latest_version_seen": latest_seen,
+                "registry_query_performed": True,
+                "exhausted_update_path": exhausted,
+            }
+        )
+        updated[task_id] = diagnostics
+        group = (group_by_id or {}).get(task.parent_group_id)
+        if action == "retry_update":
+            instruction = _build_high_level_retry_instruction(
+                task.model_copy(update={"strategy_stage": effective_stage}),
+                group,
+                None,
+                diagnostics,
+            )
+        else:
+            component = group.vulnerable_component if group else task.parent_group_id
+            instruction = (
+                f"Implement a code workaround or isolation strategy for {component} "
+                "because the manifest-based update path is exhausted."
+            )
+        plans[task_id] = SupervisorRetryPlan(
+            task_id=task_id,
+            strategy_stage=effective_stage,
+            selected_version=selected,
+            attempted_versions=attempted,
+            candidate_versions_considered=candidates,
+            latest_version_seen=latest_seen,
+            exhausted_update_path=exhausted,
+            package_abandoned=prior.package_abandoned,
+            action=action,
+            exact_instruction=instruction,
+        )
+    return updated, plans
+
+
+def _planner_plan_violations(
+    plans: Dict[str, SupervisorRetryPlan],
+    task_queue: Dict[str, RemediationTask],
+    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+) -> List[str]:
+    """Validate planner semantics before a plan can mutate routing state.
+
+    The planner's prose is intentionally not treated as an authority.  These
+    checks enforce the small set of invariants that must hold for an exact
+    worker instruction to be safe.  Returning human-readable violations also
+    makes the corrective replan visible in LangSmith through the supervisor's
+    accumulated ``errors`` field.
+    """
+    violations: List[str] = []
+    for task_id, plan in plans.items():
+        task = task_queue.get(task_id)
+        if task is None:
+            violations.append(f"task {task_id}: planner returned an unknown task")
+            continue
+
+        attempted = {
+            version.strip().lstrip("vV").lower()
+            for version in plan.attempted_versions
+            if version
+        }
+        diagnostics = diagnostics_by_task.get(task_id)
+        if diagnostics is not None:
+            attempted.update(
+                version.strip().lstrip("vV").lower()
+                for version in diagnostics.attempted_versions
+                if version
+            )
+
+        selected = (
+            plan.selected_version.strip().lstrip("vV").lower()
+            if plan.selected_version
+            else None
+        )
+        if selected and selected in attempted:
+            violations.append(
+                f"task {task_id}: selected version {plan.selected_version} was already attempted"
+            )
+        if (
+            plan.strategy_stage == SCARemediationStage.NPM_LATEST
+            and selected
+            and plan.latest_version_seen
+            and selected != plan.latest_version_seen.strip().lstrip("vV").lower()
+        ):
+            violations.append(
+                f"task {task_id}: npm_latest selected {plan.selected_version}, "
+                f"but registry latest is {plan.latest_version_seen}"
+            )
+        if plan.action == "retry_update" and selected is None:
+            violations.append(
+                f"task {task_id}: retry_update requires an unattempted exact selected_version"
+            )
+        if plan.action == "retry_update" and plan.exhausted_update_path:
+            violations.append(
+                f"task {task_id}: exhausted update path cannot retry update"
+            )
+        if plan.action == "pivot_workaround" and plan.strategy_stage != SCARemediationStage.NPM_LATEST:
+            violations.append(
+                f"task {task_id}: workaround pivot must be committed at npm_latest"
+            )
+        if plan.action == "pivot_workaround" and selected is not None:
+            violations.append(
+                f"task {task_id}: workaround pivot cannot retain selected version {plan.selected_version}"
+            )
+    return violations
+
+
+def _reconcile_registry_plan_evidence(
+    plans: Dict[str, SupervisorRetryPlan],
+    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    task_queue: Dict[str, RemediationTask],
+    group_by_id: Dict[str, VulnerabilityGroup],
+    tool_events: List[ToolEvent],
+) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    """Replace free-form version claims with the planner tool's result.
+
+    The LLM still chooses which task/stage to reason about, but the version
+    itself must come from ``plan_npm_version``.  This keeps a plausible prose
+    hallucination from surviving merely because it matches the prompt.
+    """
+    if not tool_events:
+        return diagnostics_by_task, plans
+
+    updated = dict(diagnostics_by_task)
+    reconciled: Dict[str, SupervisorRetryPlan] = {}
+    for task_id, plan in plans.items():
+        task = task_queue.get(task_id)
+        group = group_by_id.get(task.parent_group_id) if task else None
+        package_name = group.vulnerable_component if group else None
+        if not package_name:
+            reconciled[task_id] = plan
+            continue
+
+        matching_events = [
+            event
+            for event in tool_events
+            if event.name == "plan_npm_version"
+            and str(event.args.get("package_name", "")).strip() == package_name
+            and event.content.startswith("# NPM Version Plan:")
+        ]
+        if not matching_events:
+            reconciled[task_id] = plan
+            continue
+
+        same_major_events = [
+            event
+            for event in matching_events
+            if str(event.args.get("selection", "")).strip().lower() == "same_major"
+        ]
+        latest_events = [
+            event
+            for event in matching_events
+            if str(event.args.get("selection", "")).strip().lower() == "latest"
+        ]
+        selected_event = (
+            latest_events[-1]
+            if plan.strategy_stage == SCARemediationStage.NPM_LATEST and latest_events
+            else same_major_events[-1]
+            if same_major_events
+            else matching_events[-1]
+        )
+        if (
+            selected_event in same_major_events
+            and "same-major stage: skipped" in selected_event.content.lower()
+            and latest_events
+        ):
+            selected_event = latest_events[-1]
+
+        content = selected_event.content
+        selected_match = re.search(
+            r"^-\s*Selected Version:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE
+        )
+        latest_match = re.search(
+            r"^-\s*Latest Stable:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE
+        )
+        eligible_match = re.search(
+            r"^-\s*Eligible Candidates:\s*(.*)$", content, re.IGNORECASE | re.MULTILINE
+        )
+        selected_token = selected_match.group(1).strip() if selected_match else "NONE"
+        selected = None if selected_token.upper() == "NONE" else selected_token.lstrip("vV")
+        latest_seen = latest_match.group(1).strip().lstrip("vV") if latest_match else plan.latest_version_seen
+        eligible = []
+        if eligible_match:
+            eligible = [
+                version.strip().lstrip("vV")
+                for version in eligible_match.group(1).split(",")
+                if version.strip() and version.strip().upper() != "NONE"
+            ]
+
+        prior = updated.get(task_id)
+        if prior is None:
+            prior = UpdateRetryDiagnostics(task_id=task_id)
+        attempted = {
+            version.strip().lstrip("vV")
+            for version in prior.attempted_versions
+            if version
+        }
+        candidates = eligible or list(plan.candidate_versions_considered)
+        if selected and selected not in candidates:
+            candidates.insert(0, selected)
+        if latest_seen and latest_seen not in candidates:
+            candidates.append(latest_seen)
+
+        effective_stage = plan.strategy_stage
+        if selected_event in latest_events:
+            effective_stage = SCARemediationStage.NPM_LATEST
+        elif (
+            "same-major stage: skipped" in content.lower()
+            or (
+                re.search(r"^-\s*Same-Major Latest:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE)
+                and latest_seen
+                and re.search(r"^-\s*Same-Major Latest:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE).group(1).lstrip("vV") == latest_seen
+            )
+        ):
+            effective_stage = SCARemediationStage.NPM_LATEST
+
+        unattempted = [version for version in candidates if version not in attempted]
+        exhausted = (
+            effective_stage == SCARemediationStage.NPM_LATEST
+            and selected is None
+            and not unattempted
+        )
+        action = "pivot_workaround" if exhausted else "retry_update"
+        diagnostics = prior.model_copy(
+            update={
+                "strategy_stage": effective_stage,
+                "selected_version": selected,
+                "candidate_versions_considered": candidates,
+                "latest_version_seen": latest_seen,
+                "registry_query_performed": True,
+                "exhausted_update_path": exhausted,
+            }
+        )
+        updated[task_id] = diagnostics
+        if action == "retry_update":
+            instruction = _build_high_level_retry_instruction(
+                task.model_copy(update={"strategy_stage": effective_stage}),
+                group,
+                None,
+                diagnostics,
+            )
+        else:
+            component = group.vulnerable_component if group else task.parent_group_id
+            instruction = (
+                f"Implement a code workaround or isolation strategy for {component} "
+                "because the manifest-based update path is exhausted."
+            )
+        reconciled[task_id] = plan.model_copy(
+            update={
+                "strategy_stage": effective_stage,
+                "selected_version": selected,
+                "candidate_versions_considered": candidates,
+                "latest_version_seen": latest_seen,
+                "exhausted_update_path": exhausted,
+                "action": action,
+                "exact_instruction": instruction,
+            }
+        )
+    return updated, reconciled
+
+
+def _repair_invalid_planner_plans(
+    plans: Dict[str, SupervisorRetryPlan],
+    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    task_queue: Dict[str, RemediationTask],
+    group_by_id: Dict[str, VulnerabilityGroup],
+    violations: Optional[List[str]] = None,
+) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    """Apply a deterministic, fail-closed repair after corrective replanning.
+
+    A valid unattempted candidate already present in planner evidence is safe to
+    commit.  If no such candidate exists at the latest stage, the only safe
+    action is the existing workaround pivot.  In particular, this function
+    never preserves an invalid selected version merely to keep the graph
+    moving.
+    """
+    repaired_diagnostics = dict(diagnostics_by_task)
+    repaired_plans: Dict[str, SupervisorRetryPlan] = {}
+    invalid_task_ids = {
+        match.group(1)
+        for violation in (violations or [])
+        if (match := re.match(r"task\s+(task-[\w-]+):", violation))
+    }
+    for task_id, plan in plans.items():
+        if invalid_task_ids and task_id not in invalid_task_ids:
+            repaired_plans[task_id] = plan
+            continue
+        diagnostics = repaired_diagnostics.get(task_id)
+        attempted = {
+            version.strip().lstrip("vV").lower()
+            for version in plan.attempted_versions
+            if version
+        }
+        if diagnostics is not None:
+            attempted.update(
+                version.strip().lstrip("vV").lower()
+                for version in diagnostics.attempted_versions
+                if version
+            )
+
+        candidate = None
+        for version in [plan.latest_version_seen, *plan.candidate_versions_considered]:
+            if version and version.strip().lstrip("vV").lower() not in attempted:
+                candidate = version.strip().lstrip("vV")
+                break
+
+        if candidate:
+            effective_stage = plan.strategy_stage
+            if (
+                effective_stage == SCARemediationStage.NPM_SAME_MAJOR
+                and plan.latest_version_seen
+                and candidate == plan.latest_version_seen.strip().lstrip("vV")
+            ):
+                effective_stage = SCARemediationStage.NPM_LATEST
+            if diagnostics is None:
+                diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+            diagnostics = diagnostics.model_copy(
+                update={
+                    "strategy_stage": effective_stage,
+                    "selected_version": candidate,
+                    "candidate_versions_considered": list(
+                        dict.fromkeys([*diagnostics.candidate_versions_considered, candidate])
+                    ),
+                    "registry_query_performed": True,
+                    "exhausted_update_path": False,
+                }
+            )
+            repaired_diagnostics[task_id] = diagnostics
+            group = group_by_id.get(task_queue[task_id].parent_group_id)
+            instruction = _build_high_level_retry_instruction(
+                task_queue[task_id].model_copy(update={"strategy_stage": effective_stage}),
+                group,
+                None,
+                diagnostics,
+            )
+            repaired_plans[task_id] = plan.model_copy(
+                update={
+                    "strategy_stage": effective_stage,
+                    "selected_version": candidate,
+                    "candidate_versions_considered": diagnostics.candidate_versions_considered,
+                    "action": "retry_update",
+                    "exact_instruction": instruction,
+                    "exhausted_update_path": False,
+                }
+            )
+            continue
+
+        # No unattempted candidate can be proven.  Clear stale selection and
+        # pivot at the terminal update stage so no guessed/old version is sent
+        # to the dumb update worker.
+        effective_stage = SCARemediationStage.NPM_LATEST
+        if diagnostics is None:
+            diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+        diagnostics = diagnostics.model_copy(
+            update={
+                "strategy_stage": effective_stage,
+                "selected_version": None,
+                "exhausted_update_path": True,
+            }
+        )
+        repaired_diagnostics[task_id] = diagnostics
+        group = group_by_id.get(task_queue[task_id].parent_group_id)
+        component = group.vulnerable_component if group else task_queue[task_id].parent_group_id
+        instruction = (
+            f"Implement a code workaround or isolation strategy for {component} "
+            "because the manifest-based update path is exhausted."
+        )
+        repaired_plans[task_id] = plan.model_copy(
+            update={
+                "strategy_stage": effective_stage,
+                "selected_version": None,
+                "exhausted_update_path": True,
+                "action": "pivot_workaround",
+                "exact_instruction": instruction,
+            }
+        )
+    return repaired_diagnostics, repaired_plans
+
+
+def _parse_planner_selected_versions(
+    scratchpad: str,
+    task_queue: Dict[str, RemediationTask],
+    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+) -> Dict[str, UpdateRetryDiagnostics]:
+    """Backward-compatible wrapper returning reconciled diagnostics only."""
+    diagnostics, _ = _parse_planner_retry_plans(
+        scratchpad,
+        task_queue,
+        diagnostics_by_task,
+    )
+    return diagnostics
 
 
 def _update_worker_task_ids(
@@ -295,7 +866,15 @@ def _missing_retry_revised_instructions(
         task = task_queue.get(task_id)
         if task is None or task.status != TaskStatus.NEEDS_RETRY:
             continue
-        if not revised_instructions.get(task_id, "").strip():
+        instruction = revised_instructions.get(task_id, "").strip()
+        if not instruction:
+            missing.append(task_id)
+            continue
+        # Retry workers are execution-only: a retry instruction is invalid
+        # unless it carries both the strategy stage and a concrete semver.
+        if "strategy stage" not in instruction.lower() or not re.search(
+            r"(?<!\d)v?\d+\.\d+\.\d+(?!\d)", instruction
+        ):
             missing.append(task_id)
     return missing
 
@@ -328,6 +907,48 @@ def _build_high_level_retry_instruction(
     """Synthesize a high-level retry instruction for the update worker."""
     component = group.vulnerable_component if group else task.parent_group_id
     category = evaluation.failure_category if evaluation else None
+    if diagnostics and diagnostics.selected_version:
+        manifest = (group.file_paths[0] if group and group.file_paths else "package.json")
+        dependency_action = "dependency version"
+        if diagnostics.used_overrides:
+            dependency_action = "npm override"
+        return (
+            f"Apply the supervisor-selected {dependency_action} for {component} "
+            f"during strategy stage {task.strategy_stage.value}: "
+            f"update {manifest} to exact version {diagnostics.selected_version}; "
+            "after all requested manifest edits, run the single final manifest synchronization validation."
+        )
+    if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
+        floor = group.fix_plan.fixed_version
+        if floor:
+            manifest = group.file_paths[0] if group.file_paths else "package.json"
+            return (
+                f"Apply strategy stage {task.strategy_stage.value} for {component}: "
+                f"update {manifest} to exact OSV minimum fixed version {floor}; "
+                "after all requested manifest edits, run the single final manifest synchronization validation."
+            )
+    if diagnostics and task.strategy in {RoutingStrategy.VERSION_BUMP}:
+        attempted = set(diagnostics.attempted_versions)
+        candidates = [
+            version
+            for version in diagnostics.candidate_versions_considered
+            if version not in attempted
+        ]
+        candidate = next(
+            (
+                version
+                for version in [diagnostics.latest_version_seen, *candidates]
+                if version and version not in attempted
+            ),
+            None,
+        )
+        if candidate:
+            manifest = (group.file_paths[0] if group and group.file_paths else "package.json")
+            return (
+                f"Apply strategy stage {task.strategy_stage.value} for {component}: "
+                f"update {manifest} to exact version {candidate}; "
+                "after all requested manifest edits, run the single final manifest synchronization validation."
+            )
     if diagnostics and diagnostics.package_abandoned:
         return (
             f"Investigate whether {component} still has a supported manifest-based update path. "
@@ -469,46 +1090,8 @@ def _deterministic_routing(
     # Collect tasks that still need work
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
 
-    breaking_change_retry = next(
-        (
-            task
-            for task in workable
-            if task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.status == TaskStatus.NEEDS_RETRY
-            and qa_evaluations.get(task.task_id) is not None
-            and qa_evaluations[task.task_id].failure_category == FailureCategory.BREAKING_CHANGE
-        ),
-        None,
-    )
-    if breaking_change_retry is not None:
-        component = (
-            group_by_id.get(breaking_change_retry.parent_group_id).vulnerable_component
-            if breaking_change_retry.parent_group_id in group_by_id
-            else breaking_change_retry.parent_group_id
-        )
-        return SupervisorDecision(
-            next_node="workaround_subagent",
-            target_task_ids=[breaking_change_retry.task_id],
-            spawn_requests=[
-                TaskSpawnRequest(
-                    parent_task_id=breaking_change_retry.task_id,
-                    strategy=RoutingStrategy.CODE_WORKAROUND,
-                    instruction=(
-                        f"Implement a compatibility workaround for {component} to preserve "
-                        "the validated upgrade while addressing the breaking change."
-                    ),
-                    reason=(
-                        "Deterministic fallback: BREAKING_CHANGE requires follow-on "
-                        "code workaround remediation in a child task."
-                    ),
-                )
-            ],
-            instructions="Spawn a workaround child task for the breaking-change follow-on remediation.",
-            decision_reason=(
-                f"QA reported BREAKING_CHANGE for '{component}', so the validated version bump "
-                "must remain on the parent while a child handles the workaround."
-            ),
-        )
+    # All VERSION_BUMP QA failures follow the ordered version stages. A
+    # BREAKING_CHANGE is evidence for the next stage, not an immediate pivot.
 
     exhausted_retries = [
         task
@@ -661,18 +1244,17 @@ def _build_planner_prompt(
     retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
     action_summaries: List[AgentActionSummary],
     constraints_ledger: List[str],
+    correction: str = "",
 ) -> str:
     """Build the planner system + user messages."""
     lines = [
         "You are the Planner phase of an AppSec remediation Supervisor.",
-        "You own playbook reasoning for retry tasks.",
-        "Your job is to investigate failures, assess whether manifest-based update remediation is exhausted,",
-        "and write high-level retry guidance for the Router to enforce.",
+        "You own exact version planning for retry tasks.",
+        "The ordered strategy is OSV minimum, highest stable same-major release, highest stable released version, then code workaround.",
+        "The Update Subagent is a dumb worker and must receive an exact version instruction from you.",
         "",
-        "The Update Subagent gathers retry evidence by querying npm and attempting bounded manifest changes.",
-        "Do not decide exact dependency versions for the worker unless you are only verifying ambiguous evidence.",
-        "Use view_npm_package_versions only when retry diagnostics are missing, inconsistent, or ambiguous.",
-        "The default source of truth is the existing retry diagnostics, not a second full registry search.",
+        "Call plan_npm_version for NPM retry stages. Never delegate registry lookup or version choice to the worker.",
+        "Respect the OSV security floor and exclude already attempted versions, even when an attempted version is the security floor.",
         "",
         "## Actionable Retry Tasks",
         "Write Strategy Scratchpad sections only for these NEEDS_RETRY tasks.",
@@ -689,6 +1271,10 @@ def _build_planner_prompt(
         component = group.vulnerable_component if group else task.parent_group_id
         eval_ = qa_evaluations.get(task.task_id)
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
+        security_floor = (
+            diagnostics.security_floor if diagnostics and diagnostics.security_floor
+            else (group.fix_plan.fixed_version if group and group.fix_plan else "unknown")
+        )
 
         lines += [
             "",
@@ -697,6 +1283,8 @@ def _build_planner_prompt(
             f"- CVEs          : {cves}",
             f"- GHSAs         : {ghsas}",
             f"- Strategy      : {task.strategy.value}",
+            f"- Strategy Stage: {task.strategy_stage.value}",
+            f"- NPM Selection : {_selection_for_stage(task.strategy_stage) or 'none'}",
             f"- Status        : {task.status.value}",
             f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
             f"- Ancestry Depth: {task.ancestry_depth}/{MAX_ANCESTRY_DEPTH}",
@@ -777,9 +1365,7 @@ def _build_planner_prompt(
     lines += [
         "",
         "## Planner Playbooks",
-        "- SECURITY_FLAG: keep the task on update remediation unless retry diagnostics show the update path is exhausted.",
-        "- PEER_CONFLICT: keep the task on update remediation unless retry diagnostics show no compatible patch or override path remains.",
-        "- BREAKING_CHANGE: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
+        "- SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE all advance exactly one ordered version stage.",
         "- package_abandoned=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
         "- exhausted_update_path=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
         "- VERSION_BUMP + NEEDS_RETRY + exhausted_update_path=True must not be routed back to update_subagent.",
@@ -794,13 +1380,23 @@ def _build_planner_prompt(
         "  1. Observations",
         "  2. Playbook selected",
         "  3. Update-path assessment",
-        "  4. Revised high-level instruction text",
+        "  4. Exact selected version and manifest instruction",
         "  5. Strategy pivot recommendation (same-task retry or workaround child)",
         "  6. Routing notes",
         "",
-        "Use high-level retry instructions, not exact version pins.",
-        "Good example: Investigate compatible patched releases or override paths for ws; if the update path is exhausted, recommend a workaround child task.",
+        "Use exact version pins in the planner output. Format each result with TASK: <task-id>, SELECTED_VERSION: <version|NONE>, EFFECTIVE_STAGE: <stage>, and ACTION: <retry_update|pivot_workaround>.",
+        "When the same-major latest equals the latest stable version, skip the duplicate same-major stage. Select the latest version only if it is unattempted; if it is already attempted, emit SELECTED_VERSION: NONE, EFFECTIVE_STAGE: npm_latest, and ACTION: pivot_workaround.",
     ]
+
+    if correction:
+        lines += [
+            "",
+            "## Previous Planner Output Rejected",
+            "The following deterministic planner invariants were violated:",
+            *[f"- {violation}" for violation in correction.splitlines() if violation.strip()],
+            "Correct only the affected task sections. Re-call plan_npm_version with the complete attempted-version list.",
+            "Never select an attempted version. A retry_update must contain one unattempted exact version. A latest-stage task with no unattempted candidate must use ACTION: pivot_workaround.",
+        ]
 
     return "\n".join(lines)
 
@@ -813,7 +1409,9 @@ def _run_planner_phase(
     action_summaries: List[AgentActionSummary],
     constraints_ledger: List[str],
     llm: Any,
-) -> str:
+    correction: str = "",
+    return_tool_events: bool = False,
+) -> Any:
     """Run the bounded planner ReAct loop. Returns the scratchpad text."""
     planner_prompt = _build_planner_prompt(
         task_queue,
@@ -822,11 +1420,19 @@ def _run_planner_phase(
         retry_diagnostics_by_task,
         action_summaries,
         constraints_ledger,
+        correction=correction,
     )
-    tools = [view_npm_package_versions]
+    tools = [plan_npm_version]
     initial_messages = [
         SystemMessage(content=planner_prompt),
-        HumanMessage(content="Please analyse the task queue and write your Strategy Scratchpad."),
+        HumanMessage(
+            content=(
+                "Plan every retry task. For NPM stages call plan_npm_version with the package, "
+                "OSV security floor, stage selection, and attempted versions. Emit TASK and "
+                "SELECTED_VERSION lines before the Strategy Scratchpad."
+                + (" Apply the previous-output correction rules exactly." if correction else "")
+            )
+        ),
     ]
     try:
         result = run_bounded_subagent_loop(
@@ -840,10 +1446,16 @@ def _run_planner_phase(
             scratchpad = ""
         if result.errors:
             logger.warning("supervisor planner: %d error(s): %s", len(result.errors), result.errors)
-        return scratchpad or "(Planner produced no output.)"
+        scratchpad = scratchpad or "(Planner produced no output.)"
+        if return_tool_events:
+            return scratchpad, list(result.tool_events)
+        return scratchpad
     except Exception as exc:  # noqa: BLE001
         logger.warning("supervisor planner: loop failed (%s) — skipping planner.", exc)
-        return f"(Planner failed: {exc})"
+        scratchpad = f"(Planner failed: {exc})"
+        if return_tool_events:
+            return scratchpad, []
+        return scratchpad
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1473,9 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
     retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = state.get(
         "retry_diagnostics_by_task", {}
     )
+    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = state.get(
+        "retry_plans_by_task", {}
+    )
     eval_status: str = state.get("eval_status", "")
 
     group_by_id = {g.group_id: g for g in valid_groups}
@@ -868,9 +1483,9 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
     lines = [
         "You are the Router phase of an AppSec remediation Supervisor.",
         "Produce exactly one SupervisorDecision to route the next graph step.",
-        "The Planner owns playbook and strategy reasoning.",
+        "The Planner owns playbook and exact dependency-version reasoning.",
         "You only translate planner intent and current task state into routing.",
-        "Do not invent dependency-version strategy beyond what the planner scratchpad and retry diagnostics support.",
+        "Do not invent dependency versions beyond the planner scratchpad and retry diagnostics.",
         "",
     ]
 
@@ -883,6 +1498,11 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
         eval_ = qa_evaluations.get(task.task_id)
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
+        security_floor = (
+            diagnostics.security_floor
+            if diagnostics and diagnostics.security_floor
+            else (fix_plan.fixed_version if fix_plan else "unknown")
+        )
 
         lines += [
             "",
@@ -894,6 +1514,8 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
             f"- GHSAs         : {ghsas}",
             f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
             f"- Strategy      : {task.strategy.value}",
+            f"- Strategy Stage: {task.strategy_stage.value}",
+            f"- OSV Security Floor: {security_floor}",
             f"- Status        : {task.status.value}",
             f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
             f"- Ancestry Depth: {task.ancestry_depth}/{MAX_ANCESTRY_DEPTH}",
@@ -914,13 +1536,15 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
                 f"exhausted={diagnostics.exhausted_update_path}, "
                 f"abandoned={diagnostics.package_abandoned}"
             )
-            if diagnostics.planning_answers:
-                lines.append(
-                    "- Planning Answers: "
-                    + "; ".join(
-                        f"{key}={value}" for key, value in diagnostics.planning_answers.items()
-                    )
-                )
+            if diagnostics.selected_version:
+                lines.append(f"- Supervisor Selected Version: {diagnostics.selected_version}")
+        plan = retry_plans_by_task.get(task.task_id)
+        if plan is not None:
+            lines.append(
+                f"- Committed Planner Action: {plan.action}; "
+                f"effective_stage={plan.strategy_stage.value}; "
+                f"exhausted={plan.exhausted_update_path}"
+            )
 
     lines += [
         "",
@@ -955,12 +1579,13 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "0. QA-ready tasks have priority: route optimistically_fixed tasks to qa_critic before planning retries or dispatching workers.",
         f"1. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
         f"2. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
-        "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry.",
-        "4. Retry revised_instructions are high-level directives, not exact version pins.",
+        "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry containing the exact planned version.",
+        "4. Retry revised_instructions are authoritative exact execution instructions.",
         "5. Same-strategy retries reuse the same task.",
         "6. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
-        "7. SECURITY_FLAG and PEER_CONFLICT remain update remediation first unless the planner indicates the update path is exhausted.",
-        "8. BREAKING_CHANGE follow-on remediation must use a CODE_WORKAROUND child task via spawn_requests.",
+        "7. SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance the task by exactly one version stage.",
+        "SECURITY_FLAG and PEER_CONFLICT remain update remediation first; BREAKING_CHANGE also advances through the ordered update stages.",
+        "8. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task.",
         "9. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
         "10. After a worker succeeds for the current active batch, route that batch to qa_critic.",
         "11. When no actionable non-terminal tasks remain, route to teardown.",
@@ -1038,6 +1663,11 @@ def _materialize_spawn_requests(
             parent_group_id=parent_task.parent_group_id,
             parent_task_id=req.parent_task_id,
             strategy=req.strategy,
+            strategy_stage=(
+                SCARemediationStage.CODE_WORKAROUND
+                if req.strategy == RoutingStrategy.CODE_WORKAROUND
+                else SCARemediationStage.OSV_MINIMUM
+            ),
             instruction=req.instruction,
             status=TaskStatus.PENDING,
             retry_count=0,
@@ -1095,6 +1725,9 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     existing_constraints: List[str] = list(state.get("constraints_ledger", []))
     retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = dict(
         state.get("retry_diagnostics_by_task", {})
+    )
+    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
+        state.get("retry_plans_by_task", {})
     )
     errors: List[str] = list(state.get("errors") or [])
 
@@ -1178,6 +1811,37 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             else:
                 task.status = TaskStatus.NEEDS_RETRY
                 task.retry_count += 1
+                if task.strategy == RoutingStrategy.VERSION_BUMP:
+                    next_stage = _next_sca_stage(task.strategy_stage)
+                    task.strategy_stage = next_stage
+                    prior_diag = retry_diagnostics_by_task.get(resolved_t_id)
+                    group = group_by_id.get(task.parent_group_id)
+                    if prior_diag is None:
+                        retry_diagnostics_by_task[resolved_t_id] = UpdateRetryDiagnostics(
+                            task_id=resolved_t_id,
+                            strategy_stage=next_stage,
+                            security_floor=(
+                                group.fix_plan.fixed_version
+                                if group and group.fix_plan
+                                else None
+                            ),
+                            exhausted_update_path=(
+                                next_stage == SCARemediationStage.CODE_WORKAROUND
+                            ),
+                        )
+                    else:
+                        retry_diagnostics_by_task[resolved_t_id] = prior_diag.model_copy(
+                            update={
+                                "strategy_stage": next_stage,
+                                "security_floor": prior_diag.security_floor
+                                or (
+                                    group.fix_plan.fixed_version
+                                    if group and group.fix_plan
+                                    else None
+                                ),
+                                "exhausted_update_path": next_stage == SCARemediationStage.CODE_WORKAROUND,
+                            }
+                        )
 
     # ------------------------------------------------------------------
     # 4. Mark UNFIXABLE tasks that hit the retry cap
@@ -1255,36 +1919,142 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 str(state.get("status") or ""),
             ):
                 logger.info("supervisor: invoking planner phase for retry analysis.")
-                planner_scratchpad = _run_planner_phase(
-                    task_queue,
-                    group_by_id,
-                    qa_evaluations,
-                    retry_diagnostics_by_task,
-                    action_summaries,
-                    existing_constraints,
-                    router_llm,
-                )
+                planner_base_diagnostics = dict(retry_diagnostics_by_task)
+                planner_correction = ""
+                planner_violations: List[str] = []
+                parsed_diagnostics: Dict[str, UpdateRetryDiagnostics] = {}
+                parsed_plans: Dict[str, SupervisorRetryPlan] = {}
+                planner_tool_events: List[ToolEvent] = []
+
+                # Planner output is an untrusted proposal.  Give it one
+                # compact correction opportunity before applying anything to
+                # the task queue or exposing it to the router.
+                for planner_attempt in range(2):
+                    planner_result = _run_planner_phase(
+                        task_queue,
+                        group_by_id,
+                        qa_evaluations,
+                        planner_base_diagnostics,
+                        action_summaries,
+                        existing_constraints,
+                        router_llm,
+                        correction=planner_correction,
+                        return_tool_events=True,
+                    )
+                    if isinstance(planner_result, tuple):
+                        planner_scratchpad, attempt_tool_events = planner_result
+                        planner_tool_events.extend(attempt_tool_events)
+                    else:
+                        # Preserve compatibility with tests/integrations that
+                        # replace the planner helper with a text-only stub.
+                        planner_scratchpad = str(planner_result)
+                    parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
+                        planner_scratchpad,
+                        task_queue,
+                        planner_base_diagnostics,
+                        group_by_id,
+                    )
+                    parsed_diagnostics, parsed_plans = _reconcile_registry_plan_evidence(
+                        parsed_plans,
+                        parsed_diagnostics,
+                        task_queue,
+                        group_by_id,
+                        planner_tool_events,
+                    )
+                    planner_violations = _planner_plan_violations(
+                        parsed_plans,
+                        task_queue,
+                        planner_base_diagnostics,
+                    )
+                    if not planner_violations:
+                        break
+
+                    errors.extend(
+                        f"supervisor: planner semantic validation: {violation}"
+                        for violation in planner_violations
+                    )
+                    if planner_attempt == 0:
+                        planner_correction = "\n".join(planner_violations)
+                        logger.warning(
+                            "supervisor: rejecting planner output and requesting correction: %s",
+                            planner_violations,
+                        )
+                        continue
+
+                    # The second proposal is still untrusted.  Repair from
+                    # registry facts already present in the proposal, or fail
+                    # closed into the existing workaround pivot.  No stale or
+                    # attempted version can survive this boundary.
+                    parsed_diagnostics, parsed_plans = _repair_invalid_planner_plans(
+                        parsed_plans,
+                        parsed_diagnostics,
+                        task_queue,
+                        group_by_id,
+                        violations=planner_violations,
+                    )
+                    repair_violations = _planner_plan_violations(
+                        parsed_plans,
+                        task_queue,
+                        parsed_diagnostics,
+                    )
+                    if repair_violations:
+                        errors.extend(
+                            "supervisor: deterministic planner repair remained invalid: "
+                            f"{violation}"
+                            for violation in repair_violations
+                        )
+                    break
+
+                retry_diagnostics_by_task = parsed_diagnostics
+                retry_plans_by_task = parsed_plans
+                for task_id, plan in retry_plans_by_task.items():
+                    if task_id not in task_queue:
+                        continue
+                    task_queue[task_id] = task_queue[task_id].model_copy(
+                        update={
+                            "strategy_stage": plan.strategy_stage,
+                            "instruction": plan.exact_instruction,
+                        }
+                    )
+
+                # A planner-confirmed exhausted path is deterministic. Do not
+                # ask the router LLM to reinterpret a pivot as an update retry.
+                if any(
+                    plan.action == "pivot_workaround"
+                    for plan in retry_plans_by_task.values()
+                ):
+                    decision = _deterministic_routing(
+                        task_queue,
+                        group_by_id,
+                        qa_evaluations,
+                        retry_diagnostics_by_task,
+                        action_summaries=action_summaries,
+                        active_target_task_ids=active_target_task_ids,
+                        current_status=str(state.get("status") or ""),
+                    )
             structured_llm = router_llm.with_structured_output(
                 SupervisorDecision, method="function_calling"
             )
-            prompt_state: OrchestratorState = {  # type: ignore[typeddict-item]
-                **state,
-                "task_queue": task_queue,
-                "qa_evaluations": qa_evaluations,
-                "retry_diagnostics_by_task": retry_diagnostics_by_task,
-            }
-            prompt_text = build_supervisor_prompt(
-                prompt_state,
-                scratchpad=planner_scratchpad,
-            )
-            logger.info("supervisor: invoking structured router LLM.")
-            decision = structured_llm.invoke(prompt_text)
-            logger.info(
-                "supervisor: router decision → next_node=%s targets=%s reason=%s",
-                decision.next_node,
-                decision.target_task_ids,
-                decision.decision_reason,
-            )
+            if decision is None:
+                prompt_state: OrchestratorState = {  # type: ignore[typeddict-item]
+                    **state,
+                    "task_queue": task_queue,
+                    "qa_evaluations": qa_evaluations,
+                    "retry_diagnostics_by_task": retry_diagnostics_by_task,
+                    "retry_plans_by_task": retry_plans_by_task,
+                }
+                prompt_text = build_supervisor_prompt(
+                    prompt_state,
+                    scratchpad=planner_scratchpad,
+                )
+                logger.info("supervisor: invoking structured router LLM.")
+                decision = structured_llm.invoke(prompt_text)
+                logger.info(
+                    "supervisor: router decision → next_node=%s targets=%s reason=%s",
+                    decision.next_node,
+                    decision.target_task_ids,
+                    decision.decision_reason,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "supervisor: LLM call failed (%s) — using deterministic fallback.", exc
@@ -1386,6 +2156,11 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     continue
                 if task.strategy == RoutingStrategy.CODE_WORKAROUND or t_id in raw_pivot_parent_ids:
                     valid_target_ids.append(t_id)
+            if not valid_target_ids and len(raw_pivot_parent_ids) == 1:
+                # A pivot decision may contain the child spawn request but omit
+                # the parent target. Recover the single unambiguous parent
+                # before applying workaround cardinality validation.
+                valid_target_ids = [next(iter(raw_pivot_parent_ids))]
         else:
             valid_target_ids = []
 
@@ -1474,6 +2249,19 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 for k, v in decision.revised_instructions.items()
                 if k in known_task_ids and v.strip()
             }
+            # The reconciled task queue is authoritative. Preserve the public
+            # revised_instructions field while filling it from committed plans
+            # when the router omits the field or repeats stale text.
+            for task_id in valid_target_ids:
+                task = task_queue.get(task_id)
+                plan = retry_plans_by_task.get(task_id)
+                if (
+                    task is not None
+                    and task.status == TaskStatus.NEEDS_RETRY
+                    and plan is not None
+                    and plan.action == "retry_update"
+                ):
+                    clean_revised_instructions[task_id] = task.instruction
             clean_feedback = {
                 k: v
                 for k, v in decision.feedback_by_task.items()
@@ -1793,6 +2581,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
         "task_queue": task_queue,
+        "retry_diagnostics_by_task": retry_diagnostics_by_task,
+        "retry_plans_by_task": retry_plans_by_task,
         # constraints_ledger uses operator.add — return only NEW entries
         "constraints_ledger": returned_constraints,
         "errors": errors,

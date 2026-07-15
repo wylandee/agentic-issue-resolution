@@ -15,8 +15,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
-    FixPlanStatus,
     RemediationTask,
+    SCARemediationStage,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
@@ -24,8 +24,7 @@ from src.contracts.schemas import (
 from src.orchestrator.remedy_tools import build_update_toolbelt
 from src.orchestrator.state import SubagentState
 from src.orchestrator.subagent_runtime import (
-    has_tool_call_before_first_successful_edit,
-    has_successful_validation_after_last_edit,
+    has_single_final_successful_validation,
     run_bounded_subagent_loop,
 )
 from src.runtime.sandbox_mgr import DockerSandbox
@@ -192,7 +191,6 @@ def _requires_override_remediation(
             [
                 diagnostics.failure_reason,
                 diagnostics.reasoning_summary,
-                *diagnostics.planning_answers.values(),
             ]
         )
     lowered = " ".join(part.lower() for part in text_parts if part)
@@ -236,7 +234,7 @@ def _is_mixed_retry_batch(
     return saw_retry and saw_first_pass
 
 
-def _build_update_prompt(
+def _legacy_build_update_prompt(
     resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
     feedback_by_task: Dict[str, str],
@@ -667,7 +665,7 @@ def _extract_reasoning_summary(final_text: str) -> str:
     return cleaned
 
 
-def _build_retry_diagnostics(
+def _legacy_build_retry_diagnostics(
     resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
     final_text: str,
@@ -819,10 +817,161 @@ def _build_retry_diagnostics(
             exhausted_update_path=exhausted_update_path,
             failure_reason=failure_reason,
             reasoning_summary=reasoning_summary,
-            planning_answers={k: str(v) for k, v in planning_answers.items()},
         )
 
     return diagnostics_by_task
+
+
+# ---------------------------------------------------------------------------
+# Execution-only worker overrides
+# ---------------------------------------------------------------------------
+
+
+def _build_update_prompt(
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    constraints_ledger: Sequence[str],
+    feedback_by_task: Dict[str, str],
+    previous_action_summaries_by_task: Dict[str, str],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] | None = None,
+) -> str:
+    """Build an execution-only prompt; strategy selection belongs to Supervisor."""
+    sections = [
+        "You are a dependency-manifest execution worker.",
+        "The Supervisor's task instruction is authoritative. Execute it exactly.",
+        "Do not search the NPM registry, choose alternate versions, or perform retry planning.",
+        "Use only read_repository_map, modify_npm_dependency, revert_workspace_file, and validate_manifest_sync.",
+        "Inspect the repository map before editing.",
+        "Apply all exact task instructions first, then call validate_manifest_sync exactly once for the final batch state.",
+        "If final validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
+        "Never edit source-code files in this worker.",
+        "",
+        "Constraints ledger:",
+    ]
+    sections.extend(
+        f"- {item}" for item in constraints_ledger
+    )
+    if not constraints_ledger:
+        sections.append("- none")
+    for task, group, manifest_paths in resolved_tasks:
+        sections.extend([
+            "",
+            f"## Task {task.task_id}",
+            f"- Component: {group.vulnerable_component or 'unknown'}",
+            f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
+            f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
+            f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
+            f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
+        ])
+    sections.extend([
+        "",
+        "Completion rule:",
+        "Return control only after one final manifest synchronization call succeeds, or after surrendering on its failure.",
+    ])
+    return "\n".join(sections)
+
+
+def _build_action_summaries(
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    changed_files: Sequence[str],
+    final_text: str,
+    succeeded: bool,
+    retry_batch: bool = False,
+    tool_events: Optional[Sequence[Any]] = None,
+) -> List[AgentActionSummary]:
+    """Summarize worker execution without requiring registry evidence."""
+    normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
+    final_note = (final_text or "").strip()
+    summaries: List[AgentActionSummary] = []
+    for task, group, manifest_paths in resolved_tasks:
+        package_modified = _was_package_modified(group, tool_events)
+        package_validated = _has_successful_validation_for_package(group, tool_events)
+        task_succeeded = package_modified and package_validated
+        if tool_events is None:
+            task_succeeded = succeeded and bool(normalized_changed_files)
+        changed = [
+            path for path in manifest_paths
+            if path.replace("\\", "/") in normalized_changed_files
+        ]
+        status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
+        outcome = "Completed validated manifest updates" if task_succeeded else "Stopped without a validated manifest update"
+        summary = f"{outcome} for {group.vulnerable_component or 'unknown component'} in {', '.join(manifest_paths) or 'no manifest'}; changed files: {', '.join(changed or manifest_paths or ['no files'])}."
+        if final_note and len(resolved_tasks) == 1:
+            summary += f" Final note: {final_note}"
+        summaries.append(AgentActionSummary(task_id=task.task_id, status=status, summary=summary))
+    return summaries
+
+
+def _build_retry_diagnostics(
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+    final_text: str,
+    errors: Sequence[str],
+    succeeded: bool,
+    prior_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    constraints_ledger: Sequence[str],
+) -> Dict[str, UpdateRetryDiagnostics]:
+    """Record worker evidence while keeping strategy planning in Supervisor."""
+    result: Dict[str, UpdateRetryDiagnostics] = {}
+    joined_errors = " | ".join(error.strip() for error in errors if error.strip())
+    lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
+    for task, group, _ in resolved_tasks:
+        prior = prior_diagnostics_by_task.get(task.task_id)
+        attempted = list(prior.attempted_versions) if prior else []
+        used_overrides = bool(prior.used_overrides) if prior else False
+        for event in tool_events:
+            if event.name != "modify_npm_dependency":
+                continue
+            if str(event.args.get("package_name", "")).strip() != (group.vulnerable_component or "").strip():
+                continue
+            target = str(event.args.get("target_version", "")).strip().lstrip("vV")
+            if target and target not in attempted:
+                attempted.append(target)
+            used_overrides = used_overrides or event.args.get("dependency_type") == "overrides"
+        package_abandoned = bool(prior.package_abandoned) if prior else False
+        if "package abandoned" in lowered_outcome or "package not found" in lowered_outcome:
+            package_abandoned = True
+        exhausted_update_path = bool(prior.exhausted_update_path) if prior else False
+        if any(
+            marker in lowered_outcome
+            for marker in (
+                "update path is exhausted",
+                "update path exhausted",
+                "no valid candidate",
+                "already attempted the latest",
+                "latest version was already attempted",
+            )
+        ):
+            exhausted_update_path = True
+        if (
+            _is_retry_task(task)
+            and _was_package_reverted(group, tool_events)
+            and "peer" not in lowered_outcome
+            and "eresolve" not in lowered_outcome
+        ):
+            exhausted_update_path = True
+        task_stage = getattr(task, "strategy_stage", SCARemediationStage.OSV_MINIMUM)
+        if not isinstance(task_stage, SCARemediationStage):
+            task_stage = SCARemediationStage.OSV_MINIMUM
+        result[task.task_id] = UpdateRetryDiagnostics(
+            task_id=task.task_id,
+            strategy_stage=task_stage,
+            security_floor=prior.security_floor if prior else (
+                group.fix_plan.fixed_version if group.fix_plan else None
+            ),
+            registry_query_performed=prior.registry_query_performed if prior else False,
+            attempted_versions=attempted,
+            candidate_versions_considered=list(prior.candidate_versions_considered) if prior else [],
+            # Version selection belongs to the Supervisor planner. A worker
+            # failure must not resurrect the previous planner selection.
+            selected_version=(attempted[-1] if succeeded and attempted else None),
+            latest_version_seen=prior.latest_version_seen if prior else None,
+            used_overrides=used_overrides,
+            package_abandoned=package_abandoned,
+            exhausted_update_path=exhausted_update_path,
+            failure_reason=(joined_errors or final_text.strip()) if not succeeded else (prior.failure_reason if prior else ""),
+            reasoning_summary=(final_text or "").strip(),
+        )
+    return result
 
 @traceable(name="Update_Subagent_Test_Run") # for langsmith testing
 def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
@@ -894,6 +1043,10 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": resolution_errors + [msg]}
 
     touched_files: set[str] = set()
+    execution_state: Dict[str, int | bool] = {
+        "edits_started": False,
+        "validation_calls": 0,
+    }
     
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
     retry_batch = _is_retry_batch(resolved_tasks)
@@ -911,20 +1064,17 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     initial_messages = [
         SystemMessage(
             content=(
-                "Use only dependency-management tools and validate manifest synchronization after changes. "
-                "You MUST output your planning answers under the '## Planning Answers' section before making any manifest edits."
+                "You are an execution-only dependency worker. The Supervisor owns all version planning. "
+                "Execute the exact task instruction, validate manifest synchronization, and do not query registries."
             )
         ),
         HumanMessage(content=prompt),
     ]
 
-    attempted_versions_by_package: Dict[str, Set[str]] = {}
     override_required_packages: set[str] = set()
     for task, group, _ in skinny_resolved_tasks:
         pkg_name = (group.vulnerable_component or "").strip()
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
-        if pkg_name and diag and diag.attempted_versions:
-            attempted_versions_by_package[pkg_name] = set(diag.attempted_versions)
         if pkg_name and _requires_override_remediation(
             task,
             diag,
@@ -932,8 +1082,6 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
             previous_action_summaries_by_task.get(task.task_id, ""),
         ):
             override_required_packages.add(pkg_name)
-
-    planning_state = {"submitted": False} if retry_batch else None
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
@@ -948,40 +1096,25 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
                     for manifest_path in manifest_paths
                 ],
                 package_manifest_paths=package_manifest_map,
-                enable_registry_lookup=retry_batch,
-                attempted_versions_by_package=attempted_versions_by_package,
                 override_required_packages=override_required_packages,
-                require_planning_answers=retry_batch,
-                planning_state=planning_state,
+                execution_state=execution_state,
             )
             runtime = run_bounded_subagent_loop(
                 llm,
                 toolbelt,
                 initial_messages,
                 touched_files,
-                planning_state=planning_state,
             )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
         summaries = _build_surrender_summaries(resolved_task_ids, "Stopped because the sandbox or tool loop failed.")
         return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": sorted(touched_files), "errors": resolution_errors + [msg]}
 
-    succeeded = bool(runtime.changed_files) and has_successful_validation_after_last_edit(
+    succeeded = bool(runtime.changed_files) and has_single_final_successful_validation(
         runtime.tool_events,
         edit_tool_name="modify_npm_dependency",
         validation_tool_name="validate_manifest_sync",
     )
-    if succeeded and retry_batch:
-        succeeded = has_tool_call_before_first_successful_edit(
-            runtime.tool_events,
-            lookup_tool_name="view_npm_package_versions",
-            edit_tool_name="modify_npm_dependency",
-        )
-        if not succeeded:
-            runtime.errors.append(
-                "Update Subagent: retry batch reported success without calling "
-                "view_npm_package_versions before the first manifest edit."
-            )
     retry_diagnostics_by_task = _build_retry_diagnostics(
         resolved_tasks,
         runtime.tool_events,

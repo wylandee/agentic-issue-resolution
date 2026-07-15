@@ -13,7 +13,6 @@ from typing import Dict, Iterable, List, Mapping, Optional, Set
 from langchain_core.tools import tool
 
 from src.runtime.sandbox_mgr import DockerSandbox
-from src.tools.registry_tools import view_npm_package_versions
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +217,7 @@ def _make_modify_npm_dependency_tool(
     override_required_packages: Optional[Iterable[str]] = None,
     require_planning_answers: bool = False,
     planning_state: Optional[Dict[str, bool]] = None,
+    execution_state: Optional[Dict[str, int | bool]] = None,
 ):
     allowed_manifest_paths_by_package = {
         package_name: set(manifest_paths)
@@ -242,22 +242,6 @@ def _make_modify_npm_dependency_tool(
         Modify dependencies, devDependencies, or overrides in a package.json.
         """
         import re
-
-        if require_planning_answers and planning_state and not planning_state.get("submitted", False):
-            return (
-                "ERROR: You MUST output your planning answers under the '## Planning Answers' section "
-                "in your message BEFORE calling modify_npm_dependency. First explain your answers to "
-                "questions 1-10 in your text response, then invoke modify_npm_dependency."
-            )
-
-        if attempted_versions_by_package:
-            attempted = attempted_versions_by_package.get(package_name, set())
-            if target_version in attempted:
-                return (
-                    f"ERROR: Version '{target_version}' was ALREADY ATTEMPTED for package '{package_name}' "
-                    f"and failed QA or structural validation. Do NOT re-attempt an already tried version. "
-                    f"Attempted versions: {sorted(attempted)}. Either attempt an untried candidate or perform a Clean Room Surrender."
-                )
 
         safe_pattern = re.compile(r"^[a-zA-Z0-9.\-/@~^*]+$")
         if not safe_pattern.match(package_name):
@@ -321,6 +305,8 @@ def _make_modify_npm_dependency_tool(
         result = sandbox.run(cmd_str)
         if result.exit_code == 0:
             touched_files.add(rel_manifest)
+            if execution_state is not None:
+                execution_state["edits_started"] = True
             return (
                 "SUCCESS: Natively updated "
                 f"{dependency_type}.{package_name} to {target_version} in {rel_manifest}."
@@ -338,14 +324,22 @@ def _make_modify_npm_dependency_tool(
 def _make_validate_manifest_sync_tool(
     sandbox: DockerSandbox,
     target_manifest_paths: Iterable[str],
+    execution_state: Optional[Dict[str, int | bool]] = None,
 ):
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
 
     @tool
     def validate_manifest_sync() -> str:
         """
-        Validate that target package manifests can synchronize without scripts.
+        Validate the final target package manifests once without scripts.
         """
+        if execution_state is not None:
+            calls = int(execution_state.get("validation_calls", 0))
+            if calls >= 1:
+                return "ERROR: validate_manifest_sync may only be called once per update worker run."
+            if not execution_state.get("edits_started", False):
+                return "ERROR: validate_manifest_sync is only allowed after manifest edits."
+            execution_state["validation_calls"] = calls + 1
         if not manifest_paths:
             return "FAILURE: No target manifest paths were provided for validation."
 
@@ -588,6 +582,7 @@ def build_update_toolbelt(
     override_required_packages: Optional[Iterable[str]] = None,
     require_planning_answers: bool = False,
     planning_state: Optional[Dict[str, bool]] = None,
+    execution_state: Optional[Dict[str, int | bool]] = None,
 ) -> List:
     """Build the strict update-only toolbelt."""
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
@@ -601,12 +596,11 @@ def build_update_toolbelt(
             override_required_packages=override_required_packages,
             require_planning_answers=require_planning_answers,
             planning_state=planning_state,
+            execution_state=execution_state,
         ),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_manifest_sync_tool(sandbox, manifest_paths),
+        _make_validate_manifest_sync_tool(sandbox, manifest_paths, execution_state),
     ]
-    if enable_registry_lookup:
-        toolbelt.append(view_npm_package_versions)
     return toolbelt
 
 

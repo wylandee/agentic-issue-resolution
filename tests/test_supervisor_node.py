@@ -27,6 +27,7 @@ from src.contracts.schemas import (
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     Severity,
     SupervisorDecision,
     TaskSpawnRequest,
@@ -37,12 +38,16 @@ from src.contracts.schemas import (
 )
 from src.orchestrator.supervisor_node import (
     MAX_RETRIES,
+    _planner_plan_violations,
+    _parse_planner_retry_plans,
+    _reconcile_registry_plan_evidence,
     _normalize_target_task_ids_for_node,
     build_supervisor_prompt,
     run_supervisor_node,
     supervisor_router,
 )
 from src.orchestrator.task_utils import build_initial_remediation_task, derive_initial_strategy
+from src.orchestrator.subagent_runtime import ToolEvent
 
 
 def _issue() -> VulnerabilityIssue:
@@ -667,7 +672,10 @@ class TestRunSupervisorNodeQAUpdates:
             next_node="update_subagent",
             target_task_ids=["task-2"],
             revised_instructions={
-                "task-2": 'Update "test-pkg" in package.json to version "1.2.4".'
+                "task-2": (
+                    "Apply strategy stage npm_same_major: update package.json "
+                    "to exact version 1.2.4."
+                )
             },
             instructions="retry child",
             decision_reason="replan the active retry task",
@@ -677,7 +685,10 @@ class TestRunSupervisorNodeQAUpdates:
 
         assert result["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-2"].retry_count == 1
-        assert result["task_queue"]["task-2"].instruction == 'Update "test-pkg" in package.json to version "1.2.4".'
+        assert result["task_queue"]["task-2"].instruction == (
+            "Apply strategy stage npm_same_major: update package.json "
+            "to exact version 1.2.4."
+        )
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
 
@@ -709,7 +720,8 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
-        assert result["task_queue"]["task-1"].instruction.startswith("Investigate")
+        assert result["task_queue"]["task-1"].instruction.startswith("Apply strategy stage")
+        assert "exact OSV minimum fixed version 1.2.3" in result["task_queue"]["task-1"].instruction
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
         assert any("rejected update_subagent retry dispatch" in err for err in result["errors"])
@@ -745,11 +757,273 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["task_queue"]["task-1"].instruction == 'Update "test-pkg" in package.json to version "1.2.4".'
 
 
+def test_planner_none_clears_stale_selection_and_marks_latest_path_exhausted():
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=3,
+    ).model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "instruction": "Update package.json to exact version 1.2.3.",
+        }
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="1.2.3",
+        attempted_versions=["1.2.3"],
+        latest_version_seen="1.2.3",
+    )
+
+    updated, plans = _parse_planner_retry_plans(
+        """
+TASK: task-1
+SELECTED_VERSION: NONE
+ACTION: pivot_workaround
+The only candidate has already been attempted; pivot to a workaround child.
+""",
+        {"task-1": task},
+        {"task-1": diagnostics},
+        {"g1": group},
+    )
+
+    assert updated["task-1"].selected_version is None
+    assert updated["task-1"].exhausted_update_path is True
+    assert plans["task-1"].action == "pivot_workaround"
+    assert "1.2.3" not in plans["task-1"].exact_instruction
+
+
+def test_planner_rejects_a_retry_for_an_already_attempted_version():
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        attempted_versions=["6.0.0", "6.1.2"],
+        latest_version_seen="8.5.1",
+    )
+
+    updated, plans = _parse_planner_retry_plans(
+        """
+TASK: task-1, SELECTED_VERSION: 6.1.2, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update
+The same-major latest version 6.1.2 is already attempted, but retry it.
+""",
+        {"task-1": task},
+        {"task-1": diagnostics},
+        {"g1": group},
+    )
+
+    violations = _planner_plan_violations(plans, {"task-1": task}, updated)
+    assert any("6.1.2" in violation and "already attempted" in violation for violation in violations)
+
+
+def test_same_major_latest_equal_latest_forces_workaround_pivot_even_if_llm_says_retry():
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    updated, plans = _parse_planner_retry_plans(
+        """
+TASK: task-1, SELECTED_VERSION: NONE, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update
+The same-major latest version (8.21.1) is equal to the latest stable version.
+The same-major latest version (8.21.1) is already attempted, so retry it.
+""",
+        {"task-1": task},
+        {
+            "task-1": UpdateRetryDiagnostics(
+                task_id="task-1",
+                strategy_stage=SCARemediationStage.NPM_LATEST,
+                attempted_versions=["8.21.1"],
+            )
+        },
+        {"g1": group},
+    )
+
+    assert updated["task-1"].exhausted_update_path is True
+    assert plans["task-1"].action == "pivot_workaround"
+
+
+def test_registry_tool_result_overrides_free_form_selected_version():
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        attempted_versions=["6.1.2"],
+    )
+    parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
+        "TASK: task-1, SELECTED_VERSION: 6.1.2, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update",
+        {"task-1": task},
+        {"task-1": diagnostics},
+        {"g1": group},
+    )
+
+    tool_event = ToolEvent(
+        name="plan_npm_version",
+        args={
+            "package_name": "test-pkg",
+            "selection": "latest",
+            "security_floor": "1.2.3",
+            "attempted_versions": "6.1.2",
+        },
+        content=(
+            "# NPM Version Plan: test-pkg\n"
+            "- Selection: latest\n"
+            "- Selected Version: 8.5.1\n"
+            "- Same-Major Latest: 6.1.2\n"
+            "- Latest Stable: 8.5.1\n"
+            "- Same-Major Stage: APPLICABLE\n"
+            "- Eligible Candidates: 8.5.1, 6.1.2"
+        ),
+    )
+    updated, plans = _reconcile_registry_plan_evidence(
+        parsed_plans,
+        parsed_diagnostics,
+        {"task-1": task},
+        {"g1": group},
+        [tool_event],
+    )
+
+    assert updated["task-1"].selected_version == "8.5.1"
+    assert plans["task-1"].selected_version == "8.5.1"
+    assert not _planner_plan_violations(plans, {"task-1": task}, updated)
+
+
+def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(monkeypatch):
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=3,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    state = _base_state(
+        [group],
+        task_queue={"task-1": task},
+        retry_diagnostics_by_task={
+            "task-1": UpdateRetryDiagnostics(
+                task_id="task-1",
+                strategy_stage=SCARemediationStage.NPM_LATEST,
+                selected_version="1.2.3",
+                attempted_versions=["1.2.3"],
+                latest_version_seen="1.2.3",
+            )
+        },
+        status="qa_completed",
+    )
+
+    monkeypatch.setattr(
+        "src.orchestrator.supervisor_node._run_planner_phase",
+        lambda *args, **kwargs: (
+            "TASK: task-1\n"
+            "SELECTED_VERSION: NONE\n"
+            "ACTION: pivot_workaround\n"
+            "The update path is exhausted; pivot to a workaround child."
+        ),
+    )
+    mock_chat = MagicMock()
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", mock_chat)
+
+    result = run_supervisor_node(state)
+
+    assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is True
+    assert result["next_routing_step"] == "workaround_subagent"
+    assert len(result["active_target_task_ids"]) == 1
+    child_id = result["active_target_task_ids"][0]
+    assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
+    assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+
+
+def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatch(monkeypatch):
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=2,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    state = _base_state(
+        [group],
+        task_queue={"task-1": task},
+        status="qa_completed",
+        qa_evaluations={
+            "task-1": QAEvaluation(
+                task_id="task-1",
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="the attempted version still fails QA",
+            )
+        },
+        retry_diagnostics_by_task={
+            "task-1": UpdateRetryDiagnostics(
+                task_id="task-1",
+                strategy_stage=SCARemediationStage.NPM_LATEST,
+                attempted_versions=["6.0.0", "6.1.2"],
+                latest_version_seen="8.5.1",
+            )
+        },
+    )
+
+    planner_outputs = iter(
+        [
+            (
+                "TASK: task-1, SELECTED_VERSION: 6.1.2, "
+                "EFFECTIVE_STAGE: npm_latest, ACTION: retry_update\n"
+                "The same-major latest is already attempted, but retry it."
+            ),
+            (
+                "TASK: task-1, SELECTED_VERSION: 8.5.1, "
+                "EFFECTIVE_STAGE: npm_latest, ACTION: retry_update\n"
+                "Use the unattempted latest stable release."
+            ),
+        ]
+    )
+    planner_mock = MagicMock(side_effect=lambda *args, **kwargs: next(planner_outputs))
+    monkeypatch.setattr("src.orchestrator.supervisor_node._run_planner_phase", planner_mock)
+
+    router_llm = MagicMock()
+    structured = MagicMock()
+    router_llm.with_structured_output.return_value = structured
+    structured.invoke.return_value = SupervisorDecision(
+        next_node="update_subagent",
+        target_task_ids=["task-1"],
+        instructions="route the corrected retry",
+        decision_reason="planner supplied a validated exact version",
+    )
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", MagicMock(return_value=router_llm))
+
+    result = run_supervisor_node(state)
+
+    assert planner_mock.call_count == 2
+    correction = planner_mock.call_args_list[1].kwargs["correction"]
+    assert "already attempted" in correction
+    assert result["retry_diagnostics_by_task"]["task-1"].selected_version == "8.5.1"
+    assert "8.5.1" in result["task_queue"]["task-1"].instruction
+    assert "6.1.2" not in result["task_queue"]["task-1"].instruction
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-1"]
+    assert any("planner semantic validation" in error for error in result["errors"])
+
+
 # ===========================================================================
 # run_supervisor_node — action summary updates
 # ===========================================================================
 
 
+class TestRunSupervisorNodeActionSummary:
     @patch("src.orchestrator.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
     def test_qa_passed_subset_is_removed_before_retry_routing(self, mock_chat, mock_planner):
@@ -1036,6 +1310,42 @@ class TestRunSupervisorMaxRetries:
 
 class TestRunSupervisorNodePeerConflict:
     @patch("langchain_openai.ChatOpenAI")
+    def test_workaround_spawn_with_missing_target_is_normalized_to_child(self, mock_chat):
+        g1 = _sca_group("g1")
+        task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        state = _base_state([g1], task_queue={"task-1": task})
+        mock_llm = MagicMock()
+        mock_chat.return_value = mock_llm
+        mock_llm.with_structured_output.return_value.invoke.return_value = (
+            SupervisorDecision.model_construct(
+                next_node="workaround_subagent",
+                target_task_ids=[],
+                spawn_requests=[
+                    TaskSpawnRequest(
+                        parent_task_id="task-1",
+                        strategy=RoutingStrategy.CODE_WORKAROUND,
+                        instruction="Implement a code workaround for the failed update.",
+                        reason="the update path is exhausted",
+                    )
+                ],
+                instructions="pivot to workaround",
+                decision_reason="pivot after exhausted update path",
+            )
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert len(result["active_target_task_ids"]) == 1
+        child_id = result["active_target_task_ids"][0]
+        assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
+
+    @patch("langchain_openai.ChatOpenAI")
     def test_llm_strategy_pivot_spawns_child_and_routes_child(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
@@ -1140,7 +1450,7 @@ class TestRunSupervisorNodePeerConflict:
         assert any("rejected strategy pivot without task-specific child instructions" in err for err in result["errors"])
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_breaking_change_fallback_spawns_child_instead_of_retrying_parent(self, mock_chat):
+    def legacy_breaking_change_fallback_spawns_child_instead_of_retrying_parent(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
         state = _base_state(
@@ -1412,4 +1722,5 @@ class TestSupervisorPrompt:
         prompt = build_supervisor_prompt(_base_state([g1]))
 
         assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
-        assert "BREAKING_CHANGE follow-on remediation must use a CODE_WORKAROUND child task via spawn_requests" in prompt
+        assert "BREAKING_CHANGE also advances through the ordered update stages" in prompt
+        assert "Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task" in prompt

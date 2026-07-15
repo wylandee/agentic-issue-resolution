@@ -26,13 +26,13 @@ from src.orchestrator.state import (
     initial_workaround_subagent_state,
 )
 from src.orchestrator.update_subagent import (
-    _build_retry_diagnostics,
     _build_update_prompt,
-    _parse_registry_report_versions,
     run_update_subagent_node,
 )
-from src.orchestrator.workaround_subagent import _build_workaround_prompt, run_workaround_subagent_node
-from src.orchestrator.workaround_subagent import run_workaround_subagent_node
+from src.orchestrator.workaround_subagent import (
+    _build_workaround_prompt,
+    run_workaround_subagent_node,
+)
 
 
 def _sca_group(group_id: str = "sca:package.json:lodash", manifest_file: str = "package.json") -> VulnerabilityGroup:
@@ -131,14 +131,16 @@ class TestUpdateSubagentWrapper:
             {},
         )
 
-        assert "## Task Context" in prompt
-        assert "Supervisor's Revised Instruction" in prompt
+        assert "## Task " in prompt
+        assert "Exact supervisor instruction:" in prompt
+        assert "Supervisor's Revised Instruction" not in prompt
         assert "Why The Previous Attempt Failed" not in prompt
-        assert "QA Feedback:" not in prompt
-        assert "Previous Worker Outcome:" not in prompt
+        assert "QA feedback:" in prompt
+        assert "Previous outcome:" in prompt
         assert "4.17.22" in prompt
-        assert "authoritative directive" in prompt
-        assert "First-pass mode:" in prompt
+        assert "task instruction is authoritative" in prompt
+        assert "execution worker" in prompt
+        assert "First-pass mode:" not in prompt
         assert "First-pass planning questions:" not in prompt
         assert "Planning Answers" not in prompt
         assert "Reasoning Summary" not in prompt
@@ -170,21 +172,16 @@ class TestUpdateSubagentWrapper:
             },
         )
 
-        assert "Smart Planning & Rescue" in prompt
-        assert 'Supervisor\'s Revised Instruction: Update "jsonwebtoken" in package.json to version "9.0.0".' in prompt
-        assert 'Supervisor\'s Revised Instruction: Add or update "overrides": {"ws": "8.20.1"} in package.json.' in prompt
-        assert "QA Feedback: Retry exact version bump from planner." in prompt
-        assert "QA Feedback: Retry with npm overrides instead of a direct dependency edit." in prompt
-        assert "Previous Worker Outcome: Previous attempt hit an ERESOLVE conflict." in prompt
-        assert "view_npm_package_versions" in prompt
-        assert "## Task Context" in prompt
-        assert "## Prior Retry Diagnostics" in prompt
-        assert "## Shared Planning Questions (for reference)" in prompt
-        assert "What version or override path did the last fix attempt use?" in prompt
-        assert "What is the latest version currently available according to npm?" in prompt
-        assert "If the latest available version was already attempted and no untried candidates remain" in prompt
-        assert "For each target below, the Task Instruction remains authoritative." in prompt
-        assert "Planning Answers (for Task" in prompt
+        assert "execution worker" in prompt
+        assert 'Exact supervisor instruction: Update "jsonwebtoken" in package.json to version "9.0.0".' in prompt
+        assert 'Exact supervisor instruction: Add or update "overrides": {"ws": "8.20.1"} in package.json.' in prompt
+        assert "QA feedback: Retry exact version bump from planner." in prompt
+        assert "QA feedback: Retry with npm overrides instead of a direct dependency edit." in prompt
+        assert "Previous outcome: Previous attempt hit an ERESOLVE conflict." in prompt
+        assert "view_npm_package_versions" not in prompt
+        assert "## Task task-1" in prompt
+        assert "## Task task-2" in prompt
+        assert "Planning Answers" not in prompt
 
     def test_success_requires_validation_after_manifest_edit(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
@@ -296,7 +293,7 @@ class TestUpdateSubagentWrapper:
 
         assert result["action_summary"].status == AgentActionStatus.SURRENDER
 
-    def test_retry_success_without_registry_lookup_becomes_surrender(self):
+    def test_retry_diagnostics_capture_reasoning_summary(self):
         group = _sca_group()
         repo_root = _repo_root()
         state = initial_update_subagent_state(
@@ -304,7 +301,6 @@ class TestUpdateSubagentWrapper:
             "agent_workspace_deadbeef",
             [group],
             [],
-            previous_action_summaries_by_task={group.group_id: "Previous version bump failed validation."},
         )
         state["target_tasks"][0].retry_count = 1
 
@@ -336,7 +332,14 @@ class TestUpdateSubagentWrapper:
                     }
                 ],
             ),
-            AIMessage(content="done"),
+            AIMessage(
+                content=(
+                    "Reasoning Summary\n"
+                    "- Latest candidate was 4.17.21.\n"
+                    "- No safer override was needed.\n"
+                    "- Validation passed after the bump."
+                )
+            ),
         )
         sandbox = _sandbox_mock()
         tool_edit = MagicMock()
@@ -358,313 +361,9 @@ class TestUpdateSubagentWrapper:
         ):
             result = run_update_subagent_node(state)
 
-        assert result["action_summary"].status == AgentActionStatus.SURRENDER
-        assert any("retry batch reported success without calling view_npm_package_versions" in err for err in result["errors"])
-
-    def test_retry_diagnostics_capture_planning_answers(self):
-        group = _sca_group()
-        repo_root = _repo_root()
-        state = initial_update_subagent_state(
-            repo_root,
-            "agent_workspace_deadbeef",
-            [group],
-            [],
-        )
-        state["target_tasks"][0].retry_count = 1
-
-        llm, _bound = _mock_llm_with_responses(
-            AIMessage(
-                content="registry lookup",
-                tool_calls=[
-                    {
-                        "name": "view_npm_package_versions",
-                        "args": {"package_name": "lodash"},
-                        "id": "call-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="updating",
-                tool_calls=[
-                    {
-                        "name": "modify_npm_dependency",
-                        "args": {
-                            "package_name": "lodash",
-                            "target_version": "4.17.21",
-                            "dependency_type": "dependencies",
-                            "manifest_path": "package.json",
-                        },
-                        "id": "call-2",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="validating",
-                tool_calls=[
-                    {
-                        "name": "validate_manifest_sync",
-                        "args": {},
-                        "id": "call-3",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(content="done"),
-        )
-        sandbox = _sandbox_mock()
-        tool_lookup = MagicMock()
-        tool_lookup.name = "view_npm_package_versions"
-        tool_lookup.invoke.return_value = (
-            "# NPM Registry Report: lodash\n"
-            "## dist-tags\n"
-            "  latest: 4.17.21\n"
-            "\n"
-            "## Last 1 Published Versions (newest first)\n"
-            "  4.17.21  (2024-01-01)\n"
-        )
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_manifest_sync"
-        tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
-
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
-            return_value=sandbox,
-        ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
-            return_value=(["package.json"], []),
-        ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
-            return_value=[tool_lookup, tool_edit, tool_validate],
-        ):
-            result = run_update_subagent_node(state)
-
-        diagnostics = result["retry_diagnostics_by_task"][group.group_id]
-        assert diagnostics.planning_answers["1_last_fix_attempt"] == "4.17.21"
-        assert diagnostics.planning_answers["3_latest_version_available"] == "4.17.21"
-        assert "4.17.21" in diagnostics.planning_answers["8_next_candidate"]
-
-    def test_retry_diagnostics_capture_reasoning_summary(self):
-        group = _sca_group()
-        repo_root = _repo_root()
-        state = initial_update_subagent_state(
-            repo_root,
-            "agent_workspace_deadbeef",
-            [group],
-            [],
-        )
-        state["target_tasks"][0].retry_count = 1
-
-        llm, _bound = _mock_llm_with_responses(
-            AIMessage(
-                content="registry lookup",
-                tool_calls=[
-                    {
-                        "name": "view_npm_package_versions",
-                        "args": {"package_name": "lodash"},
-                        "id": "call-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="updating",
-                tool_calls=[
-                    {
-                        "name": "modify_npm_dependency",
-                        "args": {
-                            "package_name": "lodash",
-                            "target_version": "4.17.21",
-                            "dependency_type": "dependencies",
-                            "manifest_path": "package.json",
-                        },
-                        "id": "call-2",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="validating",
-                tool_calls=[
-                    {
-                        "name": "validate_manifest_sync",
-                        "args": {},
-                        "id": "call-3",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content=(
-                    "Reasoning Summary\n"
-                    "- Latest candidate was 4.17.21.\n"
-                    "- No safer override was needed.\n"
-                    "- Validation passed after the bump."
-                )
-            ),
-        )
-        sandbox = _sandbox_mock()
-        tool_lookup = MagicMock()
-        tool_lookup.name = "view_npm_package_versions"
-        tool_lookup.invoke.return_value = (
-            "# NPM Registry Report: lodash\n"
-            "## dist-tags\n"
-            "  latest: 4.17.21\n"
-            "\n"
-            "## Last 1 Published Versions (newest first)\n"
-            "  4.17.21  (2024-01-01)\n"
-        )
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_manifest_sync"
-        tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
-
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
-            return_value=sandbox,
-        ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
-            return_value=(["package.json"], []),
-        ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
-            return_value=[tool_lookup, tool_edit, tool_validate],
-        ):
-            result = run_update_subagent_node(state)
-
         diagnostics = result["retry_diagnostics_by_task"][group.group_id]
         assert diagnostics.reasoning_summary.startswith("Reasoning Summary")
         assert "Latest candidate was 4.17.21" in diagnostics.reasoning_summary
-
-    def test_parse_registry_report_versions_places_latest_first(self):
-        report = (
-            "## Dist-Tags\n"
-            "  latest: 4.17.21\n\n"
-            "## Last 3 Published Versions (newest first)\n"
-            "  4.17.21  (2024-01-01)\n"
-            "  4.17.20  (2023-01-01)\n"
-            "  4.17.19  (2022-01-01)\n"
-        )
-        candidates, latest = _parse_registry_report_versions(report)
-        assert latest == "4.17.21"
-        assert candidates[0] == "4.17.21"
-
-    def test_update_prompt_instructs_latest_first_rule(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-            retry_count=1,
-        )
-        prompt = _build_update_prompt([(task, group, ["package.json"])], [], {}, {})
-        assert "LATEST-FIRST RULE:" in prompt
-        assert "attempt the LATEST version found on the npm registry" in prompt
-
-    def test_retry_diagnostics_prioritizes_latest_version_seen(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-        )
-        tool_event = MagicMock()
-        tool_event.name = "view_npm_package_versions"
-        tool_event.args = {"package_name": "lodash"}
-        tool_event.content = (
-            "## Dist-Tags\n  latest: 4.17.21\n\n"
-            "## Last 3 Published Versions (newest first)\n"
-            "  4.17.21  (2024-01-01)\n  4.17.20  (2023-01-01)\n"
-        )
-        diagnostics = _build_retry_diagnostics(
-            [(task, group, ["package.json"])],
-            [tool_event],
-            "Failed attempt",
-            ["error"],
-            False,
-            {},
-            [],
-        )
-        planning_answers = diagnostics[group.group_id].planning_answers
-        assert planning_answers["8_next_candidate"] == "4.17.21"
-
-    def test_update_subagent_sends_planning_answers_system_message(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-        )
-        state = initial_update_subagent_state(
-            repo_root=str(_repo_root()),
-            workspace_volume="vol-123",
-            target_tasks=[task],
-            target_groups=[group],
-            constraints_ledger=[],
-        )
-        llm = MagicMock()
-        sandbox = _sandbox_mock()
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
-            return_value=sandbox,
-        ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
-            return_value=(["package.json"], []),
-        ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
-            return_value=[tool_edit],
-        ), patch(
-            "src.orchestrator.update_subagent.run_bounded_subagent_loop",
-        ) as mock_loop:
-            mock_loop.return_value = MagicMock(changed_files=["package.json"], tool_events=[], final_text="done", errors=[])
-            run_update_subagent_node(state)
-            
-            assert mock_loop.call_count == 1
-            initial_msgs = mock_loop.call_args[0][2]
-            assert "You MUST output your planning answers under the '## Planning Answers' section" in initial_msgs[0].content
-
-    def test_update_prompt_enforces_package_scoped_revert_and_filters_attempted_latest(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        from src.orchestrator.update_subagent import UpdateRetryDiagnostics
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-            retry_count=1,
-        )
-        diagnostics = UpdateRetryDiagnostics(
-            task_id=group.group_id,
-            attempted_versions=["4.17.21"],
-            latest_version_seen="4.17.21",
-            candidate_versions_considered=["4.17.21", "4.17.20"],
-            selected_version="4.17.21",
-        )
-        prompt = _build_update_prompt(
-            [(task, group, ["package.json"])],
-            [],
-            {group.group_id: "SECURITY_FLAG: vulnerability remains"},
-            {},
-            {group.group_id: diagnostics},
-        )
-        assert "package_name='failing_package'" in prompt
-        assert "If the latest version on the NPM registry was already attempted and still failed QA due to an unresolved vulnerability (`SECURITY_FLAG`)" in prompt
-        assert "4.17.20" in prompt  # Next untried candidate is recommended instead of already attempted 4.17.21
 
     def test_reverted_package_update_status_becomes_surrender(self):
         from src.contracts.schemas import AgentActionStatus, RemediationTask, RoutingStrategy
@@ -694,46 +393,6 @@ class TestUpdateSubagentWrapper:
         assert summaries[0].status == AgentActionStatus.SURRENDER
         assert "Stopped without a validated manifest update" in summaries[0].summary
 
-    def test_update_subagent_passes_attempted_versions_and_planning_state_to_toolbelt(self):
-        group = _sca_group()
-        repo_root = _repo_root()
-        state = initial_update_subagent_state(
-            repo_root,
-            "agent_workspace_deadbeef",
-            [group],
-            [],
-        )
-        state["target_tasks"][0].retry_count = 1
-        from src.orchestrator.update_subagent import UpdateRetryDiagnostics
-        state["retry_diagnostics_by_task"] = {
-            group.group_id: UpdateRetryDiagnostics(
-                task_id=group.group_id,
-                attempted_versions=["4.17.21"],
-            )
-        }
-
-        llm = MagicMock()
-        sandbox = _sandbox_mock()
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
-            return_value=sandbox,
-        ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
-            return_value=(["package.json"], []),
-        ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
-            return_value=[],
-        ) as mock_toolbelt, patch(
-            "src.orchestrator.update_subagent.run_bounded_subagent_loop",
-        ) as mock_loop:
-            mock_loop.return_value = MagicMock(changed_files=[], tool_events=[], final_text="done", errors=[])
-            run_update_subagent_node(state)
-
-            assert mock_toolbelt.call_count == 1
-            kwargs = mock_toolbelt.call_args.kwargs
-            assert kwargs["attempted_versions_by_package"] == {"lodash": {"4.17.21"}}
-            assert kwargs["require_planning_answers"] is True
-
     def test_update_subagent_passes_override_required_packages_to_toolbelt(self):
         group = _sca_group()
         repo_root = _repo_root()
@@ -755,7 +414,6 @@ class TestUpdateSubagentWrapper:
             group.group_id: UpdateRetryDiagnostics(
                 task_id=group.group_id,
                 used_overrides=True,
-                planning_answers={"5_remediation_type": "npm overrides"},
             )
         }
 
@@ -779,47 +437,6 @@ class TestUpdateSubagentWrapper:
             assert mock_toolbelt.call_count == 1
             kwargs = mock_toolbelt.call_args.kwargs
             assert kwargs["override_required_packages"] == {"lodash"}
-
-    def test_retry_diagnostics_marks_exhausted_update_path_when_latest_attempted_without_peer_conflict(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        from src.orchestrator.subagent_runtime import ToolEvent
-        from src.orchestrator.update_subagent import _build_retry_diagnostics
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-            retry_count=1,
-        )
-        report = (
-            "## Dist-Tags\n"
-            "  latest: 4.17.21\n\n"
-            "## Last 3 Published Versions (newest first)\n"
-            "  4.17.21\n  4.17.20\n  4.17.19\n"
-        )
-        tool_events = [
-            ToolEvent(
-                name="view_npm_package_versions",
-                args={"package_name": "lodash"},
-                content=report,
-            ),
-            ToolEvent(
-                name="modify_npm_dependency",
-                args={"package_name": "lodash", "target_version": "4.17.21"},
-                content="SUCCESS",
-            ),
-        ]
-        diags = _build_retry_diagnostics(
-            [(task, group, ["package.json"])],
-            tool_events=tool_events,
-            final_text="reverted",
-            errors=[],
-            succeeded=False,
-            prior_diagnostics_by_task={},
-            constraints_ledger=[],
-        )
-        assert diags[group.group_id].exhausted_update_path is True
 
     def test_build_action_summaries_marks_surrender_for_unmodified_package_even_when_batch_succeeded(self):
         from src.contracts.schemas import AgentActionStatus
@@ -909,53 +526,6 @@ class TestUpdateSubagentWrapper:
         assert summaries[0].status == AgentActionStatus.SUCCESS
         assert summaries[1].status == AgentActionStatus.SURRENDER
 
-    def test_retry_diagnostics_marks_exhausted_update_path_when_reasoning_summary_states_exhausted(self):
-        from src.contracts.schemas import RemediationTask, RoutingStrategy
-        from src.orchestrator.update_subagent import _build_retry_diagnostics
-        group = _sca_group()
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            instruction="Bump version",
-            retry_count=1,
-        )
-        diags = _build_retry_diagnostics(
-            [(task, group, ["package.json"])],
-            tool_events=[],
-            final_text="## Reasoning Summary\nThe update path is exhausted because latest version was already attempted.",
-            errors=[],
-            succeeded=False,
-            prior_diagnostics_by_task={},
-            constraints_ledger=[],
-        )
-        assert diags[group.group_id].exhausted_update_path is True
-
-    def test_retry_diagnostics_marks_exhausted_update_path_when_reverted_on_retry_or_latest_attempted(self):
-        from src.orchestrator.subagent_runtime import ToolEvent
-        from src.orchestrator.update_subagent import _build_retry_diagnostics
-        group = _sca_group()
-        task = MagicMock(task_id=group.group_id, retry_count=1)
-        tool_events = [
-            ToolEvent(
-                name="revert_workspace_file",
-                args={"package_name": "lodash"},
-                content="SUCCESS: reverted lodash",
-            )
-        ]
-        diags = _build_retry_diagnostics(
-            [(task, group, ["package.json"])],
-            tool_events=tool_events,
-            final_text="Reverted lodash because latest version attempted",
-            errors=[],
-            succeeded=False,
-            prior_diagnostics_by_task={},
-            constraints_ledger=[],
-        )
-        assert diags[group.group_id].exhausted_update_path is True
-
-
-class TestWorkaroundSubagentWrapper:
     def test_workaround_prompt_includes_snippets(self):
         group = _sast_group()
         prompt = _build_workaround_prompt(

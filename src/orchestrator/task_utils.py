@@ -18,6 +18,7 @@ from src.contracts.schemas import (
     FixPlanStatus,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     TaskStatus,
     VulnerabilityGroup,
 )
@@ -69,6 +70,11 @@ def build_initial_remediation_task(
         task_id=task_id,
         parent_group_id=group.group_id,
         strategy=strategy,
+        strategy_stage=(
+            SCARemediationStage.OSV_MINIMUM
+            if strategy == RoutingStrategy.VERSION_BUMP
+            else SCARemediationStage.CODE_WORKAROUND
+        ),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,

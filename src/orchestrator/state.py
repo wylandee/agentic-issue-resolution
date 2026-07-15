@@ -39,7 +39,9 @@ from src.contracts.schemas import (
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     SupervisorDecision,
+    SupervisorRetryPlan,
     SystemContext,
     TaskStatus,
     UpdateRetryDiagnostics,
@@ -75,6 +77,11 @@ def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask
         task_id=group.group_id,
         parent_group_id=group.group_id,
         strategy=strategy,
+        strategy_stage=(
+            SCARemediationStage.OSV_MINIMUM
+            if strategy == RoutingStrategy.VERSION_BUMP
+            else SCARemediationStage.CODE_WORKAROUND
+        ),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,
@@ -163,6 +170,9 @@ class OrchestratorState(TypedDict, total=False):
     retry_diagnostics_by_task: Annotated[
         Dict[str, UpdateRetryDiagnostics], merge_dict_reducer
     ]
+    retry_plans_by_task: Annotated[
+        Dict[str, SupervisorRetryPlan], merge_dict_reducer
+    ]
     changed_files: Annotated[List[str], operator.add]
 
     # Phase 5 Task Queue (primary orchestration unit)
@@ -233,6 +243,7 @@ def initial_orchestrator_state(
         "qa_evaluations": {},
         "action_summaries": [],
         "retry_diagnostics_by_task": {},
+        "retry_plans_by_task": {},
         "changed_files": [],
         "task_queue": {},
         "active_target_task_ids": [],

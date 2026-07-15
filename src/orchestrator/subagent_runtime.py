@@ -162,6 +162,36 @@ def has_successful_validation_after_last_edit(
     return False
 
 
+def has_single_final_successful_validation(
+    tool_events: Sequence[ToolEvent],
+    edit_tool_name: str,
+    validation_tool_name: str,
+) -> bool:
+    """Require exactly one successful validation after the final successful edit."""
+    validation_indices = [
+        index
+        for index, event in enumerate(tool_events)
+        if event.name == validation_tool_name
+    ]
+    if len(validation_indices) != 1:
+        return False
+
+    last_successful_edit_index = max(
+        (
+            index
+            for index, event in enumerate(tool_events)
+            if event.name == edit_tool_name and event.content.startswith("SUCCESS:")
+        ),
+        default=-1,
+    )
+    validation_index = validation_indices[0]
+    return (
+        last_successful_edit_index >= 0
+        and validation_index > last_successful_edit_index
+        and tool_events[validation_index].content.startswith("SUCCESS:")
+    )
+
+
 def has_tool_call_before_first_successful_edit(
     tool_events: Sequence[ToolEvent],
     lookup_tool_name: str,

@@ -17,6 +17,7 @@ from .schemas import (
     FixPlanStatus,
     FailureCategory,
     RoutingStrategy,
+    SCARemediationStage,
     AgentActionStatus,
     GroupRemediationStatus,
     TaskStatus,
@@ -45,6 +46,8 @@ from .schemas import (
     QAEvaluation,
     BatchQAResult,
     AgentActionSummary,
+    UpdateRetryDiagnostics,
+    SupervisorRetryPlan,
     SupervisorDecision,
     # Phase 5 Task Queue
     TaskSpawnRequest,
@@ -64,6 +67,7 @@ __all__ = [
     "FixPlanStatus",
     "FailureCategory",
     "RoutingStrategy",
+    "SCARemediationStage",
     "AgentActionStatus",
     "GroupRemediationStatus",
     "TaskStatus",
@@ -90,6 +94,8 @@ __all__ = [
     "QAEvaluation",
     "BatchQAResult",
     "AgentActionSummary",
+    "UpdateRetryDiagnostics",
+    "SupervisorRetryPlan",
     "SupervisorDecision",
     # Phase 5 Task Queue
     "TaskSpawnRequest",

@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from src.contracts.schemas import CommandResult
 from src.orchestrator.remedy_tools import (
     build_update_toolbelt,
@@ -25,6 +27,7 @@ def _update_tool_map(
     override_required_packages=None,
     require_planning_answers=False,
     planning_state=None,
+    execution_state=None,
 ):
     if touched_files is None:
         touched_files = set()
@@ -45,6 +48,7 @@ def _update_tool_map(
         override_required_packages=override_required_packages,
         require_planning_answers=require_planning_answers,
         planning_state=planning_state,
+        execution_state=execution_state,
     )
     return {tool.name: tool for tool in tools}
 
@@ -83,11 +87,11 @@ class TestToolbeltFactories:
             "validate_code_syntax",
         }
 
-    def test_retry_update_toolbelt_includes_registry_lookup(self):
+    def test_update_toolbelt_excludes_registry_lookup(self):
         sandbox = MagicMock()
         tools = _update_tool_map(sandbox, enable_registry_lookup=True)
 
-        assert "view_npm_package_versions" in tools
+        assert "view_npm_package_versions" not in tools
 
 
 class TestModifyNpmDependency:
@@ -236,41 +240,6 @@ class TestModifyNpmDependency:
         )
 
         assert result == "ERROR: manifest_path must point to a package.json file."
-
-    def test_rejects_already_attempted_version(self):
-        sandbox = MagicMock()
-        tools = _update_tool_map(
-            sandbox,
-            attempted_versions_by_package={"lodash": {"4.17.21"}},
-        )
-        result = tools["modify_npm_dependency"].invoke(
-            {
-                "package_name": "lodash",
-                "target_version": "4.17.21",
-                "dependency_type": "dependencies",
-                "manifest_path": "package.json",
-            }
-        )
-        assert result.startswith("ERROR:")
-        assert "ALREADY ATTEMPTED" in result
-
-    def test_rejects_missing_planning_answers(self):
-        sandbox = MagicMock()
-        tools = _update_tool_map(
-            sandbox,
-            require_planning_answers=True,
-            planning_state={"submitted": False},
-        )
-        result = tools["modify_npm_dependency"].invoke(
-            {
-                "package_name": "lodash",
-                "target_version": "4.17.21",
-                "dependency_type": "dependencies",
-                "manifest_path": "package.json",
-            }
-        )
-        assert result.startswith("ERROR:")
-        assert "output your planning answers" in result
 
     def test_rejects_direct_dependency_edit_when_overrides_required(self):
         sandbox = MagicMock()
@@ -450,6 +419,33 @@ class TestRevertWorkspaceFile:
 
 
 class TestValidateManifestSync:
+    def test_validation_is_rejected_after_the_first_call_in_worker_run(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=1.0,
+        )
+        execution_state = {"edits_started": False, "validation_calls": 0}
+        tools = _update_tool_map(sandbox, execution_state=execution_state)
+
+        edit_result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.22",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        first_validation = tools["validate_manifest_sync"].invoke({})
+        second_validation = tools["validate_manifest_sync"].invoke({})
+
+        assert edit_result.startswith("SUCCESS:")
+        assert first_validation.startswith("SUCCESS:")
+        assert second_validation.startswith("ERROR:")
+        assert "only be called once" in second_validation
+
     def test_success_runs_ignore_scripts_for_each_manifest_directory(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(

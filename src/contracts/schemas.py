@@ -130,6 +130,15 @@ class RoutingStrategy(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class SCARemediationStage(str, Enum):
+    """Ordered remediation stages for an SCA version-bump task."""
+
+    OSV_MINIMUM = "osv_minimum"
+    NPM_SAME_MAJOR = "npm_same_major"
+    NPM_LATEST = "npm_latest"
+    CODE_WORKAROUND = "code_workaround"
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 orchestrator caps
 # ---------------------------------------------------------------------------
@@ -1238,6 +1247,8 @@ class UpdateRetryDiagnostics(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(..., min_length=1)
+    strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
+    security_floor: Optional[str] = None
     registry_query_performed: bool = False
     attempted_versions: List[str] = Field(default_factory=list)
     candidate_versions_considered: List[str] = Field(default_factory=list)
@@ -1248,7 +1259,6 @@ class UpdateRetryDiagnostics(BaseModel):
     exhausted_update_path: bool = False
     failure_reason: str = ""
     reasoning_summary: str = ""
-    planning_answers: Dict[str, str] = Field(default_factory=dict)
 
     @field_validator(
         "attempted_versions",
@@ -1292,22 +1302,62 @@ class UpdateRetryDiagnostics(BaseModel):
             raise ValueError("text fields must be strings.")
         return value.strip()
 
-    @field_validator("planning_answers", mode="before")
-    @classmethod
-    def _normalize_planning_answers(cls, value: Any) -> Dict[str, str]:
-        if value is None:
-            return {}
-        if not isinstance(value, dict):
-            raise ValueError("planning_answers must be a mapping of strings to strings.")
-        cleaned: Dict[str, str] = {}
-        for key, item in value.items():
-            if not isinstance(key, str) or not key.strip():
-                raise ValueError("planning_answers keys must be non-empty strings.")
-            if not isinstance(item, str):
-                raise ValueError("planning_answers values must be strings.")
-            cleaned[key.strip()] = item.strip()
-        return cleaned
 
+class SupervisorRetryPlan(BaseModel):
+    """Authoritative planner decision committed before supervisor routing."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(..., min_length=1)
+    strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
+    selected_version: Optional[str] = None
+    attempted_versions: List[str] = Field(default_factory=list)
+    candidate_versions_considered: List[str] = Field(default_factory=list)
+    latest_version_seen: Optional[str] = None
+    exhausted_update_path: bool = False
+    package_abandoned: bool = False
+    action: Literal["retry_update", "pivot_workaround"] = "retry_update"
+    exact_instruction: str = Field(default="", min_length=1)
+
+    @field_validator(
+        "attempted_versions",
+        "candidate_versions_considered",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_plan_version_lists(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("planner version lists must be lists of strings.")
+        result: List[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("planner version lists must contain only strings.")
+            normalized = item.strip().lstrip("vV")
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
+    @field_validator("selected_version", "latest_version_seen", mode="before")
+    @classmethod
+    def _normalize_plan_optional_version(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("planner version fields must be strings when provided.")
+        normalized = value.strip().lstrip("vV")
+        return normalized or None
+
+    @field_validator("exact_instruction")
+    @classmethod
+    def _normalize_plan_instruction(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("exact_instruction must be non-empty.")
+        return normalized
 
 class SupervisorDecision(BaseModel):
     """
@@ -1519,6 +1569,10 @@ class RemediationTask(BaseModel):
     strategy: RoutingStrategy = Field(
         ...,
         description="Routing strategy: VERSION_BUMP or CODE_WORKAROUND.",
+    )
+    strategy_stage: SCARemediationStage = Field(
+        default=SCARemediationStage.OSV_MINIMUM,
+        description="Current ordered SCA remediation stage for this task.",
     )
     instruction: str = Field(
         default="",

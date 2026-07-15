@@ -15,20 +15,16 @@ It does **not**:
 Public API
 ----------
 ``plan_fix(localized_issue) -> dict``
-    Fetches the npm latest version first, then falls back to Serper workaround
-    search and returns a plain ``dict`` whose keys mirror
-    the ``FixPlan`` Pydantic model.  The dict is also always constructable
-    as a ``FixPlan`` for typed downstream consumers.
+    Queries OSV for this finding's advisory and returns a plain ``dict`` whose
+    keys mirror the ``FixPlan`` Pydantic model. It never queries NPM or Serper;
+    those later strategy stages belong to the supervisor.
 ``plan_fix_legacy(localized_issue) -> dict``
     Runs the original local-regex -> OSV -> npm-registry -> Serper waterfall.
 
-Default planner steps
----------------------
-1. **npm_registry** — fetch the ``latest`` dist-tag from the npm registry.
-   Only attempted for npm/javascript ecosystem packages.
-2. **serper** — Google Search via Serper.dev for workaround snippets.
-   Silently skipped if ``SERPER_API_KEY`` is not set.
-3. **none** — all strategies exhausted; return a ``no_fix`` plan.
+Current triage planner steps
+----------------------------
+1. **osv_api** — resolve this finding's CVE/GHSA advisory through OSV.
+2. **none** — OSV supplied neither a fixed version nor mitigation guidance.
 
 Legacy waterfall steps
 ----------------------
@@ -250,8 +246,8 @@ def _extract_fixed_from_osv_vuln(
 
     Prefers SEMVER ranges; falls back to ECOSYSTEM; skips GIT commit ranges.
     """
-    preferred: Optional[str] = None
-    fallback: Optional[str] = None
+    preferred: List[str] = []
+    fallback: List[str] = []
 
     for affected in (vuln.get("affected") or []):
         # Try to match by package name (case-insensitive); skip mismatches
@@ -268,15 +264,36 @@ def _extract_fixed_from_osv_vuln(
                 fixed = event.get("fixed")
                 if fixed:
                     if rng_type == "SEMVER":
-                        preferred = str(fixed)
+                        preferred.append(str(fixed))
                     else:
-                        fallback = str(fixed)
+                        fallback.append(str(fixed))
 
-    fixed = preferred or fallback
+    fixed = _minimum_fixed_version(preferred or fallback)
     if fixed:
         return fixed, None
 
     return None, _extract_osv_workaround_snippets(vuln)
+
+
+def _minimum_fixed_version(versions: List[str]) -> Optional[str]:
+    """Return the lowest semver-like version from a collection of fixes."""
+    parsed: List[Tuple[Tuple[int, int, int, int, str], str]] = []
+    for raw in versions:
+        match = re.search(
+            r"(?i)v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?",
+            str(raw).strip(),
+        )
+        if not match:
+            continue
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        patch = int(match.group(3) or 0)
+        prerelease = match.group(4) or ""
+        key = (major, minor, patch, 0 if prerelease else 1, prerelease)
+        parsed.append((key, str(raw).strip().lstrip("vV")))
+    if not parsed:
+        return None
+    return min(parsed, key=lambda item: item[0])[1]
 
 
 def _fetch_osv_vuln_detail(vuln_id: str) -> Optional[Dict[str, Any]]:
@@ -304,17 +321,14 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
     if not package_name:
         return None, None
 
-    query: Dict[str, Any] = {}
-   
     eco = (issue.ecosystem or "npm").lower()
-    
     mapping = {
         "npm": "npm",
         "maven": "Maven",
         "pypi": "PyPI",
-        "javascript": "npm" # Route generic JS to npm
+        "javascript": "npm",
     }
-    eco = mapping.get(eco, eco.capitalize()) 
+    eco = mapping.get(eco, eco.capitalize())
 
     query: Dict[str, Any] = {
         "package": {"name": package_name, "ecosystem": eco}
@@ -340,6 +354,7 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
         return None, None
 
     workaround_snippets: List[str] = []
+    fixed_versions: List[str] = []
 
     def _merge_snippets(snippets: Optional[List[str]]) -> None:
         if not snippets:
@@ -348,27 +363,69 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
             if snippet not in workaround_snippets:
                 workaround_snippets.append(snippet)
 
-    for result in results:
-        # Case A: full vuln objects embedded directly in result
-        for vuln in (result.get("vulns") or []):
-            if "affected" in vuln:
-                fixed, snippets = _extract_fixed_from_osv_vuln(vuln, package_name)
-                if fixed:
-                    return fixed, None
-                _merge_snippets(snippets)
+    wanted_ids = {
+        str(identifier).strip().lower()
+        for identifier in (getattr(issue, "cve_id", None), getattr(issue, "ghsa_id", None))
+        if identifier
+    }
 
-        # Case B: only vuln IDs returned — fetch details individually
-        for vuln in (result.get("vulns") or []):
-            vuln_id = vuln.get("id")
-            if not vuln_id:
-                continue
-            detail = _fetch_osv_vuln_detail(vuln_id)
-            if detail:
-                fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
-                if fixed:
-                    return fixed, None
-                _merge_snippets(snippets)
+    all_vulns = [
+        vuln
+        for result in results
+        for vuln in (result.get("vulns") or [])
+        if isinstance(vuln, dict)
+    ]
 
+    def _matches_issue(vuln: Dict[str, Any]) -> bool:
+        if not wanted_ids:
+            return True
+        returned_ids = {
+            str(identifier).strip().lower()
+            for identifier in [vuln.get("id"), *(vuln.get("aliases") or [])]
+            if identifier
+        }
+        return bool(wanted_ids & returned_ids)
+
+    matching_vulns = [vuln for vuln in all_vulns if _matches_issue(vuln)]
+
+    def _consume_vuln(vuln: Dict[str, Any]) -> None:
+        if "affected" in vuln:
+            fixed, snippets = _extract_fixed_from_osv_vuln(vuln, package_name)
+            if fixed:
+                fixed_versions.append(fixed)
+            _merge_snippets(snippets)
+            return
+
+        vuln_id = vuln.get("id")
+        if not vuln_id:
+            return
+        detail = _fetch_osv_vuln_detail(str(vuln_id))
+        if detail:
+            fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
+            if fixed:
+                fixed_versions.append(fixed)
+            _merge_snippets(snippets)
+
+    for vuln in matching_vulns:
+        _consume_vuln(vuln)
+
+    # If querybatch returned no matching advisory, resolve the finding's own
+    # CVE/GHSA directly instead of assigning another advisory's fix.
+    if not matching_vulns and all_vulns and wanted_ids:
+        for vuln_id in (
+            getattr(issue, "cve_id", None),
+            getattr(issue, "ghsa_id", None),
+        ):
+            if vuln_id:
+                detail = _fetch_osv_vuln_detail(str(vuln_id))
+                if detail:
+                    fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
+                    if fixed:
+                        fixed_versions.append(fixed)
+                    _merge_snippets(snippets)
+
+    if fixed_versions:
+        return _minimum_fixed_version(fixed_versions), None
     return None, (workaround_snippets or None)
 
 
@@ -450,7 +507,11 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> Optional[List[s
 
 def plan_fix(localized_issue: LocalizedIssue) -> dict:
     """
-    Plan one SCA fix by trying npm latest first, then Serper fallback.
+    Plan one SCA finding from OSV advisory data only.
+
+    NPM registry candidate selection intentionally does not happen here.  The
+    supervisor owns the later retry stages so each advisory is classified
+    independently before strategy-aware grouping.
 
     Returns a plain ``dict`` that mirrors the ``FixPlan`` Pydantic model and
     is always constructable as one:
@@ -468,36 +529,26 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     is_direct = localized_issue.is_direct_dependency
     manifest_file = localized_issue.manifest_file
 
-    # ------------------------------------------------------------------
-    # Step 1: npm registry — latest dist-tag (npm/javascript only)
-    # ------------------------------------------------------------------
-    if package_name and _is_npm_issue(issue):
-        fixed = _fetch_npm_latest(package_name)
-        if fixed:
-            log.info("[fix_planner] Step 1 (npm_registry): found %s → %s", package_name, fixed)
-            return _version_plan(
-                package_name, fixed, package_manager, is_direct, manifest_file,
-                strategy="npm_registry",
-            )
-
-    # ------------------------------------------------------------------
-    # Step 2: Serper web search for workarounds
-    # ------------------------------------------------------------------
-    snippets = _search_serper_workarounds(issue, package_name)
+    # Triage is deliberately OSV-first and OSV-only. NPM candidate selection is
+    # owned by the Phase 5 supervisor after QA rejects this initial attempt.
+    osv_result = _query_osv_fixed_version(issue)
+    if isinstance(osv_result, tuple) and len(osv_result) == 2:
+        fixed, snippets = osv_result
+    else:  # Defensive fallback for integrations that return no OSV result.
+        fixed, snippets = None, None
+    if fixed:
+        return _version_plan(
+            package_name, fixed, package_manager, is_direct, manifest_file,
+            strategy="osv_api",
+        )
     if snippets:
-        log.info("[fix_planner] Step 2 (serper): found %d workaround snippets", len(snippets))
         return {
             "status": FixPlanStatus.WORKAROUND_FOUND.value,
             "fixed_version": None,
             "workaround_snippets": snippets,
             "instruction": _WORKAROUND_INSTRUCTION,
-            "strategy_used": "serper",
+            "strategy_used": "osv_api",
         }
-
-    # ------------------------------------------------------------------
-    # Step 3: no fix found
-    # ------------------------------------------------------------------
-    log.warning("[fix_planner] Step 3 (none): no fix found for %s", package_name)
     return {
         "status": FixPlanStatus.NO_FIX.value,
         "fixed_version": None,
