@@ -32,6 +32,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import hashlib
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -43,14 +45,18 @@ from src.contracts.schemas import (
     AgentActionSummary,
     FailureCategory,
     QAEvaluation,
+    QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     SupervisorDecision,
     SupervisorRetryPlan,
+    StateConsistencyEvent,
+    TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
+    WorkerAttemptResult,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
@@ -71,6 +77,27 @@ _VALID_NEXT_NODES: Set[str] = {
     "teardown",
 }
 _DEFAULT_MODEL = "gpt-4o-mini"
+
+# Keep planner stage parsing and validation centralized.  The router prompt
+# uses the enum values, but planner scratchpads from older prompts commonly
+# use the shorter ``same_major`` spelling.  Accept that spelling explicitly;
+# do not let an unrecognised value silently become the task's current stage.
+_PLANNER_STAGE_ALIASES: Dict[str, SCARemediationStage] = {
+    "osv": SCARemediationStage.OSV_MINIMUM,
+    "minimum": SCARemediationStage.OSV_MINIMUM,
+    "osv_minimum": SCARemediationStage.OSV_MINIMUM,
+    "same_major": SCARemediationStage.NPM_SAME_MAJOR,
+    "npm_same_major": SCARemediationStage.NPM_SAME_MAJOR,
+    "latest": SCARemediationStage.NPM_LATEST,
+    "npm_latest": SCARemediationStage.NPM_LATEST,
+    "code_workaround": SCARemediationStage.CODE_WORKAROUND,
+}
+_SCA_STAGE_ORDER: Dict[SCARemediationStage, int] = {
+    SCARemediationStage.OSV_MINIMUM: 0,
+    SCARemediationStage.NPM_SAME_MAJOR: 1,
+    SCARemediationStage.NPM_LATEST: 2,
+    SCARemediationStage.CODE_WORKAROUND: 3,
+}
 
 # ---------------------------------------------------------------------------
 # Task status helpers
@@ -164,6 +191,469 @@ def _selection_for_stage(stage: SCARemediationStage) -> Optional[str]:
     return None
 
 
+def _instruction_digest(instruction: str) -> str:
+    """Return the stable digest used to correlate worker input and output."""
+    normalized = " ".join((instruction or "").split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _attempts_for_task(
+    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
+    task_id: str,
+) -> List[TaskAttemptSnapshot]:
+    return sorted(
+        (snapshot for snapshot in snapshots_by_id.values() if snapshot.task_id == task_id),
+        key=lambda snapshot: (snapshot.attempt_number, snapshot.created_at),
+    )
+
+
+def _build_consistency_event(
+    *,
+    error_code: str,
+    task_id: Optional[str],
+    expected_attempt_id: Optional[str],
+    received_attempt_id: Optional[str],
+    action: str,
+    details: str,
+) -> StateConsistencyEvent:
+    return StateConsistencyEvent(
+        error_code=error_code,
+        task_id=task_id,
+        expected_attempt_id=expected_attempt_id,
+        received_attempt_id=received_attempt_id,
+        action=action,  # type: ignore[arg-type]
+        details=details,
+    )
+
+
+def _dedupe_consistency_events(
+    events: List[StateConsistencyEvent],
+) -> List[StateConsistencyEvent]:
+    """Keep one consistency event per task/attempt/error tuple."""
+    result: List[StateConsistencyEvent] = []
+    seen: Set[Tuple[Optional[str], Optional[str], str]] = set()
+    for event in events:
+        key = (event.task_id, event.received_attempt_id, event.error_code)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(event)
+    return result
+
+
+def _current_action_summaries(
+    action_summaries: List[AgentActionSummary],
+    task_queue: Dict[str, RemediationTask],
+    limit: int,
+) -> List[AgentActionSummary]:
+    """Return only summaries belonging to each task's committed attempt."""
+    relevant: List[AgentActionSummary] = []
+    for summary in action_summaries:
+        task = task_queue.get(summary.task_id)
+        if task is None:
+            continue
+        if task.current_attempt_id:
+            if summary.attempt_id != task.current_attempt_id:
+                continue
+        elif summary.attempt_id is not None:
+            continue
+        relevant.append(summary)
+    return relevant[-limit:]
+
+
+def _create_attempt_snapshot(
+    task: RemediationTask,
+    *,
+    dispatch_node: str,
+    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
+    state_revision: int,
+    plan_id: Optional[str] = None,
+) -> Tuple[RemediationTask, TaskAttemptSnapshot]:
+    """Commit the exact worker input and return the revised task projection."""
+    attempt_id = str(uuid.uuid4())
+    task_revision = task.task_revision + 1
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        state_revision=state_revision,
+        task_revision=task_revision,
+        attempt_number=len(_attempts_for_task(snapshots_by_id, task.task_id)) + 1,
+        strategy_stage=task.strategy_stage,
+        selected_version=task.selected_version,
+        instruction=task.instruction,
+        instruction_digest=_instruction_digest(task.instruction),
+        dispatch_node=dispatch_node,  # type: ignore[arg-type]
+        plan_id=plan_id,
+    )
+    snapshots_by_id[attempt_id] = snapshot
+    updated_task = task.model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+        }
+    )
+    return updated_task, snapshot
+
+
+_ATTEMPT_INPUT_FIELDS = frozenset(
+    {
+        "task_revision",
+        "strategy_stage",
+        "selected_version",
+        "exhausted_update_path",
+        "instruction",
+        "strategy",
+    }
+)
+
+
+def _commit_task_transition(
+    task_queue: Dict[str, RemediationTask],
+    task_id: str,
+    *,
+    updates: Dict[str, Any],
+    close_attempt: bool = False,
+    clear_selected_version: bool = False,
+) -> Optional[RemediationTask]:
+    """Commit one coherent supervisor transition for a task.
+
+    ``task_queue`` is the authoritative projection.  This helper makes the
+    transition explicit and ensures that any change to worker-input fields is
+    either paired with a new task revision or closes the old attempt first.
+    Worker successes that are waiting for QA intentionally do not use this
+    helper for a status-only update: their current snapshot remains valid QA
+    input.  Every replan, surrender, terminalization, and pivot does use it.
+    """
+    task = task_queue.get(task_id)
+    if task is None:
+        return None
+
+    committed_updates = dict(updates)
+    input_changed = any(
+        field in committed_updates and committed_updates[field] != getattr(task, field)
+        for field in _ATTEMPT_INPUT_FIELDS
+    )
+    if close_attempt:
+        committed_updates["current_attempt_id"] = None
+        if task.current_attempt_id is not None:
+            input_changed = True
+    if clear_selected_version:
+        committed_updates["selected_version"] = None
+        if task.selected_version is not None:
+            input_changed = True
+
+    if not committed_updates:
+        return task
+
+    if input_changed:
+        committed_updates["task_revision"] = task.task_revision + 1
+
+    committed_task = task.model_copy(update=committed_updates)
+    task_queue[task_id] = committed_task
+    return committed_task
+
+
+def _validate_committed_state(
+    task_queue: Dict[str, RemediationTask],
+    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
+    retry_plans_by_task: Dict[str, SupervisorRetryPlan],
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    active_target_task_ids: List[str],
+    next_node: str,
+) -> Tuple[List[StateConsistencyEvent], List[str]]:
+    """Validate the state projection that will be handed to the next node."""
+    events: List[StateConsistencyEvent] = []
+    errors: List[str] = []
+
+    # Reconcile every task before validating routing.  Worker and QA bridges
+    # are not allowed to repair planner-owned fields, so if a stale reducer
+    # or compatibility projection paired a task with a different current
+    # snapshot, the immutable snapshot wins for an active task.  A terminal
+    # task has no authorized future worker input, so its dangling attempt is
+    # detached instead of being allowed to leak into the next prompt.
+    for task_id, task in list(task_queue.items()):
+        if task.status in _TERMINAL_STATUSES and (
+            task.current_attempt_id is not None or task.selected_version is not None
+        ):
+            expected_attempt_id = task.current_attempt_id
+            task_queue[task_id] = task.model_copy(
+                update={
+                    "current_attempt_id": None,
+                    "selected_version": None,
+                    "task_revision": task.task_revision + 1,
+                }
+            )
+            events.append(
+                _build_consistency_event(
+                    error_code="TERMINAL_TASK_FIELDS_NORMALIZED",
+                    task_id=task_id,
+                    expected_attempt_id=expected_attempt_id,
+                    received_attempt_id=expected_attempt_id,
+                    action="repaired",
+                    details=(
+                        "Terminal task cannot retain a current worker attempt or "
+                        "a dispatchable selected version."
+                    ),
+                )
+            )
+            continue
+        if not task.current_attempt_id:
+            continue
+        snapshot = snapshots_by_id.get(task.current_attempt_id)
+        if snapshot is None:
+            errors.append(
+                f"supervisor: task {task_id} references a missing attempt snapshot."
+            )
+            continue
+
+        snapshot_matches = (
+            snapshot.task_id == task.task_id
+            and snapshot.task_revision == task.task_revision
+            and snapshot.strategy_stage == task.strategy_stage
+            and snapshot.selected_version == task.selected_version
+            and snapshot.instruction == task.instruction
+            and snapshot.instruction_digest == _instruction_digest(task.instruction)
+            and (
+                (
+                    snapshot.dispatch_node == "update_subagent"
+                    and task.strategy == RoutingStrategy.VERSION_BUMP
+                )
+                or (
+                    snapshot.dispatch_node == "workaround_subagent"
+                    and task.strategy == RoutingStrategy.CODE_WORKAROUND
+                )
+                or snapshot.dispatch_node == "qa_critic"
+            )
+        )
+        if snapshot_matches:
+            continue
+
+        task_queue[task_id] = task.model_copy(
+            update={
+                "task_revision": snapshot.task_revision,
+                "current_attempt_id": snapshot.attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "instruction": snapshot.instruction,
+            }
+        )
+        events.append(
+            _build_consistency_event(
+                error_code="TASK_SNAPSHOT_REPAIRED",
+                task_id=task_id,
+                expected_attempt_id=task.current_attempt_id,
+                received_attempt_id=snapshot.attempt_id,
+                action="repaired",
+                details="Active task fields were restored from its committed attempt snapshot.",
+            )
+        )
+
+    for task_id in list(retry_plans_by_task):
+        task = task_queue.get(task_id)
+        plan = retry_plans_by_task[task_id]
+        if task is None:
+            retry_plans_by_task.pop(task_id, None)
+            continue
+        if task.status in _TERMINAL_STATUSES:
+            retry_plans_by_task.pop(task_id, None)
+            events.append(
+                _build_consistency_event(
+                    error_code="TERMINAL_TASK_PLAN_CLEARED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="repaired",
+                    details="Removed a retry plan from a terminal task.",
+                )
+            )
+            continue
+        if plan.action == "retry_update" and (
+            plan.selected_version is None or task.exhausted_update_path
+        ):
+            retry_plans_by_task.pop(task_id, None)
+            events.append(
+                _build_consistency_event(
+                    error_code="INVALID_RETRY_PLAN_CLEARED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="replanned",
+                    details="Cleared a retry plan that cannot be dispatched safely.",
+                )
+            )
+            continue
+        if plan.action == "retry_update" and (
+            plan.source_task_revision > task.task_revision
+            or plan.source_task_revision < max(0, task.task_revision - 1)
+            or
+            plan.strategy_stage != task.strategy_stage
+            or plan.selected_version != task.selected_version
+            or plan.exact_instruction != task.instruction
+            or plan.exhausted_update_path != task.exhausted_update_path
+        ):
+            retry_plans_by_task.pop(task_id, None)
+            events.append(
+                _build_consistency_event(
+                    error_code="RETRY_PLAN_TASK_CONTRADICTION",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="replanned",
+                    details="Cleared a retry plan that disagreed with the committed task queue.",
+                )
+            )
+            continue
+
+    for task_id in active_target_task_ids:
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        if task.status in _TERMINAL_STATUSES:
+            errors.append(f"supervisor: terminal task {task_id} remained active.")
+            events.append(
+                _build_consistency_event(
+                    error_code="TERMINAL_TASK_ACTIVE",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="ignored",
+                    details="Terminal task removed from dispatch projection.",
+                )
+            )
+            continue
+        if task.current_attempt_id is None:
+            errors.append(f"supervisor: active task {task_id} has no attempt snapshot.")
+            events.append(
+                _build_consistency_event(
+                    error_code="ACTIVE_TASK_WITHOUT_ATTEMPT",
+                    task_id=task_id,
+                    expected_attempt_id=None,
+                    received_attempt_id=None,
+                    action="replanned",
+                    details="Active target cannot be dispatched without a committed snapshot.",
+                )
+            )
+            continue
+        snapshot = snapshots_by_id.get(task.current_attempt_id)
+        if snapshot is None:
+            errors.append(f"supervisor: active task {task_id} references missing attempt.")
+            continue
+        if (
+            snapshot.task_revision != task.task_revision
+            or snapshot.strategy_stage != task.strategy_stage
+            or snapshot.selected_version != task.selected_version
+            or snapshot.instruction != task.instruction
+            or snapshot.instruction_digest != _instruction_digest(task.instruction)
+        ):
+            errors.append(f"supervisor: task {task_id} disagrees with its attempt snapshot.")
+            events.append(
+                _build_consistency_event(
+                    error_code="TASK_SNAPSHOT_CONTRADICTION",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=task.current_attempt_id,
+                    action="replanned",
+                    details="Task projection and committed attempt snapshot differ.",
+                )
+            )
+        if next_node == "update_subagent" and task.exhausted_update_path:
+            errors.append(f"supervisor: exhausted task {task_id} cannot route to update.")
+
+    for task_id, diagnostics in retry_diagnostics_by_task.items():
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        if diagnostics.selected_version != task.selected_version:
+            diagnostics = diagnostics.model_copy(
+                update={"selected_version": task.selected_version}
+            )
+            retry_diagnostics_by_task[task_id] = diagnostics
+            events.append(
+                _build_consistency_event(
+                    error_code="DIAGNOSTICS_PROJECTION_REPAIRED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=diagnostics.committed_attempt_id,
+                    action="repaired",
+                    details="Planner-owned selected version restored from task state.",
+                )
+            )
+        if (
+            next_node == "update_subagent"
+            and task.selected_version
+            and task.selected_version.strip().lstrip("vV").lower()
+            in {
+                version.strip().lstrip("vV").lower()
+                for version in diagnostics.attempted_versions
+                if version
+            }
+        ):
+            errors.append(
+                f"supervisor: selected version for {task_id} was already attempted."
+            )
+    return events, errors
+
+
+def reconcile_phase5_state_before_teardown(
+    state: OrchestratorState,
+) -> Dict[str, Any]:
+    """Apply the final supervisor state barrier before teardown.
+
+    Teardown is a cleanup operation, not a routing decision.  It must receive
+    a terminal task projection with no retry plans, active targets, or current
+    worker inputs.  This function deliberately performs no LLM calls and uses
+    the same validator as the supervisor return path, so direct teardown
+    callers and graph executions share the same invariant.
+    """
+    task_queue: Dict[str, RemediationTask] = {
+        task_id: task.model_copy()
+        for task_id, task in dict(state.get("task_queue", {})).items()
+    }
+    snapshots_by_id: Dict[str, TaskAttemptSnapshot] = dict(
+        state.get("attempt_snapshots_by_id", {})
+    )
+    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
+        state.get("retry_plans_by_task", {})
+    )
+    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = dict(
+        state.get("retry_diagnostics_by_task", {})
+    )
+    prior_events = list(state.get("consistency_events", []) or [])
+    prior_event_keys = {
+        (event.task_id, event.received_attempt_id, event.error_code)
+        for event in prior_events
+    }
+
+    events, errors = _validate_committed_state(
+        task_queue,
+        snapshots_by_id,
+        retry_plans_by_task,
+        retry_diagnostics_by_task,
+        [],
+        "teardown",
+    )
+    new_events = [
+        event
+        for event in _dedupe_consistency_events(events)
+        if (event.task_id, event.received_attempt_id, event.error_code)
+        not in prior_event_keys
+    ]
+    prior_errors = set(state.get("errors", []) or [])
+    new_errors = list(dict.fromkeys(error for error in errors if error not in prior_errors))
+
+    return {
+        "task_queue": task_queue,
+        "retry_plans_by_task": retry_plans_by_task,
+        "retry_diagnostics_by_task": retry_diagnostics_by_task,
+        "active_target_task_ids": [],
+        "active_target_group_ids": [],
+        "next_routing_step": "teardown",
+        "state_revision": int(state.get("state_revision", 0)) + 1,
+        "consistency_events": new_events,
+        "errors": new_errors,
+    }
+
+
 def _parse_planner_retry_plans(
     scratchpad: str,
     task_queue: Dict[str, RemediationTask],
@@ -209,15 +699,20 @@ def _parse_planner_retry_plans(
 
         effective_stage = task.strategy_stage
         stage_match = re.search(
-            r"EFFECTIVE[_ ]STAGE\s*[:=]\s*([a-z_]+)",
+            r"EFFECTIVE[_ ]STAGE\s*[:=]\s*([a-z0-9_-]+)",
             section,
             re.IGNORECASE,
         )
         if stage_match:
-            try:
-                effective_stage = SCARemediationStage(stage_match.group(1).lower())
-            except ValueError:
-                pass
+            raw_stage = stage_match.group(1).strip().lower().replace("-", "_")
+            # Normalize known planner vocabulary.  Use CODE_WORKAROUND as a
+            # fail-closed sentinel for unknown values: the semantic validator
+            # below rejects retry_update at that stage, so an invalid token can
+            # never silently inherit the task's current routing stage.
+            effective_stage = _PLANNER_STAGE_ALIASES.get(
+                raw_stage,
+                SCARemediationStage.CODE_WORKAROUND,
+            )
         action_match = re.search(
             r"ACTION\s*[:=]\s*(retry_update|pivot_workaround)",
             section,
@@ -340,6 +835,7 @@ def _parse_planner_retry_plans(
             )
         plans[task_id] = SupervisorRetryPlan(
             task_id=task_id,
+            source_task_revision=task.task_revision,
             strategy_stage=effective_stage,
             selected_version=selected,
             attempted_versions=attempted,
@@ -372,6 +868,13 @@ def _planner_plan_violations(
         if task is None:
             violations.append(f"task {task_id}: planner returned an unknown task")
             continue
+        if task.status in _TERMINAL_STATUSES:
+            violations.append(f"task {task_id}: planner returned a plan for terminal task")
+        if plan.source_task_revision != task.task_revision:
+            violations.append(
+                f"task {task_id}: planner snapshot revision {plan.source_task_revision} "
+                f"does not match current revision {task.task_revision}"
+            )
 
         attempted = {
             version.strip().lstrip("vV").lower()
@@ -412,6 +915,23 @@ def _planner_plan_violations(
         if plan.action == "retry_update" and plan.exhausted_update_path:
             violations.append(
                 f"task {task_id}: exhausted update path cannot retry update"
+            )
+        if (
+            plan.action == "retry_update"
+            and plan.strategy_stage == SCARemediationStage.CODE_WORKAROUND
+        ):
+            violations.append(
+                f"task {task_id}: retry_update cannot use code_workaround stage"
+            )
+        if (
+            plan.action == "retry_update"
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and _SCA_STAGE_ORDER[plan.strategy_stage]
+            < _SCA_STAGE_ORDER[task.strategy_stage]
+        ):
+            violations.append(
+                f"task {task_id}: planner stage {plan.strategy_stage.value} regresses "
+                f"from committed stage {task.strategy_stage.value}"
             )
         if plan.action == "pivot_workaround" and plan.strategy_stage != SCARemediationStage.NPM_LATEST:
             violations.append(
@@ -618,10 +1138,20 @@ def _repair_invalid_planner_plans(
             )
 
         candidate = None
-        for version in [plan.latest_version_seen, *plan.candidate_versions_considered]:
-            if version and version.strip().lstrip("vV").lower() not in attempted:
-                candidate = version.strip().lstrip("vV")
-                break
+        plan_regresses = (
+            task_queue[task_id].strategy == RoutingStrategy.VERSION_BUMP
+            and _SCA_STAGE_ORDER[plan.strategy_stage]
+            < _SCA_STAGE_ORDER[task_queue[task_id].strategy_stage]
+        )
+        # A correction cannot reopen an earlier stage.  In particular, a
+        # stale same-major proposal must not revive a version-bump parent that
+        # has already reached code_workaround.  Let the fail-closed branch
+        # below create the deterministic latest-stage pivot instead.
+        if not plan_regresses and plan.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
+            for version in [plan.latest_version_seen, *plan.candidate_versions_considered]:
+                if version and version.strip().lstrip("vV").lower() not in attempted:
+                    candidate = version.strip().lstrip("vV")
+                    break
 
         if candidate:
             effective_stage = plan.strategy_stage
@@ -1012,6 +1542,9 @@ def _terminalize_pivot_parents(
     parent_ids: List[str],
     strategy_by_parent: Dict[str, RoutingStrategy],
     qa_evaluations: Dict[str, QAEvaluation],
+    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
+    retry_plans_by_task: Optional[Dict[str, SupervisorRetryPlan]] = None,
+    group_by_id: Optional[Dict[str, VulnerabilityGroup]] = None,
 ) -> None:
     """Mark pivoted parent tasks terminal so they cannot be re-routed to update work."""
     for parent_id in parent_ids:
@@ -1024,8 +1557,63 @@ def _terminalize_pivot_parents(
             new_strategy,
             qa_evaluations,
         )
+        updates: Dict[str, Any] = {}
         if parent_task.status not in _TERMINAL_STATUSES:
-            task_queue[parent_id] = parent_task.model_copy(update={"status": terminal_status})
+            updates["status"] = terminal_status
+
+        # Parent/child pivots are one atomic state transition.  A version-bump
+        # parent remains the audit record for the exhausted update path, while
+        # the newly materialized child owns workaround execution.  Do not
+        # leave the parent with a code-workaround stage and an old exact
+        # dependency instruction; that contradictory combination is what made
+        # the router prompt in the trace authorize a stale update.
+        if (
+            parent_task.strategy == RoutingStrategy.VERSION_BUMP
+            and new_strategy == RoutingStrategy.CODE_WORKAROUND
+        ):
+            group = (group_by_id or {}).get(parent_task.parent_group_id)
+            component = group.vulnerable_component if group else parent_task.parent_group_id
+            updates.update(
+                {
+                    "strategy_stage": SCARemediationStage.NPM_LATEST,
+                    "selected_version": None,
+                    "exhausted_update_path": True,
+                    "instruction": (
+                        f"The manifest-based update path for {component} is exhausted; "
+                        "the workaround child task owns the remaining remediation."
+                    ),
+                }
+            )
+
+        # A pivot closes the update attempt. Keep the immutable attempt in
+        # history, but do not leave it as the task's current worker input
+        # after replacing the task with a terminal parent/child transition.
+        # Otherwise the next supervisor pass sees an old update snapshot paired
+        # with workaround state.
+        _commit_task_transition(
+            task_queue,
+            parent_id,
+            updates=updates,
+            close_attempt=(parent_task.current_attempt_id is not None),
+            clear_selected_version=(parent_task.selected_version is not None),
+        )
+        if retry_plans_by_task is not None:
+            retry_plans_by_task.pop(parent_id, None)
+        if retry_diagnostics_by_task is not None:
+            diagnostics = retry_diagnostics_by_task.get(parent_id)
+            if diagnostics is not None:
+                committed_parent = task_queue[parent_id]
+                retry_diagnostics_by_task[parent_id] = diagnostics.model_copy(
+                    update={
+                        "strategy_stage": committed_parent.strategy_stage,
+                        "selected_version": None,
+                        "exhausted_update_path": True,
+                        "committed_attempt_id": None,
+                        "instruction_digest": _instruction_digest(
+                            committed_parent.instruction
+                        ),
+                    }
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1946,7 @@ def _build_planner_prompt(
         "",
         "## Recent Action Summaries",
     ]
-    for summary in action_summaries[-6:]:
+    for summary in _current_action_summaries(action_summaries, task_queue, 6):
         lines.append(f"- [{summary.task_id}] {summary.status.value}: {summary.summary}")
     if not action_summaries:
         lines.append("- (none)")
@@ -1516,6 +2104,9 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
             f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
             f"- Strategy      : {task.strategy.value}",
             f"- Strategy Stage: {task.strategy_stage.value}",
+            f"- Task Revision : {task.task_revision}",
+            f"- Current Attempt: {task.current_attempt_id or 'none'}",
+            f"- Committed Selected Version: {task.selected_version or 'none'}",
             f"- OSV Security Floor: {security_floor}",
             f"- Status        : {task.status.value}",
             f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
@@ -1560,7 +2151,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "",
         "## Recent Action Summaries",
     ]
-    for summary in action_summaries[-10:]:
+    for summary in _current_action_summaries(action_summaries, task_queue, 10):
         lines.append(
             f"- [{summary.task_id}] {summary.status.value}: {summary.summary}"
         )
@@ -1730,7 +2321,32 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
         state.get("retry_plans_by_task", {})
     )
-    errors: List[str] = list(state.get("errors") or [])
+    attempt_snapshots_by_id: Dict[str, TaskAttemptSnapshot] = dict(
+        state.get("attempt_snapshots_by_id", {})
+    )
+    worker_results_by_attempt: Dict[str, WorkerAttemptResult] = dict(
+        state.get("worker_results_by_attempt", {})
+    )
+    qa_results_by_attempt: Dict[str, QAAttemptResult] = dict(
+        state.get("qa_results_by_attempt", {})
+    )
+    processed_worker_attempt_ids: Set[str] = set(
+        state.get("processed_worker_attempt_ids", [])
+    )
+    processed_qa_attempt_ids: Set[str] = set(
+        state.get("processed_qa_attempt_ids", [])
+    )
+    prior_consistency_events: List[StateConsistencyEvent] = list(
+        state.get("consistency_events", [])
+    )
+    consistency_events: List[StateConsistencyEvent] = []
+    state_revision = int(state.get("state_revision", 0)) + 1
+    # ``errors`` is an additive LangGraph reducer. A node must return only
+    # errors discovered during this invocation; replaying the prior list here
+    # is what caused identical planner errors to multiply across supervisor
+    # loops.
+    errors: List[str] = []
+    prior_error_messages = set(state.get("errors", []) or [])
 
     # ------------------------------------------------------------------
     # 1. Normalize task_queue (copy-on-write)
@@ -1748,40 +2364,269 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             task_queue[task_id] = build_initial_remediation_task(group, task_id)
             next_task_index += 1
 
+    # Keep task-owned planner fields synchronized with the initial OSV plan.
+    # Later planner commits are the only source allowed to change these fields.
+    for task_id, task in list(task_queue.items()):
+        group = group_by_id.get(task.parent_group_id)
+        task_updates: Dict[str, Any] = {}
+        if (
+            task.task_revision == 0
+            and
+            task.status not in _TERMINAL_STATUSES
+            and task.current_attempt_id is None
+            and not task.instruction
+            and group is not None
+            and group.fix_plan is not None
+            and group.fix_plan.instruction
+        ):
+            task_updates["instruction"] = group.fix_plan.instruction
+        if (
+            task.task_revision == 0
+            and task.current_attempt_id is None
+            and task.status == TaskStatus.PENDING
+            and task.selected_version is None
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and group is not None
+            and group.fix_plan is not None
+            and group.fix_plan.fixed_version
+        ):
+            task_updates["selected_version"] = group.fix_plan.fixed_version
+        if task_updates:
+            task_queue[task_id] = task.model_copy(update=task_updates)
+
     # ------------------------------------------------------------------
-    # 2. Ingest subagent action summaries (active targets only)
+    # 2. Ingest attempt-tagged worker results (active targets only)
     # ------------------------------------------------------------------
     active_target_task_ids = list(state.get("active_target_task_ids") or [])
     active_targets = set(active_target_task_ids)
     action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
+    new_worker_attempt_ids: List[str] = []
 
-    if active_targets and action_summaries:
-        recent_summaries = {}
-        for summary in action_summaries:
-            resolved_t_id = _resolve_task_id_from_identifier(
-                summary.task_id,
-                task_queue,
-                active_target_task_ids,
-            )
-            if resolved_t_id is None:
-                continue
-            if resolved_t_id in active_targets:
-                recent_summaries[resolved_t_id] = summary
-
-        for resolved_t_id, summary in recent_summaries.items():
-            task = task_queue[resolved_t_id]
-            if task.status in (TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE):
-                continue
-            if summary.status == AgentActionStatus.SUCCESS:
-                task.status = TaskStatus.OPTIMISTICALLY_FIXED
-            elif (
-                task.strategy == RoutingStrategy.CODE_WORKAROUND
-                or "Workaround subagent bypassed" in summary.summary
+    for task_id in active_target_task_ids:
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        current_attempt_id = task.current_attempt_id
+        snapshot = (
+            attempt_snapshots_by_id.get(current_attempt_id)
+            if current_attempt_id
+            else None
+        )
+        result = (
+            worker_results_by_attempt.get(current_attempt_id)
+            if current_attempt_id
+            else None
+        )
+        for stale_result in worker_results_by_attempt.values():
+            if (
+                stale_result.task_id == task_id
+                and stale_result.attempt_id != current_attempt_id
+                and stale_result.attempt_id not in processed_worker_attempt_ids
             ):
-                task.status = TaskStatus.UNFIXABLE
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="STALE_WORKER_RESULT",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=stale_result.attempt_id,
+                        action="ignored",
+                        details="Worker result belongs to an older task attempt.",
+                    )
+                )
+                processed_worker_attempt_ids.add(stale_result.attempt_id)
+                new_worker_attempt_ids.append(stale_result.attempt_id)
+        if result is not None and task.status in _TERMINAL_STATUSES:
+            if current_attempt_id not in processed_worker_attempt_ids:
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="TERMINAL_TASK_RESULT_IGNORED",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=result.attempt_id,
+                        action="ignored",
+                        details="A late worker result cannot reopen a terminal task.",
+                    )
+                )
+                processed_worker_attempt_ids.add(current_attempt_id)
+                new_worker_attempt_ids.append(current_attempt_id)
+            continue
+        if result is not None and current_attempt_id not in processed_worker_attempt_ids:
+            if (
+                result.task_id != task_id
+                or result.task_revision != task.task_revision
+                or snapshot is None
+                or result.instruction_digest != snapshot.instruction_digest
+            ):
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="WORKER_ATTEMPT_MISMATCH",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=result.attempt_id,
+                        action="ignored",
+                        details=(
+                            f"Expected revision {task.task_revision} and digest "
+                            f"{snapshot.instruction_digest if snapshot else 'missing'}, "
+                            f"received revision {result.task_revision} and digest "
+                            f"{result.instruction_digest}."
+                        ),
+                    )
+                )
+                errors.append(
+                    f"supervisor: ignored mismatched worker result for {task_id} "
+                    f"attempt {result.attempt_id}."
+                )
+                processed_worker_attempt_ids.add(current_attempt_id)
+                new_worker_attempt_ids.append(current_attempt_id)
+                continue
+
+            execution = result.execution_diagnostics
+            attempted_versions = list(
+                dict.fromkeys(execution.attempted_versions or result.executed_versions)
+            )
+            result_status = result.status
+            normalized_executed = {
+                version.strip().lstrip("vV").lower()
+                for version in result.executed_versions
+                if version
+            }
+            normalized_selected = (
+                snapshot.selected_version.strip().lstrip("vV").lower()
+                if snapshot.selected_version
+                else None
+            )
+            if (
+                result_status == AgentActionStatus.SUCCESS
+                and normalized_selected
+                and normalized_executed
+                and normalized_selected not in normalized_executed
+            ):
+                result_status = AgentActionStatus.SURRENDER
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="EXECUTED_VERSION_MISMATCH",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=result.attempt_id,
+                        action="replanned",
+                        details=(
+                            f"Committed {snapshot.selected_version}; worker executed "
+                            f"{', '.join(result.executed_versions)}."
+                        ),
+                    )
+                )
+                errors.append(
+                    f"supervisor: rejected worker result for {task_id} because the "
+                    "executed version differed from the committed version."
+                )
+            prior = retry_diagnostics_by_task.get(task_id)
+            if prior is None:
+                prior = UpdateRetryDiagnostics(task_id=task_id)
+            retry_diagnostics_by_task[task_id] = prior.model_copy(
+                update={
+                    "committed_attempt_id": current_attempt_id,
+                    "attempted_versions": list(
+                        dict.fromkeys(prior.attempted_versions + attempted_versions)
+                    ),
+                    "executed_versions": list(
+                        dict.fromkeys(
+                            prior.executed_versions + result.executed_versions
+                        )
+                    ),
+                    "selected_version": task.selected_version,
+                    "strategy_stage": task.strategy_stage,
+                    "exhausted_update_path": task.exhausted_update_path,
+                    "instruction_digest": snapshot.instruction_digest,
+                        "failure_reason": (
+                            " | ".join(result.errors)
+                        if result_status == AgentActionStatus.SURRENDER
+                        else prior.failure_reason
+                    ),
+                    "reasoning_summary": (
+                        result.action_summary.summary
+                        if result.action_summary is not None
+                        else prior.reasoning_summary
+                    ),
+                }
+            )
+            if result_status == AgentActionStatus.SUCCESS:
+                # Keep a successful attempt open because QA must evaluate the
+                # exact snapshot that produced the changes.
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
+                )
+            elif task.strategy == RoutingStrategy.CODE_WORKAROUND:
+                # A surrender is a completed worker outcome, not an active
+                # worker input. Close it before the next routing decision so a
+                # terminal workaround task cannot reach teardown with a live
+                # current attempt.
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.UNFIXABLE},
+                    close_attempt=True,
+                    clear_selected_version=True,
+                )
             else:
-                task.status = TaskStatus.NEEDS_RETRY
-                task.retry_count += 1
+                # Failed update attempts are replanned in this same
+                # supervisor pass. Detach the consumed attempt first so the
+                # planner cannot observe a new stage paired with an old
+                # immutable snapshot.
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    },
+                    close_attempt=True,
+                )
+            processed_worker_attempt_ids.add(current_attempt_id)
+            new_worker_attempt_ids.append(current_attempt_id)
+            continue
+
+        # Safe migration path for tests/legacy callers: untagged summaries can
+        # only be consumed before the task has ever received an attempt.
+        if current_attempt_id is None and task.status not in _TERMINAL_STATUSES:
+            matching = [
+                summary
+                for summary in action_summaries
+                if summary.task_id == task_id and summary.attempt_id is None
+            ]
+            if matching:
+                summary = matching[-1]
+                if summary.status == AgentActionStatus.SUCCESS:
+                    task_queue[task_id] = task.model_copy(
+                        update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
+                    )
+                elif task.strategy == RoutingStrategy.CODE_WORKAROUND:
+                    task_queue[task_id] = task.model_copy(
+                        update={"status": TaskStatus.UNFIXABLE}
+                    )
+                else:
+                    task_queue[task_id] = task.model_copy(
+                        update={
+                            "status": TaskStatus.NEEDS_RETRY,
+                            "retry_count": task.retry_count + 1,
+                        }
+                    )
+        elif action_summaries and current_attempt_id:
+            if any(
+                summary.task_id == task_id and summary.attempt_id is None
+                for summary in action_summaries
+            ):
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="UNCORRELATED_WORKER_RESULT",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=None,
+                        action="ignored",
+                        details="Untagged worker summary cannot mutate an attempted task.",
+                    )
+                )
 
     # ------------------------------------------------------------------
     # 3. Ingest QA results (active targets only, when qa_completed)
@@ -1791,15 +2636,107 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         task_queue,
         active_target_task_ids,
     )
+    qa_result_task_ids: Set[str] = set()
+    new_qa_attempt_ids: List[str] = []
+    for task_id in active_target_task_ids:
+        task = task_queue.get(task_id)
+        if task is None or not task.current_attempt_id:
+            continue
+        qa_result = qa_results_by_attempt.get(task.current_attempt_id)
+        for stale_result in qa_results_by_attempt.values():
+            if (
+                stale_result.task_id == task_id
+                and stale_result.attempt_id != task.current_attempt_id
+                and stale_result.attempt_id not in processed_qa_attempt_ids
+            ):
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="STALE_QA_RESULT",
+                        task_id=task_id,
+                        expected_attempt_id=task.current_attempt_id,
+                        received_attempt_id=stale_result.attempt_id,
+                        action="ignored",
+                        details="QA result belongs to an older task attempt.",
+                    )
+                )
+                processed_qa_attempt_ids.add(stale_result.attempt_id)
+                new_qa_attempt_ids.append(stale_result.attempt_id)
+        if qa_result is None or task.current_attempt_id in processed_qa_attempt_ids:
+            continue
+        if task.status in _TERMINAL_STATUSES:
+            consistency_events.append(
+                _build_consistency_event(
+                    error_code="TERMINAL_QA_RESULT_IGNORED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=qa_result.attempt_id,
+                    action="ignored",
+                    details="A late QA result cannot reopen a terminal task.",
+                )
+            )
+            processed_qa_attempt_ids.add(task.current_attempt_id)
+            new_qa_attempt_ids.append(task.current_attempt_id)
+            continue
+        snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+        if (
+            qa_result.task_id != task_id
+            or qa_result.task_revision != task.task_revision
+            or snapshot is None
+        ):
+            consistency_events.append(
+                _build_consistency_event(
+                    error_code="QA_ATTEMPT_MISMATCH",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=qa_result.attempt_id,
+                    action="ignored",
+                    details=(
+                        f"Expected revision {task.task_revision}; "
+                        f"received revision {qa_result.task_revision}."
+                    ),
+                )
+            )
+            errors.append(
+                f"supervisor: ignored mismatched QA result for {task_id} "
+                f"attempt {qa_result.attempt_id}."
+            )
+        else:
+            qa_evaluations[task_id] = qa_result.evaluation
+            qa_result_task_ids.add(task_id)
+            # QA closes the worker attempt before any status or stage change.
+            # The next planner proposal must observe a task with no active
+            # worker input; otherwise it can see the new retry stage paired
+            # with the old attempt snapshot during the same supervisor pass.
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={},
+                close_attempt=True,
+            )
+        processed_qa_attempt_ids.add(task.current_attempt_id)
+        new_qa_attempt_ids.append(task.current_attempt_id)
     auto_new_constraints: List[str] = []
 
     if state.get("status") == "qa_completed":
         for resolved_t_id, evaluation in qa_evaluations.items():
+            task_for_result = task_queue.get(resolved_t_id)
+            if (
+                task_for_result is not None
+                and task_for_result.current_attempt_id is not None
+                and resolved_t_id not in qa_result_task_ids
+            ):
+                # A compatibility QA projection without the current attempt
+                # identity cannot mutate an attempted task.
+                continue
             task = task_queue[resolved_t_id]
             if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
                 continue
             if evaluation.passed:
-                task.status = TaskStatus.QA_PASSED
+                _commit_task_transition(
+                    task_queue,
+                    resolved_t_id,
+                    updates={"status": TaskStatus.QA_PASSED},
+                )
                 group = group_by_id.get(task.parent_group_id)
                 if group:
                     constraint = _constraint_entry_for_task(task, group)
@@ -1810,11 +2747,20 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     ):
                         auto_new_constraints.append(constraint)
             else:
-                task.status = TaskStatus.NEEDS_RETRY
-                task.retry_count += 1
+                next_stage = _next_sca_stage(task.strategy_stage)
+                task_updates: Dict[str, Any] = {
+                    "status": TaskStatus.NEEDS_RETRY,
+                    "retry_count": task.retry_count + 1,
+                }
                 if task.strategy == RoutingStrategy.VERSION_BUMP:
-                    next_stage = _next_sca_stage(task.strategy_stage)
-                    task.strategy_stage = next_stage
+                    task_updates["strategy_stage"] = next_stage
+                _commit_task_transition(
+                    task_queue,
+                    resolved_t_id,
+                    updates=task_updates,
+                )
+                task = task_queue[resolved_t_id]
+                if task.strategy == RoutingStrategy.VERSION_BUMP:
                     prior_diag = retry_diagnostics_by_task.get(resolved_t_id)
                     group = group_by_id.get(task.parent_group_id)
                     if prior_diag is None:
@@ -1856,7 +2802,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 retry_diagnostics_by_task.get(task_id),
             )
         ):
-            task.status = TaskStatus.UNFIXABLE
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={"status": TaskStatus.UNFIXABLE},
+                close_attempt=task.current_attempt_id is not None,
+                clear_selected_version=task.current_attempt_id is not None,
+            )
             logger.info(
                 "supervisor: task '%s' marked UNFIXABLE after %d retries.",
                 task_id,
@@ -2006,17 +2958,134 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         )
                     break
 
-                retry_diagnostics_by_task = parsed_diagnostics
-                retry_plans_by_task = parsed_plans
-                for task_id, plan in retry_plans_by_task.items():
-                    if task_id not in task_queue:
-                        continue
-                    task_queue[task_id] = task_queue[task_id].model_copy(
-                        update={
-                            "strategy_stage": plan.strategy_stage,
-                            "instruction": plan.exact_instruction,
-                        }
+                candidate_violations = _planner_plan_violations(
+                    parsed_plans,
+                    task_queue,
+                    parsed_diagnostics,
+                )
+                if not candidate_violations:
+                    retry_diagnostics_by_task = dict(parsed_diagnostics)
+                    retry_plans_by_task = dict(parsed_plans)
+                    for task_id, plan in list(retry_plans_by_task.items()):
+                        if task_id not in task_queue:
+                            continue
+                        committed_task = _commit_task_transition(
+                            task_queue,
+                            task_id,
+                            updates={
+                                "strategy_stage": plan.strategy_stage,
+                                "instruction": plan.exact_instruction,
+                                "selected_version": plan.selected_version,
+                                "exhausted_update_path": plan.exhausted_update_path,
+                            },
+                            # A planner result supersedes any previous worker
+                            # input. Closing here makes the planner commit
+                            # atomic even when a stale worker result arrived
+                            # in the same supervisor invocation.
+                            close_attempt=True,
+                        )
+                        if committed_task is None:
+                            continue
+                        diagnostics = retry_diagnostics_by_task.get(task_id)
+                        if diagnostics is not None:
+                            retry_diagnostics_by_task[task_id] = diagnostics.model_copy(
+                                update={
+                                    "committed_attempt_id": committed_task.current_attempt_id,
+                                    "strategy_stage": committed_task.strategy_stage,
+                                    "selected_version": committed_task.selected_version,
+                                    "exhausted_update_path": committed_task.exhausted_update_path,
+                                    "instruction_digest": _instruction_digest(
+                                        committed_task.instruction
+                                    ),
+                                }
+                            )
+                        retry_plans_by_task[task_id] = plan.model_copy(
+                            update={"source_task_revision": committed_task.task_revision}
+                        )
+                else:
+                    # Never commit an invalid planner proposal. Fail closed to
+                    # a deterministic workaround pivot for affected retry tasks
+                    # so a stale version/instruction cannot be dispatched.
+                    # A malformed or incomplete planner response must not
+                    # leave an older retry plan alive. Every actionable retry
+                    # task is therefore moved through the same fail-closed
+                    # pivot path, including tasks for which the planner
+                    # emitted no parseable section at all.
+                    affected_ids = {
+                        task_id
+                        for task_id, task in task_queue.items()
+                        if task.status == TaskStatus.NEEDS_RETRY
+                    }
+                    affected_ids.update(
+                        plan.task_id
+                        for plan in parsed_plans.values()
+                        if plan.task_id in task_queue
                     )
+                    for task_id in affected_ids:
+                        retry_plans_by_task.pop(task_id, None)
+                    consistency_events.append(
+                        _build_consistency_event(
+                            error_code="INVALID_PLANNER_COMMIT",
+                            task_id=next(iter(affected_ids), None),
+                            expected_attempt_id=None,
+                            received_attempt_id=None,
+                            action="replanned",
+                            details="Planner proposal rejected; deterministic pivot committed.",
+                        )
+                    )
+                    for task_id in affected_ids:
+                        task = task_queue[task_id]
+                        group = group_by_id.get(task.parent_group_id)
+                        component = group.vulnerable_component if group else task.parent_group_id
+                        pivot_instruction = (
+                            f"Implement a code workaround or isolation strategy for {component} "
+                            "because the manifest-based update path is exhausted."
+                        )
+                        committed_task = _commit_task_transition(
+                            task_queue,
+                            task_id,
+                            updates={
+                                "strategy_stage": SCARemediationStage.NPM_LATEST,
+                                "selected_version": None,
+                                "exhausted_update_path": True,
+                                "instruction": pivot_instruction,
+                            },
+                            close_attempt=True,
+                            clear_selected_version=True,
+                        )
+                        retry_diagnostics_by_task[task_id] = UpdateRetryDiagnostics(
+                            task_id=task_id,
+                            committed_attempt_id=(
+                                committed_task.current_attempt_id
+                                if committed_task is not None
+                                else None
+                            ),
+                            strategy_stage=SCARemediationStage.NPM_LATEST,
+                            security_floor=(
+                                group.fix_plan.fixed_version
+                                if group and group.fix_plan
+                                else None
+                            ),
+                            attempted_versions=list(
+                                retry_diagnostics_by_task.get(task_id, UpdateRetryDiagnostics(task_id=task_id)).attempted_versions
+                            ),
+                            selected_version=None,
+                            exhausted_update_path=True,
+                        )
+                        retry_plans_by_task[task_id] = SupervisorRetryPlan(
+                            task_id=task_id,
+                            source_task_revision=(
+                                committed_task.task_revision
+                                if committed_task is not None
+                                else task.task_revision
+                            ),
+                            strategy_stage=SCARemediationStage.NPM_LATEST,
+                            selected_version=None,
+                            attempted_versions=retry_diagnostics_by_task[task_id].attempted_versions,
+                            exhausted_update_path=True,
+                            action="pivot_workaround",
+                            exact_instruction=pivot_instruction,
+                        )
 
                 # A planner-confirmed exhausted path is deterministic. Do not
                 # ask the router LLM to reinterpret a pivot as an update retry.
@@ -2388,6 +3457,9 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     failed_parent_ids,
                     pivot_strategy_by_parent | legacy_pivot_strategy_updates,
                     qa_evaluations,
+                    retry_diagnostics_by_task=retry_diagnostics_by_task,
+                    retry_plans_by_task=retry_plans_by_task,
+                    group_by_id=group_by_id,
                 )
                 decision = _deterministic_routing(
                     task_queue,
@@ -2460,19 +3532,47 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # 8a. Apply revised_instructions (copy-on-write per task)
     for t_id, new_instr in decision.revised_instructions.items():
         if t_id in task_queue and new_instr.strip():
-            task_queue[t_id] = task_queue[t_id].model_copy(update={"instruction": new_instr})
+            task = task_queue[t_id]
+            if task.current_attempt_id is not None:
+                errors.append(
+                    f"supervisor: ignored revised instruction for {t_id} because its "
+                    "current attempt is still active."
+                )
+                continue
+            _commit_task_transition(
+                task_queue,
+                t_id,
+                updates={"instruction": new_instr},
+            )
 
     # 8b. Apply direct strategy pivots (currently reserved for no-op / legacy cases)
     for t_id, new_strategy in decision.updated_task_strategies.items():
         if t_id in task_queue:
-            task_queue[t_id] = task_queue[t_id].model_copy(update={"strategy": new_strategy})
+            _commit_task_transition(
+                task_queue,
+                t_id,
+                updates={"strategy": new_strategy},
+                close_attempt=task_queue[t_id].current_attempt_id is not None,
+            )
 
     # 8c. Apply guarded task status overrides (only QA_PASSED and UNFIXABLE)
     _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
     for t_id, new_status in decision.task_status_updates.items():
         if t_id in task_queue and new_status in _allowed_statuses:
             if task_queue[t_id].status not in _TERMINAL_STATUSES:
-                task_queue[t_id] = task_queue[t_id].model_copy(update={"status": new_status})
+                _commit_task_transition(
+                    task_queue,
+                    t_id,
+                    updates={"status": new_status},
+                    close_attempt=(
+                        new_status in _TERMINAL_STATUSES
+                        and task_queue[t_id].current_attempt_id is not None
+                    ),
+                    clear_selected_version=(
+                        new_status in _TERMINAL_STATUSES
+                        and task_queue[t_id].current_attempt_id is not None
+                    ),
+                )
                 logger.info(
                     "supervisor: task '%s' manually set to %s via task_status_updates.",
                     t_id,
@@ -2482,7 +3582,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # 8d. Apply unfixable marks from decision
     for t_id in decision.unfixable_task_ids:
         if t_id in task_queue:
-            task_queue[t_id] = task_queue[t_id].model_copy(update={"status": TaskStatus.UNFIXABLE})
+            _commit_task_transition(
+                task_queue,
+                t_id,
+                updates={"status": TaskStatus.UNFIXABLE},
+                close_attempt=task_queue[t_id].current_attempt_id is not None,
+                clear_selected_version=task_queue[t_id].current_attempt_id is not None,
+            )
 
     # 8e. Materialize spawn requests
     child_ids_by_parent: Dict[str, List[str]] = {}
@@ -2494,14 +3600,29 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             errors=errors,
         )
         task_queue.update(new_tasks)
-        for parent_task_id, terminal_status in pivot_parent_status_by_parent.items():
-            if (
-                parent_task_id in task_queue
-                and task_queue[parent_task_id].status not in _TERMINAL_STATUSES
-            ):
-                task_queue[parent_task_id] = task_queue[parent_task_id].model_copy(
-                    update={"status": terminal_status}
+        # Apply the complete parent transition after children are materialized.
+        # This must detach the closed update attempt as well as terminalize the
+        # parent; otherwise the parent remains paired with an update snapshot
+        # while routing has already moved to the workaround child.
+        _terminalize_pivot_parents(
+            task_queue,
+            list(pivot_parent_status_by_parent),
+            {
+                parent_id: next(
+                    (
+                        request.strategy
+                        for request in decision.spawn_requests
+                        if request.parent_task_id == parent_id
+                    ),
+                    RoutingStrategy.CODE_WORKAROUND,
                 )
+                for parent_id in pivot_parent_status_by_parent
+            },
+            qa_evaluations,
+            retry_diagnostics_by_task=retry_diagnostics_by_task,
+            retry_plans_by_task=retry_plans_by_task,
+            group_by_id=group_by_id,
+        )
 
     resolved_target_task_ids: List[str] = []
     remapped_feedback_by_task: Dict[str, str] = {}
@@ -2530,6 +3651,15 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         task_queue,
         retry_diagnostics_by_task,
     )
+    # Status overrides and parent terminalization above are also untrusted
+    # router requests. Re-clamp after those mutations so a task that became
+    # terminal in this transition cannot remain in the dispatch projection.
+    resolved_target_task_ids = _normalize_target_task_ids_for_node(
+        resolved_next_node,
+        resolved_target_task_ids,
+        task_queue,
+        retry_diagnostics_by_task,
+    )
     remapped_feedback_by_task = {
         task_id: feedback
         for task_id, feedback in remapped_feedback_by_task.items()
@@ -2542,6 +3672,48 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         resolved_next_node = "teardown"
         resolved_target_task_ids = []
         remapped_feedback_by_task = {}
+
+    # Commit the exact input snapshot before exposing worker targets to the
+    # graph. QA reuses the current worker attempt; update/workaround dispatches
+    # always receive a new attempt identity.
+    if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}:
+        for task_id in list(resolved_target_task_ids):
+            task = task_queue.get(task_id)
+            if task is None:
+                continue
+            # Normal QA follows the worker attempt and reuses its snapshot.
+            # Only the safe initial-migration path needs a synthetic QA
+            # snapshot for a legacy optimistic result that arrived without an
+            # attempt envelope.
+            if resolved_next_node == "qa_critic" and task.current_attempt_id:
+                continue
+            plan = retry_plans_by_task.get(task_id)
+            task, snapshot = _create_attempt_snapshot(
+                task,
+                dispatch_node=resolved_next_node,
+                snapshots_by_id=attempt_snapshots_by_id,
+                state_revision=state_revision,
+                plan_id=plan.plan_id if plan is not None else None,
+            )
+            task_queue[task_id] = task
+            prior = retry_diagnostics_by_task.get(task_id)
+            if prior is not None:
+                retry_diagnostics_by_task[task_id] = prior.model_copy(
+                    update={
+                        "committed_attempt_id": snapshot.attempt_id,
+                        "selected_version": task.selected_version,
+                        "strategy_stage": task.strategy_stage,
+                        "exhausted_update_path": task.exhausted_update_path,
+                        "instruction_digest": snapshot.instruction_digest,
+                    }
+                )
+            if plan is not None:
+                # The plan was created against the pre-dispatch task revision.
+                # Once its exact input is committed, keep the compatibility
+                # plan projection correlated to that same revision.
+                retry_plans_by_task[task_id] = plan.model_copy(
+                    update={"source_task_revision": task.task_revision}
+                )
 
     logger.info(
         "supervisor: routing to '%s' with targets=%s",
@@ -2569,6 +3741,36 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             gid = task_queue[t_id].parent_group_id
             feedback_by_group[gid] = fb
 
+    consistency_new_events, consistency_errors = _validate_committed_state(
+        task_queue,
+        attempt_snapshots_by_id,
+        retry_plans_by_task,
+        retry_diagnostics_by_task,
+        resolved_target_task_ids,
+        resolved_next_node,
+    )
+    consistency_events.extend(consistency_new_events)
+    errors.extend(consistency_errors)
+    existing_event_keys = {
+        (event.task_id, event.received_attempt_id, event.error_code)
+        for event in prior_consistency_events
+    }
+    consistency_events = [
+        event
+        for event in _dedupe_consistency_events(consistency_events)
+        if (event.task_id, event.received_attempt_id, event.error_code)
+        not in existing_event_keys
+    ]
+    # ``errors`` uses an additive reducer, so suppress both duplicate messages
+    # from this invocation and exact messages already committed by an earlier
+    # supervisor pass. Structured consistency events remain the detailed,
+    # attempt-correlated audit record.
+    errors = list(
+        dict.fromkeys(
+            error for error in errors if error not in prior_error_messages
+        )
+    )
+
     # ------------------------------------------------------------------
     # 9. Return state patch
     # ------------------------------------------------------------------
@@ -2585,9 +3787,20 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "feedback_by_task": feedback_by_task,
         "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
+        # Compatibility projection: the attempt-tagged QA envelope remains
+        # authoritative, while this task-keyed view is retained for existing
+        # callers and prompt builders.
+        "qa_evaluations": qa_evaluations,
         "task_queue": task_queue,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "retry_plans_by_task": retry_plans_by_task,
+        "attempt_snapshots_by_id": attempt_snapshots_by_id,
+        "worker_results_by_attempt": worker_results_by_attempt,
+        "qa_results_by_attempt": qa_results_by_attempt,
+        "processed_worker_attempt_ids": list(new_worker_attempt_ids),
+        "processed_qa_attempt_ids": list(new_qa_attempt_ids),
+        "consistency_events": consistency_events,
+        "state_revision": state_revision,
         # constraints_ledger uses operator.add — return only NEW entries
         "constraints_ledger": returned_constraints,
         "errors": errors,

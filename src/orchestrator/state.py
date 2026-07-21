@@ -37,14 +37,18 @@ from src.contracts.schemas import (
     GroupRemediationStatus,
     LocalizedIssue,
     QAEvaluation,
+    QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     SupervisorDecision,
     SupervisorRetryPlan,
+    StateConsistencyEvent,
     SystemContext,
     TaskStatus,
     UpdateRetryDiagnostics,
+    TaskAttemptSnapshot,
+    WorkerAttemptResult,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -62,6 +66,21 @@ def merge_dict_reducer(
     if right:
         merged.update(right)
     return merged
+
+
+def replace_dict_reducer(
+    _left: Mapping[K, V] | None,
+    right: Mapping[K, V] | None,
+) -> Dict[K, V]:
+    """Replace an authoritative dict projection with the newest snapshot.
+
+    Phase 5 supervisor projections are complete snapshots, not patches.  A
+    merge reducer cannot represent deletion: returning ``{}`` would leave old
+    retry plans or task records in the graph state.  Keep ``merge_dict_reducer``
+    for additive/compatibility maps and use this reducer for state owned by
+    the supervisor.
+    """
+    return dict(right or {})
 
 
 def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask:
@@ -82,6 +101,7 @@ def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask
             if strategy == RoutingStrategy.VERSION_BUMP
             else SCARemediationStage.CODE_WORKAROUND
         ),
+        selected_version=(fix_plan.fixed_version if fix_plan is not None else None),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,
@@ -165,18 +185,31 @@ class OrchestratorState(TypedDict, total=False):
     retry_counts: Annotated[Dict[str, int], merge_dict_reducer]
     group_strategies: Annotated[Dict[str, RoutingStrategy], merge_dict_reducer]
     group_statuses: Annotated[Dict[str, GroupRemediationStatus], merge_dict_reducer]
-    qa_evaluations: Annotated[Dict[str, QAEvaluation], merge_dict_reducer]
+    qa_evaluations: Annotated[Dict[str, QAEvaluation], replace_dict_reducer]
     action_summaries: Annotated[List[AgentActionSummary], operator.add]
     retry_diagnostics_by_task: Annotated[
-        Dict[str, UpdateRetryDiagnostics], merge_dict_reducer
+        Dict[str, UpdateRetryDiagnostics], replace_dict_reducer
     ]
     retry_plans_by_task: Annotated[
-        Dict[str, SupervisorRetryPlan], merge_dict_reducer
+        Dict[str, SupervisorRetryPlan], replace_dict_reducer
     ]
+    attempt_snapshots_by_id: Annotated[
+        Dict[str, TaskAttemptSnapshot], merge_dict_reducer
+    ]
+    worker_results_by_attempt: Annotated[
+        Dict[str, WorkerAttemptResult], merge_dict_reducer
+    ]
+    qa_results_by_attempt: Annotated[
+        Dict[str, QAAttemptResult], merge_dict_reducer
+    ]
+    processed_worker_attempt_ids: Annotated[List[str], operator.add]
+    processed_qa_attempt_ids: Annotated[List[str], operator.add]
+    consistency_events: Annotated[List[StateConsistencyEvent], operator.add]
+    state_revision: int
     changed_files: Annotated[List[str], operator.add]
 
     # Phase 5 Task Queue (primary orchestration unit)
-    task_queue: Annotated[Dict[str, RemediationTask], merge_dict_reducer]
+    task_queue: Annotated[Dict[str, RemediationTask], replace_dict_reducer]
     active_target_task_ids: List[str]
 
     workspace_volume: Optional[str]
@@ -184,8 +217,8 @@ class OrchestratorState(TypedDict, total=False):
     # Supervisor routing fields
     next_routing_step: str
     active_target_group_ids: List[str]
-    feedback_by_group: Annotated[Dict[str, str], merge_dict_reducer]
-    feedback_by_task: Annotated[Dict[str, str], merge_dict_reducer]
+    feedback_by_group: Annotated[Dict[str, str], replace_dict_reducer]
+    feedback_by_task: Annotated[Dict[str, str], replace_dict_reducer]
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
@@ -214,9 +247,11 @@ class SubagentState(TypedDict, total=False):
     feedback_by_task: Dict[str, str]
     previous_action_summaries_by_task: Dict[str, str]
     retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics]
+    target_attempt_snapshots: Dict[str, TaskAttemptSnapshot]
 
     target_task: RemediationTask
     target_group: VulnerabilityGroup
+    attempt_snapshot: Optional[TaskAttemptSnapshot]
     constraints_ledger: List[str]
     previous_feedback: Optional[str]
 
@@ -245,6 +280,13 @@ def initial_orchestrator_state(
         "action_summaries": [],
         "retry_diagnostics_by_task": {},
         "retry_plans_by_task": {},
+        "attempt_snapshots_by_id": {},
+        "worker_results_by_attempt": {},
+        "qa_results_by_attempt": {},
+        "processed_worker_attempt_ids": [],
+        "processed_qa_attempt_ids": [],
+        "consistency_events": [],
+        "state_revision": 0,
         "changed_files": [],
         "task_queue": {},
         "active_target_task_ids": [],
@@ -278,6 +320,7 @@ def initial_update_subagent_state(
     feedback_by_group: Optional[Dict[str, str]] = None,
     previous_action_summaries_by_task: Optional[Dict[str, str]] = None,
     retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
+    target_attempt_snapshots: Optional[Dict[str, TaskAttemptSnapshot]] = None,
 ) -> Dict[str, Any]:
     """
     Build a well-formed initial batch ``SubagentState`` dict.
@@ -309,6 +352,7 @@ def initial_update_subagent_state(
         )
         previous_summaries_dict = dict(previous_action_summaries_by_task or {})
         retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
+        target_attempt_snapshots_dict = dict(target_attempt_snapshots or {})
     else:
         target_tasks_list = list(target_tasks)
         target_groups_list = list(target_groups)
@@ -316,6 +360,7 @@ def initial_update_subagent_state(
         feedback_by_task_dict = dict(feedback_by_task or {})
         previous_summaries_dict = dict(previous_action_summaries_by_task or {})
         retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
+        target_attempt_snapshots_dict = dict(target_attempt_snapshots or {})
         feedback_by_group_dict = dict(
             feedback_by_group
             or _derive_feedback_by_group(
@@ -334,6 +379,7 @@ def initial_update_subagent_state(
         "feedback_by_task": feedback_by_task_dict,
         "previous_action_summaries_by_task": previous_summaries_dict,
         "retry_diagnostics_by_task": retry_diagnostics_dict,
+        "target_attempt_snapshots": target_attempt_snapshots_dict,
         "constraints_ledger": constraints_list,
         "messages": [],
         "changed_files": [],
@@ -348,6 +394,7 @@ def initial_workaround_subagent_state(
     target_group: VulnerabilityGroup | List[str],
     constraints_ledger: Optional[List[str]] = None,
     previous_feedback: Optional[str] = None,
+    attempt_snapshot: Optional[TaskAttemptSnapshot] = None,
 ) -> Dict[str, Any]:
     """
     Build a well-formed single-task workaround ``SubagentState`` dict.
@@ -374,6 +421,7 @@ def initial_workaround_subagent_state(
         "target_group": target_group_obj,
         "constraints_ledger": constraints_list,
         "previous_feedback": previous_feedback,
+        "attempt_snapshot": attempt_snapshot,
         "messages": [],
         "changed_files": [],
         "errors": [],

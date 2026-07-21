@@ -16,7 +16,9 @@ from src.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    SCARemediationStage,
     Severity,
+    TaskAttemptSnapshot,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -32,8 +34,10 @@ from src.orchestrator import (
 from src.orchestrator.graph import (
     route_after_workspace_builder,
     run_update_subagent_from_orchestrator,
+    run_workaround_subagent_from_orchestrator,
     run_qa_critic_from_orchestrator,
 )
+from src.orchestrator.supervisor_node import _instruction_digest
 from src.orchestrator.task_utils import build_initial_remediation_task
 
 
@@ -306,6 +310,96 @@ class TestPhase5GraphIntegration:
             result = run_update_subagent_from_orchestrator(state)
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
+
+    def test_workaround_wrapper_tags_compatibility_summary_from_snapshot(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        task.instruction = "Apply the source workaround."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-workaround",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            selected_version=None,
+            instruction=task.instruction,
+            instruction_digest=_instruction_digest(task.instruction),
+            dispatch_node="workaround_subagent",
+        )
+        task = task.model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+            }
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        untagged = AgentActionSummary(
+            task_id="task-1",
+            status=AgentActionStatus.SURRENDER,
+            summary="workaround bypassed",
+        )
+        with patch(
+            "src.orchestrator.graph.run_workaround_subagent_node",
+            return_value={
+                "action_summaries": [untagged],
+                "action_summary": untagged,
+                "worker_results_by_attempt": {},
+                "errors": [],
+            },
+        ):
+            result = run_workaround_subagent_from_orchestrator(state)
+
+        summary = result["action_summaries"][0]
+        assert summary.attempt_id == snapshot.attempt_id
+        assert summary.task_revision == snapshot.task_revision
+        assert summary.instruction_digest == snapshot.instruction_digest
+
+    def test_update_wrapper_rejects_contradictory_snapshot_before_worker(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-update",
+                "selected_version": "4.17.22",
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-update",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=task.strategy_stage,
+            selected_version="4.17.21",
+            instruction=task.instruction,
+            instruction_digest=_instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        worker = MagicMock()
+        with patch("src.orchestrator.graph.run_update_subagent_node", worker):
+            result = run_update_subagent_from_orchestrator(state)
+
+        worker.assert_not_called()
+        assert result["active_target_task_ids"] == []
+        assert any(
+            event.error_code == "DISPATCH_SNAPSHOT_CONTRADICTION"
+            for event in result["consistency_events"]
+        )
 
     def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
         """After workspace_builder succeeds, supervisor routes, then teardown runs."""

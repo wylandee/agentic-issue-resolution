@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from src.orchestrator.trajectory_exporter import (
     fetch_langsmith_spans,
     invoke_with_trajectory,
     json_text,
+    _render_markdown,
     use_trajectory_recorder,
 )
 
@@ -95,6 +97,61 @@ def test_local_recorder_captures_llm_and_tool_fallback_events():
     assert [span["name"] for span in spans] == ["test.llm", "test.tool"]
     assert spans[0]["run_type"] == "llm"
     assert spans[1]["run_type"] == "tool"
+
+
+def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
+    markdown = _render_markdown(
+        trace_id="trace-attempts",
+        repo_root="repo",
+        initial_state={"state_revision": 1},
+        final_state={
+            "state_revision": 4,
+            "task_queue": {
+                "task-1": {
+                    "task_id": "task-1",
+                    "task_revision": 2,
+                    "status": "needs_retry",
+                }
+            },
+            "attempt_snapshots_by_id": {
+                "attempt-2": {
+                    "attempt_id": "attempt-2",
+                    "task_id": "task-1",
+                    "task_revision": 2,
+                    "attempt_number": 2,
+                    "strategy_stage": "npm_latest",
+                    "selected_version": "8.5.1",
+                    "dispatch_node": "update_subagent",
+                    "instruction": "Update package.json to 8.5.1.",
+                    "instruction_digest": "digest-2",
+                }
+            },
+            "worker_results_by_attempt": {
+                "attempt-2": {
+                    "status": "surrender",
+                    "executed_versions": ["8.5.1"],
+                }
+            },
+            "qa_results_by_attempt": {
+                "attempt-2": {
+                    "evaluation": {"passed": False},
+                }
+            },
+            "consistency_events": [],
+        },
+        spans=[],
+        source="local-fallback",
+        langsmith_url=None,
+        warnings=[],
+        run_error=None,
+        trajectory_path=Path("data/trajectories/trace-attempts.md"),
+    )
+
+    assert "## Attempt Snapshot Summary" in markdown
+    assert "attempt-2" in markdown
+    assert "8.5.1" in markdown
+    assert "Update package.json to 8.5.1." in markdown
+    assert '"passed": false' in markdown
 
 
 def test_export_writes_one_markdown_file_with_root_state_and_span_details(tmp_path, monkeypatch):

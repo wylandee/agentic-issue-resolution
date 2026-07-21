@@ -438,7 +438,10 @@ def _fence(payload: Any) -> str:
 
 
 def _table_value(value: Any) -> str:
-    return str(value or "").replace("|", "\\|").replace("\n", " ")
+    # Preserve meaningful false-y values such as ``False`` and ``0`` in the
+    # audit table.  Treating them as empty strings made failed QA results look
+    # like QA had not run at all.
+    return str("" if value is None else value).replace("|", "\\|").replace("\n", " ")
 
 
 def _render_markdown(
@@ -483,11 +486,67 @@ def _render_markdown(
         "",
         _fence(root_output),
         "",
+        "## Attempt Snapshot Summary",
+        "",
+         "| Task | Attempt | Revision | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
+        "|---|---|---:|---|---|---|---|---|---|---|---|",
+    ]
+    if isinstance(final_state, Mapping):
+        task_queue = final_state.get("task_queue") or {}
+        snapshots = final_state.get("attempt_snapshots_by_id") or {}
+        worker_results = final_state.get("worker_results_by_attempt") or {}
+        qa_results = final_state.get("qa_results_by_attempt") or {}
+        ordered_snapshots = sorted(
+            snapshots.values(),
+            key=lambda snapshot: (
+                getattr(snapshot, "task_id", "") if not isinstance(snapshot, Mapping) else snapshot.get("task_id", ""),
+                getattr(snapshot, "attempt_number", 0) if not isinstance(snapshot, Mapping) else snapshot.get("attempt_number", 0),
+            ),
+        )
+        for snapshot in ordered_snapshots:
+            data = to_jsonable(snapshot)
+            attempt_id = data.get("attempt_id", "")
+            task_id = data.get("task_id", "")
+            worker = worker_results.get(attempt_id)
+            qa = qa_results.get(attempt_id)
+            task = task_queue.get(task_id)
+            worker_data = to_jsonable(worker) if worker is not None else {}
+            qa_data = to_jsonable(qa) if qa is not None else {}
+            task_data = to_jsonable(task) if task is not None else {}
+            instruction = str(data.get("instruction", ""))
+            if len(instruction) > 180:
+                instruction = instruction[:177] + "..."
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _table_value(task_id),
+                        _table_value(attempt_id),
+                        _table_value(data.get("task_revision")),
+                        _table_value(data.get("strategy_stage")),
+                        _table_value(data.get("selected_version") or "none"),
+                        _table_value(data.get("dispatch_node")),
+                        _table_value(", ".join(worker_data.get("executed_versions", []) or [])),
+                        _table_value(worker_data.get("status", "pending")),
+                        _table_value((qa_data.get("evaluation") or {}).get("passed", "pending")),
+                        _table_value(task_data.get("status", "unknown")),
+                        _table_value(instruction),
+                    ]
+                )
+                + " |"
+            )
+        if not snapshots:
+            lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+    else:
+        lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+
+    lines.extend([
+        "",
         "## Execution Timeline",
         "",
         "| # | Span | Type | Parent | Start | End | Duration (s) | Status | Tokens |",
         "|---:|---|---|---|---|---|---:|---|---:|",
-    ]
+    ])
     for index, span in enumerate(spans, start=1):
         tokens = span.get("total_tokens")
         if tokens is None:
@@ -547,6 +606,11 @@ def _render_markdown(
         for task_id, plan in plans.items():
             plan_data = to_jsonable(plan)
             diagnostic_items.append(f"{task_id}: committed planner plan {json.dumps(plan_data, sort_keys=True)}")
+        for event in final_state.get("consistency_events") or []:
+            event_data = to_jsonable(event)
+            diagnostic_items.append(
+                "consistency event: " + json.dumps(event_data, sort_keys=True)
+            )
     if diagnostic_items:
         lines.extend(f"- {item}" for item in diagnostic_items)
     else:

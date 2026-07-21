@@ -63,14 +63,20 @@ from langgraph.graph import END, START, StateGraph
 
 from src.contracts.schemas import (
     AgentActionStatus,
+    AgentActionSummary,
+    QAAttemptResult,
     EditStatus,
     FixPlan,
     FixPlanStatus,
     IssueType,
     LocalizedIssue,
     RemediationTask,
+    RoutingStrategy,
+    StateConsistencyEvent,
     SystemContext,
     TaskStatus,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -88,7 +94,11 @@ from src.orchestrator.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
-from src.orchestrator.supervisor_node import run_supervisor_node, supervisor_router
+from src.orchestrator.supervisor_node import (
+    _instruction_digest,
+    run_supervisor_node,
+    supervisor_router,
+)
 from src.orchestrator.teardown_node import run_teardown_node
 from src.orchestrator.trajectory_exporter import (
     TrajectoryRecorder,
@@ -409,6 +419,159 @@ def route_after_triage(state: OrchestratorState) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _tag_attempt_summaries(
+    summaries: List[AgentActionSummary],
+    target_tasks: List[RemediationTask],
+    snapshots: Dict[str, Any],
+) -> List[AgentActionSummary]:
+    """Attach the committed attempt identity to compatibility summaries.
+
+    Some worker exit paths return an ordinary ``AgentActionSummary`` while
+    their structured ``WorkerAttemptResult`` is correctly tagged.  Re-emitting
+    the ordinary summary would create a second, uncorrelated source of truth
+    in the graph state.  The bridge therefore tags summaries only from the
+    committed snapshot for that target task.
+    """
+    task_by_id = {task.task_id: task for task in target_tasks}
+    tagged: List[AgentActionSummary] = []
+    for summary in summaries:
+        task = task_by_id.get(summary.task_id)
+        snapshot = (
+            snapshots.get(task.current_attempt_id)
+            or snapshots.get(task.task_id)
+            if task is not None and task.current_attempt_id
+            else None
+        )
+        if snapshot is not None and summary.attempt_id is None:
+            summary = summary.model_copy(
+                update={
+                    "attempt_id": snapshot.attempt_id,
+                    "task_revision": snapshot.task_revision,
+                    "instruction_digest": snapshot.instruction_digest,
+                }
+            )
+        tagged.append(summary)
+    return tagged
+
+
+def _dispatch_boundary_rejection(
+    state: OrchestratorState,
+    target_tasks: List[RemediationTask],
+    expected_node: str,
+) -> Optional[Dict[str, Any]]:
+    """Reject a worker/QA invocation whose input is not a committed snapshot.
+
+    Direct legacy bridge callers do not carry ``attempt_snapshots_by_id`` and
+    remain supported.  Every Phase 5 supervisor-produced state does carry the
+    field, so real graph execution is strict: no worker or QA node may run
+    without a matching task revision, instruction, and snapshot.
+    """
+    if "attempt_snapshots_by_id" not in state:
+        return None
+
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    errors: List[str] = []
+    events: List[StateConsistencyEvent] = []
+    for task in target_tasks:
+        attempt_id = task.current_attempt_id
+        snapshot = snapshots.get(attempt_id) if attempt_id else None
+        error_code: Optional[str] = None
+        details = ""
+        if attempt_id is None:
+            error_code = "DISPATCH_WITHOUT_ATTEMPT"
+            details = "Active worker target has no committed attempt snapshot."
+        elif snapshot is None:
+            error_code = "DISPATCH_ATTEMPT_MISSING"
+            details = "Task references an attempt that is absent from the snapshot map."
+        elif (
+            snapshot.task_id != task.task_id
+            or snapshot.task_revision != task.task_revision
+            or snapshot.strategy_stage != task.strategy_stage
+            or snapshot.selected_version != task.selected_version
+            or snapshot.instruction != task.instruction
+            or snapshot.instruction_digest != _instruction_digest(task.instruction)
+            or (
+                snapshot.dispatch_node == "update_subagent"
+                and task.strategy != RoutingStrategy.VERSION_BUMP
+            )
+            or (
+                snapshot.dispatch_node == "workaround_subagent"
+                and task.strategy != RoutingStrategy.CODE_WORKAROUND
+            )
+        ):
+            error_code = "DISPATCH_SNAPSHOT_CONTRADICTION"
+            details = "Task fields do not match the immutable dispatch snapshot."
+        elif expected_node in {"update_subagent", "workaround_subagent"} and snapshot.dispatch_node != expected_node:
+            error_code = "DISPATCH_NODE_MISMATCH"
+            details = (
+                f"Snapshot was committed for {snapshot.dispatch_node}, "
+                f"not {expected_node}."
+            )
+        if error_code is not None:
+            errors.append(f"graph: rejected {expected_node} dispatch for {task.task_id}: {details}")
+            events.append(
+                StateConsistencyEvent(
+                    error_code=error_code,
+                    task_id=task.task_id,
+                    expected_attempt_id=attempt_id,
+                    received_attempt_id=attempt_id,
+                    action="ignored",
+                    details=details,
+                )
+            )
+
+    if not errors:
+        return None
+    return {
+        "status": "supervisor_routed",
+        "next_routing_step": "supervisor",
+        "active_target_task_ids": [],
+        "active_target_group_ids": [],
+        "errors": errors,
+        "consistency_events": events,
+    }
+
+
+def _ensure_worker_attempt_results(
+    result: Dict[str, Any],
+    target_tasks: List[RemediationTask],
+    snapshots: Dict[str, Any],
+) -> Dict[str, WorkerAttemptResult]:
+    """Normalize worker compatibility output into attempt-tagged envelopes."""
+    existing = result.get("worker_results_by_attempt") or {}
+    if existing:
+        return dict(existing)
+    summaries = list(result.get("action_summaries", []) or [])
+    summary_by_task = {summary.task_id: summary for summary in summaries}
+    errors = list(result.get("errors", []) or [])
+    output: Dict[str, WorkerAttemptResult] = {}
+    for task in target_tasks:
+        snapshot = (
+            snapshots.get(task.current_attempt_id)
+            or snapshots.get(task.task_id)
+            if task.current_attempt_id
+            else None
+        )
+        if snapshot is None:
+            continue
+        summary = summary_by_task.get(task.task_id)
+        status = summary.status if summary is not None else AgentActionStatus.SURRENDER
+        output[snapshot.attempt_id] = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=status,
+            action_summary=summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                validation_passed=status == AgentActionStatus.SUCCESS,
+                failure_reason=" | ".join(errors),
+            ),
+            instruction_digest=snapshot.instruction_digest,
+            errors=errors,
+        )
+    return output
+
+
 def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     """
     Bridge OrchestratorState → SubagentState for the batch dependency update subagent.
@@ -440,9 +603,31 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         log.warning(msg)
         return {"errors": [msg]}
 
+    boundary_rejection = _dispatch_boundary_rejection(
+        state,
+        target_tasks,
+        "update_subagent",
+    )
+    if boundary_rejection is not None:
+        return boundary_rejection
+
     feedback_by_task = dict(state.get("feedback_by_task", {}))
+    attempt_snapshots = dict(state.get("attempt_snapshots_by_id", {}))
+    target_attempt_snapshots = {
+        task.task_id: attempt_snapshots[task.current_attempt_id]
+        for task in target_tasks
+        if task.current_attempt_id in attempt_snapshots
+    }
     latest_action_summary_by_task: Dict[str, str] = {}
+    target_attempt_ids = {
+        task.task_id: task.current_attempt_id for task in target_tasks
+    }
     for summary in state.get("action_summaries", []) or []:
+        expected_attempt_id = target_attempt_ids.get(summary.task_id)
+        if expected_attempt_id and summary.attempt_id != expected_attempt_id:
+            continue
+        if not expected_attempt_id and summary.attempt_id is not None:
+            continue
         latest_action_summary_by_task[summary.task_id] = summary.summary
     subagent_state = initial_update_subagent_state(
         repo_root=state.get("repo_root", ""),
@@ -453,6 +638,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         feedback_by_task=feedback_by_task,
         previous_action_summaries_by_task=latest_action_summary_by_task,
         retry_diagnostics_by_task=dict(state.get("retry_diagnostics_by_task", {})),
+        target_attempt_snapshots=target_attempt_snapshots,
     )
 
     result = run_update_subagent_node(subagent_state)
@@ -462,14 +648,27 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
-    summaries = list(result.get("action_summaries", []))
+    summaries = _tag_attempt_summaries(
+        list(result.get("action_summaries", [])),
+        target_tasks,
+        target_attempt_snapshots,
+    )
     if not summaries:
         summary = result.get("action_summary")
         if summary is not None:
             summaries = [summary]
     if summaries:
         out["action_summaries"] = summaries
-    if result.get("retry_diagnostics_by_task"):
+    worker_results = _ensure_worker_attempt_results(
+        {**result, "action_summaries": summaries},
+        target_tasks,
+        attempt_snapshots,
+    )
+    if worker_results:
+        out["worker_results_by_attempt"] = worker_results
+    elif result.get("retry_diagnostics_by_task") and not target_attempt_snapshots:
+        # Compatibility for legacy direct bridge callers that do not provide
+        # attempt envelopes. Real Phase 5 dispatches always use envelopes.
         out["retry_diagnostics_by_task"] = result["retry_diagnostics_by_task"]
     return out
 
@@ -504,6 +703,14 @@ def run_workaround_subagent_from_orchestrator(
         log.warning(msg)
         return {"errors": [msg]}
 
+    boundary_rejection = _dispatch_boundary_rejection(
+        state,
+        [task],
+        "workaround_subagent",
+    )
+    if boundary_rejection is not None:
+        return boundary_rejection
+
     group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
     target_group = group_by_id.get(task.parent_group_id)
 
@@ -513,6 +720,11 @@ def run_workaround_subagent_from_orchestrator(
         return {"errors": [msg]}
 
     feedback_by_task = dict(state.get("feedback_by_task", {}))
+    attempt_snapshot = None
+    if task.current_attempt_id:
+        attempt_snapshot = state.get("attempt_snapshots_by_id", {}).get(
+            task.current_attempt_id
+        )
     subagent_state = initial_workaround_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
@@ -520,6 +732,7 @@ def run_workaround_subagent_from_orchestrator(
         target_group=target_group,
         constraints_ledger=list(state.get("constraints_ledger", [])),
         previous_feedback=feedback_by_task.get(task.task_id),
+        attempt_snapshot=attempt_snapshot,
     )
 
     result = run_workaround_subagent_node(subagent_state)
@@ -529,13 +742,29 @@ def run_workaround_subagent_from_orchestrator(
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
-    summaries = list(result.get("action_summaries", []))
+    target_snapshots = {
+        task.current_attempt_id: attempt_snapshot
+        for task in [task]
+        if attempt_snapshot is not None and task.current_attempt_id
+    }
+    summaries = _tag_attempt_summaries(
+        list(result.get("action_summaries", [])),
+        [task],
+        target_snapshots,
+    )
     if not summaries:
         summary = result.get("action_summary")
         if summary is not None:
             summaries = [summary]
     if summaries:
         out["action_summaries"] = summaries
+    worker_results = _ensure_worker_attempt_results(
+        {**result, "action_summaries": summaries},
+        [task],
+        target_snapshots,
+    )
+    if worker_results:
+        out["worker_results_by_attempt"] = worker_results
     return out
 
 
@@ -554,6 +783,24 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     # Fall back to active_target_group_ids
     if not active_task_ids:
         active_task_ids = set(state.get("active_target_group_ids", []))
+
+    target_tasks = [
+        state.get("task_queue", {}).get(task_id)
+        for task_id in active_task_ids
+    ]
+    target_tasks = [task for task in target_tasks if task is not None]
+    boundary_rejection = _dispatch_boundary_rejection(
+        state,
+        target_tasks,
+        "qa_critic",
+    )
+    if boundary_rejection is not None:
+        return {
+            **boundary_rejection,
+            "qa_evaluations": {},
+            "eval_status": "state_inconsistent",
+            "qa_investigation_report": "",
+        }
 
     scoped_state = state
     if active_task_ids:
@@ -575,13 +822,39 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
             }
 
     result = run_qa_critic_node(scoped_state)
-    return {
+    out: Dict[str, Any] = {
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),
         "qa_investigation_report": result.get("qa_investigation_report", ""),
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
     }
+    qa_results_by_attempt: Dict[str, QAAttemptResult] = {}
+    task_queue = state.get("task_queue", {})
+    evaluations = result.get("qa_evaluations", {}) or {}
+    for task_id in active_task_ids:
+        task = task_queue.get(task_id)
+        if task is None or not task.current_attempt_id:
+            continue
+        evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task_id)
+        if evaluation is None:
+            continue
+        if evaluation.task_id != task_id:
+            # QA workers may still return the legacy group-keyed projection.
+            # The attempt envelope is task-keyed, so normalize the nested
+            # evaluation before it enters the authoritative correlation map.
+            evaluation = evaluation.model_copy(update={"task_id": task_id})
+        qa_results_by_attempt[task.current_attempt_id] = QAAttemptResult(
+            attempt_id=task.current_attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            evaluation=evaluation,
+            investigation_report=result.get("qa_investigation_report", ""),
+            errors=list(result.get("errors", []) or []),
+        )
+    if qa_results_by_attempt:
+        out["qa_results_by_attempt"] = qa_results_by_attempt
+    return out
 
 
 # ---------------------------------------------------------------------------

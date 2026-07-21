@@ -101,6 +101,16 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     diff against the host repository, and always attempts to remove the named
     volume.
     """
+    # Teardown is the final state boundary.  Reconcile terminal tasks here as
+    # well as in the supervisor so a direct teardown call or a graph path that
+    # reaches cleanup after a worker surrender cannot preserve a stale current
+    # attempt or retry plan in the final state.
+    from src.orchestrator.supervisor_node import (
+        reconcile_phase5_state_before_teardown,
+    )
+
+    barrier_state = reconcile_phase5_state_before_teardown(state)
+    state = {**state, **barrier_state}
     repo_root_str: str = state.get("repo_root", "")
     workspace_volume: Optional[str] = state.get("workspace_volume")
     changed_files: List[str] = sorted(set(state.get("changed_files", [])))
@@ -190,6 +200,7 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                     _close_client(client)
 
     result: Dict[str, Any] = {
+        **barrier_state,
         "status": "completed",
         "workspace_volume": None,
         "changed_files": changed_files,

@@ -8,13 +8,15 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
     RemediationTask,
     SCARemediationStage,
     TaskStatus,
@@ -539,7 +541,7 @@ def _had_registry_lookup_before_package_edit(
     return False
 
 
-def _build_action_summaries(
+def _legacy_build_action_summaries(
     resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
     final_text: str,
@@ -571,12 +573,11 @@ def _build_action_summaries(
             if tool_events is not None
             else succeeded
         )
-        pkg_had_retry_lookup = (
-            _had_registry_lookup_before_package_edit(group, tool_events)
-            if retry_batch and tool_events is not None
-            else True
-        )
-        task_succeeded = pkg_modified and pkg_validated and pkg_had_retry_lookup
+        # Registry lookup and version selection are supervisor responsibilities.
+        # A retry is successful when the exact committed edit was applied and
+        # the final manifest validation passed; requiring a worker-side lookup
+        # here would make every retry fail despite the execution-only contract.
+        task_succeeded = pkg_modified and pkg_validated
         summary_status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
         outcome = (
             "Completed validated manifest updates"
@@ -603,6 +604,120 @@ def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> List[Ag
         AgentActionSummary(task_id=t_id, status=AgentActionStatus.SURRENDER, summary=message)
         for t_id in task_ids
     ]
+
+
+def _worker_result_map(
+    target_tasks: Sequence[RemediationTask],
+    snapshots: Dict[str, Any],
+    summaries: Sequence[AgentActionSummary],
+    *,
+    succeeded: bool,
+    errors: Sequence[str] = (),
+    attempted_versions_by_task: Optional[Dict[str, List[str]]] = None,
+    executed_versions_by_task: Optional[Dict[str, List[str]]] = None,
+    validation_calls: int = 0,
+) -> Dict[str, WorkerAttemptResult]:
+    """Build attempt-correlated worker envelopes without changing task state."""
+    summary_by_task = {summary.task_id: summary for summary in summaries}
+    results: Dict[str, WorkerAttemptResult] = {}
+    attempted_versions_by_task = attempted_versions_by_task or {}
+    executed_versions_by_task = executed_versions_by_task or attempted_versions_by_task
+    for task in target_tasks:
+        snapshot = snapshots.get(task.task_id)
+        if snapshot is None:
+            continue
+        summary = summary_by_task.get(task.task_id)
+        attempted = list(attempted_versions_by_task.get(task.task_id, []))
+        executed = list(executed_versions_by_task.get(task.task_id, []))
+        results[snapshot.attempt_id] = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=(
+                summary.status
+                if summary is not None
+                else AgentActionStatus.SUCCESS
+                if succeeded
+                else AgentActionStatus.SURRENDER
+            ),
+            executed_versions=executed,
+            action_summary=summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                attempted_versions=attempted,
+                executed_versions=executed,
+                validation_calls=validation_calls,
+                validation_passed=succeeded,
+                failure_reason=" | ".join(errors),
+            ),
+            instruction_digest=snapshot.instruction_digest,
+            errors=list(errors),
+        )
+    return results
+
+
+def _attempted_versions_for_current_run(
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> Dict[str, List[str]]:
+    """Collect version targets from this invocation only.
+
+    ``UpdateRetryDiagnostics`` is intentionally cumulative for compatibility,
+    but a ``WorkerAttemptResult`` must describe only the attempt that produced
+    it.  In particular, carrying the previous attempt's target here would make
+    the supervisor interpret a valid retry as having executed multiple versions.
+    Tool events include failed edit calls, so this also preserves attempted
+    targets when the edit itself did not succeed.
+    """
+    package_to_task_ids: Dict[str, List[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = (group.vulnerable_component or "").strip()
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+
+    result: Dict[str, List[str]] = {
+        task.task_id: [] for task, _group, _paths in resolved_tasks
+    }
+    for event in tool_events:
+        if getattr(event, "name", "") != "modify_npm_dependency":
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
+    return result
+
+
+def _executed_versions_for_current_run(
+    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> Dict[str, List[str]]:
+    """Collect only successful exact edit targets from this worker run."""
+    result: Dict[str, List[str]] = {
+        task.task_id: [] for task, _group, _paths in resolved_tasks
+    }
+    package_to_task_ids: Dict[str, List[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = (group.vulnerable_component or "").strip()
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+    for event in tool_events:
+        if getattr(event, "name", "") != "modify_npm_dependency":
+            continue
+        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
+    return result
 
 
 def _parse_registry_report_versions(report_text: str) -> Tuple[Sequence[str], str | None]:
@@ -954,22 +1069,25 @@ def _build_retry_diagnostics(
             task_stage = SCARemediationStage.OSV_MINIMUM
         result[task.task_id] = UpdateRetryDiagnostics(
             task_id=task.task_id,
+            committed_attempt_id=prior.committed_attempt_id if prior else None,
             strategy_stage=task_stage,
             security_floor=prior.security_floor if prior else (
                 group.fix_plan.fixed_version if group.fix_plan else None
             ),
             registry_query_performed=prior.registry_query_performed if prior else False,
             attempted_versions=attempted,
+            executed_versions=attempted,
             candidate_versions_considered=list(prior.candidate_versions_considered) if prior else [],
             # Version selection belongs to the Supervisor planner. A worker
             # failure must not resurrect the previous planner selection.
-            selected_version=(attempted[-1] if succeeded and attempted else None),
+            selected_version=prior.selected_version if prior else None,
             latest_version_seen=prior.latest_version_seen if prior else None,
             used_overrides=used_overrides,
             package_abandoned=package_abandoned,
             exhausted_update_path=exhausted_update_path,
             failure_reason=(joined_errors or final_text.strip()) if not succeeded else (prior.failure_reason if prior else ""),
             reasoning_summary=(final_text or "").strip(),
+            instruction_digest=prior.instruction_digest if prior else None,
         )
     return result
 
@@ -1003,7 +1121,26 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     resolved_tasks: List[Tuple[RemediationTask, VulnerabilityGroup, List[str]]] = []
     resolution_errors: List[str] = []
+    target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
     for task, group in zip(target_tasks, target_groups):
+        snapshot = target_attempt_snapshots.get(task.task_id)
+        if snapshot is not None:
+            if (
+                task.current_attempt_id != snapshot.attempt_id
+                or task.task_revision != snapshot.task_revision
+                or task.instruction != snapshot.instruction
+            ):
+                resolution_errors.append(
+                    f"Update Subagent: committed attempt snapshot does not match task {task.task_id}."
+                )
+                continue
+            task = task.model_copy(
+                update={
+                    "strategy_stage": snapshot.strategy_stage,
+                    "selected_version": snapshot.selected_version,
+                    "instruction": snapshot.instruction,
+                }
+            )
         manifest_paths, errors = _resolve_manifest_targets(group, repo_root)
         resolution_errors.extend(errors)
         if not manifest_paths:
@@ -1110,11 +1247,52 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         summaries = _build_surrender_summaries(resolved_task_ids, "Stopped because the sandbox or tool loop failed.")
         return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": sorted(touched_files), "errors": resolution_errors + [msg]}
 
-    succeeded = bool(runtime.changed_files) and has_single_final_successful_validation(
-        runtime.tool_events,
-        edit_tool_name="modify_npm_dependency",
-        validation_tool_name="validate_manifest_sync",
+    validation_events = [
+        event
+        for event in runtime.tool_events
+        if event.name == "validate_manifest_sync"
+    ]
+    succeeded = (
+        bool(runtime.changed_files)
+        and len(validation_events) == 1
+        and int(execution_state.get("validation_calls", 0)) == 1
+        and has_single_final_successful_validation(
+            runtime.tool_events,
+            edit_tool_name="modify_npm_dependency",
+            validation_tool_name="validate_manifest_sync",
+        )
     )
+    attempted_by_task = _attempted_versions_for_current_run(
+        resolved_tasks,
+        runtime.tool_events,
+    )
+    executed_by_task = _executed_versions_for_current_run(
+        resolved_tasks,
+        runtime.tool_events,
+    )
+    instruction_mismatch_task_ids: set[str] = set()
+    instruction_mismatch_errors: List[str] = []
+    for task, _group, _manifest_paths in resolved_tasks:
+        snapshot = target_attempt_snapshots.get(task.task_id)
+        if snapshot is None or snapshot.selected_version is None:
+            continue
+        expected = snapshot.selected_version.strip().lstrip("vV").lower()
+        observed = {
+            version.strip().lstrip("vV").lower()
+            for version in attempted_by_task.get(task.task_id, [])
+            if version
+        }
+        if observed and expected not in observed:
+            instruction_mismatch_task_ids.add(task.task_id)
+            instruction_mismatch_errors.append(
+                f"Task {task.task_id}: worker attempted {', '.join(sorted(observed))} "
+                f"instead of committed version {snapshot.selected_version}."
+            )
+
+    if instruction_mismatch_task_ids:
+        runtime.errors.extend(instruction_mismatch_errors)
+        succeeded = False
+
     retry_diagnostics_by_task = _build_retry_diagnostics(
         resolved_tasks,
         runtime.tool_events,
@@ -1132,10 +1310,49 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         retry_batch=retry_batch,
         tool_events=runtime.tool_events,
     )
+    if instruction_mismatch_task_ids:
+        summaries = [
+            summary.model_copy(
+                update={
+                    "status": AgentActionStatus.SURRENDER,
+                    "summary": (
+                        f"{summary.summary} Instruction-mismatch surrender: "
+                        f"{next(error for error in instruction_mismatch_errors if summary.task_id in error)}"
+                    ),
+                }
+            )
+            if summary.task_id in instruction_mismatch_task_ids
+            else summary
+            for summary in summaries
+        ]
+    tagged_summaries = [
+        summary.model_copy(
+            update={
+                "attempt_id": target_attempt_snapshots[summary.task_id].attempt_id,
+                "task_revision": target_attempt_snapshots[summary.task_id].task_revision,
+                "instruction_digest": target_attempt_snapshots[summary.task_id].instruction_digest,
+            }
+        )
+        if summary.task_id in target_attempt_snapshots
+        else summary
+        for summary in summaries
+    ]
     return {
-        "action_summaries": summaries,
-        "action_summary": summaries[0] if summaries else None,
+        "action_summaries": tagged_summaries,
+        "action_summary": tagged_summaries[0] if tagged_summaries else None,
         "changed_files": runtime.changed_files,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
+        "worker_results_by_attempt": _worker_result_map(
+            target_tasks,
+            target_attempt_snapshots,
+            tagged_summaries,
+            succeeded=succeeded,
+            errors=runtime.errors,
+            attempted_versions_by_task=attempted_by_task,
+            executed_versions_by_task=executed_by_task,
+            validation_calls=sum(
+                1 for event in runtime.tool_events if event.name == "validate_manifest_sync"
+            ),
+        ),
         "errors": resolution_errors + runtime.errors,
     }

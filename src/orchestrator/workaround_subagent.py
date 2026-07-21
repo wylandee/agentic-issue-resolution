@@ -11,7 +11,13 @@ from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.contracts.schemas import AgentActionStatus, AgentActionSummary, VulnerabilityGroup
+from src.contracts.schemas import (
+    AgentActionStatus,
+    AgentActionSummary,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
+    VulnerabilityGroup,
+)
 from src.orchestrator.remedy_tools import build_workaround_toolbelt
 from src.orchestrator.state import SubagentState, _derive_legacy_task_from_group
 from src.orchestrator.subagent_runtime import (
@@ -141,6 +147,42 @@ def _build_action_summaries(
 def _build_surrender_summaries(task_id: str, message: str) -> List[AgentActionSummary]:
     return [AgentActionSummary(task_id=task_id, status=AgentActionStatus.SURRENDER, summary=message)]
 
+
+def _build_attempt_result(
+    state: SubagentState,
+    summary: AgentActionSummary,
+    *,
+    succeeded: bool,
+    errors: List[str],
+    changed_files: List[str],
+) -> Dict[str, WorkerAttemptResult]:
+    snapshot = state.get("attempt_snapshot")
+    if snapshot is None:
+        return {}
+    tagged_summary = summary.model_copy(
+        update={
+            "attempt_id": snapshot.attempt_id,
+            "task_revision": snapshot.task_revision,
+            "instruction_digest": snapshot.instruction_digest,
+        }
+    )
+    return {
+        snapshot.attempt_id: WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=snapshot.task_id,
+            task_revision=snapshot.task_revision,
+            status=tagged_summary.status,
+            changed_files=changed_files,
+            action_summary=tagged_summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                validation_passed=succeeded,
+                failure_reason=" | ".join(errors),
+            ),
+            instruction_digest=snapshot.instruction_digest,
+            errors=errors,
+        )
+    }
+
 @traceable(name="Workaround_Subagent_Test_Run") # for langsmith testing
 def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     """Run the single-group workaround subagent on ``SubagentState``."""
@@ -162,6 +204,13 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
             "action_summaries": summaries,
             "action_summary": summaries[0],
             "changed_files": [],
+            "worker_results_by_attempt": _build_attempt_result(
+                state,
+                summaries[0],
+                succeeded=False,
+                errors=[],
+                changed_files=[],
+            ),
             "errors": [],
         }
 
@@ -247,9 +296,28 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
         runtime.final_text,
         succeeded,
     )
+    snapshot = state.get("attempt_snapshot")
+    tagged_summaries = [
+        summaries[0].model_copy(
+            update={
+                "attempt_id": snapshot.attempt_id,
+                "task_revision": snapshot.task_revision,
+                "instruction_digest": snapshot.instruction_digest,
+            }
+        )
+        if snapshot is not None
+        else summaries[0]
+    ]
     return {
-        "action_summaries": summaries,
-        "action_summary": summaries[0],
+        "action_summaries": tagged_summaries,
+        "action_summary": tagged_summaries[0],
         "changed_files": runtime.changed_files,
+        "worker_results_by_attempt": _build_attempt_result(
+            state,
+            tagged_summaries[0],
+            succeeded=succeeded,
+            errors=list(runtime.errors),
+            changed_files=list(runtime.changed_files),
+        ),
         "errors": runtime.errors,
     }

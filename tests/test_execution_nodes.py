@@ -8,8 +8,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from src.contracts.schemas import (
+    RemediationTask,
+    RoutingStrategy,
+    SCARemediationStage,
+    TaskAttemptSnapshot,
+    TaskStatus,
+)
 from src.orchestrator.editor_node import run_workspace_builder_node
 from src.orchestrator.state import initial_orchestrator_state
+from src.orchestrator.supervisor_node import _instruction_digest
 from src.orchestrator.teardown_node import run_teardown_node
 
 
@@ -79,6 +87,42 @@ class TestWorkspaceBuilderNode:
 
 
 class TestTeardownNode:
+    def test_final_state_barrier_detaches_terminal_worker_attempt(self, tmp_path):
+        instruction = "Apply the workaround."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-terminal",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            instruction=instruction,
+            instruction_digest=_instruction_digest(instruction),
+            dispatch_node="workaround_subagent",
+        )
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["task_queue"] = {
+            "task-1": RemediationTask(
+                task_id="task-1",
+                parent_group_id="g1",
+                strategy=RoutingStrategy.CODE_WORKAROUND,
+                strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+                instruction=instruction,
+                status=TaskStatus.UNFIXABLE,
+                task_revision=1,
+                current_attempt_id=snapshot.attempt_id,
+            )
+        }
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
+
+        result = run_teardown_node(state)
+
+        assert result["task_queue"]["task-1"].current_attempt_id is None
+        assert result["active_target_task_ids"] == []
+        assert any(
+            event.error_code == "TERMINAL_TASK_FIELDS_NORMALIZED"
+            for event in result["consistency_events"]
+        )
+
     def test_changed_files_are_deduplicated_diffed_and_volume_removed(self, tmp_path):
         route_dir = tmp_path / "routes"
         route_dir.mkdir()

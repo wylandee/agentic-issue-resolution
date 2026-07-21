@@ -75,6 +75,11 @@ def build_initial_remediation_task(
             if strategy == RoutingStrategy.VERSION_BUMP
             else SCARemediationStage.CODE_WORKAROUND
         ),
+        selected_version=(
+            group.fix_plan.fixed_version
+            if group.fix_plan is not None
+            else None
+        ),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,

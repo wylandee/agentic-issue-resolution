@@ -1229,6 +1229,9 @@ class AgentActionSummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(..., min_length=1)
+    attempt_id: Optional[str] = None
+    task_revision: Optional[int] = Field(default=None, ge=0)
+    instruction_digest: Optional[str] = None
     status: AgentActionStatus
     summary: str = Field(..., min_length=1)
 
@@ -1241,6 +1244,25 @@ class AgentActionSummary(BaseModel):
         return cleaned
 
 
+class TaskAttemptSnapshot(BaseModel):
+    """Immutable supervisor commit describing one worker/QA attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempt_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    task_id: str = Field(..., min_length=1)
+    state_revision: int = Field(default=0, ge=0)
+    task_revision: int = Field(default=0, ge=0)
+    attempt_number: int = Field(default=1, ge=1)
+    strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
+    selected_version: Optional[str] = None
+    instruction: str = Field(..., min_length=1)
+    instruction_digest: str = Field(..., min_length=1)
+    dispatch_node: Literal["update_subagent", "workaround_subagent", "qa_critic"]
+    plan_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class UpdateRetryDiagnostics(BaseModel):
     """Structured retry evidence emitted by the update subagent per task."""
 
@@ -1248,9 +1270,11 @@ class UpdateRetryDiagnostics(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
+    committed_attempt_id: Optional[str] = None
     security_floor: Optional[str] = None
     registry_query_performed: bool = False
     attempted_versions: List[str] = Field(default_factory=list)
+    executed_versions: List[str] = Field(default_factory=list)
     candidate_versions_considered: List[str] = Field(default_factory=list)
     selected_version: Optional[str] = None
     latest_version_seen: Optional[str] = None
@@ -1259,9 +1283,11 @@ class UpdateRetryDiagnostics(BaseModel):
     exhausted_update_path: bool = False
     failure_reason: str = ""
     reasoning_summary: str = ""
+    instruction_digest: Optional[str] = None
 
     @field_validator(
         "attempted_versions",
+        "executed_versions",
         "candidate_versions_considered",
         mode="before",
     )
@@ -1303,12 +1329,73 @@ class UpdateRetryDiagnostics(BaseModel):
         return value.strip()
 
 
+class WorkerExecutionDiagnostics(BaseModel):
+    """Execution-only evidence reported by the update/workaround worker."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempted_versions: List[str] = Field(default_factory=list)
+    executed_versions: List[str] = Field(default_factory=list)
+    validation_calls: int = Field(default=0, ge=0)
+    validation_passed: bool = False
+    failure_reason: str = ""
+
+
+class WorkerAttemptResult(BaseModel):
+    """Worker result correlated to the supervisor's committed attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempt_id: str = Field(..., min_length=1)
+    task_id: str = Field(..., min_length=1)
+    task_revision: int = Field(default=0, ge=0)
+    status: AgentActionStatus
+    executed_versions: List[str] = Field(default_factory=list)
+    changed_files: List[str] = Field(default_factory=list)
+    action_summary: Optional[AgentActionSummary] = None
+    execution_diagnostics: WorkerExecutionDiagnostics = Field(
+        default_factory=WorkerExecutionDiagnostics
+    )
+    instruction_digest: str = Field(..., min_length=1)
+    errors: List[str] = Field(default_factory=list)
+
+
+class QAAttemptResult(BaseModel):
+    """QA result correlated to the attempt that produced the changes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempt_id: str = Field(..., min_length=1)
+    task_id: str = Field(..., min_length=1)
+    task_revision: int = Field(default=0, ge=0)
+    evaluation: QAEvaluation
+    investigation_report: str = ""
+    errors: List[str] = Field(default_factory=list)
+
+
+class StateConsistencyEvent(BaseModel):
+    """Deduplicated state-reconciliation diagnostic."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    error_code: str = Field(..., min_length=1)
+    task_id: Optional[str] = None
+    expected_attempt_id: Optional[str] = None
+    received_attempt_id: Optional[str] = None
+    action: Literal["ignored", "repaired", "replanned"]
+    details: str = ""
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class SupervisorRetryPlan(BaseModel):
     """Authoritative planner decision committed before supervisor routing."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(..., min_length=1)
+    plan_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    source_task_revision: int = Field(default=0, ge=0)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     selected_version: Optional[str] = None
     attempted_versions: List[str] = Field(default_factory=list)
@@ -1554,6 +1641,15 @@ class RemediationTask(BaseModel):
         min_length=1,
         description="Unique task identifier (e.g. 'task-1').",
     )
+    task_revision: int = Field(
+        default=0,
+        ge=0,
+        description="Monotonic revision of the supervisor-committed task input.",
+    )
+    current_attempt_id: Optional[str] = Field(
+        default=None,
+        description="Attempt snapshot currently authorized to produce results.",
+    )
     parent_group_id: str = Field(
         ...,
         min_length=1,
@@ -1573,6 +1669,14 @@ class RemediationTask(BaseModel):
     strategy_stage: SCARemediationStage = Field(
         default=SCARemediationStage.OSV_MINIMUM,
         description="Current ordered SCA remediation stage for this task.",
+    )
+    selected_version: Optional[str] = Field(
+        default=None,
+        description="Supervisor-selected version for the current update stage.",
+    )
+    exhausted_update_path: bool = Field(
+        default=False,
+        description="True when all registry-guided update stages are exhausted.",
     )
     instruction: str = Field(
         default="",
