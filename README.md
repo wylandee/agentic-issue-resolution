@@ -12,7 +12,7 @@ agent-remediation-engine/
 │   └── rules.yaml              # Global constraints (e.g., max tokens, forbidden files)
 ├── data/
 │   ├── clones/                 # Git-ignored ephemeral workspace for target repos
-│   ├── trajectories/           # JSON logs of agent thoughts, tool calls, and outcomes
+│   ├── trajectories/           # Markdown traces of states, LLM calls, tools, and outcomes
 │   └── vector_store/           # Persistent embeddings for codebase RAG
 ├── evals/
 │   ├── benchmarks/             # Curated datasets of known bugs/vulnerabilities

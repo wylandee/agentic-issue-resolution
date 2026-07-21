@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Sequence, Set
 
 from langchain_core.messages import ToolMessage
 
+from src.orchestrator.trajectory_exporter import (
+    invoke_with_trajectory,
+)
+
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
 SANDBOX_NOT_RUNNING_MARKER = "Sandbox is not running,"
 
@@ -57,7 +61,12 @@ def _invoke_bound_tool(tool_map: Dict[str, Any], tool_call: Dict[str, Any]) -> T
         content = f"ERROR: Unknown tool '{tool_name}'."
     else:
         try:
-            result = tool_map[tool_name].invoke(tool_args)
+            result = invoke_with_trajectory(
+                f"tool.{tool_name}",
+                lambda: tool_map[tool_name].invoke(tool_args),
+                tool_args,
+                run_type="tool",
+            )
             content = result if isinstance(result, str) else str(result)
         except Exception as exc:  # noqa: BLE001
             content = f"ERROR: Tool '{tool_name}' failed - {exc}"
@@ -82,7 +91,12 @@ def run_bounded_subagent_loop(
     observed_changed_files = set(touched_files)
 
     for _ in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
-        response = llm_with_tools.invoke(list(conversation))
+        response = invoke_with_trajectory(
+            "react.llm",
+            lambda: llm_with_tools.invoke(list(conversation)),
+            list(conversation),
+            run_type="llm",
+        )
         conversation.append(response)
         final_text = str(getattr(response, "content", "") or "")
         if planning_state is not None:

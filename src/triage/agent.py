@@ -36,6 +36,7 @@ from src.contracts.schemas import (
     TriageResult,
     VulnerabilityGroup,
 )
+from src.orchestrator.trajectory_exporter import invoke_with_trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +402,11 @@ def _llm_triage(
         llm = ChatOpenAI(model=model_name, temperature=0)
         structured_llm = llm.with_structured_output(TriageResult)
         prompt_text = _build_triage_prompt(group, context)
-        result: TriageResult = structured_llm.invoke(prompt_text)
+        result: TriageResult = invoke_with_trajectory(
+            "triage.llm",
+            lambda: structured_llm.invoke(prompt_text),
+            prompt_text,
+        )
         result.group_id = group.group_id
         result.recommended_issue_id = group.representative_issue_id
         result.triage_method = "llm"

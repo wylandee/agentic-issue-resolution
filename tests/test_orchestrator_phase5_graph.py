@@ -7,6 +7,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import pytest
+
 from src.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
@@ -193,6 +195,59 @@ class TestPhase5RunOrchestrator:
         assert result["status"] == "completed"
         assert result["langsmith_run_id"] == str(run_id)
         assert "langsmith_trace_url" not in result
+
+    def test_run_orchestrator_surfaces_local_trajectory_path(self, tmp_path, monkeypatch):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        mock_engine = MagicMock()
+        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(None, None),
+        ):
+            result = run_orchestrator(str(tmp_path), groups)
+
+        trajectory_path = result["trajectory_path"]
+        assert trajectory_path.startswith(str(trajectory_dir))
+        assert trajectory_path.endswith(".md")
+        assert trajectory_dir.joinpath(trajectory_path.split("\\")[-1]).exists()
+
+    def test_failed_orchestration_still_writes_trajectory_and_preserves_error(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        mock_engine = MagicMock()
+        mock_engine.invoke.side_effect = RuntimeError("graph exploded")
+
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(None, None),
+        ), pytest.raises(RuntimeError, match="graph exploded"):
+            run_orchestrator(str(tmp_path), groups)
+
+        files = list(trajectory_dir.glob("*.md"))
+        assert len(files) == 1
+        assert "graph exploded" in files[0].read_text(encoding="utf-8")
+
+    def test_trajectory_export_failure_does_not_mask_orchestration_error(
+        self, tmp_path
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        mock_engine = MagicMock()
+        mock_engine.invoke.side_effect = RuntimeError("graph exploded")
+
+        with patch("src.orchestrator.graph.orchestrator_engine", mock_engine), patch(
+            "src.orchestrator.graph.build_phase5_runnable_config",
+            return_value=(None, None),
+        ), patch(
+            "src.orchestrator.graph.export_phase5_trajectory",
+            side_effect=OSError("disk full"),
+        ), pytest.raises(RuntimeError, match="graph exploded"):
+            run_orchestrator(str(tmp_path), groups)
 
 
 class TestPhase5GraphIntegration:

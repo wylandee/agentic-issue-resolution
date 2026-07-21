@@ -194,6 +194,7 @@ class OrchestratorState(TypedDict, total=False):
     diff: str
     langsmith_run_id: str
     langsmith_trace_url: str
+    trajectory_path: str
     errors: Annotated[List[str], operator.add]
 
 
@@ -257,6 +258,7 @@ def initial_orchestrator_state(
         "eval_status": "",
         "qa_investigation_report": "",
         "diff": "",
+        "trajectory_path": "",
         "errors": [],
     }
     if issues is not None:

@@ -55,6 +55,7 @@ Phase 5:
 from __future__ import annotations
 
 import logging
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -89,6 +90,11 @@ from src.orchestrator.state import (
 )
 from src.orchestrator.supervisor_node import run_supervisor_node, supervisor_router
 from src.orchestrator.teardown_node import run_teardown_node
+from src.orchestrator.trajectory_exporter import (
+    TrajectoryRecorder,
+    export_phase5_trajectory,
+    use_trajectory_recorder,
+)
 from src.orchestrator.update_subagent import run_update_subagent_node
 from src.orchestrator.workaround_subagent import run_workaround_subagent_node
 from src.tools.edit_tools import apply_edit
@@ -636,19 +642,76 @@ def run_orchestrator(
         system_context=system_context,
     )
     config, run_id = build_phase5_runnable_config(repo_root, valid_groups)
+    recorder = TrajectoryRecorder()
+    langsmith_enabled = config is not None and run_id is not None
+    trace_id = run_id if run_id is not None else uuid.uuid4()
     if config is None:
-        result: OrchestratorState = orchestrator_engine.invoke(initial_state)
+        runnable_config: Dict[str, Any] = {
+            "run_id": trace_id,
+            "run_name": "phase5_orchestrator_local",
+            "tags": ["phase-5", "orchestrator", "langgraph", "local-trajectory"],
+            "metadata": {
+                "repo_name": Path(repo_root).name,
+                "repo_root": repo_root,
+                "vulnerability_group_count": len(valid_groups),
+            },
+            "callbacks": [recorder],
+        }
     else:
-        result = orchestrator_engine.invoke(initial_state, config)
-        result["langsmith_run_id"] = str(run_id)
-        trace_url = resolve_phase5_trace_url(run_id)
-        if trace_url:
-            result["langsmith_trace_url"] = trace_url
+        runnable_config = config
+        runnable_config["callbacks"] = list(config.get("callbacks") or []) + [recorder]
+
+    recorder.record_manual(
+        name="phase5.root_input",
+        run_type="state",
+        inputs=initial_state,
+    )
+    result: Optional[OrchestratorState] = None
+    run_error: Optional[BaseException] = None
+    trace_url: Optional[str] = None
+    try:
+        with use_trajectory_recorder(recorder):
+            result = orchestrator_engine.invoke(initial_state, runnable_config)
+        if langsmith_enabled and run_id is not None:
+            result["langsmith_run_id"] = str(run_id)
+            trace_url = resolve_phase5_trace_url(run_id)
+            if trace_url:
+                result["langsmith_trace_url"] = trace_url
+    except BaseException as exc:
+        run_error = exc
+        raise
+    finally:
+        recorder.record_manual(
+            name="phase5.root_output",
+            run_type="state",
+            inputs={"error": str(run_error)} if run_error else None,
+            outputs=result if result is not None else {"error": str(run_error) if run_error else "no result"},
+            error=run_error,
+        )
+        try:
+            trajectory_path = export_phase5_trajectory(
+                trace_id=trace_id,
+                repo_root=repo_root,
+                initial_state=initial_state,
+                final_state=result if result is not None else {"error": str(run_error) if run_error else "no result"},
+                recorder=recorder,
+                langsmith_enabled=langsmith_enabled,
+                langsmith_url=trace_url,
+                run_error=run_error,
+            )
+            if result is not None:
+                result["trajectory_path"] = str(trajectory_path)
+        except Exception as export_error:  # noqa: BLE001 - never mask remediation
+            log.warning("run_orchestrator: trajectory export failed: %s", export_error)
+            if result is not None:
+                result.setdefault("errors", []).append(
+                    f"trajectory export failed: {export_error}"
+                )
 
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",
         repo_root,
-        len(result.get("valid_groups", [])),
-        result.get("status"),
+        len(result.get("valid_groups", [])) if result is not None else 0,
+        result.get("status") if result is not None else "failed",
     )
-    return result
+    return result  # type: ignore[return-value]

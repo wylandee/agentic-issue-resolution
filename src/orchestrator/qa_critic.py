@@ -55,6 +55,7 @@ from src.contracts.schemas import (
 )
 from src.orchestrator.state import OrchestratorState
 from src.orchestrator.subagent_runtime import run_bounded_subagent_loop
+from src.orchestrator.trajectory_exporter import invoke_with_trajectory
 from src.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
@@ -2434,7 +2435,11 @@ def _run_batch_judge(
 
     logger.info("qa_critic: [Reduce] invoking batch judge for %d groups.", len(valid_groups))
     try:
-        batch_result: BatchQAResult = llm.invoke(prompt)
+        batch_result: BatchQAResult = invoke_with_trajectory(
+            "qa_critic.batch_judge",
+            lambda: llm.invoke(prompt),
+            prompt,
+        )
         logger.info(
             "qa_critic: [Reduce] batch judge returned %d evaluations.",
             len(batch_result.evaluations),
@@ -2939,7 +2944,11 @@ Return a QAEvaluation for group_id="{group.group_id}" with:
 """
 
         try:
-            evaluation: QAEvaluation = llm.invoke(prompt)
+            evaluation: QAEvaluation = invoke_with_trajectory(
+                f"qa_critic.group_judge.{group.group_id}",
+                lambda: llm.invoke(prompt),
+                prompt,
+            )
             evaluations[group.group_id] = evaluation
         except Exception as exc:  # noqa: BLE001
             logger.error(

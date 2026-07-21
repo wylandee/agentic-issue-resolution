@@ -56,6 +56,7 @@ from src.contracts.schemas import (
 from src.orchestrator.state import OrchestratorState
 from src.orchestrator.subagent_runtime import ToolEvent, run_bounded_subagent_loop
 from src.orchestrator.task_utils import build_initial_remediation_task
+from src.orchestrator.trajectory_exporter import invoke_with_trajectory
 from src.tools.registry_tools import plan_npm_version
 
 logger = logging.getLogger(__name__)
@@ -2048,7 +2049,11 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     scratchpad=planner_scratchpad,
                 )
                 logger.info("supervisor: invoking structured router LLM.")
-                decision = structured_llm.invoke(prompt_text)
+                decision = invoke_with_trajectory(
+                    "supervisor.router",
+                    lambda: structured_llm.invoke(prompt_text),
+                    prompt_text,
+                )
                 logger.info(
                     "supervisor: router decision → next_node=%s targets=%s reason=%s",
                     decision.next_node,
