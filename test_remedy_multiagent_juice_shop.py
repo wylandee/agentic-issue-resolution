@@ -25,7 +25,7 @@ TEST_REPO_ROOT = Path(
 TARGET_GROUP_IDS = (
     # Direct
     #"sca:package.json:jsonwebtoken:UPDATE_VERSION",
-    "sca:package.json:express-jwt:UPDATE_VERSION",
+    #"sca:package.json:express-jwt:UPDATE_VERSION",
     #"sca:package.json:sanitize-html:UPDATE_VERSION",
     # "sca:package.json:socket.io:UPDATE_VERSION",
     #"sca:package.json:notevil:UPDATE_VERSION",
@@ -36,13 +36,13 @@ TARGET_GROUP_IDS = (
     #"sca:frontend/package.json:elliptic:UPDATE_VERSION",
     "sca:package.json:cookie:UPDATE_VERSION", # Happy path
     #"sca:package.json:lodash.set:UPDATE_VERSION",
-    "sca:package.json:nanoid:UPDATE_VERSION", # Happy path
+    #"sca:package.json:nanoid:UPDATE_VERSION", # Happy path
     #"sca:package.json:http-cache-semantics:UPDATE_VERSION", # Happy path
     #"sca:package.json:serialize-javascript:UPDATE_VERSION",
 
 )
 
-BASELINE_ISSUES_JSONL = Path("data/odc_issues.jsonl")
+BASELINE_ISSUES_JSONL = Path("data/odc_issues_latest.jsonl")
 
 
 def _load_baseline_issues() -> list[VulnerabilityIssue]:
@@ -115,8 +115,11 @@ def main() -> None:
         result = run_orchestrator(
             repo_root=str(repo_root),
             valid_groups=valid_groups,
-            issues=baseline_issues,           # Skip Triage Node by passing None
-            system_context=None,   # Skip Triage Node by passing None
+            # Keep the complete immutable scanner baseline available to QA
+            # and post-QA triage while using the cached groups for the one
+            # preprocessing pass.
+            issues=baseline_issues,
+            system_context=None,
         )
     except Exception as exc:
         logger.exception("Orchestration graph crashed: %s", exc)

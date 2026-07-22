@@ -23,8 +23,9 @@ Phase 5 graph topology (hub-and-spoke)
 
     START
       |
-    triage
-      | triage_completed / failed | no_work -> teardown
+    initial_triage (one preprocessing pass)
+      | triage_completed / skipped -> workspace_builder
+      | failed | no_work -> teardown
     workspace_builder
       | workspace_ready / failed -> teardown
     supervisor  <-----------------------------------+
@@ -34,6 +35,8 @@ Phase 5 graph topology (hub-and-spoke)
       +-> workaround_subagent ------------------->-+
       |                                            |
       +-> qa_critic ------------------------------>+
+      |                                            |
+      +-> triage (post-QA reconciliation) -------->+
       |
       +-> teardown
            |
@@ -54,6 +57,7 @@ Phase 5:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -69,6 +73,7 @@ from src.contracts.schemas import (
     FixPlan,
     FixPlanStatus,
     IssueType,
+    IssueSource,
     LocalizedIssue,
     RemediationTask,
     RoutingStrategy,
@@ -99,6 +104,7 @@ from src.orchestrator.supervisor_node import (
     run_supervisor_node,
     supervisor_router,
 )
+from src.orchestrator.task_utils import build_initial_remediation_task
 from src.orchestrator.teardown_node import run_teardown_node
 from src.orchestrator.trajectory_exporter import (
     TrajectoryRecorder,
@@ -377,7 +383,15 @@ def run_remediation(
 
 
 def triage_node(state: OrchestratorState) -> Dict[str, Any]:
-    """Run the Phase 4 triage pipeline."""
+    """Run the one-time preprocessing triage pass."""
+    # ``valid_groups`` is the explicit compatibility contract for callers
+    # that already performed preprocessing (for example, the cached-group
+    # Juice Shop driver).  Do not silently replace that caller-selected
+    # scope with a second full triage pass.
+    if state.get("valid_groups"):
+        log.info("triage_node: pre-triaged groups supplied; skipping preprocessing triage.")
+        return {"status": "triage_skipped"}
+
     issues = state.get("issues")
     system_context = state.get("system_context")
     repo_root = state.get("repo_root")
@@ -403,6 +417,250 @@ def triage_node(state: OrchestratorState) -> Dict[str, Any]:
             "valid_groups": [],
             "status": "failed",
             "errors": [f"triage_node raised: {exc}"],
+        }
+
+
+def _stable_issue_fingerprint(issue: VulnerabilityIssue) -> str:
+    """Return an issue fingerprint that ignores generated ingestion metadata."""
+    payload = issue.model_dump(mode="json")
+    payload.pop("id", None)
+    payload.pop("ingested_at", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
+    """Compare meaningful group content while ignoring volatile triage metadata."""
+    payload = {
+        "group_id": group.group_id,
+        "issue_type": group.issue_type.value,
+        "vulnerable_component": group.vulnerable_component,
+        "file_path": group.file_path,
+        "file_paths": sorted(group.file_paths or []),
+        "cve_ids": sorted(group.cve_ids or []),
+        "ghsa_ids": sorted(group.ghsa_ids or []),
+        "versions": sorted(group.versions or []),
+        "sources": sorted(source.value for source in (group.sources or [])),
+        "issues": sorted(_stable_issue_fingerprint(issue) for issue in (group.issues or [])),
+        "fix_plan": group.fix_plan.model_dump(mode="json") if group.fix_plan else None,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _post_triage_issue_input(
+    state: OrchestratorState,
+) -> Optional[List[VulnerabilityIssue]]:
+    """Build the current issue universe from the parseable QA scan snapshot."""
+    if "post_remediation_scan_issues" not in state:
+        return None
+
+    post_scan_issues = list(state.get("post_remediation_scan_issues") or [])
+    baseline_issues = list(state.get("issues") or [])
+    retained_non_odc = [
+        issue for issue in baseline_issues if issue.source != IssueSource.ODC
+    ]
+
+    # Skip-triage callers may omit the full initial issue set.  Preserve any
+    # non-ODC findings carried by the supplied groups in that compatibility
+    # mode, while the post-remediation ODC snapshot remains authoritative for
+    # dependency findings.
+    if not baseline_issues:
+        seen_issue_fingerprints = {
+            _stable_issue_fingerprint(issue)
+            for issue in retained_non_odc
+        }
+        for group in state.get("valid_groups", []) or []:
+            for issue in group.issues or []:
+                if issue.source == IssueSource.ODC:
+                    continue
+                fingerprint = _stable_issue_fingerprint(issue)
+                if fingerprint not in seen_issue_fingerprints:
+                    retained_non_odc.append(issue)
+                    seen_issue_fingerprints.add(fingerprint)
+
+    return retained_non_odc + post_scan_issues
+
+
+def _reconcile_triaged_groups(
+    state: OrchestratorState,
+    candidate_groups: List[VulnerabilityGroup],
+) -> tuple[List[VulnerabilityGroup], Dict[str, List[str]]]:
+    """Reuse unchanged groups and retain active removed groups for QA handoff."""
+    previous_groups = list(state.get("valid_groups", []) or [])
+    previous_by_id = {group.group_id: group for group in previous_groups}
+    task_queue = state.get("task_queue", {}) or {}
+    active_task_ids = set(state.get("active_target_task_ids", []) or [])
+
+    reused: List[str] = []
+    changed: List[str] = []
+    added: List[str] = []
+    reappeared: List[str] = []
+    result: List[VulnerabilityGroup] = []
+    candidate_ids = {group.group_id for group in candidate_groups}
+
+    for candidate in candidate_groups:
+        previous = previous_by_id.get(candidate.group_id)
+        if previous is not None:
+            if _stable_group_fingerprint(previous) == _stable_group_fingerprint(candidate):
+                result.append(previous)
+                reused.append(candidate.group_id)
+            else:
+                result.append(candidate)
+                changed.append(candidate.group_id)
+            continue
+
+        existing_task = next(
+            (
+                task
+                for task in task_queue.values()
+                if task.parent_group_id == candidate.group_id
+            ),
+            None,
+        )
+        result.append(candidate)
+        if existing_task is not None:
+            reappeared.append(candidate.group_id)
+        else:
+            added.append(candidate.group_id)
+
+    retained: List[str] = []
+    for previous in previous_groups:
+        if previous.group_id in candidate_ids:
+            continue
+        matching_tasks = [
+            (task_id, task)
+            for task_id, task in task_queue.items()
+            if task.parent_group_id == previous.group_id
+        ]
+        if any(
+            task_id in active_task_ids
+            or task.status not in {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+            for task_id, task in matching_tasks
+        ):
+            result.append(previous)
+            retained.append(previous.group_id)
+
+    reconciliation = {
+        "reused_group_ids": sorted(reused),
+        "changed_group_ids": sorted(changed),
+        "new_group_ids": sorted(added),
+        "reappeared_group_ids": sorted(reappeared),
+        "retained_removed_group_ids": sorted(retained),
+        "removed_group_ids": sorted(
+            set(previous_by_id) - candidate_ids - set(retained)
+        ),
+    }
+    return sorted(result, key=lambda group: group.group_id), reconciliation
+
+
+def post_qa_triage_node(state: OrchestratorState) -> Dict[str, Any]:
+    """Re-triage the complete parseable post-remediation scan snapshot."""
+    if not state.get("triage_required"):
+        return {
+            "status": "triage_skipped",
+            "triage_reconciliation": {},
+            "active_target_task_ids": [],
+            "active_target_group_ids": [],
+        }
+
+    if state.get("new_vulnerability_status") == "scan_failed":
+        log.info("post_qa_triage_node: scan failed; preserving current groups.")
+        return {
+            "status": "triage_skipped",
+            "triage_required": False,
+            "triage_reconciliation": {},
+            "active_target_task_ids": [],
+            "active_target_group_ids": [],
+        }
+
+    issues = _post_triage_issue_input(state)
+    if issues is None:
+        return {
+            "status": "triage_skipped",
+            "triage_required": False,
+            "triage_reconciliation": {},
+            "active_target_task_ids": [],
+            "active_target_group_ids": [],
+        }
+
+    system_context = state.get("system_context") or SystemContext()
+    repo_root = state.get("repo_root")
+    log.info("post_qa_triage_node: re-triaging %d current issues.", len(issues))
+
+    try:
+        results = run_triage_pipeline(issues, system_context, repo_root)
+        candidate_groups = [
+            group for group, triage_result in results if triage_result.is_valid
+        ]
+        valid_groups, reconciliation = _reconcile_triaged_groups(
+            state,
+            candidate_groups,
+        )
+        task_queue = dict(state.get("task_queue", {}) or {})
+        changed_group_ids = set(reconciliation["changed_group_ids"])
+        changed_group_ids.update(reconciliation["reappeared_group_ids"])
+        changed_group_ids.update(reconciliation["new_group_ids"])
+        groups_by_id = {group.group_id: group for group in valid_groups}
+        reopened_task_ids: set[str] = set()
+        prior_qa_evaluations = dict(state.get("qa_evaluations", {}) or {})
+        for task_id, task in list(task_queue.items()):
+            if task.parent_group_id not in changed_group_ids:
+                continue
+            group = groups_by_id.get(task.parent_group_id)
+            if group is None:
+                continue
+            fresh_task = build_initial_remediation_task(group, task_id)
+            task_queue[task_id] = task.model_copy(
+                update={
+                    "task_revision": task.task_revision + 1,
+                    "current_attempt_id": None,
+                    "strategy": fresh_task.strategy,
+                    "strategy_stage": fresh_task.strategy_stage,
+                    "selected_version": fresh_task.selected_version,
+                    "exhausted_update_path": False,
+                    "instruction": fresh_task.instruction,
+                    "status": TaskStatus.PENDING,
+                    "retry_count": 0,
+                }
+            )
+            reopened_task_ids.add(task_id)
+
+        # A previous QA result belongs to the pre-retriage task revision. It
+        # remains available in the attempt history, but must not close the
+        # newly reopened task.
+        qa_evaluations = {
+            key: value
+            for key, value in prior_qa_evaluations.items()
+            if key not in reopened_task_ids
+            and not any(
+                task.parent_group_id in changed_group_ids
+                and key == task.parent_group_id
+                for task in task_queue.values()
+            )
+        }
+        log.info(
+            "post_qa_triage_node: produced %d valid groups (%d reused, %d new, %d changed).",
+            len(valid_groups),
+            len(reconciliation["reused_group_ids"]),
+            len(reconciliation["new_group_ids"]),
+            len(reconciliation["changed_group_ids"]),
+        )
+        return {
+            "valid_groups": valid_groups,
+            "status": "triage_completed" if valid_groups else "triage_completed_no_work",
+            "triage_required": False,
+            "triage_reconciliation": reconciliation,
+            "task_queue": task_queue,
+            "qa_evaluations": qa_evaluations,
+            "active_target_task_ids": [],
+            "active_target_group_ids": [],
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.exception("post_qa_triage_node: triage pipeline raised")
+        return {
+            "status": "triage_failed",
+            "triage_required": False,
+            "triage_reconciliation": {},
+            "errors": [f"post_qa_triage_node raised: {exc}"],
         }
 
 
@@ -822,6 +1080,19 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
             }
 
     result = run_qa_critic_node(scoped_state)
+    scan_status = result.get(
+        "new_vulnerability_status",
+        state.get("new_vulnerability_status", "not_scanned"),
+    )
+    scan_snapshot_available = (
+        "post_remediation_scan_issues" in result
+        or "post_remediation_scan_issues" in state
+    )
+    triage_required = (
+        result.get("status") in {"qa_completed", "qa_failed"}
+        and scan_status in {"none", "detected"}
+        and scan_snapshot_available
+    )
     out: Dict[str, Any] = {
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),
@@ -834,6 +1105,10 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
             "post_remediation_scan_identifiers",
             state.get("post_remediation_scan_identifiers", []),
         ),
+        "post_remediation_scan_issues": result.get(
+            "post_remediation_scan_issues",
+            state.get("post_remediation_scan_issues", []),
+        ),
         "new_vulnerability_identifiers": result.get(
             "new_vulnerability_identifiers",
             state.get("new_vulnerability_identifiers", []),
@@ -842,6 +1117,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
             "new_vulnerability_status",
             state.get("new_vulnerability_status", "not_scanned"),
         ),
+        "triage_required": triage_required,
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
     }
@@ -894,7 +1170,10 @@ def build_orchestrator_graph():
     """Compile and return the Phase 5 orchestrator StateGraph."""
     workflow = StateGraph(OrchestratorState)
 
-    workflow.add_node("triage", triage_node)
+    # ``initial_triage`` is the one preprocessing pass.  The node named
+    # ``triage`` is reserved for Supervisor-dispatched post-QA re-triage.
+    workflow.add_node("initial_triage", triage_node)
+    workflow.add_node("triage", post_qa_triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
     workflow.add_node("supervisor", run_supervisor_node)
     workflow.add_node("update_subagent", run_update_subagent_from_orchestrator)
@@ -902,13 +1181,14 @@ def build_orchestrator_graph():
     workflow.add_node("qa_critic", run_qa_critic_from_orchestrator)
     workflow.add_node("teardown", run_teardown_node)
 
-    workflow.add_edge(START, "triage")
-    workflow.add_conditional_edges("triage", route_after_triage)
+    workflow.add_edge(START, "initial_triage")
+    workflow.add_conditional_edges("initial_triage", route_after_triage)
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
     workflow.add_conditional_edges("supervisor", supervisor_router)
     workflow.add_edge("update_subagent", "supervisor")
     workflow.add_edge("workaround_subagent", "supervisor")
     workflow.add_edge("qa_critic", "supervisor")
+    workflow.add_edge("triage", "supervisor")
     workflow.add_edge("teardown", END)
 
     return workflow.compile()

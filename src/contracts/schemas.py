@@ -1455,6 +1455,7 @@ class SupervisorDecision(BaseModel):
     - ``workaround_subagent`` requires exactly one ``target_task_id``.
     - ``update_subagent`` requires 1-10 ``target_task_ids``.
     - ``qa_critic`` requires one or more ``target_task_ids`` for batch QA.
+    - ``triage`` is a graph-level handoff and does not target a task.
     - ``teardown`` requires empty ``target_task_ids``.
     - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
     """
@@ -1462,7 +1463,7 @@ class SupervisorDecision(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     next_node: Literal[
-        "update_subagent", "workaround_subagent", "qa_critic", "teardown"
+        "update_subagent", "workaround_subagent", "qa_critic", "triage", "teardown"
     ] = Field(
         ...,
         description="The next node to route to in the orchestrator graph.",

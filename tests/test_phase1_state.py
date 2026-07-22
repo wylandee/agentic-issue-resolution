@@ -94,8 +94,11 @@ class TestInitialStateHelpers:
         assert state["eval_status"] == ""
         assert state["baseline_scan_identifiers"] == ["CVE-2021-44228"]
         assert state["post_remediation_scan_identifiers"] == []
+        assert state["post_remediation_scan_issues"] == []
         assert state["new_vulnerability_identifiers"] == []
         assert state["new_vulnerability_status"] == "not_scanned"
+        assert state["triage_required"] is False
+        assert state["triage_reconciliation"] == {}
         assert "messages" not in state
 
     def test_initial_state_prefers_complete_initial_issue_baseline(self, tmp_path):

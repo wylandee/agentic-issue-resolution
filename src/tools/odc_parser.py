@@ -17,6 +17,7 @@ Changes from v1
 from __future__ import annotations
 
 import csv
+import argparse
 import json
 import logging
 import os
@@ -343,16 +344,42 @@ def export_to_csv(issues: List[VulnerabilityIssue], output_path: Path) -> None:
     log.info("Wrote CSV to %s", output_path)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Run the ODC JSON → JSONL + CSV ingestion pipeline."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent.parent
 
-    input_report = project_root / "data" / "dependency-check-report.json"
-    output_jsonl = project_root / "data" / "odc_issues.jsonl"
-    output_csv = project_root / "data" / "odc_issues.csv"
+    parser = argparse.ArgumentParser(description="Parse an OWASP Dependency-Check JSON report.")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=project_root / "data" / "dependency-check-report.json",
+        help="Dependency-Check JSON report path.",
+    )
+    parser.add_argument(
+        "--output-jsonl",
+        type=Path,
+        default=project_root / "data" / "odc_issues.jsonl",
+        help="Canonical issue JSONL output path.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=project_root / "data" / "odc_issues.csv",
+        help="Human-readable CSV output path.",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Write only JSONL and skip CSV generation.",
+    )
+    args = parser.parse_args(argv)
+
+    input_report = args.input.expanduser()
+    output_jsonl = args.output_jsonl.expanduser()
+    output_csv = args.output_csv.expanduser()
 
     log.info("Loading ODC report from %s", input_report)
     report = load_report(input_report)
@@ -362,7 +389,8 @@ def main() -> None:
     log.info("Parsed %d vulnerability issues", len(issues))
 
     export_to_jsonl(issues, output_jsonl)
-    export_to_csv(issues, output_csv)
+    if not args.no_csv:
+        export_to_csv(issues, output_csv)
     log.info("ODC ingestion complete")
 
 

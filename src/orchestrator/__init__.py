@@ -14,15 +14,6 @@ Phase 5:
 ``run_orchestrator(...)``
 """
 
-from src.orchestrator.graph import (
-    build_orchestrator_graph,
-    build_remediation_graph,
-    orchestrator_engine,
-    remediation_engine,
-    run_orchestrator,
-    run_remediation,
-)
-
 __all__ = [
     "build_orchestrator_graph",
     "build_remediation_graph",
@@ -31,3 +22,12 @@ __all__ = [
     "run_orchestrator",
     "run_remediation",
 ]
+
+
+def __getattr__(name: str):
+    """Load graph entry points lazily to avoid triage/exporter import cycles."""
+    if name in __all__:
+        from src.orchestrator import graph
+
+        return getattr(graph, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

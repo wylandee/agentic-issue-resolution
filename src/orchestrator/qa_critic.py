@@ -52,6 +52,7 @@ from src.contracts.schemas import (
     BatchQAResult,
     FailureCategory,
     QAEvaluation,
+    VulnerabilityIssue,
     VulnerabilityGroup,
 )
 from src.orchestrator.state import OrchestratorState
@@ -161,6 +162,21 @@ def _next_html_report_host_path() -> Path:
 
 def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
     """Parse CVE/GHSA identifiers from the ODC JSON report text."""
+    issues = _parse_report_issues(report_text)
+    if issues is None:
+        return None
+
+    identifiers: Set[str] = set()
+    for issue in issues:
+        if issue.cve_id:
+            identifiers.add(issue.cve_id.upper().strip())
+        if issue.ghsa_id:
+            identifiers.add(issue.ghsa_id.upper().strip())
+    return identifiers
+
+
+def _parse_report_issues(report_text: str) -> Optional[List[VulnerabilityIssue]]:
+    """Parse the complete typed vulnerability snapshot from an ODC report."""
     try:
         report = json.loads(report_text)
     except Exception as exc:  # noqa: BLE001
@@ -173,13 +189,11 @@ def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
         logger.warning("qa_critic: src.tools.odc_parser not importable.")
         return None
 
-    identifiers: Set[str] = set()
-    for issue in parse_vulnerabilities(report):
-        if issue.cve_id:
-            identifiers.add(issue.cve_id.upper().strip())
-        if issue.ghsa_id:
-            identifiers.add(issue.ghsa_id.upper().strip())
-    return identifiers
+    try:
+        return parse_vulnerabilities(report)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: failed to parse ODC vulnerabilities — %s", exc)
+        return None
 
 
 def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
@@ -266,6 +280,7 @@ class _SecurityScanResult:
     remaining_identifiers: Set[str]
     found_identifiers: Set[str]
     new_identifiers: Set[str]
+    found_issues: List[VulnerabilityIssue] = field(default_factory=list)
 
     def _legacy_projection(self) -> Tuple[bool, str, Set[str]]:
         return self.ok, self.summary, self.remaining_identifiers
@@ -284,6 +299,7 @@ class _SecurityScanResult:
                 and self.remaining_identifiers == other.remaining_identifiers
                 and self.found_identifiers == other.found_identifiers
                 and self.new_identifiers == other.new_identifiers
+                and self.found_issues == other.found_issues
             )
         if isinstance(other, tuple):
             return self._legacy_projection() == other
@@ -351,8 +367,16 @@ def _run_security_scan(
     found_identifiers = (
         _parse_report_identifiers(report_text) if report_text is not None else None
     )
+    found_issues = (
+        _parse_report_issues(report_text) if report_text is not None else None
+    )
+    # Legacy direct callers/tests may replace the identifier-only parser. In
+    # that compatibility mode there is no typed issue snapshot to propagate,
+    # but the identifier scan can still be evaluated normally.
+    if found_issues is None and found_identifiers is not None:
+        found_issues = []
 
-    if proc.returncode != 0 and found_identifiers is None:
+    if proc.returncode != 0 and (found_identifiers is None or found_issues is None):
         summary = (
             f"FAILURE: Dependency-Check exited {proc.returncode} and produced "
             "no parseable report.\n"
@@ -362,7 +386,7 @@ def _run_security_scan(
         summary += report_location_note
         return _SecurityScanResult(False, summary, set(), set(), set())
 
-    if found_identifiers is None:
+    if found_identifiers is None or found_issues is None:
         summary = (
             f"FAILURE: Dependency-Check report was not parseable "
             f"(exit {proc.returncode}).\n"
@@ -398,6 +422,7 @@ def _run_security_scan(
             remaining,
             found_identifiers,
             new_identifiers,
+            found_issues,
         )
 
     summary = "Dependency-Check found no remaining target vulnerability identifiers."
@@ -413,6 +438,7 @@ def _run_security_scan(
         set(),
         found_identifiers,
         new_identifiers,
+        found_issues,
     )
 
 
@@ -1371,6 +1397,7 @@ def _scan_state_projection(
         return {
             "baseline_scan_identifiers": sorted(baseline_identifiers),
             "post_remediation_scan_identifiers": [],
+            "post_remediation_scan_issues": [],
             "new_vulnerability_identifiers": [],
             "new_vulnerability_status": "not_scanned",
         }
@@ -1378,6 +1405,9 @@ def _scan_state_projection(
     found = set(_scan_result_value(scan_result, "found_identifiers", set()) or set())
     new_identifiers = set(
         _scan_result_value(scan_result, "new_identifiers", set()) or set()
+    )
+    found_issues = list(
+        _scan_result_value(scan_result, "found_issues", []) or []
     )
     scan_ok = bool(_scan_result_value(scan_result, "ok", False))
     remaining = set(
@@ -1391,6 +1421,7 @@ def _scan_state_projection(
     return {
         "baseline_scan_identifiers": sorted(baseline_identifiers),
         "post_remediation_scan_identifiers": sorted(found),
+        "post_remediation_scan_issues": found_issues,
         "new_vulnerability_identifiers": sorted(new_identifiers),
         "new_vulnerability_status": status,
     }

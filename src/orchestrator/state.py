@@ -252,8 +252,11 @@ class OrchestratorState(TypedDict, total=False):
     qa_investigation_report: str
     baseline_scan_identifiers: List[str]
     post_remediation_scan_identifiers: List[str]
+    post_remediation_scan_issues: List[VulnerabilityIssue]
     new_vulnerability_identifiers: List[str]
     new_vulnerability_status: str
+    triage_required: bool
+    triage_reconciliation: Dict[str, List[str]]
 
     status: str
     diff: str
@@ -338,8 +341,11 @@ def initial_orchestrator_state(
         "qa_investigation_report": "",
         "baseline_scan_identifiers": baseline_scan_identifiers,
         "post_remediation_scan_identifiers": [],
+        "post_remediation_scan_issues": [],
         "new_vulnerability_identifiers": [],
         "new_vulnerability_status": "not_scanned",
+        "triage_required": False,
+        "triage_reconciliation": {},
         "diff": "",
         "trajectory_path": "",
         "errors": [],

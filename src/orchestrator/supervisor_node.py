@@ -74,6 +74,7 @@ _VALID_NEXT_NODES: Set[str] = {
     "update_subagent",
     "workaround_subagent",
     "qa_critic",
+    "triage",
     "teardown",
 }
 _DEFAULT_MODEL = "gpt-4o-mini"
@@ -1629,6 +1630,7 @@ def _deterministic_routing(
     action_summaries: Optional[List[AgentActionSummary]] = None,
     active_target_task_ids: Optional[List[str]] = None,
     current_status: str = "",
+    triage_required: bool = False,
 ) -> SupervisorDecision:
     """
     Pure-Python fallback routing used when the LLM call fails.
@@ -1642,6 +1644,17 @@ def _deterministic_routing(
         task_queue,
         list(active_target_task_ids or []),
     )
+
+    # Post-QA triage is a Supervisor-owned handoff.  It must run before
+    # teardown even when the current task queue is already terminal, because
+    # the global scan may have discovered a new package vulnerability.
+    if triage_required and current_status in {"qa_completed", "qa_failed"}:
+        return SupervisorDecision(
+            next_node="triage",
+            target_task_ids=[],
+            instructions="Re-triage the complete parseable post-remediation scan before the next remediation decision.",
+            decision_reason="QA produced a parseable scan and marked post-QA triage as required.",
+        )
 
     # All tasks are terminal → teardown
     if not non_terminal:
@@ -2074,6 +2087,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "new_vulnerability_identifiers", []
     )
     new_vulnerability_status: str = state.get("new_vulnerability_status", "not_scanned")
+    triage_required: bool = bool(state.get("triage_required", False))
 
     group_by_id = {g.group_id: g for g in valid_groups}
 
@@ -2175,7 +2189,8 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         f"- Baseline identifiers: {', '.join(baseline_scan_identifiers) or '(none)'}",
         f"- Post-remediation identifiers: {', '.join(post_remediation_scan_identifiers) or '(none or unavailable)'}",
         f"- Newly introduced identifiers: {', '.join(new_vulnerability_identifiers) or '(none)'}",
-        "- Newly introduced identifiers are report-only until the later triage phase; do not assign them to existing tasks or retry unrelated remediation.",
+        f"- Post-QA triage required: {'yes' if triage_required else 'no'}",
+        "- Newly introduced identifiers are report-only until the later triage phase. Do not assign them to existing tasks before triage; after Supervisor dispatches triage, only newly created or explicitly changed groups may receive remediation tasks.",
         "",
         "## Planner Scratchpad",
         scratchpad or "(none)",
@@ -2184,29 +2199,30 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "",
         "## Router Rules (follow strictly)",
         "0. QA-ready tasks have priority: route optimistically_fixed tasks to qa_critic before planning retries or dispatching workers.",
-        f"1. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
-        f"2. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
-        "3. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry containing the exact planned version.",
-        "4. Retry revised_instructions are authoritative exact execution instructions.",
-        "5. Same-strategy retries reuse the same task.",
-        "6. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
-        "7. SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance the task by exactly one version stage.",
+        "1. When Post-QA triage required is yes after QA results are ingested, route to triage before any worker or teardown decision.",
+        f"2. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
+        f"3. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
+        "4. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry containing the exact planned version.",
+        "5. Retry revised_instructions are authoritative exact execution instructions.",
+        "6. Same-strategy retries reuse the same task.",
+        "7. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
+        "8. SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance the task by exactly one version stage.",
         "SECURITY_FLAG and PEER_CONFLICT remain update remediation first; BREAKING_CHANGE also advances through the ordered update stages.",
-        "8. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task.",
-        "9. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
-        "10. After a worker succeeds for the current active batch, route that batch to qa_critic.",
-        "11. When no actionable non-terminal tasks remain, route to teardown.",
-        f"12. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
-        "13. unfixable and qa_passed tasks must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
-        "14. task_status_updates may only set QA_PASSED or UNFIXABLE.",
-        f"15. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
-        "16. workaround_subagent MUST have exactly one target_task_id.",
-        "17. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
-        f"18. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
-        "19. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
-        "20. Mixed worker batches must be split by task status before routing the next node.",
-        "21. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
-        "22. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
+        "9. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task.",
+        "10. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
+        "11. After a worker succeeds for the current active batch, route that batch to qa_critic.",
+        "12. When no actionable non-terminal tasks remain, route to teardown.",
+        f"13. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
+        "14. unfixable and qa_passed tasks must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
+        "15. task_status_updates may only set QA_PASSED or UNFIXABLE.",
+        f"16. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
+        "17. workaround_subagent MUST have exactly one target_task_id.",
+        "18. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
+        f"19. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
+        "20. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
+        "21. Mixed worker batches must be split by task status before routing the next node.",
+        "22. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
+        "23. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
     ]
 
     return "\n".join(lines)
@@ -2311,15 +2327,27 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
     4. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
     5. Short-circuit: if active batch is all optimistically_fixed → qa_critic.
-    6. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
-    7. Guardrails: reject unknown IDs, enforce cardinality, fall back to
+    6. If QA produced a parseable scan and set ``triage_required``, route to
+       the post-QA triage node before any worker or teardown decision.
+    7. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
+    8. Guardrails: reject unknown IDs, enforce cardinality, fall back to
        deterministic routing if invalid.
-    8. Apply guarded: revised_instructions, strategy updates, status overrides,
+    9. Apply guarded: revised_instructions, strategy updates, status overrides,
        unfixable marks, new constraints, and materialized spawn requests.
-    9. Return state patch.
+    10. Return state patch.
     """
     valid_groups: List[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
+        if state.get("triage_required") and state.get("status") in {
+            "qa_completed",
+            "qa_failed",
+        }:
+            return {
+                "status": "supervisor_routed",
+                "next_routing_step": "triage",
+                "active_target_task_ids": [],
+                "supervisor_instructions": "Route the parseable post-remediation scan to triage.",
+            }
         logger.info("supervisor: no valid groups — routing to teardown.")
         return {
             "status": "supervisor_routed",
@@ -2848,6 +2876,21 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
                 ),
             )
+
+    # The LLM is not permitted to bypass the post-QA triage handoff.  This is
+    # deliberately applied after the optimistic QA guard so Supervisor stays
+    # the sole routing authority while preserving the required order:
+    # worker -> supervisor -> QA -> supervisor -> triage -> supervisor.
+    if state.get("triage_required") and state.get("status") in {
+        "qa_completed",
+        "qa_failed",
+    }:
+        decision = SupervisorDecision(
+            next_node="triage",
+            target_task_ids=[],
+            instructions="Route the completed QA scan to post-remediation triage before dispatching more work.",
+            decision_reason="Supervisor guardrail: triage_required is set after a parseable QA scan.",
+        )
 
     # Short-circuit: all remaining non-terminal tasks are optimistically_fixed
     if decision is None:
