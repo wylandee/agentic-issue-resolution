@@ -21,8 +21,9 @@ The QA Critic now follows a map-reduce architecture:
     Normalize, validate, and fill missing/duplicate/unknown evaluations
     deterministically.  Enforce scanner and install-error policies.
 
-The node's external contract (run_qa_critic_node, run_qa_critic_from_orchestrator,
-state key outputs) is unchanged — graph wiring requires no modifications.
+The node preserves existing per-task QA evaluation semantics while adding
+graph-level scan snapshot outputs for vulnerabilities introduced during
+remediation.
 
 Heavy QA commands (install, scan, tests) are intentionally *not* exposed as
 tools to the update or workaround subagents; they live here only.
@@ -250,36 +251,85 @@ def _run_install(sandbox: DockerSandbox) -> Tuple[bool, str]:
     return False, summary
 
 
+@dataclass(frozen=True, eq=False)
+class _SecurityScanResult:
+    """Complete deterministic security-scan outcome.
+
+    The iterator and index accessors intentionally expose the historical
+    three-value ``(ok, summary, remaining)`` projection so existing callers
+    and tests can continue to consume the scanner while newer graph code uses
+    the full identifier snapshot.
+    """
+
+    ok: bool
+    summary: str
+    remaining_identifiers: Set[str]
+    found_identifiers: Set[str]
+    new_identifiers: Set[str]
+
+    def _legacy_projection(self) -> Tuple[bool, str, Set[str]]:
+        return self.ok, self.summary, self.remaining_identifiers
+
+    def __iter__(self):
+        return iter(self._legacy_projection())
+
+    def __getitem__(self, index: int):
+        return self._legacy_projection()[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _SecurityScanResult):
+            return (
+                self.ok == other.ok
+                and self.summary == other.summary
+                and self.remaining_identifiers == other.remaining_identifiers
+                and self.found_identifiers == other.found_identifiers
+                and self.new_identifiers == other.new_identifiers
+            )
+        if isinstance(other, tuple):
+            return self._legacy_projection() == other
+        return NotImplemented
+
+
 def _run_security_scan(
     sandbox: DockerSandbox,
     workspace_volume: str,
     target_identifiers: Set[str],
-) -> Tuple[bool, str, Set[str]]:
+    baseline_identifiers: Optional[Set[str]] = None,
+) -> "_SecurityScanResult":
     """
-    Run OWASP Dependency-Check and identify remaining target identifiers.
+    Run OWASP Dependency-Check and classify the complete identifier snapshot.
 
     Returns:
-        (success, summary_text, remaining_identifiers)
+        A ``_SecurityScanResult`` containing the complete post-remediation
+        identifier set, unresolved target identifiers, and newly introduced
+        identifiers.  Iteration remains backward-compatible with the legacy
+        ``(success, summary_text, remaining_identifiers)`` shape.
         ``success=False`` when Docker is absent, ODC times out, or no
         parseable report is produced.
         ``remaining_identifiers`` is empty on success or on hard failure.
     """
+    baseline = {
+        identifier.upper().strip()
+        for identifier in (baseline_identifiers if baseline_identifiers is not None else target_identifiers)
+        if identifier and identifier.strip()
+    }
+
     if shutil.which("docker") is None:
         msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
         logger.warning("qa_critic: %s", msg)
-        return False, msg, set()
+        return _SecurityScanResult(False, msg, set(), set(), set())
 
     try:
         proc = _run_odc(workspace_volume)
     except FileNotFoundError:
         msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
-        return False, msg, set()
+        return _SecurityScanResult(False, msg, set(), set(), set())
     except subprocess.TimeoutExpired:
         msg = f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s."
-        return False, msg, set()
+        return _SecurityScanResult(False, msg, set(), set(), set())
     except Exception as exc:  # noqa: BLE001
         msg = f"FAILURE: Dependency-Check subprocess error — {exc}"
-        return False, msg, set()
+        return _SecurityScanResult(False, msg, set(), set(), set())
 
     saved_html_report = _persist_workspace_report_to_host(
         sandbox,
@@ -310,7 +360,7 @@ def _run_security_scan(
             f"stderr:\n{proc.stderr[:2000]}"
         )
         summary += report_location_note
-        return False, summary, set()
+        return _SecurityScanResult(False, summary, set(), set(), set())
 
     if found_identifiers is None:
         summary = (
@@ -319,10 +369,16 @@ def _run_security_scan(
             f"stderr:\n{proc.stderr[:2000]}"
         )
         summary += report_location_note
-        return False, summary, set()
+        return _SecurityScanResult(False, summary, set(), set(), set())
 
-    remaining = {ident.upper().strip() for ident in target_identifiers if ident}
+    found_identifiers = {
+        identifier.upper().strip() for identifier in found_identifiers if identifier
+    }
+    remaining = {
+        ident.upper().strip() for ident in target_identifiers if ident
+    }
     remaining &= found_identifiers
+    new_identifiers = found_identifiers - baseline
 
     if remaining:
         remaining_text = ", ".join(sorted(remaining))
@@ -330,12 +386,34 @@ def _run_security_scan(
             "FAILURE: Dependency-Check found unresolved target vulnerabilities. "
             f"Remaining identifiers: {remaining_text}"
         )
+        if new_identifiers:
+            summary += (
+                " Newly introduced identifiers: "
+                f"{', '.join(sorted(new_identifiers))}."
+            )
         summary += report_location_note
-        return False, summary, remaining
+        return _SecurityScanResult(
+            False,
+            summary,
+            remaining,
+            found_identifiers,
+            new_identifiers,
+        )
 
     summary = "Dependency-Check found no remaining target vulnerability identifiers."
+    if new_identifiers:
+        summary += (
+            " Newly introduced identifiers: "
+            f"{', '.join(sorted(new_identifiers))}."
+        )
     summary += report_location_note
-    return True, summary, set()
+    return _SecurityScanResult(
+        True,
+        summary,
+        set(),
+        found_identifiers,
+        new_identifiers,
+    )
 
 
 @dataclass
@@ -1202,6 +1280,37 @@ def _collect_target_identifiers(groups: List[VulnerabilityGroup]) -> Set[str]:
     return identifiers
 
 
+def _collect_baseline_identifiers(
+    state: OrchestratorState,
+    groups: List[VulnerabilityGroup],
+) -> Set[str]:
+    """Resolve the immutable pre-remediation identifier baseline.
+
+    ``initial_orchestrator_state`` normally materializes this field before
+    graph execution.  Direct QA callers and older tests may omit it, so use
+    the complete initial issue set when present and the current groups only as
+    the documented skip-triage fallback.
+    """
+    if "baseline_scan_identifiers" in state:
+        return {
+            identifier.upper().strip()
+            for identifier in state.get("baseline_scan_identifiers", []) or []
+            if identifier and identifier.strip()
+        }
+
+    issues = state.get("issues")
+    if issues is not None:
+        identifiers: Set[str] = set()
+        for issue in issues:
+            if issue.cve_id:
+                identifiers.add(issue.cve_id.upper().strip())
+            if issue.ghsa_id:
+                identifiers.add(issue.ghsa_id.upper().strip())
+        return identifiers
+
+    return _collect_target_identifiers(groups)
+
+
 # ---------------------------------------------------------------------------
 # Path safety helper (used by review tools)
 # ---------------------------------------------------------------------------
@@ -1229,8 +1338,83 @@ class _QAExecutionResults:
     """Cache for global execution phase results."""
 
     install: Optional[Tuple[bool, str]] = None          # (ok, summary)
-    scan: Optional[Tuple[bool, str, Set[str]]] = None   # (ok, summary, remaining_ids)
+    scan: Optional[Any] = None                          # _SecurityScanResult or legacy tuple
     tests: Optional[Tuple[bool, str]] = None            # (ok, summary)
+
+
+def _scan_result_value(scan_result: Any, field: str, default: Any) -> Any:
+    """Read a scan field from the new result or a legacy three-tuple."""
+    if scan_result is None:
+        return default
+    if isinstance(scan_result, _SecurityScanResult):
+        return getattr(scan_result, field)
+    legacy_index = {
+        "ok": 0,
+        "summary": 1,
+        "remaining_identifiers": 2,
+    }.get(field)
+    if legacy_index is not None:
+        try:
+            return scan_result[legacy_index]
+        except (IndexError, KeyError, TypeError):
+            pass
+    return default
+
+
+def _scan_state_projection(
+    results: _QAExecutionResults,
+    baseline_identifiers: Set[str],
+) -> Dict[str, Any]:
+    """Project the scan cache into serializable graph-state fields."""
+    scan_result = results.scan
+    if scan_result is None:
+        return {
+            "baseline_scan_identifiers": sorted(baseline_identifiers),
+            "post_remediation_scan_identifiers": [],
+            "new_vulnerability_identifiers": [],
+            "new_vulnerability_status": "not_scanned",
+        }
+
+    found = set(_scan_result_value(scan_result, "found_identifiers", set()) or set())
+    new_identifiers = set(
+        _scan_result_value(scan_result, "new_identifiers", set()) or set()
+    )
+    scan_ok = bool(_scan_result_value(scan_result, "ok", False))
+    remaining = set(
+        _scan_result_value(scan_result, "remaining_identifiers", set()) or set()
+    )
+    if isinstance(scan_result, _SecurityScanResult) and not scan_ok and not found and not remaining:
+        status = "scan_failed"
+    else:
+        status = "detected" if new_identifiers else "none"
+
+    return {
+        "baseline_scan_identifiers": sorted(baseline_identifiers),
+        "post_remediation_scan_identifiers": sorted(found),
+        "new_vulnerability_identifiers": sorted(new_identifiers),
+        "new_vulnerability_status": status,
+    }
+
+
+def _augment_qa_report_with_scan_findings(
+    report: str,
+    scan_projection: Dict[str, Any],
+) -> str:
+    """Append deterministic new-finding evidence when the scan found any."""
+    new_identifiers = scan_projection.get("new_vulnerability_identifiers", []) or []
+    if not new_identifiers:
+        return report
+    post_identifiers = (
+        scan_projection.get("post_remediation_scan_identifiers", []) or []
+    )
+    section = (
+        "## Global Newly Introduced Scanner Findings\n"
+        f"- Status: {scan_projection.get('new_vulnerability_status', 'detected')}\n"
+        f"- Newly introduced identifiers: {', '.join(new_identifiers)}\n"
+        f"- Post-remediation identifier snapshot: {', '.join(post_identifiers) or 'none'}\n"
+        "- Attribution: graph-level finding; deferred to the later triage phase."
+    )
+    return f"{report.rstrip()}\n\n{section}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1529,6 +1713,13 @@ def _build_fallback_investigation_report(
         scan_result = results.scan
     tests_ok, _ = results.tests or (False, "run_unit_tests was not called.")
 
+    post_scan_identifiers = sorted(
+        _scan_result_value(scan_result, "found_identifiers", set()) or set()
+    )
+    new_identifiers = sorted(
+        _scan_result_value(scan_result, "new_identifiers", set()) or set()
+    )
+
     changed_files_text = ", ".join(candidate_changed_files) if candidate_changed_files else "none"
     blocks = [
         _REPORT_PREFIX,
@@ -1537,6 +1728,8 @@ def _build_fallback_investigation_report(
         f"- Summary: {reason}",
         "- Suspected Responsible Group(s): unknown",
         f"- Evidence: {install_summary}",
+        f"- Post-remediation Scanner Identifiers: {', '.join(post_scan_identifiers) if post_scan_identifiers else 'none'}",
+        f"- Newly Introduced Scanner Identifiers: {', '.join(new_identifiers) if new_identifiers else 'none'}",
         "",
     ]
 
@@ -1662,6 +1855,7 @@ def _run_global_execution(
     sandbox: DockerSandbox,
     workspace_volume: str,
     target_identifiers: Set[str],
+    baseline_identifiers: Optional[Set[str]] = None,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -1676,7 +1870,17 @@ def _run_global_execution(
     install_ok, _ = results.install
 
     logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
-    results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+    if baseline_identifiers is None:
+        # Preserve the legacy helper call shape for direct callers that do not
+        # provide a pre-remediation baseline.
+        results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+    else:
+        results.scan = _run_security_scan(
+            sandbox,
+            workspace_volume,
+            target_identifiers,
+            baseline_identifiers,
+        )
 
     logger.info("qa_critic: [Step 0] running unit tests.")
     results.tests = _run_unit_tests(sandbox)
@@ -1695,6 +1899,7 @@ def build_qa_toolbelt(
     target_identifiers: Set[str],
     candidate_changed_files: List[str],
     host_repo_root: Optional[str],
+    baseline_identifiers: Optional[Set[str]] = None,
 ) -> Tuple[List, _QAExecutionResults]:
     """
     Build the QA-only toolbelt with one-shot execution tools and read-only review tools.
@@ -1759,11 +1964,21 @@ def build_qa_toolbelt(
                 "ERROR: run_security_scan must be called after "
                 "run_dependency_install."
             )
-        ok, summary, remaining = _run_security_scan(
-            sandbox, workspace_volume, target_identifiers
-        )
-        results.scan = (ok, summary, remaining)
-        return summary
+        if baseline_identifiers is None:
+            scan_result = _run_security_scan(
+                sandbox,
+                workspace_volume,
+                target_identifiers,
+            )
+        else:
+            scan_result = _run_security_scan(
+                sandbox,
+                workspace_volume,
+                target_identifiers,
+                baseline_identifiers,
+            )
+        results.scan = scan_result
+        return scan_result.summary
 
     @tool
     def run_unit_tests() -> str:
@@ -2046,6 +2261,12 @@ def _build_individual_investigator_prompt(
     install_ok, install_summary = results.install or (False, "not run")
     scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
     tests_ok, tests_summary = results.tests or (False, "not run")
+    post_scan_identifiers = sorted(
+        _scan_result_value(results.scan, "found_identifiers", set()) or set()
+    )
+    new_identifiers = sorted(
+        _scan_result_value(results.scan, "new_identifiers", set()) or set()
+    )
 
     summaries_text = "\n".join(
         f"  - {s.status.value}: {s.summary}" for s in action_summaries
@@ -2085,6 +2306,11 @@ def _build_individual_investigator_prompt(
 ## This Group's Deterministic Remaining Scanner Identifiers
 {remaining_text}
 
+## Global Post-remediation Scanner Snapshot
+All identifiers found after remediation: {', '.join(post_scan_identifiers) if post_scan_identifiers else '(none or unavailable)'}
+New identifiers absent from the pre-remediation baseline: {', '.join(new_identifiers) if new_identifiers else '(none)'}
+New identifiers are graph-level findings for a later triage phase; do not attribute them to this group unless deterministic evidence explicitly supports that conclusion.
+
 ## Your Task
 You are investigating ONLY this group ({group.group_id}). Use the provided review tools
 (list_changed_files, generate_workspace_diff, read_file_context, search_codebase_pattern,
@@ -2099,8 +2325,9 @@ they are not available to you.
 2. Relevant Global Failures: Which (if any) of the install/scan/test failures are relevant to this group's domain?
 3. Plausible Causation: Did this group's remediation plausibly cause the observed install or test failures? Reason deductively.
 4. Scanner Findings: Do the deterministic remaining scanner identifiers above indicate this group still has unresolved vulnerabilities?
-5. Workaround Path Review (if CODE_WORKAROUND): Does the changed code plausibly block the vulnerable execution path? Inspect the diff or relevant files.
-6. Exoneration or Uncertainty: Explicitly state whether this group is exonerated from failures attributed to other groups, or whether there is genuine uncertainty.
+5. Global New Findings: Note any newly introduced identifiers, but do not assign ownership to this group without evidence.
+6. Workaround Path Review (if CODE_WORKAROUND): Does the changed code plausibly block the vulnerable execution path? Inspect the diff or relevant files.
+7. Exoneration or Uncertainty: Explicitly state whether this group is exonerated from failures attributed to other groups, or whether there is genuine uncertainty.
 
 ## Output Format
 Write a free-form Markdown investigation report answering the 6 questions above.
@@ -2257,6 +2484,9 @@ def _build_fallback_investigation_for_group(
     install_ok, _ = results.install or (False, "not run")
     tests_ok, _ = results.tests or (False, "not run")
     scan_ok = results.scan[0] if results.scan else False
+    new_identifiers = sorted(
+        _scan_result_value(results.scan, "new_identifiers", set()) or set()
+    )
 
     remaining_text = ", ".join(group_remaining_ids) if group_remaining_ids else "none"
     scan_status = "still_flagged" if group_remaining_ids else ("cleared" if scan_ok else "scan_failed")
@@ -2272,6 +2502,7 @@ def _build_fallback_investigation_for_group(
         f"- Security Scan: {'SUCCESS' if scan_ok else 'FAILED'}\n"
         f"- Scan Status for this group: {scan_status}\n"
         f"- Remaining Scanner Identifiers: {remaining_text}\n"
+        f"- Global Newly Introduced Scanner Identifiers: {', '.join(new_identifiers) if new_identifiers else 'none'}\n"
         f"- Unit Tests: {'PASSED' if tests_ok else 'FAILED'}\n\n"
         f"**Summary:** Fallback investigation synthesized from deterministic results only. "
         f"No investigator prose was available."
@@ -2296,6 +2527,12 @@ def _build_batch_judge_prompt(
     install_ok, install_summary = results.install or (False, "not run")
     scan_ok, scan_summary, remaining_global = results.scan or (False, "not run", set())
     tests_ok, tests_summary = results.tests or (False, "not run")
+    post_scan_identifiers = sorted(
+        _scan_result_value(results.scan, "found_identifiers", set()) or set()
+    )
+    new_identifiers = sorted(
+        _scan_result_value(results.scan, "new_identifiers", set()) or set()
+    )
 
     # Detect install conflict type for guardrail hint
     install_conflict_hint = ""
@@ -2363,6 +2600,9 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 ### Security Scan
 - Success: {scan_ok}
 - Summary: {scan_summary[:2000]}
+- Post-remediation identifiers: {', '.join(post_scan_identifiers) if post_scan_identifiers else '(none or unavailable)'}
+- Newly introduced identifiers: {', '.join(new_identifiers) if new_identifiers else '(none)'}
+- Newly introduced identifiers are global findings for later triage. Do not force them into an existing group's evaluation or retry feedback.
 
 ### Unit Tests
 - Success: {tests_ok}
@@ -2395,11 +2635,12 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 7. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
 
 8. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
+9. Report newly introduced identifiers explicitly in the holistic report, but leave the per-group evaluations scoped to the assigned remediation groups.
 
 ## Output Requirements
 
 Return a BatchQAResult with:
-- `holistic_report`: A markdown narrative listing: (a) responsible groups, (b) possibly responsible groups, (c) exonerated groups. Reference specific test names, scanner IDs, or diff evidence.
+- `holistic_report`: A markdown narrative listing: (a) responsible groups, (b) possibly responsible groups, (c) exonerated groups, and (d) any newly introduced global scanner identifiers. Reference specific test names, scanner IDs, or diff evidence.
 - `evaluations`: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group.
   - Each evaluation must have: group_id (exact), passed (bool), failure_category (null if passed), retry_feedback (null if passed, specific actionable guidance if failed).
 
@@ -3052,6 +3293,10 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
     group_strategies: Dict[str, str] = state.get("group_strategies") or {}
     candidate_changed_files: List[str] = state.get("changed_files") or []
+    baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
+    unscanned_projection = _scan_state_projection(
+        _QAExecutionResults(), baseline_identifiers
+    )
 
     if not valid_groups and not state.get("force_qa"):
         logger.info("qa_critic: no valid groups - skipping QA.")
@@ -3061,6 +3306,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
             "status": "qa_completed",
             "changed_files": [],
             "qa_investigation_report": "",
+            **unscanned_projection,
         }
 
     if not workspace_volume:
@@ -3082,6 +3328,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
             "errors": [err],
             "changed_files": [],
             "qa_investigation_report": "",
+            **unscanned_projection,
         }
 
     target_identifiers = _collect_target_identifiers(valid_groups)
@@ -3104,7 +3351,9 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
                 sandbox=sandbox,
                 workspace_volume=workspace_volume,
                 target_identifiers=target_identifiers,
+                baseline_identifiers=baseline_identifiers,
             )
+            scan_projection = _scan_state_projection(results, baseline_identifiers)
 
             # ------------------------------------------------------------------
             # Pipeline completeness guard
@@ -3147,6 +3396,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
                     "errors": errors,
                     "changed_files": [],
                     "qa_investigation_report": "",
+                    **scan_projection,
                 }
 
             # ------------------------------------------------------------------
@@ -3183,6 +3433,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
             "errors": errors,
             "changed_files": [],
             "qa_investigation_report": "",
+            **unscanned_projection,
         }
 
     # Collect errors from map phase
@@ -3221,11 +3472,17 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         len(qa_evaluations),
     )
 
+    qa_investigation_report = _augment_qa_report_with_scan_findings(
+        batch_result.holistic_report,
+        scan_projection,
+    )
+
     return {
         "qa_evaluations": qa_evaluations,
         "eval_status": eval_status,
         "status": "qa_completed",
         "changed_files": candidate_changed_files,
         "errors": errors,
-        "qa_investigation_report": batch_result.holistic_report,
+        "qa_investigation_report": qa_investigation_report,
+        **scan_projection,
     }

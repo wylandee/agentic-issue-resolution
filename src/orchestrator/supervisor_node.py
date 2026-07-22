@@ -2066,6 +2066,14 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "retry_plans_by_task", {}
     )
     eval_status: str = state.get("eval_status", "")
+    baseline_scan_identifiers: List[str] = state.get("baseline_scan_identifiers", [])
+    post_remediation_scan_identifiers: List[str] = state.get(
+        "post_remediation_scan_identifiers", []
+    )
+    new_vulnerability_identifiers: List[str] = state.get(
+        "new_vulnerability_identifiers", []
+    )
+    new_vulnerability_status: str = state.get("new_vulnerability_status", "not_scanned")
 
     group_by_id = {g.group_id: g for g in valid_groups}
 
@@ -2161,6 +2169,13 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
     lines += [
         "",
         f"## QA Evaluation Status: {eval_status or 'none'}",
+        "",
+        "## Global Post-remediation Scanner Findings",
+        f"- New-vulnerability status: {new_vulnerability_status}",
+        f"- Baseline identifiers: {', '.join(baseline_scan_identifiers) or '(none)'}",
+        f"- Post-remediation identifiers: {', '.join(post_remediation_scan_identifiers) or '(none or unavailable)'}",
+        f"- Newly introduced identifiers: {', '.join(new_vulnerability_identifiers) or '(none)'}",
+        "- Newly introduced identifiers are report-only until the later triage phase; do not assign them to existing tasks or retry unrelated remediation.",
         "",
         "## Planner Scratchpad",
         scratchpad or "(none)",

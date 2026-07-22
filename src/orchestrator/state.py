@@ -83,6 +83,34 @@ def replace_dict_reducer(
     return dict(right or {})
 
 
+def _normalise_scan_identifiers(values: List[Optional[str]]) -> List[str]:
+    """Return sorted, de-duplicated CVE/GHSA identifiers."""
+    return sorted({value.strip().upper() for value in values if value and value.strip()})
+
+
+def _scan_identifiers_from_issues(
+    issues: List[VulnerabilityIssue],
+) -> List[str]:
+    """Collect scanner identifiers from the complete initial issue set."""
+    values: List[Optional[str]] = []
+    for issue in issues:
+        values.extend([issue.cve_id, issue.ghsa_id])
+    return _normalise_scan_identifiers(values)
+
+
+def _scan_identifiers_from_groups(
+    groups: List[VulnerabilityGroup],
+) -> List[str]:
+    """Collect scanner identifiers from groups for skip-triage compatibility."""
+    values: List[Optional[str]] = []
+    for group in groups:
+        values.extend(group.cve_ids or [])
+        values.extend(group.ghsa_ids or [])
+        for issue in group.issues or []:
+            values.extend([issue.cve_id, issue.ghsa_id])
+    return _normalise_scan_identifiers(values)
+
+
 def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask:
     """Build a synthetic task for legacy group-based subagent callers."""
     fix_plan = group.fix_plan
@@ -222,6 +250,10 @@ class OrchestratorState(TypedDict, total=False):
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
+    baseline_scan_identifiers: List[str]
+    post_remediation_scan_identifiers: List[str]
+    new_vulnerability_identifiers: List[str]
+    new_vulnerability_status: str
 
     status: str
     diff: str
@@ -269,6 +301,11 @@ def initial_orchestrator_state(
     system_context: Optional[SystemContext] = None,
 ) -> Dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
+    baseline_scan_identifiers = (
+        _scan_identifiers_from_issues(issues)
+        if issues is not None
+        else _scan_identifiers_from_groups(valid_groups)
+    )
     state: Dict[str, Any] = {
         "repo_root": repo_root,
         "valid_groups": valid_groups,
@@ -299,6 +336,10 @@ def initial_orchestrator_state(
         "supervisor_instructions": "",
         "eval_status": "",
         "qa_investigation_report": "",
+        "baseline_scan_identifiers": baseline_scan_identifiers,
+        "post_remediation_scan_identifiers": [],
+        "new_vulnerability_identifiers": [],
+        "new_vulnerability_status": "not_scanned",
         "diff": "",
         "trajectory_path": "",
         "errors": [],

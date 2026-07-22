@@ -58,10 +58,13 @@ from src.orchestrator.qa_critic import (
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
     _QAExecutionResults,
+    _SecurityScanResult,
     _apply_guardrails,
     _build_fallback_investigation_report,
+    _build_batch_judge_prompt,
     _build_individual_investigator_prompt,
     _collect_target_identifiers,
+    _collect_baseline_identifiers,
     _extract_group_evaluations,
     _group_scan_status,
     _generate_workspace_diff,
@@ -77,6 +80,7 @@ from src.orchestrator.qa_critic import (
     _run_odc,
     _run_security_scan,
     _run_unit_tests,
+    _scan_state_projection,
     _summarize_failed_test_output,
     _extract_failure_blocks,
     _normalize_node_tap_output,
@@ -607,6 +611,62 @@ class TestRunSecurityScan:
         assert remaining == set()
         assert _ODC_HTML_REPORT_NAME in str(sandbox.read_file.call_args_list[0])
 
+    def test_detects_identifiers_absent_from_baseline(self):
+        sandbox = MagicMock()
+        target = {"CVE-2021-23337"}
+        found = {"CVE-2025-10001", "GHSA-AAAA-BBBB-CCCC"}
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+            result = _run_security_scan(
+                sandbox,
+                "vol",
+                target,
+                baseline_identifiers={"CVE-2021-23337"},
+            )
+
+        assert isinstance(result, _SecurityScanResult)
+        assert result.ok is True
+        assert result.remaining_identifiers == set()
+        assert result.found_identifiers == found
+        assert result.new_identifiers == found
+        assert "Newly introduced identifiers" in result.summary
+
+    def test_preexisting_identifier_is_not_classified_as_new(self):
+        sandbox = MagicMock()
+        found = {"CVE-2021-23337", "CVE-2025-10001"}
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+            result = _run_security_scan(
+                sandbox,
+                "vol",
+                {"CVE-2021-23337"},
+                baseline_identifiers=found,
+            )
+
+        assert result.new_identifiers == set()
+        assert result.found_identifiers == found
+
+    def test_multiple_new_identifiers_are_sorted_in_summary(self):
+        sandbox = MagicMock()
+        found = {"CVE-2025-20002", "CVE-2025-10001"}
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+            result = _run_security_scan(
+                sandbox,
+                "vol",
+                set(),
+                baseline_identifiers=set(),
+            )
+
+        assert result.new_identifiers == found
+        assert result.summary.index("CVE-2025-10001") < result.summary.index("CVE-2025-20002")
+
     def test_summary_includes_saved_report_paths(self):
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
@@ -738,6 +798,66 @@ class TestCollectTargetIdentifiers:
 
     def test_empty_groups_returns_empty_set(self):
         assert _collect_target_identifiers([]) == set()
+
+    def test_baseline_prefers_explicit_initial_scan_snapshot(self):
+        group = _make_group(cve_ids=["CVE-2021-23337"])
+        issue = VulnerabilityIssue(
+            source=IssueSource.ODC,
+            issue_type=IssueType.SCA,
+            cve_id="CVE-2020-0001",
+            package_name="other-package",
+        )
+        state = {
+            "issues": [issue],
+            "baseline_scan_identifiers": ["CVE-2020-0001"],
+        }
+
+        assert _collect_baseline_identifiers(state, [group]) == {"CVE-2020-0001"}
+
+    def test_baseline_falls_back_to_target_groups_for_legacy_callers(self):
+        group = _make_group(cve_ids=["CVE-2021-23337"], ghsa_ids=[])
+
+        assert _collect_baseline_identifiers({}, [group]) == {
+            "CVE-2021-23337",
+            "GHSA-35JH-R3H4-6JV8",
+        }
+
+
+class TestScanStateProjection:
+    def test_projects_complete_scan_and_new_identifier_sets(self):
+        results = _QAExecutionResults(
+            scan=_SecurityScanResult(
+                ok=True,
+                summary="scan ok",
+                remaining_identifiers=set(),
+                found_identifiers={"CVE-2021-23337", "CVE-2025-10001"},
+                new_identifiers={"CVE-2025-10001"},
+            )
+        )
+
+        projection = _scan_state_projection(results, {"CVE-2021-23337"})
+
+        assert projection["post_remediation_scan_identifiers"] == [
+            "CVE-2021-23337",
+            "CVE-2025-10001",
+        ]
+        assert projection["new_vulnerability_identifiers"] == ["CVE-2025-10001"]
+        assert projection["new_vulnerability_status"] == "detected"
+
+    def test_projects_hard_scan_failure_as_scan_failed(self):
+        results = _QAExecutionResults(
+            scan=_SecurityScanResult(
+                ok=False,
+                summary="report unavailable",
+                remaining_identifiers=set(),
+                found_identifiers=set(),
+                new_identifiers=set(),
+            )
+        )
+
+        projection = _scan_state_projection(results, set())
+
+        assert projection["new_vulnerability_status"] == "scan_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -1323,6 +1443,38 @@ class TestRunQACriticNode:
         assert result["qa_evaluations"][group.group_id].passed is True
         assert result["qa_investigation_report"] == "All groups passed."
 
+    def test_new_identifiers_are_reported_without_task_failure(self):
+        group = _make_group(cve_ids=["CVE-2021-23337"], ghsa_ids=[])
+        state = _make_minimal_state(groups=[group])
+        state["baseline_scan_identifiers"] = ["CVE-2021-23337"]
+        results = _make_fully_populated_results(ok=True)
+        results.scan = _SecurityScanResult(
+            ok=True,
+            summary="Dependency-Check found a new identifier.",
+            remaining_identifiers=set(),
+            found_identifiers={"CVE-2025-10001"},
+            new_identifiers={"CVE-2025-10001"},
+        )
+        batch_result = BatchQAResult(
+            holistic_report="All current remediation groups passed.",
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
+        )
+        patches = self._patch_node(
+            group=group,
+            results=results,
+            batch_result=batch_result,
+        )
+
+        with patches["sandbox"], patches["global_exec"], patches["investigators"], patches["judge"]:
+            result = run_qa_critic_node(state)
+
+        assert result["eval_status"] == "all_passed"
+        assert result["qa_evaluations"][group.group_id].passed is True
+        assert result["post_remediation_scan_identifiers"] == ["CVE-2025-10001"]
+        assert result["new_vulnerability_identifiers"] == ["CVE-2025-10001"]
+        assert result["new_vulnerability_status"] == "detected"
+        assert "CVE-2025-10001" in result["qa_investigation_report"]
+
     def test_failures_detected_when_any_group_fails(self):
         group = _make_group()
         state = _make_minimal_state(groups=[group])
@@ -1675,6 +1827,37 @@ class TestGroupScanAttribution:
         assert parsed.group_sections["group-b"].scan_status == "cleared"
         assert parsed.group_sections["group-b"].remaining_scanner_findings == "none"
 
+    def test_investigator_and_batch_prompts_include_global_new_findings(self):
+        group = _make_group(group_id="group-a")
+        results = _make_fully_populated_results(ok=True)
+        results.scan = _SecurityScanResult(
+            ok=True,
+            summary="scan ok",
+            remaining_identifiers=set(),
+            found_identifiers={"CVE-2025-10001"},
+            new_identifiers={"CVE-2025-10001"},
+        )
+
+        investigator_prompt = _build_individual_investigator_prompt(
+            group=group,
+            strategy="version_bump",
+            results=results,
+            group_remaining_ids=[],
+            candidate_changed_files=[],
+            action_summaries=[],
+        )
+        batch_prompt = _build_batch_judge_prompt(
+            valid_groups=[group],
+            group_strategies={group.group_id: "version_bump"},
+            action_summaries=[],
+            results=results,
+            investigations_by_group={},
+        )
+
+        assert "CVE-2025-10001" in investigator_prompt
+        assert "CVE-2025-10001" in batch_prompt
+        assert "Do not force them into an existing group's evaluation" in batch_prompt
+
 
 class TestJudgePhaseIsolation:
     def test_judge_prompt_uses_only_current_group_block(self):
@@ -1843,6 +2026,20 @@ class TestRunGlobalExecution:
         assert results.install is not None
         assert results.scan is not None
         assert results.tests is not None
+
+    def test_passes_baseline_to_security_scan(self):
+        sandbox = MagicMock()
+        target_ids = {"CVE-2021-0001"}
+        baseline_ids = {"CVE-2021-0001", "CVE-2020-0001"}
+        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")), \
+             patch(
+                 "src.orchestrator.qa_critic._run_security_scan",
+                 return_value=_SecurityScanResult(True, "ok", set(), set(), set()),
+             ) as scan, \
+             patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")):
+            _run_global_execution(sandbox, "vol", target_ids, baseline_ids)
+
+        scan.assert_called_once_with(sandbox, "vol", target_ids, baseline_ids)
 
     def test_tests_run_even_when_install_fails(self):
         sandbox = MagicMock()

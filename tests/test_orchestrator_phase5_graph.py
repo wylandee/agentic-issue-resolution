@@ -558,6 +558,10 @@ class TestPhase5GraphIntegration:
             "qa_evaluations": {},
             "eval_status": "all_passed",
             "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
+            "baseline_scan_identifiers": ["CVE-2021-44228"],
+            "post_remediation_scan_identifiers": ["CVE-2025-10001"],
+            "new_vulnerability_identifiers": ["CVE-2025-10001"],
+            "new_vulnerability_status": "detected",
             "status": "qa_completed",
             "errors": [],
         })
@@ -574,6 +578,8 @@ class TestPhase5GraphIntegration:
         assert qa_critic.call_count == 1
         assert teardown.call_count == 1
         assert result["qa_investigation_report"].startswith("# INVESTIGATIVE REPORT")
+        assert result["new_vulnerability_identifiers"] == ["CVE-2025-10001"]
+        assert result["new_vulnerability_status"] == "detected"
 
     def test_qa_wrapper_scopes_valid_groups_to_active_batch(self, tmp_path):
         groups = [

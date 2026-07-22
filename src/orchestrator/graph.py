@@ -826,6 +826,22 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),
         "qa_investigation_report": result.get("qa_investigation_report", ""),
+        "baseline_scan_identifiers": result.get(
+            "baseline_scan_identifiers",
+            state.get("baseline_scan_identifiers", []),
+        ),
+        "post_remediation_scan_identifiers": result.get(
+            "post_remediation_scan_identifiers",
+            state.get("post_remediation_scan_identifiers", []),
+        ),
+        "new_vulnerability_identifiers": result.get(
+            "new_vulnerability_identifiers",
+            state.get("new_vulnerability_identifiers", []),
+        ),
+        "new_vulnerability_status": result.get(
+            "new_vulnerability_status",
+            state.get("new_vulnerability_status", "not_scanned"),
+        ),
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
     }

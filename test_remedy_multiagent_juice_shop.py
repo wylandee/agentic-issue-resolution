@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.contracts.schemas import VulnerabilityGroup
+from src.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
 from src.orchestrator.graph import run_orchestrator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -31,17 +31,26 @@ TARGET_GROUP_IDS = (
     #"sca:package.json:notevil:UPDATE_VERSION",
     # Transitive
     "sca:package.json:@tootallnate/once:UPDATE_VERSION", # Happy path
-    #"sca:package.json:base64url:UPDATE_VERSION", # Happy path
-    "sca:frontend/package.json:ws:UPDATE_VERSION",
+    "sca:package.json:base64url:UPDATE_VERSION", # Happy path
+    #"sca:frontend/package.json:ws:UPDATE_VERSION",
     #"sca:frontend/package.json:elliptic:UPDATE_VERSION",
-    #"sca:package.json:cookie:UPDATE_VERSION", # Happy path
+    "sca:package.json:cookie:UPDATE_VERSION", # Happy path
     #"sca:package.json:lodash.set:UPDATE_VERSION",
-    #"sca:package.json:nanoid:UPDATE_VERSION", # Happy path
+    "sca:package.json:nanoid:UPDATE_VERSION", # Happy path
     #"sca:package.json:http-cache-semantics:UPDATE_VERSION", # Happy path
     #"sca:package.json:serialize-javascript:UPDATE_VERSION",
 
 )
 
+BASELINE_ISSUES_JSONL = Path("data/odc_issues.jsonl")
+
+
+def _load_baseline_issues() -> list[VulnerabilityIssue]:
+    return [
+        VulnerabilityIssue.model_validate_json(line)
+        for line in BASELINE_ISSUES_JSONL.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 def _load_vulnerability_groups() -> list[VulnerabilityGroup]:
     if not TRIAGED_GROUPS_JSON.is_file():
@@ -101,11 +110,12 @@ def main() -> None:
     logger.info("=" * 60)
 
     try:
+        baseline_issues = _load_baseline_issues()
         # run_orchestrator automatically triggers LangSmith tracing via runnable config
         result = run_orchestrator(
             repo_root=str(repo_root),
             valid_groups=valid_groups,
-            issues=None,           # Skip Triage Node by passing None
+            issues=baseline_issues,           # Skip Triage Node by passing None
             system_context=None,   # Skip Triage Node by passing None
         )
     except Exception as exc:

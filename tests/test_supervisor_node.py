@@ -2212,6 +2212,21 @@ class TestSupervisorPrompt:
         assert "task-1" in prompt
         assert "g1" in prompt
 
+    def test_prompt_carries_new_global_scanner_findings_without_task_attribution(self):
+        g1 = _sca_group("g1")
+        state = _base_state(
+            [g1],
+            baseline_scan_identifiers=["CVE-2021-23337"],
+            post_remediation_scan_identifiers=["CVE-2025-10001"],
+            new_vulnerability_identifiers=["CVE-2025-10001"],
+            new_vulnerability_status="detected",
+        )
+
+        prompt = build_supervisor_prompt(state)
+
+        assert "CVE-2025-10001" in prompt
+        assert "report-only until the later triage phase" in prompt
+
     def test_prompt_enforces_security_flag_update_and_breaking_change_workaround(self):
         g1 = _sca_group("g1")
         prompt = build_supervisor_prompt(_base_state([g1]))

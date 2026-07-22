@@ -92,7 +92,24 @@ class TestInitialStateHelpers:
         assert state["feedback_by_group"] == {}
         assert state["supervisor_instructions"] == ""
         assert state["eval_status"] == ""
+        assert state["baseline_scan_identifiers"] == ["CVE-2021-44228"]
+        assert state["post_remediation_scan_identifiers"] == []
+        assert state["new_vulnerability_identifiers"] == []
+        assert state["new_vulnerability_status"] == "not_scanned"
         assert "messages" not in state
+
+    def test_initial_state_prefers_complete_initial_issue_baseline(self, tmp_path):
+        group = _group()
+        issue = group.issues[0].model_copy(update={"cve_id": "CVE-2020-0001"})
+
+        state = initial_orchestrator_state(str(tmp_path), [group], issues=[issue])
+
+        assert state["baseline_scan_identifiers"] == ["CVE-2020-0001"]
+
+    def test_empty_initial_issue_set_is_not_replaced_by_group_fallback(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [_group()], issues=[])
+
+        assert state["baseline_scan_identifiers"] == []
 
     def test_initial_update_subagent_state_initializes_ephemeral_fields(self, tmp_path):
         group = _group()
