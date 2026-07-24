@@ -99,10 +99,10 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
     def read_repository_map() -> str:
         """Return a deterministic ASCII tree of every file/directory in the workspace."""
         script = (
-            "find /workspace -not -path '*/node_modules/*' "
+            "find . -not -path '*/node_modules/*' "
             "-not -path '*/.git/*' "
             "-not -name '*.map' "
-            "| sort"
+            "| sed 's|^./||' | sort"
         )
         result = sandbox.run(script, timeout=10)
         if result.exit_code != 0:
@@ -492,13 +492,13 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
                 return f"ERROR: {exc}"
 
         safe_pattern = search_pattern.replace("'", "'\"'\"'")
-        search_root = f"/workspace/{td}" if td != "." else "/workspace"
+        search_root = td
         cmd = (
             f"grep -RInE "
             f"--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
             f"--include='*.mjs' --include='*.cjs' --include='*.json' "
             f"--exclude-dir=node_modules --exclude-dir=.git "
-            f"-- '{safe_pattern}' '{search_root}'"
+            f"-- '{safe_pattern}' '{search_root}' | sed 's|^./||'"
         )
 
         try:
