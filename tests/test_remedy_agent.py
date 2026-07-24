@@ -29,6 +29,7 @@ from src.orchestrator.update_subagent import (
     _build_update_prompt,
     run_update_subagent_node,
 )
+from src.orchestrator.graph import post_qa_triage_node
 from src.orchestrator.workaround_subagent import (
     _build_workaround_prompt,
     run_workaround_subagent_node,
@@ -534,7 +535,7 @@ class TestUpdateSubagentWrapper:
             previous_feedback="Keep the change narrow.",
         )
 
-        assert "Workaround snippets:" in prompt
+        assert "WORKAROUND SNIPPETS" in prompt
         assert "Escape the user input before rendering." in prompt
         assert "Keep the change narrow." in prompt
 
@@ -550,6 +551,17 @@ class TestUpdateSubagentWrapper:
         )
 
         llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="searching",
+                tool_calls=[
+                    {
+                        "name": "search_codebase_pattern",
+                        "args": {"search_pattern": "unsafeRender"},
+                        "id": "call-0",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
             AIMessage(
                 content="editing",
                 tool_calls=[
@@ -579,6 +591,9 @@ class TestUpdateSubagentWrapper:
             AIMessage(content="done"),
         )
         sandbox = _sandbox_mock()
+        tool_search = MagicMock()
+        tool_search.name = "search_codebase_pattern"
+        tool_search.invoke.return_value = "routes/login.ts:10: unsafeRender(input)"
         tool_edit = MagicMock()
         tool_edit.name = "deterministic_search_replace"
         tool_edit.invoke.return_value = "SUCCESS: File modified: routes/login.ts"
@@ -593,11 +608,11 @@ class TestUpdateSubagentWrapper:
             return_value=sandbox,
         ), patch(
             "src.orchestrator.workaround_subagent.build_workaround_toolbelt",
-            return_value=[tool_edit, tool_validate],
+            return_value=[tool_search, tool_edit, tool_validate],
         ):
             result = run_workaround_subagent_node(state)
 
-        assert bound.invoke.call_count == 3
+        assert bound.invoke.call_count == 4
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert result["changed_files"] == ["routes/login.ts"]
         assert "messages" not in result
@@ -656,6 +671,17 @@ class TestUpdateSubagentWrapper:
             group,
             [],
         )
-        result = run_workaround_subagent_node(state)
+        with patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "true"}):
+            result = run_workaround_subagent_node(state)
         assert result["action_summary"].status == AgentActionStatus.SURRENDER
         assert "Workaround subagent bypassed" in result["action_summary"].summary
+
+    def test_post_qa_triage_env_var_disable(self):
+        state = {"triage_required": True}
+        with patch.dict(os.environ, {"REMEDY_DISABLE_POST_QA_TRIAGE": "true"}):
+            res = post_qa_triage_node(state)
+        assert res["status"] == "triage_skipped"
+
+        with patch.dict(os.environ, {"REMEDY_DISABLE_RETRIAGE": "1"}):
+            res = post_qa_triage_node(state)
+        assert res["status"] == "triage_skipped"

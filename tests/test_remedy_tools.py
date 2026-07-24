@@ -80,6 +80,7 @@ class TestToolbeltFactories:
 
         assert set(tools) == {
             "read_repository_map",
+            "read_workspace_file",
             "search_codebase_pattern",
             "inspect_ast_symbol",
             "deterministic_search_replace",

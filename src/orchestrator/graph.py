@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -554,7 +555,9 @@ def _reconcile_triaged_groups(
 
 def post_qa_triage_node(state: OrchestratorState) -> Dict[str, Any]:
     """Re-triage the complete parseable post-remediation scan snapshot."""
-    if not state.get("triage_required"):
+    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in ("1", "true", "yes") or \
+                       os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
+    if disable_retriage or not state.get("triage_required"):
         return {
             "status": "triage_skipped",
             "triage_reconciliation": {},
@@ -1088,8 +1091,11 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
         "post_remediation_scan_issues" in result
         or "post_remediation_scan_issues" in state
     )
+    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in ("1", "true", "yes") or \
+                       os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
     triage_required = (
-        result.get("status") in {"qa_completed", "qa_failed"}
+        not disable_retriage
+        and result.get("status") in {"qa_completed", "qa_failed"}
         and scan_status in {"none", "detected"}
         and scan_snapshot_available
     )

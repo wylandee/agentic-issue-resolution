@@ -22,6 +22,7 @@ from src.orchestrator.remedy_tools import build_workaround_toolbelt
 from src.orchestrator.state import SubagentState, _derive_legacy_task_from_group
 from src.orchestrator.subagent_runtime import (
     has_successful_validation_after_last_edit,
+    has_tool_call_before_first_successful_edit,
     run_bounded_subagent_loop,
 )
 from src.runtime.sandbox_mgr import DockerSandbox
@@ -77,50 +78,104 @@ def _build_workaround_prompt(
 
     constraints_ledger = list(constraints_ledger or [])
     fix_plan = target_group.fix_plan
+    is_sast = target_group.issue_type.value == "sast"
+
     sections = [
         "\n".join(
             [
                 "You are a code security specialist operating inside a shared Docker workspace.",
-                "You must strictly follow this Standard Operating Procedure (SOP):",
-                "1. ALWAYS use relative file paths (e.g., 'frontend/src/app.ts'). NEVER use absolute paths starting with '/' or '/workspace'.",
-                "2. When using search_codebase_pattern, ALWAYS start your search from the repository root ('.') to ensure you don't miss files, unless you are 100% certain of the directory.",
-                "3. NEVER use inspect_ast_symbol on a file unless search_codebase_pattern has explicitly confirmed the file exists and contains the vulnerable logic.",
-                "4. After every modified file, you must run validate_code_syntax on that file.",
-                "5. If syntax validation fails, you must repair the file or revert it before finishing.",
-                "Do not modify package manifests and do not call heavy QA tools."
+                "Your mission is to apply the smallest, safest source-code change that mitigates the described vulnerability.",
+                "",
+                "=== STANDARD OPERATING PROCEDURE ===",
+                "",
+                "PHASE 1 — INVESTIGATE:",
+                "  1. Read the TARGET section below to understand the vulnerability and the instruction.",
+                "  2. Use read_repository_map to understand the project layout.",
+                "  3. Use search_codebase_pattern starting from '.' (repository root) to find all files where the vulnerable code pattern appears.",
+                "  4. Use read_workspace_file to read the relevant file(s) and understand the full context around the vulnerable code.",
+                "  5. If needed, use inspect_ast_symbol to extract the full body of a specific function or class for deeper analysis.",
+                "  6. If workaround snippets are provided, study them to understand the recommended mitigation pattern.",
+                "",
+                "PHASE 2 — PLAN:",
+                "  7. Determine the minimal code change required. Prefer adding validation/sanitization/guards rather than rewriting logic.",
+                "     - For SAST issues: Add input validation, output encoding, parameterized queries, or other defensive patterns at the vulnerable sink.",
+                "     - For SCA issues: Apply the workaround pattern from the snippets to eliminate the exploitable code path.",
+                "  8. Identify every file that needs modification.",
+                "  9. Use read_workspace_file on each file to confirm the exact current code before editing.",
+                "",
+                "PHASE 3 — EXECUTE:",
+                "  10. Use deterministic_search_replace for each change. The old_text must be an exact copy of the current code (use read_workspace_file output to get the exact text).",
+                "  11. Make one edit per file at a time. Do not batch multiple edits in a single call.",
+                "",
+                "PHASE 4 — VALIDATE:",
+                "  12. After EVERY modified file, immediately run validate_code_syntax on that file.",
+                "  13. If validation fails, either fix the syntax error with another deterministic_search_replace, or revert_workspace_file and retry.",
+                "  14. Do NOT finish until every modified file passes syntax validation.",
+                "",
+                "=== STRICT RULES ===",
+                "- ALWAYS use relative file paths (e.g., 'frontend/src/app.ts'). NEVER use absolute paths starting with '/' or '/workspace'.",
+                "- NEVER use inspect_ast_symbol on a file unless search_codebase_pattern or read_workspace_file has confirmed it exists and contains relevant code.",
+                "- Do NOT modify package.json, package-lock.json, or any dependency manifest.",
+                "- Do NOT install new packages or run npm/yarn commands.",
+                "- If you cannot find the vulnerable code or determine a safe fix, stop and explain why.",
             ]
         )
     ]
+
+    if previous_feedback:
+        sections.append(
+            "\n".join(
+                [
+                    "=== RETRY CONTEXT ===",
+                    "This is a RETRY attempt. A previous code change was rejected by QA.",
+                    f"QA Feedback: {previous_feedback}",
+                    "",
+                    "IMPORTANT: Your previous edits may still be present in the workspace.",
+                    "Before attempting a new fix:",
+                    "  1. Use read_workspace_file to check the current state of files you previously modified.",
+                    "  2. If your previous edits are present and caused the QA failure, use revert_workspace_file to restore the original code first.",
+                    "  3. Then apply a corrected fix that addresses the QA feedback.",
+                ]
+            )
+        )
 
     if constraints_ledger:
         sections.append("Constraints ledger:\n" + "\n".join(f"- {item}" for item in constraints_ledger))
     else:
         sections.append("Constraints ledger:\n- none")
 
-    sections.append(
-        "\n".join(
-            [
-                "=== TARGET ===",
-                f"Task ID       : {target_task.task_id}",
-                f"Issue Type    : {target_group.issue_type.value}",
-                f"Component     : {target_group.vulnerable_component or 'unknown'}",
-                f"Initial File  : {target_group.file_path or 'none'}",
-                f"Instruction   : {target_task.instruction or 'Derive the smallest safe code change.'}",
-                f"QA Feedback   : {previous_feedback or 'none'}",
-            ]
+    target_lines = [
+        "=== TARGET ===",
+        f"Task ID       : {target_task.task_id}",
+        f"Issue Type    : {target_group.issue_type.value}",
+        f"Component     : {target_group.vulnerable_component or 'unknown'}",
+        f"Initial File  : {target_group.file_path or 'none'}",
+    ]
+
+    if is_sast:
+        target_lines.append(
+            f"Instruction   : {target_task.instruction or 'Apply a defensive code fix at the vulnerable sink identified above.'}"
         )
-    )
+    else:
+        target_lines.append(
+            f"Instruction   : {target_task.instruction or 'Apply the workaround code pattern from the snippets below to mitigate the CVE.'}"
+        )
+
+    sections.append("\n".join(target_lines))
+
     if fix_plan and fix_plan.workaround_snippets:
         sections.append(
             "\n".join(
                 [
-                    "Workaround snippets:",
-                    *[f"- {snippet}" for snippet in fix_plan.workaround_snippets],
+                    "=== WORKAROUND SNIPPETS ===",
+                    "These are reference code patterns from security advisories. Adapt them to fit the project's existing code:",
+                    *[f"  {i+1}. {snippet}" for i, snippet in enumerate(fix_plan.workaround_snippets)],
                 ]
             )
         )
     else:
-        sections.append("Workaround snippets:\n- none")
+        sections.append("Workaround snippets:\n- none (derive the fix from the instruction and CVE context)")
+
     return "\n\n".join(sections)
 
 
@@ -195,7 +250,7 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     
     t_id = target_task.task_id if target_task else "unknown"
 
-    if os.environ.get("REMEDY_BYPASS_WORKAROUND_SUBAGENT", "true").lower() in ("1", "true", "yes"):
+    if os.environ.get("REMEDY_BYPASS_WORKAROUND_SUBAGENT", "false").lower() in ("1", "true", "yes"):
         summaries = _build_surrender_summaries(
             t_id,
             "Workaround subagent bypassed: marked unfixable (workaround functionality currently inactive)."
@@ -285,11 +340,29 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
             "errors": [f"Workaround Subagent: sandbox or tool loop failed - {exc}"],
         }
 
-    succeeded = bool(runtime.changed_files) and has_successful_validation_after_last_edit(
+    has_validated = has_successful_validation_after_last_edit(
         runtime.tool_events,
         edit_tool_name="deterministic_search_replace",
         validation_tool_name="validate_code_syntax",
     )
+    did_investigate = (
+        has_tool_call_before_first_successful_edit(
+            runtime.tool_events,
+            lookup_tool_name="search_codebase_pattern",
+            edit_tool_name="deterministic_search_replace",
+        )
+        or has_tool_call_before_first_successful_edit(
+            runtime.tool_events,
+            lookup_tool_name="inspect_ast_symbol",
+            edit_tool_name="deterministic_search_replace",
+        )
+        or has_tool_call_before_first_successful_edit(
+            runtime.tool_events,
+            lookup_tool_name="read_workspace_file",
+            edit_tool_name="deterministic_search_replace",
+        )
+    )
+    succeeded = bool(runtime.changed_files) and has_validated and did_investigate
     summaries = _build_action_summaries(
         t_id,
         runtime.changed_files,

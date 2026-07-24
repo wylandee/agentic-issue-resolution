@@ -20,6 +20,8 @@ _MANIFEST_SYNC_TIMEOUT_SECONDS = 120
 _SYNTAX_CHECK_TIMEOUT_SECONDS = 30
 
 _REPO_MAP_MAX_ENTRIES = 400
+_READ_FILE_MAX_LINES = 200
+_READ_FILE_MAX_BYTES = 16_384
 _SEARCH_MAX_BYTES = 32_768
 _SEARCH_TIMEOUT_SECONDS = 15
 _INSPECT_TEXT_MAX_CHARS = 8_000
@@ -118,6 +120,68 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
         return output
 
     return read_repository_map
+
+
+def _make_read_workspace_file_tool(sandbox: DockerSandbox):
+    @tool
+    def read_workspace_file(
+        file_path: str,
+        start_line: int = 1,
+        end_line: int = 0,
+    ) -> str:
+        """Read the contents of a workspace file, optionally scoped to a line range.
+
+        Returns the file content with line numbers prefixed (e.g., '  42: code').
+        If end_line is 0 or omitted, reads from start_line to the end of the file
+        (capped at 200 lines). Use this tool to inspect file context after
+        search_codebase_pattern identifies a relevant file and line number.
+        """
+        try:
+            rel_path = _validate_workspace_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        content = sandbox.read_file(rel_path)
+        if content is None:
+            return (
+                f"ERROR: Could not read '{rel_path}'. "
+                "Use search_codebase_pattern or read_repository_map to verify the path."
+            )
+
+        lines = content.splitlines()
+        total_lines = len(lines)
+
+        if total_lines == 0:
+            return f"FILE: {rel_path} (empty file, 0 lines)"
+
+        s = max(1, int(start_line))
+        if end_line <= 0:
+            e = min(s + _READ_FILE_MAX_LINES - 1, total_lines)
+        else:
+            e = min(int(end_line), total_lines)
+
+        if s > total_lines:
+            return f"ERROR: start_line {s} exceeds file length ({total_lines} lines)."
+
+        selected = lines[s - 1 : e]
+
+        width = len(str(e))
+        numbered = [f"{str(i).rjust(width)}: {line}" for i, line in enumerate(selected, start=s)]
+        output = "\n".join(numbered)
+
+        if len(output.encode("utf-8", errors="replace")) > _READ_FILE_MAX_BYTES:
+            output = output.encode("utf-8", errors="replace")[:_READ_FILE_MAX_BYTES].decode(
+                errors="replace"
+            )
+            last_nl = output.rfind("\n")
+            if last_nl > 0:
+                output = output[:last_nl]
+            output += "\n... (output truncated at 16 KB)"
+
+        header = f"FILE: {rel_path} (lines {s}-{e} of {total_lines})"
+        return f"{header}\n{output}"
+
+    return read_workspace_file
 
 
 def _make_revert_workspace_file_tool(
@@ -612,6 +676,7 @@ def build_workaround_toolbelt(
     """Build the strict workaround-only toolbelt."""
     return [
         _make_read_repository_map_tool(sandbox),
+        _make_read_workspace_file_tool(sandbox),
         _make_search_codebase_pattern_tool(sandbox),
         _make_inspect_ast_symbol_tool(sandbox),
         _make_deterministic_search_replace_tool(sandbox, touched_files),
