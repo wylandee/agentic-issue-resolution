@@ -699,6 +699,7 @@ def build_workaround_toolbelt(
 ) -> List:
     """Build the strict workaround-only toolbelt."""
     return [
+        _make_record_plan_tool(),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox),
         _make_search_codebase_pattern_tool(sandbox),
@@ -708,3 +709,16 @@ def build_workaround_toolbelt(
         _make_validate_code_syntax_tool(sandbox),
         _make_run_typecheck_tool(sandbox),
     ]
+
+def _make_record_plan_tool():
+    @tool
+    def record_plan(investigation_findings: str, exact_code_changes: str) -> str:
+        """
+        Record your investigation findings and your exact plan for code changes.
+        You MUST call this tool and document your exact 'old_text' and 'new_text' BEFORE executing any deterministic_search_replace.
+        """
+        logger.debug("Workaround subagent findings: %s", investigation_findings)
+        logger.debug("Workaround subagent planned changes: %s", exact_code_changes)
+        return "Plan recorded successfully. You may proceed with deterministic_search_replace."
+
+    return record_plan

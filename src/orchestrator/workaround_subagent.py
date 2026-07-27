@@ -125,6 +125,7 @@ def _build_workaround_prompt(
                 "4. After editing, ALWAYS run validate_code_syntax and run_typecheck on the modified file.",
                 "",
                 "=== STRICT RULES ===",
+                "- CRITICAL: You MUST use the `record_plan` tool to explicitly write out your investigation findings and your exact code changes (old_text/new_text) BEFORE executing any other tools.",
                 "- ALWAYS use relative file paths (e.g., 'frontend/src/app.ts'). NEVER use absolute paths starting with '/' or '/workspace'.",
                 "- NEVER use inspect_ast_symbol on a file unless search_codebase_pattern or read_workspace_file has confirmed it exists and contains relevant code.",
                 "- Do NOT modify package.json, package-lock.json, or any dependency manifest.",
