@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import requests
 import shlex
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set
@@ -25,6 +26,15 @@ _READ_FILE_MAX_BYTES = 16_384
 _SEARCH_MAX_BYTES = 32_768
 _SEARCH_TIMEOUT_SECONDS = 15
 _INSPECT_TEXT_MAX_CHARS = 8_000
+
+_SERPER_SEARCH_URL = "https://google.serper.dev/search"
+_SERPER_REQUEST_TIMEOUT = 10
+_SERPER_MAX_RESULTS = 3
+_SEARCH_WEB_MAX_CALLS = 3
+
+_JINA_READER_URL_PREFIX = "https://r.jina.ai/"
+_READ_WEB_PAGE_TIMEOUT = 15
+_READ_WEB_PAGE_MAX_CHARS = 16_000
 
 
 def _validate_workspace_path(file_path: str) -> str:
@@ -700,6 +710,8 @@ def build_workaround_toolbelt(
     """Build the strict workaround-only toolbelt."""
     return [
         _make_record_plan_tool(),
+        _make_search_web_tool(),
+        _make_read_web_page_tool(),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox),
         _make_search_codebase_pattern_tool(sandbox),
@@ -722,3 +734,99 @@ def _make_record_plan_tool():
         return "Plan recorded successfully. You may proceed with deterministic_search_replace."
 
     return record_plan
+
+
+def _make_search_web_tool():
+    """Create a web search tool backed by Serper.dev."""
+    _calls_remaining = [_SEARCH_WEB_MAX_CALLS]  # mutable container for closure
+
+    @tool
+    def search_web(query: str) -> str:
+        """
+        Search the web using Google for documentation, migration guides,
+        changelogs, or breaking changes related to the vulnerability fix.
+
+        Use this tool to research how a library's API changed between versions
+        before writing any code changes.
+
+        Limited to 3 calls per session. Returns up to 3 result snippets.
+        """
+        if _calls_remaining[0] <= 0:
+            return f"ERROR: search_web call limit reached (max {_SEARCH_WEB_MAX_CALLS} per session). Use the results you already have."
+
+        api_key = os.environ.get("SERPER_API_KEY", "").strip()
+        if not api_key:
+            return "ERROR: SERPER_API_KEY is not set. Cannot perform web search."
+
+        _calls_remaining[0] -= 1
+
+        try:
+            resp = requests.post(
+                _SERPER_SEARCH_URL,
+                json={"q": query},
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                timeout=_SERPER_REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            organic = data.get("organic") or []
+
+            results = []
+            for item in organic[:_SERPER_MAX_RESULTS]:
+                if not isinstance(item, dict):
+                    continue
+                title = item.get("title", "")
+                snippet = item.get("snippet", "")
+                link = item.get("link", "")
+                results.append(f"**{title}**\n{snippet}\nURL: {link}")
+
+            if not results:
+                return "No results found for this query. Try a different search query."
+
+            calls_left = _calls_remaining[0]
+            header = f"Found {len(results)} results ({calls_left} searches remaining):\n\n"
+            return header + "\n\n---\n\n".join(results)
+
+        except Exception as exc:
+            logger.warning("search_web failed: %s", exc)
+            return f"ERROR: Web search failed - {exc}. Try again or proceed without web results."
+
+    return search_web
+
+
+def _make_read_web_page_tool():
+    """Create a tool to fetch full markdown content of a web page using Jina Reader."""
+    @tool
+    def read_web_page(url: str) -> str:
+        """
+        Fetch the full readable markdown text of a web page given its URL.
+
+        Use this tool after search_web to read complete migration guides, breaking change lists,
+        or documentation pages found in search results.
+        """
+        target_url = (url or "").strip()
+        if not target_url:
+            return "ERROR: url is required."
+
+        jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
+        try:
+            resp = requests.get(
+                jina_url,
+                headers={"Accept": "text/plain"},
+                timeout=_READ_WEB_PAGE_TIMEOUT,
+            )
+            resp.raise_for_status()
+            text = resp.text or ""
+            if not text.strip():
+                return f"No readable content extracted from {target_url}."
+
+            if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                text = text[:_READ_WEB_PAGE_MAX_CHARS] + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+
+            return f"--- Markdown content of {target_url} ---\n\n{text}"
+
+        except Exception as exc:
+            logger.warning("read_web_page failed for %s: %s", target_url, exc)
+            return f"ERROR: Failed to read web page {target_url} - {exc}"
+
+    return read_web_page

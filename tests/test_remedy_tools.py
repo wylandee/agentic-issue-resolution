@@ -5,7 +5,7 @@ tests/test_remedy_tools.py - Direct unit tests for Phase 5 specialist toolbelts.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -79,6 +79,9 @@ class TestToolbeltFactories:
         tools = _workaround_tool_map(sandbox)
 
         assert set(tools) == {
+            "record_plan",
+            "search_web",
+            "read_web_page",
             "read_repository_map",
             "read_workspace_file",
             "search_codebase_pattern",
@@ -548,3 +551,124 @@ class TestValidateCodeSyntax:
         result = tools["validate_code_syntax"].invoke({"file_path": "/etc/passwd"})
 
         assert result.startswith("ERROR:")
+
+
+class TestSearchWeb:
+    def test_returns_formatted_results(self, monkeypatch):
+        monkeypatch.setenv("SERPER_API_KEY", "test-key")
+        body = {
+            "organic": [
+                {"snippet": "Snippet 1", "title": "Title 1", "link": "https://example.com/1"},
+                {"snippet": "Snippet 2", "title": "Title 2", "link": "https://example.com/2"},
+                {"snippet": "Snippet 3", "title": "Title 3", "link": "https://example.com/3"},
+                {"snippet": "Snippet 4", "title": "Title 4", "link": "https://example.com/4"},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = body
+        mock_resp.raise_for_status = MagicMock()
+
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+            res = tools["search_web"].invoke({"query": "express-jwt v8 migration"})
+
+        assert "Found 3 results" in res
+        assert "Title 1" in res
+        assert "Title 2" in res
+        assert "Title 3" in res
+        assert "Title 4" not in res
+
+    def test_returns_error_when_no_api_key(self, monkeypatch):
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        res = tools["search_web"].invoke({"query": "express-jwt v8"})
+        assert "ERROR: SERPER_API_KEY is not set" in res
+
+    def test_returns_error_on_network_failure(self, monkeypatch):
+        monkeypatch.setenv("SERPER_API_KEY", "test-key")
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.post", side_effect=Exception("timeout")):
+            res = tools["search_web"].invoke({"query": "express-jwt v8"})
+
+        assert "ERROR: Web search failed" in res
+
+    def test_respects_call_limit(self, monkeypatch):
+        monkeypatch.setenv("SERPER_API_KEY", "test-key")
+        body = {"organic": [{"snippet": "S1", "title": "T1", "link": "https://a.com"}]}
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = body
+        mock_resp.raise_for_status = MagicMock()
+
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+            for _ in range(3):
+                res = tools["search_web"].invoke({"query": "query"})
+                assert "Found 1 results" in res
+            
+            res_exceeded = tools["search_web"].invoke({"query": "query 4"})
+            assert "ERROR: search_web call limit reached (max 3 per session)" in res_exceeded
+
+    def test_handles_empty_results(self, monkeypatch):
+        monkeypatch.setenv("SERPER_API_KEY", "test-key")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"organic": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+            res = tools["search_web"].invoke({"query": "query"})
+
+        assert "No results found for this query" in res
+
+
+class TestReadWebPage:
+    def test_returns_markdown_content(self):
+        mock_resp = MagicMock()
+        mock_resp.text = "# Migration Guide\nUse expressjwt({ ... })"
+        mock_resp.raise_for_status = MagicMock()
+
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.get", return_value=mock_resp) as mock_get:
+            res = tools["read_web_page"].invoke({"url": "https://example.com/guide"})
+
+        mock_get.assert_called_once_with(
+            "https://r.jina.ai/https://example.com/guide",
+            headers={"Accept": "text/plain"},
+            timeout=15,
+        )
+        assert "# Migration Guide" in res
+        assert "Use expressjwt" in res
+
+    def test_truncates_oversized_page(self):
+        mock_resp = MagicMock()
+        mock_resp.text = "A" * 20_000
+        mock_resp.raise_for_status = MagicMock()
+
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.get", return_value=mock_resp):
+            res = tools["read_web_page"].invoke({"url": "https://example.com/huge"})
+
+        assert "[Content truncated at 16000 characters...]" in res
+
+    def test_handles_network_failure(self):
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
+
+        with patch("src.orchestrator.remedy_tools.requests.get", side_effect=Exception("Connection reset")):
+            res = tools["read_web_page"].invoke({"url": "https://example.com/error"})
+
+        assert "ERROR: Failed to read web page" in res
