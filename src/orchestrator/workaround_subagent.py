@@ -70,6 +70,7 @@ def _build_workaround_prompt(
     target_group: VulnerabilityGroup | List[str],
     constraints_ledger: List[str] | None = None,
     previous_feedback: str | None = None,
+    workspace_diff: str = "",
 ) -> str:
     if isinstance(target_group, list):
         constraints_ledger = list(target_group)
@@ -108,9 +109,21 @@ def _build_workaround_prompt(
                 "  11. Make one edit per file at a time. Do not batch multiple edits in a single call.",
                 "",
                 "PHASE 4 — VALIDATE:",
-                "  12. After EVERY modified file, immediately run validate_code_syntax on that file.",
+                "  12. After EVERY modified file, immediately run validate_code_syntax and run_typecheck on that file.",
                 "  13. If validation fails, either fix the syntax error with another deterministic_search_replace, or revert_workspace_file and retry.",
                 "  14. Do NOT finish until every modified file passes syntax validation.",
+                "",
+                "=== ANTI-PATTERNS (violations will cause immediate QA failure) ===",
+                "- ❌ NEVER modify package.json, package-lock.json, yarn.lock, pnpm-lock.yaml, or any dependency manifest.",
+                "- ❌ NEVER bump library versions — version selection is strictly the update_subagent's job.",
+                "- ❌ NEVER use npm/yarn/pnpm commands.",
+                "- ❌ NEVER add new external dependencies.",
+                "",
+                "=== PRE-EDIT CHECKLIST (mandatory before every deterministic_search_replace) ===",
+                "1. Use read_workspace_file to view the EXACT current content of the target file.",
+                "2. Copy the EXACT old_text from the file content (character-for-character, carefully checking commas, brackets, and semicolons).",
+                "3. Verify your new_text is valid JavaScript/TypeScript syntax before making the tool call.",
+                "4. After editing, ALWAYS run validate_code_syntax and run_typecheck on the modified file.",
                 "",
                 "=== STRICT RULES ===",
                 "- ALWAYS use relative file paths (e.g., 'frontend/src/app.ts'). NEVER use absolute paths starting with '/' or '/workspace'.",
@@ -123,21 +136,28 @@ def _build_workaround_prompt(
     ]
 
     if previous_feedback:
-        sections.append(
-            "\n".join(
+        retry_lines = [
+            "=== RETRY CONTEXT ===",
+            "This is a RETRY attempt. A previous code change was rejected by QA.",
+            f"QA Feedback: {previous_feedback}",
+        ]
+        if workspace_diff:
+            retry_lines.extend(
                 [
-                    "=== RETRY CONTEXT ===",
-                    "This is a RETRY attempt. A previous code change was rejected by QA.",
-                    f"QA Feedback: {previous_feedback}",
                     "",
-                    "IMPORTANT: Your previous edits may still be present in the workspace.",
-                    "Before attempting a new fix:",
-                    "  1. Use read_workspace_file to check the current state of files you previously modified.",
-                    "  2. If your previous edits are present and caused the QA failure, use revert_workspace_file to restore the original code first.",
-                    "  3. Then apply a corrected fix that addresses the QA feedback.",
+                    "=== YOUR PREVIOUS CHANGES (still in workspace) ===",
+                    workspace_diff,
                 ]
             )
+        retry_lines.extend(
+            [
+                "",
+                "IMPORTANT: Review your previous changes. If they caused the QA failure,",
+                "use revert_workspace_file to restore the original code first,",
+                "then apply a corrected fix that addresses the QA feedback.",
+            ]
         )
+        sections.append("\n".join(retry_lines))
 
     if constraints_ledger:
         sections.append("Constraints ledger:\n" + "\n".join(f"- {item}" for item in constraints_ledger))
@@ -321,16 +341,50 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
     touched_files: set[str] = set()
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_group)
     skinny_group = _create_skinny_subagent_group(target_group)
-    prompt = _build_workaround_prompt(target_task, skinny_group, filtered_ledger, previous_feedback)
-    initial_messages = [
-        SystemMessage(content="Use only source-code tools and validate syntax after each modified file."),
-        HumanMessage(content=prompt),
-    ]
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            workspace_diff = ""
+            if previous_feedback:
+                try:
+                    diff_res = sandbox.run("git diff --stat && git diff", timeout=10)
+                    if diff_res.exit_code == 0 and diff_res.stdout.strip():
+                        workspace_diff = diff_res.stdout.strip()[:3000]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not fetch workspace diff for retry context: %s", exc)
+
+            prompt = _build_workaround_prompt(
+                target_task,
+                skinny_group,
+                filtered_ledger,
+                previous_feedback,
+                workspace_diff=workspace_diff,
+            )
+            initial_messages = [
+                SystemMessage(content="Use only source-code tools and validate syntax after each modified file."),
+                HumanMessage(content=prompt),
+            ]
+
             toolbelt = build_workaround_toolbelt(sandbox, touched_files, repo_root)
             runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
+
+            # Programmatic guardrail: revert any dependency manifest files modified by the subagent
+            MANIFEST_FILES = {"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
+            violated_manifests = {
+                f for f in touched_files if os.path.basename(f) in MANIFEST_FILES
+            }
+            if violated_manifests:
+                logger.warning(
+                    "Workaround subagent illegally modified manifest files %s. Reverting manifests.",
+                    violated_manifests,
+                )
+                for f in violated_manifests:
+                    try:
+                        sandbox.revert_file(f)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Failed to revert manifest file %s: %s", f, exc)
+                touched_files -= violated_manifests
+                runtime = runtime._replace(changed_files=sorted(touched_files))
     except Exception as exc:  # noqa: BLE001
         summaries = _build_surrender_summaries(t_id, "Stopped because the sandbox or tool loop failed.")
         return {

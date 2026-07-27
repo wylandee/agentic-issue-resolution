@@ -635,6 +635,25 @@ def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
     return validate_code_syntax
 
 
+def _make_run_typecheck_tool(sandbox: DockerSandbox):
+    @tool
+    def run_typecheck() -> str:
+        """Run TypeScript compilation check to catch type errors and import failures."""
+        try:
+            result = sandbox.run("npx tsc --noEmit 2>&1 | head -50", timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: Typecheck execution failed: {exc}"
+
+        if result.exit_code == 0:
+            return "SUCCESS: TypeScript compilation passed cleanly."
+        output = result.stdout.strip()
+        if len(output) > 2000:
+            output = output[:2000] + "\n... (truncated)"
+        return f"TYPECHECK ERRORS (exit code {result.exit_code}):\n{output}"
+
+    return run_typecheck
+
+
 def build_update_toolbelt(
     sandbox: DockerSandbox,
     touched_files: Set[str],
@@ -682,4 +701,5 @@ def build_workaround_toolbelt(
         _make_deterministic_search_replace_tool(sandbox, touched_files),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
         _make_validate_code_syntax_tool(sandbox),
+        _make_run_typecheck_tool(sandbox),
     ]

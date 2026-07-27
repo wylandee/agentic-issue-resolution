@@ -86,6 +86,7 @@ class TestToolbeltFactories:
             "deterministic_search_replace",
             "revert_workspace_file",
             "validate_code_syntax",
+            "run_typecheck",
         }
 
     def test_update_toolbelt_excludes_registry_lookup(self):

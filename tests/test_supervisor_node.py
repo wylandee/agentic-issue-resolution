@@ -48,6 +48,8 @@ from src.orchestrator.supervisor_node import (
     _reconcile_registry_plan_evidence,
     _normalize_target_task_ids_for_node,
     _instruction_digest,
+    _deterministic_routing,
+    _materialize_spawn_requests,
     build_supervisor_prompt,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
@@ -614,7 +616,8 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
         assert result["constraints_ledger"] == []
 
-    def test_qa_completed_failed_marks_task_needs_retry(self):
+    @patch("langchain_openai.ChatOpenAI")
+    def test_qa_completed_failed_marks_task_needs_retry(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
         state = _base_state(
@@ -968,7 +971,7 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
         "task-1",
         "g1",
         status=TaskStatus.NEEDS_RETRY,
-        retry_count=3,
+        retry_count=2,
     ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
     state = _base_state(
         [group],
@@ -2234,3 +2237,185 @@ class TestSupervisorPrompt:
         assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
         assert "BREAKING_CHANGE also advances through the ordered update stages" in prompt
         assert "Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task" in prompt
+
+
+class TestBugFixes:
+    def test_bug1_deterministic_pivot_populates_feedback_by_task(self):
+        group_id = "sca:package.json:express:UPDATE_VERSION"
+        g = _sca_group(group_id)
+        task = RemediationTask(
+            task_id="task-1",
+            parent_group_id=group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            status=TaskStatus.NEEDS_RETRY,
+            instruction="Bump express",
+        )
+        task_queue = {"task-1": task}
+        group_by_id = {group_id: g}
+        qa_evaluations = {
+            "task-1": QAEvaluation(
+                task_id="task-1",
+                passed=False,
+                failure_category=FailureCategory.PEER_CONFLICT,
+                retry_feedback="Peer dependency conflict with body-parser",
+            )
+        }
+        retry_diagnostics_by_task = {
+            "task-1": UpdateRetryDiagnostics(
+                task_id="task-1",
+                exhausted_update_path=True,
+            )
+        }
+
+        decision = _deterministic_routing(
+            task_queue=task_queue,
+            group_by_id=group_by_id,
+            qa_evaluations=qa_evaluations,
+            retry_diagnostics_by_task=retry_diagnostics_by_task,
+        )
+
+        assert decision.next_node == "workaround_subagent"
+        assert len(decision.spawn_requests) == 1
+        assert decision.feedback_by_task.get("task-1") == "Peer dependency conflict with body-parser"
+
+    def test_bug2_materialize_spawn_requests_replaces_triage_strategy_bucket(self):
+        group_id = "sca:package.json:express:UPDATE_VERSION"
+        parent_task = RemediationTask(
+            task_id="task-1",
+            parent_group_id=group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+            instruction="Bump express",
+        )
+        task_queue = {"task-1": parent_task}
+        spawn_req = TaskSpawnRequest(
+            parent_task_id="task-1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            instruction="Pivot to workaround",
+            reason="Exhausted version bump",
+        )
+        errors: list[str] = []
+
+        new_tasks, _ = _materialize_spawn_requests(
+            spawn_requests=[spawn_req],
+            task_queue=task_queue,
+            group_by_id={},
+            errors=errors,
+        )
+
+        assert len(new_tasks) == 1
+        child_task = next(iter(new_tasks.values()))
+        assert child_task.parent_group_id == "sca:package.json:express:CODE_WORKAROUND"
+        assert child_task.strategy == RoutingStrategy.CODE_WORKAROUND
+        assert len(errors) == 0
+
+    def test_bug3_reject_workaround_to_workaround_spawn(self):
+        parent_task = RemediationTask(
+            task_id="task-1",
+            parent_group_id="g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.NEEDS_RETRY,
+            instruction="Workaround",
+        )
+        task_queue = {"task-1": parent_task}
+        spawn_req = TaskSpawnRequest(
+            parent_task_id="task-1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            instruction="Refactor workaround",
+            reason="Workaround failed",
+        )
+        errors: list[str] = []
+
+        new_tasks, _ = _materialize_spawn_requests(
+            spawn_requests=[spawn_req],
+            task_queue=task_queue,
+            group_by_id={},
+            errors=errors,
+        )
+
+        assert len(new_tasks) == 0
+        assert len(errors) == 1
+        assert "CODE_WORKAROUND parent 'task-1' cannot spawn another CODE_WORKAROUND child" in errors[0]
+
+    def test_bug3_deterministic_routing_filters_exhausted_workaround_tasks(self):
+        task = RemediationTask(
+            task_id="task-1",
+            parent_group_id="g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=3,  # MAX_RETRIES
+            instruction="Workaround",
+        )
+        task_queue = {"task-1": task}
+
+        decision = _deterministic_routing(
+            task_queue=task_queue,
+            group_by_id={},
+            qa_evaluations={},
+            retry_diagnostics_by_task={},
+        )
+
+        assert decision.next_node == "teardown"
+        assert decision.target_task_ids == []
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_bug4_programmatic_feedback_injection_for_workaround_retries(self, mock_chat_openai):
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_structured.invoke.return_value = SupervisorDecision(
+            target_task_ids=["task-2"],
+            next_node="workaround_subagent",
+            spawn_requests=[],
+            status_updates={},
+            unfixable_task_ids=[],
+            new_constraints=[],
+            feedback_by_task={},
+            instructions="Routing workaround",
+            decision_reason="Testing",
+        )
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_chat_openai.return_value = mock_llm
+
+        group_id = "sca:package.json:express:CODE_WORKAROUND"
+        g = _sca_group(group_id)
+        task = RemediationTask(
+            task_id="task-2",
+            parent_group_id=group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=1,
+            instruction="Workaround",
+        )
+        task_queue = {"task-2": task}
+        group_by_id = {group_id: g}
+        qa_evaluations = {
+            "task-2": QAEvaluation(
+                task_id="task-2",
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Real feedback from QA",
+            )
+        }
+
+        result = run_supervisor_node(
+            {
+                "repo_root": "/tmp",
+                "issues": [],
+                "system_context": MagicMock(),
+                "constraints_ledger": [],
+                "retry_counts": {},
+                "group_statuses": {},
+                "group_strategies": {},
+                "action_summaries": [],
+                "retry_plans_by_task": {},
+                "task_queue": task_queue,
+                "valid_groups": [g],
+                "qa_evaluations": qa_evaluations,
+                "retry_diagnostics_by_task": {},
+            }
+        )
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"

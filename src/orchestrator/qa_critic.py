@@ -2667,6 +2667,11 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 
 8. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
 9. Report newly introduced identifiers explicitly in the holistic report, but leave the per-group evaluations scoped to the assigned remediation groups.
+10. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
+    - Exact error messages from test execution, runtime logs, or compilation output.
+    - Specific failing test names and test files.
+    - File and line locations of the failure if available.
+    - Specific guidance on syntax errors, type errors, or broken imports introduced by the workaround edit.
 
 ## Output Requirements
 
