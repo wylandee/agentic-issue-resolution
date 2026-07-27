@@ -150,6 +150,15 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                 if getattr(g, "vulnerable_component", None):
                     unfixable_packages.add(g.vulnerable_component)
 
+    worker_results_by_attempt = state.get("worker_results_by_attempt", {})
+    for attempt_res in worker_results_by_attempt.values():
+        task = task_queue.get(attempt_res.task_id)
+        if task is not None and attempt_res.changed_files:
+            if task.status == TaskStatus.QA_PASSED:
+                passed_files.update(attempt_res.changed_files)
+            elif task.status == TaskStatus.UNFIXABLE:
+                unfixable_files.update(attempt_res.changed_files)
+
     files_to_exclude = unfixable_files - passed_files
 
     try:

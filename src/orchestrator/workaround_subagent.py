@@ -70,7 +70,6 @@ def _build_workaround_prompt(
     target_group: VulnerabilityGroup | List[str],
     constraints_ledger: List[str] | None = None,
     previous_feedback: str | None = None,
-    workspace_diff: str = "",
 ) -> str:
     if isinstance(target_group, list):
         constraints_ledger = list(target_group)
@@ -131,7 +130,7 @@ def _build_workaround_prompt(
                 "- Do NOT modify package.json, package-lock.json, or any dependency manifest.",
                 "- Do NOT install new packages or run npm/yarn commands.",
                 "- If you cannot find the vulnerable code or determine a safe fix, stop and explain why.",
-            ]
+                ]
         )
     ]
 
@@ -140,23 +139,9 @@ def _build_workaround_prompt(
             "=== RETRY CONTEXT ===",
             "This is a RETRY attempt. A previous code change was rejected by QA.",
             f"QA Feedback: {previous_feedback}",
+            "",
+            "IMPORTANT: Your previous failed code changes have been safely discarded. You are starting from a clean baseline workspace. Apply a totally new fix that addresses the QA feedback.",
         ]
-        if workspace_diff:
-            retry_lines.extend(
-                [
-                    "",
-                    "=== YOUR PREVIOUS CHANGES (still in workspace) ===",
-                    workspace_diff,
-                ]
-            )
-        retry_lines.extend(
-            [
-                "",
-                "IMPORTANT: Review your previous changes. If they caused the QA failure,",
-                "use revert_workspace_file to restore the original code first,",
-                "then apply a corrected fix that addresses the QA feedback.",
-            ]
-        )
         sections.append("\n".join(retry_lines))
 
     if constraints_ledger:
@@ -344,21 +329,11 @@ def run_workaround_subagent_node(state: SubagentState) -> Dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            workspace_diff = ""
-            if previous_feedback:
-                try:
-                    diff_res = sandbox.run("git diff --stat && git diff", timeout=10)
-                    if diff_res.exit_code == 0 and diff_res.stdout.strip():
-                        workspace_diff = diff_res.stdout.strip()[:3000]
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not fetch workspace diff for retry context: %s", exc)
-
             prompt = _build_workaround_prompt(
                 target_task,
                 skinny_group,
                 filtered_ledger,
                 previous_feedback,
-                workspace_diff=workspace_diff,
             )
             initial_messages = [
                 SystemMessage(content="Use only source-code tools and validate syntax after each modified file."),

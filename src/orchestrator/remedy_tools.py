@@ -33,8 +33,13 @@ def _validate_workspace_path(file_path: str) -> str:
         raise ValueError("file_path is required.")
     if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
         raise ValueError(f"Rejected absolute file path '{candidate}'.")
-    if ".." in Path(candidate).parts:
+    
+    parts = Path(candidate).parts
+    if ".." in parts:
         raise ValueError(f"Rejected path traversal in '{candidate}'.")
+    if parts and parts[0] in ("build", "dist"):
+        raise ValueError(f"Accessing compiled files in '{parts[0]}/' is strictly forbidden. Please modify the original source files instead.")
+        
     return candidate.replace("\\", "/")
 
 
@@ -497,7 +502,7 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
             f"grep -RInE "
             f"--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
             f"--include='*.mjs' --include='*.cjs' --include='*.json' "
-            f"--exclude-dir=node_modules --exclude-dir=.git "
+            f"--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=build --exclude-dir=dist "
             f"-- '{safe_pattern}' '{search_root}' | sed 's|^./||'"
         )
 
