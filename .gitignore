@@ -5,13 +5,14 @@
 # Ignore all data files, vector embeddings, and target code clones
 /data/clones/*
 /data/trajectories/*
-/data/vector_store/*
 /data/*.csv
+/data/*.json
+/data/*.jsonl
+/data/*.txt
 
 # Keep the directory structure intact in git
 !/data/clones/.gitkeep
 !/data/trajectories/.gitkeep
-!/data/vector_store/.gitkeep
 
 # Triage enrichment cache (KEV JSON, future EPSS cache)
 /data/cache/*
@@ -51,6 +52,7 @@ dist/
 # Testing, Linting & Coverage
 # ==============================================================================
 .pytest_cache/
+.pytest-tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage

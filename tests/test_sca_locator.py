@@ -1,4 +1,4 @@
-"""
+﻿"""
 Tests for the upgraded SCA locator layer.
 
 Coverage
@@ -8,7 +8,7 @@ odc_parser
   - Severity fallback chain (highestSeverity / cvssv3 / cvssv2 / raw)
   - CWE normalisation (with/without "CWE-" prefix)
   - CVE-ID extraction vs GHSA advisory IDs
-  - parse_vulnerabilities → List[VulnerabilityIssue]
+  - parse_vulnerabilities â†’ List[VulnerabilityIssue]
   - export_to_jsonl / export_to_csv round-trips
 
 manifest_locator
@@ -21,7 +21,7 @@ manifest_locator
   - locate_dependency (end-to-end, no OSV)
   - locate_from_issue (typed LocalizedIssue returned, no OSV)
 
-All tests are fully offline — no live network calls.
+All tests are fully offline â€” no live network calls.
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ from typing import Any, Dict, List
 
 import pytest
 
-from src.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
-from src.contracts.schemas import CWEEntry
-from src.tools.odc_parser import (
+from remediation_engine.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
+from remediation_engine.contracts.schemas import CWEEntry
+from remediation_engine.tools.odc_parser import (
     _ecosystem_from_purl,
     _extract_cve_id,
     _extract_ghsa_id,
@@ -48,7 +48,7 @@ from src.tools.odc_parser import (
     export_to_jsonl,
     parse_vulnerabilities,
 )
-from src.tools.manifest_locator import (
+from remediation_engine.tools.manifest_locator import (
     PackageManagerKind,
     _find_dependency_line,
     _find_nearest_manifest,
@@ -163,7 +163,7 @@ def _minimal_dep(
 
 
 # ===========================================================================
-# odc_parser — PURL helpers
+# odc_parser â€” PURL helpers
 # ===========================================================================
 
 
@@ -175,11 +175,11 @@ class TestPURLHelpers:
         ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
         ("pkg:npm/base64url@0.0.6", "base64url"),
         ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),
-        # maven: namespace=commons-io, name=commons-io → joined with ':'
+        # maven: namespace=commons-io, name=commons-io â†’ joined with ':'
         ("pkg:maven/commons-io/commons-io@2.4", "commons-io:commons-io"),
     ])
     def test_package_name_from_purl(self, purl, expected_name):
-        from src.tools.odc_parser import _package_name_from_purl
+        from remediation_engine.tools.odc_parser import _package_name_from_purl
         assert _package_name_from_purl(purl) == expected_name
 
     @pytest.mark.parametrize("purl,expected_eco", [
@@ -202,7 +202,7 @@ class TestPURLHelpers:
         assert _ecosystem_from_purl(None) is None
 
     def test_package_name_from_none_purl(self):
-        from src.tools.odc_parser import _package_name_from_purl
+        from remediation_engine.tools.odc_parser import _package_name_from_purl
         assert _package_name_from_purl(None) is None
 
     def test_parse_purl_from_dep(self):
@@ -215,7 +215,7 @@ class TestPURLHelpers:
 
 
 # ===========================================================================
-# odc_parser — severity extraction
+# odc_parser â€” severity extraction
 # ===========================================================================
 
 
@@ -227,7 +227,7 @@ class TestSeverityExtraction:
         ({"severity": "low"}, Severity.LOW),
         # highestSeverity takes precedence over cvssv3
         ({"highestSeverity": "CRITICAL", "cvssv3": {"baseSeverity": "HIGH"}}, Severity.CRITICAL),
-        # Unknown garbage → UNKNOWN
+        # Unknown garbage â†’ UNKNOWN
         ({"severity": "moderate"}, Severity.UNKNOWN),  # ODC moderate is not a valid Severity
         ({}, Severity.UNKNOWN),
     ])
@@ -240,7 +240,7 @@ class TestSeverityExtraction:
 
 
 # ===========================================================================
-# odc_parser — CWE parsing
+# odc_parser â€” CWE parsing
 # ===========================================================================
 
 
@@ -250,7 +250,7 @@ class TestCWEParsing:
         (["77"], ["CWE-77"]),
         (["CWE79", "CWE-89"], ["CWE-79", "CWE-89"]),
         ([], []),
-        (["notacwe"], []),       # no digits → skipped
+        (["notacwe"], []),       # no digits â†’ skipped
     ])
     def test_parse_cwes(self, raw, expected_ids):
         vuln = {"cwes": raw}
@@ -262,7 +262,7 @@ class TestCWEParsing:
 
 
 # ===========================================================================
-# odc_parser — CVE-ID extraction
+# odc_parser â€” CVE-ID extraction
 # ===========================================================================
 
 
@@ -310,7 +310,7 @@ class TestGHSAIDExtraction:
 
 
 # ===========================================================================
-# odc_parser — parse_vulnerabilities
+# odc_parser â€” parse_vulnerabilities
 # ===========================================================================
 
 
@@ -417,7 +417,7 @@ class TestParseVulnerabilities:
 
 
 # ===========================================================================
-# odc_parser — export functions
+# odc_parser â€” export functions
 # ===========================================================================
 
 
@@ -453,7 +453,7 @@ class TestExportFunctions:
 
 
 # ===========================================================================
-# manifest_locator — normalize_package_name
+# manifest_locator â€” normalize_package_name
 # ===========================================================================
 
 
@@ -477,7 +477,7 @@ class TestNormalizePackageName:
 
 
 # ===========================================================================
-# manifest_locator — parse_lockfile_path
+# manifest_locator â€” parse_lockfile_path
 # ===========================================================================
 
 
@@ -534,7 +534,7 @@ class TestParseLockfilePath:
 
 
 # ===========================================================================
-# manifest_locator — detect_package_manager
+# manifest_locator â€” detect_package_manager
 # ===========================================================================
 
 
@@ -557,7 +557,7 @@ class TestDetectPackageManager:
 
 
 # ===========================================================================
-# manifest_locator — _locate_in_manifest
+# manifest_locator â€” _locate_in_manifest
 # ===========================================================================
 
 
@@ -580,7 +580,7 @@ class TestLocateInManifest:
         assert result["is_direct"] is True
 
     def test_transitive_dep_no_line(self, tmp_repo):
-        """Transitive deps are not in direct deps — no line number returned."""
+        """Transitive deps are not in direct deps â€” no line number returned."""
         result = _locate_in_manifest(tmp_repo / "package.json", "cookie", "npm")
         assert result["is_direct"] is False
         assert result["line_number"] is None
@@ -601,7 +601,7 @@ class TestLocateInManifest:
         assert result["package_manager"] == "pnpm"
 
     def test_keys_returned(self, tmp_repo):
-        """Exactly the right keys — no OSV/fix artefacts."""
+        """Exactly the right keys â€” no OSV/fix artefacts."""
         result = _locate_in_manifest(tmp_repo / "package.json", "lodash", "npm")
         expected_keys = {"manifest_file", "package_name", "is_direct", "line_number", "snippet", "package_manager"}
         assert expected_keys.issubset(result.keys())
@@ -610,7 +610,7 @@ class TestLocateInManifest:
 
 
 # ===========================================================================
-# manifest_locator — _find_nearest_manifest
+# manifest_locator â€” _find_nearest_manifest
 # ===========================================================================
 
 
@@ -638,12 +638,12 @@ class TestFindNearestManifest:
 
     def test_empty_path_returns_none(self, tmp_repo):
         result = _find_nearest_manifest(tmp_repo, "")
-        # Empty path — falls back gracefully
+        # Empty path â€” falls back gracefully
         assert result is None or result.name == "package.json"
 
 
 # ===========================================================================
-# manifest_locator — locate_dependency (end-to-end, no OSV)
+# manifest_locator â€” locate_dependency (end-to-end, no OSV)
 # ===========================================================================
 
 
@@ -675,7 +675,7 @@ class TestLocateDependency:
         assert "fix_instruction" not in result
 
     def test_lockfile_ancestry_propagated(self, tmp_repo):
-        """jws → base64url transitive chain ancestry is preserved."""
+        """jws â†’ base64url transitive chain ancestry is preserved."""
         result = locate_dependency(
             repo_path=tmp_repo,
             raw_dependency_name="base64url:0.0.6",
@@ -736,7 +736,7 @@ class TestLocateDependency:
         )
         assert result["status"] == "success"
         assert result["package_name"] == "@tootallnate/once"
-        assert result["is_direct"] is False  # not in deps → transitive
+        assert result["is_direct"] is False  # not in deps â†’ transitive
 
     def test_no_extra_parameters_accepted(self):
         """Verify that old OSV parameters are gone from the signature."""
@@ -755,7 +755,7 @@ class TestLocateDependency:
 
 
 # ===========================================================================
-# manifest_locator — locate_from_issue
+# manifest_locator â€” locate_from_issue
 # ===========================================================================
 
 
@@ -776,7 +776,7 @@ class TestLocateFromIssue:
         return VulnerabilityIssue(**defaults)
 
     def test_returns_localized_issue(self, tmp_repo):
-        from src.contracts import LocalizedIssue
+        from remediation_engine.contracts import LocalizedIssue
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert isinstance(loc, LocalizedIssue)
@@ -804,7 +804,7 @@ class TestLocateFromIssue:
 
     def test_no_fix_instruction_field(self, tmp_repo):
         """LocalizedIssue must not have a fix_instruction field at all."""
-        from src.contracts import LocalizedIssue
+        from remediation_engine.contracts import LocalizedIssue
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert not hasattr(loc, "fix_instruction")
@@ -820,7 +820,7 @@ class TestLocateFromIssue:
         issue = self._make_issue()
         assert issue.fixed_version is None
         locate_from_issue(issue, tmp_repo)
-        # fixed_version should remain None — no OSV enrichment happens
+        # fixed_version should remain None â€” no OSV enrichment happens
         assert issue.fixed_version is None
 
     def test_package_manager_in_localized_issue(self, tmp_repo):
@@ -835,7 +835,7 @@ class TestLocateFromIssue:
         assert loc.package_manager == PackageManagerKind.YARN
 
     def test_json_round_trip(self, tmp_repo):
-        from src.contracts import LocalizedIssue
+        from remediation_engine.contracts import LocalizedIssue
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         reloaded = LocalizedIssue.model_validate_json(loc.model_dump_json())
@@ -878,3 +878,5 @@ class TestSampleODCReport:
         # JSONL has exactly one line per issue
         lines = (tmp_path / "out.jsonl").read_text().strip().split("\n")
         assert len(lines) == len(issues)
+
+

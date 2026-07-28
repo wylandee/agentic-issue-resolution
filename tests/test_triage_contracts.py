@@ -1,5 +1,5 @@
-"""
-tests/test_triage_contracts.py — Unit tests for the Phase 4.0 triage contracts.
+﻿"""
+tests/test_triage_contracts.py â€” Unit tests for the Phase 4.0 triage contracts.
 
 Covers:
 - TriageResult.false_positive_reason required when is_valid=False
@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     CVEEnrichment,
     FixPlan,
     FixPlanStatus,
@@ -391,10 +391,12 @@ class TestTriageResult:
 
 
 def test_re_exported_from_contracts_init():
-    """All four new models must be importable from src.contracts directly."""
-    from src.contracts import (  # noqa: F401
+    """All four new models must be importable from remediation_engine.contracts directly."""
+    from remediation_engine.contracts import (  # noqa: F401
         CVEEnrichment,
         SystemContext,
         TriageResult,
         VulnerabilityGroup,
     )
+
+

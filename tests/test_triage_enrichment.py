@@ -1,13 +1,13 @@
-"""
-tests/test_triage_enrichment.py — Unit tests for src/triage/enrichment.py.
+﻿"""
+tests/test_triage_enrichment.py â€” Unit tests for remediation_engine.triage.enrichment.
 
 Covers:
-- Mock EPSS HTTP 200 → parse epss and percentile correctly
-- Mock CISA KEV fresh download → in_kev correct, cache written
-- Mock CISA KEV cache hit (TTL not expired) → no HTTP call
-- Network timeout → safe defaults, no exception raised
-- CVE not in KEV → in_kev=False
-- Empty CVE list → empty dict returned
+- Mock EPSS HTTP 200 â†’ parse epss and percentile correctly
+- Mock CISA KEV fresh download â†’ in_kev correct, cache written
+- Mock CISA KEV cache hit (TTL not expired) â†’ no HTTP call
+- Network timeout â†’ safe defaults, no exception raised
+- CVE not in KEV â†’ in_kev=False
+- Empty CVE list â†’ empty dict returned
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from src.triage.enrichment import enrich_cves
+from remediation_engine.triage.enrichment import enrich_cves
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ class TestEPSSEnrichment:
     def test_epss_200_parses_score_and_percentile(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
                 _fake_response(FAKE_KEV_DATA),   # KEV download
                 _fake_response(FAKE_EPSS_DATA),  # EPSS query
@@ -75,7 +75,7 @@ class TestEPSSEnrichment:
     def test_epss_multiple_cves_parsed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
                 _fake_response(FAKE_KEV_DATA),
                 _fake_response(FAKE_EPSS_DATA),
@@ -88,7 +88,7 @@ class TestEPSSEnrichment:
     def test_epss_timeout_returns_safe_defaults(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             # KEV succeeds; EPSS times out
             def side_effect(url, **kwargs):
                 if "first.org" in url:
@@ -107,7 +107,7 @@ class TestEPSSEnrichment:
     def test_epss_network_error_returns_safe_defaults(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             def side_effect(url, **kwargs):
                 if "first.org" in url:
                     raise requests.exceptions.ConnectionError("refused")
@@ -129,7 +129,7 @@ class TestKEVEnrichment:
     def test_kev_fresh_download_marks_in_kev(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
                 _fake_response(FAKE_KEV_DATA),   # KEV download
                 _fake_response(FAKE_EPSS_DATA),  # EPSS
@@ -155,7 +155,7 @@ class TestKEVEnrichment:
             call_urls.append(url)
             return _fake_response(FAKE_EPSS_DATA)
 
-        with patch("src.triage.enrichment.requests.get", side_effect=mock_get):
+        with patch("remediation_engine.triage.enrichment.requests.get", side_effect=mock_get):
             result = enrich_cves(["CVE-2021-44228"])
 
         # Only the EPSS URL should have been called (KEV came from cache)
@@ -167,7 +167,7 @@ class TestKEVEnrichment:
     def test_cve_not_in_kev(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             kev_without_cve = {"vulnerabilities": []}
             mock_get.side_effect = [
                 _fake_response(kev_without_cve),
@@ -180,7 +180,7 @@ class TestKEVEnrichment:
     def test_kev_download_failure_returns_defaults(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             def side_effect(url, **kwargs):
                 if "cisa.gov" in url:
                     raise requests.exceptions.ConnectionError("cisa down")
@@ -201,14 +201,14 @@ class TestKEVEnrichment:
 class TestEdgeCases:
     def test_empty_cve_list_returns_empty_dict(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
-        with patch("src.triage.enrichment.requests.get"):
+        with patch("remediation_engine.triage.enrichment.requests.get"):
             result = enrich_cves([])
         assert result == {}
 
     def test_duplicate_cve_ids_deduplicated(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
                 _fake_response(FAKE_KEV_DATA),
                 _fake_response(FAKE_EPSS_DATA),
@@ -221,7 +221,7 @@ class TestEdgeCases:
     def test_enrichment_source_field_correct(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
-        with patch("src.triage.enrichment.requests.get") as mock_get:
+        with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
                 _fake_response(FAKE_KEV_DATA),
                 _fake_response(FAKE_EPSS_DATA),
@@ -230,3 +230,5 @@ class TestEdgeCases:
 
         # Both EPSS (>0) and KEV (in_kev=True) contributed
         assert result["CVE-2021-44228"].enrichment_source in ("epss+kev", "kev+epss")
+
+

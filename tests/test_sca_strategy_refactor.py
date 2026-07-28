@@ -1,10 +1,10 @@
-"""Focused coverage for the OSV-first, strategy-aware SCA flow."""
+﻿"""Focused coverage for the OSV-first, strategy-aware SCA flow."""
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from src.contracts import (
+from remediation_engine.contracts import (
     FixPlan,
     FixPlanStatus,
     FailureCategory,
@@ -20,21 +20,21 @@ from src.contracts import (
     UpdateRetryDiagnostics,
     VulnerabilityIssue,
 )
-from src.orchestrator.supervisor_node import (
+from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _build_high_level_retry_instruction,
     _next_sca_stage,
     run_supervisor_node,
 )
-from src.orchestrator.subagent_runtime import ToolEvent
-from src.orchestrator.update_subagent import _build_retry_diagnostics, _build_update_prompt
-from src.tools.fix_planner import (
+from remediation_engine.orchestration.subagent_runtime import ToolEvent
+from remediation_engine.orchestration.update_subagent import _build_retry_diagnostics, _build_update_prompt
+from remediation_engine.tools.fix_planner import (
     _extract_fixed_from_osv_vuln,
     _query_osv_fixed_version,
     plan_fix,
 )
-from src.tools.registry_tools import plan_npm_version
-from src.triage.grouper import group_issues
+from remediation_engine.tools.registry_tools import plan_npm_version
+from remediation_engine.triage.grouper import group_issues
 
 
 def _issue(cve: str, *, package: str = "lodash") -> VulnerabilityIssue:
@@ -105,10 +105,10 @@ def test_plan_fix_is_osv_only_and_does_not_fall_through_to_npm_or_serper():
     issue = _issue("CVE-2026-0001")
     localized = _localized(issue)
     with patch(
-        "src.tools.fix_planner._query_osv_fixed_version",
+        "remediation_engine.tools.fix_planner._query_osv_fixed_version",
         return_value=("4.17.21", None),
-    ) as osv, patch("src.tools.fix_planner._fetch_npm_latest") as npm, patch(
-        "src.tools.fix_planner._search_serper_workarounds"
+    ) as osv, patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm, patch(
+        "remediation_engine.tools.fix_planner._search_serper_workarounds"
     ) as serper:
         result = plan_fix(localized)
 
@@ -160,7 +160,7 @@ def test_osv_query_uses_the_finding_advisory_when_batch_has_multiple_cves():
             }
         ]
     }
-    with patch("src.tools.fix_planner.requests.post", return_value=response):
+    with patch("remediation_engine.tools.fix_planner.requests.post", return_value=response):
         fixed, snippets = _query_osv_fixed_version(_issue("CVE-2026-0001"))
 
     assert fixed == "4.17.21"
@@ -206,7 +206,7 @@ def test_supervisor_npm_tool_selects_same_major_then_latest(monkeypatch):
         }
     }
     monkeypatch.setattr(
-        "src.tools.registry_tools._fetch_package_data",
+        "remediation_engine.tools.registry_tools._fetch_package_data",
         lambda package: registry_data,
     )
 
@@ -234,7 +234,7 @@ def test_supervisor_npm_tool_selects_same_major_then_latest(monkeypatch):
 
 def test_supervisor_npm_tool_skips_same_major_when_it_equals_latest(monkeypatch):
     monkeypatch.setattr(
-        "src.tools.registry_tools._fetch_package_data",
+        "remediation_engine.tools.registry_tools._fetch_package_data",
         lambda package: {"versions": {"4.18.0": {}, "4.17.21": {}}},
     )
 
@@ -392,3 +392,5 @@ def test_retry_instruction_contains_exact_selected_version_and_stage():
 
     assert "5.0.0" in instruction
     assert SCARemediationStage.NPM_LATEST.value in instruction
+
+

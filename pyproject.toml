@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remediation-engine"
+version = "0.1.0"
+description = "Agentic AppSec vulnerability remediation engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "docker>=7,<9",
+  "langchain-openai>=0.3,<2",
+  "langgraph>=1.2,<2",
+  "langsmith>=0.8,<1",
+  "packageurl-python>=0.11",
+  "pydantic>=2,<3",
+  "python-dotenv>=1,<2",
+  "requests>=2.31,<3",
+  "semantic-version>=2.10,<3",
+  "tree-sitter>=0.23,<0.24",
+  "tree-sitter-javascript>=0.21,<0.22",
+  "tree-sitter-typescript>=0.21,<0.22",
+  "typing-extensions>=4.12,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "pytest-mock>=3,<4", "ruff>=0.15,<1"]
+
+[project.scripts]
+remedy = "remediation_engine.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+exclude = ["examples", "data", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D100", "D101", "D102", "D103", "D107"]
+ignore = ["E501", "D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+  "integration: tests spanning multiple internal subsystems",
+  "docker: requires a live Docker daemon",
+  "network: requires external network access",
+  "llm: requires an LLM provider",
+]

@@ -1,18 +1,18 @@
-"""
-tests/test_triage_grouper.py — Unit tests for src/triage/grouper.py.
+﻿"""
+tests/test_triage_grouper.py â€” Unit tests for remediation_engine.triage.grouper.
 
 Covers:
-- Same package/file with multiple distinct CVEs → one group, both CVE IDs
-- Duplicate CVE on same component/file → deduplicated in group
-- Semgrep SCA + ODC SCA for same CVE/component/file → merged, two sources
-- SAST issues → singleton groups
-- Mixed SAST+SCA list → correct counts and types
+- Same package/file with multiple distinct CVEs â†’ one group, both CVE IDs
+- Duplicate CVE on same component/file â†’ deduplicated in group
+- Semgrep SCA + ODC SCA for same CVE/component/file â†’ merged, two sources
+- SAST issues â†’ singleton groups
+- Mixed SAST+SCA list â†’ correct counts and types
 - group_sca_issues compatibility alias
 """
 
 from __future__ import annotations
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -22,7 +22,7 @@ from src.contracts.schemas import (
     Severity,
     VulnerabilityIssue,
 )
-from src.triage.grouper import group_issues, group_sca_issues
+from remediation_engine.triage.grouper import group_issues, group_sca_issues
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ class TestSCAGrouping:
         assert g.fix_plan.strategy_used == "UPDATE_VERSION"
 
     def test_duplicate_cve_same_component_is_deduped(self):
-        """Same CVE appearing twice (e.g. from the same scanner run) → one CVE ID."""
+        """Same CVE appearing twice (e.g. from the same scanner run) â†’ one CVE ID."""
         issues = [
             _sca(cve_id="CVE-2021-23337"),
             _sca(cve_id="CVE-2021-23337"),  # Exact duplicate
@@ -144,7 +144,7 @@ class TestSCAGrouping:
         assert groups[0].cve_ids == ["CVE-2021-23337"]
 
     def test_cross_tool_same_cve_component_file_merges(self):
-        """Semgrep SCA + ODC finding the same CVE on the same package/file → merge."""
+        """Semgrep SCA + ODC finding the same CVE on the same package/file â†’ merge."""
         semgrep_issue = _sca(source=IssueSource.SEMGREP, cve_id="CVE-2021-44228")
         odc_issue = _sca(source=IssueSource.ODC, cve_id="CVE-2021-44228")
         groups = group_issues(
@@ -230,7 +230,7 @@ class TestSCAGrouping:
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
         )
-        # Same component/file → one group; no CVE IDs expected
+        # Same component/file â†’ one group; no CVE IDs expected
         assert len(groups) == 1
         assert groups[0].cve_ids == []
 
@@ -381,3 +381,5 @@ class TestGroupSCAAlias:
         alias_ids = {g.group_id for g in alias_result}
         direct_ids = {g.group_id for g in direct_result}
         assert alias_ids == direct_ids
+
+

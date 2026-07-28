@@ -1,5 +1,5 @@
-"""
-tests/test_sandbox_mgr.py — Unit tests for src/runtime/sandbox_mgr.py.
+﻿"""
+tests/test_sandbox_mgr.py â€” Unit tests for remediation_engine.runtime.sandbox_mgr.
 
 All Docker SDK interactions are mocked; no real Docker daemon is required.
 """
@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.contracts import CommandResult
-from src.runtime.sandbox_mgr import DockerSandbox, _make_tar_archive, get_docker_client
+from remediation_engine.contracts import CommandResult
+from remediation_engine.runtime.sandbox_mgr import DockerSandbox, _make_tar_archive, get_docker_client
 
 
 class _ImageNotFound(Exception):
@@ -270,3 +270,5 @@ class TestSandboxFileIO:
         sandbox = self._started_sandbox(tmp_path, client, container)
 
         assert sandbox.read_file("missing.json") is None
+
+

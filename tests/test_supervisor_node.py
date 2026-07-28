@@ -1,4 +1,4 @@
-"""
+﻿"""
 Tests for the Phase 5 Supervisor Node.
 
 Tests have been updated to use the task-centric architecture:
@@ -16,7 +16,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
@@ -41,7 +41,7 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.supervisor_node import (
+from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _planner_plan_violations,
     _parse_planner_retry_plans,
@@ -55,8 +55,8 @@ from src.orchestrator.supervisor_node import (
     run_supervisor_node,
     supervisor_router,
 )
-from src.orchestrator.task_utils import build_initial_remediation_task, derive_initial_strategy
-from src.orchestrator.subagent_runtime import ToolEvent
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task, derive_initial_strategy
+from remediation_engine.orchestration.subagent_runtime import ToolEvent
 
 
 def _issue() -> VulnerabilityIssue:
@@ -273,7 +273,7 @@ class TestSupervisorRouterFunction:
 
 
 # ===========================================================================
-# run_supervisor_node — task initialization
+# run_supervisor_node â€” task initialization
 # ===========================================================================
 
 
@@ -299,7 +299,7 @@ class TestRunSupervisorNodeNormalization:
 
 
 # ===========================================================================
-# run_supervisor_node — routing decisions
+# run_supervisor_node â€” routing decisions
 # ===========================================================================
 
 
@@ -387,7 +387,7 @@ class TestRunSupervisorNodeToQA:
         state = _base_state(
             [g1, g2],
             task_queue={"task-1": task1, "task-2": task2},
-            # No active_target_task_ids — all tasks are already optimistically fixed
+            # No active_target_task_ids â€” all tasks are already optimistically fixed
             active_target_task_ids=[],
         )
 
@@ -472,7 +472,7 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert result["active_target_task_ids"] == ["task-1"]
 
-    @patch("src.orchestrator.supervisor_node._run_planner_phase")
+    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
     def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(self, mock_chat, mock_planner):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
@@ -516,12 +516,12 @@ class TestRunSupervisorNodeToTeardown:
 
 
 # ===========================================================================
-# run_supervisor_node — QA evaluation updates
+# run_supervisor_node â€” QA evaluation updates
 # ===========================================================================
 
 
 class TestRunSupervisorNodeQAUpdates:
-    @patch("src.orchestrator.supervisor_node._run_planner_phase")
+    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
     def test_qa_failed_retry_invokes_planner_before_router(self, mock_chat, mock_planner):
         g1 = _sca_group("g1")
@@ -989,7 +989,7 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
     )
 
     monkeypatch.setattr(
-        "src.orchestrator.supervisor_node._run_planner_phase",
+        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
         lambda *args, **kwargs: (
             "TASK: task-1\n"
             "SELECTED_VERSION: NONE\n"
@@ -1055,7 +1055,7 @@ def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatc
         ]
     )
     planner_mock = MagicMock(side_effect=lambda *args, **kwargs: next(planner_outputs))
-    monkeypatch.setattr("src.orchestrator.supervisor_node._run_planner_phase", planner_mock)
+    monkeypatch.setattr("remediation_engine.orchestration.supervisor_node._run_planner_phase", planner_mock)
 
     router_llm = MagicMock()
     structured = MagicMock()
@@ -1206,7 +1206,7 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
         instruction_digest=old_snapshot.instruction_digest,
     )
     monkeypatch.setattr(
-        "src.orchestrator.supervisor_node._run_planner_phase",
+        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
         lambda *args, **kwargs: (
             "TASK: task-1, SELECTED_VERSION: 2.0.0, "
             "EFFECTIVE_STAGE: npm_same_major, ACTION: retry_update\n"
@@ -1466,7 +1466,7 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
         }
     )
     monkeypatch.setattr(
-        "src.orchestrator.supervisor_node._run_planner_phase",
+        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
         lambda *args, **kwargs: (
             "TASK: task-1\n"
             "SELECTED_VERSION: NONE\n"
@@ -1517,12 +1517,12 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
 
 
 # ===========================================================================
-# run_supervisor_node — action summary updates
+# run_supervisor_node â€” action summary updates
 # ===========================================================================
 
 
 class TestRunSupervisorNodeActionSummary:
-    @patch("src.orchestrator.supervisor_node._run_planner_phase")
+    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
     def test_qa_passed_subset_is_removed_before_retry_routing(self, mock_chat, mock_planner):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
@@ -1652,7 +1652,7 @@ class TestRunSupervisorNodeActionSummaryUpdates:
             active_target_task_ids=["task-1"],
         )
         result = run_supervisor_node(state)
-        # QA_PASSED is terminal — must not be overwritten
+        # QA_PASSED is terminal â€” must not be overwritten
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
 
     def test_does_not_update_non_active_targets_from_action_summary(self):
@@ -1678,7 +1678,7 @@ class TestRunSupervisorNodeActionSummaryUpdates:
 
 
 # ===========================================================================
-# run_supervisor_node — max retries / unfixable marking
+# run_supervisor_node â€” max retries / unfixable marking
 # ===========================================================================
 
 
@@ -1802,7 +1802,7 @@ class TestRunSupervisorMaxRetries:
 
 
 # ===========================================================================
-# run_supervisor_node — strategy pivots
+# run_supervisor_node â€” strategy pivots
 # ===========================================================================
 
 
@@ -2041,7 +2041,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
 
-    @patch("src.orchestrator.supervisor_node._run_planner_phase")
+    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
     def test_llm_cannot_route_exhausted_update_back_to_update_subagent(self, mock_chat, mock_planner):
         g1 = _sca_group("g1")
@@ -2148,7 +2148,7 @@ class TestRunSupervisorNodePeerConflict:
 
 
 # ===========================================================================
-# run_supervisor_node — LLM fallback
+# run_supervisor_node â€” LLM fallback
 # ===========================================================================
 
 
@@ -2167,7 +2167,7 @@ class TestRunSupervisorLLMFallback:
 
 
 # ===========================================================================
-# run_supervisor_node — LLM structured output call
+# run_supervisor_node â€” LLM structured output call
 # ===========================================================================
 
 
@@ -2419,3 +2419,5 @@ class TestBugFixes:
 
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
+
+

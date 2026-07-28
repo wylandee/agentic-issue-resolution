@@ -1,5 +1,5 @@
-"""
-Tests for src/tools/semgrep_parser.py
+﻿"""
+Tests for remediation_engine.tools.semgrep_parser.
 
 All tests are local-file based - no live Semgrep API required.
 """
@@ -10,9 +10,9 @@ import csv
 import json
 from pathlib import Path
 
-from src.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
-from src.tools import semgrep_parser
-from src.tools.semgrep_parser import (
+from remediation_engine.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
+from remediation_engine.tools import semgrep_parser
+from remediation_engine.tools.semgrep_parser import (
     CSV_HEADERS,
     _extract_findings_page,
     export_to_csv,
@@ -286,3 +286,5 @@ class TestMain:
         assert "csv" in captured
         assert len(captured["jsonl"][0]) == 1
         assert captured["jsonl"][0][0].rule_id == "javascript.crypto.weak-hash"
+
+

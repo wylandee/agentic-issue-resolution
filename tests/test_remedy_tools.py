@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_remedy_tools.py - Direct unit tests for Phase 5 specialist toolbelts.
 """
 
@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.contracts.schemas import CommandResult
-from src.orchestrator.remedy_tools import (
+from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.orchestration.remedy_tools import (
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
@@ -571,7 +571,7 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
             res = tools["search_web"].invoke({"query": "express-jwt v8 migration"})
 
         assert "Found 3 results" in res
@@ -593,7 +593,7 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.post", side_effect=Exception("timeout")):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.post", side_effect=Exception("timeout")):
             res = tools["search_web"].invoke({"query": "express-jwt v8"})
 
         assert "ERROR: Web search failed" in res
@@ -608,7 +608,7 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
             for _ in range(3):
                 res = tools["search_web"].invoke({"query": "query"})
                 assert "Found 1 results" in res
@@ -625,7 +625,7 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.post", return_value=mock_resp):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
             res = tools["search_web"].invoke({"query": "query"})
 
         assert "No results found for this query" in res
@@ -640,7 +640,7 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.get", return_value=mock_resp) as mock_get:
+        with patch("remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp) as mock_get:
             res = tools["read_web_page"].invoke({"url": "https://example.com/guide"})
 
         mock_get.assert_called_once_with(
@@ -659,7 +659,7 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.get", return_value=mock_resp):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp):
             res = tools["read_web_page"].invoke({"url": "https://example.com/huge"})
 
         assert "[Content truncated at 16000 characters...]" in res
@@ -668,7 +668,9 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("src.orchestrator.remedy_tools.requests.get", side_effect=Exception("Connection reset")):
+        with patch("remediation_engine.orchestration.remedy_tools.requests.get", side_effect=Exception("Connection reset")):
             res = tools["read_web_page"].invoke({"url": "https://example.com/error"})
 
         assert "ERROR: Failed to read web page" in res
+
+

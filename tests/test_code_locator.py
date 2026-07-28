@@ -1,11 +1,11 @@
-"""
-Tests for src/tools/code_map.py and src/tools/code_locator.py.
+﻿"""
+Tests for remediation_engine.tools.code_map and code_locator.
 
 Structure
 ---------
-TestCodeMapHelpers     — unit tests for code_map.py helper functions
-TestLocateSast         — integration / unit tests for code_locator.locate_sast
-TestLocateSastFallback — graceful-degradation / edge-case tests
+TestCodeMapHelpers     â€” unit tests for code_map.py helper functions
+TestLocateSast         â€” integration / unit tests for code_locator.locate_sast
+TestLocateSastFallback â€” graceful-degradation / edge-case tests
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     ASTNodeType,
     IssueSource,
     IssueType,
@@ -25,8 +25,8 @@ from src.contracts.schemas import (
     Severity,
     VulnerabilityIssue,
 )
-from src.contracts.schemas import LineRange
-from src.tools.code_map import (
+from remediation_engine.contracts.schemas import LineRange
+from remediation_engine.tools.code_map import (
     _extract_node_name,
     _node_contains_line,
     _TREE_SITTER_AVAILABLE,
@@ -40,7 +40,7 @@ from src.tools.code_map import (
     parse_source,
     resolve_repo_file,
 )
-from src.tools.code_locator import (
+from remediation_engine.tools.code_locator import (
     _extract_data_flow_hints,
     _score_confidence,
     locate_sast,
@@ -410,7 +410,7 @@ class TestScoreConfidence:
 
 
 # ---------------------------------------------------------------------------
-# TestLocateSast — happy path (real files + tree-sitter)
+# TestLocateSast â€” happy path (real files + tree-sitter)
 # ---------------------------------------------------------------------------
 
 
@@ -511,7 +511,7 @@ class TestLocateSast:
 
 
 # ---------------------------------------------------------------------------
-# TestLocateSastFallback — graceful degradation
+# TestLocateSastFallback â€” graceful degradation
 # ---------------------------------------------------------------------------
 
 
@@ -548,7 +548,7 @@ class TestLocateSastFallback:
         assert issue.file_path == "x.js"
 
     def test_non_js_file_produces_text_fallback(self, tmp_path: Path):
-        """Python files have no tree-sitter language — should still return snippet."""
+        """Python files have no tree-sitter language â€” should still return snippet."""
         src = "def login(username):\n    return username\n"
         (tmp_path / "app.py").write_text(src)
         issue = _make_issue(file_path="app.py", line_start=2, line_end=2)
@@ -584,3 +584,5 @@ class TestLocateSastFallback:
         issue = _make_issue(file_path="b.js", line_start=1, line_end=1)
         result = locate_sast(issue, str(tmp_path))
         assert 0.0 <= result.localization_confidence <= 1.0
+
+

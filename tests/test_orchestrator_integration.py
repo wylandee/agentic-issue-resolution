@@ -1,4 +1,4 @@
-"""
+﻿"""
 Integration tests for the Phase 5 orchestrator graph, specifically testing the newly added triage pipeline connection.
 """
 
@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     Severity,
@@ -19,10 +19,15 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.graph import (
+from remediation_engine.orchestration.graph import (
     build_orchestrator_graph,
     route_after_triage,
     run_orchestrator,
+    triage_node,
+)
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    use_trajectory_recorder,
 )
 
 def _issue(issue_id: str | None = None) -> VulnerabilityIssue:
@@ -69,13 +74,26 @@ def _initial_state(tmp_path: Path, issues: list[VulnerabilityIssue], system_cont
     }
 
 class TestTriageNodeIntegration:
+    def test_triage_records_a_named_observability_span(self, tmp_path: Path):
+        """Initial triage is visible in the local/LangSmith callback trace."""
+        issues = [_issue()]
+        state = _initial_state(tmp_path, issues, SystemContext(scan_id="trace-test"))
+        recorder = TrajectoryRecorder()
+        with patch(
+            "remediation_engine.orchestration.graph.run_triage_pipeline",
+            return_value=[],
+        ), use_trajectory_recorder(recorder):
+            triage_node(state)
+
+        assert any(span["name"] == "triage.pipeline" for span in recorder.spans())
+
     def test_route_after_triage(self):
         assert route_after_triage({"status": "triage_completed"}) == "workspace_builder"
         assert route_after_triage({"status": "triage_skipped"}) == "workspace_builder"
         assert route_after_triage({"status": "triage_completed_no_work"}) == "teardown"
         assert route_after_triage({"status": "failed"}) == "teardown"
 
-    @patch("src.orchestrator.graph.run_triage_pipeline")
+    @patch("remediation_engine.orchestration.graph.run_triage_pipeline")
     def test_triage_skipped_when_no_issues(self, mock_pipeline, tmp_path: Path):
         # No issues provided
         state = {
@@ -93,8 +111,8 @@ class TestTriageNodeIntegration:
         }
         
         # We need to mock the rest of the nodes so we don't actually run them
-        with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
+        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws, \
+             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
@@ -106,7 +124,7 @@ class TestTriageNodeIntegration:
              mock_pipeline.assert_not_called()
              mock_ws.assert_called_once()
 
-    @patch("src.orchestrator.graph.run_triage_pipeline")
+    @patch("remediation_engine.orchestration.graph.run_triage_pipeline")
     def test_triage_completed_with_valid_groups(self, mock_pipeline, tmp_path: Path):
         issues = [_issue()]
         system_context = SystemContext(scan_id="test")
@@ -129,9 +147,9 @@ class TestTriageNodeIntegration:
         
         state = _initial_state(tmp_path, issues, system_context)
         
-        with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_supervisor_node") as mock_supervisor, \
-             patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
+        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws, \
+             patch("remediation_engine.orchestration.graph.run_supervisor_node") as mock_supervisor, \
+             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
@@ -153,7 +171,7 @@ class TestTriageNodeIntegration:
              mock_supervisor.assert_called_once()
              mock_teardown.assert_called_once()
 
-    @patch("src.orchestrator.graph.run_triage_pipeline")
+    @patch("remediation_engine.orchestration.graph.run_triage_pipeline")
     def test_triage_completed_no_work(self, mock_pipeline, tmp_path: Path):
         issues = [_issue()]
         system_context = SystemContext(scan_id="test")
@@ -176,8 +194,8 @@ class TestTriageNodeIntegration:
         
         state = _initial_state(tmp_path, issues, system_context)
         
-        with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
+        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws, \
+             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
@@ -191,7 +209,7 @@ class TestTriageNodeIntegration:
              mock_ws.assert_not_called()
              mock_teardown.assert_called_once()
 
-    @patch("src.orchestrator.graph.run_triage_pipeline")
+    @patch("remediation_engine.orchestration.graph.run_triage_pipeline")
     def test_triage_failure_routes_to_teardown(self, mock_pipeline, tmp_path: Path):
         issues = [_issue()]
         system_context = SystemContext(scan_id="test")
@@ -200,8 +218,8 @@ class TestTriageNodeIntegration:
         
         state = _initial_state(tmp_path, issues, system_context)
         
-        with patch("src.orchestrator.graph.run_workspace_builder_node") as mock_ws, \
-             patch("src.orchestrator.graph.run_teardown_node") as mock_teardown:
+        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws, \
+             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown:
              
              graph = build_orchestrator_graph()
              
@@ -215,7 +233,7 @@ class TestTriageNodeIntegration:
              mock_ws.assert_not_called()
              mock_teardown.assert_called_once()
 
-    @patch("src.orchestrator.graph.orchestrator_engine")
+    @patch("remediation_engine.orchestration.graph.orchestrator_engine")
     def test_run_orchestrator_with_triage_params(self, mock_engine, tmp_path: Path):
         issues = [_issue()]
         system_context = SystemContext(scan_id="test")
@@ -223,7 +241,7 @@ class TestTriageNodeIntegration:
         mock_engine.invoke.return_value = {"status": "completed", "valid_groups": [_group()]}
 
         with patch(
-            "src.orchestrator.graph.build_phase5_runnable_config",
+            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
             return_value=(None, None),
         ):
             result = run_orchestrator(
@@ -238,3 +256,5 @@ class TestTriageNodeIntegration:
         assert invoked_state["system_context"] == system_context
         assert invoked_state["repo_root"] == str(tmp_path)
         assert result["status"] == "completed"
+
+

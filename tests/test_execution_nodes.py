@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_execution_nodes.py - Unit tests for the remaining Phase 5 execution nodes.
 
 All Docker SDK interactions are mocked. No real Docker daemon is required.
@@ -8,17 +8,17 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     TaskAttemptSnapshot,
     TaskStatus,
 )
-from src.orchestrator.editor_node import run_workspace_builder_node
-from src.orchestrator.state import initial_orchestrator_state
-from src.orchestrator.supervisor_node import _instruction_digest
-from src.orchestrator.teardown_node import run_teardown_node
+from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
+from remediation_engine.orchestration.state import initial_orchestrator_state
+from remediation_engine.orchestration.supervisor_node import _instruction_digest
+from remediation_engine.orchestration.teardown_node import run_teardown_node
 
 
 def _sandbox_mock() -> MagicMock:
@@ -56,10 +56,10 @@ class TestWorkspaceBuilderNode:
         sandbox = _sandbox_mock()
 
         with patch(
-            "src.orchestrator.editor_node.get_docker_client",
+            "remediation_engine.orchestration.workspace_builder.get_docker_client",
             return_value=client,
         ), patch(
-            "src.orchestrator.editor_node.DockerSandbox",
+            "remediation_engine.orchestration.workspace_builder.DockerSandbox",
             return_value=sandbox,
         ) as mock_sandbox:
             result = run_workspace_builder_node(state)
@@ -74,10 +74,10 @@ class TestWorkspaceBuilderNode:
         client = MagicMock()
 
         with patch(
-            "src.orchestrator.editor_node.get_docker_client",
+            "remediation_engine.orchestration.workspace_builder.get_docker_client",
             return_value=client,
         ), patch(
-            "src.orchestrator.editor_node.DockerSandbox",
+            "remediation_engine.orchestration.workspace_builder.DockerSandbox",
             side_effect=RuntimeError("copy failed"),
         ):
             result = run_workspace_builder_node(state)
@@ -138,10 +138,10 @@ class TestTeardownNode:
         client = MagicMock()
 
         with patch(
-            "src.orchestrator.teardown_node.DockerSandbox",
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.teardown_node.get_docker_client",
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
             return_value=client,
         ):
             result = run_teardown_node(state)
@@ -162,10 +162,10 @@ class TestTeardownNode:
         client = MagicMock()
 
         with patch(
-            "src.orchestrator.teardown_node.get_docker_client",
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
             return_value=client,
         ), patch(
-            "src.orchestrator.teardown_node.DockerSandbox",
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
         ) as mock_sandbox:
             result = run_teardown_node(state)
 
@@ -174,3 +174,14 @@ class TestTeardownNode:
         client.volumes.get.return_value.remove.assert_called_once_with(force=True)
         assert result["changed_files"] == []
         assert result["diff"] == ""
+
+    def test_existing_errors_produce_completed_with_errors_status(self, tmp_path):
+        """Teardown preserves a failed worker outcome in its terminal status."""
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["errors"] = ["worker surrendered"]
+
+        result = run_teardown_node(state)
+
+        assert result["status"] == "completed_with_errors"
+
+

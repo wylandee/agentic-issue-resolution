@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_qa_critic.py - Unit tests for the Phase 5 QA Critic evaluator node.
 
 Mocks DockerSandbox and subprocess so no real Docker or network is required.
@@ -36,7 +36,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     BatchQAResult,
     CommandResult,
     FailureCategory,
@@ -50,7 +50,7 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.qa_critic import (
+from remediation_engine.orchestration.qa_critic import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
     _ODC_CACHE_VOLUME,
@@ -530,7 +530,7 @@ class TestParseReportIdentifiers:
         result = _parse_report_identifiers("not json")
         assert result is None
 
-    @patch("src.orchestrator.qa_critic._parse_report_identifiers")
+    @patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers")
     def test_integration_returns_identifier_set(self, mock_parse):
         """Smoke-test that the function returns a Set[str] of identifiers."""
         mock_parse.return_value = {"CVE-2021-23337", "GHSA-35JH-R3H4-6JV8"}
@@ -602,9 +602,9 @@ class TestRunSecurityScan:
         target = {"CVE-2021-23337"}
         # parse_report_identifiers returns empty set (CVE resolved)
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is True
@@ -616,9 +616,9 @@ class TestRunSecurityScan:
         target = {"CVE-2021-23337"}
         found = {"CVE-2025-10001", "GHSA-AAAA-BBBB-CCCC"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -637,9 +637,9 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         found = {"CVE-2021-23337", "CVE-2025-10001"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -654,9 +654,9 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         found = {"CVE-2025-20002", "CVE-2025-10001"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=found):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -672,15 +672,15 @@ class TestRunSecurityScan:
         target = {"CVE-2021-23337"}
 
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
              patch(
-                 "src.orchestrator.qa_critic._persist_workspace_report_to_host",
+                 "remediation_engine.orchestration.qa_critic._persist_workspace_report_to_host",
                  side_effect=[
                      Path("data/cache/qa_reports/dependency-check-report-1234567890.html"),
                      Path("data/cache/qa_reports/dependency-check-report.json"),
                  ],
              ), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is True
@@ -700,7 +700,7 @@ class TestRunSecurityScan:
     def test_failure_on_timeout(self):
         sandbox = MagicMock()
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc",
+             patch("remediation_engine.orchestration.qa_critic._run_odc",
                    side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=300)):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", {"CVE-2021-23337"})
 
@@ -711,9 +711,9 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers",
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers",
                   return_value={"CVE-2021-23337"}):  # still present
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
@@ -727,10 +727,10 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         target = {"CVE-2021-23337", "GHSA-35JH-R3H4-6JV8"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
              patch(
-                 "src.orchestrator.qa_critic._parse_report_identifiers",
+                 "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
                  return_value={"GHSA-35JH-R3H4-6JV8", "CVE-2021-23337"},
              ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
@@ -745,24 +745,24 @@ class TestRunSecurityScan:
         proc.returncode = 1
         sandbox = MagicMock()
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=proc), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value=None), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=None):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value=None), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=None):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", {"CVE-2021-23337"})
 
         assert ok is False
         assert "parseable" in summary.lower() or "no parseable" in summary.lower()
 
     def test_nonzero_exit_but_parseable_report_continues(self):
-        """ODC exits non-zero but produces a valid report → treat as soft exit."""
+        """ODC exits non-zero but produces a valid report â†’ treat as soft exit."""
         proc = MagicMock()
         proc.returncode = 2  # Dependency-Check warning exit
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc", return_value=proc), \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc), \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         # Should still pass because identifiers are resolved
@@ -868,7 +868,7 @@ class TestScanStateProjection:
 class TestGenerateWorkspaceDiff:
     def test_detects_modified_file(self):
         tmp_path = Path.cwd()
-        rel_path = "src/orchestrator/qa_critic.py"
+        rel_path = "src/remediation_engine/orchestration/qa_critic.py"
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (
             "const x = 2;\n" if path == rel_path else None
@@ -879,10 +879,10 @@ class TestGenerateWorkspaceDiff:
 
     def test_detects_deleted_file(self):
         tmp_path = Path.cwd()
-        rel_path = "src/orchestrator/qa_critic.py"
+        rel_path = "src/remediation_engine/orchestration/qa_critic.py"
 
         sandbox = MagicMock()
-        # read_file returns None → file deleted in workspace
+        # read_file returns None â†’ file deleted in workspace
         sandbox.read_file.return_value = None
         diff_text, changed = _generate_workspace_diff(str(tmp_path), sandbox, [rel_path])
 
@@ -900,8 +900,8 @@ class TestGenerateWorkspaceDiff:
 
     def test_diff_text_is_capped(self):
         tmp_path = Path.cwd()
-        rel_path = "src/orchestrator/qa_critic.py"
-        from src.orchestrator.qa_critic import _DIFF_CHAR_BUDGET
+        rel_path = "src/remediation_engine/orchestration/qa_critic.py"
+        from remediation_engine.orchestration.qa_critic import _DIFF_CHAR_BUDGET
         big_content = "x" * (_DIFF_CHAR_BUDGET * 3)
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (
@@ -912,7 +912,7 @@ class TestGenerateWorkspaceDiff:
 
     def test_optimized_changed_files_path(self):
         tmp_path = Path.cwd()
-        rel_path = "src/orchestrator/qa_critic.py"
+        rel_path = "src/remediation_engine/orchestration/qa_critic.py"
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (
             "const x = 2;\n" if path == rel_path else "const y = 2;\n"
@@ -937,7 +937,7 @@ class TestGenerateWorkspaceDiff:
 
 
 # ---------------------------------------------------------------------------
-# build_qa_toolbelt — toolbelt composition
+# build_qa_toolbelt â€” toolbelt composition
 # ---------------------------------------------------------------------------
 
 
@@ -1015,9 +1015,9 @@ class TestQAExecutionToolGuards:
         sandbox.read_file.return_value = None
 
         with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("src.orchestrator.qa_critic._run_odc") as mock_odc, \
-             patch("src.orchestrator.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("src.orchestrator.qa_critic._parse_report_identifiers", return_value=set()):
+             patch("remediation_engine.orchestration.qa_critic._run_odc") as mock_odc, \
+             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
+             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
             mock_odc.return_value = MagicMock(returncode=0, stdout="", stderr="")
             tools, results = build_qa_toolbelt(
                 sandbox=sandbox,
@@ -1321,7 +1321,7 @@ class TestQueryQaLogs:
 
 
 # ---------------------------------------------------------------------------
-# run_qa_critic_node — agentic loop integration
+# run_qa_critic_node â€” agentic loop integration
 # ---------------------------------------------------------------------------
 
 
@@ -1348,7 +1348,7 @@ def _make_minimal_state(
 
 def _make_loop_result(final_text="# INVESTIGATIVE REPORT\n## Install Analysis\n- Install Status: succeeded", tool_events=None, errors=None):
     """Build a mock SubagentRuntimeResult."""
-    from src.orchestrator.subagent_runtime import SubagentRuntimeResult, ToolEvent
+    from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult, ToolEvent
 
     return SubagentRuntimeResult(
         final_text=final_text,
@@ -1378,10 +1378,10 @@ class TestRunQACriticNode:
     ):
         """
         Return patches for the node's main external dependencies (map-reduce path):
-        - _run_global_execution → returns results
-        - _run_individual_investigations → returns a GroupInvestigation dict
-        - _run_batch_judge → returns batch_result
-        - DockerSandbox → context manager mock
+        - _run_global_execution â†’ returns results
+        - _run_individual_investigations â†’ returns a GroupInvestigation dict
+        - _run_batch_judge â†’ returns batch_result
+        - DockerSandbox â†’ context manager mock
         """
         if group is None:
             group = _make_group()
@@ -1408,19 +1408,19 @@ class TestRunQACriticNode:
 
         return {
             "sandbox": patch(
-                "src.orchestrator.qa_critic.DockerSandbox",
+                "remediation_engine.orchestration.qa_critic.DockerSandbox",
                 return_value=mock_sandbox,
             ),
             "global_exec": patch(
-                "src.orchestrator.qa_critic._run_global_execution",
+                "remediation_engine.orchestration.qa_critic._run_global_execution",
                 return_value=results,
             ),
             "investigators": patch(
-                "src.orchestrator.qa_critic._run_individual_investigations",
+                "remediation_engine.orchestration.qa_critic._run_individual_investigations",
                 return_value=investigations,
             ),
             "judge": patch(
-                "src.orchestrator.qa_critic._run_batch_judge",
+                "remediation_engine.orchestration.qa_critic._run_batch_judge",
                 return_value=batch_result,
             ),
         }
@@ -1524,7 +1524,7 @@ class TestRunQACriticNode:
         )
         mock_sandbox.__exit__ = MagicMock(return_value=None)
 
-        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox):
+        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox):
             result = run_qa_critic_node(state)
 
         assert result["status"] == "qa_failed"
@@ -1568,17 +1568,17 @@ class TestRunQACriticNode:
         mock_sandbox.__exit__ = MagicMock(return_value=None)
         results = _make_fully_populated_results(ok=True)
 
-        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox), \
-             patch("src.orchestrator.qa_critic._run_global_execution", return_value=results), \
-             patch("src.orchestrator.qa_critic._run_individual_investigations", return_value=investigations), \
-             patch("src.orchestrator.qa_critic._run_batch_judge", return_value=batch_result):
+        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox), \
+             patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=results), \
+             patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations), \
+             patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result):
             result = run_qa_critic_node(state)
 
         assert any("max rounds" in e.lower() or "exceeded" in e.lower() for e in result["errors"])
 
 
 # ---------------------------------------------------------------------------
-# Missing execution tools → qa_failed
+# Missing execution tools â†’ qa_failed
 # ---------------------------------------------------------------------------
 
 
@@ -1593,7 +1593,7 @@ class TestQAMissingExecutionTools:
         mock_sandbox.__enter__ = MagicMock(return_value=mock_sandbox)
         mock_sandbox.__exit__ = MagicMock(return_value=None)
 
-        # investigations dict — will not be reached because guardrails fire
+        # investigations dict â€” will not be reached because guardrails fire
         investigations = {
             group.group_id: GroupInvestigation(
                 group_id=group.group_id,
@@ -1607,10 +1607,10 @@ class TestQAMissingExecutionTools:
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
 
-        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sandbox), \
-             patch("src.orchestrator.qa_critic._run_global_execution", return_value=results), \
-             patch("src.orchestrator.qa_critic._run_individual_investigations", return_value=investigations), \
-             patch("src.orchestrator.qa_critic._run_batch_judge", return_value=batch_result):
+        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox), \
+             patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=results), \
+             patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations), \
+             patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result):
             return run_qa_critic_node(state), group
 
     def test_missing_install_returns_qa_failed(self):
@@ -1674,7 +1674,7 @@ class TestExtractGroupEvaluations:
     """The extraction step must call .with_structured_output(QAEvaluation) per group."""
 
     def test_uses_with_structured_output_for_qa_evaluation(self):
-        from src.contracts.schemas import AgentActionSummary, AgentActionStatus
+        from remediation_engine.contracts.schemas import AgentActionSummary, AgentActionStatus
 
         group = _make_group()
         mock_eval = QAEvaluation(task_id=group.group_id, passed=True)
@@ -1728,7 +1728,7 @@ class TestExtractGroupEvaluations:
     def test_uses_cached_execution_results_in_prompt(self):
         """Verify that missing results produce the correct fallback messages."""
         group = _make_group()
-        results = _QAExecutionResults()  # all None — nothing was called
+        results = _QAExecutionResults()  # all None â€” nothing was called
 
         with patch("langchain_openai.ChatOpenAI") as MockChatOpenAI:
             mock_llm_instance = MagicMock()
@@ -1937,7 +1937,7 @@ class TestQAToolsNotInSubagentToolbelts:
     """
 
     def test_run_dependency_install_not_in_update_toolbelt(self):
-        from src.orchestrator.remedy_tools import build_update_toolbelt
+        from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
 
         sandbox = MagicMock()
         tools = build_update_toolbelt(
@@ -1953,7 +1953,7 @@ class TestQAToolsNotInSubagentToolbelts:
         assert "run_unit_tests" not in tool_names
 
     def test_run_dependency_install_not_in_workaround_toolbelt(self):
-        from src.orchestrator.remedy_tools import build_workaround_toolbelt
+        from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
 
         sandbox = MagicMock()
         tools = build_workaround_toolbelt(
@@ -2010,7 +2010,7 @@ class TestRunGlobalExecution:
     def test_calls_install_scan_and_tests_once(self):
         sandbox = MagicMock()
         target_ids = {"CVE-2021-0001"}
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")) as mi,              patch("src.orchestrator.qa_critic._run_security_scan", return_value=(True, "ok", set())) as ms,              patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")) as mt:
+        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")) as mi,              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(True, "ok", set())) as ms,              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")) as mt:
             results = _run_global_execution(sandbox, "vol", target_ids)
         mi.assert_called_once_with(sandbox)
         ms.assert_called_once_with(sandbox, "vol", target_ids)
@@ -2021,7 +2021,7 @@ class TestRunGlobalExecution:
 
     def test_all_three_results_populated(self):
         sandbox = MagicMock()
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(False, "fail")),              patch("src.orchestrator.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(False, "fail")):
+        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(False, "fail")),              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(False, "fail")):
             results = _run_global_execution(sandbox, "vol", set())
         assert results.install is not None
         assert results.scan is not None
@@ -2031,19 +2031,19 @@ class TestRunGlobalExecution:
         sandbox = MagicMock()
         target_ids = {"CVE-2021-0001"}
         baseline_ids = {"CVE-2021-0001", "CVE-2020-0001"}
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(True, "ok")), \
+        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")), \
              patch(
-                 "src.orchestrator.qa_critic._run_security_scan",
+                 "remediation_engine.orchestration.qa_critic._run_security_scan",
                  return_value=_SecurityScanResult(True, "ok", set(), set(), set()),
              ) as scan, \
-             patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "ok")):
+             patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")):
             _run_global_execution(sandbox, "vol", target_ids, baseline_ids)
 
         scan.assert_called_once_with(sandbox, "vol", target_ids, baseline_ids)
 
     def test_tests_run_even_when_install_fails(self):
         sandbox = MagicMock()
-        with patch("src.orchestrator.qa_critic._run_install", return_value=(False, "FAILED")),              patch("src.orchestrator.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("src.orchestrator.qa_critic._run_unit_tests", return_value=(True, "passed.")) as mt:
+        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(False, "FAILED")),              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "passed.")) as mt:
             results = _run_global_execution(sandbox, "vol", set())
         mt.assert_called_once()
         assert results.tests == (True, "passed.")
@@ -2157,7 +2157,7 @@ class TestBuildIndividualInvestigatorPrompt:
 
 class TestRunIndividualInvestigations:
     def _lr(self, text="investigation complete", errors=None):
-        from src.orchestrator.subagent_runtime import SubagentRuntimeResult
+        from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
         return SubagentRuntimeResult(
             final_text=text, tool_events=[], changed_files=[], errors=errors or [],
         )
@@ -2165,8 +2165,8 @@ class TestRunIndividualInvestigations:
     def test_one_investigator_per_group(self):
         g1, g2 = _make_group(group_id="g1"), _make_group(group_id="g2")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("src.orchestrator.qa_critic.run_bounded_subagent_loop",
-                   return_value=self._lr()) as ml,              patch("src.orchestrator.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                   return_value=self._lr()) as ml,              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
             invs = _run_individual_investigations(
                 valid_groups=[g1, g2], group_strategies={}, action_summaries=[],
                 candidate_changed_files=[], sandbox=MagicMock(), repo_root="/tmp",
@@ -2178,8 +2178,8 @@ class TestRunIndividualInvestigations:
     def test_crash_produces_fallback(self):
         group = _make_group(group_id="g1")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("src.orchestrator.qa_critic.run_bounded_subagent_loop",
-                   side_effect=RuntimeError("crash")),              patch("src.orchestrator.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                   side_effect=RuntimeError("crash")),              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
             invs = _run_individual_investigations(
                 valid_groups=[group], group_strategies={}, action_summaries=[],
                 candidate_changed_files=[], sandbox=MagicMock(), repo_root=None,
@@ -2191,8 +2191,8 @@ class TestRunIndividualInvestigations:
     def test_empty_output_triggers_fallback(self):
         group = _make_group(group_id="g1")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("src.orchestrator.qa_critic.run_bounded_subagent_loop",
-                   return_value=self._lr(text="")),              patch("src.orchestrator.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                   return_value=self._lr(text="")),              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
             invs = _run_individual_investigations(
                 valid_groups=[group], group_strategies={}, action_summaries=[],
                 candidate_changed_files=[], sandbox=MagicMock(), repo_root=None,
@@ -2363,7 +2363,7 @@ class TestApplyGuardrails:
 
 
 # ---------------------------------------------------------------------------
-# run_qa_critic_node — map-reduce integration
+# run_qa_critic_node â€” map-reduce integration
 # ---------------------------------------------------------------------------
 
 
@@ -2382,7 +2382,7 @@ class TestRunQACriticNodeMapReduce:
         mock_sb.__enter__ = MagicMock(return_value=mock_sb)
         mock_sb.__exit__ = MagicMock(return_value=None)
         state = _make_minimal_state(groups=groups)
-        with patch("src.orchestrator.qa_critic.DockerSandbox", return_value=mock_sb),              patch("src.orchestrator.qa_critic._run_global_execution", return_value=global_results) as mg,              patch("src.orchestrator.qa_critic._run_individual_investigations", return_value=investigations) as mm,              patch("src.orchestrator.qa_critic._run_batch_judge", return_value=batch_result) as mr:
+        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sb),              patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=global_results) as mg,              patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations) as mm,              patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result) as mr:
             result = run_qa_critic_node(state)
         return result, mg, mm, mr
 
@@ -2430,3 +2430,5 @@ class TestRunQACriticNodeMapReduce:
         invs = {g.group_id: GroupInvestigation(g.group_id, "fallback", "", ["investigator timed out"])}
         result, _, _, _ = self._run([g], investigations=invs)
         assert any("investigator timed out" in e for e in result.get("errors", []))
+
+

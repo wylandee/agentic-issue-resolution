@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from uuid import UUID, uuid4
 from unittest.mock import MagicMock, patch
 
-from src.contracts.schemas import IssueSource, IssueType, Severity, VulnerabilityGroup, VulnerabilityIssue
-from src.orchestrator.langsmith_config import build_phase5_runnable_config, resolve_phase5_trace_url
-from src.orchestrator.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
+from remediation_engine.contracts.schemas import IssueSource, IssueType, Severity, VulnerabilityGroup, VulnerabilityIssue
+from remediation_engine.orchestration.langsmith_config import build_phase5_runnable_config, resolve_phase5_trace_url
+from remediation_engine.orchestration.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
 
 
 def _group() -> VulnerabilityGroup:
@@ -61,8 +61,8 @@ class TestPhase5LangsmithConfig:
 
 
 class TestPhase5TraceUrlResolution:
-    @patch("src.orchestrator.langsmith_config.wait_for_all_tracers")
-    @patch("src.orchestrator.langsmith_config.Client")
+    @patch("remediation_engine.orchestration.langsmith_config.wait_for_all_tracers")
+    @patch("remediation_engine.orchestration.langsmith_config.Client")
     def test_resolve_phase5_trace_url_returns_url(self, mock_client_cls, mock_wait, monkeypatch):
         monkeypatch.setenv("LANGSMITH_PROJECT", "AppSec-Remediation-Engine")
         run_id = uuid4()
@@ -81,8 +81,8 @@ class TestPhase5TraceUrlResolution:
             project_name="AppSec-Remediation-Engine",
         )
 
-    @patch("src.orchestrator.langsmith_config.wait_for_all_tracers")
-    @patch("src.orchestrator.langsmith_config.Client")
+    @patch("remediation_engine.orchestration.langsmith_config.wait_for_all_tracers")
+    @patch("remediation_engine.orchestration.langsmith_config.Client")
     def test_resolve_phase5_trace_url_returns_none_when_lookup_fails(
         self,
         mock_client_cls,
@@ -97,8 +97,8 @@ class TestPhase5TraceUrlResolution:
         assert result is None
         mock_wait.assert_called_once_with()
 
-    @patch("src.orchestrator.langsmith_config.wait_for_all_tracers")
-    @patch("src.orchestrator.langsmith_config.Client")
+    @patch("remediation_engine.orchestration.langsmith_config.wait_for_all_tracers")
+    @patch("remediation_engine.orchestration.langsmith_config.Client")
     def test_resolve_phase5_trace_url_returns_none_when_url_build_fails(
         self,
         mock_client_cls,
@@ -114,3 +114,5 @@ class TestPhase5TraceUrlResolution:
 
         assert result is None
         mock_wait.assert_called_once_with()
+
+

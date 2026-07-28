@@ -1,11 +1,11 @@
-"""Regression tests for the Supervisor-owned post-QA triage handoff."""
+﻿"""Regression tests for the Supervisor-owned post-QA triage handoff."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
 from uuid import uuid4
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -18,18 +18,18 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.graph import (
+from remediation_engine.orchestration.graph import (
     _post_triage_issue_input,
     build_orchestrator_graph,
     post_qa_triage_node,
     run_qa_critic_from_orchestrator,
 )
-from src.orchestrator.state import initial_orchestrator_state
-from src.orchestrator.supervisor_node import (
+from remediation_engine.orchestration.state import initial_orchestrator_state
+from remediation_engine.orchestration.supervisor_node import (
     _deterministic_routing,
     supervisor_router,
 )
-from src.orchestrator.task_utils import build_initial_remediation_task
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
 def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityIssue:
@@ -124,7 +124,7 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     )
 
     with patch(
-        "src.orchestrator.graph.run_triage_pipeline",
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
         return_value=[
             (candidate_unchanged, _triage_result(candidate_unchanged)),
             (changed_candidate, _triage_result(changed_candidate)),
@@ -183,7 +183,7 @@ def test_qa_wrapper_propagates_scan_snapshot_and_marks_triage_required():
     post_issue = _issue("CVE-2026-0002")
 
     with patch(
-        "src.orchestrator.graph.run_qa_critic_node",
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
         return_value={
             "qa_evaluations": {},
             "eval_status": "all_passed",
@@ -246,15 +246,15 @@ def test_graph_routes_qa_through_supervisor_to_triage_and_back():
 
     with (
         patch(
-            "src.orchestrator.graph.run_workspace_builder_node",
+            "remediation_engine.orchestration.graph.run_workspace_builder_node",
             return_value={"status": "workspace_ready", "workspace_volume": "vol"},
         ),
         patch(
-            "src.orchestrator.graph.run_supervisor_node",
+            "remediation_engine.orchestration.graph.run_supervisor_node",
             side_effect=supervisor_side_effect,
         ),
         patch(
-            "src.orchestrator.graph.run_qa_critic_from_orchestrator",
+            "remediation_engine.orchestration.graph.run_qa_critic_from_orchestrator",
             return_value={
                 "status": "qa_completed",
                 "triage_required": True,
@@ -265,11 +265,11 @@ def test_graph_routes_qa_through_supervisor_to_triage_and_back():
             },
         ),
         patch(
-            "src.orchestrator.graph.run_triage_pipeline",
+            "remediation_engine.orchestration.graph.run_triage_pipeline",
             return_value=[(post_group, _triage_result(post_group))],
         ) as triage_pipeline,
         patch(
-            "src.orchestrator.graph.run_teardown_node",
+            "remediation_engine.orchestration.graph.run_teardown_node",
             return_value={"status": "completed", "workspace_volume": None},
         ),
     ):
@@ -278,3 +278,5 @@ def test_graph_routes_qa_through_supervisor_to_triage_and_back():
     assert supervisor_calls["count"] == 3
     assert triage_pipeline.call_count == 1
     assert result["status"] == "completed"
+
+

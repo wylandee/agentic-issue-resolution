@@ -1,13 +1,13 @@
-"""
-tests/test_triage_agent.py — Unit tests for src/triage/agent.py.
+﻿"""
+tests/test_triage_agent.py â€” Unit tests for remediation_engine.triage.agent.
 
 Covers:
-- Deterministic path with no LLM → valid TriageResult, triage_method="deterministic"
-- KEV group → revised_priority clamped to CRITICAL regardless of input
-- EPSS ≥ 0.5 group → revised_priority at least HIGH
-- Mock LLM returns LOW priority for KEV group → guardrail clamps to CRITICAL
-- Dev-scope false positive → is_valid=False only with dev/test env + paths
-- No evidence group → is_valid=True (optimistic default)
+- Deterministic path with no LLM â†’ valid TriageResult, triage_method="deterministic"
+- KEV group â†’ revised_priority clamped to CRITICAL regardless of input
+- EPSS â‰¥ 0.5 group â†’ revised_priority at least HIGH
+- Mock LLM returns LOW priority for KEV group â†’ guardrail clamps to CRITICAL
+- Dev-scope false positive â†’ is_valid=False only with dev/test env + paths
+- No evidence group â†’ is_valid=True (optimistic default)
 - Original HIGH severity clamps baseline to at least HIGH
 """
 
@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     CVEEnrichment,
     IssueSource,
     IssueType,
@@ -29,7 +29,7 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.triage.agent import _build_triage_prompt, run_triage
+from remediation_engine.triage.agent import _build_triage_prompt, run_triage
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +146,11 @@ class TestDeterministicTriage:
         assert result.is_valid is True  # KEV overrides any FP decision
 
     def test_kev_in_staging_falls_through_to_epss_rule(self):
-        """In staging, KEV alone does not force CRITICAL; EPSS 0.9 ≥ 0.36 clamps to HIGH."""
+        """In staging, KEV alone does not force CRITICAL; EPSS 0.9 â‰¥ 0.36 clamps to HIGH."""
         issue = _issue(severity=Severity.MEDIUM)
         group = _group(issue, enrichment=_kev_enrichment())  # epss=0.9, in_kev=True
         result = run_triage(group, _context(environment="staging"))
-        # Not production → KEV rule skipped; EPSS 0.9 ≥ 0.36 rule fires → at least HIGH
+        # Not production â†’ KEV rule skipped; EPSS 0.9 â‰¥ 0.36 rule fires â†’ at least HIGH
         assert result.revised_priority in (Severity.HIGH, Severity.CRITICAL)
 
     def test_high_epss_clamps_to_at_least_high(self):
@@ -223,7 +223,7 @@ class TestDevScopeFalsePositive:
         assert result.false_positive_reason is not None
 
     def test_dev_env_but_prod_path_stays_valid(self):
-        """Dev environment alone is not enough — the file paths must also be dev/test."""
+        """Dev environment alone is not enough â€” the file paths must also be dev/test."""
         issue = _issue(file_path="src/utils.js")  # Not a dev path
         group = _group(issue)
         result = run_triage(group, _context(environment="dev"))
@@ -278,7 +278,7 @@ class TestLLMGuardrails:
 
         llm_result = self._make_llm_result(group, Severity.LOW)
 
-        with patch("src.triage.agent._llm_triage", return_value=llm_result):
+        with patch("remediation_engine.triage.agent._llm_triage", return_value=llm_result):
             result = run_triage(group, _context())
 
         assert result.revised_priority == Severity.CRITICAL
@@ -292,7 +292,7 @@ class TestLLMGuardrails:
         group = _group(issue, enrichment=_epss_enrichment(epss=0.1))
         llm_result = self._make_llm_result(group, Severity.MEDIUM)
 
-        with patch("src.triage.agent._llm_triage", return_value=llm_result):
+        with patch("remediation_engine.triage.agent._llm_triage", return_value=llm_result):
             result = run_triage(group, _context())
 
         assert result.revised_priority == Severity.MEDIUM
@@ -306,7 +306,7 @@ class TestLLMGuardrails:
         issue = _issue(severity=Severity.HIGH)
         group = _group(issue)
 
-        with patch("src.triage.agent._llm_triage", return_value=None):
+        with patch("remediation_engine.triage.agent._llm_triage", return_value=None):
             result = run_triage(group, _context())
 
         assert result.triage_method == "deterministic"
@@ -352,3 +352,5 @@ class TestTriagePrompt:
             "Always return original_severity, revised_priority, is_unreachable_code, validity_confidence_score, and priority_confidence_score."
             in prompt
         )
+
+

@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.contracts.schemas import IssueSource, IssueType, VulnerabilityGroup, VulnerabilityIssue
-from src.triage.reachability import analyze_reachability
+from remediation_engine.contracts.schemas import IssueSource, IssueType, VulnerabilityGroup, VulnerabilityIssue
+from remediation_engine.triage.reachability import analyze_reachability
 
 
 def _sca_issue(package_name: str) -> VulnerabilityIssue:
@@ -38,19 +38,19 @@ def test_analyze_reachability_distinguishes_direct_and_transitive(monkeypatch, t
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("src.triage.reachability.language_for_path", lambda _: object())
+    monkeypatch.setattr("remediation_engine.triage.reachability.language_for_path", lambda _: object())
     monkeypatch.setattr(
-        "src.triage.reachability.load_source_bytes",
+        "remediation_engine.triage.reachability.load_source_bytes",
         lambda path: path.read_bytes(),
     )
     monkeypatch.setattr(
-        "src.triage.reachability.parse_source",
+        "remediation_engine.triage.reachability.parse_source",
         lambda source_bytes, language: SimpleNamespace(
             root_node=source_bytes.decode("utf-8")
         ),
     )
     monkeypatch.setattr(
-        "src.triage.reachability.extract_imports",
+        "remediation_engine.triage.reachability.extract_imports",
         lambda root_node, source_bytes: (
             ['import lodash from "lodash";']
             if "use_lodash" in root_node
@@ -82,9 +82,9 @@ def test_analyze_reachability_continues_after_parse_failure(monkeypatch, tmp_pat
     (tmp_path / "src" / "broken.js").write_text("broken", encoding="utf-8")
     (tmp_path / "src" / "ok.js").write_text("ok", encoding="utf-8")
 
-    monkeypatch.setattr("src.triage.reachability.language_for_path", lambda _: object())
+    monkeypatch.setattr("remediation_engine.triage.reachability.language_for_path", lambda _: object())
     monkeypatch.setattr(
-        "src.triage.reachability.load_source_bytes",
+        "remediation_engine.triage.reachability.load_source_bytes",
         lambda path: path.read_bytes(),
     )
 
@@ -94,9 +94,9 @@ def test_analyze_reachability_continues_after_parse_failure(monkeypatch, tmp_pat
             raise RuntimeError("parse failed")
         return SimpleNamespace(root_node=marker)
 
-    monkeypatch.setattr("src.triage.reachability.parse_source", _parse)
+    monkeypatch.setattr("remediation_engine.triage.reachability.parse_source", _parse)
     monkeypatch.setattr(
-        "src.triage.reachability.extract_imports",
+        "remediation_engine.triage.reachability.extract_imports",
         lambda root_node, source_bytes: ['import lodash from "lodash";']
         if root_node == "ok"
         else [],
@@ -107,3 +107,5 @@ def test_analyze_reachability_continues_after_parse_failure(monkeypatch, tmp_pat
 
     assert groups[0].is_reachable is True
     assert groups[1].is_reachable is False
+
+

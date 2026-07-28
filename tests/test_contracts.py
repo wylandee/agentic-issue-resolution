@@ -1,5 +1,5 @@
-"""
-Tests for src/contracts/schemas.py
+﻿"""
+Tests for remediation_engine.contracts.schemas.
 
 Coverage goals
 --------------
@@ -21,7 +21,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from src.contracts import (
+from remediation_engine.contracts import (
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
@@ -44,7 +44,7 @@ from src.contracts import (
     FixPlan,
     FixPlanStatus,
 )
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     CWEEntry,
     FailingTest,
     LineRange,
@@ -684,7 +684,7 @@ class TestTrajectoryEvent:
 
 
 class TestEndToEndSASTTrajectory:
-    """Simulate the full ingest→localize→apply→validate→deliver pipeline."""
+    """Simulate the full ingestâ†’localizeâ†’applyâ†’validateâ†’deliver pipeline."""
 
     def test_full_trajectory(self):
         # 1. Ingest
@@ -939,3 +939,5 @@ class TestFixPlan:
                 instruction="No fix available",
                 strategy_used="none",
             )
+
+

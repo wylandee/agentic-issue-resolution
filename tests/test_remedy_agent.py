@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_remedy_agent.py - Unit tests for Phase 5 specialist subagent wrappers.
 """
 
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage
 
-from src.contracts.schemas import (
+from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     FixPlan,
     FixPlanStatus,
@@ -20,17 +20,17 @@ from src.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from src.orchestrator.state import (
+from remediation_engine.orchestration.state import (
     _derive_legacy_task_from_group,
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
-from src.orchestrator.update_subagent import (
+from remediation_engine.orchestration.update_subagent import (
     _build_update_prompt,
     run_update_subagent_node,
 )
-from src.orchestrator.graph import post_qa_triage_node
-from src.orchestrator.workaround_subagent import (
+from remediation_engine.orchestration.graph import post_qa_triage_node
+from remediation_engine.orchestration.workaround_subagent import (
     _build_workaround_prompt,
     run_workaround_subagent_node,
 )
@@ -46,7 +46,7 @@ def _sca_group(group_id: str = "sca:package.json:lodash", manifest_file: str = "
         package_version="4.17.15",
         file_path=manifest_file,
     )
-    from src.contracts.schemas import LocalizedIssue
+    from remediation_engine.contracts.schemas import LocalizedIssue
 
     return VulnerabilityGroup(
         group_id=group_id,
@@ -234,17 +234,17 @@ class TestUpdateSubagentWrapper:
         tool_validate.name = "validate_manifest_sync"
         tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json, frontend/package.json."
 
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
+        with patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "remediation_engine.orchestration.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
             side_effect=[
                 (["package.json"], []),
                 (["frontend/package.json"], []),
             ],
         ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
+            "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
             return_value=[tool_edit, tool_validate],
         ):
             result = run_update_subagent_node(state)
@@ -280,14 +280,14 @@ class TestUpdateSubagentWrapper:
         tool_edit.name = "modify_npm_dependency"
         tool_edit.invoke.return_value = "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
 
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
+        with patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "remediation_engine.orchestration.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
             return_value=(["package.json"], []),
         ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
+            "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
             return_value=[tool_edit],
         ):
             result = run_update_subagent_node(state)
@@ -350,14 +350,14 @@ class TestUpdateSubagentWrapper:
         tool_validate.name = "validate_manifest_sync"
         tool_validate.invoke.return_value = "SUCCESS: Manifest synchronization succeeded for package.json."
 
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
+        with patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "remediation_engine.orchestration.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
             return_value=(["package.json"], []),
         ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
+            "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
             return_value=[tool_edit, tool_validate],
         ):
             result = run_update_subagent_node(state)
@@ -367,9 +367,9 @@ class TestUpdateSubagentWrapper:
         assert "Latest candidate was 4.17.21" in diagnostics.reasoning_summary
 
     def test_reverted_package_update_status_becomes_surrender(self):
-        from src.contracts.schemas import AgentActionStatus, RemediationTask, RoutingStrategy
-        from src.orchestrator.subagent_runtime import ToolEvent
-        from src.orchestrator.update_subagent import _build_action_summaries
+        from remediation_engine.contracts.schemas import AgentActionStatus, RemediationTask, RoutingStrategy
+        from remediation_engine.orchestration.subagent_runtime import ToolEvent
+        from remediation_engine.orchestration.update_subagent import _build_action_summaries
         group = _sca_group()
         task = RemediationTask(
             task_id=group.group_id,
@@ -410,7 +410,7 @@ class TestUpdateSubagentWrapper:
         state["target_tasks"][0].instruction = (
             'Add or update "overrides": {"lodash": "4.17.22"} in package.json.'
         )
-        from src.orchestrator.update_subagent import UpdateRetryDiagnostics
+        from remediation_engine.orchestration.update_subagent import UpdateRetryDiagnostics
         state["retry_diagnostics_by_task"] = {
             group.group_id: UpdateRetryDiagnostics(
                 task_id=group.group_id,
@@ -420,17 +420,17 @@ class TestUpdateSubagentWrapper:
 
         llm = MagicMock()
         sandbox = _sandbox_mock()
-        with patch("src.orchestrator.update_subagent.ChatOpenAI", return_value=llm), patch(
-            "src.orchestrator.update_subagent.DockerSandbox",
+        with patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm), patch(
+            "remediation_engine.orchestration.update_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.update_subagent._resolve_manifest_targets",
+            "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
             return_value=(["package.json"], []),
         ), patch(
-            "src.orchestrator.update_subagent.build_update_toolbelt",
+            "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
             return_value=[],
         ) as mock_toolbelt, patch(
-            "src.orchestrator.update_subagent.run_bounded_subagent_loop",
+            "remediation_engine.orchestration.update_subagent.run_bounded_subagent_loop",
         ) as mock_loop:
             mock_loop.return_value = MagicMock(changed_files=[], tool_events=[], final_text="done", errors=[])
             run_update_subagent_node(state)
@@ -440,9 +440,9 @@ class TestUpdateSubagentWrapper:
             assert kwargs["override_required_packages"] == {"lodash"}
 
     def test_build_action_summaries_marks_surrender_for_unmodified_package_even_when_batch_succeeded(self):
-        from src.contracts.schemas import AgentActionStatus
-        from src.orchestrator.subagent_runtime import ToolEvent
-        from src.orchestrator.update_subagent import _build_action_summaries
+        from remediation_engine.contracts.schemas import AgentActionStatus
+        from remediation_engine.orchestration.subagent_runtime import ToolEvent
+        from remediation_engine.orchestration.update_subagent import _build_action_summaries
         group1 = _sca_group()
         group2 = _sca_group()
         group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
@@ -473,9 +473,9 @@ class TestUpdateSubagentWrapper:
         assert summaries[1].status == AgentActionStatus.SURRENDER
 
     def test_build_action_summaries_keeps_validated_package_successful_even_when_batch_fails(self):
-        from src.contracts.schemas import AgentActionStatus
-        from src.orchestrator.subagent_runtime import ToolEvent
-        from src.orchestrator.update_subagent import _build_action_summaries
+        from remediation_engine.contracts.schemas import AgentActionStatus
+        from remediation_engine.orchestration.subagent_runtime import ToolEvent
+        from remediation_engine.orchestration.update_subagent import _build_action_summaries
 
         group1 = _sca_group()
         group2 = _sca_group()
@@ -602,12 +602,12 @@ class TestUpdateSubagentWrapper:
         tool_validate.invoke.return_value = "SUCCESS: Syntax validation passed for routes/login.ts."
 
         with patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "false"}), patch(
-            "src.orchestrator.workaround_subagent.ChatOpenAI", return_value=llm
+            "remediation_engine.orchestration.workaround_subagent.ChatOpenAI", return_value=llm
         ), patch(
-            "src.orchestrator.workaround_subagent.DockerSandbox",
+            "remediation_engine.orchestration.workaround_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.workaround_subagent.build_workaround_toolbelt",
+            "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
             return_value=[tool_search, tool_edit, tool_validate],
         ):
             result = run_workaround_subagent_node(state)
@@ -648,12 +648,12 @@ class TestUpdateSubagentWrapper:
         )
 
         with patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "false"}), patch(
-            "src.orchestrator.workaround_subagent.ChatOpenAI", return_value=llm
+            "remediation_engine.orchestration.workaround_subagent.ChatOpenAI", return_value=llm
         ), patch(
-            "src.orchestrator.workaround_subagent.DockerSandbox",
+            "remediation_engine.orchestration.workaround_subagent.DockerSandbox",
             return_value=sandbox,
         ), patch(
-            "src.orchestrator.workaround_subagent.build_workaround_toolbelt",
+            "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
             return_value=[tool_validate],
         ):
             result = run_workaround_subagent_node(state)
@@ -685,3 +685,5 @@ class TestUpdateSubagentWrapper:
         with patch.dict(os.environ, {"REMEDY_DISABLE_RETRIAGE": "1"}):
             res = post_qa_triage_node(state)
         assert res["status"] == "triage_skipped"
+
+

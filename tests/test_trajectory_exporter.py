@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
-from src.orchestrator.trajectory_exporter import (
+from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
     default_trajectory_dir,
     export_phase5_trajectory,
@@ -68,8 +68,8 @@ def test_fetch_langsmith_spans_queries_by_trace_id(monkeypatch):
             raise AssertionError("read_run should not be needed when list_runs returns spans")
 
     fake_client = FakeClient()
-    monkeypatch.setattr("src.orchestrator.trajectory_exporter.Client", lambda: fake_client)
-    monkeypatch.setattr("src.orchestrator.trajectory_exporter.wait_for_all_tracers", lambda: None)
+    monkeypatch.setattr("remediation_engine.orchestration.trajectory_exporter.Client", lambda: fake_client)
+    monkeypatch.setattr("remediation_engine.orchestration.trajectory_exporter.wait_for_all_tracers", lambda: None)
 
     spans = fetch_langsmith_spans("trace-123")
 
@@ -218,7 +218,7 @@ def test_langsmith_spans_are_preferred_and_rendered(tmp_path, monkeypatch):
         },
     ]
     monkeypatch.setattr(
-        "src.orchestrator.trajectory_exporter.fetch_langsmith_spans",
+        "remediation_engine.orchestration.trajectory_exporter.fetch_langsmith_spans",
         lambda _trace_id: spans,
     )
 
@@ -248,7 +248,7 @@ def test_langsmith_retrieval_failure_writes_local_fallback_warning(tmp_path, mon
         inputs={"status": "pending"},
     )
     monkeypatch.setattr(
-        "src.orchestrator.trajectory_exporter.fetch_langsmith_spans",
+        "remediation_engine.orchestration.trajectory_exporter.fetch_langsmith_spans",
         lambda _trace_id: (_ for _ in ()).throw(RuntimeError("trace unavailable")),
     )
 
@@ -290,3 +290,5 @@ def test_repeated_runs_create_separate_files(tmp_path, monkeypatch):
     assert first != second
     assert first.exists() and second.exists()
     assert len(list(tmp_path.glob("*.md"))) == 2
+
+
