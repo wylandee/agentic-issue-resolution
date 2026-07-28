@@ -1,13 +1,14 @@
-﻿"""
+"""
 Shared bounded ReAct runtime for Phase 5 specialist subagents.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
 from remediation_engine.orchestration.trajectory_exporter import (
     invoke_with_trajectory,
@@ -15,6 +16,7 @@ from remediation_engine.orchestration.trajectory_exporter import (
 
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
 SANDBOX_NOT_RUNNING_MARKER = "Sandbox is not running,"
+STAGNATION_REPETITION_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,45 @@ def _invoke_bound_tool(tool_map: Dict[str, Any], tool_call: Dict[str, Any]) -> T
     return ToolMessage(content=content, tool_call_id=tool_call_id, name=tool_name)
 
 
+def _tool_call_signature(tool_call: Dict[str, Any]) -> tuple[str, str]:
+    """Return a stable signature for comparing repeated tool calls."""
+    tool_name = str(tool_call.get("name", ""))
+    tool_args = tool_call.get("args", {}) or {}
+    try:
+        serialized_args = json.dumps(tool_args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        serialized_args = repr(tool_args)
+    return tool_name, serialized_args
+
+
+def _is_failed_tool_result(content: str) -> bool:
+    """Return whether a tool response indicates that the requested operation failed."""
+    lowered = content.lstrip().lower()
+    return lowered.startswith(("error:", "not found:", "failed:", "failure:"))
+
+
+def _stagnation_recovery_instruction(tool_name: str, tool_args: Dict[str, Any]) -> str:
+    """Build a recovery instruction after a repeated failed tool call."""
+    if tool_name == "inspect_ast_symbol":
+        symbol_name = str(tool_args.get("symbol_name", "the requested symbol"))
+        return (
+            "Recovery instruction: inspect_ast_symbol has failed repeatedly for "
+            f"'{symbol_name}'. Do not repeat the same call. This tool accepts a "
+            "declared function, class, or method name; an imported identifier or "
+            "package binding is not an AST symbol. Use search_codebase_pattern to "
+            "find the call site, then inspect the enclosing declared symbol, or "
+            "use read_workspace_file and document the fallback in record_plan. "
+            "Continue the investigation and make progress toward the fix."
+        )
+
+    return (
+        "Recovery instruction: the same tool call has failed repeatedly. Do not "
+        "repeat it with the same arguments. Choose a different valid tool or "
+        "arguments, use the available search/read tools to gather the missing "
+        "context, and continue the investigation toward a complete fix."
+    )
+
+
 def run_bounded_subagent_loop(
     llm: Any,
     tools: Sequence[Any],
@@ -93,6 +134,8 @@ def run_bounded_subagent_loop(
     final_text = ""
     errors: List[str] = []
     observed_changed_files = set(touched_files)
+    failed_tool_call_counts: Dict[tuple[str, str], int] = {}
+    recovery_signatures: Set[tuple[str, str]] = set()
 
     for _ in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
         response = invoke_with_trajectory(
@@ -117,6 +160,7 @@ def run_bounded_subagent_loop(
                 errors=errors,
             )
 
+        recovery_instruction: str | None = None
         for tool_call in tool_calls:
             tool_message = _invoke_bound_tool(tool_map, tool_call)
             conversation.append(tool_message)
@@ -126,6 +170,21 @@ def run_bounded_subagent_loop(
                 content=tool_message.content,
             )
             tool_events.append(event)
+
+            call_signature = _tool_call_signature(tool_call)
+            if _is_failed_tool_result(tool_message.content):
+                failed_tool_call_counts[call_signature] = failed_tool_call_counts.get(call_signature, 0) + 1
+                if (
+                    failed_tool_call_counts[call_signature] >= STAGNATION_REPETITION_THRESHOLD
+                    and call_signature not in recovery_signatures
+                ):
+                    recovery_instruction = _stagnation_recovery_instruction(
+                        event.name,
+                        event.args,
+                    )
+                    recovery_signatures.add(call_signature)
+            else:
+                failed_tool_call_counts.pop(call_signature, None)
 
             inferred_path = _infer_changed_file(event)
             if inferred_path:
@@ -148,6 +207,9 @@ def run_bounded_subagent_loop(
                     changed_files=sorted(observed_changed_files | set(touched_files)),
                     errors=errors,
                 )
+
+        if recovery_instruction:
+            conversation.append(HumanMessage(content=recovery_instruction))
 
     errors.append(
         "Subagent exceeded the maximum tool-call rounds without reaching a final answer."
@@ -178,6 +240,37 @@ def has_successful_validation_after_last_edit(
         if event.name == validation_tool_name and event.content.startswith("SUCCESS:"):
             return True
     return False
+
+
+def has_all_modified_files_validated_after_last_edit(
+    tool_events: Sequence[ToolEvent],
+    edit_tool_name: str = "deterministic_search_replace",
+    validation_tool_name: str = "validate_code_syntax",
+) -> bool:
+    """Return whether every file modified by a successful edit had a successful syntax validation after its last edit."""
+    last_edit_by_file: Dict[str, int] = {}
+    for index, event in enumerate(tool_events):
+        if event.name == edit_tool_name and event.content.startswith("SUCCESS:"):
+            file_path = event.args.get("file_path")
+            if isinstance(file_path, str) and file_path.strip():
+                norm_path = file_path.replace("\\", "/").strip()
+                last_edit_by_file[norm_path] = index
+
+    if not last_edit_by_file:
+        return False
+
+    for norm_path, last_edit_idx in last_edit_by_file.items():
+        validated = False
+        for event in tool_events[last_edit_idx + 1:]:
+            if event.name == validation_tool_name and event.content.startswith("SUCCESS:"):
+                val_path = event.args.get("file_path")
+                if not val_path or val_path.replace("\\", "/").strip() == norm_path:
+                    validated = True
+                    break
+        if not validated:
+            return False
+
+    return True
 
 
 def has_single_final_successful_validation(

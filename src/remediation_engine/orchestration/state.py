@@ -1,4 +1,4 @@
-﻿"""
+"""
 state.py - LangGraph state schemas for the AppSec Remediation Engine.
 
 ``OrchestratorState`` - supervisor master state for the hub-and-spoke remedy
@@ -43,6 +43,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     UpdateRetryDiagnostics,
     TaskAttemptSnapshot,
+    WorkaroundReplayPlan,
     WorkerAttemptResult,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -304,6 +305,9 @@ class OrchestratorState(TypedDict, total=False):
     retry_plans_by_task: Annotated[
         Dict[str, SupervisorRetryPlan], replace_dict_reducer
     ]
+    workaround_replay_plans_by_task: Annotated[
+        Dict[str, WorkaroundReplayPlan], replace_dict_reducer
+    ]
     attempt_snapshots_by_id: Annotated[
         Dict[str, TaskAttemptSnapshot], merge_dict_reducer
     ]
@@ -367,6 +371,7 @@ class SubagentState(TypedDict, total=False):
     feedback_by_task: Dict[str, str]
     previous_action_summaries_by_task: Dict[str, str]
     retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics]
+    workaround_replay_plans_by_task: Dict[str, WorkaroundReplayPlan]
     target_attempt_snapshots: Dict[str, TaskAttemptSnapshot]
 
     target_task: RemediationTask
@@ -374,6 +379,7 @@ class SubagentState(TypedDict, total=False):
     attempt_snapshot: Optional[TaskAttemptSnapshot]
     constraints_ledger: List[str]
     previous_feedback: Optional[str]
+    current_replay_plan: Optional[WorkaroundReplayPlan]
 
     messages: Annotated[List[AnyMessage], add_messages]
 
@@ -530,6 +536,7 @@ def initial_workaround_subagent_state(
     constraints_ledger: Optional[List[str]] = None,
     previous_feedback: Optional[str] = None,
     attempt_snapshot: Optional[TaskAttemptSnapshot] = None,
+    current_replay_plan: Optional[WorkaroundReplayPlan] = None,
 ) -> Dict[str, Any]:
     """
     Build a well-formed single-task workaround ``SubagentState`` dict.
@@ -557,6 +564,7 @@ def initial_workaround_subagent_state(
         "constraints_ledger": constraints_list,
         "previous_feedback": previous_feedback,
         "attempt_snapshot": attempt_snapshot,
+        "current_replay_plan": current_replay_plan,
         "messages": [],
         "changed_files": [],
         "errors": [],

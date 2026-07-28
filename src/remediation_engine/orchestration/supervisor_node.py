@@ -1,4 +1,4 @@
-﻿"""
+"""
 supervisor_node.py - Agentic Supervisor Node for Phase 5 hub-and-spoke orchestration.
 
 Phase 2 architecture: High-Level Commander
@@ -56,6 +56,7 @@ from remediation_engine.contracts.schemas import (
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
+    WorkaroundReplayPlan,
     WorkerAttemptResult,
     VulnerabilityGroup,
 )
@@ -2472,6 +2473,9 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
         state.get("retry_plans_by_task", {})
     )
+    workaround_replay_plans_by_task: Dict[str, WorkaroundReplayPlan] = dict(
+        state.get("workaround_replay_plans_by_task", {})
+    )
     attempt_snapshots_by_id: Dict[str, TaskAttemptSnapshot] = dict(
         state.get("attempt_snapshots_by_id", {})
     )
@@ -2700,6 +2704,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     ),
                 }
             )
+            if result.replay_plan is not None:
+                workaround_replay_plans_by_task[task_id] = result.replay_plan
             if result_status == AgentActionStatus.SUCCESS:
                 # Keep a successful attempt open because QA must evaluate the
                 # exact snapshot that produced the changes.
@@ -3972,6 +3978,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "valid_groups": valid_groups,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "retry_plans_by_task": retry_plans_by_task,
+        "workaround_replay_plans_by_task": workaround_replay_plans_by_task,
         "attempt_snapshots_by_id": attempt_snapshots_by_id,
         "worker_results_by_attempt": worker_results_by_attempt,
         "qa_results_by_attempt": qa_results_by_attempt,

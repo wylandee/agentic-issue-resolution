@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pydantic v2 schemas for the Agentic AppSec Remediation Engine.
 
 Design principles
@@ -1344,6 +1344,31 @@ class WorkerExecutionDiagnostics(BaseModel):
     failure_reason: str = ""
 
 
+class WorkaroundEdit(BaseModel):
+    """Recorded deterministic search-replace edit for workaround replay."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    file_path: str = Field(..., min_length=1)
+    old_text: str = Field(...)
+    new_text: str = Field(...)
+    symbol_name: Optional[str] = None
+    edit_index: int = Field(default=0, ge=0)
+    timestamp: str = Field(default="")
+
+
+class WorkaroundReplayPlan(BaseModel):
+    """Cumulative replay plan for workaround retries."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(..., min_length=1)
+    pre_attempt_snapshots: Dict[str, str] = Field(default_factory=dict)
+    successful_edits: List[WorkaroundEdit] = Field(default_factory=list)
+    investigation_findings: Dict[str, Any] = Field(default_factory=dict)
+    source_attempt_id: str = Field(default="")
+
+
 class WorkerAttemptResult(BaseModel):
     """Worker result correlated to the supervisor's committed attempt."""
 
@@ -1360,6 +1385,7 @@ class WorkerAttemptResult(BaseModel):
         default_factory=WorkerExecutionDiagnostics
     )
     instruction_digest: str = Field(..., min_length=1)
+    replay_plan: Optional[WorkaroundReplayPlan] = None
     errors: List[str] = Field(default_factory=list)
 
 

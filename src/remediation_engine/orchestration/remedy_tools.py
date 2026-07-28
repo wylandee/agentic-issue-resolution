@@ -1,4 +1,4 @@
-﻿"""
+"""
 remedy_tools.py - Specialized native workspace tools for Phase 5 subagents.
 """
 
@@ -448,6 +448,7 @@ def _make_validate_manifest_sync_tool(
 def _make_deterministic_search_replace_tool(
     sandbox: DockerSandbox,
     touched_files: Set[str],
+    plan_state: Optional[Dict[str, bool]] = None,
 ):
     @tool
     def deterministic_search_replace(
@@ -458,6 +459,11 @@ def _make_deterministic_search_replace_tool(
         """
         Apply an exact one-time search/replace to a workspace file.
         """
+        if plan_state is not None and not plan_state.get("recorded", False):
+            return (
+                "ERROR: You MUST call record_plan before making any code edits with deterministic_search_replace."
+            )
+
         try:
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
@@ -595,8 +601,12 @@ def _make_inspect_ast_symbol_tool(sandbox: DockerSandbox):
 
         if result is None:
             return (
-                f"NOT FOUND: Symbol '{symbol_name}' not found in '{rel_path}'. "
-                "Use search_codebase_pattern to locate the correct file."
+                f"NOT FOUND: No declared function, class, or method named "
+                f"'{symbol_name}' was found in '{rel_path}'. Do not retry the "
+                "same symbol. Imported identifiers and package names are not "
+                "AST symbols. Use search_codebase_pattern to find the relevant "
+                "call site, then inspect its enclosing declared symbol, or use "
+                "read_workspace_file and document the fallback in record_plan."
             )
 
         node_text = result["text"]
@@ -706,29 +716,33 @@ def build_workaround_toolbelt(
     sandbox: DockerSandbox,
     touched_files: Set[str],
     host_repo_root: Path,
+    plan_state: Optional[Dict[str, bool]] = None,
 ) -> List:
     """Build the strict workaround-only toolbelt."""
+    if plan_state is None:
+        plan_state = {"recorded": False}
     return [
-        _make_record_plan_tool(),
+        _make_record_plan_tool(plan_state),
         _make_search_web_tool(),
         _make_read_web_page_tool(),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox),
         _make_search_codebase_pattern_tool(sandbox),
         _make_inspect_ast_symbol_tool(sandbox),
-        _make_deterministic_search_replace_tool(sandbox, touched_files),
+        _make_deterministic_search_replace_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
         _make_validate_code_syntax_tool(sandbox),
         _make_run_typecheck_tool(sandbox),
     ]
 
-def _make_record_plan_tool():
+def _make_record_plan_tool(plan_state: Dict[str, bool]):
     @tool
     def record_plan(investigation_findings: str, exact_code_changes: str) -> str:
         """
         Record your investigation findings and your exact plan for code changes.
         You MUST call this tool and document your exact 'old_text' and 'new_text' BEFORE executing any deterministic_search_replace.
         """
+        plan_state["recorded"] = True
         logger.debug("Workaround subagent findings: %s", investigation_findings)
         logger.debug("Workaround subagent planned changes: %s", exact_code_changes)
         return "Plan recorded successfully. You may proceed with deterministic_search_replace."

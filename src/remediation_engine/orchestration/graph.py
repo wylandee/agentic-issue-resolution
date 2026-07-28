@@ -1,4 +1,4 @@
-﻿"""
+"""
 graph.py - LangGraph remediation orchestrator for the current Phase 5 runtime.
 
 Phase 5 graph topology (hub-and-spoke)
@@ -733,6 +733,9 @@ def run_workaround_subagent_from_orchestrator(
         attempt_snapshot = state.get("attempt_snapshots_by_id", {}).get(
             task.current_attempt_id
         )
+    current_replay_plan = (
+        state.get("workaround_replay_plans_by_task", {}).get(task.task_id)
+    )
     subagent_state = initial_workaround_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
@@ -741,6 +744,7 @@ def run_workaround_subagent_from_orchestrator(
         constraints_ledger=list(state.get("constraints_ledger", [])),
         previous_feedback=feedback_by_task.get(task.task_id),
         attempt_snapshot=attempt_snapshot,
+        current_replay_plan=current_replay_plan,
     )
 
     result = run_workaround_subagent_node(subagent_state)
