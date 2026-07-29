@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for remediation_engine.tools.code_map and code_locator.
 
 Structure
@@ -7,13 +7,11 @@ TestCodeMapHelpers     â€” unit tests for code_map.py helper functions
 TestLocateSast         â€” integration / unit tests for code_locator.locate_sast
 TestLocateSastFallback â€” graceful-degradation / edge-case tests
 """
+
 from __future__ import annotations
 
 import textwrap
-import uuid
 from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,14 +19,17 @@ from remediation_engine.contracts.schemas import (
     ASTNodeType,
     IssueSource,
     IssueType,
+    LineRange,
     LocalizedIssue,
     Severity,
     VulnerabilityIssue,
 )
-from remediation_engine.contracts.schemas import LineRange
+from remediation_engine.tools.code_locator import (
+    _extract_data_flow_hints,
+    _score_confidence,
+    locate_sast,
+)
 from remediation_engine.tools.code_map import (
-    _extract_node_name,
-    _node_contains_line,
     _TREE_SITTER_AVAILABLE,
     extract_imports,
     extract_sink_expression,
@@ -40,12 +41,6 @@ from remediation_engine.tools.code_map import (
     parse_source,
     resolve_repo_file,
 )
-from remediation_engine.tools.code_locator import (
-    _extract_data_flow_hints,
-    _score_confidence,
-    locate_sast,
-)
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -55,7 +50,7 @@ from remediation_engine.tools.code_locator import (
 def _make_issue(
     *,
     issue_type: IssueType = IssueType.SAST,
-    file_path: Optional[str] = "src/app.js",
+    file_path: str | None = "src/app.js",
     line_start: int = 5,
     line_end: int = 5,
 ) -> VulnerabilityIssue:
@@ -173,8 +168,8 @@ class TestASTHelpers:
     """Tests for AST-based helpers (tree-sitter required)."""
 
     def _parse_js(self, code: str):
-        from tree_sitter import Language, Parser
         import tree_sitter_javascript as tsjs
+        from tree_sitter import Language, Parser
 
         lang = Language(tsjs.language())
         parser = Parser(lang)
@@ -584,5 +579,3 @@ class TestLocateSastFallback:
         issue = _make_issue(file_path="b.js", line_start=1, line_end=1)
         result = locate_sast(issue, str(tmp_path))
         assert 0.0 <= result.localization_confidence <= 1.0
-
-

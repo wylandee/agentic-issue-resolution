@@ -1,4 +1,4 @@
-﻿"""
+"""
 enrichment.py â€” CVE threat-intelligence enrichment for the triage layer.
 
 Public API
@@ -35,9 +35,9 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 import requests
 
@@ -50,9 +50,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EPSS_API_URL = "https://api.first.org/data/v1/epss"
-KEV_URL = (
-    "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-)
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_CHUNK_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 10
 KEV_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
@@ -93,7 +91,7 @@ def _is_cache_fresh(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _load_kev_set() -> tuple[Set[str], Dict[str, str]]:
+def _load_kev_set() -> tuple[set[str], dict[str, str]]:
     """
     Return (kev_cve_set, kev_date_map).
 
@@ -102,9 +100,9 @@ def _load_kev_set() -> tuple[Set[str], Dict[str, str]]:
     """
     cache_path = _kev_cache_path()
 
-    def _parse_catalog(data: Dict[str, Any]) -> tuple[Set[str], Dict[str, str]]:
-        kev_set: Set[str] = set()
-        date_map: Dict[str, str] = {}
+    def _parse_catalog(data: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
+        kev_set: set[str] = set()
+        date_map: dict[str, str] = {}
         for entry in data.get("vulnerabilities", []):
             cve_id = entry.get("cveID", "")
             date_added = entry.get("dateAdded", "")
@@ -158,7 +156,7 @@ def _load_kev_set() -> tuple[Set[str], Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_epss_chunk(cve_ids: List[str]) -> Dict[str, tuple[float, float]]:
+def _fetch_epss_chunk(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
     """
     Query the EPSS API for a chunk of CVE IDs.
 
@@ -174,7 +172,7 @@ def _fetch_epss_chunk(cve_ids: List[str]) -> Dict[str, tuple[float, float]]:
         )
         resp.raise_for_status()
         data = resp.json()
-        result: Dict[str, tuple[float, float]] = {}
+        result: dict[str, tuple[float, float]] = {}
         for entry in data.get("data", []):
             cve = entry.get("cve", "").upper()
             try:
@@ -199,7 +197,7 @@ def _fetch_epss_chunk(cve_ids: List[str]) -> Dict[str, tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-def enrich_cves(cve_ids: List[str]) -> Dict[str, CVEEnrichment]:
+def enrich_cves(cve_ids: list[str]) -> dict[str, CVEEnrichment]:
     """
     Enrich a list of CVE IDs with EPSS scores and CISA KEV membership.
 
@@ -230,14 +228,14 @@ def enrich_cves(cve_ids: List[str]) -> Dict[str, CVEEnrichment]:
     kev_set, kev_date_map = _load_kev_set()
 
     # --- EPSS (chunked) ---
-    epss_map: Dict[str, tuple[float, float]] = {}
+    epss_map: dict[str, tuple[float, float]] = {}
     for i in range(0, len(normalised), EPSS_CHUNK_SIZE):
         chunk = normalised[i : i + EPSS_CHUNK_SIZE]
         epss_map.update(_fetch_epss_chunk(chunk))
 
     # --- Assemble results ---
-    enriched_at = datetime.now(timezone.utc)
-    results: Dict[str, CVEEnrichment] = {}
+    enriched_at = datetime.now(UTC)
+    results: dict[str, CVEEnrichment] = {}
     for cve in normalised:
         in_kev = cve in kev_set
         epss_score, epss_pct = epss_map.get(cve, (0.0, 0.0))
@@ -266,5 +264,3 @@ def enrich_cves(cve_ids: List[str]) -> Dict[str, CVEEnrichment]:
         sum(1 for r in results.values() if r.epss > 0.0),
     )
     return results
-
-

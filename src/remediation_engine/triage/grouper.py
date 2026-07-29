@@ -1,4 +1,4 @@
-﻿"""
+"""
 grouper.py â€” Deterministic issue grouping for the triage layer.
 
 Public API
@@ -30,7 +30,6 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
 
 try:
     from semantic_version import Version as SemanticVersion
@@ -50,9 +49,9 @@ from remediation_engine.contracts.schemas import (
 logger = logging.getLogger(__name__)
 
 
-def _dedupe_paths(paths: List[Optional[str]]) -> List[str]:
+def _dedupe_paths(paths: list[str | None]) -> list[str]:
     """Return stable, deduplicated non-empty repo-relative paths."""
-    result: List[str] = []
+    result: list[str] = []
     seen: set[str] = set()
     for path in paths:
         if not path:
@@ -115,14 +114,10 @@ def _sast_key(issue: VulnerabilityIssue) -> str:
 
 def _field_richness(issue: VulnerabilityIssue) -> int:
     """Count non-None fields as a proxy for data richness."""
-    return sum(
-        1
-        for v in issue.model_dump().values()
-        if v is not None and v != [] and v != {}
-    )
+    return sum(1 for v in issue.model_dump().values() if v is not None and v != [] and v != {})
 
 
-def _choose_representative(issues: List[VulnerabilityIssue]) -> VulnerabilityIssue:
+def _choose_representative(issues: list[VulnerabilityIssue]) -> VulnerabilityIssue:
     """
     Choose the most informative issue from a group.
 
@@ -137,7 +132,7 @@ def _choose_representative(issues: List[VulnerabilityIssue]) -> VulnerabilityIss
 
 
 def _choose_representative_from_pairs(
-    pairs: List[Tuple[LocalizedIssue, FixPlan]],
+    pairs: list[tuple[LocalizedIssue, FixPlan]],
 ) -> VulnerabilityIssue:
     """Choose the most informative issue from a grouped SCA pair list."""
     with_fix = [localized.issue for localized, plan in pairs if plan.fixed_version]
@@ -145,7 +140,7 @@ def _choose_representative_from_pairs(
     return max(pool, key=_field_richness)
 
 
-def _normalise_semver_text(version: str) -> Optional[str]:
+def _normalise_semver_text(version: str) -> str | None:
     """Extract a semver-like token and coerce partial versions for comparison."""
     match = re.search(
         r"(?i)v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
@@ -189,14 +184,10 @@ def _semver_sort_key(version: str) -> tuple[int, object]:
 
 
 def _highest_fixed_version(
-    pairs: List[Tuple[LocalizedIssue, FixPlan]],
-) -> Tuple[Optional[str], Optional[FixPlan]]:
+    pairs: list[tuple[LocalizedIssue, FixPlan]],
+) -> tuple[str | None, FixPlan | None]:
     """Return the highest fixed version and its originating plan from a bucket."""
-    candidates = [
-        (plan.fixed_version, plan)
-        for _, plan in pairs
-        if plan.fixed_version
-    ]
+    candidates = [(plan.fixed_version, plan) for _, plan in pairs if plan.fixed_version]
     if not candidates:
         return None, None
 
@@ -208,9 +199,9 @@ def _highest_fixed_version(
 
 
 def _merge_workaround_snippets(
-    pairs: List[Tuple[LocalizedIssue, FixPlan]],
-) -> Optional[List[str]]:
-    snippets: List[str] = []
+    pairs: list[tuple[LocalizedIssue, FixPlan]],
+) -> list[str] | None:
+    snippets: list[str] = []
     for _, plan in pairs:
         for snippet in plan.workaround_snippets or []:
             if snippet not in snippets:
@@ -219,8 +210,8 @@ def _merge_workaround_snippets(
 
 
 def _build_group_fix_plan(
-    pairs: List[Tuple[LocalizedIssue, FixPlan]],
-) -> Optional[FixPlan]:
+    pairs: list[tuple[LocalizedIssue, FixPlan]],
+) -> FixPlan | None:
     """Create the unified group-level FixPlan for one SCA bucket."""
     if not pairs:
         return None
@@ -263,16 +254,16 @@ def _build_group_fix_plan(
 
 
 def _group_sca(
-    issue_plans: List[Tuple[LocalizedIssue, FixPlan]],
-) -> Dict[str, VulnerabilityGroup]:
+    issue_plans: list[tuple[LocalizedIssue, FixPlan]],
+) -> dict[str, VulnerabilityGroup]:
     """Return a dict of group_id â†’ VulnerabilityGroup for SCA issue + plan pairs."""
-    buckets: Dict[str, List[Tuple[LocalizedIssue, FixPlan]]] = defaultdict(list)
+    buckets: dict[str, list[tuple[LocalizedIssue, FixPlan]]] = defaultdict(list)
     for pair in issue_plans:
         localized_issue, fix_plan = pair
         key = _sca_key(localized_issue, fix_plan)
         buckets[key].append(pair)
 
-    groups: Dict[str, VulnerabilityGroup] = {}
+    groups: dict[str, VulnerabilityGroup] = {}
     for key, members in buckets.items():
         # Deduplicate CVE IDs, GHSA IDs, and versions
         seen_cves: list[str] = []
@@ -283,8 +274,8 @@ def _group_sca(
         seen_ver_set: set[str] = set()
         sources_set: set[IssueSource] = set()
 
-        localized_members: List[LocalizedIssue] = []
-        member_issues: List[VulnerabilityIssue] = []
+        localized_members: list[LocalizedIssue] = []
+        member_issues: list[VulnerabilityIssue] = []
 
         for localized_issue, _ in members:
             issue = localized_issue.issue
@@ -310,7 +301,11 @@ def _group_sca(
                 for localized_issue in localized_members
             ]
         )
-        group_file_path = group_file_paths[0] if group_file_paths else (localized_members[0].manifest_file or rep.file_path)
+        group_file_path = (
+            group_file_paths[0]
+            if group_file_paths
+            else (localized_members[0].manifest_file or rep.file_path)
+        )
 
         groups[key] = VulnerabilityGroup(
             group_id=key,
@@ -336,9 +331,9 @@ def _group_sca(
 # ---------------------------------------------------------------------------
 
 
-def _group_sast(issues: List[VulnerabilityIssue]) -> Dict[str, VulnerabilityGroup]:
+def _group_sast(issues: list[VulnerabilityIssue]) -> dict[str, VulnerabilityGroup]:
     """Return a dict of group_id â†’ VulnerabilityGroup for SAST issues."""
-    groups: Dict[str, VulnerabilityGroup] = {}
+    groups: dict[str, VulnerabilityGroup] = {}
     for issue in issues:
         key = _sast_key(issue)
         if key in groups:
@@ -358,7 +353,7 @@ def _group_sast(issues: List[VulnerabilityIssue]) -> Dict[str, VulnerabilityGrou
                 vulnerable_component=issue.rule_id,
                 file_path=issue.file_path,
                 file_paths=[issue.file_path] if issue.file_path else [],
-                cve_ids=[],         # SAST findings rarely carry a CVE
+                cve_ids=[],  # SAST findings rarely carry a CVE
                 ghsa_ids=[],
                 versions=[],
                 sources=[issue.source],
@@ -375,9 +370,9 @@ def _group_sast(issues: List[VulnerabilityIssue]) -> Dict[str, VulnerabilityGrou
 
 
 def group_issues(
-    issues: List[VulnerabilityIssue],
-    sca_issue_plans: Optional[List[Tuple[LocalizedIssue, FixPlan]]] = None,
-) -> List[VulnerabilityGroup]:
+    issues: list[VulnerabilityIssue],
+    sca_issue_plans: list[tuple[LocalizedIssue, FixPlan]] | None = None,
+) -> list[VulnerabilityGroup]:
     """
     Group a mixed list of SAST and SCA ``VulnerabilityIssue`` records.
 
@@ -448,7 +443,7 @@ def group_issues(
         len(sast_issues),
     )
 
-    all_groups: Dict[str, VulnerabilityGroup] = {}
+    all_groups: dict[str, VulnerabilityGroup] = {}
     all_groups.update(_group_sca(effective_sca_pairs))
     all_groups.update(_group_sast(sast_issues))
 
@@ -458,9 +453,9 @@ def group_issues(
 
 
 def group_sca_issues(
-    issues: List[VulnerabilityIssue],
-    sca_issue_plans: Optional[List[Tuple[LocalizedIssue, FixPlan]]] = None,
-) -> List[VulnerabilityGroup]:
+    issues: list[VulnerabilityIssue],
+    sca_issue_plans: list[tuple[LocalizedIssue, FixPlan]] | None = None,
+) -> list[VulnerabilityGroup]:
     """
     Backwards-compatible alias that groups only SCA issues.
 
@@ -470,10 +465,5 @@ def group_sca_issues(
     filtered_pairs = sca_issue_plans
     if filtered_pairs is not None:
         sca_issue_ids = {issue.id for issue in sca_only}
-        filtered_pairs = [
-            pair for pair in filtered_pairs
-            if pair[0].issue.id in sca_issue_ids
-        ]
+        filtered_pairs = [pair for pair in filtered_pairs if pair[0].issue.id in sca_issue_ids]
     return group_issues(sca_only, sca_issue_plans=filtered_pairs)
-
-

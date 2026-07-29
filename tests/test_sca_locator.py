@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for the upgraded SCA locator layer.
 
 Coverage
@@ -27,14 +27,22 @@ All tests are fully offline â€” no live network calls.
 from __future__ import annotations
 
 import json
-import textwrap
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import pytest
 
 from remediation_engine.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
-from remediation_engine.contracts.schemas import CWEEntry
+from remediation_engine.tools.manifest_locator import (
+    PackageManagerKind,
+    _find_nearest_manifest,
+    _locate_in_manifest,
+    detect_package_manager,
+    locate_dependency,
+    locate_from_issue,
+    normalize_package_name,
+    parse_lockfile_path,
+)
 from remediation_engine.tools.odc_parser import (
     _ecosystem_from_purl,
     _extract_cve_id,
@@ -48,18 +56,6 @@ from remediation_engine.tools.odc_parser import (
     export_to_jsonl,
     parse_vulnerabilities,
 )
-from remediation_engine.tools.manifest_locator import (
-    PackageManagerKind,
-    _find_dependency_line,
-    _find_nearest_manifest,
-    _locate_in_manifest,
-    detect_package_manager,
-    locate_dependency,
-    locate_from_issue,
-    normalize_package_name,
-    parse_lockfile_path,
-)
-
 
 # ===========================================================================
 # Fixtures / helpers
@@ -142,8 +138,8 @@ def _minimal_dep(
     purl: str = "pkg:npm/lodash@4.17.20",
     cve_name: str = "CVE-2021-23337",
     severity: str = "HIGH",
-    cwes: List[str] | None = None,
-) -> Dict[str, Any]:
+    cwes: list[str] | None = None,
+) -> dict[str, Any]:
     """Build a minimal ODC dependency dict."""
     return {
         "fileName": file_name,
@@ -170,31 +166,40 @@ def _minimal_dep(
 class TestPURLHelpers:
     """Tests for the private PURL-parsing functions in odc_parser."""
 
-    @pytest.mark.parametrize("purl,expected_name", [
-        ("pkg:npm/lodash@4.17.20", "lodash"),
-        ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
-        ("pkg:npm/base64url@0.0.6", "base64url"),
-        ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),
-        # maven: namespace=commons-io, name=commons-io â†’ joined with ':'
-        ("pkg:maven/commons-io/commons-io@2.4", "commons-io:commons-io"),
-    ])
+    @pytest.mark.parametrize(
+        "purl,expected_name",
+        [
+            ("pkg:npm/lodash@4.17.20", "lodash"),
+            ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
+            ("pkg:npm/base64url@0.0.6", "base64url"),
+            ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),
+            # maven: namespace=commons-io, name=commons-io â†’ joined with ':'
+            ("pkg:maven/commons-io/commons-io@2.4", "commons-io:commons-io"),
+        ],
+    )
     def test_package_name_from_purl(self, purl, expected_name):
-        from remediation_engine.tools.odc_parser import _package_name_from_purl
+
         assert _package_name_from_purl(purl) == expected_name
 
-    @pytest.mark.parametrize("purl,expected_eco", [
-        ("pkg:npm/lodash@4.17.20", "npm"),
-        ("pkg:javascript/underscore.js@1.7.0", "javascript"),
-        ("pkg:maven/commons-io/commons-io@2.4", "maven"),
-    ])
+    @pytest.mark.parametrize(
+        "purl,expected_eco",
+        [
+            ("pkg:npm/lodash@4.17.20", "npm"),
+            ("pkg:javascript/underscore.js@1.7.0", "javascript"),
+            ("pkg:maven/commons-io/commons-io@2.4", "maven"),
+        ],
+    )
     def test_ecosystem_from_purl(self, purl, expected_eco):
         assert _ecosystem_from_purl(purl) == expected_eco
 
-    @pytest.mark.parametrize("purl,expected_version", [
-        ("pkg:npm/lodash@4.17.20", "4.17.20"),
-        ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "1.1.2"),
-        ("pkg:npm/elliptic@6.6.1", "6.6.1"),
-    ])
+    @pytest.mark.parametrize(
+        "purl,expected_version",
+        [
+            ("pkg:npm/lodash@4.17.20", "4.17.20"),
+            ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "1.1.2"),
+            ("pkg:npm/elliptic@6.6.1", "6.6.1"),
+        ],
+    )
     def test_version_from_purl(self, purl, expected_version):
         assert _version_from_purl(purl) == expected_version
 
@@ -202,7 +207,7 @@ class TestPURLHelpers:
         assert _ecosystem_from_purl(None) is None
 
     def test_package_name_from_none_purl(self):
-        from remediation_engine.tools.odc_parser import _package_name_from_purl
+
         assert _package_name_from_purl(None) is None
 
     def test_parse_purl_from_dep(self):
@@ -220,17 +225,23 @@ class TestPURLHelpers:
 
 
 class TestSeverityExtraction:
-    @pytest.mark.parametrize("vuln,expected", [
-        ({"highestSeverity": "CRITICAL"}, Severity.CRITICAL),
-        ({"cvssv3": {"baseSeverity": "HIGH"}}, Severity.HIGH),
-        ({"cvssv2": {"severity": "MEDIUM"}}, Severity.MEDIUM),
-        ({"severity": "low"}, Severity.LOW),
-        # highestSeverity takes precedence over cvssv3
-        ({"highestSeverity": "CRITICAL", "cvssv3": {"baseSeverity": "HIGH"}}, Severity.CRITICAL),
-        # Unknown garbage â†’ UNKNOWN
-        ({"severity": "moderate"}, Severity.UNKNOWN),  # ODC moderate is not a valid Severity
-        ({}, Severity.UNKNOWN),
-    ])
+    @pytest.mark.parametrize(
+        "vuln,expected",
+        [
+            ({"highestSeverity": "CRITICAL"}, Severity.CRITICAL),
+            ({"cvssv3": {"baseSeverity": "HIGH"}}, Severity.HIGH),
+            ({"cvssv2": {"severity": "MEDIUM"}}, Severity.MEDIUM),
+            ({"severity": "low"}, Severity.LOW),
+            # highestSeverity takes precedence over cvssv3
+            (
+                {"highestSeverity": "CRITICAL", "cvssv3": {"baseSeverity": "HIGH"}},
+                Severity.CRITICAL,
+            ),
+            # Unknown garbage â†’ UNKNOWN
+            ({"severity": "moderate"}, Severity.UNKNOWN),  # ODC moderate is not a valid Severity
+            ({}, Severity.UNKNOWN),
+        ],
+    )
     def test_severity_fallback_chain(self, vuln, expected):
         assert _extract_severity(vuln) == expected
 
@@ -245,13 +256,16 @@ class TestSeverityExtraction:
 
 
 class TestCWEParsing:
-    @pytest.mark.parametrize("raw,expected_ids", [
-        (["CWE-77"], ["CWE-77"]),
-        (["77"], ["CWE-77"]),
-        (["CWE79", "CWE-89"], ["CWE-79", "CWE-89"]),
-        ([], []),
-        (["notacwe"], []),       # no digits â†’ skipped
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected_ids",
+        [
+            (["CWE-77"], ["CWE-77"]),
+            (["77"], ["CWE-77"]),
+            (["CWE79", "CWE-89"], ["CWE-79", "CWE-89"]),
+            ([], []),
+            (["notacwe"], []),  # no digits â†’ skipped
+        ],
+    )
     def test_parse_cwes(self, raw, expected_ids):
         vuln = {"cwes": raw}
         result = _parse_cwes(vuln)
@@ -267,12 +281,15 @@ class TestCWEParsing:
 
 
 class TestCVEIDExtraction:
-    @pytest.mark.parametrize("name,expected", [
-        ("CVE-2021-23337", "CVE-2021-23337"),
-        ("cve-2021-23337", "CVE-2021-23337"),
-        ("GHSA-vpq2-c234-7xj6", None),
-        ("", None),
-    ])
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("CVE-2021-23337", "CVE-2021-23337"),
+            ("cve-2021-23337", "CVE-2021-23337"),
+            ("GHSA-vpq2-c234-7xj6", None),
+            ("", None),
+        ],
+    )
     def test_extract_cve_id(self, name, expected):
         vuln = {"name": name}
         assert _extract_cve_id(vuln) == expected
@@ -282,19 +299,22 @@ class TestCVEIDExtraction:
             "name": "GHSA-vpq2-c234-7xj6",
             "references": [
                 {"url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"},
-                {"name": "some random reference"}
-            ]
+                {"name": "some random reference"},
+            ],
         }
         assert _extract_cve_id(vuln) == "CVE-2020-15084"
 
 
 class TestGHSAIDExtraction:
-    @pytest.mark.parametrize("name,expected", [
-        ("GHSA-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
-        ("ghsa-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
-        ("CVE-2021-23337", None),
-        ("", None),
-    ])
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("GHSA-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
+            ("ghsa-vpq2-c234-7xj6", "GHSA-VPQ2-C234-7XJ6"),
+            ("CVE-2021-23337", None),
+            ("", None),
+        ],
+    )
     def test_extract_ghsa_id(self, name, expected):
         vuln = {"name": name}
         assert _extract_ghsa_id(vuln) == expected
@@ -423,7 +443,16 @@ class TestParseVulnerabilities:
 
 class TestExportFunctions:
     def test_jsonl_round_trip(self, tmp_path):
-        report = {"dependencies": [_minimal_dep(), _minimal_dep(file_name="express:4.18.0", purl="pkg:npm/express@4.18.0", cve_name="CVE-2022-9999")]}
+        report = {
+            "dependencies": [
+                _minimal_dep(),
+                _minimal_dep(
+                    file_name="express:4.18.0",
+                    purl="pkg:npm/express@4.18.0",
+                    cve_name="CVE-2022-9999",
+                ),
+            ]
+        }
         issues = parse_vulnerabilities(report)
         out = tmp_path / "out.jsonl"
         export_to_jsonl(issues, out)
@@ -458,20 +487,23 @@ class TestExportFunctions:
 
 
 class TestNormalizePackageName:
-    @pytest.mark.parametrize("raw,expected", [
-        ("lodash-4.17.21.tgz", "lodash"),
-        ("lodash-4.17.20.tgz", "lodash"),
-        ("log4j-core-2.17.2.jar", "log4j-core"),
-        ("@tootallnate/once:1.1.2", "@tootallnate/once"),
-        ("@scope/pkg:2.0.0", "@scope/pkg"),
-        ("cookie:0.4.2", "cookie"),
-        ("base64url:0.0.6", "base64url"),
-        ("bench.js", "bench"),  # .js suffix stripped
-        ("pkg:npm/lodash@4.17.20", "lodash"),
-        ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
-        ("  ", ""),             # whitespace only
-        ("", ""),
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("lodash-4.17.21.tgz", "lodash"),
+            ("lodash-4.17.20.tgz", "lodash"),
+            ("log4j-core-2.17.2.jar", "log4j-core"),
+            ("@tootallnate/once:1.1.2", "@tootallnate/once"),
+            ("@scope/pkg:2.0.0", "@scope/pkg"),
+            ("cookie:0.4.2", "cookie"),
+            ("base64url:0.0.6", "base64url"),
+            ("bench.js", "bench"),  # .js suffix stripped
+            ("pkg:npm/lodash@4.17.20", "lodash"),
+            ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
+            ("  ", ""),  # whitespace only
+            ("", ""),
+        ],
+    )
     def test_normalise(self, raw, expected):
         assert normalize_package_name(raw) == expected
 
@@ -494,18 +526,24 @@ class TestParseLockfilePath:
         assert leaf == "cookie"
 
     def test_transitive_chain(self):
-        lockfile, parent, leaf = parse_lockfile_path("/src/package-lock.json?jws:0.2.6/base64url:0.0.6")
+        lockfile, parent, leaf = parse_lockfile_path(
+            "/src/package-lock.json?jws:0.2.6/base64url:0.0.6"
+        )
         assert lockfile == "/src/package-lock.json"
         assert parent == "jws"
         assert leaf == "base64url"
 
     def test_scoped_package_entry(self):
-        lockfile, parent, leaf = parse_lockfile_path("/src/package-lock.json?/@tootallnate/once:1.1.2")
+        lockfile, parent, leaf = parse_lockfile_path(
+            "/src/package-lock.json?/@tootallnate/once:1.1.2"
+        )
         assert lockfile == "/src/package-lock.json"
         assert leaf == "@tootallnate/once"
 
     def test_frontend_lockfile(self):
-        lockfile, parent, leaf = parse_lockfile_path("/src/frontend/package-lock.json?/elliptic:6.6.1")
+        lockfile, parent, leaf = parse_lockfile_path(
+            "/src/frontend/package-lock.json?/elliptic:6.6.1"
+        )
         assert "frontend" in lockfile
         assert leaf == "elliptic"
 
@@ -519,9 +557,7 @@ class TestParseLockfilePath:
 
     def test_non_lockfile_bench_js(self):
         """bench.js in node_modules should still extract the containing package."""
-        lockfile, parent, leaf = parse_lockfile_path(
-            "/src/node_modules/fast.js/dist/bench.js"
-        )
+        lockfile, parent, leaf = parse_lockfile_path("/src/node_modules/fast.js/dist/bench.js")
         assert lockfile is None
         # leaf should resolve to fast.js (the node_module containing it)
         # parent is None as there's only one node_modules level
@@ -603,7 +639,14 @@ class TestLocateInManifest:
     def test_keys_returned(self, tmp_repo):
         """Exactly the right keys â€” no OSV/fix artefacts."""
         result = _locate_in_manifest(tmp_repo / "package.json", "lodash", "npm")
-        expected_keys = {"manifest_file", "package_name", "is_direct", "line_number", "snippet", "package_manager"}
+        expected_keys = {
+            "manifest_file",
+            "package_name",
+            "is_direct",
+            "line_number",
+            "snippet",
+            "package_manager",
+        }
         assert expected_keys.issubset(result.keys())
         assert "fix_instruction" not in result
         assert "fixed_version" not in result
@@ -621,9 +664,7 @@ class TestFindNearestManifest:
         assert manifest.name == "package.json"
 
     def test_node_modules_path_resolves_root(self, tmp_repo):
-        manifest = _find_nearest_manifest(
-            tmp_repo, "/src/node_modules/lodash/package.json"
-        )
+        manifest = _find_nearest_manifest(tmp_repo, "/src/node_modules/lodash/package.json")
         assert manifest is not None
 
     def test_nested_frontend_prefers_frontend_manifest(self, tmp_repo_nested):
@@ -741,6 +782,7 @@ class TestLocateDependency:
     def test_no_extra_parameters_accepted(self):
         """Verify that old OSV parameters are gone from the signature."""
         import inspect
+
         sig = inspect.signature(locate_dependency)
         param_names = set(sig.parameters.keys())
         # These parameters must NOT exist any more
@@ -777,6 +819,7 @@ class TestLocateFromIssue:
 
     def test_returns_localized_issue(self, tmp_repo):
         from remediation_engine.contracts import LocalizedIssue
+
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert isinstance(loc, LocalizedIssue)
@@ -804,7 +847,7 @@ class TestLocateFromIssue:
 
     def test_no_fix_instruction_field(self, tmp_repo):
         """LocalizedIssue must not have a fix_instruction field at all."""
-        from remediation_engine.contracts import LocalizedIssue
+
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert not hasattr(loc, "fix_instruction")
@@ -812,6 +855,7 @@ class TestLocateFromIssue:
     def test_no_osv_parameter_on_locate_from_issue(self):
         """enrich_osv parameter must be gone from locate_from_issue."""
         import inspect
+
         sig = inspect.signature(locate_from_issue)
         assert "enrich_osv" not in sig.parameters
 
@@ -836,6 +880,7 @@ class TestLocateFromIssue:
 
     def test_json_round_trip(self, tmp_repo):
         from remediation_engine.contracts import LocalizedIssue
+
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         reloaded = LocalizedIssue.model_validate_json(loc.model_dump_json())
@@ -878,5 +923,3 @@ class TestSampleODCReport:
         # JSONL has exactly one line per issue
         lines = (tmp_path / "out.jsonl").read_text().strip().split("\n")
         assert len(lines) == len(issues)
-
-

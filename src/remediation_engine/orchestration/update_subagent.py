@@ -1,4 +1,4 @@
-﻿"""
+"""
 Batch Update Subagent for Phase 5 dependency resolution.
 """
 
@@ -7,21 +7,23 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langsmith import traceable
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
-    WorkerAttemptResult,
-    WorkerExecutionDiagnostics,
     RemediationTask,
     SCARemediationStage,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
 from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
 from remediation_engine.orchestration.state import SubagentState
@@ -30,8 +32,6 @@ from remediation_engine.orchestration.subagent_runtime import (
     run_bounded_subagent_loop,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-
-from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +46,9 @@ except ImportError:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment,misc]
 
 
-def _candidate_manifest_paths(group: VulnerabilityGroup) -> List[str]:
+def _candidate_manifest_paths(group: VulnerabilityGroup) -> list[str]:
     """Return all candidate manifest paths for one grouped dependency target."""
-    candidates: List[str] = []
+    candidates: list[str] = []
     seen: set[str] = set()
 
     def add_candidate(value: str | None) -> None:
@@ -78,23 +78,24 @@ def _candidate_manifest_paths(group: VulnerabilityGroup) -> List[str]:
 
 def _create_skinny_subagent_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
     """Create a skinny copy of a group for execution agents."""
-    return group.model_copy(update={
-        "cve_ids": [],
-        "ghsa_ids": [],
-        "versions": [],
-        "issues": [],
-    })
+    return group.model_copy(
+        update={
+            "cve_ids": [],
+            "ghsa_ids": [],
+            "versions": [],
+            "issues": [],
+        }
+    )
 
 
 def _filter_constraints_ledger(
-    constraints_ledger: Sequence[str],
-    target_groups: Sequence[VulnerabilityGroup]
-) -> List[str]:
+    constraints_ledger: Sequence[str], target_groups: Sequence[VulnerabilityGroup]
+) -> list[str]:
     """Filter ledger to only include constraints matching the target components."""
     components = [g.vulnerable_component for g in target_groups if g.vulnerable_component]
     if not components:
         return list(constraints_ledger)
-    
+
     filtered = []
     for constraint in constraints_ledger:
         if any(comp in constraint for comp in components):
@@ -105,14 +106,14 @@ def _filter_constraints_ledger(
 def _resolve_manifest_targets(
     group: VulnerabilityGroup,
     repo_root: Path,
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     """Resolve all valid package.json targets for one vulnerability group."""
     candidates = _candidate_manifest_paths(group)
     if not candidates:
         return [], [f"Group '{group.group_id}': no manifest target could be resolved."]
 
-    resolved_paths: List[str] = []
-    errors: List[str] = []
+    resolved_paths: list[str] = []
+    errors: list[str] = []
 
     for candidate in candidates:
         if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
@@ -121,9 +122,7 @@ def _resolve_manifest_targets(
             )
             continue
         if ".." in Path(candidate).parts:
-            errors.append(
-                f"Group '{group.group_id}': rejected path traversal in '{candidate}'."
-            )
+            errors.append(f"Group '{group.group_id}': rejected path traversal in '{candidate}'.")
             continue
 
         abs_target = (repo_root / candidate).resolve()
@@ -159,10 +158,10 @@ def _format_manifest_paths(manifest_paths: Sequence[str]) -> str:
 
 
 def _build_package_manifest_map(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-) -> Dict[str, List[str]]:
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+) -> dict[str, list[str]]:
     """Build a per-package allowlist of manifest paths for tool enforcement."""
-    package_manifest_map: Dict[str, List[str]] = {}
+    package_manifest_map: dict[str, list[str]] = {}
     for _, group, manifest_paths in resolved_tasks:
         package_name = (group.vulnerable_component or "").strip()
         if not package_name:
@@ -219,13 +218,13 @@ def _is_retry_task(task: RemediationTask) -> bool:
 
 
 def _is_retry_batch(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
 ) -> bool:
     return bool(resolved_tasks) and all(_is_retry_task(task) for task, _, _ in resolved_tasks)
 
 
 def _is_mixed_retry_batch(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
 ) -> bool:
     saw_retry = False
     saw_first_pass = False
@@ -238,15 +237,17 @@ def _is_mixed_retry_batch(
 
 
 def _legacy_build_update_prompt(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
-    feedback_by_task: Dict[str, str],
-    previous_action_summaries_by_task: Dict[str, str],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] | None = None,
+    feedback_by_task: dict[str, str],
+    previous_action_summaries_by_task: dict[str, str],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
 ) -> str:
     retry_diagnostics_by_task = dict(retry_diagnostics_by_task or {})
     retry_batch = _is_retry_batch(resolved_tasks)
-    constraints_text = "\n".join(f"- {item}" for item in constraints_ledger) if constraints_ledger else "- none"
+    constraints_text = (
+        "\n".join(f"- {item}" for item in constraints_ledger) if constraints_ledger else "- none"
+    )
     sections = [
         "\n".join(
             [
@@ -427,7 +428,7 @@ def _legacy_build_update_prompt(
 
 def _was_package_reverted(
     group: VulnerabilityGroup,
-    tool_events: Optional[Sequence[Any]],
+    tool_events: Sequence[Any] | None,
 ) -> bool:
     if not tool_events:
         return False
@@ -449,7 +450,7 @@ def _was_package_reverted(
 
 def _was_package_modified(
     group: VulnerabilityGroup,
-    tool_events: Optional[Sequence[Any]],
+    tool_events: Sequence[Any] | None,
 ) -> bool:
     if not tool_events:
         return False
@@ -464,7 +465,9 @@ def _was_package_modified(
                 modified = True
             else:
                 modified = False
-        elif name == "revert_workspace_file" and (content.startswith("SUCCESS:") or content == "SUCCESS"):
+        elif name == "revert_workspace_file" and (
+            content.startswith("SUCCESS:") or content == "SUCCESS"
+        ):
             revert_pkg = args.get("package_name")
             if revert_pkg == pkg or not revert_pkg:
                 modified = False
@@ -473,7 +476,7 @@ def _was_package_modified(
 
 def _has_successful_validation_for_package(
     group: VulnerabilityGroup,
-    tool_events: Optional[Sequence[Any]],
+    tool_events: Sequence[Any] | None,
 ) -> bool:
     """Return whether a package's final manifest state was validated successfully."""
     if not tool_events:
@@ -496,7 +499,7 @@ def _has_successful_validation_for_package(
     if last_successful_edit_index < 0:
         return False
 
-    for event in tool_events[last_successful_edit_index + 1:]:
+    for event in tool_events[last_successful_edit_index + 1 :]:
         name = getattr(event, "name", "")
         content = str(getattr(event, "content", ""))
         if name == "validate_manifest_sync" and (
@@ -509,7 +512,7 @@ def _has_successful_validation_for_package(
 
 def _had_registry_lookup_before_package_edit(
     group: VulnerabilityGroup,
-    tool_events: Optional[Sequence[Any]],
+    tool_events: Sequence[Any] | None,
 ) -> bool:
     """Return whether retry-mode registry lookup happened before this package's first edit."""
     if not tool_events:
@@ -543,25 +546,23 @@ def _had_registry_lookup_before_package_edit(
 
 
 def _legacy_build_action_summaries(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
     final_text: str,
     succeeded: bool,
     retry_batch: bool = False,
-    tool_events: Optional[Sequence[Any]] = None,
-) -> List[AgentActionSummary]:
+    tool_events: Sequence[Any] | None = None,
+) -> list[AgentActionSummary]:
     final_note = final_text.strip()
     normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
     include_final_note = bool(final_note) and len(resolved_tasks) == 1
-    summaries: List[AgentActionSummary] = []
+    summaries: list[AgentActionSummary] = []
 
     for task, group, manifest_paths in resolved_tasks:
         component = (group.vulnerable_component or "unknown component").strip()
         manifest_label = ", ".join(manifest_paths) if manifest_paths else "no manifests"
         relevant_changed_files = [
-            path
-            for path in manifest_paths
-            if path.replace("\\", "/") in normalized_changed_files
+            path for path in manifest_paths if path.replace("\\", "/") in normalized_changed_files
         ]
         pkg_reverted = _was_package_reverted(group, tool_events)
         pkg_modified = (
@@ -579,7 +580,9 @@ def _legacy_build_action_summaries(
         # the final manifest validation passed; requiring a worker-side lookup
         # here would make every retry fail despite the execution-only contract.
         task_succeeded = pkg_modified and pkg_validated
-        summary_status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
+        summary_status = (
+            AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
+        )
         outcome = (
             "Completed validated manifest updates"
             if task_succeeded
@@ -587,7 +590,9 @@ def _legacy_build_action_summaries(
         )
 
         changed_label = ", ".join(relevant_changed_files or manifest_paths or ["no files"])
-        summary_text = f"{outcome} for {component} in {manifest_label}; changed files: {changed_label}."
+        summary_text = (
+            f"{outcome} for {component} in {manifest_label}; changed files: {changed_label}."
+        )
         if include_final_note:
             summary_text = f"{summary_text} Final note: {final_note}"
         summaries.append(
@@ -600,7 +605,8 @@ def _legacy_build_action_summaries(
 
     return summaries
 
-def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> List[AgentActionSummary]:
+
+def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> list[AgentActionSummary]:
     return [
         AgentActionSummary(task_id=t_id, status=AgentActionStatus.SURRENDER, summary=message)
         for t_id in task_ids
@@ -609,18 +615,18 @@ def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> List[Ag
 
 def _worker_result_map(
     target_tasks: Sequence[RemediationTask],
-    snapshots: Dict[str, Any],
+    snapshots: dict[str, Any],
     summaries: Sequence[AgentActionSummary],
     *,
     succeeded: bool,
     errors: Sequence[str] = (),
-    attempted_versions_by_task: Optional[Dict[str, List[str]]] = None,
-    executed_versions_by_task: Optional[Dict[str, List[str]]] = None,
+    attempted_versions_by_task: dict[str, list[str]] | None = None,
+    executed_versions_by_task: dict[str, list[str]] | None = None,
     validation_calls: int = 0,
-) -> Dict[str, WorkerAttemptResult]:
+) -> dict[str, WorkerAttemptResult]:
     """Build attempt-correlated worker envelopes without changing task state."""
     summary_by_task = {summary.task_id: summary for summary in summaries}
-    results: Dict[str, WorkerAttemptResult] = {}
+    results: dict[str, WorkerAttemptResult] = {}
     attempted_versions_by_task = attempted_versions_by_task or {}
     executed_versions_by_task = executed_versions_by_task or attempted_versions_by_task
     for task in target_tasks:
@@ -657,9 +663,9 @@ def _worker_result_map(
 
 
 def _attempted_versions_for_current_run(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
-) -> Dict[str, List[str]]:
+) -> dict[str, list[str]]:
     """Collect version targets from this invocation only.
 
     ``UpdateRetryDiagnostics`` is intentionally cumulative for compatibility,
@@ -669,15 +675,13 @@ def _attempted_versions_for_current_run(
     Tool events include failed edit calls, so this also preserves attempted
     targets when the edit itself did not succeed.
     """
-    package_to_task_ids: Dict[str, List[str]] = {}
+    package_to_task_ids: dict[str, list[str]] = {}
     for task, group, _manifest_paths in resolved_tasks:
         package = (group.vulnerable_component or "").strip()
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
 
-    result: Dict[str, List[str]] = {
-        task.task_id: [] for task, _group, _paths in resolved_tasks
-    }
+    result: dict[str, list[str]] = {task.task_id: [] for task, _group, _paths in resolved_tasks}
     for event in tool_events:
         if getattr(event, "name", "") != "modify_npm_dependency":
             continue
@@ -693,14 +697,12 @@ def _attempted_versions_for_current_run(
 
 
 def _executed_versions_for_current_run(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
-) -> Dict[str, List[str]]:
+) -> dict[str, list[str]]:
     """Collect only successful exact edit targets from this worker run."""
-    result: Dict[str, List[str]] = {
-        task.task_id: [] for task, _group, _paths in resolved_tasks
-    }
-    package_to_task_ids: Dict[str, List[str]] = {}
+    result: dict[str, list[str]] = {task.task_id: [] for task, _group, _paths in resolved_tasks}
+    package_to_task_ids: dict[str, list[str]] = {}
     for task, group, _manifest_paths in resolved_tasks:
         package = (group.vulnerable_component or "").strip()
         if package:
@@ -721,9 +723,9 @@ def _executed_versions_for_current_run(
     return result
 
 
-def _parse_registry_report_versions(report_text: str) -> Tuple[Sequence[str], str | None]:
+def _parse_registry_report_versions(report_text: str) -> tuple[Sequence[str], str | None]:
     """Extract candidate versions and the dist-tag latest version from a registry report."""
-    candidates: List[str] = []
+    candidates: list[str] = []
     seen: set[str] = set()
     latest_version: str | None = None
 
@@ -755,8 +757,8 @@ def _parse_registry_report_versions(report_text: str) -> Tuple[Sequence[str], st
     return candidates, latest_version
 
 
-def _merge_ordered_versions(existing: Sequence[str], new_values: Sequence[str]) -> List[str]:
-    merged: List[str] = []
+def _merge_ordered_versions(existing: Sequence[str], new_values: Sequence[str]) -> list[str]:
+    merged: list[str] = []
     seen: set[str] = set()
     for value in [*existing, *new_values]:
         normalized = value.strip()
@@ -782,16 +784,16 @@ def _extract_reasoning_summary(final_text: str) -> str:
 
 
 def _legacy_build_retry_diagnostics(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
     final_text: str,
     errors: Sequence[str],
     succeeded: bool,
-    prior_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    prior_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     constraints_ledger: Sequence[str],
-) -> Dict[str, UpdateRetryDiagnostics]:
+) -> dict[str, UpdateRetryDiagnostics]:
     """Build per-task retry diagnostics from tool events and prior evidence."""
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = {}
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = {}
     lowered_final_text = final_text.lower()
     joined_errors = " | ".join(error.strip() for error in errors if error.strip())
 
@@ -809,9 +811,7 @@ def _legacy_build_retry_diagnostics(
             event_package = str(event.args.get("package_name", "") or "").strip()
             if event.name == "view_npm_package_versions" and event_package == package_name:
                 registry_query_performed = True
-                parsed_candidates, parsed_latest = _parse_registry_report_versions(
-                    event.content
-                )
+                parsed_candidates, parsed_latest = _parse_registry_report_versions(event.content)
                 candidate_versions = _merge_ordered_versions(
                     candidate_versions,
                     parsed_candidates,
@@ -844,7 +844,9 @@ def _legacy_build_retry_diagnostics(
         untried_candidates = [
             version for version in candidate_versions if version not in attempted_set
         ]
-        is_peer_conflict = "peer" in (joined_errors + " " + lowered_final_text) or "eresolve" in (joined_errors + " " + lowered_final_text)
+        is_peer_conflict = "peer" in (joined_errors + " " + lowered_final_text) or "eresolve" in (
+            joined_errors + " " + lowered_final_text
+        )
         reasoning_summary = _extract_reasoning_summary(final_text)
         if not reasoning_summary and prior:
             reasoning_summary = prior.reasoning_summary
@@ -870,9 +872,12 @@ def _legacy_build_retry_diagnostics(
             and latest_version_seen is not None
             and latest_version_seen in attempted_set
         )
-        if package_abandoned or reasoned_exhausted:
-            exhausted_update_path = True
-        elif (reverted_on_retry or latest_attempted_on_retry) and not is_peer_conflict:
+        if (
+            package_abandoned
+            or reasoned_exhausted
+            or (reverted_on_retry or latest_attempted_on_retry)
+            and not is_peer_conflict
+        ):
             exhausted_update_path = True
 
         failure_reason = ""
@@ -885,20 +890,22 @@ def _legacy_build_retry_diagnostics(
             version for version in candidate_versions if version not in attempted_set
         ]
         planning_answers = {
-            "1_last_fix_attempt": selected_version or (prior.selected_version if prior else None) or (attempted_versions[-1] if attempted_versions else "none"),
+            "1_last_fix_attempt": selected_version
+            or (prior.selected_version if prior else None)
+            or (attempted_versions[-1] if attempted_versions else "none"),
             "2_attempted_versions": ", ".join(attempted_versions) or "none",
             "3_latest_version_available": latest_version_seen or "unknown",
             "4_untried_candidates": ", ".join(candidate_choices) or "none",
-            "5_remediation_type": "npm overrides" if used_overrides else "direct dependency version bump",
+            "5_remediation_type": "npm overrides"
+            if used_overrides
+            else "direct dependency version bump",
             "6_context": (
                 "package abandoned"
                 if package_abandoned
                 else (
                     "peer conflict"
                     if "peer" in (joined_errors + " " + lowered_final_text)
-                    else (
-                        "stale version or prior failure"
-                    )
+                    else ("stale version or prior failure")
                 )
             ),
             "7_constraints": (
@@ -944,11 +951,11 @@ def _legacy_build_retry_diagnostics(
 
 
 def _build_update_prompt(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
-    feedback_by_task: Dict[str, str],
-    previous_action_summaries_by_task: Dict[str, str],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] | None = None,
+    feedback_by_task: dict[str, str],
+    previous_action_summaries_by_task: dict[str, str],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
 ) -> str:
     """Build an execution-only prompt; strategy selection belongs to Supervisor."""
     sections = [
@@ -963,41 +970,43 @@ def _build_update_prompt(
         "",
         "Constraints ledger:",
     ]
-    sections.extend(
-        f"- {item}" for item in constraints_ledger
-    )
+    sections.extend(f"- {item}" for item in constraints_ledger)
     if not constraints_ledger:
         sections.append("- none")
     for task, group, manifest_paths in resolved_tasks:
-        sections.extend([
+        sections.extend(
+            [
+                "",
+                f"## Task {task.task_id}",
+                f"- Component: {group.vulnerable_component or 'unknown'}",
+                f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
+                f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
+                f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
+                f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
+            ]
+        )
+    sections.extend(
+        [
             "",
-            f"## Task {task.task_id}",
-            f"- Component: {group.vulnerable_component or 'unknown'}",
-            f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
-            f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
-            f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
-            f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
-        ])
-    sections.extend([
-        "",
-        "Completion rule:",
-        "Return control only after one final manifest synchronization call succeeds, or after surrendering on its failure.",
-    ])
+            "Completion rule:",
+            "Return control only after one final manifest synchronization call succeeds, or after surrendering on its failure.",
+        ]
+    )
     return "\n".join(sections)
 
 
 def _build_action_summaries(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
     final_text: str,
     succeeded: bool,
     retry_batch: bool = False,
-    tool_events: Optional[Sequence[Any]] = None,
-) -> List[AgentActionSummary]:
+    tool_events: Sequence[Any] | None = None,
+) -> list[AgentActionSummary]:
     """Summarize worker execution without requiring registry evidence."""
     normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
     final_note = (final_text or "").strip()
-    summaries: List[AgentActionSummary] = []
+    summaries: list[AgentActionSummary] = []
     for task, group, manifest_paths in resolved_tasks:
         package_modified = _was_package_modified(group, tool_events)
         package_validated = _has_successful_validation_for_package(group, tool_events)
@@ -1005,11 +1014,14 @@ def _build_action_summaries(
         if tool_events is None:
             task_succeeded = succeeded and bool(normalized_changed_files)
         changed = [
-            path for path in manifest_paths
-            if path.replace("\\", "/") in normalized_changed_files
+            path for path in manifest_paths if path.replace("\\", "/") in normalized_changed_files
         ]
         status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
-        outcome = "Completed validated manifest updates" if task_succeeded else "Stopped without a validated manifest update"
+        outcome = (
+            "Completed validated manifest updates"
+            if task_succeeded
+            else "Stopped without a validated manifest update"
+        )
         summary = f"{outcome} for {group.vulnerable_component or 'unknown component'} in {', '.join(manifest_paths) or 'no manifest'}; changed files: {', '.join(changed or manifest_paths or ['no files'])}."
         if final_note and len(resolved_tasks) == 1:
             summary += f" Final note: {final_note}"
@@ -1018,16 +1030,16 @@ def _build_action_summaries(
 
 
 def _build_retry_diagnostics(
-    resolved_tasks: Sequence[Tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
     final_text: str,
     errors: Sequence[str],
     succeeded: bool,
-    prior_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    prior_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     constraints_ledger: Sequence[str],
-) -> Dict[str, UpdateRetryDiagnostics]:
+) -> dict[str, UpdateRetryDiagnostics]:
     """Record worker evidence while keeping strategy planning in Supervisor."""
-    result: Dict[str, UpdateRetryDiagnostics] = {}
+    result: dict[str, UpdateRetryDiagnostics] = {}
     joined_errors = " | ".join(error.strip() for error in errors if error.strip())
     lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
     for task, group, _ in resolved_tasks:
@@ -1037,7 +1049,10 @@ def _build_retry_diagnostics(
         for event in tool_events:
             if event.name != "modify_npm_dependency":
                 continue
-            if str(event.args.get("package_name", "")).strip() != (group.vulnerable_component or "").strip():
+            if (
+                str(event.args.get("package_name", "")).strip()
+                != (group.vulnerable_component or "").strip()
+            ):
                 continue
             target = str(event.args.get("target_version", "")).strip().lstrip("vV")
             if target and target not in attempted:
@@ -1072,13 +1087,15 @@ def _build_retry_diagnostics(
             task_id=task.task_id,
             committed_attempt_id=prior.committed_attempt_id if prior else None,
             strategy_stage=task_stage,
-            security_floor=prior.security_floor if prior else (
-                group.fix_plan.fixed_version if group.fix_plan else None
-            ),
+            security_floor=prior.security_floor
+            if prior
+            else (group.fix_plan.fixed_version if group.fix_plan else None),
             registry_query_performed=prior.registry_query_performed if prior else False,
             attempted_versions=attempted,
             executed_versions=attempted,
-            candidate_versions_considered=list(prior.candidate_versions_considered) if prior else [],
+            candidate_versions_considered=list(prior.candidate_versions_considered)
+            if prior
+            else [],
             # Version selection belongs to the Supervisor planner. A worker
             # failure must not resurrect the previous planner selection.
             selected_version=prior.selected_version if prior else None,
@@ -1086,14 +1103,17 @@ def _build_retry_diagnostics(
             used_overrides=used_overrides,
             package_abandoned=package_abandoned,
             exhausted_update_path=exhausted_update_path,
-            failure_reason=(joined_errors or final_text.strip()) if not succeeded else (prior.failure_reason if prior else ""),
+            failure_reason=(joined_errors or final_text.strip())
+            if not succeeded
+            else (prior.failure_reason if prior else ""),
             reasoning_summary=(final_text or "").strip(),
             instruction_digest=prior.instruction_digest if prior else None,
         )
     return result
 
-@traceable(name="Update_Subagent_Test_Run") # for langsmith testing
-def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
+
+@traceable(name="Update_Subagent_Test_Run")  # for langsmith testing
+def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     """Run the batch dependency update subagent on ``SubagentState``."""
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
@@ -1101,27 +1121,37 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     target_groups = list(state.get("target_groups", []))
     constraints_ledger = list(state.get("constraints_ledger", []))
     feedback_by_task = dict(state.get("feedback_by_task", {}))
-    previous_action_summaries_by_task = dict(
-        state.get("previous_action_summaries_by_task", {})
-    )
-    prior_retry_diagnostics_by_task = dict(
-        state.get("retry_diagnostics_by_task", {})
-    )
+    previous_action_summaries_by_task = dict(state.get("previous_action_summaries_by_task", {}))
+    prior_retry_diagnostics_by_task = dict(state.get("retry_diagnostics_by_task", {}))
     all_task_ids = [t.task_id for t in target_tasks]
 
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
         msg = f"Update Subagent: repo_root '{repo_root_str}' is not a valid directory."
-        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because repo_root was invalid.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": [msg]}
+        summaries = _build_surrender_summaries(
+            all_task_ids, "Stopped before execution because repo_root was invalid."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": [msg],
+        }
 
     if not workspace_volume:
         msg = "Update Subagent: workspace_volume is missing from state."
-        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because workspace_volume was missing.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": [msg]}
+        summaries = _build_surrender_summaries(
+            all_task_ids, "Stopped before execution because workspace_volume was missing."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": [msg],
+        }
 
-    resolved_tasks: List[Tuple[RemediationTask, VulnerabilityGroup, List[str]]] = []
-    resolution_errors: List[str] = []
+    resolved_tasks: list[tuple[RemediationTask, VulnerabilityGroup, list[str]]] = []
+    resolution_errors: list[str] = []
     target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
     for task, group in zip(target_tasks, target_groups):
         snapshot = target_attempt_snapshots.get(task.task_id)
@@ -1149,8 +1179,15 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         resolved_tasks.append((task, group, manifest_paths))
 
     if not resolved_tasks:
-        summaries = _build_surrender_summaries(all_task_ids, "Stopped before execution because no manifest targets could be resolved.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": resolution_errors}
+        summaries = _build_surrender_summaries(
+            all_task_ids, "Stopped before execution because no manifest targets could be resolved."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": resolution_errors,
+        }
 
     if _is_mixed_retry_batch(resolved_tasks):
         summaries = _build_surrender_summaries(
@@ -1161,7 +1198,8 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
             "action_summaries": summaries,
             "action_summary": summaries[0] if summaries else None,
             "changed_files": [],
-            "errors": resolution_errors + [
+            "errors": resolution_errors
+            + [
                 "Update Subagent: mixed first-pass and retry update tasks are not supported in the same batch."
             ],
         }
@@ -1169,29 +1207,43 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
     resolved_task_ids = [t.task_id for t, _, _ in resolved_tasks]
     if ChatOpenAI is None:
         msg = "Update Subagent: 'langchain-openai' is not installed."
-        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped before execution because the LLM client is unavailable.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(
+            resolved_task_ids, "Stopped before execution because the LLM client is unavailable."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": resolution_errors + [msg],
+        }
 
     model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
-        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped before execution because the LLM failed to initialize.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": [], "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(
+            resolved_task_ids, "Stopped before execution because the LLM failed to initialize."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": resolution_errors + [msg],
+        }
 
     touched_files: set[str] = set()
-    execution_state: Dict[str, int | bool] = {
+    execution_state: dict[str, int | bool] = {
         "edits_started": False,
         "validation_calls": 0,
     }
-    
+
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
     retry_batch = _is_retry_batch(resolved_tasks)
     skinny_resolved_tasks = [
         (t, _create_skinny_subagent_group(g), paths) for t, g, paths in resolved_tasks
     ]
-    
+
     prompt = _build_update_prompt(
         skinny_resolved_tasks,
         filtered_ledger,
@@ -1245,13 +1297,18 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
             )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
-        summaries = _build_surrender_summaries(resolved_task_ids, "Stopped because the sandbox or tool loop failed.")
-        return {"action_summaries": summaries, "action_summary": summaries[0] if summaries else None, "changed_files": sorted(touched_files), "errors": resolution_errors + [msg]}
+        summaries = _build_surrender_summaries(
+            resolved_task_ids, "Stopped because the sandbox or tool loop failed."
+        )
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": sorted(touched_files),
+            "errors": resolution_errors + [msg],
+        }
 
     validation_events = [
-        event
-        for event in runtime.tool_events
-        if event.name == "validate_manifest_sync"
+        event for event in runtime.tool_events if event.name == "validate_manifest_sync"
     ]
     succeeded = (
         bool(runtime.changed_files)
@@ -1272,7 +1329,7 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         runtime.tool_events,
     )
     instruction_mismatch_task_ids: set[str] = set()
-    instruction_mismatch_errors: List[str] = []
+    instruction_mismatch_errors: list[str] = []
     for task, _group, _manifest_paths in resolved_tasks:
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is None or snapshot.selected_version is None:
@@ -1357,5 +1414,3 @@ def run_update_subagent_node(state: SubagentState) -> Dict[str, Any]:
         ),
         "errors": resolution_errors + runtime.errors,
     }
-
-

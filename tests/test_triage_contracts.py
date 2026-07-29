@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_triage_contracts.py â€” Unit tests for the Phase 4.0 triage contracts.
 
 Covers:
@@ -13,8 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from uuid import uuid4
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
@@ -32,7 +31,6 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -219,7 +217,9 @@ class TestVulnerabilityGroup:
     def test_localized_issues_and_fix_plan_can_be_attached(self):
         issue = _make_issue()
         group = _make_group(issue)
-        localized = LocalizedIssue(issue=issue, manifest_file="package.json", localization_confidence=0.95)
+        localized = LocalizedIssue(
+            issue=issue, manifest_file="package.json", localization_confidence=0.95
+        )
         plan = FixPlan(
             status=FixPlanStatus.VERSION_FOUND,
             fixed_version="4.17.21",
@@ -398,5 +398,3 @@ def test_re_exported_from_contracts_init():
         TriageResult,
         VulnerabilityGroup,
     )
-
-

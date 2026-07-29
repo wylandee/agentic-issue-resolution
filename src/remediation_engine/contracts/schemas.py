@@ -14,13 +14,12 @@ Design principles
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import (
-    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
@@ -28,7 +27,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-
 
 # ---------------------------------------------------------------------------
 # Enumerations
@@ -50,8 +48,8 @@ class IssueSource(str, Enum):
     """The originating scanner / data source."""
 
     SEMGREP = "semgrep"
-    ODC = "odc"              # OWASP Dependency-Check
-    MANUAL = "manual"        # Injected by a human or eval harness
+    ODC = "odc"  # OWASP Dependency-Check
+    MANUAL = "manual"  # Injected by a human or eval harness
     SYNTHETIC = "synthetic"  # Generated for testing / benchmarks
 
 
@@ -59,7 +57,7 @@ class IssueType(str, Enum):
     """Broad classification of the finding."""
 
     SAST = "sast"  # Static Application Security Testing code finding
-    SCA = "sca"    # Software Composition Analysis dependency finding
+    SCA = "sca"  # Software Composition Analysis dependency finding
 
 
 class ASTNodeType(str, Enum):
@@ -78,10 +76,10 @@ class ASTNodeType(str, Enum):
 class EditStatus(str, Enum):
     """Outcome of an attempted file edit."""
 
-    APPLIED = "applied"      # Patch applied successfully
-    DRY_RUN = "dry_run"      # Validated only; no disk write
-    REJECTED = "rejected"    # Validation failed before write
-    ERROR = "error"          # Unexpected error during application
+    APPLIED = "applied"  # Patch applied successfully
+    DRY_RUN = "dry_run"  # Validated only; no disk write
+    REJECTED = "rejected"  # Validation failed before write
+    ERROR = "error"  # Unexpected error during application
 
 
 class ValidationStatus(str, Enum):
@@ -110,9 +108,9 @@ class TrajectoryEventKind(str, Enum):
 class FixPlanStatus(str, Enum):
     """Outcome of the fix-planner waterfall for one SCA finding."""
 
-    VERSION_FOUND = "version_found"       # A safe pinned version was identified
-    WORKAROUND_FOUND = "workaround_found" # No upstream fix; web snippets found
-    NO_FIX = "no_fix"                     # All strategies exhausted, nothing found
+    VERSION_FOUND = "version_found"  # A safe pinned version was identified
+    WORKAROUND_FOUND = "workaround_found"  # No upstream fix; web snippets found
+    NO_FIX = "no_fix"  # All strategies exhausted, nothing found
 
 
 class FailureCategory(str, Enum):
@@ -157,21 +155,21 @@ class AgentActionStatus(str, Enum):
 class GroupRemediationStatus(str, Enum):
     """Lifecycle status for one vulnerability group in the remediation pipeline."""
 
-    PENDING = "pending"                              # Not yet touched by any subagent
-    OPTIMISTICALLY_FIXED = "optimistically_fixed"    # Subagent succeeded; awaiting QA
-    QA_PASSED = "qa_passed"                          # QA explicitly passed; terminal success
-    NEEDS_RETRY = "needs_retry"                      # QA failed; will be re-routed
-    UNFIXABLE = "unfixable"                          # Max retries exhausted; terminal failure
+    PENDING = "pending"  # Not yet touched by any subagent
+    OPTIMISTICALLY_FIXED = "optimistically_fixed"  # Subagent succeeded; awaiting QA
+    QA_PASSED = "qa_passed"  # QA explicitly passed; terminal success
+    NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed
+    UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
 
 
 class TaskStatus(str, Enum):
     """Lifecycle status for one RemediationTask in the task queue."""
 
-    PENDING = "pending"                              # Not yet dispatched to any worker
-    OPTIMISTICALLY_FIXED = "optimistically_fixed"    # Worker succeeded; awaiting QA verdict
-    QA_PASSED = "qa_passed"                          # QA explicitly passed; terminal success
-    NEEDS_RETRY = "needs_retry"                      # QA failed; will be re-routed by supervisor
-    UNFIXABLE = "unfixable"                          # Max retries exhausted; terminal failure
+    PENDING = "pending"  # Not yet dispatched to any worker
+    OPTIMISTICALLY_FIXED = "optimistically_fixed"  # Worker succeeded; awaiting QA verdict
+    QA_PASSED = "qa_passed"  # QA explicitly passed; terminal success
+    NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed by supervisor
+    UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +226,14 @@ class FixPlan(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     status: FixPlanStatus = Field(..., description="Outcome of the waterfall.")
-    fixed_version: Optional[str] = Field(
+    fixed_version: str | None = Field(
         None,
         description="Safe pinned version to upgrade to (set iff status=version_found).",
     )
-    workaround_snippets: Optional[List[str]] = Field(
+    workaround_snippets: list[str] | None = Field(
         None,
         description="Ordered list of workaround text snippets from web search "
-                    "(set iff status=workaround_found).",
+        "(set iff status=workaround_found).",
     )
     instruction: str = Field(
         ...,
@@ -246,38 +244,28 @@ class FixPlan(BaseModel):
         ...,
         min_length=1,
         description="Which waterfall step produced this plan "
-                    "(local_regex | osv_api | npm_registry | serper | none).",
+        "(local_regex | osv_api | npm_registry | serper | none).",
     )
 
     @model_validator(mode="after")
-    def _check_invariants(self) -> "FixPlan":
+    def _check_invariants(self) -> FixPlan:
         if self.status == FixPlanStatus.VERSION_FOUND:
             if not self.fixed_version:
-                raise ValueError(
-                    "status='version_found' requires a non-empty fixed_version."
-                )
+                raise ValueError("status='version_found' requires a non-empty fixed_version.")
             if self.workaround_snippets is not None:
-                raise ValueError(
-                    "status='version_found' must have workaround_snippets=None."
-                )
+                raise ValueError("status='version_found' must have workaround_snippets=None.")
         elif self.status == FixPlanStatus.WORKAROUND_FOUND:
             if not self.workaround_snippets:
                 raise ValueError(
                     "status='workaround_found' requires a non-empty workaround_snippets list."
                 )
             if self.fixed_version is not None:
-                raise ValueError(
-                    "status='workaround_found' must have fixed_version=None."
-                )
+                raise ValueError("status='workaround_found' must have fixed_version=None.")
         else:  # NO_FIX
             if self.fixed_version is not None:
-                raise ValueError(
-                    "status='no_fix' must have fixed_version=None."
-                )
+                raise ValueError("status='no_fix' must have fixed_version=None.")
             if self.workaround_snippets is not None:
-                raise ValueError(
-                    "status='no_fix' must have workaround_snippets=None."
-                )
+                raise ValueError("status='no_fix' must have workaround_snippets=None.")
         return self
 
 
@@ -295,7 +283,7 @@ class LineRange(BaseModel):
     end: int = Field(..., ge=1, description="Last line of the range (1-indexed, inclusive).")
 
     @model_validator(mode="after")
-    def _end_gte_start(self) -> "LineRange":
+    def _end_gte_start(self) -> LineRange:
         if self.end < self.start:
             raise ValueError(f"end ({self.end}) must be >= start ({self.start})")
         return self
@@ -312,7 +300,7 @@ class CWEEntry(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str = Field(..., pattern=r"^CWE-\d+$", description="e.g. 'CWE-79'")
-    name: Optional[str] = Field(None, description="Human-readable weakness name.")
+    name: str | None = Field(None, description="Human-readable weakness name.")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +324,7 @@ class VulnerabilityIssue(BaseModel):
 
     # Identity
     id: UUID = Field(default_factory=uuid4, description="Stable internal finding UUID.")
-    finding_id: Optional[str] = Field(
+    finding_id: str | None = Field(
         None,
         description="Scanner-native finding identifier (e.g. Semgrep finding ID).",
     )
@@ -346,46 +334,42 @@ class VulnerabilityIssue(BaseModel):
     issue_type: IssueType = Field(..., description="SAST or SCA classification.")
 
     # Repository context
-    repo_url: Optional[str] = Field(
-        None, description="HTTPS clone URL of the target repository."
-    )
-    base_ref: Optional[str] = Field(
+    repo_url: str | None = Field(None, description="HTTPS clone URL of the target repository.")
+    base_ref: str | None = Field(
         None,
         description="Git branch name or commit SHA that was scanned.",
     )
 
     # Rule / advisory identification
-    rule_id: Optional[str] = Field(
+    rule_id: str | None = Field(
         None,
         description="Semgrep rule ID or equivalent scanner rule key.",
     )
-    cve_id: Optional[str] = Field(
+    cve_id: str | None = Field(
         None,
         pattern=r"^CVE-\d{4}-\d{4,}$",
         description="CVE identifier (SCA findings).",
     )
-    ghsa_id: Optional[str] = Field(
+    ghsa_id: str | None = Field(
         None,
         pattern=r"^GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$",
         description="GitHub Security Advisory identifier (SCA findings).",
     )
-    cwe: List[CWEEntry] = Field(
+    cwe: list[CWEEntry] = Field(
         default_factory=list,
         description="Associated CWE weakness entries.",
     )
-    owasp: List[str] = Field(
+    owasp: list[str] = Field(
         default_factory=list,
         description="OWASP Top-10 category labels (e.g. 'A03:2021').",
     )
 
     # Severity
     severity: Severity = Field(default=Severity.UNKNOWN)
-    confidence: Optional[str] = Field(
-        None, description="Scanner confidence label (HIGH/MEDIUM/LOW)."
-    )
+    confidence: str | None = Field(None, description="Scanner confidence label (HIGH/MEDIUM/LOW).")
 
     # Location (populated for SAST; optional for SCA)
-    file_path: Optional[str] = Field(
+    file_path: str | None = Field(
         None,
         description=(
             "Location string for the affected artifact. For SAST this is the "
@@ -394,48 +378,42 @@ class VulnerabilityIssue(BaseModel):
             "localization."
         ),
     )
-    line_range: Optional[LineRange] = Field(
+    line_range: LineRange | None = Field(
         None, description="Affected line range within ``file_path``."
     )
 
     # SCA-specific
-    package_name: Optional[str] = Field(None, description="Vulnerable package name.")
-    package_version: Optional[str] = Field(
-        None, description="Installed version of the package."
-    )
-    fixed_version: Optional[str] = Field(
+    package_name: str | None = Field(None, description="Vulnerable package name.")
+    package_version: str | None = Field(None, description="Installed version of the package.")
+    fixed_version: str | None = Field(
         None, description="Earliest non-vulnerable version, if known."
     )
-    purl: Optional[str] = Field(
-        None, description="Package URL (PURL) per the PURL spec."
-    )
-    ecosystem: Optional[str] = Field(
-        None, description="Package ecosystem: npm, pypi, maven, etc."
-    )
+    purl: str | None = Field(None, description="Package URL (PURL) per the PURL spec.")
+    ecosystem: str | None = Field(None, description="Package ecosystem: npm, pypi, maven, etc.")
 
     # Content
-    message: Optional[str] = Field(None, description="Human-readable finding message.")
-    finding_url: Optional[str] = Field(
+    message: str | None = Field(None, description="Human-readable finding message.")
+    finding_url: str | None = Field(
         None, description="Deep-link to the scanner UI for this finding."
     )
-    dataflow_trace: Optional[Dict[str, Any]] = Field(
+    dataflow_trace: dict[str, Any] | None = Field(
         None,
         description="Raw Semgrep dataflow trace object for SAST findings, if present.",
     )
 
     # Validation profile (which sandbox ruleset to use)
-    validation_profile: Optional[str] = Field(
+    validation_profile: str | None = Field(
         None,
         description="Key into config/rules.yaml selecting the validation suite.",
     )
 
     # Audit
-    raw_payload: Optional[Dict[str, Any]] = Field(
+    raw_payload: dict[str, Any] | None = Field(
         None,
         description="Original scanner JSON payload; preserved for auditability.",
     )
     ingested_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description="UTC timestamp when this issue was ingested.",
     )
 
@@ -445,7 +423,7 @@ class VulnerabilityIssue(BaseModel):
 
     @field_validator("cve_id", mode="before")
     @classmethod
-    def _normalise_cve(cls, v: Any) -> Optional[str]:
+    def _normalise_cve(cls, v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip().upper()
@@ -453,14 +431,14 @@ class VulnerabilityIssue(BaseModel):
 
     @field_validator("ghsa_id", mode="before")
     @classmethod
-    def _normalise_ghsa(cls, v: Any) -> Optional[str]:
+    def _normalise_ghsa(cls, v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip().upper()
         return s if s else None
 
     @model_validator(mode="after")
-    def _backfill_ghsa_from_rule_id(self) -> "VulnerabilityIssue":
+    def _backfill_ghsa_from_rule_id(self) -> VulnerabilityIssue:
         """Populate ``ghsa_id`` when legacy/scanner inputs only set ``rule_id``."""
         if self.ghsa_id or not self.rule_id:
             return self
@@ -486,7 +464,7 @@ class VulnerabilityIssue(BaseModel):
 
     @field_validator("file_path", mode="before")
     @classmethod
-    def _normalise_path(cls, v: Any) -> Optional[str]:
+    def _normalise_path(cls, v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip().lstrip("/")
@@ -513,45 +491,45 @@ class LocalizedIssue(BaseModel):
     issue: VulnerabilityIssue = Field(..., description="The originating finding.")
 
     # AST / symbol context (SAST)
-    enclosing_symbol: Optional[str] = Field(
+    enclosing_symbol: str | None = Field(
         None, description="Name of the enclosing function, method, or class."
     )
     enclosing_node_type: ASTNodeType = Field(
         default=ASTNodeType.UNKNOWN,
         description="AST node type of the enclosing symbol.",
     )
-    sink_expression: Optional[str] = Field(
+    sink_expression: str | None = Field(
         None, description="The specific sink call expression at the finding location."
     )
-    imports: List[str] = Field(
+    imports: list[str] = Field(
         default_factory=list,
         description="Relevant import statements from the affected file.",
     )
-    data_flow_hints: List[str] = Field(
+    data_flow_hints: list[str] = Field(
         default_factory=list,
         description="Brief data-flow notes (e.g. 'taint source: req.params.id').",
     )
-    snippet: Optional[str] = Field(
+    snippet: str | None = Field(
         None, description="Bounded code snippet around the finding (â‰¤ 30 lines)."
     )
 
     # Manifest context (SCA)
-    manifest_file: Optional[str] = Field(
+    manifest_file: str | None = Field(
         None, description="Repo-relative path to the resolved manifest / lockfile."
     )
-    is_direct_dependency: Optional[bool] = Field(
+    is_direct_dependency: bool | None = Field(
         None,
         description="True if the package appears as a direct dependency.",
     )
-    manifest_line: Optional[int] = Field(
+    manifest_line: int | None = Field(
         None,
         ge=1,
         description="1-indexed line in the manifest where the dependency is declared.",
     )
-    manifest_snippet: Optional[str] = Field(
+    manifest_snippet: str | None = Field(
         None, description="3-line snippet centred on the manifest declaration."
     )
-    package_manager: Optional[str] = Field(
+    package_manager: str | None = Field(
         None,
         description="Detected package manager (npm / yarn / pnpm) for the manifest.",
     )
@@ -565,12 +543,12 @@ class LocalizedIssue(BaseModel):
     )
 
     localized_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
     )
 
     @field_validator("manifest_file", mode="before")
     @classmethod
-    def _normalise_manifest_file(cls, v: Any) -> Optional[str]:
+    def _normalise_manifest_file(cls, v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip().replace("\\", "/").lstrip("/")
@@ -593,12 +571,8 @@ class EditRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     # Target
-    repo_root: str = Field(
-        ..., description="Absolute path to the repository workspace root."
-    )
-    file_path: str = Field(
-        ..., description="Repo-relative path to the file to be edited."
-    )
+    repo_root: str = Field(..., description="Absolute path to the repository workspace root.")
+    file_path: str = Field(..., description="Repo-relative path to the file to be edited.")
 
     # Edit specification
     old_text: str = Field(
@@ -606,9 +580,7 @@ class EditRequest(BaseModel):
         min_length=1,
         description="The exact text block to be replaced (must match uniquely).",
     )
-    new_text: str = Field(
-        ..., description="Replacement text for the matched block."
-    )
+    new_text: str = Field(..., description="Replacement text for the matched block.")
 
     # Safety controls
     dry_run: bool = Field(
@@ -622,12 +594,10 @@ class EditRequest(BaseModel):
     )
 
     # Traceability
-    issue_id: Optional[UUID] = Field(
+    issue_id: UUID | None = Field(
         None, description="UUID of the ``VulnerabilityIssue`` this edit addresses."
     )
-    rationale: Optional[str] = Field(
-        None, description="Agent-provided explanation for the change."
-    )
+    rationale: str | None = Field(None, description="Agent-provided explanation for the change.")
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -647,15 +617,15 @@ class EditResult(BaseModel):
 
     request: EditRequest
     status: EditStatus
-    unified_diff: Optional[str] = Field(
+    unified_diff: str | None = Field(
         None, description="Unified diff of the change (populated on APPLIED/DRY_RUN)."
     )
     lines_added: int = Field(default=0, ge=0)
     lines_removed: int = Field(default=0, ge=0)
-    rejection_reason: Optional[str] = Field(
+    rejection_reason: str | None = Field(
         None, description="Human-readable reason for REJECTED / ERROR status."
     )
-    applied_at: Optional[datetime] = Field(
+    applied_at: datetime | None = Field(
         None, description="UTC timestamp of the write (None for dry-run/rejected)."
     )
 
@@ -671,9 +641,9 @@ class FailingTest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
-    file: Optional[str] = None
-    line: Optional[int] = Field(None, ge=1)
-    message: Optional[str] = None
+    file: str | None = None
+    line: int | None = Field(None, ge=1)
+    message: str | None = None
 
 
 class ValidationResult(BaseModel):
@@ -686,7 +656,7 @@ class ValidationResult(BaseModel):
     model_config = ConfigDict(frozen=False)
 
     # Identity
-    patch_attempt_id: Optional[UUID] = Field(
+    patch_attempt_id: UUID | None = Field(
         None, description="UUID of the ``PatchAttempt`` this validates."
     )
     phase: str = Field(
@@ -696,32 +666,30 @@ class ValidationResult(BaseModel):
 
     # Result
     status: ValidationStatus
-    exit_code: Optional[int] = None
-    command: List[str] = Field(
+    exit_code: int | None = None
+    command: list[str] = Field(
         default_factory=list,
         description="The command array that was executed.",
     )
-    stdout_tail: Optional[str] = Field(
+    stdout_tail: str | None = Field(
         None, description="Last N lines of stdout (truncated for context)."
     )
-    stderr_tail: Optional[str] = Field(
-        None, description="Last N lines of stderr."
-    )
+    stderr_tail: str | None = Field(None, description="Last N lines of stderr.")
 
     # Structured failure analysis
-    failing_tests: List[FailingTest] = Field(default_factory=list)
-    dependency_conflict_hints: List[str] = Field(
+    failing_tests: list[FailingTest] = Field(default_factory=list)
+    dependency_conflict_hints: list[str] = Field(
         default_factory=list,
         description="Extracted dependency conflict messages for retry planning.",
     )
-    changed_files: List[str] = Field(
+    changed_files: list[str] = Field(
         default_factory=list,
         description="Repo-relative paths of files modified during validation.",
     )
 
-    duration_seconds: Optional[float] = Field(None, ge=0.0)
+    duration_seconds: float | None = Field(None, ge=0.0)
     validated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
     )
 
 
@@ -744,27 +712,27 @@ class PatchAttempt(BaseModel):
     issue_id: UUID = Field(..., description="UUID of the ``VulnerabilityIssue`` being remediated.")
     attempt_number: int = Field(..., ge=1, description="1-indexed attempt counter.")
 
-    edits: List[EditResult] = Field(
+    edits: list[EditResult] = Field(
         default_factory=list,
         description="All file edits applied in this attempt.",
     )
-    validations: List[ValidationResult] = Field(
+    validations: list[ValidationResult] = Field(
         default_factory=list,
         description="Ordered validation results for this attempt.",
     )
 
     # Summary
-    succeeded: Optional[bool] = Field(
+    succeeded: bool | None = Field(
         None,
         description="True if all validation phases passed; False if any failed; None if still running.",
     )
-    failure_summary: Optional[str] = Field(
+    failure_summary: str | None = Field(
         None,
         description="Natural-language summary of why this attempt failed (for the next retry prompt).",
     )
 
-    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    completed_at: Optional[datetime] = None
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    completed_at: datetime | None = None
 
     @property
     def all_validations_passed(self) -> bool:
@@ -790,15 +758,15 @@ class TrajectoryEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: UUID = Field(default_factory=uuid4)
-    issue_id: Optional[UUID] = Field(None, description="Related ``VulnerabilityIssue`` UUID.")
-    patch_attempt_id: Optional[UUID] = Field(None)
+    issue_id: UUID | None = Field(None, description="Related ``VulnerabilityIssue`` UUID.")
+    patch_attempt_id: UUID | None = Field(None)
 
     kind: TrajectoryEventKind
-    agent: Optional[str] = Field(None, description="Agent node name (e.g. 'remedy_agent').")
+    agent: str | None = Field(None, description="Agent node name (e.g. 'remedy_agent').")
 
     # Payload
     summary: str = Field(..., description="Short human-readable description of the step.")
-    detail: Optional[Dict[str, Any]] = Field(
+    detail: dict[str, Any] | None = Field(
         None,
         description="Structured detail payload (tool call args, diff stats, etc.).",
     )
@@ -806,10 +774,10 @@ class TrajectoryEvent(BaseModel):
     # Cost tracking
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
-    duration_seconds: Optional[float] = Field(None, ge=0.0)
+    duration_seconds: float | None = Field(None, ge=0.0)
 
     occurred_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
     )
 
     @property
@@ -833,36 +801,32 @@ class SystemContext(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    repo_url: Optional[str] = Field(
-        None, description="HTTPS clone URL of the target repository."
-    )
-    base_ref: Optional[str] = Field(
-        None, description="Git branch or commit SHA that was scanned."
-    )
+    repo_url: str | None = Field(None, description="HTTPS clone URL of the target repository.")
+    base_ref: str | None = Field(None, description="Git branch or commit SHA that was scanned.")
     scanned_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description="UTC timestamp when the scan was initiated.",
     )
-    environment: Optional[str] = Field(
+    environment: str | None = Field(
         None,
         description="Deployment environment label (e.g. 'production', 'staging', 'dev').",
     )
-    deployment_os: Optional[str] = Field(
+    deployment_os: str | None = Field(
         None, description="Operating system where the app is deployed."
     )
-    public_facing: Optional[bool] = Field(
+    public_facing: bool | None = Field(
         None, description="Whether the app is public-facing (Internet-accessible)."
     )
-    primary_language: Optional[str] = Field(
+    primary_language: str | None = Field(
         None, description="Primary programming language of the codebase."
     )
-    deployment_architecture: Optional[str] = Field(
+    deployment_architecture: str | None = Field(
         None, description="Architecture layout, e.g. serverless, containerized, monolith."
     )
-    data_sensitivity: Optional[str] = Field(
+    data_sensitivity: str | None = Field(
         None, description="Data sensitivity level, e.g. high, medium, low, public."
     )
-    tags: Dict[str, str] = Field(
+    tags: dict[str, str] = Field(
         default_factory=dict,
         description="Arbitrary key-value metadata (e.g. team, project, cost-center).",
     )
@@ -900,14 +864,14 @@ class CVEEnrichment(BaseModel):
         default=False,
         description="True if the CVE appears in the CISA KEV catalogue.",
     )
-    kev_date_added: Optional[str] = Field(
+    kev_date_added: str | None = Field(
         None,
         description="ISO-8601 date the CVE was added to KEV (e.g. '2023-04-03').",
     )
 
     # Provenance
     enriched_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description="UTC timestamp when enrichment was fetched.",
     )
     enrichment_source: str = Field(
@@ -941,15 +905,15 @@ class VulnerabilityGroup(BaseModel):
     issue_type: IssueType = Field(..., description="SAST or SCA classification of this group.")
 
     # Component identity
-    vulnerable_component: Optional[str] = Field(
+    vulnerable_component: str | None = Field(
         None,
         description="Package name (SCA) or Semgrep rule ID (SAST) shared by all members.",
     )
-    file_path: Optional[str] = Field(
+    file_path: str | None = Field(
         None,
         description="Repo-relative path to the affected file (may be None for SCA without location).",
     )
-    file_paths: List[str] = Field(
+    file_paths: list[str] = Field(
         default_factory=list,
         description=(
             "Deduplicated repo-relative file paths associated with this group. "
@@ -959,21 +923,21 @@ class VulnerabilityGroup(BaseModel):
     )
 
     # CVE / version metadata (SCA-oriented; empty for pure SAST groups)
-    cve_ids: List[str] = Field(
+    cve_ids: list[str] = Field(
         default_factory=list,
         description="Deduplicated list of CVE identifiers affecting this component.",
     )
-    ghsa_ids: List[str] = Field(
+    ghsa_ids: list[str] = Field(
         default_factory=list,
         description="Deduplicated list of GHSA identifiers affecting this component.",
     )
-    versions: List[str] = Field(
+    versions: list[str] = Field(
         default_factory=list,
         description="Deduplicated installed versions of the vulnerable package.",
     )
 
     # Scanner provenance
-    sources: List[IssueSource] = Field(
+    sources: list[IssueSource] = Field(
         default_factory=list,
         description="Which scanners contributed at least one issue to this group.",
     )
@@ -988,18 +952,18 @@ class VulnerabilityGroup(BaseModel):
     )
 
     # All member issues
-    issues: List[VulnerabilityIssue] = Field(
+    issues: list[VulnerabilityIssue] = Field(
         default_factory=list,
         description="All ``VulnerabilityIssue`` records that belong to this group.",
     )
-    localized_issues: List[LocalizedIssue] = Field(
+    localized_issues: list[LocalizedIssue] = Field(
         default_factory=list,
         description=(
             "All pre-group localization results associated with this group. "
             "Primarily populated for SCA groups in the shift-left flow."
         ),
     )
-    fix_plan: Optional[FixPlan] = Field(
+    fix_plan: FixPlan | None = Field(
         None,
         description=(
             "Unified remediation plan for the group. For SCA groups this is the "
@@ -1008,11 +972,11 @@ class VulnerabilityGroup(BaseModel):
     )
 
     # Enrichment (attached after grouping, before triage)
-    enrichment: Optional[CVEEnrichment] = Field(
+    enrichment: CVEEnrichment | None = Field(
         None,
         description="Threat-intel enrichment for the primary CVE of this group.",
     )
-    is_reachable: Optional[bool] = Field(
+    is_reachable: bool | None = Field(
         default=None,
         description=(
             "Reachability analysis result for SCA groups. "
@@ -1022,12 +986,12 @@ class VulnerabilityGroup(BaseModel):
     )
 
     grouped_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
     )
 
     @field_validator("file_path", mode="before")
     @classmethod
-    def _normalise_group_file_path(cls, v: Any) -> Optional[str]:
+    def _normalise_group_file_path(cls, v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip().replace("\\", "/").lstrip("/")
@@ -1035,12 +999,12 @@ class VulnerabilityGroup(BaseModel):
 
     @field_validator("file_paths", mode="before")
     @classmethod
-    def _normalise_group_file_paths(cls, value: Any) -> List[str]:
+    def _normalise_group_file_paths(cls, value: Any) -> list[str]:
         if value is None:
             return []
 
         raw_values = value if isinstance(value, list) else [value]
-        normalised: List[str] = []
+        normalised: list[str] = []
         seen: set[str] = set()
         for raw in raw_values:
             if raw is None:
@@ -1053,7 +1017,7 @@ class VulnerabilityGroup(BaseModel):
         return normalised
 
     @model_validator(mode="after")
-    def _sync_group_file_path_fields(self) -> "VulnerabilityGroup":
+    def _sync_group_file_path_fields(self) -> VulnerabilityGroup:
         if self.file_path and self.file_path not in self.file_paths:
             self.file_paths = [self.file_path, *self.file_paths]
         elif not self.file_path and self.file_paths:
@@ -1089,7 +1053,7 @@ class TriageResult(BaseModel):
             "Only set to False when there is explicit, specific evidence."
         ),
     )
-    false_positive_reason: Optional[str] = Field(
+    false_positive_reason: str | None = Field(
         None,
         description="Required when is_valid=False.  Must explain the specific evidence.",
     )
@@ -1126,8 +1090,7 @@ class TriageResult(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "0.0 to 1.0 representing the certainty of the is_valid decision "
-            "based on hard evidence."
+            "0.0 to 1.0 representing the certainty of the is_valid decision based on hard evidence."
         ),
     )
     priority_confidence_score: float = Field(
@@ -1153,21 +1116,50 @@ class TriageResult(BaseModel):
     )
 
     triaged_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
     )
 
     @model_validator(mode="after")
-    def _require_fp_reason(self) -> "TriageResult":
+    def _require_fp_reason(self) -> TriageResult:
         if not self.is_valid and not self.false_positive_reason:
-            raise ValueError(
-                "false_positive_reason is required when is_valid=False."
-            )
+            raise ValueError("false_positive_reason is required when is_valid=False.")
         return self
 
 
 # ---------------------------------------------------------------------------
 # Phase 5 Remedy refactor contracts
 # ---------------------------------------------------------------------------
+
+
+class WorkaroundPhase(str, Enum):
+    """Workflow phase for workaround subagent execution."""
+
+    INITIAL_MITIGATION = "initial_mitigation"
+    QA_REGRESSION_REPAIR = "qa_regression_repair"
+
+
+class QAFailureEvidence(BaseModel):
+    """Exact diagnostic evidence extracted from a failed QA evaluation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    exact_diagnostics: list[str] = Field(default_factory=list)
+    failed_tests: list[str] = Field(default_factory=list)
+    source_locations: list[str] = Field(default_factory=list)
+    affected_files: list[str] = Field(default_factory=list)
+    raw_excerpt: str = Field(default="")
+    attempt_id: str = Field(default="")
+    task_revision: int = Field(default=0, ge=0)
+
+
+class WorkaroundContext(BaseModel):
+    """Supervisor-provided phase and evidence context for workaround attempts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: WorkaroundPhase = Field(default=WorkaroundPhase.INITIAL_MITIGATION)
+    vulnerability_mechanism: str = Field(default="")
+    qa_evidence: QAFailureEvidence | None = Field(default=None)
 
 
 class QAEvaluation(BaseModel):
@@ -1177,32 +1169,36 @@ class QAEvaluation(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     passed: bool
-    failure_category: Optional[FailureCategory] = Field(
+    failure_category: FailureCategory | None = Field(
         None,
         description="Required when passed=False.",
     )
-    retry_feedback: Optional[str] = Field(
+    retry_feedback: str | None = Field(
         None,
         description="Required retry guidance when passed=False.",
     )
+    failure_evidence: QAFailureEvidence | None = Field(
+        None,
+        description="Structured failure evidence when passed=False.",
+    )
 
     @model_validator(mode="after")
-    def _check_pass_fail_payload(self) -> "QAEvaluation":
+    def _check_pass_fail_payload(self) -> QAEvaluation:
         if self.passed:
-            if self.failure_category is not None or self.retry_feedback is not None:
+            if (
+                self.failure_category is not None
+                or self.retry_feedback is not None
+                or self.failure_evidence is not None
+            ):
                 raise ValueError(
-                    "passed=True requires failure_category=None and retry_feedback=None."
+                    "passed=True requires failure_category=None, retry_feedback=None, and failure_evidence=None."
                 )
             return self
 
         if self.failure_category is None:
-            raise ValueError(
-                "passed=False requires a non-null failure_category."
-            )
+            raise ValueError("passed=False requires a non-null failure_category.")
         if not self.retry_feedback or not self.retry_feedback.strip():
-            raise ValueError(
-                "passed=False requires a non-empty retry_feedback."
-            )
+            raise ValueError("passed=False requires a non-empty retry_feedback.")
         return self
 
 
@@ -1220,7 +1216,7 @@ class BatchQAResult(BaseModel):
             "possibly responsible, and exonerated groups."
         ),
     )
-    evaluations: List[QAEvaluation] = Field(
+    evaluations: list[QAEvaluation] = Field(
         default_factory=list,
         description="Exactly one QAEvaluation per vulnerability group in the batch.",
     )
@@ -1232,9 +1228,9 @@ class AgentActionSummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(..., min_length=1)
-    attempt_id: Optional[str] = None
-    task_revision: Optional[int] = Field(default=None, ge=0)
-    instruction_digest: Optional[str] = None
+    attempt_id: str | None = None
+    task_revision: int | None = Field(default=None, ge=0)
+    instruction_digest: str | None = None
     status: AgentActionStatus
     summary: str = Field(..., min_length=1)
 
@@ -1258,12 +1254,13 @@ class TaskAttemptSnapshot(BaseModel):
     task_revision: int = Field(default=0, ge=0)
     attempt_number: int = Field(default=1, ge=1)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
-    selected_version: Optional[str] = None
+    selected_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
     dispatch_node: Literal["update_subagent", "workaround_subagent", "qa_critic"]
-    plan_id: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    plan_id: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    workaround_context: WorkaroundContext | None = Field(default=None)
 
 
 class UpdateRetryDiagnostics(BaseModel):
@@ -1273,20 +1270,20 @@ class UpdateRetryDiagnostics(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
-    committed_attempt_id: Optional[str] = None
-    security_floor: Optional[str] = None
+    committed_attempt_id: str | None = None
+    security_floor: str | None = None
     registry_query_performed: bool = False
-    attempted_versions: List[str] = Field(default_factory=list)
-    executed_versions: List[str] = Field(default_factory=list)
-    candidate_versions_considered: List[str] = Field(default_factory=list)
-    selected_version: Optional[str] = None
-    latest_version_seen: Optional[str] = None
+    attempted_versions: list[str] = Field(default_factory=list)
+    executed_versions: list[str] = Field(default_factory=list)
+    candidate_versions_considered: list[str] = Field(default_factory=list)
+    selected_version: str | None = None
+    latest_version_seen: str | None = None
     used_overrides: bool = False
     package_abandoned: bool = False
     exhausted_update_path: bool = False
     failure_reason: str = ""
     reasoning_summary: str = ""
-    instruction_digest: Optional[str] = None
+    instruction_digest: str | None = None
 
     @field_validator(
         "attempted_versions",
@@ -1295,12 +1292,12 @@ class UpdateRetryDiagnostics(BaseModel):
         mode="before",
     )
     @classmethod
-    def _normalize_version_lists(cls, value: Any) -> List[str]:
+    def _normalize_version_lists(cls, value: Any) -> list[str]:
         if value is None:
             return []
         if not isinstance(value, list):
             raise ValueError("version lists must be lists of strings.")
-        cleaned: List[str] = []
+        cleaned: list[str] = []
         seen: set[str] = set()
         for item in value:
             if not isinstance(item, str):
@@ -1314,7 +1311,7 @@ class UpdateRetryDiagnostics(BaseModel):
 
     @field_validator("selected_version", "latest_version_seen", mode="before")
     @classmethod
-    def _normalize_optional_version(cls, value: Any) -> Optional[str]:
+    def _normalize_optional_version(cls, value: Any) -> str | None:
         if value is None:
             return None
         if not isinstance(value, str):
@@ -1337,8 +1334,8 @@ class WorkerExecutionDiagnostics(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    attempted_versions: List[str] = Field(default_factory=list)
-    executed_versions: List[str] = Field(default_factory=list)
+    attempted_versions: list[str] = Field(default_factory=list)
+    executed_versions: list[str] = Field(default_factory=list)
     validation_calls: int = Field(default=0, ge=0)
     validation_passed: bool = False
     failure_reason: str = ""
@@ -1352,7 +1349,7 @@ class WorkaroundEdit(BaseModel):
     file_path: str = Field(..., min_length=1)
     old_text: str = Field(...)
     new_text: str = Field(...)
-    symbol_name: Optional[str] = None
+    symbol_name: str | None = None
     edit_index: int = Field(default=0, ge=0)
     timestamp: str = Field(default="")
 
@@ -1363,10 +1360,14 @@ class WorkaroundReplayPlan(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(..., min_length=1)
-    pre_attempt_snapshots: Dict[str, str] = Field(default_factory=dict)
-    successful_edits: List[WorkaroundEdit] = Field(default_factory=list)
-    investigation_findings: Dict[str, Any] = Field(default_factory=dict)
+    pre_attempt_snapshots: dict[str, str] = Field(default_factory=dict)
+    successful_edits: list[WorkaroundEdit] = Field(default_factory=list)
+    investigation_findings: dict[str, Any] = Field(default_factory=dict)
     source_attempt_id: str = Field(default="")
+    security_invariants: list[str] = Field(default_factory=list)
+    diagnosed_root_causes: list[str] = Field(default_factory=list)
+    planned_targets: list[str] = Field(default_factory=list)
+    validated_files: list[str] = Field(default_factory=list)
 
 
 class WorkerAttemptResult(BaseModel):
@@ -1378,15 +1379,15 @@ class WorkerAttemptResult(BaseModel):
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
     status: AgentActionStatus
-    executed_versions: List[str] = Field(default_factory=list)
-    changed_files: List[str] = Field(default_factory=list)
-    action_summary: Optional[AgentActionSummary] = None
+    executed_versions: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+    action_summary: AgentActionSummary | None = None
     execution_diagnostics: WorkerExecutionDiagnostics = Field(
         default_factory=WorkerExecutionDiagnostics
     )
     instruction_digest: str = Field(..., min_length=1)
-    replay_plan: Optional[WorkaroundReplayPlan] = None
-    errors: List[str] = Field(default_factory=list)
+    replay_plan: WorkaroundReplayPlan | None = None
+    errors: list[str] = Field(default_factory=list)
 
 
 class QAAttemptResult(BaseModel):
@@ -1399,7 +1400,7 @@ class QAAttemptResult(BaseModel):
     task_revision: int = Field(default=0, ge=0)
     evaluation: QAEvaluation
     investigation_report: str = ""
-    errors: List[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class StateConsistencyEvent(BaseModel):
@@ -1409,12 +1410,12 @@ class StateConsistencyEvent(BaseModel):
 
     event_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
     error_code: str = Field(..., min_length=1)
-    task_id: Optional[str] = None
-    expected_attempt_id: Optional[str] = None
-    received_attempt_id: Optional[str] = None
+    task_id: str | None = None
+    expected_attempt_id: str | None = None
+    received_attempt_id: str | None = None
     action: Literal["ignored", "repaired", "replanned"]
     details: str = ""
-    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class SupervisorRetryPlan(BaseModel):
@@ -1426,10 +1427,10 @@ class SupervisorRetryPlan(BaseModel):
     plan_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
     source_task_revision: int = Field(default=0, ge=0)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
-    selected_version: Optional[str] = None
-    attempted_versions: List[str] = Field(default_factory=list)
-    candidate_versions_considered: List[str] = Field(default_factory=list)
-    latest_version_seen: Optional[str] = None
+    selected_version: str | None = None
+    attempted_versions: list[str] = Field(default_factory=list)
+    candidate_versions_considered: list[str] = Field(default_factory=list)
+    latest_version_seen: str | None = None
     exhausted_update_path: bool = False
     package_abandoned: bool = False
     action: Literal["retry_update", "pivot_workaround"] = "retry_update"
@@ -1441,12 +1442,12 @@ class SupervisorRetryPlan(BaseModel):
         mode="before",
     )
     @classmethod
-    def _normalize_plan_version_lists(cls, value: Any) -> List[str]:
+    def _normalize_plan_version_lists(cls, value: Any) -> list[str]:
         if value is None:
             return []
         if not isinstance(value, list):
             raise ValueError("planner version lists must be lists of strings.")
-        result: List[str] = []
+        result: list[str] = []
         seen: set[str] = set()
         for item in value:
             if not isinstance(item, str):
@@ -1459,7 +1460,7 @@ class SupervisorRetryPlan(BaseModel):
 
     @field_validator("selected_version", "latest_version_seen", mode="before")
     @classmethod
-    def _normalize_plan_optional_version(cls, value: Any) -> Optional[str]:
+    def _normalize_plan_optional_version(cls, value: Any) -> str | None:
         if value is None:
             return None
         if not isinstance(value, str):
@@ -1474,6 +1475,7 @@ class SupervisorRetryPlan(BaseModel):
         if not normalized:
             raise ValueError("exact_instruction must be non-empty.")
         return normalized
+
 
 class SupervisorDecision(BaseModel):
     """
@@ -1497,14 +1499,14 @@ class SupervisorDecision(BaseModel):
         ...,
         description="The next node to route to in the orchestrator graph.",
     )
-    updated_task_strategies: Dict[str, "RoutingStrategy"] = Field(
+    updated_task_strategies: dict[str, RoutingStrategy] = Field(
         default_factory=dict,
         description=(
             "Requested strategy pivots keyed by parent task_id. "
             "The supervisor realizes these as child-task spawns rather than mutating the parent task in place."
         ),
     )
-    target_task_ids: List[str] = Field(
+    target_task_ids: list[str] = Field(
         default_factory=list,
         description=(
             "Task IDs to send to the next worker node. "
@@ -1514,15 +1516,15 @@ class SupervisorDecision(BaseModel):
             "One to ten entries for update_subagent."
         ),
     )
-    unfixable_task_ids: List[str] = Field(
+    unfixable_task_ids: list[str] = Field(
         default_factory=list,
         description="Task IDs that have hit MAX_RETRIES and should be marked unfixable.",
     )
-    new_constraints: List[str] = Field(
+    new_constraints: list[str] = Field(
         default_factory=list,
         description="New constraint strings to append to the constraints ledger.",
     )
-    feedback_by_task: Dict[str, str] = Field(
+    feedback_by_task: dict[str, str] = Field(
         default_factory=dict,
         description="Task-specific retry guidance keyed by task_id.",
     )
@@ -1539,7 +1541,7 @@ class SupervisorDecision(BaseModel):
         min_length=1,
         description="Concise audit explanation of why this routing decision was made.",
     )
-    revised_instructions: Dict[str, str] = Field(
+    revised_instructions: dict[str, str] = Field(
         default_factory=dict,
         description=(
             "Supervisor-revised instruction text per task_id. "
@@ -1548,14 +1550,14 @@ class SupervisorDecision(BaseModel):
             "Retry-bound worker dispatches rely on these task-specific instructions."
         ),
     )
-    spawn_requests: List["TaskSpawnRequest"] = Field(
+    spawn_requests: list[TaskSpawnRequest] = Field(
         default_factory=list,
         description=(
             "Requests to spawn new child tasks. "
             "The Python guardrail layer materializes actual RemediationTask objects."
         ),
     )
-    task_status_updates: Dict[str, "TaskStatus"] = Field(
+    task_status_updates: dict[str, TaskStatus] = Field(
         default_factory=dict,
         description=(
             "Manual status overrides keyed by task_id. "
@@ -1564,7 +1566,7 @@ class SupervisorDecision(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_routing_invariants(self) -> "SupervisorDecision":
+    def _validate_routing_invariants(self) -> SupervisorDecision:
         node = self.next_node
         targets = self.target_task_ids
         unfixable = self.unfixable_task_ids
@@ -1574,21 +1576,15 @@ class SupervisorDecision(BaseModel):
                 f"workaround_subagent requires exactly 1 target_task_id, got {len(targets)}."
             )
         if node == "update_subagent" and len(targets) < 1:
-            raise ValueError(
-                "update_subagent requires at least 1 target_task_id."
-            )
+            raise ValueError("update_subagent requires at least 1 target_task_id.")
         if node == "update_subagent" and len(targets) > 10:
             raise ValueError(
                 f"update_subagent supports at most 10 target_task_ids, got {len(targets)}."
             )
         if node == "qa_critic" and len(targets) < 1:
-            raise ValueError(
-                "qa_critic requires at least 1 target_task_id."
-            )
+            raise ValueError("qa_critic requires at least 1 target_task_id.")
         if node == "teardown" and targets:
-            raise ValueError(
-                f"{node} must have empty target_task_ids, got {targets}."
-            )
+            raise ValueError(f"{node} must have empty target_task_ids, got {targets}.")
         overlap = set(unfixable) & set(targets)
         if overlap:
             raise ValueError(
@@ -1676,7 +1672,7 @@ class RemediationTask(BaseModel):
         ge=0,
         description="Monotonic revision of the supervisor-committed task input.",
     )
-    current_attempt_id: Optional[str] = Field(
+    current_attempt_id: str | None = Field(
         default=None,
         description="Attempt snapshot currently authorized to produce results.",
     )
@@ -1685,7 +1681,7 @@ class RemediationTask(BaseModel):
         min_length=1,
         description="The ``VulnerabilityGroup.group_id`` this task remediates.",
     )
-    parent_task_id: Optional[str] = Field(
+    parent_task_id: str | None = Field(
         default=None,
         description=(
             "The task_id of the parent task that spawned this task. "
@@ -1700,7 +1696,7 @@ class RemediationTask(BaseModel):
         default=SCARemediationStage.OSV_MINIMUM,
         description="Current ordered SCA remediation stage for this task.",
     )
-    selected_version: Optional[str] = Field(
+    selected_version: str | None = Field(
         default=None,
         description="Supervisor-selected version for the current update stage.",
     )
@@ -1726,9 +1722,3 @@ class RemediationTask(BaseModel):
         ge=0,
         description="How many parent tasks spawned this task (0 = initial task).",
     )
-
-
-
-
-
-

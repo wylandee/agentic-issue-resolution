@@ -1,4 +1,4 @@
-﻿"""Validated runtime configuration loaded from environment variables."""
+"""Validated runtime configuration loaded from environment variables."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class AppSettings:
     remedy_disable_retriage: bool = False
 
     @classmethod
-    def from_env(cls) -> "AppSettings":
+    def from_env(cls) -> AppSettings:
         """Build settings from the process environment without side effects."""
         trajectory = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
         return cls(
@@ -52,11 +52,7 @@ class AppSettings:
             ).strip(),
             langsmith_endpoint=os.environ.get("LANGSMITH_ENDPOINT", "").strip(),
             remediation_trajectory_dir=Path(trajectory) if trajectory else None,
-            remedy_bypass_workaround_subagent=_env_bool(
-                "REMEDY_BYPASS_WORKAROUND_SUBAGENT"
-            ),
+            remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),
             remedy_disable_post_qa_triage=_env_bool("REMEDY_DISABLE_POST_QA_TRIAGE"),
             remedy_disable_retriage=_env_bool("REMEDY_DISABLE_RETRIAGE"),
         )
-
-

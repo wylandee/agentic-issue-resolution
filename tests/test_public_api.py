@@ -56,8 +56,9 @@ def test_run_remediation_projects_orchestrator_state(tmp_path: Path) -> None:
         "errors": [],
         "trajectory_path": "data/trajectories/run.md",
     }
-    with patch("remediation_engine.api.triage_issues", return_value=[]), patch(
-        "remediation_engine.api.run_orchestrator", return_value=state
+    with (
+        patch("remediation_engine.api.triage_issues", return_value=[]),
+        patch("remediation_engine.api.run_orchestrator", return_value=state),
     ):
         result = run_remediation(request)
 
@@ -70,9 +71,10 @@ def test_run_remediation_leaves_initial_triage_to_graph(tmp_path: Path) -> None:
     """An API run passes issues to the graph without a hidden pre-triage call."""
     request = RemediationRequest(repo_root=tmp_path, issues=[_issue()])
     state = {"status": "completed", "errors": []}
-    with patch("remediation_engine.api.triage_issues") as mock_triage, patch(
-        "remediation_engine.api.run_orchestrator", return_value=state
-    ) as mock_orchestrator:
+    with (
+        patch("remediation_engine.api.triage_issues") as mock_triage,
+        patch("remediation_engine.api.run_orchestrator", return_value=state) as mock_orchestrator,
+    ):
         run_remediation(request)
 
     mock_triage.assert_not_called()
@@ -161,5 +163,9 @@ def test_cli_exposes_ingest_triage_and_run_commands() -> None:
     parser = build_parser()
 
     for command in ("ingest", "triage", "run"):
-        args = parser.parse_args([command, "issues.jsonl", "--repo", "."] if command == "run" else [command, "issues.jsonl"])
+        args = parser.parse_args(
+            [command, "issues.jsonl", "--repo", "."]
+            if command == "run"
+            else [command, "issues.jsonl"]
+        )
         assert args.command == command

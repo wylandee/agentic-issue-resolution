@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_qa_critic.py - Unit tests for the Phase 5 QA Critic evaluator node.
 
 Mocks DockerSandbox and subprocess so no real Docker or network is required.
@@ -25,14 +25,15 @@ Covers:
     CODE_WORKAROUND+remaining allowed pass; ERESOLVE maps to PEER_CONFLICT
   - run_qa_critic_node map-reduce integration: global execution once, map once per group, reduce once
 """
+
 from __future__ import annotations
 
 import json
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Set
-from unittest.mock import MagicMock, call, patch
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -45,7 +46,6 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     QAEvaluation,
-    RoutingStrategy,
     Severity,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -57,40 +57,39 @@ from remediation_engine.orchestration.qa_critic import (
     _ODC_HTML_REPORT_NAME,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
-    _QAExecutionResults,
-    _SecurityScanResult,
+    GroupInvestigation,
     _apply_guardrails,
-    _build_fallback_investigation_report,
     _build_batch_judge_prompt,
+    _build_fallback_investigation_report,
     _build_individual_investigator_prompt,
-    _collect_target_identifiers,
     _collect_baseline_identifiers,
-    _extract_group_evaluations,
-    _group_scan_status,
-    _generate_workspace_diff,
+    _collect_target_identifiers,
     _detect_test_suite_plans,
+    _extract_failure_blocks,
+    _extract_group_evaluations,
+    _generate_workspace_diff,
+    _group_scan_status,
+    _normalize_node_tap_output,
     _parse_investigation_report,
     _parse_report_identifiers,
+    _QAExecutionResults,
     _read_report_from_workspace,
     _run_batch_judge,
     _run_global_execution,
     _run_individual_investigations,
-    _run_judge_phase,
     _run_install,
+    _run_judge_phase,
     _run_odc,
     _run_security_scan,
     _run_unit_tests,
     _scan_state_projection,
+    _SecurityScanResult,
     _summarize_failed_test_output,
-    _extract_failure_blocks,
-    _normalize_node_tap_output,
     _validate_qa_path,
     build_qa_review_toolbelt,
     build_qa_toolbelt,
     run_qa_critic_node,
-    GroupInvestigation,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -117,7 +116,9 @@ def _make_group(
         status=fix_plan_status,
         fixed_version="4.17.21" if fix_plan_status == FixPlanStatus.VERSION_FOUND else None,
         workaround_snippets=(
-            ["// workaround: sanitize input"] if fix_plan_status == FixPlanStatus.WORKAROUND_FOUND else None
+            ["// workaround: sanitize input"]
+            if fix_plan_status == FixPlanStatus.WORKAROUND_FOUND
+            else None
         ),
         instruction="Upgrade lodash to 4.17.21.",
         strategy_used="osv_api",
@@ -207,9 +208,7 @@ class TestRunUnitTests:
 
         assert ok is True
         assert "passed" in summary.lower()
-        sandbox.run.assert_called_once_with(
-            "npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS
-        )
+        sandbox.run.assert_called_once_with("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
 
     def test_failure_returns_condensed_detected_failures(self):
         stdout = "\n".join(
@@ -249,7 +248,7 @@ class TestRunUnitTests:
             "scripts": {
                 "test": "npm run test:server && npm run test:api",
                 "test:server": "mocha -r tsx --recursive test/server/**/*.ts",
-                "test:api": "node --import tsx --test \"test/api/**/*.test.ts\"",
+                "test:api": 'node --import tsx --test "test/api/**/*.test.ts"',
             }
         }
         sandbox = _make_sandbox(
@@ -274,7 +273,9 @@ class TestRunUnitTests:
                 )
             ]
         )
-        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps(root_package) if path == "package.json" else None
+        )
 
         ok, summary = _run_unit_tests(sandbox)
 
@@ -292,7 +293,7 @@ class TestRunUnitTests:
             "scripts": {
                 "test": "npm run test:server && npm run test:api",
                 "test:server": "mocha test/server/**/*.ts",
-                "test:api": "node --test \"test/api/**/*.test.ts\"",
+                "test:api": 'node --test "test/api/**/*.test.ts"',
             }
         }
         sandbox = _make_sandbox(
@@ -301,7 +302,9 @@ class TestRunUnitTests:
                 CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0),
             ]
         )
-        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps(root_package) if path == "package.json" else None
+        )
 
         ok, summary = _run_unit_tests(sandbox)
 
@@ -321,7 +324,9 @@ class TestRunUnitTests:
                 )
             ]
         )
-        sandbox.read_file.side_effect = lambda path: json.dumps(root_package) if path == "package.json" else None
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps(root_package) if path == "package.json" else None
+        )
 
         ok, summary = _run_unit_tests(sandbox)
 
@@ -337,7 +342,7 @@ class TestStructuredTestDetection:
                 "test": "npm run test:frontend && npm run test:server && npm run test:api",
                 "test:frontend": "cd frontend && npm run test",
                 "test:server": "mocha -r tsx --recursive test/server/**/*.ts",
-                "test:api": "node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \"test/api/**/*.test.ts\"",
+                "test:api": 'node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit "test/api/**/*.test.ts"',
             }
         }
         frontend_package = {
@@ -346,11 +351,7 @@ class TestStructuredTestDetection:
         }
         frontend_angular = {
             "projects": {
-                "frontend": {
-                    "architect": {
-                        "test": {"builder": "@angular/build:unit-test"}
-                    }
-                }
+                "frontend": {"architect": {"test": {"builder": "@angular/build:unit-test"}}}
             }
         }
 
@@ -399,15 +400,18 @@ class TestStructuredNodeTapNormalization:
                 "  type: 'suite'",
                 "  failureType: 'subtestsFailed'",
                 "  error: '1 subtest failed'",
-                "# Error: Test hook \"before\" at test/api/chat.test.ts:4:1079 generated asynchronous activity after the test ended.",
-                "# This activity created the error \"SyntaxError: Unexpected end of JSON input\"",
+                '# Error: Test hook "before" at test/api/chat.test.ts:4:1079 generated asynchronous activity after the test ended.',
+                '# This activity created the error "SyntaxError: Unexpected end of JSON input"',
             ]
         )
 
         failures, diagnostics = _normalize_node_tap_output(output, "", suite_name="api")
 
         assert len(failures) == 1
-        assert failures[0].name == "POST handles searchProducts tool call and returns follow-up response"
+        assert (
+            failures[0].name
+            == "POST handles searchProducts tool call and returns follow-up response"
+        )
         assert failures[0].failure_type == "testTimeoutFailure"
         assert len(diagnostics) == 2
         assert any("subtestsFailed" in diagnostic.message for diagnostic in diagnostics)
@@ -475,10 +479,7 @@ class TestTestFailureExtraction:
 
     def test_large_noisy_output_is_condensed(self):
         repeated = "\n".join(
-            [
-                f"{i}) failure {i}\nAssertionError: broken expectation {i}"
-                for i in range(1, 15)
-            ]
+            [f"{i}) failure {i}\nAssertionError: broken expectation {i}" for i in range(1, 15)]
         )
         summary = _summarize_failed_test_output(1, repeated, "")
         assert "Detected Failures:" in summary
@@ -516,7 +517,7 @@ class TestReadReportFromWorkspace:
 class TestParseReportIdentifiers:
     def _make_report(self, cve_id=None, ghsa_id=None) -> str:
         """Minimal ODC JSON report with one vulnerability."""
-        vuln: Dict[str, Any] = {"name": "CVE-2021-23337", "severity": "HIGH"}
+        vuln: dict[str, Any] = {"name": "CVE-2021-23337", "severity": "HIGH"}
         if cve_id:
             vuln["name"] = cve_id
         package = {
@@ -601,10 +602,21 @@ class TestRunSecurityScan:
 
         target = {"CVE-2021-23337"}
         # parse_report_identifiers returns empty set (CVE resolved)
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=set(),
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is True
@@ -615,10 +627,21 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
         found = {"CVE-2025-10001", "GHSA-AAAA-BBBB-CCCC"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=found,
+            ),
+        ):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -636,10 +659,21 @@ class TestRunSecurityScan:
     def test_preexisting_identifier_is_not_classified_as_new(self):
         sandbox = MagicMock()
         found = {"CVE-2021-23337", "CVE-2025-10001"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=found,
+            ),
+        ):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -653,10 +687,21 @@ class TestRunSecurityScan:
     def test_multiple_new_identifiers_are_sorted_in_summary(self):
         sandbox = MagicMock()
         found = {"CVE-2025-20002", "CVE-2025-10001"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value="{}"), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=found):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=found,
+            ),
+        ):
             result = _run_security_scan(
                 sandbox,
                 "vol",
@@ -671,16 +716,24 @@ class TestRunSecurityScan:
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
 
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch(
-                 "remediation_engine.orchestration.qa_critic._persist_workspace_report_to_host",
-                 side_effect=[
-                     Path("data/cache/qa_reports/dependency-check-report-1234567890.html"),
-                     Path("data/cache/qa_reports/dependency-check-report.json"),
-                 ],
-             ), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._persist_workspace_report_to_host",
+                side_effect=[
+                    Path("data/cache/qa_reports/dependency-check-report-1234567890.html"),
+                    Path("data/cache/qa_reports/dependency-check-report.json"),
+                ],
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=set(),
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is True
@@ -699,9 +752,13 @@ class TestRunSecurityScan:
 
     def test_failure_on_timeout(self):
         sandbox = MagicMock()
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc",
-                   side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=300)):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=300),
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", {"CVE-2021-23337"})
 
         assert ok is False
@@ -710,11 +767,21 @@ class TestRunSecurityScan:
     def test_failure_when_target_still_found(self):
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers",
-                  return_value={"CVE-2021-23337"}):  # still present
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value={"CVE-2021-23337"},
+            ),
+        ):  # still present
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is False
@@ -726,13 +793,21 @@ class TestRunSecurityScan:
     def test_failure_summary_lists_multiple_remaining_identifiers(self):
         sandbox = MagicMock()
         target = {"CVE-2021-23337", "GHSA-35JH-R3H4-6JV8"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=self._make_passing_odc_proc()), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch(
-                 "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
-                 return_value={"GHSA-35JH-R3H4-6JV8", "CVE-2021-23337"},
-             ):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_odc",
+                return_value=self._make_passing_odc_proc(),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value={"GHSA-35JH-R3H4-6JV8", "CVE-2021-23337"},
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         assert ok is False
@@ -744,10 +819,18 @@ class TestRunSecurityScan:
         proc = MagicMock()
         proc.returncode = 1
         sandbox = MagicMock()
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value=None), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=None):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value=None,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=None,
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", {"CVE-2021-23337"})
 
         assert ok is False
@@ -759,10 +842,18 @@ class TestRunSecurityScan:
         proc.returncode = 2  # Dependency-Check warning exit
         sandbox = MagicMock()
         target = {"CVE-2021-23337"}
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc), \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch("remediation_engine.orchestration.qa_critic._run_odc", return_value=proc),
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=set(),
+            ),
+        ):
             ok, summary, remaining = _run_security_scan(sandbox, "vol", target)
 
         # Should still pass because identifiers are resolved
@@ -870,9 +961,7 @@ class TestGenerateWorkspaceDiff:
         tmp_path = Path.cwd()
         rel_path = "src/remediation_engine/orchestration/qa_critic.py"
         sandbox = MagicMock()
-        sandbox.read_file.side_effect = lambda path: (
-            "const x = 2;\n" if path == rel_path else None
-        )
+        sandbox.read_file.side_effect = lambda path: "const x = 2;\n" if path == rel_path else None
         diff_text, changed = _generate_workspace_diff(str(tmp_path), sandbox, [rel_path])
         assert rel_path in changed
         assert rel_path in diff_text
@@ -902,6 +991,7 @@ class TestGenerateWorkspaceDiff:
         tmp_path = Path.cwd()
         rel_path = "src/remediation_engine/orchestration/qa_critic.py"
         from remediation_engine.orchestration.qa_critic import _DIFF_CHAR_BUDGET
+
         big_content = "x" * (_DIFF_CHAR_BUDGET * 3)
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (
@@ -1014,10 +1104,18 @@ class TestQAExecutionToolGuards:
         )
         sandbox.read_file.return_value = None
 
-        with patch("shutil.which", return_value="/usr/bin/docker"), \
-             patch("remediation_engine.orchestration.qa_critic._run_odc") as mock_odc, \
-             patch("remediation_engine.orchestration.qa_critic._read_report_from_workspace", return_value='{}'), \
-             patch("remediation_engine.orchestration.qa_critic._parse_report_identifiers", return_value=set()):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch("remediation_engine.orchestration.qa_critic._run_odc") as mock_odc,
+            patch(
+                "remediation_engine.orchestration.qa_critic._read_report_from_workspace",
+                return_value="{}",
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._parse_report_identifiers",
+                return_value=set(),
+            ),
+        ):
             mock_odc.return_value = MagicMock(returncode=0, stdout="", stderr="")
             tools, results = build_qa_toolbelt(
                 sandbox=sandbox,
@@ -1346,9 +1444,13 @@ def _make_minimal_state(
     }
 
 
-def _make_loop_result(final_text="# INVESTIGATIVE REPORT\n## Install Analysis\n- Install Status: succeeded", tool_events=None, errors=None):
+def _make_loop_result(
+    final_text="# INVESTIGATIVE REPORT\n## Install Analysis\n- Install Status: succeeded",
+    tool_events=None,
+    errors=None,
+):
     """Build a mock SubagentRuntimeResult."""
-    from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult, ToolEvent
+    from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
 
     return SubagentRuntimeResult(
         final_text=final_text,
@@ -1519,12 +1621,12 @@ class TestRunQACriticNode:
         state = _make_minimal_state(groups=[group])
 
         mock_sandbox = MagicMock()
-        mock_sandbox.__enter__ = MagicMock(
-            side_effect=RuntimeError("Docker daemon unreachable")
-        )
+        mock_sandbox.__enter__ = MagicMock(side_effect=RuntimeError("Docker daemon unreachable"))
         mock_sandbox.__exit__ = MagicMock(return_value=None)
 
-        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox):
+        with patch(
+            "remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox
+        ):
             result = run_qa_critic_node(state)
 
         assert result["status"] == "qa_failed"
@@ -1568,10 +1670,24 @@ class TestRunQACriticNode:
         mock_sandbox.__exit__ = MagicMock(return_value=None)
         results = _make_fully_populated_results(ok=True)
 
-        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox), \
-             patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=results), \
-             patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations), \
-             patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result):
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic.DockerSandbox",
+                return_value=mock_sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_global_execution",
+                return_value=results,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_individual_investigations",
+                return_value=investigations,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_batch_judge",
+                return_value=batch_result,
+            ),
+        ):
             result = run_qa_critic_node(state)
 
         assert any("max rounds" in e.lower() or "exceeded" in e.lower() for e in result["errors"])
@@ -1607,10 +1723,24 @@ class TestQAMissingExecutionTools:
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
 
-        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sandbox), \
-             patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=results), \
-             patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations), \
-             patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result):
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic.DockerSandbox",
+                return_value=mock_sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_global_execution",
+                return_value=results,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_individual_investigations",
+                return_value=investigations,
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_batch_judge",
+                return_value=batch_result,
+            ),
+        ):
             return run_qa_critic_node(state), group
 
     def test_missing_install_returns_qa_failed(self):
@@ -1664,7 +1794,6 @@ class TestQAMissingExecutionTools:
         assert "run_unit_tests" in error_text
 
 
-
 # ---------------------------------------------------------------------------
 # _extract_group_evaluations (replaces TestLlmCriticStructuredOutput)
 # ---------------------------------------------------------------------------
@@ -1674,7 +1803,6 @@ class TestExtractGroupEvaluations:
     """The extraction step must call .with_structured_output(QAEvaluation) per group."""
 
     def test_uses_with_structured_output_for_qa_evaluation(self):
-        from remediation_engine.contracts.schemas import AgentActionSummary, AgentActionStatus
 
         group = _make_group()
         mock_eval = QAEvaluation(task_id=group.group_id, passed=True)
@@ -1734,12 +1862,17 @@ class TestExtractGroupEvaluations:
             mock_llm_instance = MagicMock()
             mock_structured = MagicMock()
             captured_prompts = []
-            mock_eval = QAEvaluation(task_id=group.group_id, passed=False,
-                                     failure_category=FailureCategory.SECURITY_FLAG,
-                                     retry_feedback="tools not called")
+            mock_eval = QAEvaluation(
+                task_id=group.group_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="tools not called",
+            )
+
             def capture_invoke(prompt):
                 captured_prompts.append(prompt)
                 return mock_eval
+
             mock_structured.invoke.side_effect = capture_invoke
             mock_llm_instance.with_structured_output.return_value = mock_structured
             MockChatOpenAI.return_value = mock_llm_instance
@@ -2010,7 +2143,19 @@ class TestRunGlobalExecution:
     def test_calls_install_scan_and_tests_once(self):
         sandbox = MagicMock()
         target_ids = {"CVE-2021-0001"}
-        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")) as mi,              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(True, "ok", set())) as ms,              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")) as mt:
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")
+            ) as mi,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_security_scan",
+                return_value=(True, "ok", set()),
+            ) as ms,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_unit_tests",
+                return_value=(True, "ok"),
+            ) as mt,
+        ):
             results = _run_global_execution(sandbox, "vol", target_ids)
         mi.assert_called_once_with(sandbox)
         ms.assert_called_once_with(sandbox, "vol", target_ids)
@@ -2021,7 +2166,20 @@ class TestRunGlobalExecution:
 
     def test_all_three_results_populated(self):
         sandbox = MagicMock()
-        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(False, "fail")),              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(False, "fail")):
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_install",
+                return_value=(False, "fail"),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_security_scan",
+                return_value=(False, "fail", set()),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_unit_tests",
+                return_value=(False, "fail"),
+            ),
+        ):
             results = _run_global_execution(sandbox, "vol", set())
         assert results.install is not None
         assert results.scan is not None
@@ -2031,19 +2189,39 @@ class TestRunGlobalExecution:
         sandbox = MagicMock()
         target_ids = {"CVE-2021-0001"}
         baseline_ids = {"CVE-2021-0001", "CVE-2020-0001"}
-        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")), \
-             patch(
-                 "remediation_engine.orchestration.qa_critic._run_security_scan",
-                 return_value=_SecurityScanResult(True, "ok", set(), set(), set()),
-             ) as scan, \
-             patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")):
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_security_scan",
+                return_value=_SecurityScanResult(True, "ok", set(), set(), set()),
+            ) as scan,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_unit_tests",
+                return_value=(True, "ok"),
+            ),
+        ):
             _run_global_execution(sandbox, "vol", target_ids, baseline_ids)
 
         scan.assert_called_once_with(sandbox, "vol", target_ids, baseline_ids)
 
     def test_tests_run_even_when_install_fails(self):
         sandbox = MagicMock()
-        with patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(False, "FAILED")),              patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=(False, "fail", set())),              patch("remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "passed.")) as mt:
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_install",
+                return_value=(False, "FAILED"),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_security_scan",
+                return_value=(False, "fail", set()),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_unit_tests",
+                return_value=(True, "passed."),
+            ) as mt,
+        ):
             results = _run_global_execution(sandbox, "vol", set())
         mt.assert_called_once()
         assert results.tests == (True, "passed.")
@@ -2080,9 +2258,14 @@ class TestBuildQaReviewToolbelt:
     def test_all_six_review_tools_present(self):
         tools, _ = self._build()
         names = {t.name for t in tools}
-        for n in ["list_changed_files", "generate_workspace_diff",
-                  "read_file_context", "search_codebase_pattern",
-                  "inspect_ast_symbol", "query_qa_logs"]:
+        for n in [
+            "list_changed_files",
+            "generate_workspace_diff",
+            "read_file_context",
+            "search_codebase_pattern",
+            "inspect_ast_symbol",
+            "query_qa_logs",
+        ]:
             assert n in names
 
     def test_review_tools_locked_when_results_empty(self):
@@ -2148,8 +2331,6 @@ class TestBuildIndividualInvestigatorPrompt:
         assert "not available to you" in lower or "do not attempt" in lower
 
 
-
-
 # ---------------------------------------------------------------------------
 # _run_individual_investigations
 # ---------------------------------------------------------------------------
@@ -2158,18 +2339,35 @@ class TestBuildIndividualInvestigatorPrompt:
 class TestRunIndividualInvestigations:
     def _lr(self, text="investigation complete", errors=None):
         from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
+
         return SubagentRuntimeResult(
-            final_text=text, tool_events=[], changed_files=[], errors=errors or [],
+            final_text=text,
+            tool_events=[],
+            changed_files=[],
+            errors=errors or [],
         )
 
     def test_one_investigator_per_group(self):
         g1, g2 = _make_group(group_id="g1"), _make_group(group_id="g2")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
-                   return_value=self._lr()) as ml,              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                return_value=self._lr(),
+            ) as ml,
+            patch(
+                "remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
             invs = _run_individual_investigations(
-                valid_groups=[g1, g2], group_strategies={}, action_summaries=[],
-                candidate_changed_files=[], sandbox=MagicMock(), repo_root="/tmp",
+                valid_groups=[g1, g2],
+                group_strategies={},
+                action_summaries=[],
+                candidate_changed_files=[],
+                sandbox=MagicMock(),
+                repo_root="/tmp",
                 results=results,
             )
         assert ml.call_count == 2
@@ -2178,11 +2376,24 @@ class TestRunIndividualInvestigations:
     def test_crash_produces_fallback(self):
         group = _make_group(group_id="g1")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
-                   side_effect=RuntimeError("crash")),              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                side_effect=RuntimeError("crash"),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
             invs = _run_individual_investigations(
-                valid_groups=[group], group_strategies={}, action_summaries=[],
-                candidate_changed_files=[], sandbox=MagicMock(), repo_root=None,
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                candidate_changed_files=[],
+                sandbox=MagicMock(),
+                repo_root=None,
                 results=results,
             )
         assert invs["g1"].errors
@@ -2191,11 +2402,24 @@ class TestRunIndividualInvestigations:
     def test_empty_output_triggers_fallback(self):
         group = _make_group(group_id="g1")
         results = _make_fully_populated_results(ok=True)
-        with patch("langchain_openai.ChatOpenAI"),              patch("remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
-                   return_value=self._lr(text="")),              patch("remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt", return_value=[]):
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
+                return_value=self._lr(text=""),
+            ),
+            patch(
+                "remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
             invs = _run_individual_investigations(
-                valid_groups=[group], group_strategies={}, action_summaries=[],
-                candidate_changed_files=[], sandbox=MagicMock(), repo_root=None,
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                candidate_changed_files=[],
+                sandbox=MagicMock(),
+                repo_root=None,
                 results=results,
             )
         assert invs["g1"].errors
@@ -2223,8 +2447,11 @@ class TestRunBatchJudge:
             mi.with_structured_output.return_value = ms
             MockLLM.return_value = mi
             result = _run_batch_judge(
-                valid_groups=[group], group_strategies={}, action_summaries=[],
-                results=results, investigations_by_group=invs,
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                results=results,
+                investigations_by_group=invs,
             )
         mi.with_structured_output.assert_called_once_with(BatchQAResult)
         ms.invoke.assert_called_once()
@@ -2241,8 +2468,11 @@ class TestRunBatchJudge:
             mi.with_structured_output.return_value = ms
             MockLLM.return_value = mi
             result = _run_batch_judge(
-                valid_groups=[group], group_strategies={}, action_summaries=[],
-                results=results, investigations_by_group=invs,
+                valid_groups=[group],
+                group_strategies={},
+                action_summaries=[],
+                results=results,
+                investigations_by_group=invs,
             )
         assert "Failure" in result.holistic_report
         assert result.evaluations[0].passed is False
@@ -2264,93 +2494,150 @@ class TestApplyGuardrails:
 
     def test_valid_passes_through(self):
         g = _make_group()
-        batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
-        evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                          results=self._res(), group_strategies={g.group_id: "version_bump"})
+        batch = BatchQAResult(
+            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
+        )
+        evals, errors = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(),
+            group_strategies={g.group_id: "version_bump"},
+        )
         assert evals[g.group_id].passed is True and not errors
 
     def test_unknown_group_id_dropped(self):
         g = _make_group(group_id="real")
-        batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id="real", passed=True),
-            QAEvaluation(task_id="ghost", passed=False,
-                         failure_category=FailureCategory.SECURITY_FLAG, retry_feedback="x"),
-        ])
-        evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                          results=self._res(), group_strategies={})
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(task_id="real", passed=True),
+                QAEvaluation(
+                    task_id="ghost",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="x",
+                ),
+            ],
+        )
+        evals, errors = _apply_guardrails(
+            valid_groups=[g], batch_result=batch, results=self._res(), group_strategies={}
+        )
         assert "ghost" not in evals and any("ghost" in e for e in errors)
 
     def test_duplicate_keeps_first(self):
         g = _make_group()
-        batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id=g.group_id, passed=True),
-            QAEvaluation(task_id=g.group_id, passed=False,
-                         failure_category=FailureCategory.SECURITY_FLAG, retry_feedback="second"),
-        ])
-        evals, errors = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                          results=self._res(), group_strategies={})
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(task_id=g.group_id, passed=True),
+                QAEvaluation(
+                    task_id=g.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="second",
+                ),
+            ],
+        )
+        evals, errors = _apply_guardrails(
+            valid_groups=[g], batch_result=batch, results=self._res(), group_strategies={}
+        )
         assert evals[g.group_id].passed is True and any("duplicate" in e.lower() for e in errors)
 
     def test_missing_group_synthesized(self):
         g1, g2 = _make_group(group_id="g1"), _make_group(group_id="g2")
-        batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(task_id="g1", passed=True)])
-        evals, errors = _apply_guardrails(valid_groups=[g1, g2], batch_result=batch,
-                                          results=self._res(), group_strategies={})
-        assert evals["g2"].passed is False and evals["g2"].failure_category == FailureCategory.SECURITY_FLAG
+        batch = BatchQAResult(
+            holistic_report="ok", evaluations=[QAEvaluation(task_id="g1", passed=True)]
+        )
+        evals, errors = _apply_guardrails(
+            valid_groups=[g1, g2], batch_result=batch, results=self._res(), group_strategies={}
+        )
+        assert (
+            evals["g2"].passed is False
+            and evals["g2"].failure_category == FailureCategory.SECURITY_FLAG
+        )
 
     def test_version_bump_remaining_forces_fail(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
-        batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
-        evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                     results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
-                                     group_strategies={g.group_id: "version_bump"})
+        batch = BatchQAResult(
+            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
+        )
+        evals, _ = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
+            group_strategies={g.group_id: "version_bump"},
+        )
         assert evals[g.group_id].passed is False
         assert evals[g.group_id].failure_category == FailureCategory.SECURITY_FLAG
 
     def test_code_workaround_remaining_allowed_pass(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
-        batch = BatchQAResult(holistic_report="ok",
-                              evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
-        evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                     results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
-                                     group_strategies={g.group_id: "code_workaround"})
+        batch = BatchQAResult(
+            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
+        )
+        evals, _ = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
+            group_strategies={g.group_id: "code_workaround"},
+        )
         assert evals[g.group_id].passed is True
 
     def test_eresolve_remaps_breaking_to_peer_conflict(self):
         g = _make_group()
-        batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id=g.group_id, passed=False,
-                         failure_category=FailureCategory.BREAKING_CHANGE, retry_feedback="x")
-        ])
-        evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                     results=self._res(install_ok=False, install_summary="ERESOLVE conflict"),
-                                     group_strategies={g.group_id: "version_bump"})
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(
+                    task_id=g.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="x",
+                )
+            ],
+        )
+        evals, _ = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(install_ok=False, install_summary="ERESOLVE conflict"),
+            group_strategies={g.group_id: "version_bump"},
+        )
         assert evals[g.group_id].failure_category == FailureCategory.PEER_CONFLICT
 
     def test_eresolve_exempt_for_code_workaround(self):
         g = _make_group()
-        batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id=g.group_id, passed=False,
-                         failure_category=FailureCategory.BREAKING_CHANGE, retry_feedback="x")
-        ])
-        evals, _ = _apply_guardrails(valid_groups=[g], batch_result=batch,
-                                     results=self._res(install_ok=False, install_summary="ERESOLVE conflict"),
-                                     group_strategies={g.group_id: "code_workaround"})
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(
+                    task_id=g.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="x",
+                )
+            ],
+        )
+        evals, _ = _apply_guardrails(
+            valid_groups=[g],
+            batch_result=batch,
+            results=self._res(install_ok=False, install_summary="ERESOLVE conflict"),
+            group_strategies={g.group_id: "code_workaround"},
+        )
         assert evals[g.group_id].failure_category == FailureCategory.BREAKING_CHANGE
 
     def test_remaining_scanner_reclassifies_breaking_change_to_security_flag(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
-        batch = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(
-                task_id=g.group_id,
-                passed=False,
-                failure_category=FailureCategory.BREAKING_CHANGE,
-                retry_feedback="JWT unit tests failed after the version bump.",
-            )
-        ])
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(
+                    task_id=g.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="JWT unit tests failed after the version bump.",
+                )
+            ],
+        )
         evals, errors = _apply_guardrails(
             valid_groups=[g],
             batch_result=batch,
@@ -2382,7 +2669,21 @@ class TestRunQACriticNodeMapReduce:
         mock_sb.__enter__ = MagicMock(return_value=mock_sb)
         mock_sb.__exit__ = MagicMock(return_value=None)
         state = _make_minimal_state(groups=groups)
-        with patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sb),              patch("remediation_engine.orchestration.qa_critic._run_global_execution", return_value=global_results) as mg,              patch("remediation_engine.orchestration.qa_critic._run_individual_investigations", return_value=investigations) as mm,              patch("remediation_engine.orchestration.qa_critic._run_batch_judge", return_value=batch_result) as mr:
+        with (
+            patch("remediation_engine.orchestration.qa_critic.DockerSandbox", return_value=mock_sb),
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_global_execution",
+                return_value=global_results,
+            ) as mg,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_individual_investigations",
+                return_value=investigations,
+            ) as mm,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_batch_judge",
+                return_value=batch_result,
+            ) as mr,
+        ):
             result = run_qa_critic_node(state)
         return result, mg, mm, mr
 
@@ -2393,8 +2694,13 @@ class TestRunQACriticNodeMapReduce:
     def test_individual_investigations_called_once(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
-        br = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id="g1", passed=True), QAEvaluation(task_id="g2", passed=True)])
+        br = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(task_id="g1", passed=True),
+                QAEvaluation(task_id="g2", passed=True),
+            ],
+        )
         _, _, mm, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         mm.assert_called_once()
 
@@ -2404,31 +2710,39 @@ class TestRunQACriticNodeMapReduce:
 
     def test_holistic_report_in_output(self):
         g = _make_group()
-        br = BatchQAResult(holistic_report="## Holistic.",
-                           evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
+        br = BatchQAResult(
+            holistic_report="## Holistic.",
+            evaluations=[QAEvaluation(task_id=g.group_id, passed=True)],
+        )
         result, _, _, _ = self._run([g], batch_result=br)
         assert result["qa_investigation_report"] == "## Holistic."
 
     def test_all_passed_status(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
-        br = BatchQAResult(holistic_report="ok", evaluations=[
-            QAEvaluation(task_id="g1", passed=True), QAEvaluation(task_id="g2", passed=True)])
+        br = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[
+                QAEvaluation(task_id="g1", passed=True),
+                QAEvaluation(task_id="g2", passed=True),
+            ],
+        )
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert result["eval_status"] == "all_passed" and result["status"] == "qa_completed"
 
     def test_guardrails_fill_missing_eval(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
-        br = BatchQAResult(holistic_report="ok",
-                           evaluations=[QAEvaluation(task_id="g1", passed=True)])  # g2 missing
+        br = BatchQAResult(
+            holistic_report="ok", evaluations=[QAEvaluation(task_id="g1", passed=True)]
+        )  # g2 missing
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert "g2" in result["qa_evaluations"] and result["qa_evaluations"]["g2"].passed is False
 
     def test_map_errors_appear_in_output(self):
         g = _make_group()
-        invs = {g.group_id: GroupInvestigation(g.group_id, "fallback", "", ["investigator timed out"])}
+        invs = {
+            g.group_id: GroupInvestigation(g.group_id, "fallback", "", ["investigator timed out"])
+        }
         result, _, _, _ = self._run([g], investigations=invs)
         assert any("investigator timed out" in e for e in result.get("errors", []))
-
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_triage_pipeline.py â€” Unit tests for remediation_engine.triage.pipeline.
 
 Covers:
@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-from typing import List
 from unittest.mock import patch
 
 import pytest
@@ -37,14 +36,15 @@ from remediation_engine.triage.pipeline import (
     select_issues_for_remediation,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def disable_llm_triage_by_default(monkeypatch):
     monkeypatch.setenv("TRIAGE_LLM_ENABLED", "false")
+
 
 def _ctx() -> SystemContext:
     return SystemContext(environment="production")
@@ -86,7 +86,7 @@ def _sast(
     )
 
 
-def _empty_enrichment_map(cve_ids: List[str]):
+def _empty_enrichment_map(cve_ids: list[str]):
     """Return safe-default CVEEnrichment for all requested CVEs."""
     return {
         cve: CVEEnrichment(cve_id=cve, epss=0.0, in_kev=False, enrichment_source="none")
@@ -94,7 +94,7 @@ def _empty_enrichment_map(cve_ids: List[str]):
     }
 
 
-def _sca_issue_plans(issues: List[VulnerabilityIssue]):
+def _sca_issue_plans(issues: list[VulnerabilityIssue]):
     pairs = []
     for issue in issues:
         if issue.issue_type != IssueType.SCA:
@@ -124,8 +124,9 @@ def _sca_issue_plans(issues: List[VulnerabilityIssue]):
 
 class TestRunTriagePipeline:
     def test_empty_input_returns_empty(self):
-        with patch("remediation_engine.triage.pipeline.enrich_cves", return_value={}), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]
+        with (
+            patch("remediation_engine.triage.pipeline.enrich_cves", return_value={}),
+            patch("remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]),
         ):
             result = run_triage_pipeline([], _ctx())
         assert result == []
@@ -133,8 +134,14 @@ class TestRunTriagePipeline:
     def test_sca_issue_produces_one_pair(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
         issues = [_sca()]
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -146,8 +153,11 @@ class TestRunTriagePipeline:
     def test_sast_issue_produces_one_pair(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
         issues = [_sast()]
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch("remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -160,8 +170,14 @@ class TestRunTriagePipeline:
             _sca(package_name="express", file_path="backend/package.json"),
             _sast(file_path="src/login.js", rule_id="sqli", line_start=5, line_end=5),
         ]
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -170,8 +186,14 @@ class TestRunTriagePipeline:
     def test_all_results_are_tuples_of_correct_types(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
         issues = [_sca(), _sast()]
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -190,8 +212,15 @@ class TestRunTriagePipeline:
             enrichment_source="epss+kev",
         )
         issues = [_sca(cve_id="CVE-2021-23337")]
-        with patch("remediation_engine.triage.pipeline.enrich_cves", return_value={"CVE-2021-23337": kev_enrichment}), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves",
+                return_value={"CVE-2021-23337": kev_enrichment},
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -204,9 +233,16 @@ class TestRunTriagePipeline:
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
         issues = [_sca()]
 
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
-        ), patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability:
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
+            patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability,
+        ):
             run_triage_pipeline(issues, _ctx(), repo_root=str(tmp_path))
 
         mock_reachability.assert_called_once()
@@ -216,9 +252,16 @@ class TestRunTriagePipeline:
         issues = [_sca()]
         missing_root = tmp_path / "missing-repo"
 
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=_sca_issue_plans(issues)
-        ), patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability:
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=_sca_issue_plans(issues),
+            ),
+            patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability,
+        ):
             run_triage_pipeline(issues, _ctx(), repo_root=str(missing_root))
 
         mock_reachability.assert_not_called()
@@ -228,9 +271,15 @@ class TestRunTriagePipeline:
         issues = [_sca()]
         planned_pairs = _sca_issue_plans(issues)
 
-        with patch("remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map), patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=planned_pairs
-        ) as mock_prepare:
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=planned_pairs,
+            ) as mock_prepare,
+        ):
             result = run_triage_pipeline(issues, _ctx(), repo_root=str(tmp_path))
 
         mock_prepare.assert_called_once()
@@ -254,9 +303,15 @@ class TestRunTriagePipeline:
             "strategy_used": "osv_api",
         }
 
-        with patch("remediation_engine.tools.manifest_locator.locate_from_issue", return_value=localized) as mock_locate, patch(
-            "remediation_engine.tools.fix_planner.plan_fix", return_value=raw_plan
-        ) as mock_plan:
+        with (
+            patch(
+                "remediation_engine.tools.manifest_locator.locate_from_issue",
+                return_value=localized,
+            ) as mock_locate,
+            patch(
+                "remediation_engine.tools.fix_planner.plan_fix", return_value=raw_plan
+            ) as mock_plan,
+        ):
             pairs = _prepare_sca_issue_plans([issue], str(tmp_path))
 
         mock_locate.assert_called_once()
@@ -327,9 +382,13 @@ class TestSelectIssuesForRemediation:
         assert isinstance(selected[0], VulnerabilityIssue)
 
     def test_priority_sort_critical_before_high_before_medium(self):
-        critical_issue = _sca(package_name="pkg_c", file_path="c/package.json", severity=Severity.CRITICAL)
+        critical_issue = _sca(
+            package_name="pkg_c", file_path="c/package.json", severity=Severity.CRITICAL
+        )
         high_issue = _sca(package_name="pkg_h", file_path="h/package.json", severity=Severity.HIGH)
-        medium_issue = _sca(package_name="pkg_m", file_path="m/package.json", severity=Severity.MEDIUM)
+        medium_issue = _sca(
+            package_name="pkg_m", file_path="m/package.json", severity=Severity.MEDIUM
+        )
 
         # Provide in wrong order intentionally
         pairs = [
@@ -383,5 +442,3 @@ class TestSelectIssuesForRemediation:
         )
         selected = select_issues_for_remediation([(group, triage)])
         assert selected[0].id == issue.id
-
-

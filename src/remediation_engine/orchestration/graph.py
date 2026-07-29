@@ -42,26 +42,25 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
-    QAAttemptResult,
     IssueSource,
+    QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     StateConsistencyEvent,
     SystemContext,
     TaskStatus,
-    WorkerAttemptResult,
-    WorkerExecutionDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
-from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
@@ -89,11 +88,10 @@ from remediation_engine.orchestration.trajectory_exporter import (
 )
 from remediation_engine.orchestration.update_subagent import run_update_subagent_node
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
+from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +99,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def triage_node(state: OrchestratorState) -> Dict[str, Any]:
+def triage_node(state: OrchestratorState) -> dict[str, Any]:
     """Run the one-time preprocessing triage pass."""
     # ``valid_groups`` is the explicit compatibility contract for callers
     # that already performed preprocessing (for example, the cached-group
@@ -196,26 +194,21 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
 
 def _post_triage_issue_input(
     state: OrchestratorState,
-) -> Optional[List[VulnerabilityIssue]]:
+) -> list[VulnerabilityIssue] | None:
     """Build the current issue universe from the parseable QA scan snapshot."""
     if "post_remediation_scan_issues" not in state:
         return None
 
     post_scan_issues = list(state.get("post_remediation_scan_issues") or [])
     baseline_issues = list(state.get("issues") or [])
-    retained_non_odc = [
-        issue for issue in baseline_issues if issue.source != IssueSource.ODC
-    ]
+    retained_non_odc = [issue for issue in baseline_issues if issue.source != IssueSource.ODC]
 
     # Skip-triage callers may omit the full initial issue set.  Preserve any
     # non-ODC findings carried by the supplied groups in that compatibility
     # mode, while the post-remediation ODC snapshot remains authoritative for
     # dependency findings.
     if not baseline_issues:
-        seen_issue_fingerprints = {
-            _stable_issue_fingerprint(issue)
-            for issue in retained_non_odc
-        }
+        seen_issue_fingerprints = {_stable_issue_fingerprint(issue) for issue in retained_non_odc}
         for group in state.get("valid_groups", []) or []:
             for issue in group.issues or []:
                 if issue.source == IssueSource.ODC:
@@ -230,19 +223,19 @@ def _post_triage_issue_input(
 
 def _reconcile_triaged_groups(
     state: OrchestratorState,
-    candidate_groups: List[VulnerabilityGroup],
-) -> tuple[List[VulnerabilityGroup], Dict[str, List[str]]]:
+    candidate_groups: list[VulnerabilityGroup],
+) -> tuple[list[VulnerabilityGroup], dict[str, list[str]]]:
     """Reuse unchanged groups and retain active removed groups for QA handoff."""
     previous_groups = list(state.get("valid_groups", []) or [])
     previous_by_id = {group.group_id: group for group in previous_groups}
     task_queue = state.get("task_queue", {}) or {}
     active_task_ids = set(state.get("active_target_task_ids", []) or [])
 
-    reused: List[str] = []
-    changed: List[str] = []
-    added: List[str] = []
-    reappeared: List[str] = []
-    result: List[VulnerabilityGroup] = []
+    reused: list[str] = []
+    changed: list[str] = []
+    added: list[str] = []
+    reappeared: list[str] = []
+    result: list[VulnerabilityGroup] = []
     candidate_ids = {group.group_id for group in candidate_groups}
 
     for candidate in candidate_groups:
@@ -257,11 +250,7 @@ def _reconcile_triaged_groups(
             continue
 
         existing_task = next(
-            (
-                task
-                for task in task_queue.values()
-                if task.parent_group_id == candidate.group_id
-            ),
+            (task for task in task_queue.values() if task.parent_group_id == candidate.group_id),
             None,
         )
         result.append(candidate)
@@ -270,7 +259,7 @@ def _reconcile_triaged_groups(
         else:
             added.append(candidate.group_id)
 
-    retained: List[str] = []
+    retained: list[str] = []
     for previous in previous_groups:
         if previous.group_id in candidate_ids:
             continue
@@ -293,17 +282,18 @@ def _reconcile_triaged_groups(
         "new_group_ids": sorted(added),
         "reappeared_group_ids": sorted(reappeared),
         "retained_removed_group_ids": sorted(retained),
-        "removed_group_ids": sorted(
-            set(previous_by_id) - candidate_ids - set(retained)
-        ),
+        "removed_group_ids": sorted(set(previous_by_id) - candidate_ids - set(retained)),
     }
     return sorted(result, key=lambda group: group.group_id), reconciliation
 
 
-def post_qa_triage_node(state: OrchestratorState) -> Dict[str, Any]:
+def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
     """Re-triage the complete parseable post-remediation scan snapshot."""
-    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in ("1", "true", "yes") or \
-                       os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
+    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ) or os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
     if disable_retriage or not state.get("triage_required"):
         return {
             "status": "triage_skipped",
@@ -338,9 +328,7 @@ def post_qa_triage_node(state: OrchestratorState) -> Dict[str, Any]:
 
     try:
         results = run_triage_pipeline(issues, system_context, repo_root)
-        candidate_groups = [
-            group for group, triage_result in results if triage_result.is_valid
-        ]
+        candidate_groups = [group for group, triage_result in results if triage_result.is_valid]
         valid_groups, reconciliation = _reconcile_triaged_groups(
             state,
             candidate_groups,
@@ -382,8 +370,7 @@ def post_qa_triage_node(state: OrchestratorState) -> Dict[str, Any]:
             for key, value in prior_qa_evaluations.items()
             if key not in reopened_task_ids
             and not any(
-                task.parent_group_id in changed_group_ids
-                and key == task.parent_group_id
+                task.parent_group_id in changed_group_ids and key == task.parent_group_id
                 for task in task_queue.values()
             )
         }
@@ -428,10 +415,10 @@ def route_after_triage(state: OrchestratorState) -> str:
 
 
 def _tag_attempt_summaries(
-    summaries: List[AgentActionSummary],
-    target_tasks: List[RemediationTask],
-    snapshots: Dict[str, Any],
-) -> List[AgentActionSummary]:
+    summaries: list[AgentActionSummary],
+    target_tasks: list[RemediationTask],
+    snapshots: dict[str, Any],
+) -> list[AgentActionSummary]:
     """Attach the committed attempt identity to compatibility summaries.
 
     Some worker exit paths return an ordinary ``AgentActionSummary`` while
@@ -441,12 +428,11 @@ def _tag_attempt_summaries(
     committed snapshot for that target task.
     """
     task_by_id = {task.task_id: task for task in target_tasks}
-    tagged: List[AgentActionSummary] = []
+    tagged: list[AgentActionSummary] = []
     for summary in summaries:
         task = task_by_id.get(summary.task_id)
         snapshot = (
-            snapshots.get(task.current_attempt_id)
-            or snapshots.get(task.task_id)
+            snapshots.get(task.current_attempt_id) or snapshots.get(task.task_id)
             if task is not None and task.current_attempt_id
             else None
         )
@@ -464,9 +450,9 @@ def _tag_attempt_summaries(
 
 def _dispatch_boundary_rejection(
     state: OrchestratorState,
-    target_tasks: List[RemediationTask],
+    target_tasks: list[RemediationTask],
     expected_node: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Reject a worker/QA invocation whose input is not a committed snapshot.
 
     Direct legacy bridge callers do not carry ``attempt_snapshots_by_id`` and
@@ -478,12 +464,12 @@ def _dispatch_boundary_rejection(
         return None
 
     snapshots = state.get("attempt_snapshots_by_id") or {}
-    errors: List[str] = []
-    events: List[StateConsistencyEvent] = []
+    errors: list[str] = []
+    events: list[StateConsistencyEvent] = []
     for task in target_tasks:
         attempt_id = task.current_attempt_id
         snapshot = snapshots.get(attempt_id) if attempt_id else None
-        error_code: Optional[str] = None
+        error_code: str | None = None
         details = ""
         if attempt_id is None:
             error_code = "DISPATCH_WITHOUT_ATTEMPT"
@@ -509,12 +495,12 @@ def _dispatch_boundary_rejection(
         ):
             error_code = "DISPATCH_SNAPSHOT_CONTRADICTION"
             details = "Task fields do not match the immutable dispatch snapshot."
-        elif expected_node in {"update_subagent", "workaround_subagent"} and snapshot.dispatch_node != expected_node:
+        elif (
+            expected_node in {"update_subagent", "workaround_subagent"}
+            and snapshot.dispatch_node != expected_node
+        ):
             error_code = "DISPATCH_NODE_MISMATCH"
-            details = (
-                f"Snapshot was committed for {snapshot.dispatch_node}, "
-                f"not {expected_node}."
-            )
+            details = f"Snapshot was committed for {snapshot.dispatch_node}, not {expected_node}."
         if error_code is not None:
             errors.append(f"graph: rejected {expected_node} dispatch for {task.task_id}: {details}")
             events.append(
@@ -541,10 +527,10 @@ def _dispatch_boundary_rejection(
 
 
 def _ensure_worker_attempt_results(
-    result: Dict[str, Any],
-    target_tasks: List[RemediationTask],
-    snapshots: Dict[str, Any],
-) -> Dict[str, WorkerAttemptResult]:
+    result: dict[str, Any],
+    target_tasks: list[RemediationTask],
+    snapshots: dict[str, Any],
+) -> dict[str, WorkerAttemptResult]:
     """Normalize worker compatibility output into attempt-tagged envelopes."""
     existing = result.get("worker_results_by_attempt") or {}
     if existing:
@@ -552,11 +538,10 @@ def _ensure_worker_attempt_results(
     summaries = list(result.get("action_summaries", []) or [])
     summary_by_task = {summary.task_id: summary for summary in summaries}
     errors = list(result.get("errors", []) or [])
-    output: Dict[str, WorkerAttemptResult] = {}
+    output: dict[str, WorkerAttemptResult] = {}
     for task in target_tasks:
         snapshot = (
-            snapshots.get(task.current_attempt_id)
-            or snapshots.get(task.task_id)
+            snapshots.get(task.current_attempt_id) or snapshots.get(task.task_id)
             if task.current_attempt_id
             else None
         )
@@ -580,7 +565,7 @@ def _ensure_worker_attempt_results(
     return output
 
 
-def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
+def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
     Bridge OrchestratorState â†’ SubagentState for the batch dependency update subagent.
 
@@ -588,7 +573,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
     resolves the associated VulnerabilityGroups, calls ``run_update_subagent_node``,
     then merges results back into the orchestrator state via task_queue.
     """
-    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
     active_task_ids = list(state.get("active_target_task_ids", []))
 
     # Fall back to active_target_group_ids for backward compat during migration
@@ -626,10 +611,8 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
         for task in target_tasks
         if task.current_attempt_id in attempt_snapshots
     }
-    latest_action_summary_by_task: Dict[str, str] = {}
-    target_attempt_ids = {
-        task.task_id: task.current_attempt_id for task in target_tasks
-    }
+    latest_action_summary_by_task: dict[str, str] = {}
+    target_attempt_ids = {task.task_id: task.current_attempt_id for task in target_tasks}
     for summary in state.get("action_summaries", []) or []:
         expected_attempt_id = target_attempt_ids.get(summary.task_id)
         if expected_attempt_id and summary.attempt_id != expected_attempt_id:
@@ -651,7 +634,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
 
     result = run_update_subagent_node(subagent_state)
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
@@ -683,7 +666,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> Dict[str,
 
 def run_workaround_subagent_from_orchestrator(
     state: OrchestratorState,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Bridge OrchestratorState â†’ SubagentState for the single-group workaround subagent.
 
@@ -691,7 +674,7 @@ def run_workaround_subagent_from_orchestrator(
     VulnerabilityGroup, calls ``run_workaround_subagent_node``, then merges
     results back and updates task_queue.
     """
-    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
     active_task_ids = list(state.get("active_target_task_ids", []))
 
     # Fall back to active_target_group_ids for backward compat
@@ -730,12 +713,8 @@ def run_workaround_subagent_from_orchestrator(
     feedback_by_task = dict(state.get("feedback_by_task", {}))
     attempt_snapshot = None
     if task.current_attempt_id:
-        attempt_snapshot = state.get("attempt_snapshots_by_id", {}).get(
-            task.current_attempt_id
-        )
-    current_replay_plan = (
-        state.get("workaround_replay_plans_by_task", {}).get(task.task_id)
-    )
+        attempt_snapshot = state.get("attempt_snapshots_by_id", {}).get(task.current_attempt_id)
+    current_replay_plan = state.get("workaround_replay_plans_by_task", {}).get(task.task_id)
     subagent_state = initial_workaround_subagent_state(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
@@ -749,7 +728,7 @@ def run_workaround_subagent_from_orchestrator(
 
     result = run_workaround_subagent_node(subagent_state)
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "errors": result.get("errors", []),
     }
     if result.get("changed_files"):
@@ -780,7 +759,7 @@ def run_workaround_subagent_from_orchestrator(
     return out
 
 
-def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
+def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
     Run the QA Critic against the current OrchestratorState.
 
@@ -789,17 +768,14 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
     ``changed_files`` in its return dict to avoid double-counting via the
     ``operator.add`` reducer.
     """
-    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
+    task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
     active_task_ids = set(state.get("active_target_task_ids", []))
 
     # Fall back to active_target_group_ids
     if not active_task_ids:
         active_task_ids = set(state.get("active_target_group_ids", []))
 
-    target_tasks = [
-        state.get("task_queue", {}).get(task_id)
-        for task_id in active_task_ids
-    ]
+    target_tasks = [state.get("task_queue", {}).get(task_id) for task_id in active_task_ids]
     target_tasks = [task for task in target_tasks if task is not None]
     boundary_rejection = _dispatch_boundary_rejection(
         state,
@@ -839,18 +815,20 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
         state.get("new_vulnerability_status", "not_scanned"),
     )
     scan_snapshot_available = (
-        "post_remediation_scan_issues" in result
-        or "post_remediation_scan_issues" in state
+        "post_remediation_scan_issues" in result or "post_remediation_scan_issues" in state
     )
-    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in ("1", "true", "yes") or \
-                       os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
+    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ) or os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
     triage_required = (
         not disable_retriage
         and result.get("status") in {"qa_completed", "qa_failed"}
         and scan_status in {"none", "detected"}
         and scan_snapshot_available
     )
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "qa_evaluations": result.get("qa_evaluations", {}),
         "eval_status": result.get("eval_status", ""),
         "qa_investigation_report": result.get("qa_investigation_report", ""),
@@ -878,7 +856,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> Dict[str, Any]:
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
     }
-    qa_results_by_attempt: Dict[str, QAAttemptResult] = {}
+    qa_results_by_attempt: dict[str, QAAttemptResult] = {}
     task_queue = state.get("task_queue", {})
     evaluations = result.get("qa_evaluations", {}) or {}
     for task_id in active_task_ids:
@@ -956,9 +934,9 @@ orchestrator_engine = build_orchestrator_graph()
 
 def run_orchestrator(
     repo_root: str,
-    valid_groups: List[VulnerabilityGroup],
-    issues: Optional[List[VulnerabilityIssue]] = None,
-    system_context: Optional[SystemContext] = None,
+    valid_groups: list[VulnerabilityGroup],
+    issues: list[VulnerabilityIssue] | None = None,
+    system_context: SystemContext | None = None,
 ) -> OrchestratorState:
     """Convenience entry point for the Phase 5 orchestrator graph."""
     initial_state = initial_orchestrator_state(
@@ -972,7 +950,7 @@ def run_orchestrator(
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
     if config is None:
-        runnable_config: Dict[str, Any] = {
+        runnable_config: dict[str, Any] = {
             "run_id": trace_id,
             "run_name": "phase5_orchestrator_local",
             "tags": ["phase-5", "orchestrator", "langgraph", "local-trajectory"],
@@ -992,9 +970,9 @@ def run_orchestrator(
         run_type="state",
         inputs=initial_state,
     )
-    result: Optional[OrchestratorState] = None
-    run_error: Optional[BaseException] = None
-    trace_url: Optional[str] = None
+    result: OrchestratorState | None = None
+    run_error: BaseException | None = None
+    trace_url: str | None = None
     try:
         with use_trajectory_recorder(recorder):
             result = orchestrator_engine.invoke(initial_state, runnable_config)
@@ -1011,7 +989,9 @@ def run_orchestrator(
             name="phase5.root_output",
             run_type="state",
             inputs={"error": str(run_error)} if run_error else None,
-            outputs=result if result is not None else {"error": str(run_error) if run_error else "no result"},
+            outputs=result
+            if result is not None
+            else {"error": str(run_error) if run_error else "no result"},
             error=run_error,
         )
         try:
@@ -1019,7 +999,9 @@ def run_orchestrator(
                 trace_id=trace_id,
                 repo_root=repo_root,
                 initial_state=initial_state,
-                final_state=result if result is not None else {"error": str(run_error) if run_error else "no result"},
+                final_state=result
+                if result is not None
+                else {"error": str(run_error) if run_error else "no result"},
                 recorder=recorder,
                 langsmith_enabled=langsmith_enabled,
                 langsmith_url=trace_url,
@@ -1030,9 +1012,7 @@ def run_orchestrator(
         except Exception as export_error:  # noqa: BLE001 - never mask remediation
             log.warning("run_orchestrator: trajectory export failed: %s", export_error)
             if result is not None:
-                result.setdefault("errors", []).append(
-                    f"trajectory export failed: {export_error}"
-                )
+                result.setdefault("errors", []).append(f"trajectory export failed: {export_error}")
 
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",
@@ -1041,5 +1021,3 @@ def run_orchestrator(
         result.get("status") if result is not None else "failed",
     )
     return result  # type: ignore[return-value]
-
-

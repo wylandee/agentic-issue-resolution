@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_triage_enrichment.py â€” Unit tests for remediation_engine.triage.enrichment.
 
 Covers:
@@ -13,15 +13,12 @@ Covers:
 from __future__ import annotations
 
 import json
-import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
 from remediation_engine.triage.enrichment import enrich_cves
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -62,7 +59,7 @@ class TestEPSSEnrichment:
 
         with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
-                _fake_response(FAKE_KEV_DATA),   # KEV download
+                _fake_response(FAKE_KEV_DATA),  # KEV download
                 _fake_response(FAKE_EPSS_DATA),  # EPSS query
             ]
             result = enrich_cves(["CVE-2021-44228"])
@@ -108,6 +105,7 @@ class TestEPSSEnrichment:
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
         with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
+
             def side_effect(url, **kwargs):
                 if "first.org" in url:
                     raise requests.exceptions.ConnectionError("refused")
@@ -131,7 +129,7 @@ class TestKEVEnrichment:
 
         with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
             mock_get.side_effect = [
-                _fake_response(FAKE_KEV_DATA),   # KEV download
+                _fake_response(FAKE_KEV_DATA),  # KEV download
                 _fake_response(FAKE_EPSS_DATA),  # EPSS
             ]
             result = enrich_cves(["CVE-2021-44228"])
@@ -181,6 +179,7 @@ class TestKEVEnrichment:
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 
         with patch("remediation_engine.triage.enrichment.requests.get") as mock_get:
+
             def side_effect(url, **kwargs):
                 if "cisa.gov" in url:
                     raise requests.exceptions.ConnectionError("cisa down")
@@ -230,5 +229,3 @@ class TestEdgeCases:
 
         # Both EPSS (>0) and KEV (in_kev=True) contributed
         assert result["CVE-2021-44228"].enrichment_source in ("epss+kev", "kev+epss")
-
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_execution_nodes.py - Unit tests for the remaining Phase 5 execution nodes.
 
 All Docker SDK interactions are mocked. No real Docker daemon is required.
@@ -15,10 +15,10 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     TaskStatus,
 )
-from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.orchestration.state import initial_orchestrator_state
 from remediation_engine.orchestration.supervisor_node import _instruction_digest
 from remediation_engine.orchestration.teardown_node import run_teardown_node
+from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 
 def _sandbox_mock() -> MagicMock:
@@ -55,13 +55,16 @@ class TestWorkspaceBuilderNode:
         client = MagicMock()
         sandbox = _sandbox_mock()
 
-        with patch(
-            "remediation_engine.orchestration.workspace_builder.get_docker_client",
-            return_value=client,
-        ), patch(
-            "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-            return_value=sandbox,
-        ) as mock_sandbox:
+        with (
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ) as mock_sandbox,
+        ):
             result = run_workspace_builder_node(state)
 
         client.volumes.create.assert_called_once()
@@ -73,12 +76,15 @@ class TestWorkspaceBuilderNode:
         state = initial_orchestrator_state(str(tmp_path), [])
         client = MagicMock()
 
-        with patch(
-            "remediation_engine.orchestration.workspace_builder.get_docker_client",
-            return_value=client,
-        ), patch(
-            "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-            side_effect=RuntimeError("copy failed"),
+        with (
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                side_effect=RuntimeError("copy failed"),
+            ),
         ):
             result = run_workspace_builder_node(state)
 
@@ -137,12 +143,15 @@ class TestTeardownNode:
         sandbox.read_file.return_value = "const x = 2;\n"
         client = MagicMock()
 
-        with patch(
-            "remediation_engine.orchestration.teardown_node.DockerSandbox",
-            return_value=sandbox,
-        ), patch(
-            "remediation_engine.orchestration.teardown_node.get_docker_client",
-            return_value=client,
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.DockerSandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
         ):
             result = run_teardown_node(state)
 
@@ -161,12 +170,15 @@ class TestTeardownNode:
 
         client = MagicMock()
 
-        with patch(
-            "remediation_engine.orchestration.teardown_node.get_docker_client",
-            return_value=client,
-        ), patch(
-            "remediation_engine.orchestration.teardown_node.DockerSandbox",
-        ) as mock_sandbox:
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            ) as mock_sandbox,
+        ):
             result = run_teardown_node(state)
 
         mock_sandbox.assert_not_called()
@@ -183,5 +195,3 @@ class TestTeardownNode:
         result = run_teardown_node(state)
 
         assert result["status"] == "completed_with_errors"
-
-

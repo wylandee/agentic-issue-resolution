@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,12 +6,12 @@ from uuid import uuid4
 
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
+    _render_markdown,
     default_trajectory_dir,
     export_phase5_trajectory,
     fetch_langsmith_spans,
     invoke_with_trajectory,
     json_text,
-    _render_markdown,
     use_trajectory_recorder,
 )
 
@@ -68,8 +68,12 @@ def test_fetch_langsmith_spans_queries_by_trace_id(monkeypatch):
             raise AssertionError("read_run should not be needed when list_runs returns spans")
 
     fake_client = FakeClient()
-    monkeypatch.setattr("remediation_engine.orchestration.trajectory_exporter.Client", lambda: fake_client)
-    monkeypatch.setattr("remediation_engine.orchestration.trajectory_exporter.wait_for_all_tracers", lambda: None)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.Client", lambda: fake_client
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.wait_for_all_tracers", lambda: None
+    )
 
     spans = fetch_langsmith_spans("trace-123")
 
@@ -86,12 +90,15 @@ def test_local_recorder_captures_llm_and_tool_fallback_events():
             lambda: {"answer": "use 8.5.1"},
             {"messages": ["select the next version"]},
         ) == {"answer": "use 8.5.1"}
-        assert invoke_with_trajectory(
-            "test.tool",
-            lambda: "SUCCESS: registry result",
-            {"package_name": "test-pkg"},
-            run_type="tool",
-        ) == "SUCCESS: registry result"
+        assert (
+            invoke_with_trajectory(
+                "test.tool",
+                lambda: "SUCCESS: registry result",
+                {"package_name": "test-pkg"},
+                run_type="tool",
+            )
+            == "SUCCESS: registry result"
+        )
 
     spans = recorder.spans()
     assert [span["name"] for span in spans] == ["test.llm", "test.tool"]
@@ -290,5 +297,3 @@ def test_repeated_runs_create_separate_files(tmp_path, monkeypatch):
     assert first != second
     assert first.exists() and second.exists()
     assert len(list(tmp_path.glob("*.md"))) == 2
-
-

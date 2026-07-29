@@ -1,4 +1,4 @@
-﻿"""Command-line interface for the remediation engine."""
+"""Command-line interface for the remediation engine."""
 
 from __future__ import annotations
 
@@ -70,8 +70,7 @@ def _write_json(path: Path | None, value: object) -> None:
 def _write_jsonl(path: Path | None, values: list[object]) -> None:
     """Write one compact JSON object per line to a file or stdout."""
     payload = "".join(
-        json.dumps(value, separators=(",", ":"), default=str) + "\n"
-        for value in values
+        json.dumps(value, separators=(",", ":"), default=str) + "\n" for value in values
     )
     if path is None:
         print(payload, end="")
@@ -144,5 +143,3 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         log.error("%s", exc)
         return 2
-
-

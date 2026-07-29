@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for the Phase 5 Supervisor Node.
 
 Tests have been updated to use the task-centric architecture:
@@ -24,39 +24,41 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
-    QAEvaluation,
     QAAttemptResult,
+    QAEvaluation,
+    QAFailureEvidence,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
     SupervisorDecision,
     SupervisorRetryPlan,
-    TaskSpawnRequest,
     TaskAttemptSnapshot,
+    TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
-    WorkerAttemptResult,
-    WorkerExecutionDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkaroundPhase,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
+from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
-    _planner_plan_violations,
-    _parse_planner_retry_plans,
-    _reconcile_registry_plan_evidence,
-    _normalize_target_task_ids_for_node,
-    _instruction_digest,
     _deterministic_routing,
+    _instruction_digest,
     _materialize_spawn_requests,
+    _normalize_target_task_ids_for_node,
+    _parse_planner_retry_plans,
+    _planner_plan_violations,
+    _reconcile_registry_plan_evidence,
     build_supervisor_prompt,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
     supervisor_router,
 )
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task, derive_initial_strategy
-from remediation_engine.orchestration.subagent_runtime import ToolEvent
+from remediation_engine.orchestration.task_utils import derive_initial_strategy
 
 
 def _issue() -> VulnerabilityIssue:
@@ -263,7 +265,9 @@ class TestDeriveInitialStrategy:
 class TestSupervisorRouterFunction:
     def test_valid_next_routing_steps_route_correctly(self):
         assert supervisor_router({"next_routing_step": "update_subagent"}) == "update_subagent"
-        assert supervisor_router({"next_routing_step": "workaround_subagent"}) == "workaround_subagent"
+        assert (
+            supervisor_router({"next_routing_step": "workaround_subagent"}) == "workaround_subagent"
+        )
         assert supervisor_router({"next_routing_step": "qa_critic"}) == "qa_critic"
         assert supervisor_router({"next_routing_step": "teardown"}) == "teardown"
 
@@ -399,8 +403,8 @@ class TestRunSupervisorNodeToQA:
         # 12 groups: first 10 are optimistically fixed (active batch), 2 are pending
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
         tasks = {
-            f"task-{i+1}": _make_task(
-                f"task-{i+1}",
+            f"task-{i + 1}": _make_task(
+                f"task-{i + 1}",
                 f"g{i}",
                 status=TaskStatus.OPTIMISTICALLY_FIXED if i < 10 else TaskStatus.PENDING,
             )
@@ -409,20 +413,20 @@ class TestRunSupervisorNodeToQA:
         state = _base_state(
             groups,
             task_queue=tasks,
-            active_target_task_ids=[f"task-{i+1}" for i in range(10)],
+            active_target_task_ids=[f"task-{i + 1}" for i in range(10)],
         )
 
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert set(result["active_target_task_ids"]) == {f"task-{i+1}" for i in range(10)}
+        assert set(result["active_target_task_ids"]) == {f"task-{i + 1}" for i in range(10)}
 
     @patch("langchain_openai.ChatOpenAI")
     def test_mixed_update_batch_routes_successful_subset_to_qa(self, mock_chat):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
         tasks = {
-            f"task-{i+1}": _make_task(
-                f"task-{i+1}",
+            f"task-{i + 1}": _make_task(
+                f"task-{i + 1}",
                 f"g{i}",
                 status=TaskStatus.NEEDS_RETRY,
                 retry_count=1,
@@ -430,17 +434,33 @@ class TestRunSupervisorNodeToQA:
             for i in range(5)
         }
         summaries = [
-            AgentActionSummary(task_id="task-1", status=AgentActionStatus.SUCCESS, summary="updated jsonwebtoken"),
-            AgentActionSummary(task_id="task-2", status=AgentActionStatus.SUCCESS, summary="updated express-jwt"),
-            AgentActionSummary(task_id="task-3", status=AgentActionStatus.SUCCESS, summary="updated @tootallnate/once"),
-            AgentActionSummary(task_id="task-4", status=AgentActionStatus.SURRENDER, summary="ws reverted due to dependency conflict"),
-            AgentActionSummary(task_id="task-5", status=AgentActionStatus.SURRENDER, summary="elliptic update path exhausted"),
+            AgentActionSummary(
+                task_id="task-1", status=AgentActionStatus.SUCCESS, summary="updated jsonwebtoken"
+            ),
+            AgentActionSummary(
+                task_id="task-2", status=AgentActionStatus.SUCCESS, summary="updated express-jwt"
+            ),
+            AgentActionSummary(
+                task_id="task-3",
+                status=AgentActionStatus.SUCCESS,
+                summary="updated @tootallnate/once",
+            ),
+            AgentActionSummary(
+                task_id="task-4",
+                status=AgentActionStatus.SURRENDER,
+                summary="ws reverted due to dependency conflict",
+            ),
+            AgentActionSummary(
+                task_id="task-5",
+                status=AgentActionStatus.SURRENDER,
+                summary="elliptic update path exhausted",
+            ),
         ]
         state = _base_state(
             groups,
             task_queue=tasks,
             action_summaries=summaries,
-            active_target_task_ids=[f"task-{i+1}" for i in range(5)],
+            active_target_task_ids=[f"task-{i + 1}" for i in range(5)],
         )
 
         result = run_supervisor_node(state)
@@ -474,7 +494,9 @@ class TestRunSupervisorNodeToQA:
 
     @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
-    def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(self, mock_chat, mock_planner):
+    def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(
+        self, mock_chat, mock_planner
+    ):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -589,7 +611,8 @@ class TestRunSupervisorNodeQAUpdates:
     def test_qa_completed_passed_workaround_adds_constraint(self):
         g1 = _sast_group("g1")
         task = _make_task(
-            "task-1", "g1",
+            "task-1",
+            "g1",
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.OPTIMISTICALLY_FIXED,
         )
@@ -696,14 +719,15 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-2"].retry_count == 1
         assert result["task_queue"]["task-2"].instruction == (
-            "Apply strategy stage npm_same_major: update package.json "
-            "to exact version 1.2.4."
+            "Apply strategy stage npm_same_major: update package.json to exact version 1.2.4."
         )
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_retry_update_without_revised_instruction_falls_back_to_high_level_retry(self, mock_chat):
+    def test_retry_update_without_revised_instruction_falls_back_to_high_level_retry(
+        self, mock_chat
+    ):
         g1 = _sca_group("g1")
         task = _make_task(
             "task-1",
@@ -764,7 +788,10 @@ class TestRunSupervisorNodeQAUpdates:
 
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
-        assert result["task_queue"]["task-1"].instruction == 'Update "test-pkg" in package.json to version "1.2.4".'
+        assert (
+            result["task_queue"]["task-1"].instruction
+            == 'Update "test-pkg" in package.json to version "1.2.4".'
+        )
 
 
 def test_planner_none_clears_stale_selection_and_marks_latest_path_exhausted():
@@ -831,7 +858,9 @@ The same-major latest version 6.1.2 is already attempted, but retry it.
     )
 
     violations = _planner_plan_violations(plans, {"task-1": task}, updated)
-    assert any("6.1.2" in violation and "already attempted" in violation for violation in violations)
+    assert any(
+        "6.1.2" in violation and "already attempted" in violation for violation in violations
+    )
 
 
 def test_planner_rejects_stage_regression_from_code_workaround_to_update():
@@ -884,7 +913,9 @@ def test_unknown_planner_stage_is_fail_closed():
     violations = _planner_plan_violations(plans, {"task-1": task}, updated)
 
     assert plans["task-1"].strategy_stage == SCARemediationStage.CODE_WORKAROUND
-    assert any("retry_update cannot use code_workaround stage" in violation for violation in violations)
+    assert any(
+        "retry_update cannot use code_workaround stage" in violation for violation in violations
+    )
 
 
 def test_same_major_latest_equal_latest_forces_workaround_pivot_even_if_llm_says_retry():
@@ -976,6 +1007,39 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
     state = _base_state(
         [group],
         task_queue={"task-1": task},
+        qa_evaluations={
+            "task-1": QAEvaluation(
+                task_id="task-1",
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Repair the express-jwt compatibility regression.",
+                failure_evidence=QAFailureEvidence(
+                    attempt_id="update-attempt-1",
+                    task_revision=1,
+                    exact_diagnostics=["(0, import_express_jwt.default) is not a function"],
+                    source_locations=["/workspace/lib/insecurity.ts:54:35"],
+                ),
+            )
+        },
+        qa_results_by_attempt={
+            "update-attempt-1": QAAttemptResult(
+                attempt_id="update-attempt-1",
+                task_id="task-1",
+                task_revision=1,
+                evaluation=QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="Repair the express-jwt compatibility regression.",
+                    failure_evidence=QAFailureEvidence(
+                        attempt_id="update-attempt-1",
+                        task_revision=1,
+                        exact_diagnostics=["(0, import_express_jwt.default) is not a function"],
+                        source_locations=["/workspace/lib/insecurity.ts:54:35"],
+                    ),
+                ),
+            )
+        },
         retry_diagnostics_by_task={
             "task-1": UpdateRetryDiagnostics(
                 task_id="task-1",
@@ -1008,6 +1072,14 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
     child_id = result["active_target_task_ids"][0]
     assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
     assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+    child_attempt_id = result["task_queue"][child_id].current_attempt_id
+    child_snapshot = result["attempt_snapshots_by_id"][child_attempt_id]
+    assert child_snapshot.workaround_context is not None
+    assert child_snapshot.workaround_context.phase == WorkaroundPhase.QA_REGRESSION_REPAIR
+    assert child_snapshot.workaround_context.qa_evidence is not None
+    assert child_snapshot.workaround_context.qa_evidence.source_locations == [
+        "/workspace/lib/insecurity.ts:54:35"
+    ]
 
 
 def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatch(monkeypatch):
@@ -1055,7 +1127,9 @@ def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatc
         ]
     )
     planner_mock = MagicMock(side_effect=lambda *args, **kwargs: next(planner_outputs))
-    monkeypatch.setattr("remediation_engine.orchestration.supervisor_node._run_planner_phase", planner_mock)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._run_planner_phase", planner_mock
+    )
 
     router_llm = MagicMock()
     structured = MagicMock()
@@ -1159,10 +1233,7 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
     assert committed.current_attempt_id == "attempt-new"
     assert committed.selected_version == "2.0.0"
     assert committed.status == TaskStatus.OPTIMISTICALLY_FIXED
-    assert any(
-        event.error_code == "STALE_WORKER_RESULT"
-        for event in result["consistency_events"]
-    )
+    assert any(event.error_code == "STALE_WORKER_RESULT" for event in result["consistency_events"])
 
 
 def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch):
@@ -1249,10 +1320,11 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
     assert committed.current_attempt_id != old_snapshot.attempt_id
     assert committed.selected_version == "2.0.0"
     assert committed.task_revision > old_snapshot.task_revision
-    assert result["attempt_snapshots_by_id"][committed.current_attempt_id].selected_version == "2.0.0"
+    assert (
+        result["attempt_snapshots_by_id"][committed.current_attempt_id].selected_version == "2.0.0"
+    )
     assert not any(
-        event.error_code == "TASK_SNAPSHOT_REPAIRED"
-        for event in result["consistency_events"]
+        event.error_code == "TASK_SNAPSHOT_REPAIRED" for event in result["consistency_events"]
     )
 
 
@@ -1307,10 +1379,7 @@ def test_stale_qa_result_does_not_increment_retry_count():
 
     assert result["task_queue"]["task-1"].retry_count == 1
     assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
-    assert any(
-        event.error_code == "STALE_QA_RESULT"
-        for event in result["consistency_events"]
-    )
+    assert any(event.error_code == "STALE_QA_RESULT" for event in result["consistency_events"])
 
 
 def test_terminal_task_cannot_retain_retry_plan():
@@ -1334,8 +1403,7 @@ def test_terminal_task_cannot_retain_retry_plan():
 
     assert "task-1" not in result["retry_plans_by_task"]
     assert any(
-        event.error_code == "TERMINAL_TASK_PLAN_CLEARED"
-        for event in result["consistency_events"]
+        event.error_code == "TERMINAL_TASK_PLAN_CLEARED" for event in result["consistency_events"]
     )
 
 
@@ -1511,9 +1579,7 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
     )
     assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is True
     assert result["task_queue"][child_id].current_attempt_id is not None
-    assert result["task_queue"][child_id].current_attempt_id in result[
-        "attempt_snapshots_by_id"
-    ]
+    assert result["task_queue"][child_id].current_attempt_id in result["attempt_snapshots_by_id"]
 
 
 # ===========================================================================
@@ -1597,7 +1663,9 @@ class TestRunSupervisorNodeActionSummaryUpdates:
 
     def test_updates_workaround_task_to_unfixable_on_surrender(self):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.CODE_WORKAROUND, status=TaskStatus.PENDING)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.CODE_WORKAROUND, status=TaskStatus.PENDING
+        )
         summary = AgentActionSummary(
             task_id="task-1",
             status=AgentActionStatus.SURRENDER,
@@ -1736,7 +1804,8 @@ class TestRunSupervisorMaxRetries:
     def test_max_retries_marks_task_unfixable_and_removes_from_targets(self):
         g1 = _sca_group("g1")
         task = _make_task(
-            "task-1", "g1",
+            "task-1",
+            "g1",
             status=TaskStatus.NEEDS_RETRY,
             retry_count=MAX_RETRIES,
         )
@@ -1846,7 +1915,9 @@ class TestRunSupervisorNodePeerConflict:
     @patch("langchain_openai.ChatOpenAI")
     def test_llm_strategy_pivot_spawns_child_and_routes_child(self, mock_chat):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -1876,12 +1947,17 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
         assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
-        assert result["task_queue"]["task-2"].instruction == "Implement a code workaround for the unresolved peer conflict."
+        assert (
+            result["task_queue"]["task-2"].instruction
+            == "Implement a code workaround for the unresolved peer conflict."
+        )
 
     @patch("langchain_openai.ChatOpenAI")
     def test_breaking_change_pivot_marks_parent_passed_and_routes_child(self, mock_chat):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -1923,7 +1999,9 @@ class TestRunSupervisorNodePeerConflict:
     @patch("langchain_openai.ChatOpenAI")
     def test_strategy_pivot_without_child_instruction_fails_closed(self, mock_chat):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -1945,12 +2023,17 @@ class TestRunSupervisorNodePeerConflict:
         assert result["active_target_task_ids"] == []
         assert "task-2" not in result["task_queue"]
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
-        assert any("rejected strategy pivot without task-specific child instructions" in err for err in result["errors"])
+        assert any(
+            "rejected strategy pivot without task-specific child instructions" in err
+            for err in result["errors"]
+        )
 
     @patch("langchain_openai.ChatOpenAI")
     def legacy_breaking_change_fallback_spawns_child_instead_of_retrying_parent(self, mock_chat):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -1977,7 +2060,9 @@ class TestRunSupervisorNodePeerConflict:
     @patch("langchain_openai.ChatOpenAI")
     def test_exhausted_update_path_fallback_spawns_child_and_terminalizes_parent(self, mock_chat):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -2043,9 +2128,13 @@ class TestRunSupervisorNodePeerConflict:
 
     @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
-    def test_llm_cannot_route_exhausted_update_back_to_update_subagent(self, mock_chat, mock_planner):
+    def test_llm_cannot_route_exhausted_update_back_to_update_subagent(
+        self, mock_chat, mock_planner
+    ):
         g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY)
+        task = _make_task(
+            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
+        )
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
@@ -2068,9 +2157,7 @@ class TestRunSupervisorNodePeerConflict:
         structured.invoke.return_value = SupervisorDecision(
             next_node="update_subagent",
             target_task_ids=["task-1"],
-            revised_instructions={
-                "task-1": "Try update again even though it is exhausted."
-            },
+            revised_instructions={"task-1": "Try update again even though it is exhausted."},
             instructions="incorrectly retry exhausted update",
             decision_reason="bad router decision",
         )
@@ -2087,8 +2174,8 @@ class TestRunSupervisorNodePeerConflict:
     def test_multi_spawn_materializes_all_children_but_routes_first_child(self, mock_chat):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
         tasks = {
-            f"task-{i+1}": _make_task(
-                f"task-{i+1}",
+            f"task-{i + 1}": _make_task(
+                f"task-{i + 1}",
                 f"g{i}",
                 strategy=RoutingStrategy.VERSION_BUMP,
                 status=TaskStatus.NEEDS_RETRY,
@@ -2190,7 +2277,9 @@ class TestSupervisorLLMStructuredOutput:
 
         run_supervisor_node(state)
 
-        mock_llm.with_structured_output.assert_called_once_with(SupervisorDecision, method="function_calling")
+        mock_llm.with_structured_output.assert_called_once_with(
+            SupervisorDecision, method="function_calling"
+        )
         mock_structured.invoke.assert_called_once()
 
 
@@ -2236,7 +2325,9 @@ class TestSupervisorPrompt:
 
         assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
         assert "BREAKING_CHANGE also advances through the ordered update stages" in prompt
-        assert "Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task" in prompt
+        assert (
+            "Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task" in prompt
+        )
 
 
 class TestBugFixes:
@@ -2277,7 +2368,9 @@ class TestBugFixes:
 
         assert decision.next_node == "workaround_subagent"
         assert len(decision.spawn_requests) == 1
-        assert decision.feedback_by_task.get("task-1") == "Peer dependency conflict with body-parser"
+        assert (
+            decision.feedback_by_task.get("task-1") == "Peer dependency conflict with body-parser"
+        )
 
     def test_bug2_materialize_spawn_requests_replaces_triage_strategy_bucket(self):
         group_id = "sca:package.json:express:UPDATE_VERSION"
@@ -2336,7 +2429,10 @@ class TestBugFixes:
 
         assert len(new_tasks) == 0
         assert len(errors) == 1
-        assert "CODE_WORKAROUND parent 'task-1' cannot spawn another CODE_WORKAROUND child" in errors[0]
+        assert (
+            "CODE_WORKAROUND parent 'task-1' cannot spawn another CODE_WORKAROUND child"
+            in errors[0]
+        )
 
     def test_bug3_deterministic_routing_filters_exhausted_workaround_tasks(self):
         task = RemediationTask(
@@ -2419,5 +2515,3 @@ class TestBugFixes:
 
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
-
-

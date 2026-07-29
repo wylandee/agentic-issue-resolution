@@ -1,9 +1,8 @@
-﻿"""Regression tests for the Supervisor-owned post-QA triage handoff."""
+"""Regression tests for the Supervisor-owned post-QA triage handoff."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
-from uuid import uuid4
 
 from remediation_engine.contracts.schemas import (
     FixPlan,
@@ -112,9 +111,7 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
             },
             "qa_evaluations": {
                 changed.group_id: QAEvaluation(task_id=changed.group_id, passed=True),
-                unchanged.group_id: QAEvaluation(
-                    task_id=unchanged.group_id, passed=True
-                ),
+                unchanged.group_id: QAEvaluation(task_id=unchanged.group_id, passed=True),
             },
             "triage_required": True,
             "new_vulnerability_status": "detected",
@@ -278,5 +275,3 @@ def test_graph_routes_qa_through_supervisor_to_triage_and_back():
     assert supervisor_calls["count"] == 3
     assert triage_pipeline.call_count == 1
     assert result["status"] == "completed"
-
-

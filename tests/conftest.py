@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import shutil
 import tempfile
@@ -22,5 +22,3 @@ def tmp_path() -> Path:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
-
-

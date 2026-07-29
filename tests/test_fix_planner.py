@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for remediation_engine.tools.fix_planner.
 
 All network calls are mocked â€” no live internet required.
@@ -33,13 +33,10 @@ FixPlan round-trip
 
 from __future__ import annotations
 
-import json
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 
 from remediation_engine.contracts import (
     FixPlan,
@@ -63,14 +60,13 @@ from remediation_engine.tools.fix_planner import (
     plan_fix,
 )
 
-
 # ===========================================================================
 # Shared factories
 # ===========================================================================
 
 
 def _make_vuln_issue(**kwargs) -> VulnerabilityIssue:
-    defaults: Dict[str, Any] = dict(
+    defaults: dict[str, Any] = dict(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
@@ -86,10 +82,10 @@ def _make_vuln_issue(**kwargs) -> VulnerabilityIssue:
     return VulnerabilityIssue(**defaults)
 
 
-def _make_localized(issue: Optional[VulnerabilityIssue] = None, **kwargs) -> LocalizedIssue:
+def _make_localized(issue: VulnerabilityIssue | None = None, **kwargs) -> LocalizedIssue:
     if issue is None:
         issue = _make_vuln_issue()
-    defaults: Dict[str, Any] = dict(
+    defaults: dict[str, Any] = dict(
         issue=issue,
         manifest_file="package.json",
         is_direct_dependency=True,
@@ -107,16 +103,19 @@ def _make_localized(issue: Optional[VulnerabilityIssue] = None, **kwargs) -> Loc
 
 
 class TestExtractLocalVersion:
-    @pytest.mark.parametrize("msg,expected", [
-        ("Update to version 3.0.0 or later.", "3.0.0"),
-        ("Upgrade to 1.2.3.", "1.2.3"),
-        ("Fixed in v2.1.4.", "2.1.4"),
-        ("Patched in 5.0.0-beta.1.", "5.0.0"),
-        ("Use version 0.0.1.", "0.0.1"),
-        ("Requires 2.0.0 or higher.", "2.0.0"),
-        ("No version mentioned here.", None),
-        ("", None),
-    ])
+    @pytest.mark.parametrize(
+        "msg,expected",
+        [
+            ("Update to version 3.0.0 or later.", "3.0.0"),
+            ("Upgrade to 1.2.3.", "1.2.3"),
+            ("Fixed in v2.1.4.", "2.1.4"),
+            ("Patched in 5.0.0-beta.1.", "5.0.0"),
+            ("Use version 0.0.1.", "0.0.1"),
+            ("Requires 2.0.0 or higher.", "2.0.0"),
+            ("No version mentioned here.", None),
+            ("", None),
+        ],
+    )
     def test_variants(self, msg, expected):
         assert _extract_local_version(msg) == expected
 
@@ -313,7 +312,9 @@ class TestFetchOsvVulnDetail:
         assert result["id"] == "GHSA-xxxx"
 
     def test_network_failure_returns_none(self):
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("timeout")):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("timeout")
+        ):
             result = _fetch_osv_vuln_detail("GHSA-xxxx")
         assert result is None
 
@@ -357,7 +358,9 @@ class TestFetchNpmLatest:
         assert "%40" in captured["url"] or "%2F" in captured["url"]
 
     def test_network_failure_returns_none(self):
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("DNS")):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("DNS")
+        ):
             result = _fetch_npm_latest("lodash")
         assert result is None
 
@@ -410,16 +413,16 @@ class TestQueryOsvFixedVersion:
                 }
             ]
         }
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+        ):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
         assert result == ("4.17.21", None)
 
     def test_id_only_triggers_detail_fetch(self):
         """querybatch returns only {id: ...}, no 'affected' â†’ fall back to GET."""
-        querybatch_body = {
-            "results": [{"vulns": [{"id": "GHSA-xxxx"}]}]
-        }
+        querybatch_body = {"results": [{"vulns": [{"id": "GHSA-xxxx"}]}]}
         detail_body = {
             "id": "GHSA-xxxx",
             "affected": [
@@ -439,8 +442,10 @@ class TestQueryOsvFixedVersion:
         get_mock.json.return_value = detail_body
         get_mock.raise_for_status = MagicMock()
 
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=post_mock), \
-             patch("remediation_engine.tools.fix_planner.requests.get", return_value=get_mock):
+        with (
+            patch("remediation_engine.tools.fix_planner.requests.post", return_value=post_mock),
+            patch("remediation_engine.tools.fix_planner.requests.get", return_value=get_mock),
+        ):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
         assert result == ("4.17.21", None)
@@ -465,7 +470,9 @@ class TestQueryOsvFixedVersion:
                 }
             ]
         }
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+        ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (
             None,
@@ -473,13 +480,17 @@ class TestQueryOsvFixedVersion:
         )
 
     def test_network_failure_returns_none(self):
-        with patch("remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")
+        ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (None, None)
 
     def test_empty_results_returns_none(self):
         body = {"results": [{}]}
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+        ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (None, None)
 
@@ -526,7 +537,9 @@ class TestSearchSerperWorkarounds:
 
     def test_network_failure_returns_none(self, monkeypatch):
         monkeypatch.setenv("SERPER_API_KEY", "test-key")
-        with patch("remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")
+        ):
             result = _search_serper_workarounds(_make_vuln_issue(), "lodash")
         assert result is None
 
@@ -551,8 +564,10 @@ class LegacyPlanFixNpmFirst:
     def test_npm_registry_latest_wins_over_local_hint(self):
         """Message contains version hint â†’ step 1 wins."""
         loc = _make_localized()  # message includes local hint 4.17.21.
-        with patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"), \
-             patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock:
+        with (
+            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"),
+            patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock,
+        ):
             result = plan_fix(loc)
 
         osv_mock.assert_not_called()
@@ -565,8 +580,10 @@ class LegacyPlanFixNpmFirst:
         """No local hint, but OSV returns a fixed version."""
         issue = _make_vuln_issue(message="No version hint here.")
         loc = _make_localized(issue=issue)
-        with patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"), \
-             patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock:
+        with (
+            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"),
+            patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock,
+        ):
             result = plan_fix(loc)
 
         osv_mock.assert_not_called()
@@ -578,8 +595,13 @@ class LegacyPlanFixNpmFirst:
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
         snippets = ["Workaround A", "Workaround B"]
-        with patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value=None), \
-             patch("remediation_engine.tools.fix_planner._search_serper_workarounds", return_value=snippets):
+        with (
+            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value=None),
+            patch(
+                "remediation_engine.tools.fix_planner._search_serper_workarounds",
+                return_value=snippets,
+            ),
+        ):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
         assert result["fixed_version"] is None
@@ -590,7 +612,10 @@ class LegacyPlanFixNpmFirst:
         """No hint + OSV fails â†’ npm registry returns latest."""
         issue = _make_vuln_issue(message="No version hint here.")
         loc = _make_localized(issue=issue)
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.VERSION_FOUND.value
         assert result["fixed_version"] == "4.17.21"
@@ -605,8 +630,13 @@ class LegacyPlanFixNpmFirst:
         )
         loc = _make_localized(issue=issue)
         snippets = ["Workaround for Maven package."]
-        with patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock, \
-             patch("remediation_engine.tools.fix_planner._search_serper_workarounds", return_value=snippets):
+        with (
+            patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock,
+            patch(
+                "remediation_engine.tools.fix_planner._search_serper_workarounds",
+                return_value=snippets,
+            ),
+        ):
             result = plan_fix(loc)
         npm_mock.assert_not_called()
         assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
@@ -620,8 +650,12 @@ class LegacyPlanFixNpmFirst:
             purl="pkg:maven/commons-io/commons-io@2.4",
         )
         loc = _make_localized(issue=issue)
-        with patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock, \
-             patch("remediation_engine.tools.fix_planner._search_serper_workarounds", return_value=None):
+        with (
+            patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock,
+            patch(
+                "remediation_engine.tools.fix_planner._search_serper_workarounds", return_value=None
+            ),
+        ):
             result = plan_fix(loc)
 
         npm_mock.assert_not_called()
@@ -636,7 +670,10 @@ class LegacyPlanFixNpmFirst:
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
         snippets = ["Workaround A", "Workaround B"]
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=(None, snippets)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=(None, snippets),
+        ):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
         assert result["workaround_snippets"] == snippets
@@ -652,15 +689,18 @@ class LegacyPlanFixNpmFirst:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No version hint.")
         loc = _make_localized(issue=issue)
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=(None, None),
+        ):
             result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.NO_FIX.value
         assert result["fixed_version"] is None
         assert result["workaround_snippets"] is None
         assert result["strategy_used"] == "none"
-        assert result["instruction"] == "No upstream patch or workaround was found. Inform the user."
-
-
+        assert (
+            result["instruction"] == "No upstream patch or workaround was found. Inform the user."
+        )
 
 
 # ===========================================================================
@@ -673,7 +713,10 @@ class TestPlanFixRoundTrip:
 
     def test_version_found_validates(self):
         loc = _make_localized()
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.VERSION_FOUND
@@ -683,7 +726,10 @@ class TestPlanFixRoundTrip:
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
         snippets = ["patch A"]
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=(None, snippets)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=(None, snippets),
+        ):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.WORKAROUND_FOUND
@@ -693,14 +739,20 @@ class TestPlanFixRoundTrip:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=(None, None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=(None, None),
+        ):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.NO_FIX
 
     def test_json_round_trip(self):
         loc = _make_localized()
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         fp = FixPlan(**result)
         reloaded = FixPlan.model_validate_json(fp.model_dump_json())
@@ -717,7 +769,10 @@ class TestPlanFixRoundTrip:
 class TestPlanFixInstructionContent:
     def test_direct_dep_instruction_mentions_update(self):
         loc = _make_localized(is_direct_dependency=True, manifest_file="package.json")
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         assert "Update" in result["instruction"]
         assert "lodash" in result["instruction"]
@@ -729,7 +784,10 @@ class TestPlanFixInstructionContent:
             package_manager="npm",
             manifest_file="package.json",
         )
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         assert "overrides" in result["instruction"]
 
@@ -739,7 +797,10 @@ class TestPlanFixInstructionContent:
             package_manager="yarn",
             manifest_file="package.json",
         )
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         assert "resolutions" in result["instruction"]
 
@@ -749,8 +810,9 @@ class TestPlanFixInstructionContent:
             package_manager="pnpm",
             manifest_file="package.json",
         )
-        with patch("remediation_engine.tools.fix_planner._query_osv_fixed_version", return_value=("4.17.21", None)):
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ):
             result = plan_fix(loc)
         assert "pnpm" in result["instruction"]
-
-

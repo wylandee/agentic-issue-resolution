@@ -1,4 +1,4 @@
-﻿"""
+"""
 SCA Manifest Locator â€” finds *where* a vulnerable package is declared.
 
 Separation-of-Concerns refactor
@@ -38,19 +38,20 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import unquote  # noqa: F401 â€” kept for callers that may use it
 
 from remediation_engine.contracts import (
-    IssueSource,
-    IssueType,
     LocalizedIssue,
     VulnerabilityIssue,
 )
-from remediation_engine.contracts.schemas import CWEEntry  # noqa: F401 â€” re-exported for convenience
+from remediation_engine.contracts.schemas import (
+    CWEEntry,  # noqa: F401 â€” re-exported for convenience
+)
 
 try:
     from packageurl import PackageURL
+
     _PURL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _PURL_AVAILABLE = False
@@ -103,7 +104,11 @@ def normalize_package_name(raw_name: str) -> str:
     name = re.sub(r"\s*\(.*?\)", "", name)
 
     # Keep clean scoped packages intact
-    if name.startswith("@") and "/" in name and not re.search(r"\.(tgz|jar|zip)$", name, re.IGNORECASE):
+    if (
+        name.startswith("@")
+        and "/" in name
+        and not re.search(r"\.(tgz|jar|zip)$", name, re.IGNORECASE)
+    ):
         return name.strip()
 
     # Remove archive/js suffixes
@@ -115,7 +120,7 @@ def normalize_package_name(raw_name: str) -> str:
     return name.strip()
 
 
-def _package_name_from_purl(purl_str: str) -> Optional[str]:
+def _package_name_from_purl(purl_str: str) -> str | None:
     """Extract decoded package name (with namespace) from a PURL string.
 
     For npm: packageurl-python puts '@scope/name' directly in purl.name
@@ -150,7 +155,7 @@ def _package_name_from_purl(purl_str: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def parse_lockfile_path(file_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def parse_lockfile_path(file_path: str) -> tuple[str | None, str | None, str | None]:
     """
     Parse ODC's composite file-path notation.
 
@@ -181,7 +186,7 @@ def parse_lockfile_path(file_path: str) -> Tuple[Optional[str], Optional[str], O
         #   - a plain token like "cookie:0.4.2"
         #   - a scoped token like "@tootallnate/once:1.1.2"  (starts with @)
         # We must NOT split scoped tokens on the '/' inside them.
-        segments: List[str] = []
+        segments: list[str] = []
         remaining = ancestry
         while remaining:
             if remaining.startswith("@"):
@@ -191,21 +196,21 @@ def parse_lockfile_path(file_path: str) -> Tuple[Optional[str], Optional[str], O
                 # We find the end of this token by locating the first '/' that comes
                 # AFTER the mandatory scope separator.
                 slash_scope = remaining.index("/")  # separator between @scope and name
-                rest_after_scope = remaining[slash_scope + 1:]  # "once:1.1.2/next..."
+                rest_after_scope = remaining[slash_scope + 1 :]  # "once:1.1.2/next..."
                 next_slash = rest_after_scope.find("/")
                 if next_slash == -1:
                     segments.append(remaining)
                     break
                 token = remaining[: slash_scope + 1 + next_slash]
                 segments.append(token)
-                remaining = rest_after_scope[next_slash + 1:]
+                remaining = rest_after_scope[next_slash + 1 :]
             else:
                 slash_idx = remaining.find("/")
                 if slash_idx == -1:
                     segments.append(remaining)
                     break
                 segments.append(remaining[:slash_idx])
-                remaining = remaining[slash_idx + 1:]
+                remaining = remaining[slash_idx + 1 :]
 
         if not segments:
             return lockfile, None, None
@@ -235,7 +240,7 @@ def parse_lockfile_path(file_path: str) -> Tuple[Optional[str], Optional[str], O
 # ---------------------------------------------------------------------------
 
 
-def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path]:
+def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     """
     Walk up from the directory implied by the ODC file path to find the closest
     ``package.json`` that is still inside ``repo_root``.
@@ -270,7 +275,7 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Optional[Path
     fallback_dir = start_dir
     fallback_depth = -1
     for variant in variants:
-        candidate = (repo_root / variant)
+        candidate = repo_root / variant
         current = candidate.resolve()
         if current.exists():
             start_dir = current if current.is_dir() else current.parent
@@ -347,7 +352,7 @@ def detect_package_manager(manifest_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _read_json_file(path: Path) -> Dict[str, Any]:
+def _read_json_file(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -357,7 +362,7 @@ def _read_json_file(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _find_dependency_line(lines: List[str], package_name: str) -> Optional[int]:
+def _find_dependency_line(lines: list[str], package_name: str) -> int | None:
     """Find 1-indexed line number of a dependency declaration in package.json text."""
     pattern = re.compile(rf'^\s*"{re.escape(package_name)}"\s*:\s*')
     for idx, line in enumerate(lines, start=1):
@@ -366,10 +371,10 @@ def _find_dependency_line(lines: List[str], package_name: str) -> Optional[int]:
     return None
 
 
-def _build_snippet(lines: List[str], line_number: int, context: int = 1) -> str:
+def _build_snippet(lines: list[str], line_number: int, context: int = 1) -> str:
     start = max(1, line_number - context)
     end = min(len(lines), line_number + context)
-    return "\n".join(lines[start - 1: end])
+    return "\n".join(lines[start - 1 : end])
 
 
 def _run_package_lock_generation(repo_path: Path) -> None:
@@ -401,7 +406,7 @@ def _locate_in_manifest(
     manifest_path: Path,
     package_name: str,
     pkg_manager: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Inspect a ``package.json`` and return localization data for the package.
 
@@ -418,7 +423,7 @@ def _locate_in_manifest(
 
     is_direct = package_name in all_direct
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "manifest_file": str(manifest_path),
         "package_name": package_name,
         "is_direct": is_direct,
@@ -446,7 +451,7 @@ def locate_dependency(
     repo_path: Path,
     raw_dependency_name: str,
     odc_file_path: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Locate where a vulnerable SCA dependency is declared in the repository.
 
@@ -529,12 +534,12 @@ def locate_from_issue(
     )
 
     is_success = result.get("status") == "success"
-    manifest_rel: Optional[str] = None
+    manifest_rel: str | None = None
     if is_success and result.get("manifest_file"):
         try:
-            manifest_rel = Path(result["manifest_file"]).resolve().relative_to(
-                repo_path.resolve()
-            ).as_posix()
+            manifest_rel = (
+                Path(result["manifest_file"]).resolve().relative_to(repo_path.resolve()).as_posix()
+            )
         except (OSError, ValueError):
             # Never leak an absolute path into the graph contract.  A
             # localization outside the scanned repository is unusable by the
@@ -562,5 +567,3 @@ def locate_from_issue(
         package_manager=result.get("package_manager"),
         localization_confidence=confidence,
     )
-
-

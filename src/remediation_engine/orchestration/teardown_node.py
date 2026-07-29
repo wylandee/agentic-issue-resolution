@@ -1,4 +1,4 @@
-﻿"""
+"""
 teardown_node.py - Final cleanup node for the Phase 5 AppSec Orchestrator.
 
 This node reads changed files back out of the shared Docker named volume to
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import difflib
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
 import re
+from pathlib import Path
+from typing import Any
 
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
@@ -42,12 +42,16 @@ def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
         )
     )
 
-def _revert_unfixable_packages_in_json(original_text: str, updated_text: str, unfixable_packages: Set[str]) -> str:
+
+def _revert_unfixable_packages_in_json(
+    original_text: str, updated_text: str, unfixable_packages: set[str]
+) -> str:
     import json
+
     try:
         orig_obj = json.loads(original_text)
         upd_obj = json.loads(updated_text)
-        
+
         indent = 2
         for line in updated_text.splitlines():
             if line.startswith(" ") or line.startswith("\t"):
@@ -56,35 +60,57 @@ def _revert_unfixable_packages_in_json(original_text: str, updated_text: str, un
                     indent = "\t"
                 break
 
-        dep_keys = {"dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "overrides", "resolutions"}
-        
+        dep_keys = {
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+            "overrides",
+            "resolutions",
+        }
+
         for pkg in unfixable_packages:
             for key in dep_keys:
                 if key in upd_obj and isinstance(upd_obj[key], dict) and pkg in upd_obj[key]:
-                    if key in orig_obj and isinstance(orig_obj.get(key), dict) and pkg in orig_obj[key]:
+                    if (
+                        key in orig_obj
+                        and isinstance(orig_obj.get(key), dict)
+                        and pkg in orig_obj[key]
+                    ):
                         upd_obj[key][pkg] = orig_obj[key][pkg]
                     else:
                         del upd_obj[key][pkg]
-                    
+
                     if not upd_obj[key] and (key not in orig_obj or not orig_obj[key]):
                         del upd_obj[key]
-            
-            if "pnpm" in upd_obj and isinstance(upd_obj["pnpm"], dict) and "overrides" in upd_obj["pnpm"]:
+
+            if (
+                "pnpm" in upd_obj
+                and isinstance(upd_obj["pnpm"], dict)
+                and "overrides" in upd_obj["pnpm"]
+            ):
                 if pkg in upd_obj["pnpm"]["overrides"]:
-                    if "pnpm" in orig_obj and isinstance(orig_obj.get("pnpm"), dict) and "overrides" in orig_obj["pnpm"] and pkg in orig_obj["pnpm"]["overrides"]:
+                    if (
+                        "pnpm" in orig_obj
+                        and isinstance(orig_obj.get("pnpm"), dict)
+                        and "overrides" in orig_obj["pnpm"]
+                        and pkg in orig_obj["pnpm"]["overrides"]
+                    ):
                         upd_obj["pnpm"]["overrides"][pkg] = orig_obj["pnpm"]["overrides"][pkg]
                     else:
                         del upd_obj["pnpm"]["overrides"][pkg]
-                    if not upd_obj["pnpm"]["overrides"] and ("pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})):
+                    if not upd_obj["pnpm"]["overrides"] and (
+                        "pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})
+                    ):
                         del upd_obj["pnpm"]["overrides"]
-                        
+
         return json.dumps(upd_obj, indent=indent) + "\n"
     except Exception:
         for pkg in unfixable_packages:
             pattern = r'("' + re.escape(pkg) + r'"\s*:\s*"[^"]*")'
             orig_matches = re.findall(pattern, original_text)
             upd_matches = re.findall(pattern, updated_text)
-            
+
             if len(orig_matches) == 1 and len(upd_matches) == 1:
                 updated_text = updated_text.replace(upd_matches[0], orig_matches[0])
             elif len(orig_matches) > 1 and len(orig_matches) == len(upd_matches):
@@ -93,7 +119,7 @@ def _revert_unfixable_packages_in_json(original_text: str, updated_text: str, un
         return updated_text
 
 
-def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
+def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node - Teardown.
 
@@ -119,24 +145,25 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
         "errors": prior_errors + list(barrier_state.get("errors", []) or []),
     }
     repo_root_str: str = state.get("repo_root", "")
-    workspace_volume: Optional[str] = state.get("workspace_volume")
-    changed_files: List[str] = sorted(set(state.get("changed_files", [])))
+    workspace_volume: str | None = state.get("workspace_volume")
+    changed_files: list[str] = sorted(set(state.get("changed_files", [])))
 
-    diff_chunks: List[str] = []
-    errors: List[str] = []
+    diff_chunks: list[str] = []
+    errors: list[str] = []
     client = None
 
     task_queue = state.get("task_queue", {})
     valid_groups = state.get("valid_groups", [])
     # Build a lookup from parent_group_id to task status
     from remediation_engine.contracts.schemas import TaskStatus
+
     task_by_group: dict = {}
     for task in task_queue.values():
         task_by_group[task.parent_group_id] = task
 
-    passed_files: Set[str] = set()
-    unfixable_files: Set[str] = set()
-    unfixable_packages: Set[str] = set()
+    passed_files: set[str] = set()
+    unfixable_files: set[str] = set()
+    unfixable_packages: set[str] = set()
 
     for g in valid_groups:
         files = set()
@@ -188,12 +215,12 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                             if updated_text is None:
                                 continue
                             original_text = _read_host_text(repo_root, rel_path)
-                            
+
                             if rel_path.endswith(".json") and unfixable_packages:
                                 updated_text = _revert_unfixable_packages_in_json(
                                     original_text, updated_text, unfixable_packages
                                 )
-                                
+
                             diff_text = _build_diff(rel_path, original_text, updated_text)
                             if diff_text:
                                 diff_chunks.append(diff_text)
@@ -208,7 +235,9 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                 client.volumes.get(workspace_volume).remove(force=True)
                 logger.info("teardown_node: removed workspace volume %s.", workspace_volume)
             except Exception as exc:  # noqa: BLE001
-                msg = f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {exc}"
+                msg = (
+                    f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {exc}"
+                )
                 logger.exception("teardown_node: workspace volume cleanup failed.")
                 errors.append(msg)
             finally:
@@ -216,7 +245,7 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
                     _close_client(client)
 
     terminal_has_errors = bool(state.get("errors")) or bool(errors)
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         **barrier_state,
         "status": "completed_with_errors" if terminal_has_errors else "completed",
         "workspace_volume": None,
@@ -226,5 +255,3 @@ def run_teardown_node(state: OrchestratorState) -> Dict[str, Any]:
     if errors:
         result["errors"] = errors
     return result
-
-

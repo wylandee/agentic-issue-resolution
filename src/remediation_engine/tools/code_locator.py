@@ -1,4 +1,4 @@
-﻿"""
+"""
 code_locator.py â€” SAST finding localization using tree-sitter.
 
 Public API
@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional
 
 from remediation_engine.contracts.schemas import (
     ASTNodeType,
@@ -90,9 +89,9 @@ _TAINT_SINK_PATTERNS = [
 ]
 
 
-def _extract_data_flow_hints(snippet: str) -> List[str]:
+def _extract_data_flow_hints(snippet: str) -> list[str]:
     """Scan *snippet* for taint-source and sink patterns, returning brief hints."""
-    hints: List[str] = []
+    hints: list[str] = []
     seen: set = set()
 
     for pattern, template in _TAINT_SOURCE_PATTERNS:
@@ -229,10 +228,10 @@ def locate_sast(
     # ------------------------------------------------------------------
     language = language_for_path(issue.file_path)
     ast_available = False
-    enclosing_symbol: Optional[str] = None
+    enclosing_symbol: str | None = None
     enclosing_node_type: ASTNodeType = ASTNodeType.UNKNOWN
-    sink_expression: Optional[str] = None
-    imports: List[str] = []
+    sink_expression: str | None = None
+    imports: list[str] = []
 
     if language is not None:
         tree = parse_source(source_bytes, language)
@@ -265,7 +264,7 @@ def locate_sast(
     # ------------------------------------------------------------------
     # Step 6: Data-flow hints
     # ------------------------------------------------------------------
-    data_flow_hints: List[str] = []
+    data_flow_hints: list[str] = []
     if snippet:
         try:
             data_flow_hints = _extract_data_flow_hints(snippet)
@@ -301,5 +300,3 @@ def locate_sast(
         snippet=snippet,
         localization_confidence=confidence,
     )
-
-

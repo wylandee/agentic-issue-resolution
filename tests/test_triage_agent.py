@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_triage_agent.py â€” Unit tests for remediation_engine.triage.agent.
 
 Covers:
@@ -13,7 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +21,6 @@ from remediation_engine.contracts.schemas import (
     CVEEnrichment,
     IssueSource,
     IssueType,
-    LineRange,
     Severity,
     SystemContext,
     TriageResult,
@@ -30,7 +28,6 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.triage.agent import _build_triage_prompt, run_triage
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,7 +203,9 @@ class TestDeterministicTriage:
         assert result.is_valid is True
         assert result.false_positive_reason is None
         assert result.is_unreachable_code is True
-        assert "Reachability analysis shows the package is not imported" in result.priority_reasoning
+        assert (
+            "Reachability analysis shows the package is not imported" in result.priority_reasoning
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,5 +351,3 @@ class TestTriagePrompt:
             "Always return original_severity, revised_priority, is_unreachable_code, validity_confidence_score, and priority_confidence_score."
             in prompt
         )
-
-

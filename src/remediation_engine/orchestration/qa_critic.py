@@ -1,4 +1,4 @@
-﻿"""
+"""
 qa_critic.py - Agentic QA evaluator node for the Phase 5 orchestrator.
 
 The QA Critic now follows a map-reduce architecture:
@@ -41,7 +41,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -52,8 +52,9 @@ from remediation_engine.contracts.schemas import (
     BatchQAResult,
     FailureCategory,
     QAEvaluation,
-    VulnerabilityIssue,
+    QAFailureEvidence,
     VulnerabilityGroup,
+    VulnerabilityIssue,
 )
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
@@ -86,14 +87,16 @@ _TEST_FAILURE_CONTEXT_LINES = 12
 _TEST_FAILURE_EXCERPT_CHARS = 500
 
 # Exclusion patterns for workspace diff
-_DIFF_EXCLUDE_DIRS = frozenset({
-    "node_modules",
-    ".git",
-    "dependency-check-data",
-    "coverage",
-    ".nyc_output",
-    ".cache",
-})
+_DIFF_EXCLUDE_DIRS = frozenset(
+    {
+        "node_modules",
+        ".git",
+        "dependency-check-data",
+        "coverage",
+        ".nyc_output",
+        ".cache",
+    }
+)
 _DIFF_EXCLUDE_SUFFIXES = frozenset({".map", ".lock"})
 _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
@@ -119,7 +122,7 @@ _STACK_NOISE_RE = re.compile(r"^\s*(at\s+.+|\^\s*|[-]{3,}|\s*operator:\s+.+)$")
 # ---------------------------------------------------------------------------
 
 
-def _read_report_from_workspace(sandbox: DockerSandbox) -> Optional[str]:
+def _read_report_from_workspace(sandbox: DockerSandbox) -> str | None:
     """Read the ODC JSON report from the sandbox workspace."""
     try:
         return sandbox.read_file(_ODC_REPORT_NAME)
@@ -127,11 +130,12 @@ def _read_report_from_workspace(sandbox: DockerSandbox) -> Optional[str]:
         logger.warning("qa_critic: failed to read ODC report from workspace â€” %s", exc)
         return None
 
+
 def _persist_workspace_report_to_host(
     sandbox: DockerSandbox,
     workspace_name: str,
     host_path: Path,
-) -> Optional[Path]:
+) -> Path | None:
     """Copy a Dependency-Check report from the workspace volume onto the host."""
     try:
         content = sandbox.read_file(workspace_name)
@@ -163,13 +167,13 @@ def _next_html_report_host_path() -> Path:
     return _ODC_DEBUG_DIR / f"dependency-check-report-{timestamp_ms}.html"
 
 
-def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
+def _parse_report_identifiers(report_text: str) -> set[str] | None:
     """Parse CVE/GHSA identifiers from the ODC JSON report text."""
     issues = _parse_report_issues(report_text)
     if issues is None:
         return None
 
-    identifiers: Set[str] = set()
+    identifiers: set[str] = set()
     for issue in issues:
         if issue.cve_id:
             identifiers.add(issue.cve_id.upper().strip())
@@ -178,7 +182,7 @@ def _parse_report_identifiers(report_text: str) -> Optional[Set[str]]:
     return identifiers
 
 
-def _parse_report_issues(report_text: str) -> Optional[List[VulnerabilityIssue]]:
+def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
     """Parse the complete typed vulnerability snapshot from an ODC report."""
     try:
         report = json.loads(report_text)
@@ -199,7 +203,7 @@ def _parse_report_issues(report_text: str) -> Optional[List[VulnerabilityIssue]]
         return None
 
 
-def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
+def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
     """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
     cmd = [
         "docker",
@@ -243,7 +247,7 @@ def _run_odc(workspace_volume: str) -> "subprocess.CompletedProcess[str]":
 # ---------------------------------------------------------------------------
 
 
-def _run_install(sandbox: DockerSandbox) -> Tuple[bool, str]:
+def _run_install(sandbox: DockerSandbox) -> tuple[bool, str]:
     """
     Run ``npm install --package-lock=true`` inside the workspace.
 
@@ -280,12 +284,12 @@ class _SecurityScanResult:
 
     ok: bool
     summary: str
-    remaining_identifiers: Set[str]
-    found_identifiers: Set[str]
-    new_identifiers: Set[str]
-    found_issues: List[VulnerabilityIssue] = field(default_factory=list)
+    remaining_identifiers: set[str]
+    found_identifiers: set[str]
+    new_identifiers: set[str]
+    found_issues: list[VulnerabilityIssue] = field(default_factory=list)
 
-    def _legacy_projection(self) -> Tuple[bool, str, Set[str]]:
+    def _legacy_projection(self) -> tuple[bool, str, set[str]]:
         return self.ok, self.summary, self.remaining_identifiers
 
     def __iter__(self):
@@ -312,9 +316,9 @@ class _SecurityScanResult:
 def _run_security_scan(
     sandbox: DockerSandbox,
     workspace_volume: str,
-    target_identifiers: Set[str],
-    baseline_identifiers: Optional[Set[str]] = None,
-) -> "_SecurityScanResult":
+    target_identifiers: set[str],
+    baseline_identifiers: set[str] | None = None,
+) -> _SecurityScanResult:
     """
     Run OWASP Dependency-Check and classify the complete identifier snapshot.
 
@@ -329,7 +333,9 @@ def _run_security_scan(
     """
     baseline = {
         identifier.upper().strip()
-        for identifier in (baseline_identifiers if baseline_identifiers is not None else target_identifiers)
+        for identifier in (
+            baseline_identifiers if baseline_identifiers is not None else target_identifiers
+        )
         if identifier and identifier.strip()
     }
 
@@ -367,12 +373,8 @@ def _run_security_scan(
             report_location_note += f"\nJSON report saved to: {saved_json_report}"
 
     report_text = _read_report_from_workspace(sandbox)
-    found_identifiers = (
-        _parse_report_identifiers(report_text) if report_text is not None else None
-    )
-    found_issues = (
-        _parse_report_issues(report_text) if report_text is not None else None
-    )
+    found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
+    found_issues = _parse_report_issues(report_text) if report_text is not None else None
     # Legacy direct callers/tests may replace the identifier-only parser. In
     # that compatibility mode there is no typed issue snapshot to propagate,
     # but the identifier scan can still be evaluated normally.
@@ -401,9 +403,7 @@ def _run_security_scan(
     found_identifiers = {
         identifier.upper().strip() for identifier in found_identifiers if identifier
     }
-    remaining = {
-        ident.upper().strip() for ident in target_identifiers if ident
-    }
+    remaining = {ident.upper().strip() for ident in target_identifiers if ident}
     remaining &= found_identifiers
     new_identifiers = found_identifiers - baseline
 
@@ -414,10 +414,7 @@ def _run_security_scan(
             f"Remaining identifiers: {remaining_text}"
         )
         if new_identifiers:
-            summary += (
-                " Newly introduced identifiers: "
-                f"{', '.join(sorted(new_identifiers))}."
-            )
+            summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
         summary += report_location_note
         return _SecurityScanResult(
             False,
@@ -430,10 +427,7 @@ def _run_security_scan(
 
     summary = "Dependency-Check found no remaining target vulnerability identifiers."
     if new_identifiers:
-        summary += (
-            " Newly introduced identifiers: "
-            f"{', '.join(sorted(new_identifiers))}."
-        )
+        summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
     summary += report_location_note
     return _SecurityScanResult(
         True,
@@ -493,8 +487,8 @@ class _NormalizedSuiteResult:
     runner: str
     command: str
     exit_code: int
-    failed_tests: List[_NormalizedTestFailure] = field(default_factory=list)
-    diagnostics: List[_NormalizedTestDiagnostic] = field(default_factory=list)
+    failed_tests: list[_NormalizedTestFailure] = field(default_factory=list)
+    diagnostics: list[_NormalizedTestDiagnostic] = field(default_factory=list)
     fallback_summary: str = ""
 
 
@@ -503,7 +497,7 @@ def _strip_ansi(value: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", value or "")
 
 
-def _normalize_log_lines(text: str) -> List[str]:
+def _normalize_log_lines(text: str) -> list[str]:
     """Normalize raw log text into plain lines for deterministic parsing."""
     normalized = _strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n")
     return normalized.splitlines()
@@ -544,12 +538,12 @@ def _score_failure_lines(title: str, excerpt: str, source: str) -> int:
 
 
 def _capture_failure_excerpt(
-    lines: List[str],
+    lines: list[str],
     start_index: int,
     title_line: str,
-) -> Tuple[str, int]:
+) -> tuple[str, int]:
     """Capture a bounded high-signal excerpt starting at one failure marker."""
-    captured: List[str] = []
+    captured: list[str] = []
     end_index = start_index
     for index in range(start_index, min(len(lines), start_index + _TEST_FAILURE_CONTEXT_LINES)):
         line = lines[index].rstrip()
@@ -570,17 +564,17 @@ def _capture_failure_excerpt(
     return excerpt, end_index
 
 
-def _extract_failure_blocks(text: str, source: str = "stdout") -> List[_TestFailureBlock]:
+def _extract_failure_blocks(text: str, source: str = "stdout") -> list[_TestFailureBlock]:
     """Extract bounded failure blocks from raw test output using grep-like regex scanning."""
     lines = _normalize_log_lines(text)
-    blocks: List[_TestFailureBlock] = []
+    blocks: list[_TestFailureBlock] = []
     index = 0
-    pending_subtest: Optional[str] = None
+    pending_subtest: str | None = None
 
     while index < len(lines):
         line = lines[index]
         stripped = line.strip()
-        title: Optional[str] = None
+        title: str | None = None
 
         if not stripped:
             index += 1
@@ -637,11 +631,11 @@ def _extract_failure_blocks(text: str, source: str = "stdout") -> List[_TestFail
     return blocks
 
 
-def _dedupe_failure_blocks(blocks: List[_TestFailureBlock]) -> List[_TestFailureBlock]:
+def _dedupe_failure_blocks(blocks: list[_TestFailureBlock]) -> list[_TestFailureBlock]:
     """Drop overlapping or repeated failure blocks while keeping the highest-signal copy."""
-    deduped: List[_TestFailureBlock] = []
-    seen_signatures: Set[Tuple[str, str]] = set()
-    occupied_ranges: List[Tuple[int, int, str]] = []
+    deduped: list[_TestFailureBlock] = []
+    seen_signatures: set[tuple[str, str]] = set()
+    occupied_ranges: list[tuple[int, int, str]] = []
 
     for block in sorted(blocks, key=lambda item: (-item.score, item.start_line)):
         signature = (
@@ -675,7 +669,7 @@ def _fallback_raw_tail(exit_code: int, stdout: str, stderr: str) -> str:
     )
 
 
-def _format_failure_summary(exit_code: int, blocks: List[_TestFailureBlock]) -> str:
+def _format_failure_summary(exit_code: int, blocks: list[_TestFailureBlock]) -> str:
     """Format extracted test failures into a compact LLM-facing summary."""
     visible_blocks = blocks[:_TEST_FAILURE_MAX_ITEMS]
     lines = [
@@ -696,9 +690,7 @@ def _format_failure_summary(exit_code: int, blocks: List[_TestFailureBlock]) -> 
             lines.append(excerpt_body)
         lines.append("")
     if len(blocks) > len(visible_blocks):
-        lines.append(
-            f"... and {len(blocks) - len(visible_blocks)} more failures omitted"
-        )
+        lines.append(f"... and {len(blocks) - len(visible_blocks)} more failures omitted")
 
     summary = "\n".join(lines).strip()
     if len(summary) > _LOG_QUERY_MAX_CHARS:
@@ -719,7 +711,357 @@ def _summarize_failed_test_output(exit_code: int, stdout: str, stderr: str) -> s
     return _format_failure_summary(exit_code, blocks)
 
 
-def _workspace_json_file(sandbox: DockerSandbox, path: str) -> Optional[Dict[str, Any]]:
+_QA_ERROR_MARKER = re.compile(
+    r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
+    re.IGNORECASE,
+)
+
+
+def extract_qa_failure_evidence(
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    attempt_id: str = "",
+    task_revision: int = 0,
+) -> QAFailureEvidence:
+    """Extract structured, verbatim QAFailureEvidence from test output."""
+    exact_diagnostics: list[str] = []
+    failed_tests: list[str] = []
+    source_locations: list[str] = []
+    affected_files: list[str] = []
+
+    blocks = _dedupe_failure_blocks(
+        [
+            *_extract_failure_blocks(stdout, source="stdout"),
+            *_extract_failure_blocks(stderr, source="stderr"),
+        ]
+    )
+
+    for block in blocks:
+        title_clean = block.title.rstrip(":").strip() if block.title else ""
+        if title_clean and title_clean not in failed_tests:
+            failed_tests.append(title_clean)
+        if block.excerpt and block.excerpt not in exact_diagnostics:
+            exact_diagnostics.append(block.excerpt)
+
+    full_text = f"{stdout}\n{stderr}"
+    lines = full_text.splitlines()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if (
+            "is not a function" in stripped
+            or _QA_ERROR_MARKER.search(stripped)
+            or re.search(r"\b[A-Za-z_][\w.]*(?:Error|Exception)\s*:", stripped)
+        ):
+            snippet = stripped[:500] + "... (truncated)" if len(stripped) > 500 else stripped
+            if snippet not in exact_diagnostics:
+                exact_diagnostics.append(snippet)
+
+        matches = re.finditer(
+            r"(?:at\s+.*?\()?([a-zA-Z0-9_\-\./\\]+\.(?:js|ts|jsx|tsx|mjs|cjs)):(\d+)(?::(\d+))?\)?",
+            line,
+        )
+        for match in matches:
+            filepath = match.group(1).replace("\\", "/")
+            if "node_modules" in filepath:
+                continue
+            line_no = match.group(2)
+            col_no = match.group(3)
+            loc = f"{filepath}:{line_no}:{col_no}" if col_no else f"{filepath}:{line_no}"
+            if loc not in source_locations:
+                source_locations.append(loc)
+            if filepath not in affected_files:
+                affected_files.append(filepath)
+
+    raw_excerpt = _fallback_raw_tail(exit_code, stdout, stderr)
+
+    return QAFailureEvidence(
+        exact_diagnostics=exact_diagnostics[:15],
+        failed_tests=failed_tests[:10],
+        source_locations=source_locations[:10],
+        affected_files=affected_files[:10],
+        raw_excerpt=raw_excerpt[:2000],
+        attempt_id=attempt_id,
+        task_revision=task_revision,
+    )
+
+
+def detect_test_runner(sandbox: DockerSandbox, test_file: str | None = None) -> str:
+    """Detect the source test runner for a targeted test file."""
+    return _detect_targeted_test_context(sandbox, test_file)[0]
+
+
+def _normalise_test_path(path: str) -> str:
+    """Normalize one repository-relative test path for runner selection."""
+    normalized = (path or "").replace("\\", "/").strip().lstrip("/")
+    if normalized.startswith("/workspace/"):
+        normalized = normalized[len("/workspace/") :]
+    if normalized.startswith("build/"):
+        normalized = normalized[len("build/") :]
+    return normalized
+
+
+def _find_test_package_context(
+    sandbox: DockerSandbox,
+    test_file: str,
+) -> tuple[str, dict[str, Any]]:
+    """Find the nearest package.json that owns a targeted test file."""
+    normalized = _normalise_test_path(test_file)
+    parts = normalized.split("/")
+    for index in range(max(len(parts) - 1, 0), -1, -1):
+        cwd = "/".join(parts[:index])
+        package_json = _read_package_json_for_cwd(sandbox, cwd)
+        if package_json is not None:
+            return cwd, package_json
+    return "", _workspace_json_file(sandbox, "package.json") or {}
+
+
+def _target_is_under_cwd(test_file: str, cwd: str) -> bool:
+    """Return whether a normalized test path belongs to a package directory."""
+    normalized = _normalise_test_path(test_file)
+    normalized_cwd = cwd.strip().strip("/\\")
+    return (
+        not normalized_cwd
+        or normalized == normalized_cwd
+        or normalized.startswith(normalized_cwd + "/")
+    )
+
+
+def _relative_test_path(test_file: str, cwd: str) -> str:
+    """Return a test path relative to its owning package directory."""
+    normalized = _normalise_test_path(test_file)
+    normalized_cwd = cwd.strip().strip("/\\")
+    if normalized_cwd and normalized.startswith(normalized_cwd + "/"):
+        return normalized[len(normalized_cwd) + 1 :]
+    return normalized
+
+
+def _command_targets_test_file(command: str, test_file: str, cwd: str) -> bool:
+    """Check whether a leaf test command covers a targeted path."""
+    if not _target_is_under_cwd(test_file, cwd):
+        return False
+
+    relative_path = _relative_test_path(test_file, cwd)
+    command_text = command.replace('"', "").replace("'", "")
+    for token in re.findall(r"[^\s]+", command_text):
+        token = token.strip(";,()")
+        if not token or token.startswith("-"):
+            continue
+        if "*" in token or "?" in token:
+            prefix = re.split(r"[*?]", token, maxsplit=1)[0].rstrip("/")
+            if prefix and relative_path.startswith(prefix):
+                return True
+        elif token == relative_path or token == test_file:
+            return True
+
+    # Commands such as ``ng test`` and ``vitest`` discover files through the
+    # package configuration instead of spelling out a glob.
+    words = command_text.split()
+    return words[:2] == ["ng", "test"] or bool(words and words[0] in {"vitest", "jest"})
+
+
+def _resolve_targeted_test_command(
+    sandbox: DockerSandbox,
+    command: str,
+    test_file: str,
+    *,
+    cwd: str,
+    package_json: dict[str, Any],
+    seen: set[tuple[str, str]] | None = None,
+) -> tuple[str, str, str] | None:
+    """Resolve a matching npm test command to ``(runner, cwd, leaf command)``.
+
+    Returning the leaf command is important for targeted execution. Appending a
+    file to ``npm run test:api -- file`` does not remove a glob already present
+    in ``test:api``; it therefore still executes the entire suite. The caller
+    replaces the leaf command's test glob with the requested source file.
+    """
+    seen = seen or set()
+    command = (command or "").strip()
+    key = (cwd, command)
+    if not command or key in seen:
+        return None
+    seen.add(key)
+
+    cd_match = re.match(r"^\s*cd\s+(?P<child>[^\s&]+)\s+&&\s+(?P<rest>.+)$", command)
+    if cd_match:
+        child = cd_match.group("child").strip("\"'")
+        next_cwd = f"{cwd.rstrip('/')}/{child}" if cwd else child
+        child_package = _read_package_json_for_cwd(sandbox, next_cwd) or {}
+        if not _target_is_under_cwd(test_file, next_cwd):
+            return None
+        return _resolve_targeted_test_command(
+            sandbox,
+            cd_match.group("rest"),
+            test_file,
+            cwd=next_cwd,
+            package_json=child_package,
+            seen=seen,
+        )
+
+    script_name = _script_name_from_npm_run(command)
+    scripts = package_json.get("scripts") if isinstance(package_json, dict) else None
+    if script_name and isinstance(scripts, dict) and isinstance(scripts.get(script_name), str):
+        resolved = _resolve_targeted_test_command(
+            sandbox,
+            scripts[script_name],
+            test_file,
+            cwd=cwd,
+            package_json=package_json,
+            seen=seen,
+        )
+        if resolved is not None:
+            runner, resolved_cwd, leaf_command = resolved
+            return runner, resolved_cwd, leaf_command
+        return None
+
+    if not _command_targets_test_file(command, test_file, cwd):
+        return None
+    runner = _classify_test_command(
+        sandbox,
+        command,
+        cwd=cwd,
+        package_json=package_json,
+        seen=set(),
+    )
+    if runner == "npm_text_fallback":
+        return None
+    return runner, cwd, command
+
+
+def _detect_targeted_test_context(
+    sandbox: DockerSandbox,
+    test_file: str | None = None,
+) -> tuple[str, str, str]:
+    """Return ``(runner, package_cwd, npm_invocation)`` for a targeted test."""
+    normalized = _normalise_test_path(test_file or "")
+    cwd, package_json = (
+        _find_test_package_context(sandbox, normalized)
+        if normalized
+        else (
+            "",
+            _workspace_json_file(sandbox, "package.json") or {},
+        )
+    )
+    scripts = package_json.get("scripts") if isinstance(package_json, dict) else None
+    test_script = scripts.get("test") if isinstance(scripts, dict) else None
+
+    if normalized and isinstance(test_script, str) and test_script.strip():
+        for command in _split_script_chain(test_script):
+            resolved = _resolve_targeted_test_command(
+                sandbox,
+                command,
+                normalized,
+                cwd=cwd,
+                package_json=package_json,
+            )
+            if resolved is not None:
+                return resolved
+
+    if isinstance(test_script, str) and test_script.strip():
+        for command in _split_script_chain(test_script):
+            runner = _classify_test_command(sandbox, command, cwd=cwd, package_json=package_json)
+            if runner != "npm_text_fallback":
+                return runner, cwd, "npm test"
+
+    deps: dict[str, Any] = {}
+    if isinstance(package_json, dict):
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            if isinstance(package_json.get(key), dict):
+                deps.update(package_json[key])
+
+    for dependency, runner in (("mocha", "mocha"), ("jest", "jest"), ("vitest", "vitest")):
+        if dependency in deps:
+            return runner, cwd, "npm test"
+    return "npm_text_fallback", cwd, "npm test"
+
+
+def build_targeted_test_command(
+    runner: str,
+    test_file: str,
+    test_name: str | None = None,
+    npm_invocation: str = "npm test",
+) -> str | None:
+    """Construct a source-runner command that executes only ``test_file``.
+
+    ``npm_invocation`` is the resolved leaf command from ``package.json``. A
+    direct command is used so an existing wildcard cannot continue to select
+    the whole suite. The function retains the old ``npm test`` append behavior
+    for callers that pass a generic npm invocation.
+    """
+    safe_file = shlex.quote(test_file)
+    safe_name = shlex.quote(test_name) if test_name else None
+    invocation = npm_invocation.strip() or "npm test"
+
+    if invocation in {"npm test", "npm run test"} or invocation.startswith("npm run "):
+        if runner == "mocha":
+            args = safe_file + (f" --grep {safe_name}" if safe_name else "")
+            return f"{invocation} -- {args}"
+        if runner == "jest":
+            args = safe_file + (f" -t {safe_name}" if safe_name else "")
+            return f"{invocation} -- {args}"
+        if runner == "vitest":
+            args = f"--run {safe_file}" + (f" -t {safe_name}" if safe_name else "")
+            return f"{invocation} -- {args}"
+        if runner == "angular_vitest":
+            return f"{invocation} -- --include {safe_file}"
+        if runner == "node_test":
+            args = safe_file + (f" --test-name-pattern {safe_name}" if safe_name else "")
+            return f"{invocation} -- {args}"
+        return None
+
+    try:
+        tokens = shlex.split(invocation)
+    except ValueError:
+        tokens = invocation.split()
+    if not tokens:
+        return None
+
+    if runner == "angular_vitest":
+        tokens.extend(["--include", test_file])
+    else:
+        target_replaced = False
+        skip_next = False
+        rebuilt: list[str] = []
+        for token in tokens:
+            if skip_next:
+                rebuilt.append(token)
+                skip_next = False
+                continue
+            if token in {"--import", "-r", "--require"}:
+                rebuilt.append(token)
+                skip_next = True
+                continue
+            normalized_token = token.replace("\\", "/")
+            is_test_path = ("*" in normalized_token or "?" in normalized_token) and (
+                "test" in normalized_token or "spec" in normalized_token
+            )
+            if is_test_path:
+                rebuilt.append(test_file)
+                target_replaced = True
+            else:
+                rebuilt.append(token)
+        tokens = rebuilt
+        if not target_replaced:
+            tokens.append(test_file)
+
+        if runner == "vitest" and "--run" not in tokens:
+            tokens.insert(1 if tokens else 0, "--run")
+        if test_name:
+            if runner == "mocha":
+                tokens.extend(["--grep", test_name])
+            elif runner == "jest" or runner == "vitest":
+                tokens.extend(["-t", test_name])
+            elif runner == "node_test":
+                tokens.extend(["--test-name-pattern", test_name])
+
+    return shlex.join(tokens)
+
+
+def _workspace_json_file(sandbox: DockerSandbox, path: str) -> dict[str, Any] | None:
     """Read one JSON file from the sandbox workspace, returning ``None`` on misses."""
     try:
         content = sandbox.read_file(path)
@@ -734,12 +1076,12 @@ def _workspace_json_file(sandbox: DockerSandbox, path: str) -> Optional[Dict[str
     return parsed if isinstance(parsed, dict) else None
 
 
-def _split_script_chain(script: str) -> List[str]:
+def _split_script_chain(script: str) -> list[str]:
     """Split simple npm ``&&`` chains while preserving each child command."""
     return [part.strip() for part in (script or "").split("&&") if part.strip()]
 
 
-def _script_name_from_npm_run(command: str) -> Optional[str]:
+def _script_name_from_npm_run(command: str) -> str | None:
     """Return the script name from simple ``npm run <name>`` commands."""
     match = re.match(
         r"^\s*npm\s+(?:run|run-script)\s+(?:--silent\s+)?(?P<name>[^\s]+)",
@@ -748,7 +1090,7 @@ def _script_name_from_npm_run(command: str) -> Optional[str]:
     return match.group("name") if match else None
 
 
-def _read_package_json_for_cwd(sandbox: DockerSandbox, cwd: str) -> Optional[Dict[str, Any]]:
+def _read_package_json_for_cwd(sandbox: DockerSandbox, cwd: str) -> dict[str, Any] | None:
     """Read package.json for a detected child-suite working directory."""
     normalized_cwd = cwd.strip().strip("/\\")
     package_path = "package.json" if not normalized_cwd else f"{normalized_cwd}/package.json"
@@ -777,8 +1119,8 @@ def _classify_test_command(
     command: str,
     *,
     cwd: str = "",
-    package_json: Optional[Dict[str, Any]] = None,
-    seen: Optional[Set[Tuple[str, str]]] = None,
+    package_json: dict[str, Any] | None = None,
+    seen: set[tuple[str, str]] | None = None,
 ) -> str:
     """Classify a test command into a supported structured strategy."""
     seen = seen or set()
@@ -810,7 +1152,9 @@ def _classify_test_command(
     if re.search(r"(^|\s)vitest(\s|$)", lowered):
         return "vitest"
     if re.search(r"(^|\s)ng\s+test(\s|$)", lowered):
-        return "angular_vitest" if _angular_project_uses_vitest(sandbox, cwd) else "npm_text_fallback"
+        return (
+            "angular_vitest" if _angular_project_uses_vitest(sandbox, cwd) else "npm_text_fallback"
+        )
 
     script_name = _script_name_from_npm_run(command)
     scripts = (package_json or {}).get("scripts") if isinstance(package_json, dict) else None
@@ -837,7 +1181,7 @@ def _suite_name_from_command(command: str) -> str:
     return command.split()[0] if command.split() else "npm test"
 
 
-def _detect_test_suite_plans(sandbox: DockerSandbox) -> Optional[List[_TestSuitePlan]]:
+def _detect_test_suite_plans(sandbox: DockerSandbox) -> list[_TestSuitePlan] | None:
     """Detect npm test child suites from package.json, expanding simple ``&&`` chains."""
     package_json = _workspace_json_file(sandbox, "package.json")
     scripts = package_json.get("scripts") if isinstance(package_json, dict) else None
@@ -849,7 +1193,7 @@ def _detect_test_suite_plans(sandbox: DockerSandbox) -> Optional[List[_TestSuite
     if not commands:
         return None
 
-    plans: List[_TestSuitePlan] = []
+    plans: list[_TestSuitePlan] = []
     for command in commands:
         runner = _classify_test_command(sandbox, command, package_json=package_json)
         plans.append(
@@ -883,7 +1227,9 @@ def _truncate_summary_text(value: str, limit: int = _TEST_FAILURE_EXCERPT_CHARS)
     return value
 
 
-def _diagnostic_from_lines(lines: List[str], suite: str, kind: str = "diagnostic") -> _NormalizedTestDiagnostic:
+def _diagnostic_from_lines(
+    lines: list[str], suite: str, kind: str = "diagnostic"
+) -> _NormalizedTestDiagnostic:
     """Build one bounded diagnostic message from raw runner lines."""
     return _NormalizedTestDiagnostic(
         message=_truncate_summary_text("\n".join(line.rstrip() for line in lines if line.strip())),
@@ -897,13 +1243,13 @@ def _normalize_node_tap_output(
     stderr: str,
     *,
     suite_name: str = "node_test",
-) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+) -> tuple[list[_NormalizedTestFailure], list[_NormalizedTestDiagnostic]]:
     """Normalize Node test TAP output without counting parent suites as leaf failures."""
     lines = _normalize_log_lines(f"{stdout or ''}\n{stderr or ''}")
-    failures: List[_NormalizedTestFailure] = []
-    diagnostics: List[_NormalizedTestDiagnostic] = []
-    pending_subtest: Optional[str] = None
-    seen_diagnostics: Set[str] = set()
+    failures: list[_NormalizedTestFailure] = []
+    diagnostics: list[_NormalizedTestDiagnostic] = []
+    pending_subtest: str | None = None
+    seen_diagnostics: set[str] = set()
     index = 0
 
     while index < len(lines):
@@ -917,13 +1263,18 @@ def _normalize_node_tap_output(
         tap_match = _TAP_FAILURE_RE.match(line)
         if not tap_match:
             stripped = line.strip()
-            if stripped.startswith("# Error:") or "generated asynchronous activity after the test ended" in stripped:
+            if (
+                stripped.startswith("# Error:")
+                or "generated asynchronous activity after the test ended" in stripped
+            ):
                 diagnostic_lines = [stripped]
                 next_index = index + 1
                 while next_index < len(lines) and lines[next_index].strip().startswith("#"):
                     diagnostic_lines.append(lines[next_index].strip())
                     next_index += 1
-                diagnostic = _diagnostic_from_lines(diagnostic_lines, suite_name, kind="node_runner")
+                diagnostic = _diagnostic_from_lines(
+                    diagnostic_lines, suite_name, kind="node_runner"
+                )
                 if diagnostic.message and diagnostic.message not in seen_diagnostics:
                     diagnostics.append(diagnostic)
                     seen_diagnostics.add(diagnostic.message)
@@ -974,7 +1325,7 @@ def _normalize_node_tap_output(
     return failures, diagnostics
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Extract a JSON object from reporter output that may contain extra log lines."""
     stripped = (text or "").strip()
     if not stripped:
@@ -1001,12 +1352,12 @@ def _normalize_mocha_json_output(
     stderr: str,
     *,
     suite_name: str = "mocha",
-) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+) -> tuple[list[_NormalizedTestFailure], list[_NormalizedTestDiagnostic]]:
     """Normalize Mocha JSON reporter output."""
     report = _extract_json_object(stdout) or _extract_json_object(stderr)
     if not report:
         return [], []
-    failures: List[_NormalizedTestFailure] = []
+    failures: list[_NormalizedTestFailure] = []
     for item in report.get("failures") or []:
         if not isinstance(item, dict):
             continue
@@ -1023,9 +1374,9 @@ def _normalize_mocha_json_output(
     return failures, []
 
 
-def _iter_vitest_failures(node: Any) -> List[Dict[str, Any]]:
+def _iter_vitest_failures(node: Any) -> list[dict[str, Any]]:
     """Collect failed assertion nodes from Vitest JSON reporter-like structures."""
-    found: List[Dict[str, Any]] = []
+    found: list[dict[str, Any]] = []
     if isinstance(node, dict):
         status = str(node.get("status") or "").lower()
         if status in {"failed", "fail"} and (node.get("name") or node.get("fullName")):
@@ -1043,12 +1394,12 @@ def _normalize_vitest_json_output(
     stderr: str,
     *,
     suite_name: str = "vitest",
-) -> Tuple[List[_NormalizedTestFailure], List[_NormalizedTestDiagnostic]]:
+) -> tuple[list[_NormalizedTestFailure], list[_NormalizedTestDiagnostic]]:
     """Normalize Vitest JSON reporter output when available."""
     report = _extract_json_object(stdout) or _extract_json_object(stderr)
     if not report:
         return [], []
-    failures: List[_NormalizedTestFailure] = []
+    failures: list[_NormalizedTestFailure] = []
     for item in _iter_vitest_failures(report):
         errors = item.get("errors") if isinstance(item.get("errors"), list) else []
         first_error = errors[0] if errors and isinstance(errors[0], dict) else {}
@@ -1073,8 +1424,8 @@ def _normalize_suite_result(
     stdout = getattr(result, "stdout", "") or ""
     stderr = getattr(result, "stderr", "") or ""
     exit_code = int(getattr(result, "exit_code", 1))
-    failures: List[_NormalizedTestFailure] = []
-    diagnostics: List[_NormalizedTestDiagnostic] = []
+    failures: list[_NormalizedTestFailure] = []
+    diagnostics: list[_NormalizedTestDiagnostic] = []
 
     if plan.runner == "node_test":
         failures, diagnostics = _normalize_node_tap_output(stdout, stderr, suite_name=plan.name)
@@ -1098,7 +1449,7 @@ def _normalize_suite_result(
     )
 
 
-def _format_normalized_test_summary(suites: List[_NormalizedSuiteResult]) -> str:
+def _format_normalized_test_summary(suites: list[_NormalizedSuiteResult]) -> str:
     """Format normalized suite results into the bounded query_qa_logs text contract."""
     failed_suites = [suite for suite in suites if suite.exit_code != 0]
     exit_code = failed_suites[-1].exit_code if failed_suites else 0
@@ -1113,9 +1464,7 @@ def _format_normalized_test_summary(suites: List[_NormalizedSuiteResult]) -> str
     ]
     for suite in suites:
         status = "passed" if suite.exit_code == 0 else "failed"
-        lines.append(
-            f"- {suite.name}: {status} ({suite.runner}, exit {suite.exit_code})"
-        )
+        lines.append(f"- {suite.name}: {status} ({suite.runner}, exit {suite.exit_code})")
         lines.append(f"  command: {suite.command}")
 
     if failed_tests:
@@ -1123,9 +1472,7 @@ def _format_normalized_test_summary(suites: List[_NormalizedSuiteResult]) -> str
         for index, failure in enumerate(failed_tests[:_TEST_FAILURE_MAX_ITEMS], start=1):
             suffix = f" [{failure.suite}]" if failure.suite else ""
             lines.append(f"{index}. {failure.name}{suffix}")
-            details = "\n".join(
-                part for part in [failure.failure_type, failure.message] if part
-            )
+            details = "\n".join(part for part in [failure.failure_type, failure.message] if part)
             if details:
                 lines.append(details)
             lines.append("")
@@ -1158,10 +1505,10 @@ def _format_normalized_test_summary(suites: List[_NormalizedSuiteResult]) -> str
 
 def _run_detected_test_suites(
     sandbox: DockerSandbox,
-    plans: List[_TestSuitePlan],
-) -> Tuple[bool, str]:
+    plans: list[_TestSuitePlan],
+) -> tuple[bool, str]:
     """Run detected child suites sequentially, preserving npm ``&&`` short-circuiting."""
-    suite_results: List[_NormalizedSuiteResult] = []
+    suite_results: list[_NormalizedSuiteResult] = []
     for plan in plans:
         command = _structured_command_for_plan(plan)
         result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
@@ -1172,7 +1519,7 @@ def _run_detected_test_suites(
     return True, "npm test passed."
 
 
-def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
+def _run_unit_tests(sandbox: DockerSandbox) -> tuple[bool, str]:
     """
     Run workspace unit tests, preferring structured child-suite summaries.
 
@@ -1198,8 +1545,8 @@ def _run_unit_tests(sandbox: DockerSandbox) -> Tuple[bool, str]:
 def _generate_workspace_diff(
     host_repo_root: str,
     sandbox: DockerSandbox,
-    candidate_changed_files: List[str],
-) -> Tuple[str, List[str]]:
+    candidate_changed_files: list[str],
+) -> tuple[str, list[str]]:
     """
     Generate a unified diff by comparing host baseline to the current sandbox workspace
     for only the specified candidate_changed_files.
@@ -1217,12 +1564,12 @@ def _generate_workspace_diff(
         return "(no changed files were provided; diff is empty)", []
 
     host_root = Path(host_repo_root)
-    changed_files: List[str] = []
-    diff_parts: List[str] = []
+    changed_files: list[str] = []
+    diff_parts: list[str] = []
 
     # Deduplicate files while preserving order.
-    seen: Set[str] = set()
-    unique_candidates: List[str] = []
+    seen: set[str] = set()
+    unique_candidates: list[str] = []
     for f in candidate_changed_files:
         if f not in seen:
             seen.add(f)
@@ -1263,13 +1610,16 @@ def _generate_workspace_diff(
             # File modified.
             changed_files.append(rel_path)
             import difflib
-            diff_lines = list(difflib.unified_diff(
-                host_content.splitlines(keepends=True),
-                workspace_content.splitlines(keepends=True),
-                fromfile=f"a/{rel_path}",
-                tofile=f"b/{rel_path}",
-                lineterm="",
-            ))
+
+            diff_lines = list(
+                difflib.unified_diff(
+                    host_content.splitlines(keepends=True),
+                    workspace_content.splitlines(keepends=True),
+                    fromfile=f"a/{rel_path}",
+                    tofile=f"b/{rel_path}",
+                    lineterm="",
+                )
+            )
             diff_parts.append("".join(diff_lines))
 
     full_diff = "\n".join(diff_parts)
@@ -1290,9 +1640,9 @@ def _generate_workspace_diff(
 # ---------------------------------------------------------------------------
 
 
-def _collect_target_identifiers(groups: List[VulnerabilityGroup]) -> Set[str]:
+def _collect_target_identifiers(groups: list[VulnerabilityGroup]) -> set[str]:
     """Collect all CVE/GHSA identifiers from the valid vulnerability groups."""
-    identifiers: Set[str] = set()
+    identifiers: set[str] = set()
     for group in groups:
         for cve in group.cve_ids or []:
             if cve:
@@ -1311,8 +1661,8 @@ def _collect_target_identifiers(groups: List[VulnerabilityGroup]) -> Set[str]:
 
 def _collect_baseline_identifiers(
     state: OrchestratorState,
-    groups: List[VulnerabilityGroup],
-) -> Set[str]:
+    groups: list[VulnerabilityGroup],
+) -> set[str]:
     """Resolve the immutable pre-remediation identifier baseline.
 
     ``initial_orchestrator_state`` normally materializes this field before
@@ -1329,7 +1679,7 @@ def _collect_baseline_identifiers(
 
     issues = state.get("issues")
     if issues is not None:
-        identifiers: Set[str] = set()
+        identifiers: set[str] = set()
         for issue in issues:
             if issue.cve_id:
                 identifiers.add(issue.cve_id.upper().strip())
@@ -1366,9 +1716,9 @@ def _validate_qa_path(file_path: str) -> str:
 class _QAExecutionResults:
     """Cache for global execution phase results."""
 
-    install: Optional[Tuple[bool, str]] = None          # (ok, summary)
-    scan: Optional[Any] = None                          # _SecurityScanResult or legacy tuple
-    tests: Optional[Tuple[bool, str]] = None            # (ok, summary)
+    install: tuple[bool, str] | None = None  # (ok, summary)
+    scan: Any | None = None  # _SecurityScanResult or legacy tuple
+    tests: tuple[bool, str] | None = None  # (ok, summary)
 
 
 def _scan_result_value(scan_result: Any, field: str, default: Any) -> Any:
@@ -1392,8 +1742,8 @@ def _scan_result_value(scan_result: Any, field: str, default: Any) -> Any:
 
 def _scan_state_projection(
     results: _QAExecutionResults,
-    baseline_identifiers: Set[str],
-) -> Dict[str, Any]:
+    baseline_identifiers: set[str],
+) -> dict[str, Any]:
     """Project the scan cache into serializable graph-state fields."""
     scan_result = results.scan
     if scan_result is None:
@@ -1406,16 +1756,10 @@ def _scan_state_projection(
         }
 
     found = set(_scan_result_value(scan_result, "found_identifiers", set()) or set())
-    new_identifiers = set(
-        _scan_result_value(scan_result, "new_identifiers", set()) or set()
-    )
-    found_issues = list(
-        _scan_result_value(scan_result, "found_issues", []) or []
-    )
+    new_identifiers = set(_scan_result_value(scan_result, "new_identifiers", set()) or set())
+    found_issues = list(_scan_result_value(scan_result, "found_issues", []) or [])
     scan_ok = bool(_scan_result_value(scan_result, "ok", False))
-    remaining = set(
-        _scan_result_value(scan_result, "remaining_identifiers", set()) or set()
-    )
+    remaining = set(_scan_result_value(scan_result, "remaining_identifiers", set()) or set())
     if isinstance(scan_result, _SecurityScanResult) and not scan_ok and not found and not remaining:
         status = "scan_failed"
     else:
@@ -1432,15 +1776,13 @@ def _scan_state_projection(
 
 def _augment_qa_report_with_scan_findings(
     report: str,
-    scan_projection: Dict[str, Any],
+    scan_projection: dict[str, Any],
 ) -> str:
     """Append deterministic new-finding evidence when the scan found any."""
     new_identifiers = scan_projection.get("new_vulnerability_identifiers", []) or []
     if not new_identifiers:
         return report
-    post_identifiers = (
-        scan_projection.get("post_remediation_scan_identifiers", []) or []
-    )
+    post_identifiers = scan_projection.get("post_remediation_scan_identifiers", []) or []
     section = (
         "## Global Newly Introduced Scanner Findings\n"
         f"- Status: {scan_projection.get('new_vulnerability_status', 'detected')}\n"
@@ -1463,7 +1805,7 @@ class GroupInvestigation:
     group_id: str
     investigation_text: str
     tool_transcript: str
-    errors: List[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1471,9 +1813,9 @@ class BatchInvestigationArtifact:
     """All Map phase outputs consumed by the Reduce phase."""
 
     results: _QAExecutionResults
-    investigations_by_group: Dict[str, GroupInvestigation]
-    holistic_report: str = ""   # filled after reduce phase
-    errors: List[str] = field(default_factory=list)
+    investigations_by_group: dict[str, GroupInvestigation]
+    holistic_report: str = ""  # filled after reduce phase
+    errors: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1509,9 +1851,9 @@ class ParsedInvestigationReport:
 
     raw_report: str
     shared_install_analysis: str
-    group_sections: Dict[str, GroupInvestigationSection]
-    errors: List[str]
-    warnings: List[str]
+    group_sections: dict[str, GroupInvestigationSection]
+    errors: list[str]
+    warnings: list[str]
 
 
 @dataclass
@@ -1522,13 +1864,13 @@ class GroupEvidencePacket:
     strategy: str
     fix_plan_status: str
     fix_plan_instruction: str
-    action_summaries: List[str]
+    action_summaries: list[str]
     shared_install_analysis: str
     install_ok: bool
     install_summary: str
     scan_ok: bool
     scan_summary: str
-    remaining_identifiers: List[str]
+    remaining_identifiers: list[str]
     tests_ok: bool
     tests_summary: str
     group_block_markdown: str
@@ -1543,7 +1885,7 @@ class InvestigationArtifact:
     parsed_report: ParsedInvestigationReport
     transcript: str
     results: _QAExecutionResults
-    errors: List[str]
+    errors: list[str]
 
 
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
@@ -1553,14 +1895,10 @@ _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 
 def _pipeline_complete(results: _QAExecutionResults) -> bool:
     """Return whether install, scan, and tests have all run at least once."""
-    return (
-        results.install is not None
-        and results.scan is not None
-        and results.tests is not None
-    )
+    return results.install is not None and results.scan is not None and results.tests is not None
 
 
-def _review_ready_error(results: _QAExecutionResults) -> Optional[str]:
+def _review_ready_error(results: _QAExecutionResults) -> str | None:
     """Return the standard review-tool order error, if any."""
     if _pipeline_complete(results):
         return None
@@ -1572,14 +1910,14 @@ def _review_ready_error(results: _QAExecutionResults) -> Optional[str]:
 
 def _resolve_action_summary_group_ids(
     summary: AgentActionSummary,
-    known_group_ids: Set[str],
-) -> List[str]:
+    known_group_ids: set[str],
+) -> list[str]:
     """Resolve which exact group_ids an AgentActionSummary applies to."""
     raw_task_id = (summary.task_id or "").strip()
     if not raw_task_id:
         return []
     if raw_task_id.startswith("batch:"):
-        payload = raw_task_id[len("batch:"):]
+        payload = raw_task_id[len("batch:") :]
         resolved = []
         for part in payload.split(","):
             candidate = part.strip()
@@ -1590,12 +1928,12 @@ def _resolve_action_summary_group_ids(
 
 
 def _relevant_action_summaries(
-    action_summaries: List[AgentActionSummary],
+    action_summaries: list[AgentActionSummary],
     group_id: str,
-    known_group_ids: Set[str],
-) -> List[AgentActionSummary]:
+    known_group_ids: set[str],
+) -> list[AgentActionSummary]:
     """Filter action summaries to those explicitly linked to one group."""
-    relevant: List[AgentActionSummary] = []
+    relevant: list[AgentActionSummary] = []
     for summary in action_summaries:
         if group_id in _resolve_action_summary_group_ids(summary, known_group_ids):
             relevant.append(summary)
@@ -1658,11 +1996,11 @@ def _trim_action_summary_text(summary_text: str, group: VulnerabilityGroup) -> s
     return "\n".join(trimmed_lines)
 
 
-def _parse_report_bullets(block_text: str) -> Dict[str, str]:
+def _parse_report_bullets(block_text: str) -> dict[str, str]:
     """Parse markdown '- Label: value' bullets, preserving wrapped lines."""
-    fields: Dict[str, str] = {}
-    current_label: Optional[str] = None
-    current_lines: List[str] = []
+    fields: dict[str, str] = {}
+    current_label: str | None = None
+    current_lines: list[str] = []
 
     def flush() -> None:
         """Commit the current markdown bullet to the parsed field mapping."""
@@ -1688,9 +2026,9 @@ def _parse_report_bullets(block_text: str) -> Dict[str, str]:
     return fields
 
 
-def _group_target_identifiers(group: VulnerabilityGroup) -> Set[str]:
+def _group_target_identifiers(group: VulnerabilityGroup) -> set[str]:
     """Collect normalized scanner identifiers relevant to one group."""
-    identifiers: Set[str] = set()
+    identifiers: set[str] = set()
     for cve in group.cve_ids or []:
         if cve:
             identifiers.add(cve.upper().strip())
@@ -1707,14 +2045,14 @@ def _group_target_identifiers(group: VulnerabilityGroup) -> Set[str]:
 
 def _group_remaining_identifiers(
     group: VulnerabilityGroup,
-    remaining_identifiers: Set[str],
-) -> List[str]:
+    remaining_identifiers: set[str],
+) -> list[str]:
     """Return the exact remaining scanner identifiers attributable to one group."""
     return sorted(_group_target_identifiers(group) & remaining_identifiers)
 
 
 def _group_scan_status(
-    scan_result: Optional[Tuple[bool, str, Set[str]]],
+    scan_result: tuple[bool, str, set[str]] | None,
     group: VulnerabilityGroup,
 ) -> str:
     """Classify the scanner outcome for one group from deterministic results."""
@@ -1732,18 +2070,19 @@ def _group_scan_status(
 
 
 def _build_fallback_investigation_report(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    candidate_changed_files: List[str],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    candidate_changed_files: list[str],
     results: _QAExecutionResults,
     reason: str,
 ) -> str:
     """Synthesize a minimal investigative report when the LLM output is malformed."""
     install_ok, install_summary = results.install or (
-        False, "run_dependency_install was not called."
+        False,
+        "run_dependency_install was not called.",
     )
     if results.scan is None:
-        scan_result: Optional[Tuple[bool, str, Set[str]]] = None
+        scan_result: tuple[bool, str, set[str]] | None = None
     else:
         scan_result = results.scan
     tests_ok, _ = results.tests or (False, "run_unit_tests was not called.")
@@ -1751,9 +2090,7 @@ def _build_fallback_investigation_report(
     post_scan_identifiers = sorted(
         _scan_result_value(scan_result, "found_identifiers", set()) or set()
     )
-    new_identifiers = sorted(
-        _scan_result_value(scan_result, "new_identifiers", set()) or set()
-    )
+    new_identifiers = sorted(_scan_result_value(scan_result, "new_identifiers", set()) or set())
 
     changed_files_text = ", ".join(candidate_changed_files) if candidate_changed_files else "none"
     blocks = [
@@ -1772,52 +2109,52 @@ def _build_fallback_investigation_report(
         strategy = group_strategies.get(group.group_id, "(unknown)")
         group_identifiers = sorted(_group_target_identifiers(group))
         group_remaining = (
-            _group_remaining_identifiers(group, scan_result[2])
-            if scan_result is not None
-            else []
+            _group_remaining_identifiers(group, scan_result[2]) if scan_result is not None else []
         )
         scan_status = _group_scan_status(scan_result, group)
-        blocks.extend([
-            f"### GROUP: {group.group_id}",
-            f"- Component: {group.vulnerable_component or '(unknown)'}",
-            f"- Strategy: {strategy}",
-            f"- Target Identifiers: {', '.join(group_identifiers) if group_identifiers else 'none'}",
-            f"- Changed Files: {changed_files_text}",
-            "",
-            f"- Scan Status: {scan_status}",
-            f"- Remaining Scanner Findings: {', '.join(group_remaining) if group_remaining else 'none'}",
-            "- Scan Reasoning: Investigation report was synthesized from deterministic QA results.",
-            "",
-            (
-                "- Workaround Review: not applicable"
-                if strategy != "code_workaround"
-                else "- Workaround Review: not reviewed; fallback report due to malformed investigator output."
-            ),
-            (
-                "- Diff Evidence: not applicable"
-                if strategy != "code_workaround"
-                else "- Diff Evidence: none reviewed."
-            ),
-            "",
-            f"- Test Status: {'passed' if tests_ok else 'failed'}",
-            "- Attributed Test Failures: none",
-            "- Causal Reasoning: No trusted investigator prose was available; defer to deterministic QA logs.",
-            "- Exonerated Groups: none",
-            "",
-            "- Group Summary: Fallback summary generated because the investigator output was missing or malformed.",
-            "",
-        ])
+        blocks.extend(
+            [
+                f"### GROUP: {group.group_id}",
+                f"- Component: {group.vulnerable_component or '(unknown)'}",
+                f"- Strategy: {strategy}",
+                f"- Target Identifiers: {', '.join(group_identifiers) if group_identifiers else 'none'}",
+                f"- Changed Files: {changed_files_text}",
+                "",
+                f"- Scan Status: {scan_status}",
+                f"- Remaining Scanner Findings: {', '.join(group_remaining) if group_remaining else 'none'}",
+                "- Scan Reasoning: Investigation report was synthesized from deterministic QA results.",
+                "",
+                (
+                    "- Workaround Review: not applicable"
+                    if strategy != "code_workaround"
+                    else "- Workaround Review: not reviewed; fallback report due to malformed investigator output."
+                ),
+                (
+                    "- Diff Evidence: not applicable"
+                    if strategy != "code_workaround"
+                    else "- Diff Evidence: none reviewed."
+                ),
+                "",
+                f"- Test Status: {'passed' if tests_ok else 'failed'}",
+                "- Attributed Test Failures: none",
+                "- Causal Reasoning: No trusted investigator prose was available; defer to deterministic QA logs.",
+                "- Exonerated Groups: none",
+                "",
+                "- Group Summary: Fallback summary generated because the investigator output was missing or malformed.",
+                "",
+            ]
+        )
     return "\n".join(blocks).strip()
 
 
 def _parse_investigation_report(
     report_text: str,
-    valid_groups: List[VulnerabilityGroup],
+    valid_groups: list[VulnerabilityGroup],
 ) -> ParsedInvestigationReport:
     """Parse the investigator markdown report into shared and per-group sections (backcompat)."""
     known_group_ids = {group.group_id for group in valid_groups}
-    errors: List[str] = []
-    warnings: List[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
     normalized = (report_text or "").strip()
 
     if not normalized.startswith(_REPORT_PREFIX):
@@ -1826,9 +2163,9 @@ def _parse_investigation_report(
 
     matches = list(_GROUP_HEADING_RE.finditer(normalized))
     shared_end = matches[0].start() if matches else len(normalized)
-    shared_install_analysis = normalized[len(_REPORT_PREFIX):shared_end].strip()
+    shared_install_analysis = normalized[len(_REPORT_PREFIX) : shared_end].strip()
 
-    sections: Dict[str, GroupInvestigationSection] = {}
+    sections: dict[str, GroupInvestigationSection] = {}
     for index, match in enumerate(matches):
         group_id = match.group(1).strip()
         block_start = match.start()
@@ -1861,12 +2198,14 @@ def _parse_investigation_report(
         if group.group_id in sections:
             continue
         errors.append(f"Investigation report missing block for group '{group.group_id}'.")
-        placeholder = "\n".join([
-            f"### GROUP: {group.group_id}",
-            "- Scan Analysis: missing",
-            "- Test Attribution & Exoneration: missing",
-            "- Diff Review: missing",
-        ])
+        placeholder = "\n".join(
+            [
+                f"### GROUP: {group.group_id}",
+                "- Scan Analysis: missing",
+                "- Test Attribution & Exoneration: missing",
+                "- Diff Review: missing",
+            ]
+        )
         sections[group.group_id] = GroupInvestigationSection(
             group_id=group.group_id,
             raw_text=placeholder,
@@ -1889,8 +2228,8 @@ def _parse_investigation_report(
 def _run_global_execution(
     sandbox: DockerSandbox,
     workspace_volume: str,
-    target_identifiers: Set[str],
-    baseline_identifiers: Optional[Set[str]] = None,
+    target_identifiers: set[str],
+    baseline_identifiers: set[str] | None = None,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -1931,11 +2270,11 @@ def _run_global_execution(
 def build_qa_toolbelt(
     sandbox: DockerSandbox,
     workspace_volume: str,
-    target_identifiers: Set[str],
-    candidate_changed_files: List[str],
-    host_repo_root: Optional[str],
-    baseline_identifiers: Optional[Set[str]] = None,
-) -> Tuple[List, _QAExecutionResults]:
+    target_identifiers: set[str],
+    candidate_changed_files: list[str],
+    host_repo_root: str | None,
+    baseline_identifiers: set[str] | None = None,
+) -> tuple[list, _QAExecutionResults]:
     """
     Build the QA-only toolbelt with one-shot execution tools and read-only review tools.
 
@@ -1995,10 +2334,7 @@ def build_qa_toolbelt(
             _, summary, _ = results.scan
             return f"[CACHED â€” already run] {summary}"
         if results.install is None:
-            return (
-                "ERROR: run_security_scan must be called after "
-                "run_dependency_install."
-            )
+            return "ERROR: run_security_scan must be called after run_dependency_install."
         if baseline_identifiers is None:
             scan_result = _run_security_scan(
                 sandbox,
@@ -2026,9 +2362,7 @@ def build_qa_toolbelt(
             _, summary = results.tests
             return f"[CACHED â€” already run] {summary}"
         if results.scan is None:
-            return (
-                "ERROR: run_unit_tests must be called after run_security_scan."
-            )
+            return "ERROR: run_unit_tests must be called after run_security_scan."
         ok, summary = _run_unit_tests(sandbox)
         results.tests = (ok, summary)
         return summary
@@ -2064,9 +2398,7 @@ def build_qa_toolbelt(
             return review_error
         if host_repo_root is None:
             return "ERROR: host_repo_root is not available; cannot generate diff."
-        diff_text, _ = _generate_workspace_diff(
-            host_repo_root, sandbox, candidate_changed_files
-        )
+        diff_text, _ = _generate_workspace_diff(host_repo_root, sandbox, candidate_changed_files)
         return diff_text
 
     @tool
@@ -2154,10 +2486,10 @@ def build_qa_toolbelt(
 
 def build_qa_review_toolbelt(
     sandbox: DockerSandbox,
-    candidate_changed_files: List[str],
-    host_repo_root: Optional[str],
+    candidate_changed_files: list[str],
+    host_repo_root: str | None,
     results: _QAExecutionResults,
-) -> List:
+) -> list:
     """
     Build a read-only review toolbelt for individual group investigators.
 
@@ -2197,9 +2529,7 @@ def build_qa_review_toolbelt(
             return review_error
         if host_repo_root is None:
             return "ERROR: host_repo_root is not available; cannot generate diff."
-        diff_text, _ = _generate_workspace_diff(
-            host_repo_root, sandbox, candidate_changed_files
-        )
+        diff_text, _ = _generate_workspace_diff(host_repo_root, sandbox, candidate_changed_files)
         return diff_text
 
     @tool
@@ -2282,9 +2612,9 @@ def _build_individual_investigator_prompt(
     group: VulnerabilityGroup,
     strategy: str,
     results: _QAExecutionResults,
-    group_remaining_ids: List[str],
-    candidate_changed_files: List[str],
-    action_summaries: List[AgentActionSummary],
+    group_remaining_ids: list[str],
+    candidate_changed_files: list[str],
+    action_summaries: list[AgentActionSummary],
 ) -> str:
     """Build a group-scoped system prompt for one individual investigator."""
     fix_plan = group.fix_plan
@@ -2299,22 +2629,16 @@ def _build_individual_investigator_prompt(
     post_scan_identifiers = sorted(
         _scan_result_value(results.scan, "found_identifiers", set()) or set()
     )
-    new_identifiers = sorted(
-        _scan_result_value(results.scan, "new_identifiers", set()) or set()
-    )
+    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
 
-    summaries_text = "\n".join(
-        f"  - {s.status.value}: {s.summary}" for s in action_summaries
-    ) or "  (none)"
-
-    changed_files_text = (
-        "\n".join(f"  - {f}" for f in candidate_changed_files)
-        if candidate_changed_files
-        else "  (none)"
+    summaries_text = (
+        "\n".join(f"  - {s.status.value}: {s.summary}" for s in action_summaries) or "  (none)"
     )
 
     remaining_text = (
-        ", ".join(group_remaining_ids) if group_remaining_ids else "(none â€” scanner cleared this group)"
+        ", ".join(group_remaining_ids)
+        if group_remaining_ids
+        else "(none â€” scanner cleared this group)"
     )
 
     trimmed_summaries = []
@@ -2327,7 +2651,7 @@ def _build_individual_investigator_prompt(
 
 ## Your Assigned Group
 - Group ID       : {group.group_id}
-- Component      : {group.vulnerable_component or '(unknown)'}
+- Component      : {group.vulnerable_component or "(unknown)"}
 - Issue Type     : {group.issue_type.value}
 - Routing Strategy: {strategy}
 - CVEs           : {cves}
@@ -2342,8 +2666,8 @@ def _build_individual_investigator_prompt(
 {remaining_text}
 
 ## Global Post-remediation Scanner Snapshot
-All identifiers found after remediation: {', '.join(post_scan_identifiers) if post_scan_identifiers else '(none or unavailable)'}
-New identifiers absent from the pre-remediation baseline: {', '.join(new_identifiers) if new_identifiers else '(none)'}
+All identifiers found after remediation: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
+New identifiers absent from the pre-remediation baseline: {", ".join(new_identifiers) if new_identifiers else "(none)"}
 New identifiers are graph-level findings for a later triage phase; do not attribute them to this group unless deterministic evidence explicitly supports that conclusion.
 
 ## Your Task
@@ -2379,14 +2703,14 @@ Do NOT assign a final pass/fail verdict â€” that is the Batch Judge's respo
 
 
 def _run_individual_investigations(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
-    candidate_changed_files: List[str],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
+    candidate_changed_files: list[str],
     sandbox: DockerSandbox,
-    repo_root: Optional[str],
+    repo_root: str | None,
     results: _QAExecutionResults,
-) -> Dict[str, GroupInvestigation]:
+) -> dict[str, GroupInvestigation]:
     """
     Map phase: run one bounded ReAct investigator per vulnerability group.
 
@@ -2402,7 +2726,7 @@ def _run_individual_investigations(
 
     model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
     known_group_ids = {group.group_id for group in valid_groups}
-    investigations: Dict[str, GroupInvestigation] = {}
+    investigations: dict[str, GroupInvestigation] = {}
 
     for group in valid_groups:
         strategy = group_strategies.get(group.group_id, "version_bump")
@@ -2414,11 +2738,6 @@ def _run_individual_investigations(
             action_summaries, group.group_id, known_group_ids
         )
 
-        # Narrow candidate files to those mentioned in action summaries for this group,
-        # falling back to the full batch list if none are found.
-        narrowed_files: List[str] = []
-        for s in relevant_summaries:
-            pass  # Action summaries don't carry file lists in current schema; use batch list
         group_candidate_files = candidate_changed_files  # use full batch list
 
         system_prompt = _build_individual_investigator_prompt(
@@ -2512,19 +2831,19 @@ def _build_fallback_investigation_for_group(
     group: VulnerabilityGroup,
     strategy: str,
     results: _QAExecutionResults,
-    group_remaining_ids: List[str],
+    group_remaining_ids: list[str],
     reason: str,
 ) -> str:
     """Synthesize a minimal investigation for a single group when the investigator fails."""
     install_ok, _ = results.install or (False, "not run")
     tests_ok, _ = results.tests or (False, "not run")
     scan_ok = results.scan[0] if results.scan else False
-    new_identifiers = sorted(
-        _scan_result_value(results.scan, "new_identifiers", set()) or set()
-    )
+    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
 
     remaining_text = ", ".join(group_remaining_ids) if group_remaining_ids else "none"
-    scan_status = "still_flagged" if group_remaining_ids else ("cleared" if scan_ok else "scan_failed")
+    scan_status = (
+        "still_flagged" if group_remaining_ids else ("cleared" if scan_ok else "scan_failed")
+    )
 
     return (
         f"## Fallback Investigation: {group.group_id}\n\n"
@@ -2550,11 +2869,11 @@ def _build_fallback_investigation_for_group(
 
 
 def _build_batch_judge_prompt(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
     results: _QAExecutionResults,
-    investigations_by_group: Dict[str, GroupInvestigation],
+    investigations_by_group: dict[str, GroupInvestigation],
 ) -> str:
     """Build the single comprehensive prompt for the batch judge."""
     known_group_ids = {group.group_id for group in valid_groups}
@@ -2565,9 +2884,7 @@ def _build_batch_judge_prompt(
     post_scan_identifiers = sorted(
         _scan_result_value(results.scan, "found_identifiers", set()) or set()
     )
-    new_identifiers = sorted(
-        _scan_result_value(results.scan, "new_identifiers", set()) or set()
-    )
+    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
 
     # Detect install conflict type for guardrail hint
     install_conflict_hint = ""
@@ -2635,8 +2952,8 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 ### Security Scan
 - Success: {scan_ok}
 - Summary: {scan_summary[:2000]}
-- Post-remediation identifiers: {', '.join(post_scan_identifiers) if post_scan_identifiers else '(none or unavailable)'}
-- Newly introduced identifiers: {', '.join(new_identifiers) if new_identifiers else '(none)'}
+- Post-remediation identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
+- Newly introduced identifiers: {", ".join(new_identifiers) if new_identifiers else "(none)"}
 - Newly introduced identifiers are global findings for later triage. Do not force them into an existing group's evaluation or retry feedback.
 
 ### Unit Tests
@@ -2689,11 +3006,11 @@ You MUST emit exactly {len(valid_groups)} evaluations, one for each group ID lis
 
 
 def _run_batch_judge(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
     results: _QAExecutionResults,
-    investigations_by_group: Dict[str, GroupInvestigation],
+    investigations_by_group: dict[str, GroupInvestigation],
 ) -> BatchQAResult:
     """
     Reduce phase: one structured LLM call across all group investigations.
@@ -2755,11 +3072,11 @@ def _run_batch_judge(
 
 
 def _apply_guardrails(
-    valid_groups: List[VulnerabilityGroup],
+    valid_groups: list[VulnerabilityGroup],
     batch_result: BatchQAResult,
     results: _QAExecutionResults,
-    group_strategies: Dict[str, str],
-) -> Tuple[Dict[str, QAEvaluation], List[str]]:
+    group_strategies: dict[str, str],
+) -> tuple[dict[str, QAEvaluation], list[str]]:
     """
     Normalize and validate BatchQAResult evaluations into a Dict[group_id, QAEvaluation].
 
@@ -2777,11 +3094,11 @@ def _apply_guardrails(
         (evaluations_dict, error_list)
     """
     known_group_ids = {group.group_id for group in valid_groups}
-    errors: List[str] = []
+    errors: list[str] = []
 
     # Phase 1: deduplicate and filter unknown group_ids
-    seen: Set[str] = set()
-    normalized: Dict[str, QAEvaluation] = {}
+    seen: set[str] = set()
+    normalized: dict[str, QAEvaluation] = {}
     for evaluation in batch_result.evaluations:
         gid = evaluation.task_id
         if gid not in known_group_ids:
@@ -2811,7 +3128,7 @@ def _apply_guardrails(
             )
 
     # Phase 3: deterministic scanner guardrail
-    remaining_global: Set[str] = results.scan[2] if results.scan else set()
+    remaining_global: set[str] = results.scan[2] if results.scan else set()
     for group in valid_groups:
         strategy = group_strategies.get(group.group_id, "version_bump")
         group_remaining = _group_remaining_identifiers(group, remaining_global)
@@ -2832,7 +3149,10 @@ def _apply_guardrails(
                 "The version bump did not fully resolve the vulnerability. "
                 "Check that the correct version was applied."
             )
-            if current.failure_category == FailureCategory.BREAKING_CHANGE and current.retry_feedback:
+            if (
+                current.failure_category == FailureCategory.BREAKING_CHANGE
+                and current.retry_feedback
+            ):
                 retry_feedback = (
                     retry_feedback
                     + " Test regressions may also be present, but SECURITY_FLAG takes precedence until the unresolved scanner findings are cleared. "
@@ -2858,7 +3178,10 @@ def _apply_guardrails(
                 if strategy != "version_bump":
                     continue
                 current = normalized[group.group_id]
-                if not current.passed and current.failure_category == FailureCategory.BREAKING_CHANGE:
+                if (
+                    not current.passed
+                    and current.failure_category == FailureCategory.BREAKING_CHANGE
+                ):
                     normalized[group.group_id] = QAEvaluation(
                         task_id=group.group_id,
                         passed=False,
@@ -2873,16 +3196,60 @@ def _apply_guardrails(
     return normalized, errors
 
 
+def _attach_failure_evidence_to_evaluations(
+    evaluations: dict[str, QAEvaluation],
+    results: _QAExecutionResults,
+    state: OrchestratorState,
+) -> dict[str, QAEvaluation]:
+    """Attach deterministic QA diagnostics and committed attempt provenance.
+
+    The batch judge is allowed to classify a failure, but it is not the source
+    of truth for the failing test output.  Use the deterministic test summary
+    and the task's committed attempt envelope so workaround retries receive
+    actionable evidence instead of a blank or stale ``attempt_id``.
+    """
+    test_evidence = None
+    if results.tests and not results.tests[0]:
+        test_evidence = extract_qa_failure_evidence(1, results.tests[1], "")
+
+    task_queue = state.get("task_queue", {}) or {}
+    tasks_by_group = {
+        task.parent_group_id: task
+        for task in task_queue.values()
+        if getattr(task, "parent_group_id", None)
+    }
+    enriched: dict[str, QAEvaluation] = {}
+    for group_id, evaluation in evaluations.items():
+        if evaluation.passed:
+            enriched[group_id] = evaluation
+            continue
+
+        task = tasks_by_group.get(group_id)
+        attempt_id = getattr(task, "current_attempt_id", None) or ""
+        task_revision = int(getattr(task, "task_revision", 0) or 0)
+        evidence = evaluation.failure_evidence or test_evidence
+        if evidence is not None:
+            evidence = evidence.model_copy(
+                update={
+                    "attempt_id": attempt_id or evidence.attempt_id,
+                    "task_revision": task_revision or evidence.task_revision,
+                }
+            )
+            evaluation = evaluation.model_copy(update={"failure_evidence": evidence})
+        enriched[group_id] = evaluation
+    return enriched
+
+
 # ---------------------------------------------------------------------------
 # QA agent system prompt (backcompat â€” used by legacy _run_investigator_phase)
 # ---------------------------------------------------------------------------
 
 
 def _build_qa_system_prompt(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
-    candidate_changed_files: List[str],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
+    candidate_changed_files: list[str],
 ) -> str:
     """Build the system prompt for the bounded QA agent loop (backcompat)."""
     known_group_ids = {group.group_id for group in valid_groups}
@@ -3008,9 +3375,9 @@ Rules:
 
 
 def _build_group_evidence_packet(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
     results: _QAExecutionResults,
     parsed_report: ParsedInvestigationReport,
     group: VulnerabilityGroup,
@@ -3022,11 +3389,14 @@ def _build_group_evidence_packet(
     fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
     fix_plan_instruction = fix_plan.instruction if fix_plan else "(none)"
     install_ok, install_summary = results.install or (
-        False, "run_dependency_install was not called."
+        False,
+        "run_dependency_install was not called.",
     )
     if results.scan is None:
         scan_ok, scan_summary, remaining_identifiers = (
-            False, "run_security_scan was not called.", set()
+            False,
+            "run_security_scan was not called.",
+            set(),
         )
     else:
         scan_ok, scan_summary, remaining_identifiers = results.scan
@@ -3043,8 +3413,7 @@ def _build_group_evidence_packet(
         fix_plan_status=fix_plan_status,
         fix_plan_instruction=fix_plan_instruction,
         action_summaries=[
-            f"{summary.status.value}: {summary.summary}"
-            for summary in relevant_summaries
+            f"{summary.status.value}: {summary.summary}" for summary in relevant_summaries
         ],
         shared_install_analysis=parsed_report.shared_install_analysis,
         install_ok=install_ok,
@@ -3060,14 +3429,14 @@ def _build_group_evidence_packet(
 
 
 def _run_investigator_phase(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
-    candidate_changed_files: List[str],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
+    candidate_changed_files: list[str],
     sandbox: DockerSandbox,
-    repo_root: Optional[str],
+    repo_root: str | None,
     workspace_volume: str,
-    target_identifiers: Set[str],
+    target_identifiers: set[str],
 ) -> InvestigationArtifact:
     """Run the bounded QA investigator agent and parse its final report (backcompat)."""
     tools, results = build_qa_toolbelt(
@@ -3149,18 +3518,18 @@ def _run_investigator_phase(
 
 
 def _run_judge_phase(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
     investigation: InvestigationArtifact,
-) -> Dict[str, QAEvaluation]:
+) -> dict[str, QAEvaluation]:
     """Run the zero-shot Judge once per vulnerability group (backcompat)."""
     from langchain_openai import ChatOpenAI
 
     model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(QAEvaluation)
 
-    evaluations: Dict[str, QAEvaluation] = {}
+    evaluations: dict[str, QAEvaluation] = {}
     for group in valid_groups:
         packet = _build_group_evidence_packet(
             valid_groups=valid_groups,
@@ -3172,13 +3541,15 @@ def _run_judge_phase(
         )
         cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
         ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
-        summaries_text = "\n".join(f"- {summary}" for summary in packet.action_summaries) or "- (none)"
+        summaries_text = (
+            "\n".join(f"- {summary}" for summary in packet.action_summaries) or "- (none)"
+        )
 
         prompt = f"""You are the Judge phase of a QA Critic for one vulnerability group.
 
 ## Group
 - Group ID: {group.group_id}
-- Component: {group.vulnerable_component or '(unknown)'}
+- Component: {group.vulnerable_component or "(unknown)"}
 - Issue Type: {group.issue_type.value}
 - CVEs: {cves}
 - GHSAs: {ghsas}
@@ -3187,7 +3558,7 @@ def _run_judge_phase(
 - Fix Plan Instruction: {packet.fix_plan_instruction}
 
 ## Shared Install Analysis
-{packet.shared_install_analysis or '(none)'}
+{packet.shared_install_analysis or "(none)"}
 
 ## Group-Specific Investigation Block
 {packet.group_block_markdown}
@@ -3195,19 +3566,19 @@ def _run_judge_phase(
 ## Deterministic Flags (Hard Rules)
 - Global Install Success: {packet.install_ok}
 - Global Tests Success: {packet.tests_ok}
-- THIS GROUP'S Remaining Scanner Identifiers: {', '.join(packet.remaining_identifiers) if packet.remaining_identifiers else '(none)'}
+- THIS GROUP'S Remaining Scanner Identifiers: {", ".join(packet.remaining_identifiers) if packet.remaining_identifiers else "(none)"}
 
 ## Relevant Action Summaries
 {summaries_text}
 
 ## Parsed Group Fields
-- Scan Reasoning: {packet.section.scan_reasoning or '(none)'}
-- Workaround Review: {packet.section.workaround_review or '(none)'}
-- Diff Evidence: {packet.section.diff_evidence or '(none)'}
-- Attributed Test Failures: {packet.section.attributed_test_failures or '(none)'}
-- Causal Reasoning: {packet.section.causal_reasoning or '(none)'}
-- Exonerated Groups: {packet.section.exonerated_groups or '(none)'}
-- Group Summary: {packet.section.group_summary or '(none)'}
+- Scan Reasoning: {packet.section.scan_reasoning or "(none)"}
+- Workaround Review: {packet.section.workaround_review or "(none)"}
+- Diff Evidence: {packet.section.diff_evidence or "(none)"}
+- Attributed Test Failures: {packet.section.attributed_test_failures or "(none)"}
+- Causal Reasoning: {packet.section.causal_reasoning or "(none)"}
+- Exonerated Groups: {packet.section.exonerated_groups or "(none)"}
+- Group Summary: {packet.section.group_summary or "(none)"}
 
 ## Evaluation Rules
 1. VERSION_BUMP passes only when install succeeds, THIS GROUP'S Remaining Scanner Identifiers is "(none)" under Deterministic Flags (Hard Rules), AND (tests pass OR the investigation report explicitly attributes the test failures to a different group / exonerates this group).
@@ -3252,16 +3623,17 @@ Return a QAEvaluation for group_id="{group.group_id}" with:
 
 def _create_skinny_qa_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
     """Create a skinny copy of a group for QA evaluator agents."""
-    return group.model_copy(update={
-        "issues": [],
-        "localized_issues": [],
-    })
+    return group.model_copy(
+        update={
+            "issues": [],
+            "localized_issues": [],
+        }
+    )
 
 
 def _filter_recent_action_summaries(
-    action_summaries: List[AgentActionSummary],
-    valid_groups: List[VulnerabilityGroup]
-) -> List[AgentActionSummary]:
+    action_summaries: list[AgentActionSummary], valid_groups: list[VulnerabilityGroup]
+) -> list[AgentActionSummary]:
     """Extract ONLY the most recently appended summary for each group_id."""
     known_group_ids = {g.group_id for g in valid_groups}
     recent_summaries = []
@@ -3283,15 +3655,16 @@ def _filter_recent_action_summaries(
 
 
 def _extract_group_evaluations(
-    valid_groups: List[VulnerabilityGroup],
-    group_strategies: Dict[str, str],
-    action_summaries: List[AgentActionSummary],
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    action_summaries: list[AgentActionSummary],
     results: _QAExecutionResults,
     agent_transcript: str,
-) -> Dict[str, QAEvaluation]:
+) -> dict[str, QAEvaluation]:
     """Backward-compatible wrapper around the Judge phase."""
     parsed_report = _parse_investigation_report(
-        agent_transcript if agent_transcript.strip().startswith(_REPORT_PREFIX)
+        agent_transcript
+        if agent_transcript.strip().startswith(_REPORT_PREFIX)
         else _build_fallback_investigation_report(
             valid_groups=valid_groups,
             group_strategies=group_strategies,
@@ -3317,7 +3690,7 @@ def _extract_group_evaluations(
 
 
 @traceable(name="qa_critic")
-def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
+def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node: run the map-reduce QA pipeline and evaluate each group.
 
@@ -3327,16 +3700,14 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
       Reduce  â€” One batch judge call (with_structured_output(BatchQAResult))
       Guards  â€” Python guardrails normalize and validate evaluations
     """
-    valid_groups: List[VulnerabilityGroup] = state.get("valid_groups") or []
-    workspace_volume: Optional[str] = state.get("workspace_volume")
-    repo_root: Optional[str] = state.get("repo_root")
-    action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
-    group_strategies: Dict[str, str] = state.get("group_strategies") or {}
-    candidate_changed_files: List[str] = state.get("changed_files") or []
+    valid_groups: list[VulnerabilityGroup] = state.get("valid_groups") or []
+    workspace_volume: str | None = state.get("workspace_volume")
+    repo_root: str | None = state.get("repo_root")
+    action_summaries: list[AgentActionSummary] = state.get("action_summaries") or []
+    group_strategies: dict[str, str] = state.get("group_strategies") or {}
+    candidate_changed_files: list[str] = state.get("changed_files") or []
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
-    unscanned_projection = _scan_state_projection(
-        _QAExecutionResults(), baseline_identifiers
-    )
+    unscanned_projection = _scan_state_projection(_QAExecutionResults(), baseline_identifiers)
 
     if not valid_groups and not state.get("force_qa"):
         logger.info("qa_critic: no valid groups - skipping QA.")
@@ -3381,7 +3752,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
     valid_groups = [_create_skinny_qa_group(g) for g in valid_groups]
     action_summaries = _filter_recent_action_summaries(action_summaries, valid_groups)
 
-    errors: List[str] = []
+    errors: list[str] = []
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
             # ------------------------------------------------------------------
@@ -3398,7 +3769,7 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
             # ------------------------------------------------------------------
             # Pipeline completeness guard
             # ------------------------------------------------------------------
-            missing_tools: List[str] = []
+            missing_tools: list[str] = []
             if results.install is None:
                 missing_tools.append("run_dependency_install")
             if results.scan is None:
@@ -3452,7 +3823,6 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
                 results=results,
             )
 
-
     except RuntimeError as exc:
         err = f"qa_critic: Docker sandbox unavailable - {exc}"
         logger.error(err)
@@ -3501,6 +3871,11 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         group_strategies=group_strategies,
     )
     errors.extend(guardrail_errors)
+    qa_evaluations = _attach_failure_evidence_to_evaluations(
+        qa_evaluations,
+        results,
+        state,
+    )
 
     all_passed = all(evaluation.passed for evaluation in qa_evaluations.values())
     eval_status = "all_passed" if all_passed else "failures_detected"
@@ -3526,5 +3901,3 @@ def run_qa_critic_node(state: OrchestratorState) -> Dict[str, Any]:
         "qa_investigation_report": qa_investigation_report,
         **scan_projection,
     }
-
-

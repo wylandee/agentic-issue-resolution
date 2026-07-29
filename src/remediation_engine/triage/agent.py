@@ -1,4 +1,4 @@
-﻿"""
+"""
 agent.py - Triage agent for scanner findings.
 
 Public API
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 from langsmith import traceable
 
@@ -43,8 +42,7 @@ from remediation_engine.orchestration.trajectory_exporter import invoke_with_tra
 logger = logging.getLogger(__name__)
 
 _UNREACHABLE_CODE_NOTE = (
-    "Reachability analysis shows the package is not imported by the application "
-    "source code."
+    "Reachability analysis shows the package is not imported by the application source code."
 )
 
 # ---------------------------------------------------------------------------
@@ -81,11 +79,11 @@ def _original_severity(group: VulnerabilityGroup) -> Severity:
 def _apply_guardrails(
     priority: Severity,
     is_valid: bool,
-    false_positive_reason: Optional[str],
+    false_positive_reason: str | None,
     context: SystemContext,
-    enrichment: Optional[CVEEnrichment],
+    enrichment: CVEEnrichment | None,
     original_severity: Severity,
-) -> tuple[Severity, str, bool, Optional[str], bool]:
+) -> tuple[Severity, str, bool, str | None, bool]:
     """
     Apply deterministic RBVM guardrails to a candidate triage verdict.
 
@@ -163,20 +161,17 @@ def _deterministic_triage(
 
     # Start optimistic
     is_valid = True
-    false_positive_reason: Optional[str] = None
+    false_positive_reason: str | None = None
     base_priority = original_sev if original_sev != Severity.UNKNOWN else Severity.MEDIUM
 
-    reasoning_parts: list[str] = [
-        f"Original severity: {original_sev.value}."
-    ]
+    reasoning_parts: list[str] = [f"Original severity: {original_sev.value}."]
     if is_unreachable_code:
         reasoning_parts.append(_UNREACHABLE_CODE_NOTE)
 
     # Dev/test scope: only mark FP when there is clear evidence
     is_dev_env = (context.environment or "").lower() in {"dev", "test", "ci", "development"}
     all_dev_only = group.issues and all(
-        (i.file_path or "").startswith(("test/", "tests/", "spec/", "dev/"))
-        or i.file_path is None
+        (i.file_path or "").startswith(("test/", "tests/", "spec/", "dev/")) or i.file_path is None
         for i in group.issues
     )
     if is_dev_env and all_dev_only:
@@ -202,8 +197,7 @@ def _deterministic_triage(
     if enrichment:
         if enrichment.epss > 0.0:
             reasoning_parts.append(
-                f"EPSS score: {enrichment.epss:.3f} "
-                f"(percentile {enrichment.epss_percentile:.3f})."
+                f"EPSS score: {enrichment.epss:.3f} (percentile {enrichment.epss_percentile:.3f})."
             )
         if enrichment.in_kev:
             reasoning_parts.append("CVE is in CISA KEV; active exploitation risk is known.")
@@ -303,7 +297,11 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
     )
 
     sys_os = context.deployment_os or "unknown"
-    sys_public = "yes" if context.public_facing is True else ("no" if context.public_facing is False else "unknown")
+    sys_public = (
+        "yes"
+        if context.public_facing is True
+        else ("no" if context.public_facing is False else "unknown")
+    )
     sys_lang = context.primary_language or "unknown"
     sys_arch = context.deployment_architecture or "unknown"
     sys_sens = context.data_sensitivity or "unknown"
@@ -383,7 +381,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
 def _llm_triage(
     group: VulnerabilityGroup,
     context: SystemContext,
-) -> Optional[TriageResult]:
+) -> TriageResult | None:
     """
     Attempt an LLM-based triage using LangChain structured output.
 
@@ -433,7 +431,7 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
     produced the initial verdict.
     """
     llm_enabled = os.environ.get("TRIAGE_LLM_ENABLED", "false").lower() == "true"
-    result: Optional[TriageResult] = None
+    result: TriageResult | None = None
 
     if llm_enabled:
         result = _llm_triage(group, context)
@@ -465,5 +463,3 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
         result.priority_confidence_score = 1.0
 
     return result
-
-

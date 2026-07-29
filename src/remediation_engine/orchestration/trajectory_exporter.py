@@ -1,4 +1,4 @@
-﻿"""Local and LangSmith-backed trajectory export for Phase 5 runs.
+"""Local and LangSmith-backed trajectory export for Phase 5 runs.
 
 The exporter deliberately keeps the trace format plain Markdown with JSON
 payloads.  This makes the resulting artifact easy for another LLM (or a human)
@@ -12,13 +12,14 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, is_dataclass, asdict
-from datetime import date, datetime, timezone
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
+from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
@@ -39,7 +40,7 @@ _SECRET_VALUE_RE = re.compile(
     r"(?P<labeled>(?:api[_ -]?key|authorization|password|passwd|secret)\s*[:=]\s*)\S+|"
     r"\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9._-]{10,}"
 )
-_ACTIVE_RECORDER: ContextVar[Optional["TrajectoryRecorder"]] = ContextVar(
+_ACTIVE_RECORDER: ContextVar[TrajectoryRecorder | None] = ContextVar(
     "phase5_trajectory_recorder",
     default=None,
 )
@@ -56,7 +57,7 @@ def _redact_string(value: str) -> str:
     return _SECRET_VALUE_RE.sub(replace, value)
 
 
-def to_jsonable(value: Any, *, key: Optional[str] = None) -> Any:
+def to_jsonable(value: Any, *, key: str | None = None) -> Any:
     """Convert common LangChain/Pydantic/runtime objects into safe JSON data."""
     if key and _SECRET_KEY_RE.search(key):
         return "[REDACTED]"
@@ -123,13 +124,13 @@ class _LocalSpan:
     run_id: str
     name: str
     run_type: str
-    parent_run_id: Optional[str]
+    parent_run_id: str | None
     started_at: datetime
-    ended_at: Optional[datetime] = None
+    ended_at: datetime | None = None
     inputs: Any = None
     outputs: Any = None
-    error: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     serialized: Any = None
     sequence: int = 0
@@ -161,7 +162,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
     def __init__(self) -> None:
         super().__init__()
         self._lock = RLock()
-        self._spans: Dict[str, _LocalSpan] = {}
+        self._spans: dict[str, _LocalSpan] = {}
         self._order: list[str] = []
         self._sequence = 0
 
@@ -174,8 +175,8 @@ class TrajectoryRecorder(BaseCallbackHandler):
         run_type: str,
         inputs: Any = None,
         serialized: Any = None,
-        tags: Optional[Sequence[str]] = None,
-        metadata: Optional[Mapping[str, Any]] = None,
+        tags: Sequence[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             identifier = _identifier(run_id)
@@ -186,7 +187,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
                     name=name,
                     run_type=run_type,
                     parent_run_id=_identifier(parent_run_id) or None,
-                    started_at=datetime.now(timezone.utc),
+                    started_at=datetime.now(UTC),
                     inputs=to_jsonable(inputs),
                     serialized=to_jsonable(serialized),
                     tags=list(tags or []),
@@ -202,7 +203,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         run_id: Any,
         *,
         outputs: Any = None,
-        error: Optional[Any] = None,
+        error: Any | None = None,
     ) -> None:
         try:
             identifier = _identifier(run_id)
@@ -215,12 +216,12 @@ class TrajectoryRecorder(BaseCallbackHandler):
                         name="unknown",
                         run_type="chain",
                         parent_run_id=None,
-                        started_at=datetime.now(timezone.utc),
+                        started_at=datetime.now(UTC),
                         sequence=self._sequence,
                     )
                     self._spans[identifier] = span
                     self._order.append(identifier)
-                span.ended_at = datetime.now(timezone.utc)
+                span.ended_at = datetime.now(UTC)
                 if outputs is not None:
                     span.outputs = to_jsonable(outputs)
                 if error is not None:
@@ -235,8 +236,8 @@ class TrajectoryRecorder(BaseCallbackHandler):
         run_type: str,
         inputs: Any = None,
         outputs: Any = None,
-        error: Optional[Any] = None,
-        parent_run_id: Optional[str] = None,
+        error: Any | None = None,
+        parent_run_id: str | None = None,
     ) -> str:
         """Record an explicit root/state/runtime event when callbacks are absent."""
         identifier = f"manual-{uuid.uuid4()}"
@@ -255,18 +256,36 @@ class TrajectoryRecorder(BaseCallbackHandler):
         with self._lock:
             return self._sequence
 
-    def has_span_since(self, sequence: int, run_type: Optional[str] = None) -> bool:
+    def has_span_since(self, sequence: int, run_type: str | None = None) -> bool:
         """Return whether a span of the requested type started after a sequence."""
         with self._lock:
             return any(
-                span.sequence > sequence
-                and (run_type is None or span.run_type == run_type)
+                span.sequence > sequence and (run_type is None or span.run_type == run_type)
                 for span in self._spans.values()
             )
 
-    def on_chain_start(self, serialized: dict[str, Any], inputs: dict[str, Any], *, run_id: Any, parent_run_id: Any = None, tags: Optional[list[str]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+    def on_chain_start(
+        self,
+        serialized: dict[str, Any],
+        inputs: dict[str, Any],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Record the start of a LangChain chain callback."""
-        self._start(run_id=run_id, parent_run_id=parent_run_id, name=_span_name(serialized, "chain"), run_type="chain", inputs=inputs, serialized=serialized, tags=tags, metadata=metadata)
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "chain"),
+            run_type="chain",
+            inputs=inputs,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
 
     def on_chain_end(self, outputs: Any, *, run_id: Any, **kwargs: Any) -> None:
         """Record successful completion of a chain callback."""
@@ -276,13 +295,51 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Record a failed chain callback."""
         self._end(run_id, error=error)
 
-    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], *, run_id: Any, parent_run_id: Any = None, tags: Optional[list[str]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+    def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Record the start of an LLM callback."""
-        self._start(run_id=run_id, parent_run_id=parent_run_id, name=_span_name(serialized, "llm"), run_type="llm", inputs=prompts, serialized=serialized, tags=tags, metadata=metadata)
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "llm"),
+            run_type="llm",
+            inputs=prompts,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
 
-    def on_chat_model_start(self, serialized: dict[str, Any], messages: list[list[BaseMessage]], *, run_id: Any, parent_run_id: Any = None, tags: Optional[list[str]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Record the start of a chat-model callback."""
-        self._start(run_id=run_id, parent_run_id=parent_run_id, name=_span_name(serialized, "chat_model"), run_type="llm", inputs=messages, serialized=serialized, tags=tags, metadata=metadata)
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "chat_model"),
+            run_type="llm",
+            inputs=messages,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
 
     def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
         """Record successful completion of an LLM callback."""
@@ -292,9 +349,29 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Record a failed LLM callback."""
         self._end(run_id, error=error)
 
-    def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: Any, parent_run_id: Any = None, tags: Optional[list[str]] = None, metadata: Optional[dict[str, Any]] = None, inputs: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Record the start of a tool callback."""
-        self._start(run_id=run_id, parent_run_id=parent_run_id, name=_span_name(serialized, "tool"), run_type="tool", inputs=inputs if inputs is not None else input_str, serialized=serialized, tags=tags, metadata=metadata)
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "tool"),
+            run_type="tool",
+            inputs=inputs if inputs is not None else input_str,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
 
     def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:
         """Record successful completion of a tool callback."""
@@ -340,7 +417,7 @@ def use_trajectory_recorder(recorder: TrajectoryRecorder) -> Iterator[Trajectory
         _ACTIVE_RECORDER.reset(token)
 
 
-def get_active_trajectory_recorder() -> Optional[TrajectoryRecorder]:
+def get_active_trajectory_recorder() -> TrajectoryRecorder | None:
     """Return the recorder bound to the current execution context, if any."""
     return _ACTIVE_RECORDER.get()
 
@@ -394,7 +471,9 @@ def _remote_span(run: Any, sequence: int) -> dict[str, Any]:
         "ended_at": getattr(run, "end_time", None),
         "inputs": to_jsonable(getattr(run, "inputs", {})),
         "outputs": to_jsonable(getattr(run, "outputs", {})),
-        "error": _redact_string(str(getattr(run, "error", ""))) if getattr(run, "error", None) else None,
+        "error": _redact_string(str(getattr(run, "error", "")))
+        if getattr(run, "error", None)
+        else None,
         "metadata": to_jsonable(getattr(run, "extra", {}) or {}),
         "tags": list(getattr(run, "tags", []) or []),
         "serialized": to_jsonable(getattr(run, "serialized", {})),
@@ -434,11 +513,11 @@ def _format_time(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).isoformat()
+        return value.astimezone(UTC).isoformat()
     return str(value)
 
 
-def _duration_seconds(span: Mapping[str, Any]) -> Optional[float]:
+def _duration_seconds(span: Mapping[str, Any]) -> float | None:
     start = span.get("started_at")
     end = span.get("ended_at")
     if isinstance(start, datetime) and isinstance(end, datetime):
@@ -468,9 +547,9 @@ def _render_markdown(
     final_state: Any,
     spans: list[dict[str, Any]],
     source: str,
-    langsmith_url: Optional[str],
+    langsmith_url: str | None,
     warnings: Sequence[str],
-    run_error: Optional[str],
+    run_error: str | None,
     trajectory_path: Path,
 ) -> str:
     root_output = dict(final_state) if isinstance(final_state, Mapping) else final_state
@@ -492,7 +571,7 @@ def _render_markdown(
         f"- Export source: `{source}`",
         f"- Span count: `{len(spans)}`",
         f"- LangSmith trace: {langsmith_url or 'unavailable'}",
-        f"- Exported at: `{datetime.now(timezone.utc).isoformat()}`",
+        f"- Exported at: `{datetime.now(UTC).isoformat()}`",
         "",
         "## Root Input State",
         "",
@@ -504,7 +583,7 @@ def _render_markdown(
         "",
         "## Attempt Snapshot Summary",
         "",
-         "| Task | Attempt | Revision | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
+        "| Task | Attempt | Revision | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
         "|---|---|---:|---|---|---|---|---|---|---|---|",
     ]
     if isinstance(final_state, Mapping):
@@ -515,8 +594,12 @@ def _render_markdown(
         ordered_snapshots = sorted(
             snapshots.values(),
             key=lambda snapshot: (
-                getattr(snapshot, "task_id", "") if not isinstance(snapshot, Mapping) else snapshot.get("task_id", ""),
-                getattr(snapshot, "attempt_number", 0) if not isinstance(snapshot, Mapping) else snapshot.get("attempt_number", 0),
+                getattr(snapshot, "task_id", "")
+                if not isinstance(snapshot, Mapping)
+                else snapshot.get("task_id", ""),
+                getattr(snapshot, "attempt_number", 0)
+                if not isinstance(snapshot, Mapping)
+                else snapshot.get("attempt_number", 0),
             ),
         )
         for snapshot in ordered_snapshots:
@@ -556,19 +639,25 @@ def _render_markdown(
     else:
         lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
 
-    lines.extend([
-        "",
-        "## Execution Timeline",
-        "",
-        "| # | Span | Type | Parent | Start | End | Duration (s) | Status | Tokens |",
-        "|---:|---|---|---|---|---|---:|---|---:|",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Execution Timeline",
+            "",
+            "| # | Span | Type | Parent | Start | End | Duration (s) | Status | Tokens |",
+            "|---:|---|---|---|---|---|---:|---|---:|",
+        ]
+    )
     for index, span in enumerate(spans, start=1):
         tokens = span.get("total_tokens")
         if tokens is None:
             prompt = span.get("prompt_tokens")
             completion = span.get("completion_tokens")
-            tokens = (prompt or 0) + (completion or 0) if prompt is not None or completion is not None else ""
+            tokens = (
+                (prompt or 0) + (completion or 0)
+                if prompt is not None or completion is not None
+                else ""
+            )
         status = "error" if span.get("error") else span.get("status") or "completed"
         lines.append(
             "| "
@@ -621,12 +710,12 @@ def _render_markdown(
         plans = final_state.get("retry_plans_by_task") or {}
         for task_id, plan in plans.items():
             plan_data = to_jsonable(plan)
-            diagnostic_items.append(f"{task_id}: committed planner plan {json.dumps(plan_data, sort_keys=True)}")
+            diagnostic_items.append(
+                f"{task_id}: committed planner plan {json.dumps(plan_data, sort_keys=True)}"
+            )
         for event in final_state.get("consistency_events") or []:
             event_data = to_jsonable(event)
-            diagnostic_items.append(
-                "consistency event: " + json.dumps(event_data, sort_keys=True)
-            )
+            diagnostic_items.append("consistency event: " + json.dumps(event_data, sort_keys=True))
     if diagnostic_items:
         lines.extend(f"- {item}" for item in diagnostic_items)
     else:
@@ -645,8 +734,8 @@ def export_phase5_trajectory(
     final_state: Any,
     recorder: TrajectoryRecorder,
     langsmith_enabled: bool,
-    langsmith_url: Optional[str] = None,
-    run_error: Optional[BaseException] = None,
+    langsmith_url: str | None = None,
+    run_error: BaseException | None = None,
 ) -> Path:
     """Write one Markdown trajectory, preferring LangSmith spans when possible."""
     warnings: list[str] = []
@@ -663,7 +752,7 @@ def export_phase5_trajectory(
 
     output_dir = default_trajectory_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_path = output_dir / f"phase5_{timestamp}_{trace_id}.md"
     markdown = _render_markdown(
         trace_id=str(trace_id),
@@ -681,5 +770,3 @@ def export_phase5_trajectory(
     temporary_path.write_text(markdown, encoding="utf-8")
     temporary_path.replace(output_path)
     return output_path
-
-

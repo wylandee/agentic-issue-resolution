@@ -1,4 +1,4 @@
-﻿"""
+"""
 code_map.py â€” Reusable AST & file helpers for the SAST code locator.
 
 Responsibilities
@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ if _TREE_SITTER_AVAILABLE:
     }
 
 
-def language_for_path(file_path: str) -> Optional[object]:
+def language_for_path(file_path: str) -> object | None:
     """Return the tree-sitter ``Language`` for a file extension, or ``None``."""
     ext = Path(file_path).suffix.lower()
     return _EXT_TO_LANG.get(ext)
@@ -80,7 +80,7 @@ def language_for_path(file_path: str) -> Optional[object]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_repo_file(repo_root: str, repo_relative_path: str) -> Optional[Path]:
+def resolve_repo_file(repo_root: str, repo_relative_path: str) -> Path | None:
     """Resolve a repo-relative path to an absolute ``Path``, or ``None`` if missing.
 
     Args:
@@ -106,7 +106,7 @@ def resolve_repo_file(repo_root: str, repo_relative_path: str) -> Optional[Path]
 # ---------------------------------------------------------------------------
 
 
-def load_source_bytes(path: Path) -> Optional[bytes]:
+def load_source_bytes(path: Path) -> bytes | None:
     """Read raw bytes from *path*, returning ``None`` on any IO error.
 
     We do **not** decode here â€” tree-sitter works natively on bytes, and
@@ -119,7 +119,7 @@ def load_source_bytes(path: Path) -> Optional[bytes]:
         return None
 
 
-def load_source_lines(path: Path) -> Optional[List[str]]:
+def load_source_lines(path: Path) -> list[str] | None:
     """Return the file as a list of text lines, or ``None`` on error.
 
     Uses UTF-8 with ``errors='replace'`` to avoid crashing on binary content.
@@ -135,7 +135,7 @@ def load_source_lines(path: Path) -> Optional[List[str]]:
 # ---------------------------------------------------------------------------
 
 
-def parse_source(source_bytes: bytes, language: object) -> Optional["Tree"]:  # type: ignore[name-defined]
+def parse_source(source_bytes: bytes, language: object) -> Tree | None:  # type: ignore[name-defined]
     """Parse *source_bytes* with *language*, returning a ``Tree`` or ``None``.
 
     A parse result is always returned by tree-sitter (even for invalid code), so
@@ -156,7 +156,7 @@ def parse_source(source_bytes: bytes, language: object) -> Optional["Tree"]:  # 
 # ---------------------------------------------------------------------------
 
 # Node types that represent "enclosing scopes" for SAST findings.
-_ENCLOSING_TYPES: Tuple[str, ...] = (
+_ENCLOSING_TYPES: tuple[str, ...] = (
     "function_declaration",
     "function_expression",
     "generator_function_declaration",
@@ -168,12 +168,12 @@ _ENCLOSING_TYPES: Tuple[str, ...] = (
 )
 
 
-def _node_contains_line(node: "Node", zero_indexed_line: int) -> bool:  # type: ignore[name-defined]
+def _node_contains_line(node: Node, zero_indexed_line: int) -> bool:  # type: ignore[name-defined]
     """Return True when *zero_indexed_line* falls within *node*'s extent."""
     return node.start_point[0] <= zero_indexed_line <= node.end_point[0]
 
 
-def _extract_node_name(node: "Node") -> Optional[str]:  # type: ignore[name-defined]
+def _extract_node_name(node: Node) -> str | None:  # type: ignore[name-defined]
     """Best-effort extraction of a human-readable name for *node*."""
     # Standard named fields used by JS/TS grammars
     for field in ("name", "key"):
@@ -190,7 +190,9 @@ def _extract_node_name(node: "Node") -> Optional[str]:  # type: ignore[name-defi
             id_child = parent.child_by_field_name("name")
             if id_child is not None and id_child.text:
                 text = id_child.text
-                return text.decode("utf-8", errors="replace") if isinstance(text, bytes) else str(text)
+                return (
+                    text.decode("utf-8", errors="replace") if isinstance(text, bytes) else str(text)
+                )
     return None
 
 
@@ -212,9 +214,9 @@ if _TREE_SITTER_AVAILABLE:
 
 
 def find_enclosing_symbol(
-    root: "Node",  # type: ignore[name-defined]
+    root: Node,  # type: ignore[name-defined]
     one_indexed_line: int,
-) -> Tuple[Optional[str], object]:
+) -> tuple[str | None, object]:
     """Walk the AST from *root* to find the innermost enclosing symbol at *one_indexed_line*.
 
     Args:
@@ -227,12 +229,13 @@ def find_enclosing_symbol(
     """
     if not _TREE_SITTER_AVAILABLE:
         from remediation_engine.contracts.schemas import ASTNodeType
+
         return None, ASTNodeType.UNKNOWN
 
     from remediation_engine.contracts.schemas import ASTNodeType
 
     target = one_indexed_line - 1  # convert to 0-indexed
-    best_name: Optional[str] = None
+    best_name: str | None = None
     best_type: ASTNodeType = ASTNodeType.UNKNOWN
     best_size: int = -1  # track smallest enclosing node
 
@@ -259,7 +262,7 @@ def find_enclosing_symbol(
 
 
 # Node types that are directly searchable by name in `find_named_symbol`.
-_NAMED_TYPES: Tuple[str, ...] = (
+_NAMED_TYPES: tuple[str, ...] = (
     "function_declaration",
     "function_expression",
     "generator_function_declaration",
@@ -272,12 +275,12 @@ _NAMED_TYPES: Tuple[str, ...] = (
 
 
 def find_named_symbol(
-    root: "Node",  # type: ignore[name-defined]
+    root: Node,  # type: ignore[name-defined]
     symbol_name: str,
     source_bytes: bytes,
     *,
-    line_hint: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+    line_hint: int | None = None,
+) -> dict[str, Any] | None:
     """Find an AST node whose resolved name exactly matches *symbol_name*.
 
     Args:
@@ -304,7 +307,7 @@ def find_named_symbol(
     if not _TREE_SITTER_AVAILABLE:
         raise RuntimeError("tree-sitter is unavailable.")
 
-    candidates: List[Dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
     stack = list(root.children)
     while stack:
@@ -327,7 +330,9 @@ def find_named_symbol(
                 "symbol_name": name,
                 "node_type": node.type,
                 "start_line": node.start_point[0] + 1,  # 1-indexed
-                "end_line": node.end_point[0] + 1,      # 1-indexed
+                "end_line": node.end_point[0] + 1,  # 1-indexed
+                "start_byte": node.start_byte,
+                "end_byte": node.end_byte,
                 "text": node_text,
             }
         )
@@ -341,9 +346,7 @@ def find_named_symbol(
     # Multiple exact name matches â€” try to resolve by line_hint.
     if line_hint is not None:
         # Prefer a candidate whose range encloses the hint line.
-        enclosing = [
-            c for c in candidates if c["start_line"] <= line_hint <= c["end_line"]
-        ]
+        enclosing = [c for c in candidates if c["start_line"] <= line_hint <= c["end_line"]]
         if len(enclosing) == 1:
             return enclosing[0]
         if len(enclosing) > 1:
@@ -355,7 +358,8 @@ def find_named_symbol(
 
     # Unresolvable ambiguity: surface deterministic error with all ranges.
     ranges = ", ".join(
-        f"L{c['start_line']}-{c['end_line']}" for c in sorted(candidates, key=lambda c: c["start_line"])
+        f"L{c['start_line']}-{c['end_line']}"
+        for c in sorted(candidates, key=lambda c: c["start_line"])
     )
     raise ValueError(
         f"Ambiguous symbol '{symbol_name}': found {len(candidates)} definitions at "
@@ -363,7 +367,7 @@ def find_named_symbol(
     )
 
 
-def extract_imports(root: "Node", source_bytes: bytes) -> List[str]:  # type: ignore[name-defined]
+def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: ignore[name-defined]
     """Return top-level import/require statements as stripped text strings.
 
     Captures:
@@ -373,7 +377,7 @@ def extract_imports(root: "Node", source_bytes: bytes) -> List[str]:  # type: ig
     if not _TREE_SITTER_AVAILABLE:
         return []
 
-    results: List[str] = []
+    results: list[str] = []
     try:
         lang = root.tree.language if hasattr(root, "tree") else None
     except Exception:
@@ -398,10 +402,10 @@ def extract_imports(root: "Node", source_bytes: bytes) -> List[str]:  # type: ig
 
 
 def extract_sink_expression(
-    root: "Node",  # type: ignore[name-defined]
+    root: Node,  # type: ignore[name-defined]
     one_indexed_line: int,
     source_bytes: bytes,
-) -> Optional[str]:
+) -> str | None:
     """Return the text of the call-expression node at *one_indexed_line*, if any.
 
     Walks the AST looking for the innermost ``call_expression`` whose start line
@@ -412,7 +416,7 @@ def extract_sink_expression(
 
     target = one_indexed_line - 1  # 0-indexed
 
-    best_node: Optional["Node"] = None  # type: ignore[name-defined]
+    best_node: Node | None = None  # type: ignore[name-defined]
     best_size = -1
 
     stack = list(root.children)
@@ -454,7 +458,7 @@ _SNIPPET_RADIUS = 10  # lines of context above and below the finding
 
 
 def extract_snippet(
-    lines: List[str],
+    lines: list[str],
     start_line: int,
     end_line: int,
     *,
@@ -487,5 +491,3 @@ def extract_snippet(
     hi = min(hi, centre + half + 1)
 
     return "\n".join(lines[lo:hi])
-
-

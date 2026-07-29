@@ -1,4 +1,4 @@
-﻿"""
+"""
 sandbox_mgr.py â€” Ephemeral Docker sandbox for safe command execution.
 
 Phase 5 of the AppSec Remediation Engine. Provides ``DockerSandbox``, a
@@ -21,7 +21,6 @@ import tarfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from langsmith import traceable
 
@@ -47,9 +46,7 @@ def _make_tar_archive(repo_root: Path) -> bytes:
 
     with tarfile.open(fileobj=buf, mode="w", dereference=False) as tf:
         for dirpath, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
-            dirnames[:] = sorted(
-                dirname for dirname in dirnames if dirname not in _SKIP_DIR_NAMES
-            )
+            dirnames[:] = sorted(dirname for dirname in dirnames if dirname not in _SKIP_DIR_NAMES)
 
             current_dir = Path(dirpath)
             rel_dir = current_dir.relative_to(repo_root)
@@ -113,7 +110,7 @@ class DockerSandbox:
         self,
         repo_root: str | Path | None,
         image: str = _DEFAULT_IMAGE,
-        workspace_volume: Optional[str] = None,
+        workspace_volume: str | None = None,
     ) -> None:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._image = image
@@ -141,9 +138,7 @@ class DockerSandbox:
             client.images.get(self._image)
             logger.debug("DockerSandbox: image %r found locally.", self._image)
         except docker_errors.ImageNotFound:
-            logger.info(
-                "DockerSandbox: image %r not found locally â€” pulling.", self._image
-            )
+            logger.info("DockerSandbox: image %r not found locally â€” pulling.", self._image)
             client.images.pull(self._image)
             logger.info("DockerSandbox: pull complete for %r.", self._image)
 
@@ -156,9 +151,7 @@ class DockerSandbox:
             "network_mode": "bridge",
         }
         if self._workspace_volume:
-            run_kwargs["volumes"] = {
-                self._workspace_volume: {"bind": "/workspace", "mode": "rw"}
-            }
+            run_kwargs["volumes"] = {self._workspace_volume: {"bind": "/workspace", "mode": "rw"}}
 
         logger.info(
             "DockerSandbox: starting container %r from image %r.",
@@ -169,14 +162,10 @@ class DockerSandbox:
 
         exit_code, _ = self._container.exec_run("mkdir -p /workspace")
         if exit_code != 0:
-            logger.warning(
-                "DockerSandbox: non-zero exit creating /workspace (%d).", exit_code
-            )
+            logger.warning("DockerSandbox: non-zero exit creating /workspace (%d).", exit_code)
 
         if self._repo_root is not None:
-            logger.info(
-                "DockerSandbox: copying %s into container /workspace.", self._repo_root
-            )
+            logger.info("DockerSandbox: copying %s into container /workspace.", self._repo_root)
             archive = _make_tar_archive(self._repo_root)
             self._container.put_archive("/workspace", archive)
             logger.info("DockerSandbox: repository copied; sandbox ready.")
@@ -218,7 +207,7 @@ class DockerSandbox:
             self._container = None
             self._alive = False
 
-    def __enter__(self) -> "DockerSandbox":
+    def __enter__(self) -> DockerSandbox:
         self.start()
         return self
 
@@ -355,7 +344,7 @@ class DockerSandbox:
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
 
     @traceable(run_type="tool", name="docker_sandbox.read_file")
-    def read_file(self, file_path: str) -> Optional[str]:
+    def read_file(self, file_path: str) -> str | None:
         """Read *file_path* from ``/workspace`` and return decoded text."""
         if not self._alive or self._container is None:
             logger.warning("DockerSandbox.read_file: sandbox is not running.")
@@ -366,9 +355,7 @@ class DockerSandbox:
         try:
             stream, _stat = self._container.get_archive(abs_path)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "DockerSandbox.read_file: could not retrieve %s â€” %s", abs_path, exc
-            )
+            logger.warning("DockerSandbox.read_file: could not retrieve %s â€” %s", abs_path, exc)
             return None
 
         raw = b"".join(chunk for chunk in stream)
@@ -378,15 +365,9 @@ class DockerSandbox:
                 member = tf.getmembers()[0]
                 extracted = tf.extractfile(member)
                 if extracted is None:
-                    logger.warning(
-                        "DockerSandbox.read_file: %s is not a regular file.", abs_path
-                    )
+                    logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
                     return None
                 return extracted.read().decode("utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "DockerSandbox.read_file: failed to extract %s â€” %s", abs_path, exc
-            )
+            logger.warning("DockerSandbox.read_file: failed to extract %s â€” %s", abs_path, exc)
             return None
-
-

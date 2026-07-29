@@ -1,4 +1,4 @@
-﻿"""
+"""
 Fix Planner â€” pure planning tool for SCA vulnerability remediation.
 
 Separation-of-Concerns role
@@ -34,16 +34,15 @@ planner step.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import quote
 
 import requests
 
-from remediation_engine.contracts import FixPlan, FixPlanStatus, LocalizedIssue
+from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
 
 log = logging.getLogger(__name__)
 
@@ -113,13 +112,13 @@ def _package_name_from_issue(issue: Any) -> str:
         return name
     purl = issue.purl or ""
     if purl.startswith("pkg:npm/"):
-        raw = purl[len("pkg:npm/"):]
+        raw = purl[len("pkg:npm/") :]
         raw = raw.split("@")[0]  # drop version
         return raw.replace("%40", "@").replace("%2F", "/")
     return ""
 
 
-def _extract_local_version(message: Optional[str]) -> Optional[str]:
+def _extract_local_version(message: str | None) -> str | None:
     """
     Scan the ODC/Semgrep ``message`` for an embedded fixed-version hint.
 
@@ -143,9 +142,9 @@ def _extract_local_version(message: Optional[str]) -> Optional[str]:
 def _build_instruction(
     package_name: str,
     fixed_version: str,
-    package_manager: Optional[str],
-    is_direct: Optional[bool],
-    manifest_file: Optional[str],
+    package_manager: str | None,
+    is_direct: bool | None,
+    manifest_file: str | None,
 ) -> str:
     """
     Generate a terse, actionable instruction for the Remedy agent.
@@ -192,11 +191,11 @@ def _contains_workaround_keyword(text: str) -> bool:
     return any(keyword in lowered for keyword in _WORKAROUND_KEYWORDS)
 
 
-def _extract_osv_workaround_snippets(vuln: Dict[str, Any]) -> Optional[List[str]]:
+def _extract_osv_workaround_snippets(vuln: dict[str, Any]) -> list[str] | None:
     """Extract workaround or mitigation text from OSV details/references."""
-    snippets: List[str] = []
+    snippets: list[str] = []
 
-    def _add_snippet(candidate: Optional[str]) -> None:
+    def _add_snippet(candidate: str | None) -> None:
         if not candidate:
             return
         snippet = candidate.strip()
@@ -210,7 +209,7 @@ def _extract_osv_workaround_snippets(vuln: Dict[str, Any]) -> Optional[List[str]
         if isinstance(value, str):
             _add_snippet(value)
 
-    for reference in (vuln.get("references") or []):
+    for reference in vuln.get("references") or []:
         if not isinstance(reference, dict):
             continue
         parts = [
@@ -227,30 +226,30 @@ def _extract_osv_workaround_snippets(vuln: Dict[str, Any]) -> Optional[List[str]
 
 
 def _extract_fixed_from_osv_vuln(
-    vuln: Dict[str, Any],
+    vuln: dict[str, Any],
     package_name: str,
-) -> Tuple[Optional[str], Optional[List[str]]]:
+) -> tuple[str | None, list[str] | None]:
     """
     Walk an OSV vuln object's ``affected[].ranges[].events[]`` to find a
     non-Git ``fixed`` version.
 
     Prefers SEMVER ranges; falls back to ECOSYSTEM; skips GIT commit ranges.
     """
-    preferred: List[str] = []
-    fallback: List[str] = []
+    preferred: list[str] = []
+    fallback: list[str] = []
 
-    for affected in (vuln.get("affected") or []):
+    for affected in vuln.get("affected") or []:
         # Try to match by package name (case-insensitive); skip mismatches
         pkg_info = affected.get("package") or {}
         affected_name = pkg_info.get("name", "")
         if affected_name and affected_name.lower() != package_name.lower():
             continue
 
-        for rng in (affected.get("ranges") or []):
+        for rng in affected.get("ranges") or []:
             rng_type = (rng.get("type") or "").upper()
             if rng_type == "GIT":
                 continue  # commit hashes are not useful for manifest pins
-            for event in (rng.get("events") or []):
+            for event in rng.get("events") or []:
                 fixed = event.get("fixed")
                 if fixed:
                     if rng_type == "SEMVER":
@@ -265,9 +264,9 @@ def _extract_fixed_from_osv_vuln(
     return None, _extract_osv_workaround_snippets(vuln)
 
 
-def _minimum_fixed_version(versions: List[str]) -> Optional[str]:
+def _minimum_fixed_version(versions: list[str]) -> str | None:
     """Return the lowest semver-like version from a collection of fixes."""
-    parsed: List[Tuple[Tuple[int, int, int, int, str], str]] = []
+    parsed: list[tuple[tuple[int, int, int, int, str], str]] = []
     for raw in versions:
         match = re.search(
             r"(?i)v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?",
@@ -286,7 +285,7 @@ def _minimum_fixed_version(versions: List[str]) -> Optional[str]:
     return min(parsed, key=lambda item: item[0])[1]
 
 
-def _fetch_osv_vuln_detail(vuln_id: str) -> Optional[Dict[str, Any]]:
+def _fetch_osv_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
     """GET /v1/vulns/{id} â€” fetch a single OSV advisory in full detail."""
     url = OSV_VULN_URL.format(vuln_id=vuln_id)
     try:
@@ -298,7 +297,7 @@ def _fetch_osv_vuln_detail(vuln_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[str]]]:
+def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
     """
     Query the OSV querybatch API for the fixed version.
 
@@ -320,10 +319,8 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
     }
     eco = mapping.get(eco, eco.capitalize())
 
-    query: Dict[str, Any] = {
-        "package": {"name": package_name, "ecosystem": eco}
-    }
-    
+    query: dict[str, Any] = {"package": {"name": package_name, "ecosystem": eco}}
+
     if issue.package_version:
         query["version"] = issue.package_version
 
@@ -335,7 +332,7 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
             headers={"Content-Type": "application/json"},
         )
         resp.raise_for_status()
-        results: List[Dict[str, Any]] = resp.json().get("results") or []
+        results: list[dict[str, Any]] = resp.json().get("results") or []
     except Exception as exc:
         log.warning("OSV querybatch failed: %s", exc)
         return None, None
@@ -343,10 +340,10 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
     if not results:
         return None, None
 
-    workaround_snippets: List[str] = []
-    fixed_versions: List[str] = []
+    workaround_snippets: list[str] = []
+    fixed_versions: list[str] = []
 
-    def _merge_snippets(snippets: Optional[List[str]]) -> None:
+    def _merge_snippets(snippets: list[str] | None) -> None:
         if not snippets:
             return
         for snippet in snippets:
@@ -360,13 +357,10 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
     }
 
     all_vulns = [
-        vuln
-        for result in results
-        for vuln in (result.get("vulns") or [])
-        if isinstance(vuln, dict)
+        vuln for result in results for vuln in (result.get("vulns") or []) if isinstance(vuln, dict)
     ]
 
-    def _matches_issue(vuln: Dict[str, Any]) -> bool:
+    def _matches_issue(vuln: dict[str, Any]) -> bool:
         if not wanted_ids:
             return True
         returned_ids = {
@@ -378,7 +372,7 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
 
     matching_vulns = [vuln for vuln in all_vulns if _matches_issue(vuln)]
 
-    def _consume_vuln(vuln: Dict[str, Any]) -> None:
+    def _consume_vuln(vuln: dict[str, Any]) -> None:
         if "affected" in vuln:
             fixed, snippets = _extract_fixed_from_osv_vuln(vuln, package_name)
             if fixed:
@@ -424,7 +418,7 @@ def _query_osv_fixed_version(issue: Any) -> Tuple[Optional[str], Optional[List[s
 # ---------------------------------------------------------------------------
 
 
-def _fetch_npm_latest(package_name: str) -> Optional[str]:
+def _fetch_npm_latest(package_name: str) -> str | None:
     """
     Fetch the ``latest`` dist-tag version from the npm registry.
 
@@ -448,7 +442,7 @@ def _fetch_npm_latest(package_name: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _search_serper_workarounds(issue: Any, package_name: str) -> Optional[List[str]]:
+def _search_serper_workarounds(issue: Any, package_name: str) -> list[str] | None:
     """
     Search Google via Serper.dev for workaround snippets.
 
@@ -463,9 +457,9 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> Optional[List[s
         return None
 
     vuln_id = issue.cve_id or issue.rule_id or ""
-    
-    query = f'{package_name} {vuln_id} vulnerability workaround github'
-    
+
+    query = f"{package_name} {vuln_id} vulnerability workaround github"
+
     log.info(f"Executing Serper search with query: {query}")
 
     try:
@@ -480,9 +474,7 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> Optional[List[s
         data = resp.json()
         organic = data.get("organic") or []
         snippets = [
-            item["snippet"]
-            for item in organic
-            if isinstance(item, dict) and item.get("snippet")
+            item["snippet"] for item in organic if isinstance(item, dict) and item.get("snippet")
         ][:3]
         return snippets if snippets else None
     except Exception as exc:
@@ -528,7 +520,11 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
         fixed, snippets = None, None
     if fixed:
         return _version_plan(
-            package_name, fixed, package_manager, is_direct, manifest_file,
+            package_name,
+            fixed,
+            package_manager,
+            is_direct,
+            manifest_file,
             strategy="osv_api",
         )
     if snippets:
@@ -548,8 +544,6 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     }
 
 
-
-
 # ---------------------------------------------------------------------------
 # Internal plan builder
 # ---------------------------------------------------------------------------
@@ -558,9 +552,9 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
 def _version_plan(
     package_name: str,
     fixed_version: str,
-    package_manager: Optional[str],
-    is_direct: Optional[bool],
-    manifest_file: Optional[str],
+    package_manager: str | None,
+    is_direct: bool | None,
+    manifest_file: str | None,
     strategy: str,
 ) -> dict:
     """Return a ``version_found`` plan dict."""
@@ -578,5 +572,3 @@ def _version_plan(
         "instruction": instruction,
         "strategy_used": strategy,
     }
-
-

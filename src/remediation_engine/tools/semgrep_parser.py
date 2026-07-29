@@ -1,4 +1,4 @@
-﻿"""
+"""
 Semgrep Parser - typed ingestion layer for local Semgrep JSON output.
 
 Reads findings from ``data/semgrep.json``, normalizes each raw dict into a
@@ -24,14 +24,16 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
+
     def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
         """Provide a no-op fallback when python-dotenv is unavailable."""
         return False
+
 
 from remediation_engine.contracts import (
     CWEEntry,
@@ -80,7 +82,7 @@ def setup_session(api_token: str) -> None:
     return None
 
 
-def _extract_findings_page(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_findings_page(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract a list of findings from known Semgrep response shapes."""
     if isinstance(payload.get("findings"), list):
         return payload["findings"]
@@ -91,7 +93,7 @@ def _extract_findings_page(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def load_findings_from_json(json_path: Path | str) -> List[Dict[str, Any]]:
+def load_findings_from_json(json_path: Path | str) -> list[dict[str, Any]]:
     """Load findings from a local Semgrep JSON file."""
     path = Path(json_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -104,17 +106,17 @@ def load_findings_from_json(json_path: Path | str) -> List[Dict[str, Any]]:
 
 def fetch_findings(
     session: Any = None,
-    deployment_slug: Optional[str] = None,
+    deployment_slug: str | None = None,
     json_path: Path | str | None = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Compatibility wrapper that now loads findings from local JSON."""
     del session, deployment_slug
     input_path = Path(json_path) if json_path is not None else _default_input_json_path()
     return load_findings_from_json(input_path)
 
 
-def _parse_cwe_entries(values: Any) -> List[CWEEntry]:
-    cwe_list: List[CWEEntry] = []
+def _parse_cwe_entries(values: Any) -> list[CWEEntry]:
+    cwe_list: list[CWEEntry] = []
     for raw_cwe in values or []:
         raw_str = str(raw_cwe).strip()
         if not raw_str:
@@ -134,8 +136,8 @@ def _parse_cwe_entries(values: Any) -> List[CWEEntry]:
     return cwe_list
 
 
-def _parse_owasp_entries(values: Any) -> List[str]:
-    owasp_list: List[str] = []
+def _parse_owasp_entries(values: Any) -> list[str]:
+    owasp_list: list[str] = []
     for raw_owasp in values or []:
         raw_str = str(raw_owasp).strip()
         if not raw_str:
@@ -158,7 +160,7 @@ def _coerce_severity(value: Any) -> Severity:
 def _build_line_range(
     start_line: Any,
     end_line: Any,
-) -> Optional[LineRange]:
+) -> LineRange | None:
     try:
         start = int(start_line) if start_line is not None else 0
         end = int(end_line) if end_line is not None else 0
@@ -169,7 +171,7 @@ def _build_line_range(
     return None
 
 
-def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
+def normalize_finding(finding: dict[str, Any]) -> VulnerabilityIssue | None:
     """Normalise one raw Semgrep finding into a typed ``VulnerabilityIssue``."""
     status = str(finding.get("status", "")).upper()
     if status and status != "OPEN":
@@ -188,10 +190,10 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
     cwe_list = _parse_cwe_entries(metadata.get("cwe") or rule.get("cwe_names"))
     owasp_list = _parse_owasp_entries(metadata.get("owasp") or rule.get("owasp_names"))
 
-    repo_url: Optional[str] = repository.get("url") or None
-    base_ref: Optional[str] = repository.get("ref") or repository.get("branch") or None
+    repo_url: str | None = repository.get("url") or None
+    base_ref: str | None = repository.get("ref") or repository.get("branch") or None
 
-    rule_id: Optional[str] = (
+    rule_id: str | None = (
         finding.get("check_id")
         or finding.get("rule_name")
         or rule.get("name")
@@ -199,7 +201,7 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
         or None
     )
 
-    finding_id: Optional[str] = None
+    finding_id: str | None = None
     for candidate in (
         finding.get("id"),
         extra.get("fingerprint"),
@@ -215,25 +217,22 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
 
     start = finding.get("start") if isinstance(finding.get("start"), dict) else {}
     end = finding.get("end") if isinstance(finding.get("end"), dict) else {}
-    file_path: Optional[str] = (
-        finding.get("path")
-        or location.get("file_path")
-        or finding.get("file_path")
-        or None
+    file_path: str | None = (
+        finding.get("path") or location.get("file_path") or finding.get("file_path") or None
     )
     line_range = _build_line_range(
         start.get("line") or location.get("line"),
         end.get("line") or location.get("end_line"),
     )
 
-    message: Optional[str] = (
+    message: str | None = (
         extra.get("message")
         or finding.get("rule_message")
         or rule.get("message")
         or finding.get("message")
         or None
     )
-    finding_url: Optional[str] = (
+    finding_url: str | None = (
         metadata.get("semgrep.url")
         or finding.get("line_of_code_url")
         or finding.get("url")
@@ -243,17 +242,29 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
 
     issue_type = IssueType.SCA if sca_info is not None else IssueType.SAST
 
-    package_name: Optional[str] = finding.get("package_name")
-    package_version: Optional[str] = finding.get("package_version") or finding.get("found_version")
-    fixed_version: Optional[str] = finding.get("fixed_version")
-    purl: Optional[str] = finding.get("purl")
-    ecosystem: Optional[str] = finding.get("ecosystem")
-    cve_id: Optional[str] = finding.get("cve_id")
+    package_name: str | None = finding.get("package_name")
+    package_version: str | None = finding.get("package_version") or finding.get("found_version")
+    fixed_version: str | None = finding.get("fixed_version")
+    purl: str | None = finding.get("purl")
+    ecosystem: str | None = finding.get("ecosystem")
+    cve_id: str | None = finding.get("cve_id")
 
     if sca_info is not None:
-        dependency_match = sca_info.get("dependency_match") if isinstance(sca_info.get("dependency_match"), dict) else {}
-        found_dependency = dependency_match.get("found_dependency") if isinstance(dependency_match.get("found_dependency"), dict) else {}
-        dependency_pattern = dependency_match.get("dependency_pattern") if isinstance(dependency_match.get("dependency_pattern"), dict) else {}
+        dependency_match = (
+            sca_info.get("dependency_match")
+            if isinstance(sca_info.get("dependency_match"), dict)
+            else {}
+        )
+        found_dependency = (
+            dependency_match.get("found_dependency")
+            if isinstance(dependency_match.get("found_dependency"), dict)
+            else {}
+        )
+        dependency_pattern = (
+            dependency_match.get("dependency_pattern")
+            if isinstance(dependency_match.get("dependency_pattern"), dict)
+            else {}
+        )
 
         if not package_name:
             package_name = found_dependency.get("package") or dependency_pattern.get("package")
@@ -276,7 +287,9 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
                 or extra.get("cve_id")
                 or finding.get("vulnerability_identifier")
             )
-            if explicit_cve and re.match(r"^CVE-\d{4}-\d{4,}$", str(explicit_cve).strip(), re.IGNORECASE):
+            if explicit_cve and re.match(
+                r"^CVE-\d{4}-\d{4,}$", str(explicit_cve).strip(), re.IGNORECASE
+            ):
                 cve_id = str(explicit_cve).strip().upper()
 
     if not purl and ecosystem and package_name and package_version:
@@ -310,7 +323,7 @@ def normalize_finding(finding: Dict[str, Any]) -> Optional[VulnerabilityIssue]:
     )
 
 
-def export_to_jsonl(issues: List[VulnerabilityIssue], output_path: Path) -> None:
+def export_to_jsonl(issues: list[VulnerabilityIssue], output_path: Path) -> None:
     """Write issues as JSONL - one JSON object per line."""
     os.makedirs(output_path.parent, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
@@ -320,7 +333,7 @@ def export_to_jsonl(issues: List[VulnerabilityIssue], output_path: Path) -> None
     log.info("Wrote %d issues to %s", len(issues), output_path)
 
 
-def export_to_csv(issues: List[VulnerabilityIssue], output_path: Path) -> None:
+def export_to_csv(issues: list[VulnerabilityIssue], output_path: Path) -> None:
     """Export a flat CSV projection of typed issues for human inspection."""
     os.makedirs(output_path.parent, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -361,7 +374,7 @@ def main() -> None:
     raw_findings = load_findings_from_json(input_json)
     log.info("Loaded %s total findings", len(raw_findings))
 
-    issues: List[VulnerabilityIssue] = []
+    issues: list[VulnerabilityIssue] = []
     skipped = 0
     for raw in raw_findings:
         issue = normalize_finding(raw)
@@ -378,5 +391,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Issue triage, enrichment, grouping, and reachability analysis.
 
 Public API
@@ -9,5 +9,3 @@ agent.run_triage              â€” deterministic (+ optional LLM) triage ver
 pipeline.run_triage_pipeline  â€” full triage flow (group â†’ enrich â†’ triage)
 pipeline.select_issues_for_remediation â€” pick one issue per valid group
 """
-
-

@@ -1,16 +1,16 @@
-﻿"""
+"""
 tests/test_remedy_tools.py - Direct unit tests for Phase 5 specialist toolbelts.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from remediation_engine.contracts.schemas import CommandResult
 from remediation_engine.orchestration.remedy_tools import (
+    _make_validate_code_syntax_tool,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
@@ -87,16 +87,191 @@ class TestToolbeltFactories:
             "search_codebase_pattern",
             "inspect_ast_symbol",
             "deterministic_search_replace",
+            "deterministic_replace_ast_symbol",
             "revert_workspace_file",
-            "validate_code_syntax",
-            "run_typecheck",
+            "validate_workaround",
         }
+
+    def test_targeted_test_uses_matching_npm_script_and_qa_target(self):
+        sandbox = MagicMock()
+        package_json = {
+            "scripts": {
+                "test": "npm run test:frontend && npm run test:api",
+                "test:frontend": "cd frontend && npm run test",
+                "test:api": 'node --test "test/api/**/*.test.ts"',
+            }
+        }
+
+        def read_file(path):
+            if path == "package.json":
+                return json.dumps(package_json)
+            if path == "src/auth.ts":
+                return "export const auth = true;"
+            return None
+
+        sandbox.read_file.side_effect = read_file
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="targeted test passed",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools = {
+            tool.name: tool
+            for tool in build_workaround_toolbelt(
+                sandbox,
+                set(),
+                Path("/dummy/repo/root"),
+                preferred_test_files=["test/api/2fa.test.ts"],
+            )
+        }
+
+        rejected = tools["validate_workaround"].invoke(
+            {
+                "modified_files": ["src/auth.ts"],
+                "targeted_test_file": "test/api/file-serving.test.ts",
+            }
+        )
+        assert "not the QA-recommended target" in rejected
+
+        compiled = tools["validate_workaround"].invoke(
+            {"modified_files": ["src/auth.ts"], "targeted_test_file": "build/test/api/2fa.test.js"}
+        )
+        assert "Compiled test path" in compiled
+
+        result = tools["validate_workaround"].invoke(
+            {
+                "modified_files": ["src/auth.ts"],
+                "runtime_smoke_file": "src/auth.ts",
+                "targeted_test_file": "test/api/2fa.test.ts",
+            }
+        )
+        assert result.startswith("SUCCESS: Workaround validation gate passed")
+        assert any(
+            "node --test test/api/2fa.test.ts" in call.args[0]
+            for call in sandbox.run.call_args_list
+        )
+
+    def test_validate_workaround_short_circuits_on_first_failed_gate(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: (
+            "const value = 1;" if path == "src/auth.ts" else None
+        )
+        sandbox.run.return_value = CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr="SyntaxError: unexpected token",
+            duration_seconds=0.1,
+        )
+        tools = _workaround_tool_map(sandbox)
+
+        result = tools["validate_workaround"].invoke(
+            {"modified_files": ["src/auth.ts"], "runtime_smoke_file": "src/auth.ts"}
+        )
+
+        assert result.startswith("FAILURE: Workaround validation gate 'syntax'")
+        assert sandbox.run.call_count == 1
+
+    def test_validate_workaround_runtime_smoke_catches_import_errors(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: (
+            "const value = 1;" if path == "src/auth.ts" else None
+        )
+        sandbox.run.side_effect = [
+            CommandResult(exit_code=0, stdout="", stderr="", duration_seconds=0.1),
+            CommandResult(exit_code=1, stdout="", stderr="", duration_seconds=0.1),
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="ReferenceError: jwksRsa is not defined",
+                duration_seconds=0.1,
+            ),
+        ]
+        tools = _workaround_tool_map(sandbox)
+
+        result = tools["validate_workaround"].invoke(
+            {"modified_files": ["src/auth.ts"], "runtime_smoke_file": "src/auth.ts"}
+        )
+
+        assert result.startswith("FAILURE: Workaround validation gate 'runtime_smoke'")
+        assert "jwksRsa is not defined" in result
+        assert sandbox.run.call_count == 3
 
     def test_update_toolbelt_excludes_registry_lookup(self):
         sandbox = MagicMock()
         tools = _update_tool_map(sandbox, enable_registry_lookup=True)
 
         assert "view_npm_package_versions" not in tools
+
+    def test_ast_tool_accepts_complete_arrow_declaration_replacement(self):
+        """Arrow symbols may be replaced with their complete exported declaration."""
+
+        class FakeNode:
+            def __init__(self, node_type, start_byte, end_byte, text, children=None):
+                self.type = node_type
+                self.start_byte = start_byte
+                self.end_byte = end_byte
+                self.text = text
+                self.children = children or []
+
+        source = "export const isAuthorized = () => expressjwt({});\n"
+        arrow_start = source.index("()")
+        arrow = FakeNode("arrow_function", arrow_start, len(source) - 1, "() => expressjwt({});")
+        export = FakeNode("export_statement", 0, len(source) - 1, source, [arrow])
+        root = FakeNode("program", 0, len(source), source, [export])
+
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = source
+        sandbox.run.return_value.exit_code = 0
+        touched = set()
+        plan_state = {
+            "recorded": True,
+            "planned_files": ["lib/insecurity.ts"],
+            "inspected_files": set(),
+            "fallback_files": set(),
+        }
+        tool = {
+            item.name: item
+            for item in build_workaround_toolbelt(
+                sandbox,
+                touched,
+                Path("/dummy/repo/root"),
+                plan_state=plan_state,
+            )
+        }["deterministic_replace_ast_symbol"]
+
+        with (
+            patch("remediation_engine.tools.code_map.language_for_path", return_value="typescript"),
+            patch(
+                "remediation_engine.tools.code_map.parse_source",
+                return_value=MagicMock(root_node=root),
+            ),
+            patch(
+                "remediation_engine.tools.code_map.find_named_symbol",
+                return_value={
+                    "symbol_name": "isAuthorized",
+                    "node_type": "arrow_function",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": arrow_start,
+                    "end_byte": len(source) - 1,
+                    "text": arrow.text,
+                },
+            ),
+        ):
+            result = tool.invoke(
+                {
+                    "file_path": "lib/insecurity.ts",
+                    "symbol_name": "isAuthorized",
+                    "replacement": "const isAuthorized = () => expressjwt({ algorithms: ['RS256'] });",
+                }
+            )
+
+        assert result.startswith("SUCCESS:")
+        assert "lib/insecurity.ts" in touched
+        written = sandbox.write_file.call_args.args[1]
+        assert "export const isAuthorized = const" not in written
+        assert "const isAuthorized = () => expressjwt" in written
 
 
 class TestModifyNpmDependency:
@@ -326,35 +501,24 @@ class TestRevertWorkspaceFile:
         host_repo.mkdir()
         baseline_file = host_repo / "package.json"
         baseline_json = {
-            "dependencies": {
-                "lodash": "4.17.20",
-                "axios": "0.21.1"
-            },
-            "devDependencies": {
-                "jest": "26.6.3"
-            }
+            "dependencies": {"lodash": "4.17.20", "axios": "0.21.1"},
+            "devDependencies": {"jest": "26.6.3"},
         }
         import json
+
         baseline_file.write_text(json.dumps(baseline_json, indent=2), encoding="utf-8")
 
         sandbox_json = {
-            "dependencies": {
-                "lodash": "4.17.21",
-                "axios": "0.22.0",
-                "newpkg": "1.0.0"
-            },
-            "devDependencies": {
-                "jest": "27.0.0"
-            }
+            "dependencies": {"lodash": "4.17.21", "axios": "0.22.0", "newpkg": "1.0.0"},
+            "devDependencies": {"jest": "27.0.0"},
         }
         sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
 
         tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
 
-        result = tools["revert_workspace_file"].invoke({
-            "file_path": "package.json",
-            "package_name": "axios"
-        })
+        result = tools["revert_workspace_file"].invoke(
+            {"file_path": "package.json", "package_name": "axios"}
+        )
 
         assert result.startswith("SUCCESS:")
         assert sandbox.write_file.called
@@ -374,28 +538,19 @@ class TestRevertWorkspaceFile:
         host_repo = tmp_path / "host"
         host_repo.mkdir()
         baseline_file = host_repo / "package.json"
-        baseline_json = {
-            "dependencies": {
-                "lodash": "4.17.20"
-            }
-        }
+        baseline_json = {"dependencies": {"lodash": "4.17.20"}}
         import json
+
         baseline_file.write_text(json.dumps(baseline_json, indent=2), encoding="utf-8")
 
-        sandbox_json = {
-            "dependencies": {
-                "lodash": "4.17.20",
-                "newpkg": "1.0.0"
-            }
-        }
+        sandbox_json = {"dependencies": {"lodash": "4.17.20", "newpkg": "1.0.0"}}
         sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
 
         tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
 
-        result = tools["revert_workspace_file"].invoke({
-            "file_path": "package.json",
-            "package_name": "newpkg"
-        })
+        result = tools["revert_workspace_file"].invoke(
+            {"file_path": "package.json", "package_name": "newpkg"}
+        )
 
         assert result.startswith("SUCCESS:")
         written_content = sandbox.write_file.call_args[0][1]
@@ -414,10 +569,9 @@ class TestRevertWorkspaceFile:
 
         tools = _workaround_tool_map(sandbox, host_repo_root=host_repo)
 
-        result = tools["revert_workspace_file"].invoke({
-            "file_path": "src/index.js",
-            "package_name": "axios"
-        })
+        result = tools["revert_workspace_file"].invoke(
+            {"file_path": "src/index.js", "package_name": "axios"}
+        )
 
         assert result.startswith("ERROR:")
         assert "only be specified for package.json files" in result
@@ -498,9 +652,7 @@ class TestValidateCodeSyntax:
             stderr="",
             duration_seconds=0.1,
         )
-        tools = _workaround_tool_map(sandbox)
-
-        result = tools["validate_code_syntax"].invoke({"file_path": "src/index.js"})
+        result = _make_validate_code_syntax_tool(sandbox).invoke({"file_path": "src/index.js"})
 
         assert result.startswith("SUCCESS:")
         sandbox.run.assert_called_once()
@@ -514,9 +666,7 @@ class TestValidateCodeSyntax:
             stderr="",
             duration_seconds=0.1,
         )
-        tools = _workaround_tool_map(sandbox)
-
-        result = tools["validate_code_syntax"].invoke({"file_path": "src/index.ts"})
+        result = _make_validate_code_syntax_tool(sandbox).invoke({"file_path": "src/index.ts"})
 
         assert result.startswith("SUCCESS:")
         assert "esbuild" in sandbox.run.call_args[0][0]
@@ -529,26 +679,20 @@ class TestValidateCodeSyntax:
             stderr="}",
             duration_seconds=0.1,
         )
-        tools = _workaround_tool_map(sandbox)
-
-        result = tools["validate_code_syntax"].invoke({"file_path": "routes/login.ts"})
+        result = _make_validate_code_syntax_tool(sandbox).invoke({"file_path": "routes/login.ts"})
 
         assert result.startswith("FAILURE:")
         assert "TS1005" in result
 
     def test_unsupported_extension_returns_error(self):
         sandbox = MagicMock()
-        tools = _workaround_tool_map(sandbox)
-
-        result = tools["validate_code_syntax"].invoke({"file_path": "README.md"})
+        result = _make_validate_code_syntax_tool(sandbox).invoke({"file_path": "README.md"})
 
         assert result.startswith("ERROR:")
 
     def test_absolute_path_rejected(self):
         sandbox = MagicMock()
-        tools = _workaround_tool_map(sandbox)
-
-        result = tools["validate_code_syntax"].invoke({"file_path": "/etc/passwd"})
+        result = _make_validate_code_syntax_tool(sandbox).invoke({"file_path": "/etc/passwd"})
 
         assert result.startswith("ERROR:")
 
@@ -571,7 +715,9 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp
+        ):
             res = tools["search_web"].invoke({"query": "express-jwt v8 migration"})
 
         assert "Found 3 results" in res
@@ -593,7 +739,10 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.post", side_effect=Exception("timeout")):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.post",
+            side_effect=Exception("timeout"),
+        ):
             res = tools["search_web"].invoke({"query": "express-jwt v8"})
 
         assert "ERROR: Web search failed" in res
@@ -608,11 +757,13 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp
+        ):
             for _ in range(3):
                 res = tools["search_web"].invoke({"query": "query"})
                 assert "Found 1 results" in res
-            
+
             res_exceeded = tools["search_web"].invoke({"query": "query 4"})
             assert "ERROR: search_web call limit reached (max 3 per session)" in res_exceeded
 
@@ -625,7 +776,9 @@ class TestSearchWeb:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.post", return_value=mock_resp
+        ):
             res = tools["search_web"].invoke({"query": "query"})
 
         assert "No results found for this query" in res
@@ -640,7 +793,9 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp) as mock_get:
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp
+        ) as mock_get:
             res = tools["read_web_page"].invoke({"url": "https://example.com/guide"})
 
         mock_get.assert_called_once_with(
@@ -659,7 +814,9 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.get", return_value=mock_resp
+        ):
             res = tools["read_web_page"].invoke({"url": "https://example.com/huge"})
 
         assert "[Content truncated at 16000 characters...]" in res
@@ -668,9 +825,35 @@ class TestReadWebPage:
         sandbox = MagicMock()
         tools = _workaround_tool_map(sandbox)
 
-        with patch("remediation_engine.orchestration.remedy_tools.requests.get", side_effect=Exception("Connection reset")):
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.get",
+            side_effect=Exception("Connection reset"),
+        ):
             res = tools["read_web_page"].invoke({"url": "https://example.com/error"})
 
         assert "ERROR: Failed to read web page" in res
 
+    def test_github_urls_use_github_api_instead_of_jina(self):
+        mock_resp = MagicMock()
+        mock_resp.text = "# Migration Guide\nUse expressjwt from the named export."
+        mock_resp.raise_for_status = MagicMock()
+        sandbox = MagicMock()
+        tools = _workaround_tool_map(sandbox)
 
+        with patch(
+            "remediation_engine.orchestration.remedy_tools.requests.get",
+            return_value=mock_resp,
+        ) as mock_get:
+            res = tools["read_web_page"].invoke(
+                {"url": "https://github.com/auth0/express-jwt/blob/v8.5.1/README.md"}
+            )
+
+        mock_get.assert_called_once_with(
+            "https://api.github.com/repos/auth0/express-jwt/contents/README.md?ref=v8.5.1",
+            headers={
+                "Accept": "application/vnd.github.raw+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=15,
+        )
+        assert "Use expressjwt from the named export" in res

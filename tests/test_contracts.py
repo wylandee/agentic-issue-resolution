@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for remediation_engine.contracts.schemas.
 
 Coverage goals
@@ -15,8 +15,8 @@ Coverage goals
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from uuid import UUID, uuid4
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -29,6 +29,8 @@ from remediation_engine.contracts import (
     EditResult,
     EditStatus,
     FailureCategory,
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
@@ -41,15 +43,12 @@ from remediation_engine.contracts import (
     ValidationResult,
     ValidationStatus,
     VulnerabilityIssue,
-    FixPlan,
-    FixPlanStatus,
 )
 from remediation_engine.contracts.schemas import (
     CWEEntry,
     FailingTest,
     LineRange,
 )
-
 
 # ===========================================================================
 # Helpers
@@ -148,17 +147,20 @@ class TestCWEEntry:
 
 
 class TestSeverityCoercion:
-    @pytest.mark.parametrize("raw,expected", [
-        ("high", Severity.HIGH),
-        ("HIGH", Severity.HIGH),
-        ("critical", Severity.CRITICAL),
-        ("medium", Severity.MEDIUM),
-        ("low", Severity.LOW),
-        ("info", Severity.INFO),
-        ("garbage", Severity.UNKNOWN),
-        ("", Severity.UNKNOWN),
-        (None, Severity.UNKNOWN),
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("high", Severity.HIGH),
+            ("HIGH", Severity.HIGH),
+            ("critical", Severity.CRITICAL),
+            ("medium", Severity.MEDIUM),
+            ("low", Severity.LOW),
+            ("info", Severity.INFO),
+            ("garbage", Severity.UNKNOWN),
+            ("", Severity.UNKNOWN),
+            (None, Severity.UNKNOWN),
+        ],
+    )
     def test_coerce(self, raw, expected):
         issue = VulnerabilityIssue(
             source=IssueSource.SEMGREP,
@@ -474,7 +476,7 @@ class TestEditResult:
             unified_diff="--- a/routes/userProfile.ts\n+++ b/routes/userProfile.ts\n@@ -61,1 +61,1 @@\n-old\n+new",
             lines_added=1,
             lines_removed=1,
-            applied_at=datetime.now(timezone.utc),
+            applied_at=datetime.now(UTC),
         )
 
     def test_applied(self):
@@ -529,7 +531,12 @@ class TestValidationResult:
             exit_code=1,
             command=["npm", "test"],
             failing_tests=[
-                FailingTest(name="routes/userProfile.spec.ts > should sanitize query", file="routes/userProfile.spec.ts", line=88, message="Expected 200 but got 500"),
+                FailingTest(
+                    name="routes/userProfile.spec.ts > should sanitize query",
+                    file="routes/userProfile.spec.ts",
+                    line=88,
+                    message="Expected 200 but got 500",
+                ),
             ],
             stderr_tail="Error: Cannot find module 'sanitize-html'",
             dependency_conflict_hints=["sanitize-html is not installed"],
@@ -740,7 +747,7 @@ class TestEndToEndSASTTrajectory:
             unified_diff="--- a/routes/userProfile.ts\n+++ b/routes/userProfile.ts",
             lines_added=1,
             lines_removed=2,
-            applied_at=datetime.now(timezone.utc),
+            applied_at=datetime.now(UTC),
         )
         apply_event = TrajectoryEvent(
             issue_id=issue.id,
@@ -864,7 +871,9 @@ class TestFixPlan:
         assert fp.workaround_snippets is None
 
     def test_version_found_missing_version_raises(self):
-        with pytest.raises(ValidationError, match="status='version_found' requires a non-empty fixed_version"):
+        with pytest.raises(
+            ValidationError, match="status='version_found' requires a non-empty fixed_version"
+        ):
             FixPlan(
                 status=FixPlanStatus.VERSION_FOUND,
                 fixed_version=None,
@@ -873,7 +882,9 @@ class TestFixPlan:
             )
 
     def test_version_found_with_snippets_raises(self):
-        with pytest.raises(ValidationError, match="status='version_found' must have workaround_snippets=None"):
+        with pytest.raises(
+            ValidationError, match="status='version_found' must have workaround_snippets=None"
+        ):
             FixPlan(
                 status=FixPlanStatus.VERSION_FOUND,
                 fixed_version="1.2.3",
@@ -894,7 +905,10 @@ class TestFixPlan:
         assert fp.fixed_version is None
 
     def test_workaround_found_missing_snippets_raises(self):
-        with pytest.raises(ValidationError, match="status='workaround_found' requires a non-empty workaround_snippets list"):
+        with pytest.raises(
+            ValidationError,
+            match="status='workaround_found' requires a non-empty workaround_snippets list",
+        ):
             FixPlan(
                 status=FixPlanStatus.WORKAROUND_FOUND,
                 workaround_snippets=None,
@@ -903,7 +917,9 @@ class TestFixPlan:
             )
 
     def test_workaround_found_with_version_raises(self):
-        with pytest.raises(ValidationError, match="status='workaround_found' must have fixed_version=None"):
+        with pytest.raises(
+            ValidationError, match="status='workaround_found' must have fixed_version=None"
+        ):
             FixPlan(
                 status=FixPlanStatus.WORKAROUND_FOUND,
                 fixed_version="1.2.3",
@@ -932,12 +948,12 @@ class TestFixPlan:
             )
 
     def test_no_fix_with_snippets_raises(self):
-        with pytest.raises(ValidationError, match="status='no_fix' must have workaround_snippets=None"):
+        with pytest.raises(
+            ValidationError, match="status='no_fix' must have workaround_snippets=None"
+        ):
             FixPlan(
                 status=FixPlanStatus.NO_FIX,
                 workaround_snippets=["snippet"],
                 instruction="No fix available",
                 strategy_used="none",
             )
-
-

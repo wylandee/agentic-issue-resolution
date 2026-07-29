@@ -1,10 +1,19 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from uuid import UUID, uuid4
 from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
 
-from remediation_engine.contracts.schemas import IssueSource, IssueType, Severity, VulnerabilityGroup, VulnerabilityIssue
-from remediation_engine.orchestration.langsmith_config import build_phase5_runnable_config, resolve_phase5_trace_url
+from remediation_engine.contracts.schemas import (
+    IssueSource,
+    IssueType,
+    Severity,
+    VulnerabilityGroup,
+    VulnerabilityIssue,
+)
+from remediation_engine.orchestration.langsmith_config import (
+    build_phase5_runnable_config,
+    resolve_phase5_trace_url,
+)
 from remediation_engine.orchestration.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
 
 
@@ -114,5 +123,3 @@ class TestPhase5TraceUrlResolution:
 
         assert result is None
         mock_wait.assert_called_once_with()
-
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Phase 5 LangSmith tracing helpers.
 
 This module is intentionally scoped to the Phase 5 orchestrator entrypoint so
@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import Client
@@ -62,7 +62,7 @@ def build_phase5_runnable_config(
     return config, run_id
 
 
-def resolve_phase5_trace_url(run_id: uuid.UUID) -> Optional[str]:
+def resolve_phase5_trace_url(run_id: uuid.UUID) -> str | None:
     """
     Resolve a LangSmith trace URL for a completed Phase 5 run.
 
@@ -77,5 +77,3 @@ def resolve_phase5_trace_url(run_id: uuid.UUID) -> Optional[str]:
     except Exception as exc:  # pragma: no cover - defensive logging path
         log.warning("Phase 5 LangSmith URL lookup failed for run_id=%s: %s", run_id, exc)
         return None
-
-

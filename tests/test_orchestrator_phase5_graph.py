@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for the Phase 5 LangGraph orchestrator wiring.
 """
 
@@ -30,9 +30,9 @@ from remediation_engine.orchestration import (
 )
 from remediation_engine.orchestration.graph import (
     route_after_workspace_builder,
+    run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
-    run_qa_critic_from_orchestrator,
 )
 from remediation_engine.orchestration.supervisor_node import _instruction_digest
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
@@ -135,9 +135,12 @@ class TestPhase5RunOrchestrator:
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(None, None),
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
@@ -162,12 +165,16 @@ class TestPhase5RunOrchestrator:
             "metadata": {"repo_name": tmp_path.name},
         }
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(config, run_id),
-        ), patch(
-            "remediation_engine.orchestration.graph.resolve_phase5_trace_url",
-            return_value="https://smith.langchain.com/o/test/projects/p/runs/r",
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(config, run_id),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.resolve_phase5_trace_url",
+                return_value="https://smith.langchain.com/o/test/projects/p/runs/r",
+            ),
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
@@ -175,7 +182,9 @@ class TestPhase5RunOrchestrator:
         assert invoked_state["repo_root"] == str(tmp_path)
         assert invoked_config == config
         assert result["langsmith_run_id"] == str(run_id)
-        assert result["langsmith_trace_url"] == "https://smith.langchain.com/o/test/projects/p/runs/r"
+        assert (
+            result["langsmith_trace_url"] == "https://smith.langchain.com/o/test/projects/p/runs/r"
+        )
 
     def test_run_orchestrator_succeeds_when_trace_url_lookup_fails(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
@@ -184,12 +193,16 @@ class TestPhase5RunOrchestrator:
         run_id = uuid4()
         config = {"run_id": run_id}
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(config, run_id),
-        ), patch(
-            "remediation_engine.orchestration.graph.resolve_phase5_trace_url",
-            return_value=None,
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(config, run_id),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.resolve_phase5_trace_url",
+                return_value=None,
+            ),
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
@@ -204,9 +217,12 @@ class TestPhase5RunOrchestrator:
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(None, None),
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
@@ -224,30 +240,37 @@ class TestPhase5RunOrchestrator:
         mock_engine = MagicMock()
         mock_engine.invoke.side_effect = RuntimeError("graph exploded")
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(None, None),
-        ), pytest.raises(RuntimeError, match="graph exploded"):
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
+            pytest.raises(RuntimeError, match="graph exploded"),
+        ):
             run_orchestrator(str(tmp_path), groups)
 
         files = list(trajectory_dir.glob("*.md"))
         assert len(files) == 1
         assert "graph exploded" in files[0].read_text(encoding="utf-8")
 
-    def test_trajectory_export_failure_does_not_mask_orchestration_error(
-        self, tmp_path
-    ):
+    def test_trajectory_export_failure_does_not_mask_orchestration_error(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
         mock_engine.invoke.side_effect = RuntimeError("graph exploded")
 
-        with patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine), patch(
-            "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-            return_value=(None, None),
-        ), patch(
-            "remediation_engine.orchestration.graph.export_phase5_trajectory",
-            side_effect=OSError("disk full"),
-        ), pytest.raises(RuntimeError, match="graph exploded"):
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.export_phase5_trajectory",
+                side_effect=OSError("disk full"),
+            ),
+            pytest.raises(RuntimeError, match="graph exploded"),
+        ):
             run_orchestrator(str(tmp_path), groups)
 
 
@@ -260,7 +283,9 @@ class TestPhase5GraphIntegration:
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["task_queue"] = {"task-1": task}
         state["active_target_task_ids"] = ["task-1"]
-        state["supervisor_instructions"] = "Use registry lookup to find a safe compatible remediation."
+        state["supervisor_instructions"] = (
+            "Use registry lookup to find a safe compatible remediation."
+        )
         state["action_summaries"] = [
             AgentActionSummary(
                 task_id="task-1",
@@ -271,12 +296,20 @@ class TestPhase5GraphIntegration:
 
         update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
 
-        with patch("remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent):
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
+        ):
             run_update_subagent_from_orchestrator(state)
 
         subagent_state = update_subagent.call_args[0][0]
-        assert subagent_state["target_tasks"][0].instruction == 'Update "lodash" in package.json to version "4.17.22".'
-        assert subagent_state["previous_action_summaries_by_task"]["task-1"] == "Previous version bump failed manifest validation."
+        assert (
+            subagent_state["target_tasks"][0].instruction
+            == 'Update "lodash" in package.json to version "4.17.22".'
+        )
+        assert (
+            subagent_state["previous_action_summaries_by_task"]["task-1"]
+            == "Previous version bump failed manifest validation."
+        )
         assert "supervisor_instruction" not in subagent_state
 
     def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path):
@@ -303,7 +336,9 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        with patch("remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent):
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
+        ):
             result = run_update_subagent_from_orchestrator(state)
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
@@ -429,9 +464,14 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node", workspace_builder), \
-             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor), \
-             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown):
+        with (
+            patch(
+                "remediation_engine.orchestration.graph.run_workspace_builder_node",
+                workspace_builder,
+            ),
+            patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
+            patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
+        ):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
@@ -452,8 +492,13 @@ class TestPhase5GraphIntegration:
         )
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
-        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node", workspace_builder), \
-             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown):
+        with (
+            patch(
+                "remediation_engine.orchestration.graph.run_workspace_builder_node",
+                workspace_builder,
+            ),
+            patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
+        ):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
@@ -466,10 +511,12 @@ class TestPhase5GraphIntegration:
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         gid = groups[0].group_id
 
-        workspace_builder = MagicMock(return_value={
-            "status": "workspace_ready",
-            "workspace_volume": "vol123",
-        })
+        workspace_builder = MagicMock(
+            return_value={
+                "status": "workspace_ready",
+                "workspace_volume": "vol123",
+            }
+        )
 
         call_count = {"n": 0}
 
@@ -503,10 +550,17 @@ class TestPhase5GraphIntegration:
         update_subagent = MagicMock(return_value={"errors": [], "group_statuses": {}})
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
-        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node", workspace_builder), \
-             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor), \
-             patch("remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent), \
-             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown):
+        with (
+            patch(
+                "remediation_engine.orchestration.graph.run_workspace_builder_node",
+                workspace_builder,
+            ),
+            patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
+            patch(
+                "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
+            ),
+            patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
+        ):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
@@ -517,10 +571,12 @@ class TestPhase5GraphIntegration:
         """Supervisor routes to qa_critic once, then to teardown."""
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
-        workspace_builder = MagicMock(return_value={
-            "status": "workspace_ready",
-            "workspace_volume": "vol123",
-        })
+        workspace_builder = MagicMock(
+            return_value={
+                "status": "workspace_ready",
+                "workspace_volume": "vol123",
+            }
+        )
 
         call_count = {"n": 0}
 
@@ -551,23 +607,30 @@ class TestPhase5GraphIntegration:
             }
 
         supervisor = MagicMock(side_effect=supervisor_side_effect)
-        qa_critic = MagicMock(return_value={
-            "qa_evaluations": {},
-            "eval_status": "all_passed",
-            "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
-            "baseline_scan_identifiers": ["CVE-2021-44228"],
-            "post_remediation_scan_identifiers": ["CVE-2025-10001"],
-            "new_vulnerability_identifiers": ["CVE-2025-10001"],
-            "new_vulnerability_status": "detected",
-            "status": "qa_completed",
-            "errors": [],
-        })
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {},
+                "eval_status": "all_passed",
+                "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
+                "baseline_scan_identifiers": ["CVE-2021-44228"],
+                "post_remediation_scan_identifiers": ["CVE-2025-10001"],
+                "new_vulnerability_identifiers": ["CVE-2025-10001"],
+                "new_vulnerability_status": "detected",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
-        with patch("remediation_engine.orchestration.graph.run_workspace_builder_node", workspace_builder), \
-             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor), \
-             patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic), \
-             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown):
+        with (
+            patch(
+                "remediation_engine.orchestration.graph.run_workspace_builder_node",
+                workspace_builder,
+            ),
+            patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
+            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
+        ):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
@@ -613,5 +676,3 @@ class TestPhase5Exports:
     def test_graph_compiles_without_error(self):
         graph = build_orchestrator_graph()
         assert graph is not None
-
-

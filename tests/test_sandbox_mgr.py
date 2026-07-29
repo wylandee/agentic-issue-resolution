@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_sandbox_mgr.py â€” Unit tests for remediation_engine.runtime.sandbox_mgr.
 
 All Docker SDK interactions are mocked; no real Docker daemon is required.
@@ -14,7 +14,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from remediation_engine.contracts import CommandResult
-from remediation_engine.runtime.sandbox_mgr import DockerSandbox, _make_tar_archive, get_docker_client
+from remediation_engine.runtime.sandbox_mgr import (
+    DockerSandbox,
+    _make_tar_archive,
+    get_docker_client,
+)
 
 
 class _ImageNotFound(Exception):
@@ -82,12 +86,14 @@ class TestDockerClientHelper:
     def test_get_docker_client_raises_on_connection_error(self):
         docker_mod, docker_errors, client, _container = _docker_modules()
         client.ping.side_effect = Exception("Connection refused")
-        with patch.dict(
-            "sys.modules",
-            {"docker": docker_mod, "docker.errors": docker_errors},
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="Docker daemon unreachable"),
         ):
-            with pytest.raises(RuntimeError, match="Docker daemon unreachable"):
-                get_docker_client()
+            get_docker_client()
 
 
 class TestTarArchiveHelper:
@@ -106,7 +112,9 @@ class TestTarArchiveHelper:
         (tmp_path / ".git").mkdir()
         (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
         (tmp_path / "node_modules").mkdir()
-        (tmp_path / "node_modules" / "leftpad.js").write_text("module.exports = {}", encoding="utf-8")
+        (tmp_path / "node_modules" / "leftpad.js").write_text(
+            "module.exports = {}", encoding="utf-8"
+        )
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "index.js").write_text("console.log('ok')", encoding="utf-8")
 
@@ -270,5 +278,3 @@ class TestSandboxFileIO:
         sandbox = self._started_sandbox(tmp_path, client, container)
 
         assert sandbox.read_file("missing.json") is None
-
-

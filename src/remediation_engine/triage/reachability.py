@@ -1,4 +1,4 @@
-﻿"""
+"""
 reachability.py - Deterministic SCA package reachability analysis.
 
 Scans application source files for import/require statements and uses the
@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from remediation_engine.contracts.schemas import IssueType, VulnerabilityGroup
 from remediation_engine.tools.code_map import (
@@ -123,5 +123,3 @@ def analyze_reachability(groups: list[VulnerabilityGroup], repo_root: str | Path
             group.is_reachable = False
         else:
             group.is_reachable = None
-
-

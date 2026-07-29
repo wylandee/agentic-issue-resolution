@@ -6,19 +6,27 @@ from __future__ import annotations
 
 import logging
 import os
-import requests
+import re
 import shlex
+from base64 import b64decode
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Set
+from typing import Any
+from urllib.parse import quote, urlparse
 
+import requests
 from langchain_core.tools import tool
 
+from remediation_engine.contracts.schemas import WorkaroundEdit
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
 
 _MANIFEST_SYNC_TIMEOUT_SECONDS = 120
 _SYNTAX_CHECK_TIMEOUT_SECONDS = 30
+_NPM_TEST_TIMEOUT_SECONDS = 180
+_LINT_CHECK_TIMEOUT_SECONDS = 60
+_RUNTIME_SMOKE_TIMEOUT_SECONDS = 30
 
 _REPO_MAP_MAX_ENTRIES = 400
 _READ_FILE_MAX_LINES = 200
@@ -33,23 +41,30 @@ _SERPER_MAX_RESULTS = 3
 _SEARCH_WEB_MAX_CALLS = 3
 
 _JINA_READER_URL_PREFIX = "https://r.jina.ai/"
+_GITHUB_API_URL_PREFIX = "https://api.github.com/"
 _READ_WEB_PAGE_TIMEOUT = 15
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 
 
 def _validate_workspace_path(file_path: str) -> str:
-    candidate = (file_path or "").strip()
+    candidate = (file_path or "").strip().replace("\\", "/")
     if not candidate:
         raise ValueError("file_path is required.")
-    if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
+
+    if candidate.startswith("/workspace/"):
+        candidate = candidate[len("/workspace/") :]
+
+    if os.path.isabs(candidate) or candidate.startswith("/"):
         raise ValueError(f"Rejected absolute file path '{candidate}'.")
-    
+
     parts = Path(candidate).parts
     if ".." in parts:
         raise ValueError(f"Rejected path traversal in '{candidate}'.")
     if parts and parts[0] in ("build", "dist"):
-        raise ValueError(f"Accessing compiled files in '{parts[0]}/' is strictly forbidden. Please modify the original source files instead.")
-        
+        raise ValueError(
+            f"Accessing compiled files in '{parts[0]}/' is strictly forbidden. Please modify the original source files instead."
+        )
+
     return candidate.replace("\\", "/")
 
 
@@ -76,31 +91,24 @@ def _workspace_dir_for_manifest(manifest_path: str) -> str:
     return f"/workspace/{parent}"
 
 
-def _normalize_manifest_targets(target_manifest_paths: Iterable[str]) -> List[str]:
+def _normalize_manifest_targets(target_manifest_paths: Iterable[str]) -> list[str]:
     """Return stable, validated package.json targets for one update batch."""
     manifest_paths = sorted(
-        {
-            _validate_workspace_path(path)
-            for path in target_manifest_paths
-            if path
-        }
+        {_validate_workspace_path(path) for path in target_manifest_paths if path}
     )
-    invalid = [
-        path for path in manifest_paths if Path(path).name != "package.json"
-    ]
+    invalid = [path for path in manifest_paths if Path(path).name != "package.json"]
     if invalid:
         raise ValueError(
-            "All target manifest paths must point to package.json files. "
-            f"Invalid values: {invalid}"
+            f"All target manifest paths must point to package.json files. Invalid values: {invalid}"
         )
     return manifest_paths
 
 
 def _normalize_package_manifest_targets(
     package_manifest_paths: Mapping[str, Iterable[str]],
-) -> Dict[str, List[str]]:
+) -> dict[str, list[str]]:
     """Return validated package-to-manifest targets for one update batch."""
-    normalized: Dict[str, List[str]] = {}
+    normalized: dict[str, list[str]] = {}
     for package_name, manifest_paths in package_manifest_paths.items():
         package_key = (package_name or "").strip()
         if not package_key:
@@ -137,7 +145,10 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
     return read_repository_map
 
 
-def _make_read_workspace_file_tool(sandbox: DockerSandbox):
+def _make_read_workspace_file_tool(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any] | None = None,
+):
     @tool
     def read_workspace_file(
         file_path: str,
@@ -155,6 +166,9 @@ def _make_read_workspace_file_tool(sandbox: DockerSandbox):
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
             return f"ERROR: {exc}"
+
+        if plan_state is not None:
+            plan_state.setdefault("read_files", set()).add(rel_path)
 
         content = sandbox.read_file(rel_path)
         if content is None:
@@ -201,11 +215,11 @@ def _make_read_workspace_file_tool(sandbox: DockerSandbox):
 
 def _make_revert_workspace_file_tool(
     sandbox: DockerSandbox,
-    touched_files: Set[str],
+    touched_files: set[str],
     host_repo_root: Path,
 ):
     @tool
-    def revert_workspace_file(file_path: str, package_name: Optional[str] = None) -> str:
+    def revert_workspace_file(file_path: str, package_name: str | None = None) -> str:
         """
         Restore a workspace file to its original host baseline state.
 
@@ -230,6 +244,7 @@ def _make_revert_workspace_file_tool(
                 return "ERROR: package_name can only be specified for package.json files."
 
             import json
+
             try:
                 baseline_data = json.loads(content)
             except Exception as exc:
@@ -290,13 +305,13 @@ def _make_revert_workspace_file_tool(
 
 def _make_modify_npm_dependency_tool(
     sandbox: DockerSandbox,
-    touched_files: Set[str],
+    touched_files: set[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
-    attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
-    override_required_packages: Optional[Iterable[str]] = None,
+    attempted_versions_by_package: Mapping[str, set[str]] | None = None,
+    override_required_packages: Iterable[str] | None = None,
     require_planning_answers: bool = False,
-    planning_state: Optional[Dict[str, bool]] = None,
-    execution_state: Optional[Dict[str, int | bool]] = None,
+    planning_state: dict[str, bool] | None = None,
+    execution_state: dict[str, int | bool] | None = None,
 ):
     allowed_manifest_paths_by_package = {
         package_name: set(manifest_paths)
@@ -339,10 +354,7 @@ def _make_modify_npm_dependency_tool(
                 "ERROR: dependency_type must be strictly one of: "
                 "'dependencies', 'devDependencies', or 'overrides'."
             )
-        if (
-            package_name in override_required_package_names
-            and dependency_type != "overrides"
-        ):
+        if package_name in override_required_package_names and dependency_type != "overrides":
             return (
                 f"ERROR: Package '{package_name}' is constrained to npm overrides for "
                 "this task. Retry modify_npm_dependency with dependency_type='overrides'. "
@@ -378,9 +390,7 @@ def _make_modify_npm_dependency_tool(
         else:
             cmd_str = f"cd {shlex.quote(workspace_dir)} && {npm_cmd}"
 
-        logger.info(
-            "remedy_tools: modifying npm dependency in sandbox: %s", cmd_str
-        )
+        logger.info("remedy_tools: modifying npm dependency in sandbox: %s", cmd_str)
         result = sandbox.run(cmd_str)
         if result.exit_code == 0:
             touched_files.add(rel_manifest)
@@ -403,7 +413,7 @@ def _make_modify_npm_dependency_tool(
 def _make_validate_manifest_sync_tool(
     sandbox: DockerSandbox,
     target_manifest_paths: Iterable[str],
-    execution_state: Optional[Dict[str, int | bool]] = None,
+    execution_state: dict[str, int | bool] | None = None,
 ):
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
 
@@ -415,7 +425,9 @@ def _make_validate_manifest_sync_tool(
         if execution_state is not None:
             calls = int(execution_state.get("validation_calls", 0))
             if calls >= 1:
-                return "ERROR: validate_manifest_sync may only be called once per update worker run."
+                return (
+                    "ERROR: validate_manifest_sync may only be called once per update worker run."
+                )
             if not execution_state.get("edits_started", False):
                 return "ERROR: validate_manifest_sync is only allowed after manifest edits."
             execution_state["validation_calls"] = calls + 1
@@ -437,37 +449,100 @@ def _make_validate_manifest_sync_tool(
                     f"stderr:\n{result.stderr}"
                 )
 
-        return (
-            "SUCCESS: Manifest synchronization succeeded for "
-            f"{', '.join(manifest_paths)}."
-        )
+        return f"SUCCESS: Manifest synchronization succeeded for {', '.join(manifest_paths)}."
 
     return validate_manifest_sync
 
 
+def _is_prohibited_target(rel_path: str) -> bool:
+    """Check if file is a manifest or test file that workaround subagent must not modify."""
+    norm = rel_path.replace("\\", "/").lstrip("/")
+    basename = Path(norm).name.lower()
+
+    if basename in (
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pom.xml",
+        "build.gradle",
+        "requirements.txt",
+        "pyproject.toml",
+    ):
+        return True
+
+    parts = norm.lower().split("/")
+    if any(p in ("test", "tests", "__tests__", "spec", "specs") for p in parts):
+        return True
+
+    if any(
+        basename.endswith(ext)
+        for ext in (
+            ".test.js",
+            ".spec.js",
+            ".test.ts",
+            ".spec.ts",
+            ".test.jsx",
+            ".spec.jsx",
+            ".test.tsx",
+            ".spec.tsx",
+            "_test.py",
+            "_spec.py",
+        )
+    ):
+        return True
+
+    return False
+
+
 def _make_deterministic_search_replace_tool(
     sandbox: DockerSandbox,
-    touched_files: Set[str],
-    plan_state: Optional[Dict[str, bool]] = None,
+    touched_files: set[str],
+    plan_state: dict[str, Any] | None = None,
 ):
     @tool
     def deterministic_search_replace(
         file_path: str,
         old_text: str,
         new_text: str,
+        symbol_name: str | None = None,
     ) -> str:
         """
         Apply an exact one-time search/replace to a workspace file.
         """
         if plan_state is not None and not plan_state.get("recorded", False):
-            return (
-                "ERROR: You MUST call record_plan before making any code edits with deterministic_search_replace."
-            )
+            return "ERROR: You MUST call record_plan before making any code edits with deterministic_search_replace."
 
         try:
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
             return f"ERROR: {exc}"
+
+        if _is_prohibited_target(rel_path):
+            return "ERROR: Workaround workers cannot modify dependency manifests or test files."
+
+        planned_files = {
+            str(path).replace("\\", "/").lstrip("/")
+            for path in (plan_state or {}).get("planned_files", [])
+        }
+        if plan_state is not None and plan_state.get("recorded") and planned_files:
+            if rel_path not in planned_files:
+                return (
+                    f"ERROR: '{rel_path}' is outside the recorded workaround plan. "
+                    "Re-run record_plan with every causally related source file before editing it; "
+                    "do not apply an isolated or unrelated fix."
+                )
+
+        suffix = Path(rel_path).suffix.lower()
+        if suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+            inspected_files = plan_state.get("inspected_files", set()) if plan_state else set()
+            fallback_files = plan_state.get("fallback_files", set()) if plan_state else set()
+            if rel_path not in inspected_files and rel_path not in fallback_files:
+                return (
+                    f"ERROR: AST inspection required before first edit on '{rel_path}'. "
+                    "Use inspect_ast_symbol for the target symbol, or use read_workspace_file "
+                    "and document a no-symbol fallback in record_plan before editing."
+                )
 
         current = sandbox.read_file(rel_path)
         if current is None:
@@ -491,17 +566,204 @@ def _make_deterministic_search_replace_tool(
             return "ERROR: old_text found multiple times. Make anchor more specific."
 
         updated = current_norm.replace(old_norm, new_norm, 1)
+
         sandbox.write_file(rel_path, _restore_newlines(updated, newline_style))
+
+        syntax_tool = _make_validate_code_syntax_tool(sandbox)
+        syntax_res = syntax_tool.invoke({"file_path": rel_path})
+        if "FAILURE" in syntax_res or "ERROR" in syntax_res:
+            sandbox.write_file(rel_path, current)
+            return f"ERROR: Replacement produced invalid syntax in '{rel_path}'. Edit reverted.\n{syntax_res}"
+
         touched_files.add(rel_path)
+        if plan_state is not None:
+            edits = plan_state.setdefault("successful_edits", [])
+            edits.append(
+                WorkaroundEdit(
+                    file_path=rel_path,
+                    old_text=old_text,
+                    new_text=new_text,
+                    symbol_name=symbol_name,
+                    edit_index=len(edits),
+                )
+            )
         return f"SUCCESS: File modified: {rel_path}"
 
     return deterministic_search_replace
 
 
+def _make_deterministic_replace_ast_symbol_tool(
+    sandbox: DockerSandbox,
+    touched_files: set[str],
+    plan_state: dict[str, Any] | None = None,
+):
+    @tool
+    def deterministic_replace_ast_symbol(
+        file_path: str,
+        symbol_name: str,
+        replacement: str,
+        line_hint: int = 0,
+    ) -> str:
+        """
+        Replace the complete AST body of a declared function, class, or method.
+        """
+        if plan_state is not None and not plan_state.get("recorded", False):
+            return "ERROR: You MUST call record_plan before making any code edits."
+
+        try:
+            rel_path = _validate_workspace_path(file_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        if _is_prohibited_target(rel_path):
+            return "ERROR: Workaround workers cannot modify dependency manifests or test files."
+
+        planned_files = {
+            str(path).replace("\\", "/").lstrip("/")
+            for path in (plan_state or {}).get("planned_files", [])
+        }
+        if plan_state is not None and plan_state.get("recorded") and planned_files:
+            if rel_path not in planned_files:
+                return (
+                    f"ERROR: '{rel_path}' is outside the recorded workaround plan. "
+                    "Re-run record_plan with every causally related source file before editing it; "
+                    "do not apply an isolated or unrelated fix."
+                )
+
+        content = sandbox.read_file(rel_path)
+        if content is None:
+            return f"ERROR: Could not read '{rel_path}'."
+
+        try:
+            from remediation_engine.tools.code_map import (
+                find_named_symbol,
+                language_for_path,
+                parse_source,
+            )
+        except ImportError:
+            return "ERROR: code_map module is unavailable."
+
+        lang = language_for_path(rel_path)
+        if lang is None:
+            return f"ERROR: No AST parser available for '{rel_path}'."
+
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = parse_source(source_bytes, lang)
+        if tree is None:
+            return "ERROR: tree-sitter unavailable."
+
+        hint = int(line_hint) if line_hint else None
+        try:
+            res = find_named_symbol(tree.root_node, symbol_name, source_bytes, line_hint=hint)
+        except (ValueError, RuntimeError) as exc:
+            return f"ERROR: {exc}"
+
+        if res is None:
+            return (
+                f"NOT FOUND: No declared function, class, or method named '{symbol_name}' found in '{rel_path}'. "
+                "Imported identifiers and package names are not AST symbols. "
+                "Use search_codebase_pattern to find the call site and inspect its "
+                "enclosing declared symbol. For an arrow-function binding, pass the "
+                "variable name only after confirming it is declared in this file; "
+                "this tool accepts either the expression body or a complete enclosing declaration."
+            )
+
+        old_text = res["text"]
+
+        # tree-sitter reports an arrow function's expression as the symbol,
+        # but models often correctly reason in terms of the complete exported
+        # declaration.  If the replacement is declaration-shaped, expand the
+        # replacement scope to the enclosing export/lexical declaration.  This
+        # avoids producing invalid text such as ``export const name = const
+        # name = ...`` while retaining expression-only replacement semantics.
+        replacement_stripped = replacement.strip()
+        declaration_shaped = bool(
+            re.match(
+                r"^(?:export\s+(?:default\s+)?)?(?:const|let|var|function|class)\b",
+                replacement_stripped,
+            )
+        )
+        if res.get("node_type") == "arrow_function" and declaration_shaped:
+            start_byte = int(res.get("start_byte", -1))
+            end_byte = int(res.get("end_byte", -1))
+            enclosing_nodes = []
+            if start_byte >= 0 and end_byte >= 0:
+                stack = [tree.root_node]
+                while stack:
+                    node = stack.pop()
+                    stack.extend(getattr(node, "children", []) or [])
+                    if (
+                        node.start_byte <= start_byte
+                        and node.end_byte >= end_byte
+                        and node.type
+                        in {
+                            "variable_declarator",
+                            "lexical_declaration",
+                            "variable_declaration",
+                            "export_statement",
+                        }
+                    ):
+                        node_text = node.text
+                        if isinstance(node_text, bytes):
+                            node_text = node_text.decode("utf-8", errors="replace")
+                        if symbol_name in str(node_text):
+                            enclosing_nodes.append(node)
+            if enclosing_nodes:
+                replacement_scope = max(
+                    enclosing_nodes,
+                    key=lambda node: node.end_byte - node.start_byte,
+                )
+                raw_scope = replacement_scope.text
+                old_text = (
+                    raw_scope.decode("utf-8", errors="replace")
+                    if isinstance(raw_scope, bytes)
+                    else str(raw_scope)
+                )
+            else:
+                return (
+                    f"ERROR: Replacement for arrow symbol '{symbol_name}' is a complete declaration, "
+                    "but its enclosing declaration could not be identified. "
+                    "Retry with only the arrow/function expression body."
+                )
+        if old_text not in content:
+            return f"ERROR: Symbol text for '{symbol_name}' could not be cleanly anchored in '{rel_path}'."
+
+        count = content.count(old_text)
+        if count > 1:
+            return f"ERROR: Symbol text for '{symbol_name}' appears {count} times in '{rel_path}'. Provide a line_hint."
+
+        updated = content.replace(old_text, replacement, 1)
+
+        sandbox.write_file(rel_path, updated)
+
+        syntax_tool = _make_validate_code_syntax_tool(sandbox)
+        syntax_res = syntax_tool.invoke({"file_path": rel_path})
+        if "FAILURE" in syntax_res or "ERROR" in syntax_res:
+            sandbox.write_file(rel_path, content)
+            return f"ERROR: Replacement produced invalid syntax in '{rel_path}'. Edit reverted.\n{syntax_res}"
+
+        touched_files.add(rel_path)
+        if plan_state is not None:
+            plan_state.setdefault("inspected_files", set()).add(rel_path)
+            edits = plan_state.setdefault("successful_edits", [])
+            edits.append(
+                WorkaroundEdit(
+                    file_path=rel_path,
+                    old_text=old_text,
+                    new_text=replacement,
+                    symbol_name=symbol_name,
+                    edit_index=len(edits),
+                )
+            )
+        return f"SUCCESS: Symbol '{symbol_name}' in '{rel_path}' successfully replaced."
+
+    return deterministic_replace_ast_symbol
+
+
 def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
     @tool
     def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
-        """Lexically search for an extended-regex pattern across workspace files."""
+        """Lexically search for an extended-regex pattern across workspace source files."""
         if not search_pattern or not search_pattern.strip():
             return "ERROR: search_pattern is required."
 
@@ -517,8 +779,9 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
         cmd = (
             f"grep -RInE "
             f"--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
-            f"--include='*.mjs' --include='*.cjs' --include='*.json' "
+            f"--include='*.mjs' --include='*.cjs' "
             f"--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=build --exclude-dir=dist "
+            f"--exclude-dir=data --exclude-dir=reports --exclude-dir=.pytest_cache "
             f"-- '{safe_pattern}' '{search_root}' | sed 's|^./||'"
         )
 
@@ -531,10 +794,7 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
             return f"NO MATCH: Pattern '{search_pattern}' not found in '{td}'."
 
         if result.exit_code not in (0, 1):
-            return (
-                f"ERROR: grep exited {result.exit_code}.\n"
-                f"stderr: {result.stderr.strip()[:500]}"
-            )
+            return f"ERROR: grep exited {result.exit_code}.\nstderr: {result.stderr.strip()[:500]}"
 
         output = result.stdout
         if len(output.encode()) > _SEARCH_MAX_BYTES:
@@ -548,7 +808,10 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
     return search_codebase_pattern
 
 
-def _make_inspect_ast_symbol_tool(sandbox: DockerSandbox):
+def _make_inspect_ast_symbol_tool(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any] | None = None,
+):
     @tool
     def inspect_ast_symbol(
         file_path: str,
@@ -594,9 +857,7 @@ def _make_inspect_ast_symbol_tool(sandbox: DockerSandbox):
                 source_bytes,
                 line_hint=hint,
             )
-        except ValueError as exc:
-            return f"ERROR: {exc}"
-        except RuntimeError as exc:
+        except (ValueError, RuntimeError) as exc:
             return f"ERROR: {exc}"
 
         if result is None:
@@ -606,8 +867,15 @@ def _make_inspect_ast_symbol_tool(sandbox: DockerSandbox):
                 "same symbol. Imported identifiers and package names are not "
                 "AST symbols. Use search_codebase_pattern to find the relevant "
                 "call site, then inspect its enclosing declared symbol, or use "
-                "read_workspace_file and document the fallback in record_plan."
+                "read_workspace_file and document the fallback in record_plan. "
+                "For an arrow-function binding, pass the variable name only after "
+                "confirming it is declared in this file; deterministic_replace_ast_symbol "
+                "accepts either the expression body or a complete enclosing declaration."
             )
+
+        if plan_state is not None:
+            plan_state.setdefault("inspected_symbols", set()).add(f"{rel_path}:{symbol_name}")
+            plan_state.setdefault("inspected_files", set()).add(rel_path)
 
         node_text = result["text"]
         if len(node_text) > _INSPECT_TEXT_MAX_CHARS:
@@ -625,6 +893,100 @@ def _make_inspect_ast_symbol_tool(sandbox: DockerSandbox):
     return inspect_ast_symbol
 
 
+def _make_run_targeted_test_tool(
+    sandbox: DockerSandbox,
+    preferred_test_files: Sequence[str] | None = None,
+):
+    preferred = tuple(
+        path.replace("\\", "/").strip().lstrip("/")
+        for path in (preferred_test_files or [])
+        if isinstance(path, str) and path.strip()
+    )
+
+    @tool
+    def run_targeted_test(
+        test_file: str,
+        test_name: str | None = None,
+    ) -> str:
+        """
+        Run a bounded targeted test for fast diagnostic feedback.
+        Only accepts repository-relative test file paths.
+        """
+        if not test_file or not test_file.strip():
+            return "ERROR: test_file is required."
+
+        norm_path = test_file.replace("\\", "/").strip().lstrip("/")
+        if ".." in norm_path or norm_path.startswith("/") or norm_path.startswith("C:"):
+            return (
+                f"ERROR: Invalid test file path '{test_file}'. Must be a repository-relative path."
+            )
+        if norm_path.startswith(("build/", "dist/")):
+            return (
+                f"ERROR: Compiled test path '{norm_path}' is not supported. "
+                "Use the original source test path under test/, tests/, or the source package directory."
+            )
+
+        if preferred and norm_path not in preferred:
+            preferred_text = ", ".join(preferred)
+            return (
+                f"ERROR: Targeted test '{norm_path}' is not the QA-recommended target. "
+                f"Run one of these source test files instead: {preferred_text}."
+            )
+
+        from remediation_engine.orchestration.qa_critic import (
+            _detect_targeted_test_context,
+            build_targeted_test_command,
+            extract_qa_failure_evidence,
+        )
+
+        runner, package_cwd, npm_invocation = _detect_targeted_test_context(sandbox, norm_path)
+        if runner == "npm_text_fallback":
+            return (
+                f"ERROR: Cannot run targeted test on '{norm_path}'. "
+                "No safe runner-specific target command can be constructed for runner 'npm_text_fallback'."
+            )
+
+        relative_test_file = norm_path
+        if package_cwd and norm_path.startswith(package_cwd.rstrip("/") + "/"):
+            relative_test_file = norm_path[len(package_cwd.rstrip("/")) + 1 :]
+        cmd = build_targeted_test_command(
+            runner,
+            relative_test_file,
+            test_name,
+            npm_invocation=npm_invocation,
+        )
+        if not cmd:
+            return f"ERROR: Could not construct targeted test command for runner '{runner}' and file '{norm_path}'."
+        if package_cwd:
+            cmd = f"cd {shlex.quote(package_cwd)} && {cmd}"
+
+        try:
+            result = sandbox.run(cmd, timeout=_NPM_TEST_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: Targeted test execution failed - {exc}"
+
+        if result.exit_code == 0:
+            name_str = f" [{test_name}]" if test_name else ""
+            return f"SUCCESS: Targeted test passed ({runner}): {norm_path}{name_str}\n\nstdout:\n{result.stdout[:1000]}"
+
+        evidence = extract_qa_failure_evidence(result.exit_code, result.stdout, result.stderr)
+        diag_str = (
+            "\n".join(evidence.exact_diagnostics[:5]) or result.stderr[:500] or result.stdout[:500]
+        )
+        loc_str = "\n".join(evidence.source_locations[:5])
+        test_str = test_name or (evidence.failed_tests[0] if evidence.failed_tests else "unknown")
+
+        return (
+            f"FAILURE: Targeted test failed ({runner}): {norm_path} (exit {result.exit_code})\n"
+            f"Failing Test: {test_str}\n"
+            f"Exact Diagnostics:\n{diag_str}\n"
+            f"Source Locations:\n{loc_str}\n"
+            f"Raw Excerpt:\n{evidence.raw_excerpt[:1000]}"
+        )
+
+    return run_targeted_test
+
+
 def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
     @tool
     def validate_code_syntax(file_path: str) -> str:
@@ -638,9 +1000,7 @@ def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
         if suffix in {".js", ".mjs", ".cjs"}:
             cmd = f"node -c {shlex.quote(f'/workspace/{rel_path}')}"
         elif suffix in {".ts", ".tsx", ".jsx"}:
-            cmd = (
-                f"npx --yes esbuild {shlex.quote(rel_path)} --outfile=/dev/null"
-            )
+            cmd = f"npx --yes esbuild {shlex.quote(rel_path)} --outfile=/dev/null"
         else:
             return (
                 f"ERROR: validate_code_syntax does not support '{rel_path}'. "
@@ -679,19 +1039,200 @@ def _make_run_typecheck_tool(sandbox: DockerSandbox):
     return run_typecheck
 
 
+def _make_validate_workaround_tool(
+    sandbox: DockerSandbox,
+    touched_files: set[str],
+    preferred_test_files: Sequence[str] | None = None,
+):
+    """Build one short-circuiting validation gate for source workarounds.
+
+    The gate runs syntax, typecheck, lint, runtime-import, and targeted-test
+    checks in that order. It returns immediately after the first failed gate,
+    preserving the exact diagnostic for the worker's next reasoning turn.
+    Individual check implementations remain private helpers so update workers
+    can retain their manifest-specific validation contract, while workaround
+    workers receive one atomic validation tool.
+    """
+    syntax_tool = _make_validate_code_syntax_tool(sandbox)
+    targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files)
+
+    def _failure(gate: str, detail: str) -> str:
+        return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
+
+    def _run_typecheck_gate() -> str:
+        tsconfig = sandbox.read_file("tsconfig.json")
+        if not isinstance(tsconfig, str) or not tsconfig.strip():
+            return "SKIPPED: TypeScript gate (tsconfig.json not found)."
+        try:
+            result = sandbox.run("npx --no-install tsc --noEmit", timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            return f"FAILURE: TypeScript gate execution failed: {exc}"
+        if result.exit_code == 0:
+            return "SUCCESS: TypeScript compilation passed cleanly."
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if len(output) > 3000:
+            output = output[:3000] + "\n... (truncated)"
+        return f"FAILURE: TypeScript compilation failed (exit {result.exit_code}).\n{output}"
+
+    def _run_lint_gate(source_files: Sequence[str]) -> str:
+        source_files = [
+            path
+            for path in source_files
+            if Path(path).suffix.lower() in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}
+        ]
+        if not source_files:
+            return "SKIPPED: Lint gate (no lintable source files were modified)."
+        try:
+            eslint_probe = sandbox.run("test -x node_modules/.bin/eslint", timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            return f"FAILURE: Lint gate probe failed: {exc}"
+        if eslint_probe.exit_code != 0:
+            return "SKIPPED: Lint gate (the repository does not provide eslint)."
+        command = "npx --no-install eslint --no-error-on-unmatched-pattern " + " ".join(
+            shlex.quote(path) for path in source_files
+        )
+        try:
+            result = sandbox.run(command, timeout=_LINT_CHECK_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            return f"FAILURE: Lint gate execution failed: {exc}"
+        if result.exit_code == 0:
+            return f"SUCCESS: Lint passed for {', '.join(source_files)}."
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if len(output) > 3000:
+            output = output[:3000] + "\n... (truncated)"
+        return f"FAILURE: Lint failed (exit {result.exit_code}).\n{output}"
+
+    def _run_runtime_smoke_gate(runtime_file: str | None) -> str:
+        if not runtime_file:
+            return "SKIPPED: Runtime smoke gate (no runtime_smoke_file was supplied)."
+        try:
+            rel_path = _validate_workspace_path(runtime_file)
+        except ValueError as exc:
+            return f"FAILURE: Runtime smoke gate received an invalid file: {exc}"
+        suffix = Path(rel_path).suffix.lower()
+        if suffix not in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
+            return f"FAILURE: Runtime smoke gate does not support '{rel_path}'."
+
+        import json
+
+        import_expression = json.dumps(f"./{rel_path}")
+        script = (
+            f"import({import_expression}).catch((error) => {{ "
+            "console.error(error?.stack || error); process.exitCode = 1; })"
+        )
+        loader = "--import tsx " if suffix in {".ts", ".tsx", ".jsx"} else ""
+        command = f"node {loader}--input-type=module -e {shlex.quote(script)}"
+        try:
+            result = sandbox.run(command, timeout=_RUNTIME_SMOKE_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            return f"FAILURE: Runtime smoke gate execution failed: {exc}"
+        if result.exit_code == 0:
+            return f"SUCCESS: Runtime smoke import passed for {rel_path}."
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if len(output) > 3000:
+            output = output[:3000] + "\n... (truncated)"
+        return f"FAILURE: Runtime smoke import failed for {rel_path}.\n{output}"
+
+    @tool
+    def validate_workaround(
+        modified_files: list[str],
+        runtime_smoke_file: str | None = None,
+        targeted_test_file: str | None = None,
+        targeted_test_name: str | None = None,
+    ) -> str:
+        """Run all workaround validation gates and stop at the first failure.
+
+        ``modified_files`` must include every source file changed by the
+        current cumulative patch. A QA-recommended test is selected
+        automatically when the caller omits ``targeted_test_file``.
+        """
+        requested = [
+            str(path).replace("\\", "/").strip().lstrip("/")
+            for path in (modified_files or [])
+            if str(path).strip()
+        ]
+        current = [
+            str(path).replace("\\", "/").strip().lstrip("/")
+            for path in touched_files
+            if str(path).strip()
+        ]
+        files = list(dict.fromkeys([*requested, *current]))
+        if not files:
+            return "FAILURE: Workaround validation gate 'input' failed. No modified files were supplied."
+
+        prohibited = [path for path in files if _is_prohibited_target(path)]
+        if prohibited:
+            return _failure(
+                "input",
+                f"Prohibited files were included in the cumulative patch: {', '.join(prohibited)}",
+            )
+
+        for file_path in files:
+            current_content = sandbox.read_file(file_path)
+            if current_content is None:
+                return _failure(
+                    "patch_integrity",
+                    f"Modified file '{file_path}' could not be re-read from the workspace.",
+                )
+            syntax_result = syntax_tool.invoke({"file_path": file_path})
+            if not str(syntax_result).startswith("SUCCESS:"):
+                return _failure("syntax", str(syntax_result))
+
+        typecheck_result = _run_typecheck_gate()
+        if typecheck_result.startswith("FAILURE:"):
+            return _failure("typecheck", typecheck_result)
+
+        lint_result = _run_lint_gate(files)
+        if lint_result.startswith("FAILURE:"):
+            return _failure("lint", lint_result)
+
+        smoke_file = runtime_smoke_file
+        if not smoke_file:
+            smoke_file = next(
+                (
+                    path
+                    for path in files
+                    if Path(path).suffix.lower() in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}
+                ),
+                None,
+            )
+        smoke_result = _run_runtime_smoke_gate(smoke_file)
+        if smoke_result.startswith("FAILURE:"):
+            return _failure("runtime_smoke", smoke_result)
+
+        test_file = targeted_test_file
+        if not test_file and preferred_test_files:
+            test_file = next(iter(preferred_test_files), None)
+        if test_file:
+            test_result = targeted_test_tool.invoke(
+                {"test_file": test_file, "test_name": targeted_test_name}
+            )
+            if not str(test_result).startswith("SUCCESS:"):
+                return _failure("targeted_test", str(test_result))
+
+        return (
+            "SUCCESS: Workaround validation gate passed. "
+            f"Validated files: {', '.join(files)}; "
+            f"runtime smoke: {smoke_file or 'skipped'}; "
+            f"targeted test: {test_file or 'skipped'}."
+        )
+
+    return validate_workaround
+
+
 def build_update_toolbelt(
     sandbox: DockerSandbox,
-    touched_files: Set[str],
+    touched_files: set[str],
     host_repo_root: Path,
     target_manifest_paths: Iterable[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
     enable_registry_lookup: bool = False,
-    attempted_versions_by_package: Optional[Mapping[str, Set[str]]] = None,
-    override_required_packages: Optional[Iterable[str]] = None,
+    attempted_versions_by_package: Mapping[str, set[str]] | None = None,
+    override_required_packages: Iterable[str] | None = None,
     require_planning_answers: bool = False,
-    planning_state: Optional[Dict[str, bool]] = None,
-    execution_state: Optional[Dict[str, int | bool]] = None,
-) -> List:
+    planning_state: dict[str, bool] | None = None,
+    execution_state: dict[str, int | bool] | None = None,
+) -> list:
     """Build the strict update-only toolbelt."""
     manifest_paths = _normalize_manifest_targets(target_manifest_paths)
     toolbelt = [
@@ -714,45 +1255,93 @@ def build_update_toolbelt(
 
 def build_workaround_toolbelt(
     sandbox: DockerSandbox,
-    touched_files: Set[str],
+    touched_files: set[str],
     host_repo_root: Path,
-    plan_state: Optional[Dict[str, bool]] = None,
-) -> List:
+    plan_state: dict[str, Any] | None = None,
+    mandatory_search_terms: dict[str, str] | None = None,
+    preferred_test_files: Sequence[str] | None = None,
+) -> list:
     """Build the strict workaround-only toolbelt."""
     if plan_state is None:
         plan_state = {"recorded": False}
+
+    plan_state.setdefault("inspected_symbols", set())
+    plan_state.setdefault("inspected_files", set())
+    plan_state.setdefault("fallback_files", set())
+    plan_state.setdefault("read_files", set())
+    plan_state.setdefault("successful_edits", [])
+
     return [
         _make_record_plan_tool(plan_state),
-        _make_search_web_tool(),
+        _make_search_web_tool(mandatory_search_terms=mandatory_search_terms),
         _make_read_web_page_tool(),
         _make_read_repository_map_tool(sandbox),
-        _make_read_workspace_file_tool(sandbox),
+        _make_read_workspace_file_tool(sandbox, plan_state),
         _make_search_codebase_pattern_tool(sandbox),
-        _make_inspect_ast_symbol_tool(sandbox),
+        _make_inspect_ast_symbol_tool(sandbox, plan_state),
         _make_deterministic_search_replace_tool(sandbox, touched_files, plan_state),
+        _make_deterministic_replace_ast_symbol_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_code_syntax_tool(sandbox),
-        _make_run_typecheck_tool(sandbox),
+        _make_validate_workaround_tool(sandbox, touched_files, preferred_test_files),
     ]
 
-def _make_record_plan_tool(plan_state: Dict[str, bool]):
+
+def _make_record_plan_tool(plan_state: dict[str, Any]):
     @tool
-    def record_plan(investigation_findings: str, exact_code_changes: str) -> str:
+    def record_plan(
+        affected_files: Any,
+        affected_symbols: Any,
+        security_invariant: str,
+        causal_hypothesis: str,
+        exact_intended_edits: str,
+    ) -> str:
         """
-        Record your investigation findings and your exact plan for code changes.
-        You MUST call this tool and document your exact 'old_text' and 'new_text' BEFORE executing any deterministic_search_replace.
+        Record your investigation findings, affected files/symbols, security invariant, causal hypothesis, and planned edits.
+        You MUST call this tool BEFORE executing any code edits.
         """
         plan_state["recorded"] = True
-        logger.debug("Workaround subagent findings: %s", investigation_findings)
-        logger.debug("Workaround subagent planned changes: %s", exact_code_changes)
-        return "Plan recorded successfully. You may proceed with deterministic_search_replace."
+
+        files_list = affected_files if isinstance(affected_files, list) else [str(affected_files)]
+        symbols_list = (
+            affected_symbols if isinstance(affected_symbols, list) else [str(affected_symbols)]
+        )
+
+        valid_files = []
+        for f in files_list:
+            f_str = str(f).strip()
+            if f_str:
+                try:
+                    valid_files.append(_validate_workspace_path(f_str))
+                except ValueError:
+                    valid_files.append(f_str)
+
+        plan_state["planned_files"] = valid_files
+        plan_state["planned_symbols"] = [str(s).strip() for s in symbols_list if str(s).strip()]
+        plan_state["security_invariant"] = str(security_invariant).strip()
+        plan_state["causal_hypothesis"] = str(causal_hypothesis).strip()
+        plan_state["exact_intended_edits"] = str(exact_intended_edits).strip()
+
+        read_files = plan_state.get("read_files", set())
+        for f in plan_state["planned_files"]:
+            norm_f = f.replace("\\", "/").lstrip("/")
+            if norm_f in read_files:
+                plan_state.setdefault("fallback_files", set()).add(norm_f)
+
+        logger.debug("Workaround subagent plan recorded: %s", plan_state)
+        return "Plan recorded successfully. You may proceed with code edits."
 
     return record_plan
 
 
-def _make_search_web_tool():
-    """Create a web search tool backed by Serper.dev."""
-    _calls_remaining = [_SEARCH_WEB_MAX_CALLS]  # mutable container for closure
+def _make_search_web_tool(mandatory_search_terms: dict[str, str] | None = None):
+    """Create a web search tool backed by Serper.dev.
+
+    ``mandatory_search_terms`` is retained for API compatibility with older
+    callers, but the worker now owns query construction. Workaround type,
+    scanner state, and QA diagnostics require different searches; silently
+    appending one fixed query shape can hide that distinction.
+    """
+    _calls_remaining = [_SEARCH_WEB_MAX_CALLS]
 
     @tool
     def search_web(query: str) -> str:
@@ -760,10 +1349,9 @@ def _make_search_web_tool():
         Search the web using Google for documentation, migration guides,
         changelogs, or breaking changes related to the vulnerability fix.
 
-        Use this tool to research how a library's API changed between versions
-        before writing any code changes.
-
-        Limited to 3 calls per session. Returns up to 3 result snippets.
+        SEARCH HEURISTICS:
+        - Scenarios 1 & 4 (Unit test failure or validate_workaround error): Prioritize searching the error string / stack trace without quotation marks.
+        - Scenarios 2 & 3 (Scanner failure or no version bumps available): Prioritize searching the CVE ID and mitigation strategies without quotation marks.
         """
         if _calls_remaining[0] <= 0:
             return f"ERROR: search_web call limit reached (max {_SEARCH_WEB_MAX_CALLS} per session). Use the results you already have."
@@ -774,10 +1362,18 @@ def _make_search_web_tool():
 
         _calls_remaining[0] -= 1
 
+        effective_query = (query or "").replace('"', "").replace("'", "").strip()
+        if not effective_query:
+            return (
+                "ERROR: search_web requires a worker-selected query. Classify the workaround "
+                "type first and include the relevant package, advisory, migration, scanner, "
+                "or test-regression terms."
+            )
+
         try:
             resp = requests.post(
                 _SERPER_SEARCH_URL,
-                json={"q": query},
+                json={"q": effective_query},
                 headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
                 timeout=_SERPER_REQUEST_TIMEOUT,
             )
@@ -794,22 +1390,96 @@ def _make_search_web_tool():
                 link = item.get("link", "")
                 results.append(f"**{title}**\n{snippet}\nURL: {link}")
 
-            if not results:
-                return "No results found for this query. Try a different search query."
-
             calls_left = _calls_remaining[0]
-            header = f"Found {len(results)} results ({calls_left} searches remaining):\n\n"
+            if not results:
+                return f"Effective Query: {effective_query}\nNo results found for this query."
+
+            header = f"Effective Query: {effective_query}\nFound {len(results)} results ({calls_left} searches remaining):\n\n"
             return header + "\n\n---\n\n".join(results)
 
         except Exception as exc:
             logger.warning("search_web failed: %s", exc)
-            return f"ERROR: Web search failed - {exc}. Try again or proceed without web results."
+            return f"Effective Query: {effective_query}\nERROR: Web search failed - {exc}."
 
     return search_web
 
 
+def _github_api_url(target_url: str) -> str | None:
+    """Translate a public GitHub URL into its corresponding GitHub API URL."""
+    parsed = urlparse(target_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"github.com", "www.github.com"}:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+
+    if parts[0].lower() == "advisories" and len(parts) >= 2:
+        return f"{_GITHUB_API_URL_PREFIX}advisories/{quote(parts[1], safe='')}"
+    if len(parts) < 2:
+        return None
+
+    owner, repository = parts[0], parts[1]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    base = f"{_GITHUB_API_URL_PREFIX}repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+    if len(parts) == 2:
+        return base
+
+    resource = parts[2].lower()
+    if resource in {"issues", "pulls", "commits"} and len(parts) >= 4:
+        return f"{base}/{resource}/{quote(parts[3], safe='')}"
+    if resource == "releases" and len(parts) >= 5 and parts[3].lower() == "tag":
+        return f"{base}/releases/tags/{quote('/'.join(parts[4:]), safe='')}"
+    if resource in {"blob", "raw", "tree"} and len(parts) >= 4:
+        ref = quote(parts[3], safe="")
+        content_path = quote("/".join(parts[4:]), safe="/")
+        endpoint = f"{base}/contents/{content_path}" if content_path else f"{base}/contents"
+        return f"{endpoint}?ref={ref}"
+    return base
+
+
+def _github_headers() -> dict[str, str]:
+    """Build GitHub API headers without exposing an optional token in logs."""
+    headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _decode_github_response(resp: Any, target_url: str) -> str:
+    """Decode raw GitHub content or a JSON API response into readable text."""
+    text = getattr(resp, "text", "") or ""
+    if text.strip():
+        try:
+            payload = resp.json()
+        except Exception:  # noqa: BLE001
+            return text
+        if (
+            isinstance(payload, dict)
+            and payload.get("encoding") == "base64"
+            and payload.get("content")
+        ):
+            try:
+                return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
+            except Exception:  # noqa: BLE001
+                return text
+        if isinstance(payload, (dict, list)):
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        return text
+    return f"No readable content extracted from {target_url}."
+
+
 def _make_read_web_page_tool():
-    """Create a tool to fetch full markdown content of a web page using Jina Reader."""
+    """Create a tool to fetch web pages, using the GitHub API for GitHub URLs."""
+
     @tool
     def read_web_page(url: str) -> str:
         """
@@ -822,20 +1492,27 @@ def _make_read_web_page_tool():
         if not target_url:
             return "ERROR: url is required."
 
-        jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
+        github_api_url = _github_api_url(target_url)
+        request_url = github_api_url or f"{_JINA_READER_URL_PREFIX}{target_url}"
+        request_headers = _github_headers() if github_api_url else {"Accept": "text/plain"}
         try:
             resp = requests.get(
-                jina_url,
-                headers={"Accept": "text/plain"},
+                request_url,
+                headers=request_headers,
                 timeout=_READ_WEB_PAGE_TIMEOUT,
             )
             resp.raise_for_status()
-            text = resp.text or ""
+            text = (
+                _decode_github_response(resp, target_url) if github_api_url else (resp.text or "")
+            )
             if not text.strip():
                 return f"No readable content extracted from {target_url}."
 
             if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                text = text[:_READ_WEB_PAGE_MAX_CHARS] + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                text = (
+                    text[:_READ_WEB_PAGE_MAX_CHARS]
+                    + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                )
 
             return f"--- Markdown content of {target_url} ---\n\n{text}"
 
@@ -844,5 +1521,3 @@ def _make_read_web_page_tool():
             return f"ERROR: Failed to read web page {target_url} - {exc}"
 
     return read_web_page
-
-

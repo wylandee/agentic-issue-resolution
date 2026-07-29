@@ -29,12 +29,13 @@ supervisor_router(state) -> str
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
-import hashlib
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -44,21 +45,24 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
-    QAEvaluation,
     QAAttemptResult,
+    QAEvaluation,
+    QAFailureEvidence,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
+    StateConsistencyEvent,
     SupervisorDecision,
     SupervisorRetryPlan,
-    StateConsistencyEvent,
     TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
+    VulnerabilityGroup,
+    WorkaroundContext,
+    WorkaroundPhase,
     WorkaroundReplayPlan,
     WorkerAttemptResult,
-    VulnerabilityGroup,
 )
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
@@ -71,7 +75,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES: int = 3
 UPDATE_BATCH_SIZE: int = 10
 
-_VALID_NEXT_NODES: Set[str] = {
+_VALID_NEXT_NODES: set[str] = {
     "update_subagent",
     "workaround_subagent",
     "qa_critic",
@@ -84,7 +88,7 @@ _DEFAULT_MODEL = "gpt-4o-mini"
 # uses the enum values, but planner scratchpads from older prompts commonly
 # use the shorter ``same_major`` spelling.  Accept that spelling explicitly;
 # do not let an unrecognised value silently become the task's current stage.
-_PLANNER_STAGE_ALIASES: Dict[str, SCARemediationStage] = {
+_PLANNER_STAGE_ALIASES: dict[str, SCARemediationStage] = {
     "osv": SCARemediationStage.OSV_MINIMUM,
     "minimum": SCARemediationStage.OSV_MINIMUM,
     "osv_minimum": SCARemediationStage.OSV_MINIMUM,
@@ -94,7 +98,7 @@ _PLANNER_STAGE_ALIASES: Dict[str, SCARemediationStage] = {
     "npm_latest": SCARemediationStage.NPM_LATEST,
     "code_workaround": SCARemediationStage.CODE_WORKAROUND,
 }
-_SCA_STAGE_ORDER: Dict[SCARemediationStage, int] = {
+_SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
     SCARemediationStage.NPM_LATEST: 2,
@@ -105,27 +109,31 @@ _SCA_STAGE_ORDER: Dict[SCARemediationStage, int] = {
 # Task status helpers
 # ---------------------------------------------------------------------------
 
-_TERMINAL_STATUSES = frozenset({
-    TaskStatus.QA_PASSED,
-    TaskStatus.UNFIXABLE,
-})
-_WORKABLE_STATUSES = frozenset({
-    TaskStatus.PENDING,
-    TaskStatus.NEEDS_RETRY,
-})
+_TERMINAL_STATUSES = frozenset(
+    {
+        TaskStatus.QA_PASSED,
+        TaskStatus.UNFIXABLE,
+    }
+)
+_WORKABLE_STATUSES = frozenset(
+    {
+        TaskStatus.PENDING,
+        TaskStatus.NEEDS_RETRY,
+    }
+)
 
 
 def _dispatchable_task_ids_for_status(
-    task_queue: Dict[str, RemediationTask],
-    statuses: Set[TaskStatus],
-    preferred_ids: Optional[List[str]] = None,
-    strategy: Optional[RoutingStrategy] = None,
-    limit: Optional[int] = None,
-) -> List[str]:
+    task_queue: dict[str, RemediationTask],
+    statuses: set[TaskStatus],
+    preferred_ids: list[str] | None = None,
+    strategy: RoutingStrategy | None = None,
+    limit: int | None = None,
+) -> list[str]:
     """Return non-terminal task IDs matching status and optional strategy filters."""
     ordered_ids = list(preferred_ids) if preferred_ids is not None else list(task_queue.keys())
-    dispatchable: List[str] = []
-    seen: Set[str] = set()
+    dispatchable: list[str] = []
+    seen: set[str] = set()
 
     for task_id in ordered_ids:
         if task_id in seen:
@@ -148,9 +156,9 @@ def _dispatchable_task_ids_for_status(
 
 
 def _qa_ready_task_ids(
-    task_queue: Dict[str, RemediationTask],
-    preferred_ids: Optional[List[str]] = None,
-) -> List[str]:
+    task_queue: dict[str, RemediationTask],
+    preferred_ids: list[str] | None = None,
+) -> list[str]:
     return _dispatchable_task_ids_for_status(
         task_queue,
         {TaskStatus.OPTIMISTICALLY_FIXED},
@@ -160,7 +168,7 @@ def _qa_ready_task_ids(
 
 def _is_exhausted_update_pivot_candidate(
     task: RemediationTask,
-    diagnostics: Optional[UpdateRetryDiagnostics],
+    diagnostics: UpdateRetryDiagnostics | None,
 ) -> bool:
     """Return True when a retry update task must pivot instead of retrying update."""
     return (
@@ -185,7 +193,7 @@ def _next_sca_stage(stage: SCARemediationStage) -> SCARemediationStage:
     return SCARemediationStage.CODE_WORKAROUND
 
 
-def _selection_for_stage(stage: SCARemediationStage) -> Optional[str]:
+def _selection_for_stage(stage: SCARemediationStage) -> str | None:
     if stage == SCARemediationStage.NPM_SAME_MAJOR:
         return "same_major"
     if stage == SCARemediationStage.NPM_LATEST:
@@ -200,9 +208,9 @@ def _instruction_digest(instruction: str) -> str:
 
 
 def _attempts_for_task(
-    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
+    snapshots_by_id: dict[str, TaskAttemptSnapshot],
     task_id: str,
-) -> List[TaskAttemptSnapshot]:
+) -> list[TaskAttemptSnapshot]:
     return sorted(
         (snapshot for snapshot in snapshots_by_id.values() if snapshot.task_id == task_id),
         key=lambda snapshot: (snapshot.attempt_number, snapshot.created_at),
@@ -212,9 +220,9 @@ def _attempts_for_task(
 def _build_consistency_event(
     *,
     error_code: str,
-    task_id: Optional[str],
-    expected_attempt_id: Optional[str],
-    received_attempt_id: Optional[str],
+    task_id: str | None,
+    expected_attempt_id: str | None,
+    received_attempt_id: str | None,
     action: str,
     details: str,
 ) -> StateConsistencyEvent:
@@ -229,11 +237,11 @@ def _build_consistency_event(
 
 
 def _dedupe_consistency_events(
-    events: List[StateConsistencyEvent],
-) -> List[StateConsistencyEvent]:
+    events: list[StateConsistencyEvent],
+) -> list[StateConsistencyEvent]:
     """Keep one consistency event per task/attempt/error tuple."""
-    result: List[StateConsistencyEvent] = []
-    seen: Set[Tuple[Optional[str], Optional[str], str]] = set()
+    result: list[StateConsistencyEvent] = []
+    seen: set[tuple[str | None, str | None, str]] = set()
     for event in events:
         key = (event.task_id, event.received_attempt_id, event.error_code)
         if key in seen:
@@ -244,12 +252,12 @@ def _dedupe_consistency_events(
 
 
 def _current_action_summaries(
-    action_summaries: List[AgentActionSummary],
-    task_queue: Dict[str, RemediationTask],
+    action_summaries: list[AgentActionSummary],
+    task_queue: dict[str, RemediationTask],
     limit: int,
-) -> List[AgentActionSummary]:
+) -> list[AgentActionSummary]:
     """Return only summaries belonging to each task's committed attempt."""
-    relevant: List[AgentActionSummary] = []
+    relevant: list[AgentActionSummary] = []
     for summary in action_summaries:
         task = task_queue.get(summary.task_id)
         if task is None:
@@ -263,14 +271,35 @@ def _current_action_summaries(
     return relevant[-limit:]
 
 
+def _extract_workaround_vulnerability_mechanism(group: VulnerabilityGroup) -> str:
+    """Return the scanner-described security mechanism for workaround prompts."""
+    for issue in getattr(group, "issues", []) or []:
+        message = getattr(issue, "message", None)
+        if not isinstance(message, str) or not message.strip():
+            continue
+        mechanism = message
+        for marker in ("### Am I affected?", "### How to fix that?"):
+            mechanism = mechanism.split(marker, 1)[0]
+        mechanism = re.sub(r"\s+", " ", mechanism).strip()
+        if mechanism:
+            return mechanism[:1200]
+
+    fix_plan = getattr(group, "fix_plan", None)
+    instruction = getattr(fix_plan, "instruction", None)
+    if isinstance(instruction, str) and instruction.strip():
+        return re.sub(r"\s+", " ", instruction).strip()[:1200]
+    return ""
+
+
 def _create_attempt_snapshot(
     task: RemediationTask,
     *,
     dispatch_node: str,
-    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
+    snapshots_by_id: dict[str, TaskAttemptSnapshot],
     state_revision: int,
-    plan_id: Optional[str] = None,
-) -> Tuple[RemediationTask, TaskAttemptSnapshot]:
+    plan_id: str | None = None,
+    workaround_context: WorkaroundContext | None = None,
+) -> tuple[RemediationTask, TaskAttemptSnapshot]:
     """Commit the exact worker input and return the revised task projection."""
     attempt_id = str(uuid.uuid4())
     task_revision = task.task_revision + 1
@@ -286,6 +315,7 @@ def _create_attempt_snapshot(
         instruction_digest=_instruction_digest(task.instruction),
         dispatch_node=dispatch_node,  # type: ignore[arg-type]
         plan_id=plan_id,
+        workaround_context=workaround_context,
     )
     snapshots_by_id[attempt_id] = snapshot
     updated_task = task.model_copy(
@@ -295,6 +325,128 @@ def _create_attempt_snapshot(
         }
     )
     return updated_task, snapshot
+
+
+def _qa_failure_evidence_for_workaround_retry(
+    task_id: str,
+    parent_group_id: str,
+    qa_evaluations: dict[str, QAEvaluation],
+    qa_results_by_attempt: dict[str, QAAttemptResult],
+    *,
+    related_task_ids: Iterable[str] = (),
+    related_group_ids: Iterable[str] = (),
+) -> QAFailureEvidence | None:
+    """Resolve QA evidence for a workaround dispatch and its task ancestry.
+
+    QA closes the failed worker attempt before Supervisor creates the retry
+    snapshot. Therefore the failed evidence's ``attempt_id`` must not be
+    compared with the new task's ``current_attempt_id`` (which is ``None`` at
+    this point). Prefer the authoritative attempt envelope and fall back to
+    the task-keyed compatibility projection for legacy callers.
+
+    A workaround pivot creates a child task with a new task ID and usually a
+    strategy-specific group ID. Its first QA failure still belongs to the
+    parent update attempt, so the caller supplies the parent's task/group IDs
+    through ``related_task_ids`` and ``related_group_ids``. Evidence for the
+    current task always takes precedence over inherited evidence.
+    """
+    task_ids = list(dict.fromkeys([task_id, *related_task_ids]))
+    group_ids = list(dict.fromkeys([parent_group_id, *related_group_ids]))
+
+    for evaluation_key in [*task_ids, *group_ids]:
+        evaluation = qa_evaluations.get(evaluation_key)
+        evaluation_evidence = evaluation.failure_evidence if evaluation else None
+
+        if evaluation_evidence and evaluation_evidence.attempt_id:
+            envelope = qa_results_by_attempt.get(evaluation_evidence.attempt_id)
+            if (
+                envelope is not None
+                and envelope.task_id in task_ids
+                and envelope.evaluation.failure_evidence is not None
+            ):
+                return envelope.evaluation.failure_evidence
+
+        if evaluation_evidence is not None:
+            return evaluation_evidence
+
+    candidates = [
+        result.evaluation.failure_evidence
+        for result in qa_results_by_attempt.values()
+        if (
+            result.task_id in task_ids
+            and not result.evaluation.passed
+            and result.evaluation.failure_evidence is not None
+        )
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _qa_evidence_indicates_test_regression(
+    evidence: QAFailureEvidence | None,
+) -> bool:
+    """Return whether inherited QA evidence represents a test/build regression."""
+    if evidence is None:
+        return False
+    if evidence.failed_tests:
+        return True
+
+    text = " ".join(
+        [
+            *(evidence.exact_diagnostics or []),
+            evidence.raw_excerpt or "",
+            *(evidence.source_locations or []),
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "npm test",
+            "test failed",
+            "tests failed",
+            "typecheck",
+            "compile failed",
+            "build failed",
+            "is not a function",
+            "typeerror",
+            "/test/",
+            "\\test\\",
+        )
+    )
+
+
+def _workaround_task_ancestry(
+    task: RemediationTask,
+    task_queue: dict[str, RemediationTask],
+) -> tuple[list[str], list[str]]:
+    """Return parent task/group IDs whose QA evidence may seed a child attempt.
+
+    The task queue is authoritative for parent links. Missing or cyclic links
+    are ignored defensively so malformed state cannot block workaround
+    dispatch.
+
+    Args:
+        task: Workaround task being dispatched.
+        task_queue: Current supervisor task queue.
+
+    Returns:
+        A tuple of ``(parent_task_ids, parent_group_ids)`` ordered from the
+        immediate parent toward the root task.
+    """
+    parent_task_ids: list[str] = []
+    parent_group_ids: list[str] = []
+    seen: set[str] = set()
+    parent_task_id = task.parent_task_id
+
+    while parent_task_id and parent_task_id not in seen:
+        seen.add(parent_task_id)
+        parent_task = task_queue.get(parent_task_id)
+        if parent_task is None:
+            break
+        parent_task_ids.append(parent_task.task_id)
+        parent_group_ids.append(parent_task.parent_group_id)
+        parent_task_id = parent_task.parent_task_id
+
+    return parent_task_ids, parent_group_ids
 
 
 _ATTEMPT_INPUT_FIELDS = frozenset(
@@ -310,13 +462,13 @@ _ATTEMPT_INPUT_FIELDS = frozenset(
 
 
 def _commit_task_transition(
-    task_queue: Dict[str, RemediationTask],
+    task_queue: dict[str, RemediationTask],
     task_id: str,
     *,
-    updates: Dict[str, Any],
+    updates: dict[str, Any],
     close_attempt: bool = False,
     clear_selected_version: bool = False,
-) -> Optional[RemediationTask]:
+) -> RemediationTask | None:
     """Commit one coherent supervisor transition for a task.
 
     ``task_queue`` is the authoritative projection.  This helper makes the
@@ -356,16 +508,16 @@ def _commit_task_transition(
 
 
 def _validate_committed_state(
-    task_queue: Dict[str, RemediationTask],
-    snapshots_by_id: Dict[str, TaskAttemptSnapshot],
-    retry_plans_by_task: Dict[str, SupervisorRetryPlan],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    active_target_task_ids: List[str],
+    task_queue: dict[str, RemediationTask],
+    snapshots_by_id: dict[str, TaskAttemptSnapshot],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    active_target_task_ids: list[str],
     next_node: str,
-) -> Tuple[List[StateConsistencyEvent], List[str]]:
+) -> tuple[list[StateConsistencyEvent], list[str]]:
     """Validate the state projection that will be handed to the next node."""
-    events: List[StateConsistencyEvent] = []
-    errors: List[str] = []
+    events: list[StateConsistencyEvent] = []
+    errors: list[str] = []
 
     # Reconcile every task before validating routing.  Worker and QA bridges
     # are not allowed to repair planner-owned fields, so if a stale reducer
@@ -403,9 +555,7 @@ def _validate_committed_state(
             continue
         snapshot = snapshots_by_id.get(task.current_attempt_id)
         if snapshot is None:
-            errors.append(
-                f"supervisor: task {task_id} references a missing attempt snapshot."
-            )
+            errors.append(f"supervisor: task {task_id} references a missing attempt snapshot.")
             continue
 
         snapshot_matches = (
@@ -487,8 +637,7 @@ def _validate_committed_state(
         if plan.action == "retry_update" and (
             plan.source_task_revision > task.task_revision
             or plan.source_task_revision < max(0, task.task_revision - 1)
-            or
-            plan.strategy_stage != task.strategy_stage
+            or plan.strategy_stage != task.strategy_stage
             or plan.selected_version != task.selected_version
             or plan.exact_instruction != task.instruction
             or plan.exhausted_update_path != task.exhausted_update_path
@@ -566,9 +715,7 @@ def _validate_committed_state(
         if task is None:
             continue
         if diagnostics.selected_version != task.selected_version:
-            diagnostics = diagnostics.model_copy(
-                update={"selected_version": task.selected_version}
-            )
+            diagnostics = diagnostics.model_copy(update={"selected_version": task.selected_version})
             retry_diagnostics_by_task[task_id] = diagnostics
             events.append(
                 _build_consistency_event(
@@ -590,15 +737,13 @@ def _validate_committed_state(
                 if version
             }
         ):
-            errors.append(
-                f"supervisor: selected version for {task_id} was already attempted."
-            )
+            errors.append(f"supervisor: selected version for {task_id} was already attempted.")
     return events, errors
 
 
 def reconcile_phase5_state_before_teardown(
     state: OrchestratorState,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Apply the final supervisor state barrier before teardown.
 
     Teardown is a cleanup operation, not a routing decision.  It must receive
@@ -607,23 +752,17 @@ def reconcile_phase5_state_before_teardown(
     the same validator as the supervisor return path, so direct teardown
     callers and graph executions share the same invariant.
     """
-    task_queue: Dict[str, RemediationTask] = {
-        task_id: task.model_copy()
-        for task_id, task in dict(state.get("task_queue", {})).items()
+    task_queue: dict[str, RemediationTask] = {
+        task_id: task.model_copy() for task_id, task in dict(state.get("task_queue", {})).items()
     }
-    snapshots_by_id: Dict[str, TaskAttemptSnapshot] = dict(
-        state.get("attempt_snapshots_by_id", {})
-    )
-    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
-        state.get("retry_plans_by_task", {})
-    )
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = dict(
+    snapshots_by_id: dict[str, TaskAttemptSnapshot] = dict(state.get("attempt_snapshots_by_id", {}))
+    retry_plans_by_task: dict[str, SupervisorRetryPlan] = dict(state.get("retry_plans_by_task", {}))
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = dict(
         state.get("retry_diagnostics_by_task", {})
     )
     prior_events = list(state.get("consistency_events", []) or [])
     prior_event_keys = {
-        (event.task_id, event.received_attempt_id, event.error_code)
-        for event in prior_events
+        (event.task_id, event.received_attempt_id, event.error_code) for event in prior_events
     }
 
     events, errors = _validate_committed_state(
@@ -637,8 +776,7 @@ def reconcile_phase5_state_before_teardown(
     new_events = [
         event
         for event in _dedupe_consistency_events(events)
-        if (event.task_id, event.received_attempt_id, event.error_code)
-        not in prior_event_keys
+        if (event.task_id, event.received_attempt_id, event.error_code) not in prior_event_keys
     ]
     prior_errors = set(state.get("errors", []) or [])
     new_errors = list(dict.fromkeys(error for error in errors if error not in prior_errors))
@@ -658,10 +796,10 @@ def reconcile_phase5_state_before_teardown(
 
 def _parse_planner_retry_plans(
     scratchpad: str,
-    task_queue: Dict[str, RemediationTask],
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    group_by_id: Optional[Dict[str, VulnerabilityGroup]] = None,
-) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    task_queue: dict[str, RemediationTask],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
+) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Parse planner markers and reconcile them into typed per-task plans.
 
     The planner scratchpad remains useful audit evidence, but this function is
@@ -670,9 +808,9 @@ def _parse_planner_retry_plans(
     previous retry candidate active.
     """
     updated = dict(diagnostics_by_task)
-    plans: Dict[str, SupervisorRetryPlan] = {}
-    sections: Dict[str, List[str]] = {}
-    current_task: Optional[str] = None
+    plans: dict[str, SupervisorRetryPlan] = {}
+    sections: dict[str, list[str]] = {}
+    current_task: str | None = None
     for line in (scratchpad or "").splitlines():
         task_match = re.search(r"(?:TASK|Task)\s*[:#]?\s*(task-[\w-]+)", line)
         if task_match and task_match.group(1) in task_queue:
@@ -768,11 +906,11 @@ def _parse_planner_retry_plans(
         exhausted = bool(prior.exhausted_update_path)
         if selected is None and (
             action_hint == "pivot_workaround"
-            or
-            pivot_recommended
+            or pivot_recommended
             or "no new version" in lowered
             or "no valid candidate" in lowered
-            or "only candidate" in lowered and "already been attempted" in lowered
+            or "only candidate" in lowered
+            and "already been attempted" in lowered
             or (
                 effective_stage == SCARemediationStage.NPM_LATEST
                 and same_major_equals_latest
@@ -783,8 +921,7 @@ def _parse_planner_retry_plans(
 
         if (
             not stage_match
-            and
-            effective_stage == SCARemediationStage.NPM_SAME_MAJOR
+            and effective_stage == SCARemediationStage.NPM_SAME_MAJOR
             and "same-major" in lowered
             and (
                 "same-major stage: skipped" in lowered
@@ -852,10 +989,10 @@ def _parse_planner_retry_plans(
 
 
 def _planner_plan_violations(
-    plans: Dict[str, SupervisorRetryPlan],
-    task_queue: Dict[str, RemediationTask],
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-) -> List[str]:
+    plans: dict[str, SupervisorRetryPlan],
+    task_queue: dict[str, RemediationTask],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+) -> list[str]:
     """Validate planner semantics before a plan can mutate routing state.
 
     The planner's prose is intentionally not treated as an authority.  These
@@ -864,7 +1001,7 @@ def _planner_plan_violations(
     makes the corrective replan visible in LangSmith through the supervisor's
     accumulated ``errors`` field.
     """
-    violations: List[str] = []
+    violations: list[str] = []
     for task_id, plan in plans.items():
         task = task_queue.get(task_id)
         if task is None:
@@ -879,9 +1016,7 @@ def _planner_plan_violations(
             )
 
         attempted = {
-            version.strip().lstrip("vV").lower()
-            for version in plan.attempted_versions
-            if version
+            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
         }
         diagnostics = diagnostics_by_task.get(task_id)
         if diagnostics is not None:
@@ -892,9 +1027,7 @@ def _planner_plan_violations(
             )
 
         selected = (
-            plan.selected_version.strip().lstrip("vV").lower()
-            if plan.selected_version
-            else None
+            plan.selected_version.strip().lstrip("vV").lower() if plan.selected_version else None
         )
         if selected and selected in attempted:
             violations.append(
@@ -915,30 +1048,26 @@ def _planner_plan_violations(
                 f"task {task_id}: retry_update requires an unattempted exact selected_version"
             )
         if plan.action == "retry_update" and plan.exhausted_update_path:
-            violations.append(
-                f"task {task_id}: exhausted update path cannot retry update"
-            )
+            violations.append(f"task {task_id}: exhausted update path cannot retry update")
         if (
             plan.action == "retry_update"
             and plan.strategy_stage == SCARemediationStage.CODE_WORKAROUND
         ):
-            violations.append(
-                f"task {task_id}: retry_update cannot use code_workaround stage"
-            )
+            violations.append(f"task {task_id}: retry_update cannot use code_workaround stage")
         if (
             plan.action == "retry_update"
             and task.strategy == RoutingStrategy.VERSION_BUMP
-            and _SCA_STAGE_ORDER[plan.strategy_stage]
-            < _SCA_STAGE_ORDER[task.strategy_stage]
+            and _SCA_STAGE_ORDER[plan.strategy_stage] < _SCA_STAGE_ORDER[task.strategy_stage]
         ):
             violations.append(
                 f"task {task_id}: planner stage {plan.strategy_stage.value} regresses "
                 f"from committed stage {task.strategy_stage.value}"
             )
-        if plan.action == "pivot_workaround" and plan.strategy_stage != SCARemediationStage.NPM_LATEST:
-            violations.append(
-                f"task {task_id}: workaround pivot must be committed at npm_latest"
-            )
+        if (
+            plan.action == "pivot_workaround"
+            and plan.strategy_stage != SCARemediationStage.NPM_LATEST
+        ):
+            violations.append(f"task {task_id}: workaround pivot must be committed at npm_latest")
         if plan.action == "pivot_workaround" and selected is not None:
             violations.append(
                 f"task {task_id}: workaround pivot cannot retain selected version {plan.selected_version}"
@@ -947,12 +1076,12 @@ def _planner_plan_violations(
 
 
 def _reconcile_registry_plan_evidence(
-    plans: Dict[str, SupervisorRetryPlan],
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    tool_events: List[ToolEvent],
-) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    plans: dict[str, SupervisorRetryPlan],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    tool_events: list[ToolEvent],
+) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Replace free-form version claims with the planner tool's result.
 
     The LLM still chooses which task/stage to reason about, but the version
@@ -963,7 +1092,7 @@ def _reconcile_registry_plan_evidence(
         return diagnostics_by_task, plans
 
     updated = dict(diagnostics_by_task)
-    reconciled: Dict[str, SupervisorRetryPlan] = {}
+    reconciled: dict[str, SupervisorRetryPlan] = {}
     for task_id, plan in plans.items():
         task = task_queue.get(task_id)
         group = group_by_id.get(task.parent_group_id) if task else None
@@ -1019,7 +1148,9 @@ def _reconcile_registry_plan_evidence(
         )
         selected_token = selected_match.group(1).strip() if selected_match else "NONE"
         selected = None if selected_token.upper() == "NONE" else selected_token.lstrip("vV")
-        latest_seen = latest_match.group(1).strip().lstrip("vV") if latest_match else plan.latest_version_seen
+        latest_seen = (
+            latest_match.group(1).strip().lstrip("vV") if latest_match else plan.latest_version_seen
+        )
         eligible = []
         if eligible_match:
             eligible = [
@@ -1032,9 +1163,7 @@ def _reconcile_registry_plan_evidence(
         if prior is None:
             prior = UpdateRetryDiagnostics(task_id=task_id)
         attempted = {
-            version.strip().lstrip("vV")
-            for version in prior.attempted_versions
-            if version
+            version.strip().lstrip("vV") for version in prior.attempted_versions if version
         }
         candidates = eligible or list(plan.candidate_versions_considered)
         if selected and selected not in candidates:
@@ -1043,14 +1172,18 @@ def _reconcile_registry_plan_evidence(
             candidates.append(latest_seen)
 
         effective_stage = plan.strategy_stage
-        if selected_event in latest_events:
-            effective_stage = SCARemediationStage.NPM_LATEST
-        elif (
-            "same-major stage: skipped" in content.lower()
+        if (
+            selected_event in latest_events
+            or "same-major stage: skipped" in content.lower()
             or (
                 re.search(r"^-\s*Same-Major Latest:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE)
                 and latest_seen
-                and re.search(r"^-\s*Same-Major Latest:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE).group(1).lstrip("vV") == latest_seen
+                and re.search(
+                    r"^-\s*Same-Major Latest:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE
+                )
+                .group(1)
+                .lstrip("vV")
+                == latest_seen
             )
         ):
             effective_stage = SCARemediationStage.NPM_LATEST
@@ -1101,12 +1234,12 @@ def _reconcile_registry_plan_evidence(
 
 
 def _repair_invalid_planner_plans(
-    plans: Dict[str, SupervisorRetryPlan],
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    violations: Optional[List[str]] = None,
-) -> Tuple[Dict[str, UpdateRetryDiagnostics], Dict[str, SupervisorRetryPlan]]:
+    plans: dict[str, SupervisorRetryPlan],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    violations: list[str] | None = None,
+) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Apply a deterministic, fail-closed repair after corrective replanning.
 
     A valid unattempted candidate already present in planner evidence is safe to
@@ -1116,7 +1249,7 @@ def _repair_invalid_planner_plans(
     moving.
     """
     repaired_diagnostics = dict(diagnostics_by_task)
-    repaired_plans: Dict[str, SupervisorRetryPlan] = {}
+    repaired_plans: dict[str, SupervisorRetryPlan] = {}
     invalid_task_ids = {
         match.group(1)
         for violation in (violations or [])
@@ -1128,9 +1261,7 @@ def _repair_invalid_planner_plans(
             continue
         diagnostics = repaired_diagnostics.get(task_id)
         attempted = {
-            version.strip().lstrip("vV").lower()
-            for version in plan.attempted_versions
-            if version
+            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
         }
         if diagnostics is not None:
             attempted.update(
@@ -1230,9 +1361,9 @@ def _repair_invalid_planner_plans(
 
 def _parse_planner_selected_versions(
     scratchpad: str,
-    task_queue: Dict[str, RemediationTask],
-    diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-) -> Dict[str, UpdateRetryDiagnostics]:
+    task_queue: dict[str, RemediationTask],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+) -> dict[str, UpdateRetryDiagnostics]:
     """Backward-compatible wrapper returning reconciled diagnostics only."""
     diagnostics, _ = _parse_planner_retry_plans(
         scratchpad,
@@ -1243,11 +1374,11 @@ def _parse_planner_selected_versions(
 
 
 def _update_worker_task_ids(
-    task_queue: Dict[str, RemediationTask],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    preferred_ids: Optional[List[str]] = None,
-    limit: Optional[int] = UPDATE_BATCH_SIZE,
-) -> List[str]:
+    task_queue: dict[str, RemediationTask],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    preferred_ids: list[str] | None = None,
+    limit: int | None = UPDATE_BATCH_SIZE,
+) -> list[str]:
     task_ids = _dispatchable_task_ids_for_status(
         task_queue,
         set(_WORKABLE_STATUSES),
@@ -1269,10 +1400,10 @@ def _update_worker_task_ids(
 
 def _normalize_target_task_ids_for_node(
     next_node: str,
-    target_task_ids: List[str],
-    task_queue: Dict[str, RemediationTask],
-    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
-) -> List[str]:
+    target_task_ids: list[str],
+    task_queue: dict[str, RemediationTask],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+) -> list[str]:
     """Clamp returned active targets to the lifecycle state accepted by next_node."""
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
     if next_node == "qa_critic":
@@ -1297,9 +1428,9 @@ def _normalize_target_task_ids_for_node(
 
 def _resolve_task_id_from_identifier(
     identifier: str,
-    task_queue: Dict[str, RemediationTask],
-    active_target_task_ids: List[str],
-) -> Optional[str]:
+    task_queue: dict[str, RemediationTask],
+    active_target_task_ids: list[str],
+) -> str | None:
     """
     Resolve a task or legacy group identifier to the most relevant task_id.
 
@@ -1329,9 +1460,7 @@ def _resolve_task_id_from_identifier(
         return non_terminal_matches[0]
 
     all_matches = [
-        task.task_id
-        for task in task_queue.values()
-        if task.parent_group_id == identifier
+        task.task_id for task in task_queue.values() if task.parent_group_id == identifier
     ]
     if len(all_matches) == 1:
         return all_matches[0]
@@ -1340,12 +1469,12 @@ def _resolve_task_id_from_identifier(
 
 
 def _normalize_qa_evaluations_for_tasks(
-    qa_evaluations: Dict[str, QAEvaluation],
-    task_queue: Dict[str, RemediationTask],
-    active_target_task_ids: List[str],
-) -> Dict[str, QAEvaluation]:
+    qa_evaluations: dict[str, QAEvaluation],
+    task_queue: dict[str, RemediationTask],
+    active_target_task_ids: list[str],
+) -> dict[str, QAEvaluation]:
     """Re-key QA evaluations to concrete task_ids when possible."""
-    normalized: Dict[str, QAEvaluation] = {}
+    normalized: dict[str, QAEvaluation] = {}
     for identifier, evaluation in qa_evaluations.items():
         resolved_t_id = _resolve_task_id_from_identifier(
             identifier,
@@ -1386,15 +1515,15 @@ def _constraint_entry_for_task(
 
 def _missing_retry_revised_instructions(
     next_node: str,
-    target_task_ids: List[str],
-    revised_instructions: Dict[str, str],
-    task_queue: Dict[str, RemediationTask],
-) -> List[str]:
+    target_task_ids: list[str],
+    revised_instructions: dict[str, str],
+    task_queue: dict[str, RemediationTask],
+) -> list[str]:
     """Return retry-bound update targets that are missing exact revised instructions."""
     if next_node != "update_subagent":
         return []
 
-    missing: List[str] = []
+    missing: list[str] = []
     for task_id in target_task_ids:
         task = task_queue.get(task_id)
         if task is None or task.status != TaskStatus.NEEDS_RETRY:
@@ -1413,12 +1542,12 @@ def _missing_retry_revised_instructions(
 
 
 def _latest_action_summary_by_task(
-    action_summaries: List[AgentActionSummary],
-    task_queue: Dict[str, RemediationTask],
-    active_target_task_ids: List[str],
-) -> Dict[str, AgentActionSummary]:
+    action_summaries: list[AgentActionSummary],
+    task_queue: dict[str, RemediationTask],
+    active_target_task_ids: list[str],
+) -> dict[str, AgentActionSummary]:
     """Return the most recent action summary keyed by resolved task_id."""
-    latest: Dict[str, AgentActionSummary] = {}
+    latest: dict[str, AgentActionSummary] = {}
     for summary in action_summaries:
         resolved_task_id = _resolve_task_id_from_identifier(
             summary.task_id,
@@ -1433,11 +1562,19 @@ def _latest_action_summary_by_task(
 
 def _build_workaround_retry_instruction(
     task: RemediationTask,
-    evaluation: Optional[QAEvaluation],
+    evaluation: QAEvaluation | None,
 ) -> str:
     """Synthesize a high-level retry instruction for the workaround subagent."""
-    category_str = evaluation.failure_category.value if evaluation and evaluation.failure_category else "unknown"
-    feedback_str = evaluation.retry_feedback if evaluation and evaluation.retry_feedback else "No feedback provided."
+    category_str = (
+        evaluation.failure_category.value
+        if evaluation and evaluation.failure_category
+        else "unknown"
+    )
+    feedback_str = (
+        evaluation.retry_feedback
+        if evaluation and evaluation.retry_feedback
+        else "No feedback provided."
+    )
     component = task.vulnerable_component or task.parent_group_id
     return (
         f"RETRY: Your previous code workaround attempt for {component} failed QA.\n"
@@ -1450,15 +1587,15 @@ def _build_workaround_retry_instruction(
 
 def _build_high_level_retry_instruction(
     task: RemediationTask,
-    group: Optional[VulnerabilityGroup],
-    evaluation: Optional[QAEvaluation],
-    diagnostics: Optional[UpdateRetryDiagnostics],
+    group: VulnerabilityGroup | None,
+    evaluation: QAEvaluation | None,
+    diagnostics: UpdateRetryDiagnostics | None,
 ) -> str:
     """Synthesize a high-level retry instruction for the update worker."""
     component = group.vulnerable_component if group else task.parent_group_id
     category = evaluation.failure_category if evaluation else None
     if diagnostics and diagnostics.selected_version:
-        manifest = (group.file_paths[0] if group and group.file_paths else "package.json")
+        manifest = group.file_paths[0] if group and group.file_paths else "package.json"
         dependency_action = "dependency version"
         if diagnostics.used_overrides:
             dependency_action = "npm override"
@@ -1493,7 +1630,7 @@ def _build_high_level_retry_instruction(
             None,
         )
         if candidate:
-            manifest = (group.file_paths[0] if group and group.file_paths else "package.json")
+            manifest = group.file_paths[0] if group and group.file_paths else "package.json"
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update {manifest} to exact version {candidate}; "
@@ -1536,7 +1673,7 @@ def _worker_node_for_strategy(strategy: RoutingStrategy) -> str:
 def _parent_status_for_strategy_pivot(
     parent_task: RemediationTask,
     new_strategy: RoutingStrategy,
-    qa_evaluations: Dict[str, QAEvaluation],
+    qa_evaluations: dict[str, QAEvaluation],
 ) -> TaskStatus:
     """
     Choose the terminal parent status when a strategy pivot spawns a child task.
@@ -1559,13 +1696,13 @@ def _parent_status_for_strategy_pivot(
 
 
 def _terminalize_pivot_parents(
-    task_queue: Dict[str, RemediationTask],
-    parent_ids: List[str],
-    strategy_by_parent: Dict[str, RoutingStrategy],
-    qa_evaluations: Dict[str, QAEvaluation],
-    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
-    retry_plans_by_task: Optional[Dict[str, SupervisorRetryPlan]] = None,
-    group_by_id: Optional[Dict[str, VulnerabilityGroup]] = None,
+    task_queue: dict[str, RemediationTask],
+    parent_ids: list[str],
+    strategy_by_parent: dict[str, RoutingStrategy],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    retry_plans_by_task: dict[str, SupervisorRetryPlan] | None = None,
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> None:
     """Mark pivoted parent tasks terminal so they cannot be re-routed to update work."""
     for parent_id in parent_ids:
@@ -1578,7 +1715,7 @@ def _terminalize_pivot_parents(
             new_strategy,
             qa_evaluations,
         )
-        updates: Dict[str, Any] = {}
+        updates: dict[str, Any] = {}
         if parent_task.status not in _TERMINAL_STATUSES:
             updates["status"] = terminal_status
 
@@ -1630,9 +1767,7 @@ def _terminalize_pivot_parents(
                         "selected_version": None,
                         "exhausted_update_path": True,
                         "committed_attempt_id": None,
-                        "instruction_digest": _instruction_digest(
-                            committed_parent.instruction
-                        ),
+                        "instruction_digest": _instruction_digest(committed_parent.instruction),
                     }
                 )
 
@@ -1643,12 +1778,12 @@ def _terminalize_pivot_parents(
 
 
 def _deterministic_routing(
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    qa_evaluations: Dict[str, QAEvaluation],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    action_summaries: Optional[List[AgentActionSummary]] = None,
-    active_target_task_ids: Optional[List[str]] = None,
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    action_summaries: list[AgentActionSummary] | None = None,
+    active_target_task_ids: list[str] | None = None,
     current_status: str = "",
     triage_required: bool = False,
 ) -> SupervisorDecision:
@@ -1724,17 +1859,15 @@ def _deterministic_routing(
         )
     ]
     if exhausted_retries:
-        spawn_requests: List[TaskSpawnRequest] = []
-        feedback_by_task: Dict[str, str] = {}
+        spawn_requests: list[TaskSpawnRequest] = []
+        feedback_by_task: dict[str, str] = {}
         for task in exhausted_retries:
             component = (
                 group_by_id.get(task.parent_group_id).vulnerable_component
                 if task.parent_group_id in group_by_id
                 else task.parent_group_id
             )
-            eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(
-                task.parent_group_id
-            )
+            eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
             if eval_ and eval_.retry_feedback:
                 feedback_by_task[task.task_id] = eval_.retry_feedback
             spawn_requests.append(
@@ -1770,8 +1903,8 @@ def _deterministic_routing(
     ]
     if retry_version_bump:
         batch = retry_version_bump[:UPDATE_BATCH_SIZE]
-        feedback_by_task: Dict[str, str] = {}
-        revised_instructions: Dict[str, str] = {}
+        feedback_by_task: dict[str, str] = {}
+        revised_instructions: dict[str, str] = {}
         for task in batch:
             evaluation = qa_evaluations.get(task.task_id) or qa_evaluations.get(
                 task.parent_group_id
@@ -1803,7 +1936,7 @@ def _deterministic_routing(
     ]
     if version_bump:
         batch = version_bump[:UPDATE_BATCH_SIZE]
-        feedback_by_task: Dict[str, str] = {}
+        feedback_by_task: dict[str, str] = {}
         for t in batch:
             eval_ = qa_evaluations.get(t.task_id) or qa_evaluations.get(t.parent_group_id)
             if eval_ and eval_.retry_feedback:
@@ -1822,16 +1955,13 @@ def _deterministic_routing(
     workaround = [
         t
         for t in workable
-        if t.strategy == RoutingStrategy.CODE_WORKAROUND
-        and t.retry_count < MAX_RETRIES
+        if t.strategy == RoutingStrategy.CODE_WORKAROUND and t.retry_count < MAX_RETRIES
     ]
     if workaround:
         target = workaround[0]
-        eval_ = qa_evaluations.get(target.task_id) or qa_evaluations.get(
-            target.parent_group_id
-        )
-        feedback: Dict[str, str] = {}
-        revised_instructions: Dict[str, str] = {}
+        eval_ = qa_evaluations.get(target.task_id) or qa_evaluations.get(target.parent_group_id)
+        feedback: dict[str, str] = {}
+        revised_instructions: dict[str, str] = {}
         if eval_ and eval_.retry_feedback:
             feedback[target.task_id] = eval_.retry_feedback
         if target.status == TaskStatus.NEEDS_RETRY and eval_:
@@ -1845,9 +1975,7 @@ def _deterministic_routing(
             feedback_by_task=feedback,
             revised_instructions=revised_instructions,
             instructions="Apply the minimal safe code workaround for this vulnerability.",
-            decision_reason=(
-                f"Routing task '{target.task_id}' to workaround_subagent."
-            ),
+            decision_reason=(f"Routing task '{target.task_id}' to workaround_subagent."),
         )
 
     # Unexpected: no workable tasks found â†’ teardown as safe default
@@ -1855,9 +1983,7 @@ def _deterministic_routing(
         next_node="teardown",
         target_task_ids=[],
         instructions="No actionable tasks remain.",
-        decision_reason=(
-            "Deterministic fallback: no workable tasks found, routing to teardown."
-        ),
+        decision_reason=("Deterministic fallback: no workable tasks found, routing to teardown."),
     )
 
 
@@ -1867,9 +1993,9 @@ def _deterministic_routing(
 
 
 def _needs_planner(
-    task_queue: Dict[str, RemediationTask],
-    qa_evaluations: Dict[str, QAEvaluation],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
+    task_queue: dict[str, RemediationTask],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     current_status: str,
 ) -> bool:
     """Return True when the planner should be invoked.
@@ -1878,23 +2004,24 @@ def _needs_planner(
     CODE_WORKAROUND tasks do not use the npm version planner.
     """
     version_bump_retries = [
-        t for t in task_queue.values()
+        t
+        for t in task_queue.values()
         if t.status == TaskStatus.NEEDS_RETRY and t.strategy == RoutingStrategy.VERSION_BUMP
     ]
     if not version_bump_retries:
         return False
-    return current_status == "qa_completed" or bool(qa_evaluations) or bool(
-        retry_diagnostics_by_task
+    return (
+        current_status == "qa_completed" or bool(qa_evaluations) or bool(retry_diagnostics_by_task)
     )
 
 
 def _build_planner_prompt(
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    qa_evaluations: Dict[str, QAEvaluation],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    action_summaries: List[AgentActionSummary],
-    constraints_ledger: List[str],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    action_summaries: list[AgentActionSummary],
+    constraints_ledger: list[str],
     correction: str = "",
 ) -> str:
     """Build the planner system + user messages."""
@@ -1929,7 +2056,8 @@ def _build_planner_prompt(
         eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
         security_floor = (
-            diagnostics.security_floor if diagnostics and diagnostics.security_floor
+            diagnostics.security_floor
+            if diagnostics and diagnostics.security_floor
             else (group.fix_plan.fixed_version if group and group.fix_plan else "unknown")
         )
 
@@ -1968,9 +2096,7 @@ def _build_planner_prompt(
     if not actionable_retry_tasks:
         lines.append("- (none)")
 
-    terminal_tasks = [
-        task for task in active_tasks.values() if task.status in _TERMINAL_STATUSES
-    ]
+    terminal_tasks = [task for task in active_tasks.values() if task.status in _TERMINAL_STATUSES]
     qa_ready_tasks = [
         task for task in active_tasks.values() if task.status == TaskStatus.OPTIMISTICALLY_FIXED
     ]
@@ -2059,12 +2185,12 @@ def _build_planner_prompt(
 
 
 def _run_planner_phase(
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    qa_evaluations: Dict[str, QAEvaluation],
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics],
-    action_summaries: List[AgentActionSummary],
-    constraints_ledger: List[str],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    action_summaries: list[AgentActionSummary],
+    constraints_ledger: list[str],
     llm: Any,
     correction: str = "",
     return_tool_events: bool = False,
@@ -2122,25 +2248,21 @@ def _run_planner_phase(
 
 def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> str:
     """Build the structured Router LLM prompt for the Supervisor decision."""
-    valid_groups: List[VulnerabilityGroup] = state.get("valid_groups", [])
-    task_queue: Dict[str, RemediationTask] = state.get("task_queue", {})
-    constraints_ledger: List[str] = state.get("constraints_ledger", [])
-    action_summaries: List[AgentActionSummary] = state.get("action_summaries", [])
-    qa_evaluations: Dict[str, QAEvaluation] = state.get("qa_evaluations", {})
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = state.get(
+    valid_groups: list[VulnerabilityGroup] = state.get("valid_groups", [])
+    task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
+    constraints_ledger: list[str] = state.get("constraints_ledger", [])
+    action_summaries: list[AgentActionSummary] = state.get("action_summaries", [])
+    qa_evaluations: dict[str, QAEvaluation] = state.get("qa_evaluations", {})
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = state.get(
         "retry_diagnostics_by_task", {}
     )
-    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = state.get(
-        "retry_plans_by_task", {}
-    )
+    retry_plans_by_task: dict[str, SupervisorRetryPlan] = state.get("retry_plans_by_task", {})
     eval_status: str = state.get("eval_status", "")
-    baseline_scan_identifiers: List[str] = state.get("baseline_scan_identifiers", [])
-    post_remediation_scan_identifiers: List[str] = state.get(
+    baseline_scan_identifiers: list[str] = state.get("baseline_scan_identifiers", [])
+    post_remediation_scan_identifiers: list[str] = state.get(
         "post_remediation_scan_identifiers", []
     )
-    new_vulnerability_identifiers: List[str] = state.get(
-        "new_vulnerability_identifiers", []
-    )
+    new_vulnerability_identifiers: list[str] = state.get("new_vulnerability_identifiers", [])
     new_vulnerability_status: str = state.get("new_vulnerability_status", "not_scanned")
     triage_required: bool = bool(state.get("triage_required", False))
 
@@ -2235,9 +2357,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "## Recent Action Summaries",
     ]
     for summary in _current_action_summaries(action_summaries, task_queue, 10):
-        lines.append(
-            f"- [{summary.task_id}] {summary.status.value}: {summary.summary}"
-        )
+        lines.append(f"- [{summary.task_id}] {summary.status.value}: {summary.summary}")
     if not action_summaries:
         lines.append("- (none)")
 
@@ -2285,6 +2405,10 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "21. Mixed worker batches must be split by task status before routing the next node.",
         "22. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
         "23. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
+        "24. When routing or spawning CODE_WORKAROUND tasks, you MUST provide a search_hint in the task `instruction` or `revised_instructions`:",
+        '    - Scenario: QA failed on unit tests -> "Hint: Unit tests failed, prioritize searching the error string / stack trace without quotation marks."',
+        '    - Scenario: QA failed on scanner/CVE unresolved, or no version bumps available -> "Hint: Prioritize searching the CVE and mitigation strategies without quotation marks."',
+        '    - Scenario: Workaround validation gate failed (retry) -> "Hint: Validation gate failed, prioritize searching the error string without quotation marks."',
     ]
 
     return "\n".join(lines)
@@ -2296,20 +2420,20 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
 
 
 def _materialize_spawn_requests(
-    spawn_requests: List[TaskSpawnRequest],
-    task_queue: Dict[str, RemediationTask],
-    group_by_id: Dict[str, VulnerabilityGroup],
-    errors: List[str],
-    valid_groups: Optional[List[VulnerabilityGroup]] = None,
-) -> Tuple[Dict[str, RemediationTask], Dict[str, List[str]]]:
+    spawn_requests: list[TaskSpawnRequest],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    errors: list[str],
+    valid_groups: list[VulnerabilityGroup] | None = None,
+) -> tuple[dict[str, RemediationTask], dict[str, list[str]]]:
     """Validate and materialize spawn requests into new RemediationTask objects.
 
     Returns a dict of new task_id â†’ RemediationTask to be merged into task_queue.
     Rejected requests are logged to errors.
     """
     next_index = len(task_queue) + 1
-    new_tasks: Dict[str, RemediationTask] = {}
-    child_ids_by_parent: Dict[str, List[str]] = {}
+    new_tasks: dict[str, RemediationTask] = {}
+    child_ids_by_parent: dict[str, list[str]] = {}
     current_queue_size = len(task_queue)
 
     for req in spawn_requests:
@@ -2358,7 +2482,7 @@ def _materialize_spawn_requests(
         child_task_id = f"task-{next_index}"
         next_index += 1
 
-        _TRIAGE_BUCKET_TO_STRATEGY: Dict[str, str] = {
+        _TRIAGE_BUCKET_TO_STRATEGY: dict[str, str] = {
             "UPDATE_VERSION": RoutingStrategy.VERSION_BUMP.name,
             "WORKAROUND": RoutingStrategy.CODE_WORKAROUND.name,
             "NO_FIX": RoutingStrategy.CODE_WORKAROUND.name,
@@ -2424,7 +2548,7 @@ def _materialize_spawn_requests(
 # ---------------------------------------------------------------------------
 
 
-def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
+def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node â€” Supervisor commander for Phase 5 orchestration.
 
@@ -2445,7 +2569,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
        unfixable marks, new constraints, and materialized spawn requests.
     10. Return state patch.
     """
-    valid_groups: List[VulnerabilityGroup] = list(state.get("valid_groups", []))
+    valid_groups: list[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
         if state.get("triage_required") and state.get("status") in {
             "qa_completed",
@@ -2465,50 +2589,42 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             "supervisor_instructions": "No groups to process.",
         }
 
-    group_by_id: Dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
-    existing_constraints: List[str] = list(state.get("constraints_ledger", []))
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics] = dict(
+    group_by_id: dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
+    existing_constraints: list[str] = list(state.get("constraints_ledger", []))
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = dict(
         state.get("retry_diagnostics_by_task", {})
     )
-    retry_plans_by_task: Dict[str, SupervisorRetryPlan] = dict(
-        state.get("retry_plans_by_task", {})
-    )
-    workaround_replay_plans_by_task: Dict[str, WorkaroundReplayPlan] = dict(
+    retry_plans_by_task: dict[str, SupervisorRetryPlan] = dict(state.get("retry_plans_by_task", {}))
+    workaround_replay_plans_by_task: dict[str, WorkaroundReplayPlan] = dict(
         state.get("workaround_replay_plans_by_task", {})
     )
-    attempt_snapshots_by_id: Dict[str, TaskAttemptSnapshot] = dict(
+    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot] = dict(
         state.get("attempt_snapshots_by_id", {})
     )
-    worker_results_by_attempt: Dict[str, WorkerAttemptResult] = dict(
+    worker_results_by_attempt: dict[str, WorkerAttemptResult] = dict(
         state.get("worker_results_by_attempt", {})
     )
-    qa_results_by_attempt: Dict[str, QAAttemptResult] = dict(
-        state.get("qa_results_by_attempt", {})
-    )
-    processed_worker_attempt_ids: Set[str] = set(
-        state.get("processed_worker_attempt_ids", [])
-    )
-    processed_qa_attempt_ids: Set[str] = set(
-        state.get("processed_qa_attempt_ids", [])
-    )
-    prior_consistency_events: List[StateConsistencyEvent] = list(
+    qa_results_by_attempt: dict[str, QAAttemptResult] = dict(state.get("qa_results_by_attempt", {}))
+    processed_worker_attempt_ids: set[str] = set(state.get("processed_worker_attempt_ids", []))
+    processed_qa_attempt_ids: set[str] = set(state.get("processed_qa_attempt_ids", []))
+    prior_consistency_events: list[StateConsistencyEvent] = list(
         state.get("consistency_events", [])
     )
-    consistency_events: List[StateConsistencyEvent] = []
+    consistency_events: list[StateConsistencyEvent] = []
     state_revision = int(state.get("state_revision", 0)) + 1
     # ``errors`` is an additive LangGraph reducer. A node must return only
     # errors discovered during this invocation; replaying the prior list here
     # is what caused identical planner errors to multiply across supervisor
     # loops.
-    errors: List[str] = []
+    errors: list[str] = []
     prior_error_messages = set(state.get("errors", []) or [])
 
     # ------------------------------------------------------------------
     # 1. Normalize task_queue (copy-on-write)
     # ------------------------------------------------------------------
-    raw_task_queue: Dict[str, RemediationTask] = dict(state.get("task_queue", {}))
+    raw_task_queue: dict[str, RemediationTask] = dict(state.get("task_queue", {}))
     # Copy-on-write: work with model copies so we never mutate state-owned objects
-    task_queue: Dict[str, RemediationTask] = {
+    task_queue: dict[str, RemediationTask] = {
         tid: t.model_copy() for tid, t in raw_task_queue.items()
     }
     existing_group_ids = {t.parent_group_id for t in task_queue.values()}
@@ -2523,11 +2639,10 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # Later planner commits are the only source allowed to change these fields.
     for task_id, task in list(task_queue.items()):
         group = group_by_id.get(task.parent_group_id)
-        task_updates: Dict[str, Any] = {}
+        task_updates: dict[str, Any] = {}
         if (
             task.task_revision == 0
-            and
-            task.status not in _TERMINAL_STATUSES
+            and task.status not in _TERMINAL_STATUSES
             and task.current_attempt_id is None
             and not task.instruction
             and group is not None
@@ -2554,24 +2669,16 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     active_target_task_ids = list(state.get("active_target_task_ids") or [])
     active_targets = set(active_target_task_ids)
-    action_summaries: List[AgentActionSummary] = state.get("action_summaries") or []
-    new_worker_attempt_ids: List[str] = []
+    action_summaries: list[AgentActionSummary] = state.get("action_summaries") or []
+    new_worker_attempt_ids: list[str] = []
 
     for task_id in active_target_task_ids:
         task = task_queue.get(task_id)
         if task is None:
             continue
         current_attempt_id = task.current_attempt_id
-        snapshot = (
-            attempt_snapshots_by_id.get(current_attempt_id)
-            if current_attempt_id
-            else None
-        )
-        result = (
-            worker_results_by_attempt.get(current_attempt_id)
-            if current_attempt_id
-            else None
-        )
+        snapshot = attempt_snapshots_by_id.get(current_attempt_id) if current_attempt_id else None
+        result = worker_results_by_attempt.get(current_attempt_id) if current_attempt_id else None
         for stale_result in worker_results_by_attempt.values():
             if (
                 stale_result.task_id == task_id
@@ -2684,16 +2791,14 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         dict.fromkeys(prior.attempted_versions + attempted_versions)
                     ),
                     "executed_versions": list(
-                        dict.fromkeys(
-                            prior.executed_versions + result.executed_versions
-                        )
+                        dict.fromkeys(prior.executed_versions + result.executed_versions)
                     ),
                     "selected_version": task.selected_version,
                     "strategy_stage": task.strategy_stage,
                     "exhausted_update_path": task.exhausted_update_path,
                     "instruction_digest": snapshot.instruction_digest,
-                        "failure_reason": (
-                            " | ".join(result.errors)
+                    "failure_reason": (
+                        " | ".join(result.errors)
                         if result_status == AgentActionStatus.SURRENDER
                         else prior.failure_reason
                     ),
@@ -2759,9 +2864,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
                     )
                 elif task.strategy == RoutingStrategy.CODE_WORKAROUND:
-                    task_queue[task_id] = task.model_copy(
-                        update={"status": TaskStatus.UNFIXABLE}
-                    )
+                    task_queue[task_id] = task.model_copy(update={"status": TaskStatus.UNFIXABLE})
                 else:
                     task_queue[task_id] = task.model_copy(
                         update={
@@ -2788,13 +2891,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 3. Ingest QA results (active targets only, when qa_completed)
     # ------------------------------------------------------------------
-    qa_evaluations: Dict[str, QAEvaluation] = _normalize_qa_evaluations_for_tasks(
+    qa_evaluations: dict[str, QAEvaluation] = _normalize_qa_evaluations_for_tasks(
         dict(state.get("qa_evaluations", {})),
         task_queue,
         active_target_task_ids,
     )
-    qa_result_task_ids: Set[str] = set()
-    new_qa_attempt_ids: List[str] = []
+    qa_result_task_ids: set[str] = set()
+    new_qa_attempt_ids: list[str] = []
     for task_id in active_target_task_ids:
         task = task_queue.get(task_id)
         if task is None or not task.current_attempt_id:
@@ -2872,7 +2975,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
         processed_qa_attempt_ids.add(task.current_attempt_id)
         new_qa_attempt_ids.append(task.current_attempt_id)
-    auto_new_constraints: List[str] = []
+    auto_new_constraints: list[str] = []
 
     if state.get("status") == "qa_completed":
         for resolved_t_id, evaluation in qa_evaluations.items():
@@ -2905,7 +3008,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         auto_new_constraints.append(constraint)
             else:
                 next_stage = _next_sca_stage(task.strategy_stage)
-                task_updates: Dict[str, Any] = {
+                task_updates: dict[str, Any] = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
@@ -2925,9 +3028,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                             task_id=resolved_t_id,
                             strategy_stage=next_stage,
                             security_floor=(
-                                group.fix_plan.fixed_version
-                                if group and group.fix_plan
-                                else None
+                                group.fix_plan.fixed_version if group and group.fix_plan else None
                             ),
                             exhausted_update_path=(
                                 next_stage == SCARemediationStage.CODE_WORKAROUND
@@ -2943,7 +3044,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                                     if group and group.fix_plan
                                     else None
                                 ),
-                                "exhausted_update_path": next_stage == SCARemediationStage.CODE_WORKAROUND,
+                                "exhausted_update_path": next_stage
+                                == SCARemediationStage.CODE_WORKAROUND,
                             }
                         )
 
@@ -2975,7 +3077,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 5. Short-circuit: if active batch is all optimistically_fixed â†’ qa_critic
     # ------------------------------------------------------------------
-    decision: Optional[SupervisorDecision] = None
+    decision: SupervisorDecision | None = None
     if state.get("status") != "qa_completed" and active_target_task_ids:
         active_qa_ready = _qa_ready_task_ids(
             task_queue,
@@ -3046,10 +3148,10 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 logger.info("supervisor: invoking planner phase for retry analysis.")
                 planner_base_diagnostics = dict(retry_diagnostics_by_task)
                 planner_correction = ""
-                planner_violations: List[str] = []
-                parsed_diagnostics: Dict[str, UpdateRetryDiagnostics] = {}
-                parsed_plans: Dict[str, SupervisorRetryPlan] = {}
-                planner_tool_events: List[ToolEvent] = []
+                planner_violations: list[str] = []
+                parsed_diagnostics: dict[str, UpdateRetryDiagnostics] = {}
+                parsed_plans: dict[str, SupervisorRetryPlan] = {}
+                planner_tool_events: list[ToolEvent] = []
 
                 # Planner output is an untrusted proposal.  Give it one
                 # compact correction opportunity before applying anything to
@@ -3189,9 +3291,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         if task.status == TaskStatus.NEEDS_RETRY
                     }
                     affected_ids.update(
-                        plan.task_id
-                        for plan in parsed_plans.values()
-                        if plan.task_id in task_queue
+                        plan.task_id for plan in parsed_plans.values() if plan.task_id in task_queue
                     )
                     for task_id in affected_ids:
                         retry_plans_by_task.pop(task_id, None)
@@ -3234,12 +3334,12 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                             ),
                             strategy_stage=SCARemediationStage.NPM_LATEST,
                             security_floor=(
-                                group.fix_plan.fixed_version
-                                if group and group.fix_plan
-                                else None
+                                group.fix_plan.fixed_version if group and group.fix_plan else None
                             ),
                             attempted_versions=list(
-                                retry_diagnostics_by_task.get(task_id, UpdateRetryDiagnostics(task_id=task_id)).attempted_versions
+                                retry_diagnostics_by_task.get(
+                                    task_id, UpdateRetryDiagnostics(task_id=task_id)
+                                ).attempted_versions
                             ),
                             selected_version=None,
                             exhausted_update_path=True,
@@ -3253,7 +3353,9 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                             ),
                             strategy_stage=SCARemediationStage.NPM_LATEST,
                             selected_version=None,
-                            attempted_versions=retry_diagnostics_by_task[task_id].attempted_versions,
+                            attempted_versions=retry_diagnostics_by_task[
+                                task_id
+                            ].attempted_versions,
                             exhausted_update_path=True,
                             action="pivot_workaround",
                             exact_instruction=pivot_instruction,
@@ -3261,10 +3363,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
                 # A planner-confirmed exhausted path is deterministic. Do not
                 # ask the router LLM to reinterpret a pivot as an update retry.
-                if any(
-                    plan.action == "pivot_workaround"
-                    for plan in retry_plans_by_task.values()
-                ):
+                if any(plan.action == "pivot_workaround" for plan in retry_plans_by_task.values()):
                     decision = _deterministic_routing(
                         task_queue,
                         group_by_id,
@@ -3325,8 +3424,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
     # ------------------------------------------------------------------
-    pivot_parent_status_by_parent: Dict[str, TaskStatus] = {}
-    pivot_target_parent_ids: Set[str] = set()
+    pivot_parent_status_by_parent: dict[str, TaskStatus] = {}
+    pivot_target_parent_ids: set[str] = set()
 
     if decision is None:
         decision = _deterministic_routing(
@@ -3338,9 +3437,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
         )
-        logger.info(
-            "supervisor: deterministic fallback â†’ next_node=%s", decision.next_node
-        )
+        logger.info("supervisor: deterministic fallback â†’ next_node=%s", decision.next_node)
         fallback_pivot_strategy_by_parent = {
             req.parent_task_id: req.strategy
             for req in decision.spawn_requests
@@ -3423,23 +3520,21 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
             needs_fallback = True
         elif decision.next_node == "update_subagent" and not valid_target_ids:
-            logger.warning(
-                "supervisor: update_subagent needs â‰¥1 target, got 0 â€” falling back."
-            )
+            logger.warning("supervisor: update_subagent needs â‰¥1 target, got 0 â€” falling back.")
             needs_fallback = True
 
-        if not needs_fallback and decision.next_node == "update_subagent" and len(valid_target_ids) > UPDATE_BATCH_SIZE:
+        if (
+            not needs_fallback
+            and decision.next_node == "update_subagent"
+            and len(valid_target_ids) > UPDATE_BATCH_SIZE
+        ):
             logger.warning(
                 "supervisor: update_subagent supports at most %d targets, got %d â€” falling back.",
                 UPDATE_BATCH_SIZE,
                 len(valid_target_ids),
             )
             needs_fallback = True
-        if (
-            not needs_fallback
-            and decision.next_node == "update_subagent"
-            and valid_target_ids
-        ):
+        if not needs_fallback and decision.next_node == "update_subagent" and valid_target_ids:
             has_retry_targets = any(
                 task_queue[t_id].status == TaskStatus.NEEDS_RETRY
                 or task_queue[t_id].retry_count > 0
@@ -3456,9 +3551,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 )
                 needs_fallback = True
         if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
-            logger.warning(
-                "supervisor: qa_critic needs at least 1 target, got 0 â€” falling back."
-            )
+            logger.warning("supervisor: qa_critic needs at least 1 target, got 0 â€” falling back.")
             needs_fallback = True
 
         if needs_fallback:
@@ -3509,9 +3602,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 ):
                     clean_revised_instructions[task_id] = task.instruction
             clean_feedback = {
-                k: v
-                for k, v in decision.feedback_by_task.items()
-                if k in known_task_ids
+                k: v for k, v in decision.feedback_by_task.items() if k in known_task_ids
             }
             clean_updated_task_strategies = {
                 k: v
@@ -3545,7 +3636,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 clean_updated_task_strategies = dict(decision.updated_task_strategies)
 
             # Validate task_status_updates â€” only known tasks, only terminal statuses
-            clean_status_updates: Dict[str, TaskStatus] = {}
+            clean_status_updates: dict[str, TaskStatus] = {}
             _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
             for t_id, new_status in decision.task_status_updates.items():
                 if t_id not in known_task_ids:
@@ -3567,7 +3658,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 if req.parent_task_id in known_task_ids
                 and task_queue[req.parent_task_id].status not in _TERMINAL_STATUSES
             ]
-            pivot_strategy_by_parent: Dict[str, RoutingStrategy] = {
+            pivot_strategy_by_parent: dict[str, RoutingStrategy] = {
                 req.parent_task_id: req.strategy
                 for req in clean_spawn_requests
                 if task_queue[req.parent_task_id].strategy != req.strategy
@@ -3578,7 +3669,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 if task_queue[task_id].strategy != new_strategy
                 and task_id not in pivot_strategy_by_parent
             }
-            malformed_pivot_parent_ids: List[str] = []
+            malformed_pivot_parent_ids: list[str] = []
             for task_id, new_strategy in legacy_pivot_strategy_updates.items():
                 child_instruction = clean_revised_instructions.pop(task_id, "").strip()
                 if not child_instruction:
@@ -3604,11 +3695,12 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             incompatible_targeted_pivots = [
                 task_id
                 for task_id in targeted_pivot_ids
-                if decision.next_node != _worker_node_for_strategy(
-                    pivot_strategy_by_parent[task_id]
-                )
+                if decision.next_node
+                != _worker_node_for_strategy(pivot_strategy_by_parent[task_id])
             ]
-            pivot_validation_failed = bool(malformed_pivot_parent_ids or incompatible_targeted_pivots)
+            pivot_validation_failed = bool(
+                malformed_pivot_parent_ids or incompatible_targeted_pivots
+            )
             if pivot_validation_failed:
                 if malformed_pivot_parent_ids:
                     errors.append(
@@ -3620,10 +3712,12 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                         "supervisor: rejected strategy pivot because next_node does not match "
                         f"the child strategy for {incompatible_targeted_pivots}."
                     )
-                failed_parent_ids = list({
-                    *malformed_pivot_parent_ids,
-                    *incompatible_targeted_pivots,
-                })
+                failed_parent_ids = list(
+                    {
+                        *malformed_pivot_parent_ids,
+                        *incompatible_targeted_pivots,
+                    }
+                )
                 _terminalize_pivot_parents(
                     task_queue,
                     failed_parent_ids,
@@ -3682,9 +3776,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                     decision_reason=decision.decision_reason,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "supervisor: decision rebuild failed (%s) â€” falling back.", exc
-                )
+                logger.warning("supervisor: decision rebuild failed (%s) â€” falling back.", exc)
                 pivot_parent_status_by_parent = {}
                 pivot_target_parent_ids = set()
                 decision = _deterministic_routing(
@@ -3763,7 +3855,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             )
 
     # 8e. Materialize spawn requests
-    child_ids_by_parent: Dict[str, List[str]] = {}
+    child_ids_by_parent: dict[str, list[str]] = {}
     if decision.spawn_requests:
         new_tasks, child_ids_by_parent = _materialize_spawn_requests(
             spawn_requests=list(decision.spawn_requests),
@@ -3797,8 +3889,8 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             group_by_id=group_by_id,
         )
 
-    resolved_target_task_ids: List[str] = []
-    remapped_feedback_by_task: Dict[str, str] = {}
+    resolved_target_task_ids: list[str] = []
+    remapped_feedback_by_task: dict[str, str] = {}
     for task_id in decision.target_task_ids:
         if task_id in pivot_target_parent_ids:
             child_ids = child_ids_by_parent.get(task_id, [])
@@ -3848,7 +3940,10 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
                 eval_ = qa_evaluations.get(task_id) or qa_evaluations.get(task.parent_group_id)
                 if eval_ and eval_.retry_feedback:
                     remapped_feedback_by_task[task_id] = eval_.retry_feedback
-    if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"} and not resolved_target_task_ids:
+    if (
+        resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}
+        and not resolved_target_task_ids
+    ):
         errors.append(
             "supervisor: routing fell back to teardown because no dispatchable target tasks remained."
         )
@@ -3871,12 +3966,49 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
             if resolved_next_node == "qa_critic" and task.current_attempt_id:
                 continue
             plan = retry_plans_by_task.get(task_id)
+            workaround_ctx = None
+            if resolved_next_node == "workaround_subagent":
+                attempts = _attempts_for_task(attempt_snapshots_by_id, task_id)
+                parent_task_ids, parent_group_ids = _workaround_task_ancestry(
+                    task,
+                    task_queue,
+                )
+                evidence = _qa_failure_evidence_for_workaround_retry(
+                    task_id,
+                    task.parent_group_id,
+                    qa_evaluations,
+                    qa_results_by_attempt,
+                    related_task_ids=parent_task_ids,
+                    related_group_ids=parent_group_ids,
+                )
+                phase = (
+                    WorkaroundPhase.QA_REGRESSION_REPAIR
+                    if attempts or _qa_evidence_indicates_test_regression(evidence)
+                    else WorkaroundPhase.INITIAL_MITIGATION
+                )
+                group = next(
+                    (
+                        candidate
+                        for candidate in state.get("valid_groups", []) or []
+                        if candidate.group_id == task.parent_group_id
+                    ),
+                    None,
+                )
+                vulnerability_mechanism = (
+                    _extract_workaround_vulnerability_mechanism(group) if group is not None else ""
+                )
+                workaround_ctx = WorkaroundContext(
+                    phase=phase,
+                    vulnerability_mechanism=vulnerability_mechanism,
+                    qa_evidence=evidence,
+                )
             task, snapshot = _create_attempt_snapshot(
                 task,
                 dispatch_node=resolved_next_node,
                 snapshots_by_id=attempt_snapshots_by_id,
                 state_revision=state_revision,
                 plan_id=plan.plan_id if plan is not None else None,
+                workaround_context=workaround_ctx,
             )
             task_queue[task_id] = task
             prior = retry_diagnostics_by_task.get(task_id)
@@ -3907,7 +4039,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # 8f. Collect new constraints
     # ------------------------------------------------------------------
-    returned_constraints: List[str] = list(auto_new_constraints)
+    returned_constraints: list[str] = list(auto_new_constraints)
     for constraint in decision.new_constraints:
         if (
             constraint
@@ -3918,7 +4050,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
 
     # Build feedback_by_group for bridge node backward compat
     feedback_by_task = remapped_feedback_by_task
-    feedback_by_group: Dict[str, str] = {}
+    feedback_by_group: dict[str, str] = {}
     for t_id, fb in feedback_by_task.items():
         if t_id in task_queue:
             gid = task_queue[t_id].parent_group_id
@@ -3941,18 +4073,13 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
     consistency_events = [
         event
         for event in _dedupe_consistency_events(consistency_events)
-        if (event.task_id, event.received_attempt_id, event.error_code)
-        not in existing_event_keys
+        if (event.task_id, event.received_attempt_id, event.error_code) not in existing_event_keys
     ]
     # ``errors`` uses an additive reducer, so suppress both duplicate messages
     # from this invocation and exact messages already committed by an earlier
     # supervisor pass. Structured consistency events remain the detailed,
     # attempt-correlated audit record.
-    errors = list(
-        dict.fromkeys(
-            error for error in errors if error not in prior_error_messages
-        )
-    )
+    errors = list(dict.fromkeys(error for error in errors if error not in prior_error_messages))
 
     # ------------------------------------------------------------------
     # 9. Return state patch
@@ -3963,9 +4090,7 @@ def run_supervisor_node(state: OrchestratorState) -> Dict[str, Any]:
         "active_target_task_ids": resolved_target_task_ids,
         # Keep active_target_group_ids populated for bridge nodes that still use it
         "active_target_group_ids": [
-            task_queue[t].parent_group_id
-            for t in resolved_target_task_ids
-            if t in task_queue
+            task_queue[t].parent_group_id for t in resolved_target_task_ids if t in task_queue
         ],
         "feedback_by_task": feedback_by_task,
         "feedback_by_group": feedback_by_group,
@@ -4012,5 +4137,3 @@ def supervisor_router(state: OrchestratorState) -> str:
         step,
     )
     return "teardown"
-
-

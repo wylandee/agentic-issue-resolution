@@ -5,10 +5,13 @@ from __future__ import annotations
 from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
+    QAFailureEvidence,
     RemediationTask,
     RoutingStrategy,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkaroundContext,
+    WorkaroundPhase,
 )
 from remediation_engine.orchestration.remedy_tools import (
     _make_inspect_ast_symbol_tool,
@@ -67,8 +70,70 @@ def test_qa_query_uses_the_diagnostic_runtime_error() -> None:
         previous_feedback=feedback,
     )
 
-    assert '"(0 , import_express_jwt.default) is not a function"' in prompt
-    assert "workaround migration breaking change" in prompt
+    assert "(0 , import_express_jwt.default) is not a function" in prompt
+    assert "construct the query yourself" in prompt
+    assert "update_mitigates_cve_but_breaks_tests" in prompt
+    assert "=== RECOMMENDED INITIAL SEARCH QUERY ===" in prompt
+    assert "migration breaking changes compatibility" in prompt
+
+
+def test_initial_query_uses_advisory_identifier_and_mechanism() -> None:
+    """Initial mitigation should start with the advisory and vulnerable mechanism."""
+    task, group = _task_and_group()
+
+    prompt = _build_workaround_prompt(
+        target_task=task,
+        target_group=group,
+    )
+
+    assert (
+        "Initial evidence-based classification to confirm or reject: initial_code_workaround_or_isolation"
+        in prompt
+    )
+    assert "CVE-2020-15084" in prompt
+    assert "security advisory" in prompt
+    assert "mitigation" in prompt
+
+
+def test_scanner_failure_query_prioritizes_unresolved_finding() -> None:
+    """Scanner failures should search the advisory mechanism before migration guidance."""
+    task, group = _task_and_group()
+    prompt = _build_workaround_prompt(
+        target_task=task,
+        target_group=group,
+        previous_feedback=(
+            "Dependency scanner still reports CVE-2020-15084; remaining scanner "
+            "findings require a source-level mitigation."
+        ),
+    )
+
+    assert (
+        "Initial evidence-based classification to confirm or reject: update_does_not_resolve_scanner_findings"
+        in prompt
+    )
+    assert "still vulnerable" in prompt
+    assert "source-level mitigation" in prompt
+
+
+def test_qa_query_prefers_structured_diagnostic_over_generic_retry_feedback() -> None:
+    """Search extraction must use the exact QA diagnostic when both forms exist."""
+    task, group = _task_and_group()
+    prompt = _build_workaround_prompt(
+        target_task=task,
+        target_group=group,
+        previous_feedback="Generic QA retry guidance with no useful error details.",
+        workaround_context=WorkaroundContext(
+            phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
+            qa_evidence=QAFailureEvidence(
+                exact_diagnostics=["express-jwt: algorithms is a required option"],
+                attempt_id="attempt-1",
+                task_revision=2,
+            ),
+        ),
+    )
+
+    assert "express-jwt: algorithms is a required option" in prompt
+    assert "Generic QA retry guidance" not in prompt
 
 
 def test_skinny_prompt_preserves_vulnerability_mechanism() -> None:

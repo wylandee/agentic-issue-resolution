@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for remediation_engine.tools.semgrep_parser.
 
 All tests are local-file based - no live Semgrep API required.
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import csv
 import json
-from pathlib import Path
 
 from remediation_engine.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
 from remediation_engine.tools import semgrep_parser
@@ -216,17 +215,35 @@ class TestNormalizeFinding:
         assert issue.severity == Severity.MEDIUM
 
     def test_severity_mapping_critical_to_critical(self):
-        issue = normalize_finding(_cli_sast_raw(extra={"message": "x", "severity": "CRITICAL", "fingerprint": "f", "metadata": {}}))
+        issue = normalize_finding(
+            _cli_sast_raw(
+                extra={"message": "x", "severity": "CRITICAL", "fingerprint": "f", "metadata": {}}
+            )
+        )
         assert issue is not None
         assert issue.severity == Severity.CRITICAL
 
     def test_unknown_severity_becomes_unknown(self):
-        issue = normalize_finding(_cli_sast_raw(extra={"message": "x", "severity": "GARBAGE", "fingerprint": "f", "metadata": {}}))
+        issue = normalize_finding(
+            _cli_sast_raw(
+                extra={"message": "x", "severity": "GARBAGE", "fingerprint": "f", "metadata": {}}
+            )
+        )
         assert issue is not None
         assert issue.severity == Severity.UNKNOWN
 
     def test_ignored_finding_is_skipped(self):
-        issue = normalize_finding(_cli_sast_raw(extra={"message": "x", "severity": "WARNING", "fingerprint": "f", "metadata": {}, "is_ignored": True}))
+        issue = normalize_finding(
+            _cli_sast_raw(
+                extra={
+                    "message": "x",
+                    "severity": "WARNING",
+                    "fingerprint": "f",
+                    "metadata": {},
+                    "is_ignored": True,
+                }
+            )
+        )
         assert issue is None
 
     def test_raw_payload_is_preserved(self):
@@ -286,5 +303,3 @@ class TestMain:
         assert "csv" in captured
         assert len(captured["jsonl"][0]) == 1
         assert captured["jsonl"][0][0].rule_id == "javascript.crypto.weak-hash"
-
-

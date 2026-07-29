@@ -1,4 +1,4 @@
-﻿"""Small typed API around ingestion, triage, and the Phase 5 graph."""
+"""Small typed API around ingestion, triage, and the Phase 5 graph."""
 
 from __future__ import annotations
 
@@ -87,5 +87,3 @@ def run_remediation(
         trajectory_path=state.get("trajectory_path"),
         raw_state=dict(state),
     )
-
-

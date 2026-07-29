@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_triage_grouper.py â€” Unit tests for remediation_engine.triage.grouper.
 
 Covers:
@@ -23,7 +23,6 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.triage.grouper import group_issues, group_sca_issues
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,8 +116,14 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2020-28500"),
         ]
         pairs = [
-            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
-            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22")),
+            (
+                _localized(issues[0]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
+            (
+                _localized(issues[1]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22"),
+            ),
         ]
         groups = group_issues(issues, sca_issue_plans=pairs)
         assert len(groups) == 1
@@ -136,8 +141,14 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2021-23337"),  # Exact duplicate
         ]
         pairs = [
-            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
-            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
+            (
+                _localized(issues[0]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
+            (
+                _localized(issues[1]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
         ]
         groups = group_issues(issues, sca_issue_plans=pairs)
         assert len(groups) == 1
@@ -150,8 +161,18 @@ class TestSCAGrouping:
         groups = group_issues(
             [semgrep_issue, odc_issue],
             sca_issue_plans=[
-                (_localized(semgrep_issue), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround A"])),
-                (_localized(odc_issue), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround B"])),
+                (
+                    _localized(semgrep_issue),
+                    _plan(
+                        status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround A"]
+                    ),
+                ),
+                (
+                    _localized(odc_issue),
+                    _plan(
+                        status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Workaround B"]
+                    ),
+                ),
             ],
         )
         assert len(groups) == 1
@@ -196,7 +217,9 @@ class TestSCAGrouping:
         groups = group_issues(issues, sca_issue_plans=pairs)
 
         assert len(groups) == 2
-        assert groups[0].file_paths == ["frontend/package.json"] or groups[0].file_paths == ["package.json"]
+        assert groups[0].file_paths == ["frontend/package.json"] or groups[0].file_paths == [
+            "package.json"
+        ]
         all_group_paths = sorted(path for group in groups for path in group.file_paths)
         assert all_group_paths == ["frontend/package.json", "package.json"]
 
@@ -258,8 +281,17 @@ class TestSCAGrouping:
         groups = group_issues(
             issues,
             sca_issue_plans=[
-                (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
-                (_localized(issues[1]), _plan(status=FixPlanStatus.WORKAROUND_FOUND, workaround_snippets=["Mitigation: disable feature"])),
+                (
+                    _localized(issues[0]),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+                ),
+                (
+                    _localized(issues[1]),
+                    _plan(
+                        status=FixPlanStatus.WORKAROUND_FOUND,
+                        workaround_snippets=["Mitigation: disable feature"],
+                    ),
+                ),
             ],
         )
         assert len(groups) == 2
@@ -275,8 +307,14 @@ class TestSCAGrouping:
         groups = group_issues(
             issues,
             sca_issue_plans=[
-                (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="v1.2")),
-                (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.2.5")),
+                (
+                    _localized(issues[0]),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="v1.2"),
+                ),
+                (
+                    _localized(issues[1]),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.2.5"),
+                ),
             ],
         )
         assert len(groups) == 1
@@ -335,7 +373,10 @@ class TestMixedGrouping:
             issues,
             sca_issue_plans=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
-                (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.18.3")),
+                (
+                    _localized(issues[1]),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.18.3"),
+                ),
             ],
         )
         assert len(groups) == 3
@@ -364,7 +405,9 @@ class TestGroupSCAAlias:
         issues = [_sca(), _sast()]
         sca_groups = group_sca_issues(
             issues,
-            sca_issue_plans=[(_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none"))],
+            sca_issue_plans=[
+                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none"))
+            ],
         )
         assert all(g.issue_type == IssueType.SCA for g in sca_groups)
 
@@ -372,8 +415,14 @@ class TestGroupSCAAlias:
         # Create one shared list so both calls operate on the same issue objects
         issues = [_sca(cve_id="CVE-2021-23337"), _sca(cve_id="CVE-2020-28500")]
         pairs = [
-            (_localized(issues[0]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21")),
-            (_localized(issues[1]), _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22")),
+            (
+                _localized(issues[0]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+            ),
+            (
+                _localized(issues[1]),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22"),
+            ),
         ]
         alias_result = group_sca_issues(issues, sca_issue_plans=pairs)
         direct_result = group_issues(issues, sca_issue_plans=pairs)
@@ -381,5 +430,3 @@ class TestGroupSCAAlias:
         alias_ids = {g.group_id for g in alias_result}
         direct_ids = {g.group_id for g in direct_result}
         assert alias_ids == direct_ids
-
-

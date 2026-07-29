@@ -1,4 +1,4 @@
-﻿"""
+"""
 registry_tools.py - LangChain tools for querying public package registries.
 
 Provides:
@@ -28,8 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import quote
 
 import requests
@@ -43,7 +43,7 @@ _MAX_RECENT_VERSIONS = 30
 _MAX_MAJOR_SERIES = 6
 
 
-def _stable_version_key(version: str) -> Optional[tuple[int, int, int]]:
+def _stable_version_key(version: str) -> tuple[int, int, int] | None:
     """Return a comparable key for a stable semver string."""
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", version.strip())
     if not match:
@@ -56,7 +56,7 @@ def _stable_version_key(version: str) -> Optional[tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 
-def _format_timestamp(iso_str: Optional[str]) -> str:
+def _format_timestamp(iso_str: str | None) -> str:
     """Format an ISO-8601 timestamp as a short human-readable string."""
     if not iso_str:
         return "unknown"
@@ -67,7 +67,7 @@ def _format_timestamp(iso_str: Optional[str]) -> str:
         return iso_str[:10] if len(iso_str) >= 10 else iso_str
 
 
-def _parse_major(version: str) -> Optional[int]:
+def _parse_major(version: str) -> int | None:
     """Return the major version number, or None if not parseable."""
     try:
         return int(version.split(".")[0])
@@ -75,7 +75,7 @@ def _parse_major(version: str) -> Optional[int]:
         return None
 
 
-def _fetch_package_data(package_name: str) -> Dict[str, Any]:
+def _fetch_package_data(package_name: str) -> dict[str, Any]:
     """Fetch raw JSON from the npm registry for *package_name*.
 
     Raises ``requests.RequestException`` on network errors.
@@ -92,18 +92,18 @@ def _fetch_package_data(package_name: str) -> Dict[str, Any]:
 
 
 def _build_version_entries(
-    data: Dict[str, Any],
-    time_map: Dict[str, str],
-) -> List[Dict[str, Any]]:
+    data: dict[str, Any],
+    time_map: dict[str, str],
+) -> list[dict[str, Any]]:
     """Return a list of version dicts sorted newest-first with metadata."""
-    versions_data: Dict[str, Any] = data.get("versions", {})
+    versions_data: dict[str, Any] = data.get("versions", {})
     entries = []
 
     for version, meta in versions_data.items():
         if not isinstance(meta, dict):
             continue
         publish_time = time_map.get(version)
-        ts_key: Optional[datetime] = None
+        ts_key: datetime | None = None
         if publish_time:
             try:
                 ts_key = datetime.fromisoformat(publish_time.replace("Z", "+00:00"))
@@ -121,16 +121,16 @@ def _build_version_entries(
             }
         )
 
-    entries.sort(key=lambda e: (e["_ts"] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    entries.sort(key=lambda e: e["_ts"] or datetime.min.replace(tzinfo=UTC), reverse=True)
     return entries
 
 
-def _build_report(package_name: str, data: Dict[str, Any]) -> str:
+def _build_report(package_name: str, data: dict[str, Any]) -> str:
     """Build a bounded, LLM-readable report from the npm registry response."""
-    time_map: Dict[str, str] = data.get("time", {})
+    time_map: dict[str, str] = data.get("time", {})
     created = _format_timestamp(time_map.get("created"))
     modified = _format_timestamp(time_map.get("modified"))
-    dist_tags: Dict[str, str] = data.get("dist-tags", {})
+    dist_tags: dict[str, str] = data.get("dist-tags", {})
 
     lines = [
         f"# NPM Registry Report: {package_name}",
@@ -155,9 +155,7 @@ def _build_report(package_name: str, data: Dict[str, Any]) -> str:
         if e.get("engines_node"):
             row += f"  [node: {e['engines_node']}]"
         if e.get("peer_deps"):
-            peer_str = ", ".join(
-                f"{k}@{v}" for k, v in list(e["peer_deps"].items())[:4]
-            )
+            peer_str = ", ".join(f"{k}@{v}" for k, v in list(e["peer_deps"].items())[:4])
             row += f"  [peers: {peer_str}]"
         if e.get("deprecated"):
             dep_msg = str(e["deprecated"])[:80]
@@ -165,7 +163,7 @@ def _build_report(package_name: str, data: Dict[str, Any]) -> str:
         lines.append(row)
 
     # Latest stable per major (last _MAX_MAJOR_SERIES majors)
-    best_per_major: Dict[int, str] = {}
+    best_per_major: dict[int, str] = {}
     for e in all_entries:
         major = _parse_major(e["version"])
         if major is None:
@@ -238,8 +236,7 @@ def view_npm_package_versions(package_name: str) -> str:
         return f"NETWORK ERROR: Failed to fetch '{package_name}' from npm registry: {exc}"
     except json.JSONDecodeError as exc:
         return (
-            f"MALFORMED RESPONSE: npm registry returned non-JSON data for "
-            f"'{package_name}': {exc}"
+            f"MALFORMED RESPONSE: npm registry returned non-JSON data for '{package_name}': {exc}"
         )
     except Exception as exc:  # noqa: BLE001
         return f"UNEXPECTED ERROR: {exc}"
@@ -290,7 +287,7 @@ def plan_npm_version(
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: Could not query '{package_name}': {exc}"
 
-    stable_versions: List[tuple[tuple[int, int, int], str]] = []
+    stable_versions: list[tuple[tuple[int, int, int], str]] = []
     for raw_version in (data.get("versions") or {}).keys():
         version = str(raw_version).strip().lstrip("vV")
         key = _stable_version_key(version)
@@ -320,5 +317,3 @@ def plan_npm_version(
         f"- Eligible Candidates: {', '.join(version for _, version in eligible[:30]) or 'none'}",
     ]
     return "\n".join(lines)
-
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 task_utils.py - Utility helpers for Phase 5 task queue management.
 
 Provides pure functions for creating and managing ``RemediationTask`` objects
@@ -75,15 +75,9 @@ def build_initial_remediation_task(
             if strategy == RoutingStrategy.VERSION_BUMP
             else SCARemediationStage.CODE_WORKAROUND
         ),
-        selected_version=(
-            group.fix_plan.fixed_version
-            if group.fix_plan is not None
-            else None
-        ),
+        selected_version=(group.fix_plan.fixed_version if group.fix_plan is not None else None),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,
         ancestry_depth=0,
     )
-
-

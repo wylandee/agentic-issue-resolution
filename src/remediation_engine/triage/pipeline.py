@@ -1,4 +1,4 @@
-﻿"""
+"""
 pipeline.py â€” End-to-end triage pipeline for scanner findings.
 
 Public API
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 from langsmith import traceable
 
@@ -54,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Priority sort order
 # ---------------------------------------------------------------------------
 
-_PRIORITY_ORDER: Dict[Severity, int] = {
+_PRIORITY_ORDER: dict[Severity, int] = {
     Severity.CRITICAL: 0,
     Severity.HIGH: 1,
     Severity.MEDIUM: 2,
@@ -70,8 +69,8 @@ _PRIORITY_ORDER: Dict[Severity, int] = {
 
 
 def _attach_enrichment(
-    groups: List[VulnerabilityGroup],
-    enrichment_map: Dict[str, CVEEnrichment],
+    groups: list[VulnerabilityGroup],
+    enrichment_map: dict[str, CVEEnrichment],
 ) -> None:
     """
     Mutate groups in-place: attach the enrichment for the primary CVE.
@@ -96,9 +95,9 @@ def _attach_enrichment(
 
 
 def _find_issue_by_id(
-    groups: List[VulnerabilityGroup],
+    groups: list[VulnerabilityGroup],
     issue_id,
-) -> Optional[VulnerabilityIssue]:
+) -> VulnerabilityIssue | None:
     """Locate a VulnerabilityIssue by UUID across all group members."""
     for group in groups:
         for issue in group.issues:
@@ -150,9 +149,9 @@ def _run_reachability(groups: list[VulnerabilityGroup], repo_root: str) -> None:
 
 @traceable(name="triage.sca_localization_and_planning", run_type="chain")
 def _prepare_sca_issue_plans(
-    sca_issues: List[VulnerabilityIssue],
-    repo_root: Optional[str],
-) -> List[Tuple[LocalizedIssue, FixPlan]]:
+    sca_issues: list[VulnerabilityIssue],
+    repo_root: str | None,
+) -> list[tuple[LocalizedIssue, FixPlan]]:
     """Locate and plan SCA issues before grouping."""
     if not sca_issues:
         return []
@@ -161,7 +160,7 @@ def _prepare_sca_issue_plans(
     from remediation_engine.tools.manifest_locator import locate_from_issue
 
     repo_path = Path(repo_root) if repo_root and Path(repo_root).exists() else None
-    issue_plans: List[Tuple[LocalizedIssue, FixPlan]] = []
+    issue_plans: list[tuple[LocalizedIssue, FixPlan]] = []
 
     for issue in sca_issues:
         localized_issue = _fallback_localized_issue(issue)
@@ -197,10 +196,10 @@ def _prepare_sca_issue_plans(
 
 @traceable(name="triage.pipeline", run_type="chain")
 def run_triage_pipeline(
-    issues: List[VulnerabilityIssue],
+    issues: list[VulnerabilityIssue],
     system_context: SystemContext,
-    repo_root: Optional[str] = None,
-) -> List[Tuple[VulnerabilityGroup, TriageResult]]:
+    repo_root: str | None = None,
+) -> list[tuple[VulnerabilityGroup, TriageResult]]:
     """
     Run the full triage pipeline on a flat list of ``VulnerabilityIssue`` records.
 
@@ -234,7 +233,7 @@ def run_triage_pipeline(
     logger.info("Triage pipeline: produced %d groups.", len(groups))
 
     # Step 2: Collect all unique CVE IDs for bulk enrichment
-    all_cve_ids: List[str] = []
+    all_cve_ids: list[str] = []
     seen: set = set()
     for group in groups:
         for cve in group.cve_ids:
@@ -243,7 +242,7 @@ def run_triage_pipeline(
                 seen.add(cve)
 
     # Step 3: Enrich CVEs (failure-safe)
-    enrichment_map: Dict[str, CVEEnrichment] = {}
+    enrichment_map: dict[str, CVEEnrichment] = {}
     if all_cve_ids:
         enrichment_map = _run_enrichment(all_cve_ids)
         logger.info(
@@ -260,7 +259,7 @@ def run_triage_pipeline(
         _run_reachability(groups, repo_root)
 
     # Step 6: Triage each group
-    results: List[Tuple[VulnerabilityGroup, TriageResult]] = []
+    results: list[tuple[VulnerabilityGroup, TriageResult]] = []
     for group in groups:
         try:
             triage_result = run_triage(group, system_context)
@@ -273,15 +272,13 @@ def run_triage_pipeline(
             )
 
     valid_count = sum(1 for _, r in results if r.is_valid)
-    logger.info(
-        "Triage pipeline: %d/%d groups are valid.", valid_count, len(results)
-    )
+    logger.info("Triage pipeline: %d/%d groups are valid.", valid_count, len(results))
     return results
 
 
 def select_issues_for_remediation(
-    results: List[Tuple[VulnerabilityGroup, TriageResult]],
-) -> List[VulnerabilityIssue]:
+    results: list[tuple[VulnerabilityGroup, TriageResult]],
+) -> list[VulnerabilityIssue]:
     """
     Select one representative ``VulnerabilityIssue`` per valid group.
 
@@ -298,7 +295,7 @@ def select_issues_for_remediation(
     List[VulnerabilityIssue]
         Ready to pass one-by-one to ``run_remediation`` in the existing graph.
     """
-    selected: List[Tuple[Severity, VulnerabilityIssue]] = []
+    selected: list[tuple[Severity, VulnerabilityIssue]] = []
 
     for group, triage in results:
         if not triage.is_valid:
@@ -323,5 +320,3 @@ def select_issues_for_remediation(
     # Sort by priority (lower _PRIORITY_ORDER value = higher urgency)
     selected.sort(key=lambda t: _PRIORITY_ORDER.get(t[0], 99))
     return [issue for _, issue in selected]
-
-

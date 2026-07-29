@@ -1,33 +1,36 @@
-﻿"""Focused coverage for the OSV-first, strategy-aware SCA flow."""
+"""Focused coverage for the OSV-first, strategy-aware SCA flow."""
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts import (
+    FailureCategory,
     FixPlan,
     FixPlanStatus,
-    FailureCategory,
     IssueSource,
     IssueType,
     LocalizedIssue,
+    QAEvaluation,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
     TaskStatus,
-    QAEvaluation,
     UpdateRetryDiagnostics,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _build_high_level_retry_instruction,
     _next_sca_stage,
     run_supervisor_node,
 )
-from remediation_engine.orchestration.subagent_runtime import ToolEvent
-from remediation_engine.orchestration.update_subagent import _build_retry_diagnostics, _build_update_prompt
+from remediation_engine.orchestration.update_subagent import (
+    _build_retry_diagnostics,
+    _build_update_prompt,
+)
 from remediation_engine.tools.fix_planner import (
     _extract_fixed_from_osv_vuln,
     _query_osv_fixed_version,
@@ -104,12 +107,14 @@ def test_osv_extracts_the_minimum_fixed_version_for_one_advisory():
 def test_plan_fix_is_osv_only_and_does_not_fall_through_to_npm_or_serper():
     issue = _issue("CVE-2026-0001")
     localized = _localized(issue)
-    with patch(
-        "remediation_engine.tools.fix_planner._query_osv_fixed_version",
-        return_value=("4.17.21", None),
-    ) as osv, patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm, patch(
-        "remediation_engine.tools.fix_planner._search_serper_workarounds"
-    ) as serper:
+    with (
+        patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("4.17.21", None),
+        ) as osv,
+        patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm,
+        patch("remediation_engine.tools.fix_planner._search_serper_workarounds") as serper,
+    ):
         result = plan_fix(localized)
 
     osv.assert_called_once_with(issue)
@@ -269,7 +274,9 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
     issue = _issue("CVE-2026-0001")
     group = group_issues(
         [issue],
-        sca_issue_plans=[(_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))],
+        sca_issue_plans=[
+            (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
+        ],
     )[0]
     prompt = _build_update_prompt(
         [(task, group, ["package.json"])],
@@ -291,7 +298,9 @@ def test_update_worker_records_failed_exact_version_attempts_without_selecting_n
     issue = _issue("CVE-2026-0001")
     group = group_issues(
         [issue],
-        sca_issue_plans=[(_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))],
+        sca_issue_plans=[
+            (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
+        ],
     )[0]
     task = RemediationTask(
         task_id="task-1",
@@ -335,7 +344,9 @@ def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():
     issue = _issue("CVE-2026-0001")
     group = group_issues(
         [issue],
-        sca_issue_plans=[(_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))],
+        sca_issue_plans=[
+            (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
+        ],
     )[0]
     task = RemediationTask(
         task_id="task-1",
@@ -377,7 +388,9 @@ def test_retry_instruction_contains_exact_selected_version_and_stage():
     issue = _issue("CVE-2026-0001")
     group = group_issues(
         [issue],
-        sca_issue_plans=[(_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))],
+        sca_issue_plans=[
+            (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
+        ],
     )[0]
     diagnostics = {
         "task_id": "task-1",
@@ -392,5 +405,3 @@ def test_retry_instruction_contains_exact_selected_version_and_stage():
 
     assert "5.0.0" in instruction
     assert SCARemediationStage.NPM_LATEST.value in instruction
-
-

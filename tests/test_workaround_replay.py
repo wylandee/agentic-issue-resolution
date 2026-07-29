@@ -65,24 +65,46 @@ def test_workaround_schemas_and_serialization() -> None:
 def test_has_all_modified_files_validated_after_last_edit() -> None:
     """Verify per-file syntax validation check."""
     events_valid = [
-        ToolEvent(name="deterministic_search_replace", args={"file_path": "a.js"}, content="SUCCESS: Modified"),
-        ToolEvent(name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"),
-        ToolEvent(name="deterministic_search_replace", args={"file_path": "b.js"}, content="SUCCESS: Modified"),
-        ToolEvent(name="validate_code_syntax", args={"file_path": "b.js"}, content="SUCCESS: Validated"),
+        ToolEvent(
+            name="deterministic_search_replace",
+            args={"file_path": "a.js"},
+            content="SUCCESS: Modified",
+        ),
+        ToolEvent(
+            name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"
+        ),
+        ToolEvent(
+            name="deterministic_search_replace",
+            args={"file_path": "b.js"},
+            content="SUCCESS: Modified",
+        ),
+        ToolEvent(
+            name="validate_code_syntax", args={"file_path": "b.js"}, content="SUCCESS: Validated"
+        ),
     ]
     assert has_all_modified_files_validated_after_last_edit(events_valid) is True
 
     events_invalid = [
-        ToolEvent(name="deterministic_search_replace", args={"file_path": "a.js"}, content="SUCCESS: Modified"),
-        ToolEvent(name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"),
-        ToolEvent(name="deterministic_search_replace", args={"file_path": "b.js"}, content="SUCCESS: Modified"),
+        ToolEvent(
+            name="deterministic_search_replace",
+            args={"file_path": "a.js"},
+            content="SUCCESS: Modified",
+        ),
+        ToolEvent(
+            name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"
+        ),
+        ToolEvent(
+            name="deterministic_search_replace",
+            args={"file_path": "b.js"},
+            content="SUCCESS: Modified",
+        ),
         # Missing validation for b.js
     ]
     assert has_all_modified_files_validated_after_last_edit(events_invalid) is False
 
 
 def test_targeted_search_query_generation_in_prompt() -> None:
-    """Verify that QA error context generates targeted search query guidance."""
+    """Verify that QA error context gives the worker evidence for query selection."""
     task = RemediationTask(
         task_id="task-1",
         parent_group_id="grp-1",
@@ -103,9 +125,11 @@ def test_targeted_search_query_generation_in_prompt() -> None:
         previous_feedback='TypeError: "algorithms should be set"',
     )
 
-    assert "SUGGESTED TARGETED SEARCH QUERY" in prompt
+    assert "SEARCH INPUT EVIDENCE" in prompt
+    assert "construct the query yourself" in prompt
     assert "express-jwt" in prompt
     assert "CVE-2020-15084" in prompt
+    assert "algorithms should be set" in prompt
 
 
 def test_supervisor_commits_matching_replay_plan_and_ignores_stale() -> None:

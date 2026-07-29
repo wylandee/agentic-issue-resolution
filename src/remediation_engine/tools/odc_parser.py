@@ -1,4 +1,4 @@
-﻿"""
+"""
 ODC Parser â€” upgraded SCA ingestion layer.
 
 Changes from v1
@@ -16,14 +16,13 @@ Changes from v1
 
 from __future__ import annotations
 
-import csv
 import argparse
+import csv
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from typing import Any
 
 from remediation_engine.contracts import (
     CWEEntry,
@@ -32,10 +31,10 @@ from remediation_engine.contracts import (
     Severity,
     VulnerabilityIssue,
 )
-from remediation_engine.contracts.schemas import LineRange
 
 try:
     from packageurl import PackageURL
+
     _PURL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _PURL_AVAILABLE = False
@@ -62,7 +61,7 @@ CSV_HEADERS = [
 # ---------------------------------------------------------------------------
 
 
-def _extract_severity(vulnerability: Dict[str, Any]) -> Severity:
+def _extract_severity(vulnerability: dict[str, Any]) -> Severity:
     """Extract severity using ODC fallback order, returning a typed Severity."""
     candidates = [
         vulnerability.get("highestSeverity", ""),
@@ -79,7 +78,7 @@ def _extract_severity(vulnerability: Dict[str, Any]) -> Severity:
     return Severity.UNKNOWN
 
 
-def _parse_purl(dep: Dict[str, Any]) -> Optional[str]:
+def _parse_purl(dep: dict[str, Any]) -> str | None:
     """Return the first PURL string from the dependency's packages list."""
     packages = dep.get("packages") or []
     for pkg in packages:
@@ -89,7 +88,7 @@ def _parse_purl(dep: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _ecosystem_from_purl(purl_str: Optional[str]) -> Optional[str]:
+def _ecosystem_from_purl(purl_str: str | None) -> str | None:
     """Extract ecosystem (type) from a PURL string."""
     if not purl_str:
         return None
@@ -107,7 +106,7 @@ def _ecosystem_from_purl(purl_str: Optional[str]) -> Optional[str]:
         return None
 
 
-def _package_name_from_purl(purl_str: Optional[str]) -> Optional[str]:
+def _package_name_from_purl(purl_str: str | None) -> str | None:
     """Extract canonical package name from a PURL string.
 
     For npm: packageurl-python puts '@scope/name' directly in purl.name,
@@ -140,7 +139,7 @@ def _package_name_from_purl(purl_str: Optional[str]) -> Optional[str]:
         return None
 
 
-def _version_from_purl(purl_str: Optional[str]) -> Optional[str]:
+def _version_from_purl(purl_str: str | None) -> str | None:
     """Extract package version from a PURL string."""
     if not purl_str:
         return None
@@ -158,10 +157,10 @@ def _version_from_purl(purl_str: Optional[str]) -> Optional[str]:
         return None
 
 
-def _parse_cwes(vulnerability: Dict[str, Any]) -> List[CWEEntry]:
+def _parse_cwes(vulnerability: dict[str, Any]) -> list[CWEEntry]:
     """Extract CWE entries from vulnerability.cwes list."""
     cwes_raw = vulnerability.get("cwes") or []
-    result: List[CWEEntry] = []
+    result: list[CWEEntry] = []
     for raw in cwes_raw:
         cwe_str = str(raw).strip()
         # Normalise: "CWE-79", "79", "CWE79" â†’ "CWE-79"
@@ -178,14 +177,15 @@ def _parse_cwes(vulnerability: Dict[str, Any]) -> List[CWEEntry]:
     return result
 
 
-def _extract_cve_id(vulnerability: Dict[str, Any]) -> Optional[str]:
+def _extract_cve_id(vulnerability: dict[str, Any]) -> str | None:
     """Return CVE ID if the vuln name matches CVE format, else check references."""
     name = (vulnerability.get("name") or "").strip()
     if name.upper().startswith("CVE-"):
         return name.upper()
 
     import re
-    cve_regex = re.compile(r'\b(CVE-\d{4}-\d{4,7})\b', re.IGNORECASE)
+
+    cve_regex = re.compile(r"\b(CVE-\d{4}-\d{4,7})\b", re.IGNORECASE)
     for ref in vulnerability.get("references") or []:
         for key in ("url", "name"):
             val = ref.get(key) or ""
@@ -195,7 +195,7 @@ def _extract_cve_id(vulnerability: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_ghsa_id(vulnerability: Dict[str, Any]) -> Optional[str]:
+def _extract_ghsa_id(vulnerability: dict[str, Any]) -> str | None:
     """Return GHSA ID if the vulnerability name or references contain one."""
     import re
 
@@ -223,7 +223,7 @@ def _extract_ghsa_id(vulnerability: Dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def load_report(report_path: Path) -> Dict[str, Any]:
+def load_report(report_path: Path) -> dict[str, Any]:
     """Load and parse the OWASP Dependency-Check JSON report from disk."""
     if not report_path.exists():
         raise FileNotFoundError(f"Input report not found: {report_path}")
@@ -232,10 +232,10 @@ def load_report(report_path: Path) -> Dict[str, Any]:
 
 
 def parse_vulnerabilities(
-    report: Dict[str, Any],
-    repo_url: Optional[str] = None,
-    base_ref: Optional[str] = None,
-) -> List[VulnerabilityIssue]:
+    report: dict[str, Any],
+    repo_url: str | None = None,
+    base_ref: str | None = None,
+) -> list[VulnerabilityIssue]:
     """
     Flatten dependency vulnerabilities into typed ``VulnerabilityIssue`` objects.
 
@@ -248,7 +248,7 @@ def parse_vulnerabilities(
     base_ref:
         Optional git branch or commit SHA that was scanned.
     """
-    issues: List[VulnerabilityIssue] = []
+    issues: list[VulnerabilityIssue] = []
     dependencies = report.get("dependencies") or []
 
     if not isinstance(dependencies, list):
@@ -309,7 +309,7 @@ def parse_vulnerabilities(
     return issues
 
 
-def export_to_jsonl(issues: List[VulnerabilityIssue], output_path: Path) -> None:
+def export_to_jsonl(issues: list[VulnerabilityIssue], output_path: Path) -> None:
     """Write issues as JSONL â€” one JSON object per line (canonical agent format)."""
     os.makedirs(output_path.parent, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -319,7 +319,7 @@ def export_to_jsonl(issues: List[VulnerabilityIssue], output_path: Path) -> None
     log.info("Wrote %d issues to %s", len(issues), output_path)
 
 
-def export_to_csv(issues: List[VulnerabilityIssue], output_path: Path) -> None:
+def export_to_csv(issues: list[VulnerabilityIssue], output_path: Path) -> None:
     """Export a flat CSV projection of issues for human inspection."""
     os.makedirs(output_path.parent, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -344,7 +344,7 @@ def export_to_csv(issues: List[VulnerabilityIssue], output_path: Path) -> None:
     log.info("Wrote CSV to %s", output_path)
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Run the ODC JSON â†’ JSONL + CSV ingestion pipeline."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -396,5 +396,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-

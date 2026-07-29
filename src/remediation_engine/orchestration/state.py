@@ -11,18 +11,19 @@ Reducer notes
   only its new error strings and LangGraph will append them.
 * ``messages`` exists only in ``SubagentState`` so subagent ReAct transcripts
   stay isolated from the long-lived supervisor state.
-* ``changed_files`` uses ``operator.add`` so each node can report only the
-  files it newly observed as changed.
+* ``changed_files`` uses an order-preserving set-like reducer so retries and
+  bridge nodes cannot duplicate the same path in the final patch projection.
 * All other fields use the default "last writer wins" semantics.
 """
 
 from __future__ import annotations
 
-import operator
 import ntpath
+import operator
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Mapping, Optional, TypeVar
+from typing import Annotated, Any, TypeVar
 
 from langgraph.graph.message import AnyMessage, add_messages
 from typing_extensions import TypedDict
@@ -31,22 +32,21 @@ from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FixPlanStatus,
     GroupRemediationStatus,
-    QAEvaluation,
     QAAttemptResult,
+    QAEvaluation,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
-    SupervisorDecision,
-    SupervisorRetryPlan,
     StateConsistencyEvent,
+    SupervisorRetryPlan,
     SystemContext,
+    TaskAttemptSnapshot,
     TaskStatus,
     UpdateRetryDiagnostics,
-    TaskAttemptSnapshot,
-    WorkaroundReplayPlan,
-    WorkerAttemptResult,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkaroundReplayPlan,
+    WorkerAttemptResult,
 )
 
 K = TypeVar("K")
@@ -56,9 +56,9 @@ V = TypeVar("V")
 def merge_dict_reducer(
     left: Mapping[K, V] | None,
     right: Mapping[K, V] | None,
-) -> Dict[K, V]:
+) -> dict[K, V]:
     """Merge dict-like values without mutating either input."""
-    merged: Dict[K, V] = dict(left or {})
+    merged: dict[K, V] = dict(left or {})
     if right:
         merged.update(right)
     return merged
@@ -67,7 +67,7 @@ def merge_dict_reducer(
 def replace_dict_reducer(
     _left: Mapping[K, V] | None,
     right: Mapping[K, V] | None,
-) -> Dict[K, V]:
+) -> dict[K, V]:
     """Replace an authoritative dict projection with the newest snapshot.
 
     Phase 5 supervisor projections are complete snapshots, not patches.  A
@@ -79,26 +79,43 @@ def replace_dict_reducer(
     return dict(right or {})
 
 
-def _normalise_scan_identifiers(values: List[Optional[str]]) -> List[str]:
+def merge_changed_files_reducer(
+    left: list[str] | None,
+    right: list[str] | None,
+) -> list[str]:
+    """Merge changed-file projections while normalizing and de-duplicating paths."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in [*(left or []), *(right or [])]:
+        if not isinstance(value, str):
+            continue
+        path = value.replace("\\", "/").lstrip("/").strip()
+        if path and path not in seen:
+            seen.add(path)
+            merged.append(path)
+    return merged
+
+
+def _normalise_scan_identifiers(values: list[str | None]) -> list[str]:
     """Return sorted, de-duplicated CVE/GHSA identifiers."""
     return sorted({value.strip().upper() for value in values if value and value.strip()})
 
 
 def _scan_identifiers_from_issues(
-    issues: List[VulnerabilityIssue],
-) -> List[str]:
+    issues: list[VulnerabilityIssue],
+) -> list[str]:
     """Collect scanner identifiers from the complete initial issue set."""
-    values: List[Optional[str]] = []
+    values: list[str | None] = []
     for issue in issues:
         values.extend([issue.cve_id, issue.ghsa_id])
     return _normalise_scan_identifiers(values)
 
 
 def _scan_identifiers_from_groups(
-    groups: List[VulnerabilityGroup],
-) -> List[str]:
+    groups: list[VulnerabilityGroup],
+) -> list[str]:
     """Collect scanner identifiers from groups for skip-triage compatibility."""
-    values: List[Optional[str]] = []
+    values: list[str | None] = []
     for group in groups:
         values.extend(group.cve_ids or [])
         values.extend(group.ghsa_ids or [])
@@ -144,9 +161,9 @@ def _repo_relative_path(value: str | None, repo_root: str) -> str | None:
 
 
 def normalize_group_paths(
-    groups: List[VulnerabilityGroup],
+    groups: list[VulnerabilityGroup],
     repo_root: str,
-) -> List[VulnerabilityGroup]:
+) -> list[VulnerabilityGroup]:
     """Return groups whose manifest paths are safe repository-relative paths.
 
     This boundary normalization also updates nested ``LocalizedIssue``
@@ -154,7 +171,7 @@ def normalize_group_paths(
     Newly generated groups are already relative; the helper is primarily for
     callers that load preprocessed JSON produced by older versions.
     """
-    normalized: List[VulnerabilityGroup] = []
+    normalized: list[VulnerabilityGroup] = []
     for group in groups:
         replacements: dict[str, str] = {}
         localized_issues = []
@@ -165,7 +182,7 @@ def normalize_group_paths(
                 replacements[str(old)] = new or "unknown-manifest"
             localized_issues.append(localized.model_copy(update={"manifest_file": new}))
 
-        file_paths: List[str] = []
+        file_paths: list[str] = []
         for path in group.file_paths or []:
             new = _repo_relative_path(path, repo_root)
             if new and new not in file_paths:
@@ -241,12 +258,12 @@ def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask
 
 
 def _derive_feedback_by_group(
-    target_tasks: List[RemediationTask],
-    target_groups: List[VulnerabilityGroup],
-    feedback_by_task: Optional[Mapping[str, str]],
-) -> Dict[str, str]:
+    target_tasks: list[RemediationTask],
+    target_groups: list[VulnerabilityGroup],
+    feedback_by_task: Mapping[str, str] | None,
+) -> dict[str, str]:
     """Translate task-keyed feedback into group-keyed feedback when possible."""
-    feedback_by_group: Dict[str, str] = {}
+    feedback_by_group: dict[str, str] = {}
     task_map = {task.task_id: task for task in target_tasks}
     group_map = {group.group_id: group for group in target_groups}
 
@@ -259,8 +276,6 @@ def _derive_feedback_by_group(
             feedback_by_group[task_id] = feedback
 
     return feedback_by_group
-
-
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -288,71 +303,61 @@ class OrchestratorState(TypedDict, total=False):
     """
 
     repo_root: str
-    valid_groups: List[VulnerabilityGroup]
+    valid_groups: list[VulnerabilityGroup]
 
-    issues: List[VulnerabilityIssue]
+    issues: list[VulnerabilityIssue]
     system_context: SystemContext
 
-    constraints_ledger: Annotated[List[str], operator.add]
-    retry_counts: Annotated[Dict[str, int], merge_dict_reducer]
-    group_strategies: Annotated[Dict[str, RoutingStrategy], merge_dict_reducer]
-    group_statuses: Annotated[Dict[str, GroupRemediationStatus], merge_dict_reducer]
-    qa_evaluations: Annotated[Dict[str, QAEvaluation], replace_dict_reducer]
-    action_summaries: Annotated[List[AgentActionSummary], operator.add]
-    retry_diagnostics_by_task: Annotated[
-        Dict[str, UpdateRetryDiagnostics], replace_dict_reducer
-    ]
-    retry_plans_by_task: Annotated[
-        Dict[str, SupervisorRetryPlan], replace_dict_reducer
-    ]
+    constraints_ledger: Annotated[list[str], operator.add]
+    retry_counts: Annotated[dict[str, int], merge_dict_reducer]
+    group_strategies: Annotated[dict[str, RoutingStrategy], merge_dict_reducer]
+    group_statuses: Annotated[dict[str, GroupRemediationStatus], merge_dict_reducer]
+    qa_evaluations: Annotated[dict[str, QAEvaluation], replace_dict_reducer]
+    action_summaries: Annotated[list[AgentActionSummary], operator.add]
+    retry_diagnostics_by_task: Annotated[dict[str, UpdateRetryDiagnostics], replace_dict_reducer]
+    retry_plans_by_task: Annotated[dict[str, SupervisorRetryPlan], replace_dict_reducer]
     workaround_replay_plans_by_task: Annotated[
-        Dict[str, WorkaroundReplayPlan], replace_dict_reducer
+        dict[str, WorkaroundReplayPlan], replace_dict_reducer
     ]
-    attempt_snapshots_by_id: Annotated[
-        Dict[str, TaskAttemptSnapshot], merge_dict_reducer
-    ]
-    worker_results_by_attempt: Annotated[
-        Dict[str, WorkerAttemptResult], merge_dict_reducer
-    ]
-    qa_results_by_attempt: Annotated[
-        Dict[str, QAAttemptResult], merge_dict_reducer
-    ]
-    processed_worker_attempt_ids: Annotated[List[str], operator.add]
-    processed_qa_attempt_ids: Annotated[List[str], operator.add]
-    consistency_events: Annotated[List[StateConsistencyEvent], operator.add]
+    attempt_snapshots_by_id: Annotated[dict[str, TaskAttemptSnapshot], merge_dict_reducer]
+    worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
+    qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
+    processed_worker_attempt_ids: Annotated[list[str], operator.add]
+    processed_qa_attempt_ids: Annotated[list[str], operator.add]
+    consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
     state_revision: int
-    changed_files: Annotated[List[str], operator.add]
+    changed_files: Annotated[list[str], merge_changed_files_reducer]
 
     # Phase 5 Task Queue (primary orchestration unit)
-    task_queue: Annotated[Dict[str, RemediationTask], replace_dict_reducer]
-    active_target_task_ids: List[str]
+    task_queue: Annotated[dict[str, RemediationTask], replace_dict_reducer]
+    active_target_task_ids: list[str]
 
-    workspace_volume: Optional[str]
+    workspace_volume: str | None
 
     # Supervisor routing fields
     next_routing_step: str
-    active_target_group_ids: List[str]
-    feedback_by_group: Annotated[Dict[str, str], replace_dict_reducer]
-    feedback_by_task: Annotated[Dict[str, str], replace_dict_reducer]
+    active_target_group_ids: list[str]
+    feedback_by_group: Annotated[dict[str, str], replace_dict_reducer]
+    feedback_by_task: Annotated[dict[str, str], replace_dict_reducer]
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
-    baseline_scan_identifiers: List[str]
-    post_remediation_scan_identifiers: List[str]
-    post_remediation_scan_issues: List[VulnerabilityIssue]
-    new_vulnerability_identifiers: List[str]
+    baseline_scan_identifiers: list[str]
+    post_remediation_scan_identifiers: list[str]
+    post_remediation_scan_issues: list[VulnerabilityIssue]
+    new_vulnerability_identifiers: list[str]
     new_vulnerability_status: str
     triage_required: bool
     initial_triage_status: str
     initial_triage_executed: bool
-    triage_reconciliation: Dict[str, List[str]]
+    triage_reconciliation: dict[str, list[str]]
 
     status: str
     diff: str
     langsmith_run_id: str
     langsmith_trace_url: str
     trajectory_path: str
-    errors: Annotated[List[str], operator.add]
+    errors: Annotated[list[str], operator.add]
 
 
 class SubagentState(TypedDict, total=False):
@@ -365,35 +370,35 @@ class SubagentState(TypedDict, total=False):
     repo_root: str
     workspace_volume: str
 
-    target_tasks: List[RemediationTask]
-    target_groups: List[VulnerabilityGroup]
-    feedback_by_group: Dict[str, str]
-    feedback_by_task: Dict[str, str]
-    previous_action_summaries_by_task: Dict[str, str]
-    retry_diagnostics_by_task: Dict[str, UpdateRetryDiagnostics]
-    workaround_replay_plans_by_task: Dict[str, WorkaroundReplayPlan]
-    target_attempt_snapshots: Dict[str, TaskAttemptSnapshot]
+    target_tasks: list[RemediationTask]
+    target_groups: list[VulnerabilityGroup]
+    feedback_by_group: dict[str, str]
+    feedback_by_task: dict[str, str]
+    previous_action_summaries_by_task: dict[str, str]
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics]
+    workaround_replay_plans_by_task: dict[str, WorkaroundReplayPlan]
+    target_attempt_snapshots: dict[str, TaskAttemptSnapshot]
 
     target_task: RemediationTask
     target_group: VulnerabilityGroup
-    attempt_snapshot: Optional[TaskAttemptSnapshot]
-    constraints_ledger: List[str]
-    previous_feedback: Optional[str]
-    current_replay_plan: Optional[WorkaroundReplayPlan]
+    attempt_snapshot: TaskAttemptSnapshot | None
+    constraints_ledger: list[str]
+    previous_feedback: str | None
+    current_replay_plan: WorkaroundReplayPlan | None
 
-    messages: Annotated[List[AnyMessage], add_messages]
+    messages: Annotated[list[AnyMessage], add_messages]
 
-    action_summaries: List[AgentActionSummary]
-    changed_files: Annotated[List[str], operator.add]
-    errors: Annotated[List[str], operator.add]
+    action_summaries: list[AgentActionSummary]
+    changed_files: Annotated[list[str], operator.add]
+    errors: Annotated[list[str], operator.add]
 
 
 def initial_orchestrator_state(
     repo_root: str,
-    valid_groups: List[VulnerabilityGroup],
-    issues: Optional[List[VulnerabilityIssue]] = None,
-    system_context: Optional[SystemContext] = None,
-) -> Dict[str, Any]:
+    valid_groups: list[VulnerabilityGroup],
+    issues: list[VulnerabilityIssue] | None = None,
+    system_context: SystemContext | None = None,
+) -> dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
     valid_groups = normalize_group_paths(valid_groups, repo_root)
     baseline_scan_identifiers = (
@@ -401,7 +406,7 @@ def initial_orchestrator_state(
         if issues is not None
         else _scan_identifiers_from_groups(valid_groups)
     )
-    state: Dict[str, Any] = {
+    state: dict[str, Any] = {
         "repo_root": repo_root,
         "valid_groups": valid_groups,
         "constraints_ledger": [],
@@ -454,15 +459,15 @@ def initial_orchestrator_state(
 def initial_update_subagent_state(
     repo_root: str,
     workspace_volume: str,
-    target_tasks: List[RemediationTask] | List[VulnerabilityGroup],
-    target_groups: List[VulnerabilityGroup] | List[str],
-    constraints_ledger: Optional[List[str]] = None,
-    feedback_by_task: Optional[Dict[str, str]] = None,
-    feedback_by_group: Optional[Dict[str, str]] = None,
-    previous_action_summaries_by_task: Optional[Dict[str, str]] = None,
-    retry_diagnostics_by_task: Optional[Dict[str, UpdateRetryDiagnostics]] = None,
-    target_attempt_snapshots: Optional[Dict[str, TaskAttemptSnapshot]] = None,
-) -> Dict[str, Any]:
+    target_tasks: list[RemediationTask] | list[VulnerabilityGroup],
+    target_groups: list[VulnerabilityGroup] | list[str],
+    constraints_ledger: list[str] | None = None,
+    feedback_by_task: dict[str, str] | None = None,
+    feedback_by_group: dict[str, str] | None = None,
+    previous_action_summaries_by_task: dict[str, str] | None = None,
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    target_attempt_snapshots: dict[str, TaskAttemptSnapshot] | None = None,
+) -> dict[str, Any]:
     """
     Build a well-formed initial batch ``SubagentState`` dict.
 
@@ -476,21 +481,13 @@ def initial_update_subagent_state(
     if legacy_mode:
         legacy_groups = list(target_tasks)
         target_groups_list = legacy_groups
-        target_tasks_list = [
-            _derive_legacy_task_from_group(group)
-            for group in legacy_groups
-        ]
+        target_tasks_list = [_derive_legacy_task_from_group(group) for group in legacy_groups]
         constraints_list = list(target_groups)
         legacy_feedback = (
-            dict(constraints_ledger)
-            if isinstance(constraints_ledger, Mapping)
-            else {}
+            dict(constraints_ledger) if isinstance(constraints_ledger, Mapping) else {}
         )
         feedback_by_group_dict = dict(feedback_by_group or legacy_feedback)
-        feedback_by_task_dict = dict(
-            feedback_by_task
-            or feedback_by_group_dict
-        )
+        feedback_by_task_dict = dict(feedback_by_task or feedback_by_group_dict)
         previous_summaries_dict = dict(previous_action_summaries_by_task or {})
         retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
         target_attempt_snapshots_dict = dict(target_attempt_snapshots or {})
@@ -532,12 +529,12 @@ def initial_workaround_subagent_state(
     repo_root: str,
     workspace_volume: str,
     target_task: RemediationTask | VulnerabilityGroup,
-    target_group: VulnerabilityGroup | List[str],
-    constraints_ledger: Optional[List[str]] = None,
-    previous_feedback: Optional[str] = None,
-    attempt_snapshot: Optional[TaskAttemptSnapshot] = None,
-    current_replay_plan: Optional[WorkaroundReplayPlan] = None,
-) -> Dict[str, Any]:
+    target_group: VulnerabilityGroup | list[str],
+    constraints_ledger: list[str] | None = None,
+    previous_feedback: str | None = None,
+    attempt_snapshot: TaskAttemptSnapshot | None = None,
+    current_replay_plan: WorkaroundReplayPlan | None = None,
+) -> dict[str, Any]:
     """
     Build a well-formed single-task workaround ``SubagentState`` dict.
 
@@ -569,5 +566,3 @@ def initial_workaround_subagent_state(
         "changed_files": [],
         "errors": [],
     }
-
-
