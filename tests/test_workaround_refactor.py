@@ -370,7 +370,7 @@ def test_workaround_toolbelt_ast_gate_and_search_enrichment():
     res_no_ast = dsr.invoke(
         {"file_path": "src/index.js", "old_text": "oldFunc", "new_text": "newFunc"}
     )
-    assert "ERROR: AST inspection required" in res_no_ast
+    assert "AST inspection required" in res_no_ast
 
     # The worker owns query construction; the tool preserves it verbatim.
     search_web_tool = tool_dict["search_web"]

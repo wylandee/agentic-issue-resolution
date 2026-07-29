@@ -349,6 +349,7 @@ def _preferred_targeted_test_files(qa_evidence: Any) -> list[str]:
 
     candidates: list[str] = []
     for raw_value in [
+        *(getattr(qa_evidence, "failed_tests", []) or []),
         *(getattr(qa_evidence, "source_locations", []) or []),
         *(getattr(qa_evidence, "affected_files", []) or []),
     ]:
@@ -371,6 +372,39 @@ def _preferred_targeted_test_files(qa_evidence: Any) -> list[str]:
     return candidates[:5]
 
 
+def _primary_non_test_source_files(qa_evidence: Any) -> list[str]:
+    """Extract primary non-test source files from structured QA locations."""
+    if qa_evidence is None:
+        return []
+
+    candidates: list[str] = []
+    for raw_value in [
+        *(getattr(qa_evidence, "source_locations", []) or []),
+        *(getattr(qa_evidence, "affected_files", []) or []),
+    ]:
+        value = str(raw_value or "").strip().replace("\\", "/")
+        value = re.sub(r":\d+(?::\d+)?(?:$|\b).*", "", value)
+        if value.startswith("/workspace/"):
+            value = value[len("/workspace/") :]
+        elif value.startswith("workspace/"):
+            value = value[len("workspace/") :]
+        value = value.strip(" `\"'()[]{}.,;")
+        if value.startswith("build/"):
+            value = value[len("build/") :]
+        if not value:
+            continue
+        if (
+            "/test/" in f"/{value}/"
+            or "/tests/" in f"/{value}/"
+            or "/__tests__/" in f"/{value}/"
+            or re.search(r"\.(?:test|spec)\.[^.]+$", value, re.IGNORECASE)
+        ):
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return candidates[:3]
+
+
 def _extract_vulnerability_mechanism(group: VulnerabilityGroup) -> str:
     """Extract a compact vulnerability mechanism before the detailed fix guidance."""
     for issue in getattr(group, "issues", []) or []:
@@ -381,15 +415,139 @@ def _extract_vulnerability_mechanism(group: VulnerabilityGroup) -> str:
         mechanism = message
         for section_marker in ("### Am I affected?", "### How to fix that?"):
             mechanism = mechanism.split(section_marker, 1)[0]
-        mechanism = _clean_prompt_snippet(mechanism, max_chars=1200)
+        mechanism = _clean_prompt_snippet(mechanism, max_chars=600)
         if mechanism:
             return mechanism
 
     fix_plan = getattr(group, "fix_plan", None)
     instruction = getattr(fix_plan, "instruction", None)
     if isinstance(instruction, str) and instruction.strip():
-        return _clean_prompt_snippet(instruction, max_chars=1200)
+        return _clean_prompt_snippet(instruction, max_chars=600)
     return ""
+
+
+def _workaround_search_recommendation(
+    target_task: Any,
+    target_group: VulnerabilityGroup,
+    workaround_context: WorkaroundContext | None,
+    previous_feedback: str | None,
+) -> _SearchQueryRecommendation:
+    """Build a first web query from the current remediation evidence."""
+    fix_plan = getattr(target_group, "fix_plan", None)
+    plan_status = getattr(getattr(fix_plan, "status", None), "value", "")
+    evidence_text = _workaround_evidence_text(workaround_context, previous_feedback)
+    scanner_failure = any(
+        marker in evidence_text
+        for marker in (
+            "scanner",
+            "remaining findings",
+            "remaining scanner",
+            "unresolved identifier",
+            "still vulnerable",
+            "security scan",
+            "dependency-check",
+            "semgrep",
+        )
+    )
+    test_failure = _has_test_failure_evidence(workaround_context, previous_feedback)
+    is_qa_phase = (
+        workaround_context is not None
+        and workaround_context.phase == WorkaroundPhase.QA_REGRESSION_REPAIR
+    )
+
+    component = _search_query_term(
+        getattr(target_group, "vulnerable_component", "") or "component",
+        max_chars=100,
+    )
+    identifiers = [
+        *(getattr(target_group, "cve_ids", []) or [])[:1],
+        *(getattr(target_group, "ghsa_ids", []) or [])[:1],
+    ]
+    identifier_terms = " ".join(
+        _search_query_term(identifier, max_chars=80) for identifier in identifiers
+    )
+    mechanism = _search_query_term(
+        _extract_vulnerability_mechanism(target_group),
+        max_chars=140,
+    )
+    diagnostic = ""
+    qa_evidence = workaround_context.qa_evidence if workaround_context else None
+    if qa_evidence and qa_evidence.exact_diagnostics:
+        diagnostic = _extract_qa_error_snippet(qa_evidence.exact_diagnostics[0])
+    elif previous_feedback:
+        diagnostic = _extract_qa_error_snippet(previous_feedback)
+    diagnostic_term = _search_query_term(diagnostic, max_chars=180)
+
+    selected_version = getattr(target_task, "selected_version", None)
+    if not selected_version and fix_plan is not None:
+        selected_version = getattr(fix_plan, "fixed_version", None)
+    version_term = f"version {selected_version}" if selected_version else ""
+
+    if is_qa_phase or test_failure:
+        return _SearchQueryRecommendation(
+            scenario="update_mitigates_cve_but_breaks_tests",
+            initial_query=_query_parts(
+                component,
+                version_term,
+                diagnostic_term,
+                "migration breaking changes compatibility",
+            ),
+            rationale=(
+                "Lead with the exact QA diagnostic and attempted version so the worker "
+                "finds the package migration or API compatibility guidance."
+            ),
+            follow_up_query="",
+        )
+
+    if scanner_failure:
+        return _SearchQueryRecommendation(
+            scenario="update_does_not_resolve_scanner_findings",
+            initial_query=_query_parts(
+                component,
+                identifier_terms,
+                "still vulnerable",
+                "scanner remediation",
+                mechanism,
+            ),
+            rationale=(
+                "Lead with the advisory identifier and vulnerable mechanism so the worker "
+                "can determine why the scanner still flags the package."
+            ),
+            follow_up_query="",
+        )
+
+    if plan_status in {"no_fix", "workaround_found"}:
+        return _SearchQueryRecommendation(
+            scenario="no_update_available_to_resolve_cve",
+            initial_query=_query_parts(
+                component,
+                identifier_terms,
+                "no upstream fix",
+                "compensating control",
+                mechanism,
+            ),
+            rationale=(
+                "Search for a defensible source-level isolation or compensating control "
+                "because the planner has no usable upstream version."
+            ),
+            follow_up_query="",
+        )
+
+    return _SearchQueryRecommendation(
+        scenario="initial_code_workaround_or_isolation",
+        initial_query=_query_parts(
+            component,
+            identifier_terms,
+            mechanism,
+            "security advisory",
+            "mitigation",
+        ),
+        rationale=(
+            "Start with the vulnerability identifier and mechanism, then adapt the "
+            "advisory guidance to the local source code."
+        ),
+        follow_up_query="",
+    )
 
 
 def _workaround_search_strategy(
@@ -408,23 +566,11 @@ def _workaround_search_strategy(
 
     return "\n".join(
         [
-            "=== WORKAROUND SEARCH STRATEGY ===",
-            "Classify the workaround from the evidence before calling search_web.",
-            "  - update_mitigates_cve_but_breaks_tests: search the package's migration/API change, exact runtime error, and affected test behavior.",
-            "  - update_does_not_resolve_scanner_findings: search the advisory's vulnerable mechanism, scanner identifier, and source-level mitigation requirements.",
-            "  - no_update_available_to_resolve_cve: search vendor advisories, maintainer guidance, and safe code-level isolation or compensating controls.",
-            "  - initial_code_workaround_or_isolation: search the exact component, vulnerability mechanism, and authoritative implementation guidance.",
-            f"Initial evidence-based classification to confirm or reject: {recommendation.scenario}.",
             "=== RECOMMENDED INITIAL SEARCH QUERY ===",
             f"Scenario: {recommendation.scenario}",
             f"Query: {recommendation.initial_query}",
-            f"Why this query: {recommendation.rationale}",
-            (
-                f"If the first results are insufficient, follow-up query: {recommendation.follow_up_query}"
-                if recommendation.follow_up_query
-                else ""
-            ),
-            "Use the recommended query for the first search_web call; construct the query yourself only when refining it, and do not blindly copy a fixed template.",
+            f"Rationale: {recommendation.rationale}",
+            "Use the recommended query for the first search_web call. Refine your query only after receiving an inadequate result or validation failure.",
             "Prefer authoritative advisory, maintainer, migration-guide, or source-repository results.",
         ]
     )
@@ -447,9 +593,9 @@ def _build_workaround_prompt(
     constraints_ledger = list(constraints_ledger or [])
     fix_plan = getattr(target_group, "fix_plan", None)
     vulnerability_mechanism = (
-        _clean_prompt_snippet(vulnerability_mechanism, max_chars=1200)
+        _clean_prompt_snippet(vulnerability_mechanism, max_chars=600)
         if vulnerability_mechanism
-        else _extract_vulnerability_mechanism(target_group)
+        else _clean_prompt_snippet(_extract_vulnerability_mechanism(target_group), max_chars=600)
     )
 
     phase = (
@@ -462,9 +608,21 @@ def _build_workaround_prompt(
         )
     )
 
+    comp_name = getattr(target_group, "vulnerable_component", "") or "component"
+    cve_label = (
+        target_group.cve_ids[0]
+        if getattr(target_group, "cve_ids", None)
+        else (target_group.ghsa_ids[0] if getattr(target_group, "ghsa_ids", None) else "")
+    )
+    selected_version = getattr(target_task, "selected_version", None)
+    if not selected_version and fix_plan is not None:
+        selected_version = getattr(fix_plan, "fixed_version", None)
+
     sections = [
         "You are a code security specialist operating inside a shared Docker workspace.",
         f"WORKFLOW PHASE: {phase.value.upper()}",
+        f"Target Package: {comp_name}"
+        + (f" (version: {selected_version})" if selected_version else ""),
     ]
 
     if phase == WorkaroundPhase.INITIAL_MITIGATION:
@@ -472,32 +630,21 @@ def _build_workaround_prompt(
             "\n".join(
                 [
                     "=== OPERATING PRINCIPLES ===",
-                    "  1. MINIMAL SURGICAL EDITS: Make only the changes necessary to implement a code workaround or isolate the targeted vulnerability. Do not rewrite surrounding unchanged code, alter formatting styles unnecessarily, or remove comments.",
-                    "  2. NO ASSUMPTIONS: Always inspect the codebase using search_codebase_pattern and inspect_ast_symbol to confirm file paths, signatures, and dependencies. DO NOT guess security configurations; rely on search_web for authoritative CVE mitigation guidance.",
-                    "  3. VALIDATION-DRIVEN CONFIRMATION: Never assume a fix is successful without verifying it through validate_workaround. It is the only public validation gate and short-circuits on the first failure.",
-                    "  4. ADAPT, DO NOT COPY: NEVER blindly copy-paste code snippets from CVE advisories or documentation. Advisories use placeholders (like [REDACTED]) and external libraries that may not exist in our codebase. You must extract the underlying security invariant and apply it seamlessly to the existing variables and logic found in the workspace.",
+                    "  1. MINIMAL SURGICAL EDITS: Make only the changes necessary to implement a code workaround or isolate the targeted vulnerability. Do not rewrite surrounding unchanged code.",
+                    "  2. NO ASSUMPTIONS: Investigate the codebase using search_codebase_pattern, inspect_ast_symbol, and read_workspace_file BEFORE searching the web.",
+                    "  3. VALIDATION-DRIVEN CONFIRMATION: Verify fixes through validate_workaround.",
+                    "  4. ADAPT, DO NOT COPY: Extract the security invariant and apply it to local workspace code.",
                     "",
                     "=== EXECUTION LIFECYCLE ===",
                     "  1. EXPLORE & INSPECT",
-                    "     - Read the TARGET section to understand the vulnerability mechanism.",
-                    "     - FIRST: Use search_codebase_pattern to locate vulnerable package/pattern usage across source files.",
-                    "     - FIRST: Inspect relevant JS/TS AST symbols using inspect_ast_symbol or read lines with read_workspace_file BEFORE searching the web. You must understand the local context (variable names, existing parameters) first.",
-                    "     - THEN: Use search_web to find authoritative advisory or mitigation information. Adapt the findings to the local context you just discovered. If you need to read a specific result, use read_web_page.",
+                    "     - FIRST: Inspect local code files using search_codebase_pattern, inspect_ast_symbol, or read_workspace_file before searching the web.",
+                    "     - THEN: Use search_web for authoritative guidance. Perform the initial web search ONCE. Use read_web_page for specific results.",
                     "  2. PLAN",
-                    "     - Form a security-preserving causal hypothesis based on authoritative documentation.",
-                    "     - Record your plan using record_plan, explicitly identifying the affected files, symbols, security invariant, and the exact intended edits.",
+                    "     - Form a hypothesis and call record_plan before making code edits.",
                     "  3. IMPLEMENT",
-                    "     - Apply required security changes incrementally using deterministic_search_replace or deterministic_replace_ast_symbol.",
-                    "     - If you make a mistake, you may use revert_workspace_file to reset a file back to its initial state.",
+                    "     - Apply changes using deterministic_search_replace or deterministic_replace_ast_symbol.",
                     "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround with every modified source file and the most relevant runtime smoke file.",
-                    "     - If validation fails, analyze the exact first-gate diagnostic. Do not blindly guess fixes. If you encounter a TypeScript or runtime error, you MUST search the web for the exact error string.",
-                    "     - Revise your hypothesis, re-record the complete plan, and repeat until the validation gate passes cleanly.",
-                    "",
-                    "=== TOOL USE RULES ===",
-                    "  - Batching: Batch independent tool calls (e.g., calling read_workspace_file on multiple files, or doing multiple search_codebase_pattern searches) into a single turn to save latency.",
-                    "  - Editing: Build the complete cumulative patch first before calling validate_workaround.",
-                    "  - Debugging Errors: If a tool call or validation fails, analyze the error output directly rather than repeating the exact same tool invocation or guessing syntax.",
+                    "     - Call validate_workaround to verify.",
                 ]
             )
         )
@@ -506,30 +653,20 @@ def _build_workaround_prompt(
             "\n".join(
                 [
                     "=== OPERATING PRINCIPLES ===",
-                    "  1. PRESERVE INTENT: Make only the changes necessary to resolve the QA regression caused by a dependency update. Preserve prior replayed edits listed in CUMULATIVE REPLAY CONTEXT.",
-                    "  2. NO API ASSUMPTIONS: When fixing regressions following a package update, DO NOT guess the new API syntax. Always use search_web to find the library's migration guide or breaking changes.",
-                    "  3. TEST-DRIVEN CONFIRMATION: Return control to QA only after the combined validation gate passes cleanly.",
-                    "  4. ADAPT, DO NOT COPY: NEVER blindly copy-paste code snippets from CVE advisories or documentation. You must extract the underlying security invariant and apply it seamlessly to the existing variables and logic found in the workspace.",
+                    "  1. PRESERVE INTENT: Make only changes necessary to resolve QA regression following dependency update.",
+                    "  2. SEEDED DEPENDENCY: Dependency update is already seeded; do not modify manifests (package.json, etc.).",
+                    "  3. REPLAYED EDITS: Replayed edits from prior attempts are already present in the workspace; inspect workspace files directly.",
                     "",
                     "=== EXECUTION LIFECYCLE ===",
                     "  1. EXPLORE & INSPECT",
-                    "     - Quote or explicitly acknowledge the exact QA diagnostic reported below.",
-                    "     - FIRST: Trace failing behavior from the reported test location to the modified source using search_codebase_pattern, read_workspace_file, and inspect_ast_symbol.",
-                    '     - THEN: If the diagnostic is a TypeError (e.g., "is not a function") or an import failure, use search_web to find the library\'s "migration guide" or exact error string. Read the guide using read_web_page.',
+                    "     - Trace failing behavior from test location to modified source using search_codebase_pattern and read_workspace_file.",
+                    "     - Use search_web to check migration guides or exact breaking change diagnostics.",
                     "  2. PLAN",
-                    "     - Form a causal hypothesis based on authoritative documentation, NOT hallucination.",
-                    "     - Record all required changes as one coherent plan using record_plan, including every causally related file and symbol.",
+                    "     - Record a complete cumulative plan using record_plan before editing.",
                     "  3. IMPLEMENT",
-                    "     - Apply the complete repair incrementally using deterministic_search_replace or deterministic_replace_ast_symbol. Ensure imports, call sites, and control-flow changes exactly match the updated library API.",
-                    "     - If you make a mistake, use revert_workspace_file to discard your local edits.",
+                    "     - Apply fix incrementally using deterministic_search_replace or deterministic_replace_ast_symbol.",
                     "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround with the complete cumulative modified-file list and the failing test target.",
-                    "     - If the gate fails again, use its exact diagnostic to revise your hypothesis. Do not flip-flop between syntax guesses. Re-evaluate your documentation search, re-record the plan, and try again.",
-                    "",
-                    "=== TOOL USE RULES ===",
-                    "  - Batching: Batch independent tool calls (e.g., calling inspect_ast_symbol on multiple files) into a single turn to save latency.",
-                    "  - Editing: Build the complete cumulative patch first before calling validate_workaround.",
-                    "  - Debugging Errors: If a tool call or validation fails, analyze the error output directly rather than repeating the exact same tool invocation or guessing syntax.",
+                    "     - Call validate_workaround with complete modified-file list.",
                 ]
             )
         )
@@ -538,11 +675,9 @@ def _build_workaround_prompt(
         "\n".join(
             [
                 "=== PROHIBITIONS & ANTI-PATTERNS ===",
-                "- ❌ NEVER modify package.json, package-lock.json, yarn.lock, pnpm-lock.yaml, pom.xml, or any dependency manifest.",
+                "- ❌ NEVER modify package.json, package-lock.json, pom.xml, or any dependency manifest.",
                 "- ❌ NEVER modify test files to make assertions pass.",
-                "- ❌ NEVER bump library versions — version selection is strictly the update_subagent's job.",
-                "- ❌ NEVER remove vulnerability mitigations without explicit instruction.",
-                "- ❌ NEVER declare success based only on syntax/typecheck.",
+                "- ❌ NEVER bump library versions.",
                 "- ALWAYS use relative file paths.",
                 "- MUST call record_plan before making code edits.",
             ]
@@ -558,136 +693,43 @@ def _build_workaround_prompt(
         )
     )
 
-    if current_replay_plan and current_replay_plan.successful_edits:
-        replay_lines = [
-            "=== CUMULATIVE REPLAY CONTEXT ===",
-            f"The following {len(current_replay_plan.successful_edits)} valid code workaround edit(s) from prior attempt(s) have been automatically replayed onto your baseline:",
-        ]
-        for edit in current_replay_plan.successful_edits:
-            replay_lines.append(
-                f"  - File: {edit.file_path} (symbol: {edit.symbol_name or 'n/a'}, edit #{edit.edit_index})"
-            )
-            old_preview = _clean_prompt_snippet(edit.old_text, max_chars=260)
-            new_preview = _clean_prompt_snippet(edit.new_text, max_chars=260)
-            replay_lines.append(f"    Prior exact replacement: {old_preview} -> {new_preview}")
-        if current_replay_plan.security_invariants:
-            replay_lines.append("Preserved Security Invariants:")
-            for inv in current_replay_plan.security_invariants:
-                replay_lines.append(f"  - {inv}")
-        if current_replay_plan.diagnosed_root_causes:
-            replay_lines.append("Previously Diagnosed Root Causes:")
-            for cause in current_replay_plan.diagnosed_root_causes:
-                replay_lines.append(f"  - {cause}")
-        if current_replay_plan.planned_targets:
-            replay_lines.append("Previously Planned Targets:")
-            for target in current_replay_plan.planned_targets:
-                replay_lines.append(f"  - {target}")
-        findings = current_replay_plan.investigation_findings or {}
-        validation_feedback = findings.get("validation_feedback")
-        if validation_feedback:
-            replay_lines.append("Latest Validation Feedback:")
-            replay_lines.append(f"  {str(validation_feedback)[:2400]}")
-        if current_replay_plan.validated_files:
-            replay_lines.append("Previously Validated Files:")
-            for file_path in current_replay_plan.validated_files:
-                replay_lines.append(f"  - {file_path}")
-        replay_lines.append(
-            "Build directly on top of these replayed edits without removing security mitigations."
-        )
-        sections.append("\n".join(replay_lines))
-
-    comp_name = getattr(target_group, "vulnerable_component", "") or "component"
-    cve_label = (
-        target_group.cve_ids[0]
-        if getattr(target_group, "cve_ids", None)
-        else (target_group.ghsa_ids[0] if getattr(target_group, "ghsa_ids", None) else "")
-    )
-
     qa_evidence = workaround_context.qa_evidence if workaround_context else None
-    # Structured QA evidence is authoritative. The free-form retry message
-    # often wraps the real diagnostic in a large generic report.
     err_text = (
         qa_evidence.exact_diagnostics[0]
         if qa_evidence and qa_evidence.exact_diagnostics
         else (previous_feedback or "")
     )
-    if err_text:
-        err_snippet = _extract_qa_error_snippet(err_text)
-        search_evidence = err_snippet
-    else:
-        search_evidence = ""
 
-    if qa_evidence:
-        ev_lines = [
-            "=== QA FAILURE EVIDENCE ===",
-            f"Source Attempt ID : {qa_evidence.attempt_id}",
-            f"Source Revision   : {qa_evidence.task_revision}",
-            "Exact Diagnostics :",
+    if phase == WorkaroundPhase.QA_REGRESSION_REPAIR:
+        qa_lines = ["=== QA FAILURE EVIDENCE ==="]
+        if err_text:
+            err_snippet = _clean_prompt_snippet(_extract_qa_error_snippet(err_text), max_chars=300)
+            qa_lines.append(f"Diagnostic: {err_snippet}")
+
+        primary_sources = _primary_non_test_source_files(qa_evidence)
+        if primary_sources:
+            qa_lines.append("Primary Source Files:")
+            for ps in primary_sources:
+                qa_lines.append(f"  - {ps}")
+
+        pref_tests = _preferred_targeted_test_files(qa_evidence)[:1]
+        if pref_tests:
+            qa_lines.append(f"Targeted Test File: {pref_tests[0]}")
+
+        tool_events = getattr(workaround_context, "tool_events", []) or []
+        latest_val = _clean_prompt_snippet(_latest_validation_feedback(tool_events), max_chars=300)
+        if latest_val:
+            qa_lines.append(f"Latest Validation Excerpt: {latest_val}")
+
+        sections.append("\n".join(qa_lines))
+    else:  # INITIAL_MITIGATION
+        target_lines = [
+            "=== TARGET ===",
+            f"Vulnerability Identifier: {cve_label or 'none'}",
+            f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
+            f"Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=300)}",
         ]
-        for diag in qa_evidence.exact_diagnostics:
-            ev_lines.append(f"  - {diag}")
-        if qa_evidence.failed_tests:
-            ev_lines.append("Failed Tests:")
-            for ft in qa_evidence.failed_tests:
-                ev_lines.append(f"  - {ft}")
-        if qa_evidence.source_locations:
-            ev_lines.append("Source Locations:")
-            for sl in qa_evidence.source_locations:
-                ev_lines.append(f"  - {sl}")
-        if qa_evidence.affected_files:
-            ev_lines.append("Affected Files:")
-            for af in qa_evidence.affected_files:
-                ev_lines.append(f"  - {af}")
-        preferred_tests = _preferred_targeted_test_files(qa_evidence)
-        if preferred_tests:
-            ev_lines.append(
-                "RECOMMENDED TARGETED TEST FILES (use these before any unrelated test):"
-            )
-            for test_file in preferred_tests:
-                ev_lines.append(f"  - {test_file}")
-        if qa_evidence.raw_excerpt:
-            ev_lines.append(f"Raw Excerpt:\n{qa_evidence.raw_excerpt[:1000]}")
-        if search_evidence:
-            ev_lines.extend(
-                [
-                    "SEARCH INPUT EVIDENCE (construct the query yourself; do not copy a fixed template):",
-                    f"  - Component: {comp_name}",
-                    f"  - Vulnerability identifier: {cve_label or 'not provided'}",
-                    f"  - Exact diagnostic candidate: {search_evidence}",
-                ]
-            )
-        sections.append("\n".join(ev_lines))
-    elif previous_feedback:
-        retry_lines = [
-            "=== RETRY CONTEXT ===",
-            f"QA Feedback: {previous_feedback}",
-        ]
-        if search_evidence:
-            retry_lines.extend(
-                [
-                    "SEARCH INPUT EVIDENCE (construct the query yourself; do not copy a fixed template):",
-                    f"  - Component: {comp_name}",
-                    f"  - Vulnerability identifier: {cve_label or 'not provided'}",
-                    f"  - Exact diagnostic candidate: {search_evidence}",
-                ]
-            )
-        sections.append("\n".join(retry_lines))
-
-    if constraints_ledger:
-        sections.append(
-            "Constraints ledger:\n" + "\n".join(f"- {item}" for item in constraints_ledger)
-        )
-
-    target_lines = [
-        "=== TARGET ===",
-        f"Task ID       : {target_task.task_id}",
-        f"Issue Type    : {getattr(target_group.issue_type, 'value', str(target_group.issue_type))}",
-        f"Component     : {getattr(target_group, 'vulnerable_component', '') or 'unknown'}",
-        f"Initial File  : {getattr(target_group, 'file_path', '') or 'none'}",
-        f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
-        f"Instruction   : {target_task.instruction or 'Apply defensive code fix.'}",
-    ]
-    sections.append("\n".join(target_lines))
+        sections.append("\n".join(target_lines))
 
     if fix_plan and getattr(fix_plan, "workaround_snippets", None):
         sections.append(
@@ -696,12 +738,18 @@ def _build_workaround_prompt(
                     "=== WORKAROUND SNIPPETS ===",
                     "Reference code patterns from security advisories:",
                     *[
-                        f"  {i + 1}. {snippet}"
-                        for i, snippet in enumerate(fix_plan.workaround_snippets)
+                        f"  {i + 1}. {_clean_prompt_snippet(snippet, max_chars=300)}"
+                        for i, snippet in enumerate(fix_plan.workaround_snippets[:3])
                     ],
                 ]
             )
         )
+
+    if constraints_ledger:
+        cleaned_constraints = [
+            _clean_prompt_snippet(c, max_chars=120) for c in constraints_ledger[:5]
+        ]
+        sections.append("Constraints:\n" + "\n".join(f"- {c}" for c in cleaned_constraints))
 
     return "\n\n".join(sections)
 
@@ -935,6 +983,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
 
             snapshot = state.get("attempt_snapshot")
             workaround_ctx = getattr(snapshot, "workaround_context", None) if snapshot else None
+            if (
+                workaround_ctx
+                and getattr(workaround_ctx, "phase", None) == WorkaroundPhase.QA_REGRESSION_REPAIR
+            ):
+                plan_state["require_authoritative_evidence"] = True
 
             qa_ev = workaround_ctx.qa_evidence if workaround_ctx else None
             prompt = _build_workaround_prompt(

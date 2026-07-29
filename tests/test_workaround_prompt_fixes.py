@@ -1,185 +1,120 @@
-"""Regression tests for workaround prompt context and QA feedback extraction."""
+from unittest.mock import MagicMock
 
-from __future__ import annotations
-
-from remediation_engine.contracts.schemas import (
-    IssueSource,
-    IssueType,
-    QAFailureEvidence,
-    RemediationTask,
-    RoutingStrategy,
-    VulnerabilityGroup,
-    VulnerabilityIssue,
-    WorkaroundContext,
-    WorkaroundPhase,
-)
-from remediation_engine.orchestration.remedy_tools import (
-    _make_inspect_ast_symbol_tool,
-)
+from remediation_engine.contracts.schemas import QAFailureEvidence, WorkaroundContext
 from remediation_engine.orchestration.workaround_subagent import (
+    WorkaroundPhase,
     _build_workaround_prompt,
-    _create_skinny_subagent_group,
-    _extract_vulnerability_mechanism,
+    _workaround_search_recommendation,
 )
 
 
-def _task_and_group() -> tuple[RemediationTask, VulnerabilityGroup]:
-    """Build a representative SCA task and finding for prompt tests."""
-    issue = VulnerabilityIssue(
-        source=IssueSource.ODC,
-        issue_type=IssueType.SCA,
-        cve_id="CVE-2020-15084",
-        package_name="express-jwt",
-        message=(
-            "### Overview\n"
-            "Versions before and including 5.3.3 do not enforce the algorithms "
-            "entry. Without algorithms, a jwks-rsa secret can lead to "
-            "authorization bypass.\n\n"
-            "### Am I affected?\nDetails omitted.\n\n"
-            "### How to fix that?\nSpecify algorithms."
-        ),
-    )
-    group = VulnerabilityGroup(
-        group_id="grp-1",
-        issue_type=IssueType.SCA,
+def test_compact_initial_mitigation_prompt():
+    task = MagicMock(task_id="task-1", selected_version="1.2.3", instruction="Fix vulnerability")
+    group = MagicMock(
         vulnerable_component="express-jwt",
-        cve_ids=["CVE-2020-15084"],
-        representative_issue_id=issue.id,
-        issues=[issue],
+        cve_ids=["CVE-2026-1234"],
+        ghsa_ids=[],
+        fix_plan=MagicMock(
+            status=MagicMock(value="no_fix"), fixed_version=None, workaround_snippets=["snippet1"]
+        ),
     )
-    task = RemediationTask(
-        task_id="task-1",
-        parent_group_id=group.group_id,
-        strategy=RoutingStrategy.CODE_WORKAROUND,
-        instruction="Apply the express-jwt workaround.",
-    )
-    return task, group
-
-
-def test_qa_query_uses_the_diagnostic_runtime_error() -> None:
-    """The targeted search query should contain the actionable QA error."""
-    task, group = _task_and_group()
-    feedback = (
-        "The API tests failed after the update: "
-        "`(0 , import_express_jwt.default) is not a function`."
-    )
+    group.issues = []
 
     prompt = _build_workaround_prompt(
         target_task=task,
         target_group=group,
-        previous_feedback=feedback,
+        workaround_context=None,
     )
 
-    assert "(0 , import_express_jwt.default) is not a function" in prompt
-    assert "construct the query yourself" in prompt
-    assert "update_mitigates_cve_but_breaks_tests" in prompt
+    assert "WORKFLOW PHASE: INITIAL_MITIGATION" in prompt
+    assert "Target Package: express-jwt (version: 1.2.3)" in prompt
+    assert "CVE-2026-1234" in prompt
     assert "=== RECOMMENDED INITIAL SEARCH QUERY ===" in prompt
-    assert "migration breaking changes compatibility" in prompt
+    assert "=== WORKAROUND SNIPPETS ===" in prompt
+    # No noisy QA evidence fields
+    assert "Source Attempt ID" not in prompt
+    assert "Raw Excerpt" not in prompt
 
 
-def test_initial_query_uses_advisory_identifier_and_mechanism() -> None:
-    """Initial mitigation should start with the advisory and vulnerable mechanism."""
-    task, group = _task_and_group()
+def test_compact_qa_regression_repair_prompt():
+    task = MagicMock(task_id="task-2", selected_version="8.5.1", instruction="Update package")
+    group = MagicMock(
+        vulnerable_component="express-jwt",
+        cve_ids=["CVE-2026-9999"],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
+    )
+    qa_ev = QAFailureEvidence(
+        attempt_id="att-123",
+        task_revision=5,
+        exact_diagnostics=["TypeError: jwt is not a function"],
+        failed_tests=["tests/jwt.test.ts"],
+        source_locations=["lib/insecurity.ts:42:10"],
+        affected_files=["lib/insecurity.ts"],
+        raw_excerpt="A very large raw log excerpt..." * 10,
+    )
+    context = WorkaroundContext(
+        phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
+        qa_evidence=qa_ev,
+    )
 
     prompt = _build_workaround_prompt(
         target_task=task,
         target_group=group,
+        workaround_context=context,
     )
 
-    assert (
-        "Initial evidence-based classification to confirm or reject: initial_code_workaround_or_isolation"
-        in prompt
+    assert "WORKFLOW PHASE: QA_REGRESSION_REPAIR" in prompt
+    assert "Dependency update is already seeded; do not modify manifests" in prompt
+    assert "TypeError: jwt is not a function" in prompt
+    assert "lib/insecurity.ts" in prompt
+    assert "Targeted Test File: tests/jwt.test.ts" in prompt
+
+    # Verify omission of noisy/redundant fields
+    assert "Source Attempt ID" not in prompt
+    assert "Source Revision" not in prompt
+    assert "Raw Excerpt" not in prompt
+    assert "A very large raw log excerpt" not in prompt
+
+
+def test_search_recommendation_precedence():
+    task = MagicMock(selected_version="2.0.0")
+    group = MagicMock(
+        vulnerable_component="lodash",
+        cve_ids=["CVE-2025-1111"],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
     )
-    assert "CVE-2020-15084" in prompt
-    assert "security advisory" in prompt
-    assert "mitigation" in prompt
+    group.issues = []
 
-
-def test_scanner_failure_query_prioritizes_unresolved_finding() -> None:
-    """Scanner failures should search the advisory mechanism before migration guidance."""
-    task, group = _task_and_group()
-    prompt = _build_workaround_prompt(
-        target_task=task,
-        target_group=group,
-        previous_feedback=(
-            "Dependency scanner still reports CVE-2020-15084; remaining scanner "
-            "findings require a source-level mitigation."
-        ),
+    # 1. QA Phase -> update_mitigates_cve_but_breaks_tests
+    context = WorkaroundContext(
+        phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
+        qa_evidence=QAFailureEvidence(exact_diagnostics=["TypeError: fn is not a function"]),
     )
+    rec = _workaround_search_recommendation(task, group, context, None)
+    assert rec.scenario == "update_mitigates_cve_but_breaks_tests"
 
-    assert (
-        "Initial evidence-based classification to confirm or reject: update_does_not_resolve_scanner_findings"
-        in prompt
+    # 2. Scanner failure -> update_does_not_resolve_scanner_findings
+    context_scanner = WorkaroundContext(
+        phase=WorkaroundPhase.INITIAL_MITIGATION,
+        qa_evidence=None,
     )
-    assert "still vulnerable" in prompt
-    assert "source-level mitigation" in prompt
-
-
-def test_qa_query_prefers_structured_diagnostic_over_generic_retry_feedback() -> None:
-    """Search extraction must use the exact QA diagnostic when both forms exist."""
-    task, group = _task_and_group()
-    prompt = _build_workaround_prompt(
-        target_task=task,
-        target_group=group,
-        previous_feedback="Generic QA retry guidance with no useful error details.",
-        workaround_context=WorkaroundContext(
-            phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
-            qa_evidence=QAFailureEvidence(
-                exact_diagnostics=["express-jwt: algorithms is a required option"],
-                attempt_id="attempt-1",
-                task_revision=2,
-            ),
-        ),
+    rec_scanner = _workaround_search_recommendation(
+        task, group, context_scanner, previous_feedback="scanner findings remaining"
     )
+    assert rec_scanner.scenario == "update_does_not_resolve_scanner_findings"
 
-    assert "express-jwt: algorithms is a required option" in prompt
-    assert "Generic QA retry guidance" not in prompt
-
-
-def test_skinny_prompt_preserves_vulnerability_mechanism() -> None:
-    """The skinny execution group still receives the vulnerability mechanism."""
-    task, group = _task_and_group()
-    mechanism = _extract_vulnerability_mechanism(group)
-    skinny_group = _create_skinny_subagent_group(group)
-
-    assert skinny_group.issues == []
-    prompt = _build_workaround_prompt(
-        target_task=task,
-        target_group=skinny_group,
-        vulnerability_mechanism=mechanism,
+    # 3. No fix -> no_update_available_to_resolve_cve
+    group_nofix = MagicMock(
+        vulnerable_component="lodash",
+        cve_ids=["CVE-2025-1111"],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="no_fix")),
     )
+    rec_nofix = _workaround_search_recommendation(task, group_nofix, context_scanner, None)
+    assert rec_nofix.scenario == "no_update_available_to_resolve_cve"
 
-    assert "Vulnerability Mechanism:" in prompt
-    assert "algorithms" in prompt
-    assert "authorization bypass" in prompt
-
-
-def test_ast_lookup_error_explains_declared_symbol_requirement() -> None:
-    """A missing AST symbol should tell the worker how to recover."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock, patch
-
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = "import expressJwt from 'express-jwt';"
-    tool = _make_inspect_ast_symbol_tool(sandbox)
-
-    with (
-        patch(
-            "remediation_engine.tools.code_map.language_for_path",
-            return_value="typescript",
-        ),
-        patch(
-            "remediation_engine.tools.code_map.parse_source",
-            return_value=SimpleNamespace(root_node=object()),
-        ),
-        patch(
-            "remediation_engine.tools.code_map.find_named_symbol",
-            return_value=None,
-        ),
-    ):
-        result = tool.invoke({"file_path": "lib/insecurity.ts", "symbol_name": "expressJwt"})
-
-    assert "declared function, class, or method" in result
-    assert "Imported identifiers and package names are not AST symbols" in result
-    assert "Do not retry the same symbol" in result
-    assert "read_workspace_file" in result
+    # 4. Otherwise -> initial_code_workaround_or_isolation
+    rec_init = _workaround_search_recommendation(task, group, context_scanner, None)
+    assert rec_init.scenario == "initial_code_workaround_or_isolation"

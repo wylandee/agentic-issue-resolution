@@ -98,8 +98,18 @@ def _tool_call_signature(tool_call: dict[str, Any]) -> tuple[str, str]:
     if tool_name in {
         "deterministic_search_replace",
         "deterministic_replace_ast_symbol",
-        "revert_workspace_file",
     }:
+        file_path = tool_args.get("file_path", "")
+        old_text = tool_args.get("old_text", "") or tool_args.get("target_text", "")
+        new_text = tool_args.get("new_text", "") or tool_args.get("replacement_text", "")
+        symbol_name = tool_args.get("symbol_name", "")
+        line_hint = tool_args.get("line_hint", "")
+        return (
+            tool_name,
+            f"file:{file_path}|sym:{symbol_name}|old:{str(old_text)[:60]}|new:{str(new_text)[:60]}|line:{line_hint}",
+        )
+
+    if tool_name == "revert_workspace_file":
         return tool_name, f"file:{tool_args.get('file_path', '')}"
 
     try:
@@ -199,6 +209,8 @@ def run_bounded_subagent_loop(
     recovery_signatures: set[tuple[str, str]] = set()
     last_failed_tool_content: dict[tuple[str, str], str] = {}
     consecutive_validation_failures = 0
+    validation_gate_call_count = 0
+    scope_violation_count = 0
 
     for _ in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
         try:
@@ -235,6 +247,10 @@ def run_bounded_subagent_loop(
         recovery_instruction: str | None = None
         sandbox_stopped = False
         malformed_tool_call = False
+        infrastructure_blocked = False
+        scope_loop_error: str | None = None
+        validation_limit_error: str | None = None
+        blocker_errors: list[str] = []
         for tool_call in tool_calls:
             call_signature = _tool_call_signature(tool_call)
             tool_call_id = tool_call.get("id")
@@ -245,7 +261,7 @@ def run_bounded_subagent_loop(
                 prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
                 tool_message = ToolMessage(
                     content=(
-                        "ERROR: Repeated failed tool call suppressed. Choose a different "
+                        "ERROR: [REPEATED_INVALID_CALL] Repeated failed tool call suppressed. Choose a different "
                         "tool or argument set; the exact signature has already received a "
                         f"recovery instruction. Prior failure: {prior_failure}"
                     ),
@@ -261,6 +277,21 @@ def run_bounded_subagent_loop(
                 content=tool_message.content,
             )
             tool_events.append(event)
+
+            if (
+                "[PLAN_VIOLATION]" in tool_message.content
+                or "[PROHIBITED_TARGET]" in tool_message.content
+            ):
+                scope_violation_count += 1
+                if scope_violation_count >= 2:
+                    scope_loop_error = f"SCOPE_LOOP_ERROR: Subagent stopped due to repeated scope/plan violations: {tool_message.content}"
+
+            if tool_message.content.startswith("BLOCKED:") or "BLOCKED:" in tool_message.content:
+                infrastructure_blocked = True
+                b_msg = tool_message.content.strip()
+                if not b_msg.startswith("INFRASTRUCTURE_BLOCKER:"):
+                    b_msg = f"INFRASTRUCTURE_BLOCKER: {b_msg}"
+                blocker_errors.append(b_msg)
 
             if _is_failed_tool_result(tool_message.content):
                 failed_tool_call_counts[call_signature] = (
@@ -285,7 +316,12 @@ def run_bounded_subagent_loop(
                     HumanMessage(content=_targeted_test_recovery_instruction(event.content))
                 )
             if event.name == "validate_workaround":
-                if event.content.startswith("FAILURE:"):
+                validation_gate_call_count += 1
+                if validation_gate_call_count >= 3 and event.content.startswith("FAILURE:"):
+                    validation_limit_error = (
+                        "VALIDATION_LIMIT_REACHED: Maximum 3 validation gate attempts reached."
+                    )
+                elif event.content.startswith("FAILURE:"):
                     consecutive_validation_failures += 1
                     if consecutive_validation_failures >= 3:
                         conversation.append(
@@ -332,6 +368,41 @@ def run_bounded_subagent_loop(
                 tool_events=tool_events,
                 changed_files=sorted(observed_changed_files | set(touched_files)),
                 errors=errors,
+            )
+
+        if infrastructure_blocked:
+            errors.extend(blocker_errors)
+            revert_tool = tool_map.get("revert_workspace_file")
+            for f_path in list(observed_changed_files):
+                if revert_tool and f_path not in touched_files:
+                    try:
+                        revert_tool.invoke({"file_path": f_path})
+                    except Exception:  # noqa: BLE001
+                        pass
+            observed_changed_files.clear()
+            return SubagentRuntimeResult(
+                final_text=final_text,
+                tool_events=tool_events,
+                changed_files=[],
+                errors=list(dict.fromkeys(errors)),
+            )
+
+        if scope_loop_error:
+            errors.append(scope_loop_error)
+            return SubagentRuntimeResult(
+                final_text=final_text,
+                tool_events=tool_events,
+                changed_files=sorted(observed_changed_files | set(touched_files)),
+                errors=list(dict.fromkeys(errors)),
+            )
+
+        if validation_limit_error:
+            errors.append(validation_limit_error)
+            return SubagentRuntimeResult(
+                final_text=final_text,
+                tool_events=tool_events,
+                changed_files=sorted(observed_changed_files | set(touched_files)),
+                errors=list(dict.fromkeys(errors)),
             )
 
         if sandbox_stopped:

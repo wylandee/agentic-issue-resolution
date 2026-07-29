@@ -127,7 +127,8 @@
     "lockfile": "package-lock.json",
     "source_file_to_leave_unchanged": "lib/insecurity.ts",
     "package_manager": "npm",
-    "install_command": "npm install --package-lock-only --ignore-scripts --no-audit --no-fund"
+    "install_command": "npm install --package-lock-only --ignore-scripts --no-audit --no-fund",
+    "ci_command": "npm ci --ignore-scripts --no-audit --no-fund"
   },
   "provenance": {
     "source_trace_file": "data/trajectories/phase5_20260729T063522Z_249c81ed-5f64-42f2-98d8-013fb6ed0723.md",

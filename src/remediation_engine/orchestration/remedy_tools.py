@@ -46,6 +46,42 @@ _READ_WEB_PAGE_TIMEOUT = 15
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 
 
+def _is_authoritative_evidence_source(source: str) -> bool:
+    """Return whether an evidence source URL or path is authoritative."""
+    candidate = (source or "").strip().lower()
+    if not candidate:
+        return False
+    if any(
+        untrusted in candidate
+        for untrusted in ("stackoverflow.com", "stackexchange.com", "reddit.com", "snippet-only")
+    ):
+        return False
+
+    authoritative_markers = (
+        "github.com/",
+        "github.com/advisories",
+        "raw.githubusercontent.com",
+        "nvd.nist.gov",
+        "cve.org",
+        "osv.dev",
+        "security.snyk.io",
+        "npmjs.com/package/",
+        "registry.npmjs.org",
+        "expressjs.com",
+        "jwt.io",
+        "node_modules/",
+        "readme",
+        "index.d.ts",
+        "package.json",
+        "official advisory",
+        "package repository",
+        "package docs",
+        "npm registry",
+        "installed package",
+    )
+    return any(marker in candidate for marker in authoritative_markers)
+
+
 def _validate_workspace_path(file_path: str) -> str:
     candidate = (file_path or "").strip().replace("\\", "/")
     if not candidate:
@@ -53,6 +89,8 @@ def _validate_workspace_path(file_path: str) -> str:
 
     if candidate.startswith("/workspace/"):
         candidate = candidate[len("/workspace/") :]
+    elif candidate.startswith("workspace/"):
+        candidate = candidate[len("workspace/") :]
 
     if os.path.isabs(candidate) or candidate.startswith("/"):
         raise ValueError(f"Rejected absolute file path '{candidate}'.")
@@ -176,6 +214,10 @@ def _make_read_workspace_file_tool(
                 f"ERROR: Could not read '{rel_path}'. "
                 "Use search_codebase_pattern or read_repository_map to verify the path."
             )
+
+        if plan_state is not None and rel_path.startswith("node_modules/"):
+            plan_state["has_authoritative_evidence"] = True
+            plan_state["evidence_source"] = rel_path
 
         lines = content.splitlines()
         total_lines = len(lines)
@@ -511,7 +553,18 @@ def _make_deterministic_search_replace_tool(
         Apply an exact one-time search/replace to a workspace file.
         """
         if plan_state is not None and not plan_state.get("recorded", False):
-            return "ERROR: You MUST call record_plan before making any code edits with deterministic_search_replace."
+            return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits with deterministic_search_replace."
+
+        if (
+            plan_state is not None
+            and plan_state.get("require_authoritative_evidence")
+            and not plan_state.get("has_authoritative_evidence")
+        ):
+            return (
+                "ERROR: [MISSING_EVIDENCE] Authoritative evidence required before editing for QA_REGRESSION_REPAIR. "
+                "Gather evidence from an official advisory, package repo/docs, npm registry metadata, "
+                "or the installed package's README/types in node_modules."
+            )
 
         try:
             rel_path = _validate_workspace_path(file_path)
@@ -519,7 +572,7 @@ def _make_deterministic_search_replace_tool(
             return f"ERROR: {exc}"
 
         if _is_prohibited_target(rel_path):
-            return "ERROR: Workaround workers cannot modify dependency manifests or test files."
+            return "ERROR: [PROHIBITED_TARGET] Workaround workers cannot modify dependency manifests or test files."
 
         planned_files = {
             str(path).replace("\\", "/").lstrip("/")
@@ -528,7 +581,7 @@ def _make_deterministic_search_replace_tool(
         if plan_state is not None and plan_state.get("recorded") and planned_files:
             if rel_path not in planned_files:
                 return (
-                    f"ERROR: '{rel_path}' is outside the recorded workaround plan. "
+                    f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
                     "Re-run record_plan with every causally related source file before editing it; "
                     "do not apply an isolated or unrelated fix."
                 )
@@ -539,7 +592,7 @@ def _make_deterministic_search_replace_tool(
             fallback_files = plan_state.get("fallback_files", set()) if plan_state else set()
             if rel_path not in inspected_files and rel_path not in fallback_files:
                 return (
-                    f"ERROR: AST inspection required before first edit on '{rel_path}'. "
+                    f"ERROR: [MISSING_INSPECTION] AST inspection required before first edit on '{rel_path}'. "
                     "Use inspect_ast_symbol for the target symbol, or use read_workspace_file "
                     "and document a no-symbol fallback in record_plan before editing."
                 )
@@ -608,7 +661,18 @@ def _make_deterministic_replace_ast_symbol_tool(
         Replace the complete AST body of a declared function, class, or method.
         """
         if plan_state is not None and not plan_state.get("recorded", False):
-            return "ERROR: You MUST call record_plan before making any code edits."
+            return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits."
+
+        if (
+            plan_state is not None
+            and plan_state.get("require_authoritative_evidence")
+            and not plan_state.get("has_authoritative_evidence")
+        ):
+            return (
+                "ERROR: [MISSING_EVIDENCE] Authoritative evidence required before editing for QA_REGRESSION_REPAIR. "
+                "Gather evidence from an official advisory, package repo/docs, npm registry metadata, "
+                "or the installed package's README/types in node_modules."
+            )
 
         try:
             rel_path = _validate_workspace_path(file_path)
@@ -616,7 +680,7 @@ def _make_deterministic_replace_ast_symbol_tool(
             return f"ERROR: {exc}"
 
         if _is_prohibited_target(rel_path):
-            return "ERROR: Workaround workers cannot modify dependency manifests or test files."
+            return "ERROR: [PROHIBITED_TARGET] Workaround workers cannot modify dependency manifests or test files."
 
         planned_files = {
             str(path).replace("\\", "/").lstrip("/")
@@ -625,7 +689,7 @@ def _make_deterministic_replace_ast_symbol_tool(
         if plan_state is not None and plan_state.get("recorded") and planned_files:
             if rel_path not in planned_files:
                 return (
-                    f"ERROR: '{rel_path}' is outside the recorded workaround plan. "
+                    f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
                     "Re-run record_plan with every causally related source file before editing it; "
                     "do not apply an isolated or unrelated fix."
                 )
@@ -1066,10 +1130,21 @@ def _make_validate_workaround_tool(
         try:
             result = sandbox.run("npx --no-install tsc --noEmit", timeout=60)
         except Exception as exc:  # noqa: BLE001
-            return f"FAILURE: TypeScript gate execution failed: {exc}"
+            return f"BLOCKED: TypeScript gate execution failed: {exc}"
         if result.exit_code == 0:
             return "SUCCESS: TypeScript compilation passed cleanly."
         output = (result.stdout + "\n" + result.stderr).strip()
+        lowered = output.lower()
+        if (
+            result.exit_code == 127
+            or "command not found" in lowered
+            or "cannot find module" in lowered
+            or "npx: not found" in lowered
+            or "err_module_not_found" in lowered
+        ):
+            if len(output) > 3000:
+                output = output[:3000] + "\n... (truncated)"
+            return f"BLOCKED: TypeScript gate blocked.\nCommand: npx --no-install tsc --noEmit\nDiagnostic:\n{output}"
         if len(output) > 3000:
             output = output[:3000] + "\n... (truncated)"
         return f"FAILURE: TypeScript compilation failed (exit {result.exit_code}).\n{output}"
@@ -1125,10 +1200,23 @@ def _make_validate_workaround_tool(
         try:
             result = sandbox.run(command, timeout=_RUNTIME_SMOKE_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
-            return f"FAILURE: Runtime smoke gate execution failed: {exc}"
+            return f"BLOCKED: Runtime smoke gate execution failed: {exc}"
         if result.exit_code == 0:
             return f"SUCCESS: Runtime smoke import passed for {rel_path}."
         output = (result.stdout + "\n" + result.stderr).strip()
+        lowered = output.lower()
+        if suffix in {".ts", ".tsx", ".jsx"} and (
+            result.exit_code == 127
+            or "cannot find module 'tsx'" in lowered
+            or "tsx: command not found" in lowered
+            or "err_module_not_found" in lowered
+            or "npx: not found" in lowered
+        ):
+            if len(output) > 3000:
+                output = output[:3000] + "\n... (truncated)"
+            return (
+                f"BLOCKED: Runtime smoke gate blocked.\nCommand: {command}\nDiagnostic:\n{output}"
+            )
         if len(output) > 3000:
             output = output[:3000] + "\n... (truncated)"
         return f"FAILURE: Runtime smoke import failed for {rel_path}.\n{output}"
@@ -1175,14 +1263,20 @@ def _make_validate_workaround_tool(
                     f"Modified file '{file_path}' could not be re-read from the workspace.",
                 )
             syntax_result = syntax_tool.invoke({"file_path": file_path})
+            if str(syntax_result).startswith("BLOCKED:"):
+                return str(syntax_result)
             if not str(syntax_result).startswith("SUCCESS:"):
                 return _failure("syntax", str(syntax_result))
 
         typecheck_result = _run_typecheck_gate()
+        if typecheck_result.startswith("BLOCKED:"):
+            return typecheck_result
         if typecheck_result.startswith("FAILURE:"):
             return _failure("typecheck", typecheck_result)
 
         lint_result = _run_lint_gate(files)
+        if lint_result.startswith("BLOCKED:"):
+            return lint_result
         if lint_result.startswith("FAILURE:"):
             return _failure("lint", lint_result)
 
@@ -1197,6 +1291,8 @@ def _make_validate_workaround_tool(
                 None,
             )
         smoke_result = _run_runtime_smoke_gate(smoke_file)
+        if smoke_result.startswith("BLOCKED:"):
+            return smoke_result
         if smoke_result.startswith("FAILURE:"):
             return _failure("runtime_smoke", smoke_result)
 
@@ -1207,6 +1303,8 @@ def _make_validate_workaround_tool(
             test_result = targeted_test_tool.invoke(
                 {"test_file": test_file, "test_name": targeted_test_name}
             )
+            if str(test_result).startswith("BLOCKED:"):
+                return str(test_result)
             if not str(test_result).startswith("SUCCESS:"):
                 return _failure("targeted_test", str(test_result))
 
@@ -1274,7 +1372,7 @@ def build_workaround_toolbelt(
     return [
         _make_record_plan_tool(plan_state),
         _make_search_web_tool(mandatory_search_terms=mandatory_search_terms),
-        _make_read_web_page_tool(),
+        _make_read_web_page_tool(plan_state),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox, plan_state),
         _make_search_codebase_pattern_tool(sandbox),
@@ -1294,9 +1392,10 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         security_invariant: str,
         causal_hypothesis: str,
         exact_intended_edits: str,
+        evidence_source: str | None = None,
     ) -> str:
         """
-        Record your investigation findings, affected files/symbols, security invariant, causal hypothesis, and planned edits.
+        Record your investigation findings, affected files/symbols, security invariant, causal hypothesis, planned edits, and optional evidence source.
         You MUST call this tool BEFORE executing any code edits.
         """
         plan_state["recorded"] = True
@@ -1315,11 +1414,25 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
                 except ValueError:
                     valid_files.append(f_str)
 
-        plan_state["planned_files"] = valid_files
-        plan_state["planned_symbols"] = [str(s).strip() for s in symbols_list if str(s).strip()]
+        existing_planned = list(plan_state.get("planned_files", []))
+        existing_modified = list(plan_state.get("modified_files", set()))
+        all_planned = list(dict.fromkeys(existing_planned + existing_modified + valid_files))
+
+        existing_symbols = list(plan_state.get("planned_symbols", []))
+        new_symbols = [str(s).strip() for s in symbols_list if str(s).strip()]
+        all_symbols = list(dict.fromkeys(existing_symbols + new_symbols))
+
+        plan_state["planned_files"] = all_planned
+        plan_state["planned_symbols"] = all_symbols
         plan_state["security_invariant"] = str(security_invariant).strip()
         plan_state["causal_hypothesis"] = str(causal_hypothesis).strip()
         plan_state["exact_intended_edits"] = str(exact_intended_edits).strip()
+
+        if evidence_source:
+            source_str = str(evidence_source).strip()
+            plan_state["evidence_source"] = source_str
+            if _is_authoritative_evidence_source(source_str):
+                plan_state["has_authoritative_evidence"] = True
 
         read_files = plan_state.get("read_files", set())
         for f in plan_state["planned_files"]:
@@ -1341,17 +1454,13 @@ def _make_search_web_tool(mandatory_search_terms: dict[str, str] | None = None):
     scanner state, and QA diagnostics require different searches; silently
     appending one fixed query shape can hide that distinction.
     """
-    _calls_remaining = [_SEARCH_WEB_MAX_CALLS]
+    _calls_remaining = [3]
 
     @tool
     def search_web(query: str) -> str:
-        """
-        Search the web using Google for documentation, migration guides,
-        changelogs, or breaking changes related to the vulnerability fix.
+        """Search the web for vulnerability fixes, migration guides, or documentation.
 
-        SEARCH HEURISTICS:
-        - Scenarios 1 & 4 (Unit test failure or validate_workaround error): Prioritize searching the error string / stack trace without quotation marks.
-        - Scenarios 2 & 3 (Scanner failure or no version bumps available): Prioritize searching the CVE ID and mitigation strategies without quotation marks.
+        Pass your own targeted query. Do not wrap queries in quotes.
         """
         if _calls_remaining[0] <= 0:
             return f"ERROR: search_web call limit reached (max {_SEARCH_WEB_MAX_CALLS} per session). Use the results you already have."
@@ -1460,16 +1569,25 @@ def _decode_github_response(resp: Any, target_url: str) -> str:
             payload = resp.json()
         except Exception:  # noqa: BLE001
             return text
-        if (
-            isinstance(payload, dict)
-            and payload.get("encoding") == "base64"
-            and payload.get("content")
-        ):
-            try:
-                return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
-            except Exception:  # noqa: BLE001
-                return text
-        if isinstance(payload, (dict, list)):
+        if isinstance(payload, dict):
+            if payload.get("encoding") == "base64" and payload.get("content"):
+                try:
+                    return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
+                except Exception:  # noqa: BLE001
+                    return text
+            title = (
+                payload.get("title")
+                or payload.get("name")
+                or payload.get("login")
+                or "GitHub Content"
+            )
+            body = payload.get("body") or payload.get("description") or payload.get("content") or ""
+            if title or body:
+                return f"Title: {title}\nURL: {target_url}\n\n{body}".strip()
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        if isinstance(payload, list):
             import json
 
             return json.dumps(payload, indent=2, ensure_ascii=False)
@@ -1477,8 +1595,8 @@ def _decode_github_response(resp: Any, target_url: str) -> str:
     return f"No readable content extracted from {target_url}."
 
 
-def _make_read_web_page_tool():
-    """Create a tool to fetch web pages, using the GitHub API for GitHub URLs."""
+def _make_read_web_page_tool(plan_state: dict[str, Any] | None = None):
+    """Create a tool to fetch web pages, using GitHub API, raw content, Jina, and npm fallbacks."""
 
     @tool
     def read_web_page(url: str) -> str:
@@ -1492,32 +1610,128 @@ def _make_read_web_page_tool():
         if not target_url:
             return "ERROR: url is required."
 
-        github_api_url = _github_api_url(target_url)
-        request_url = github_api_url or f"{_JINA_READER_URL_PREFIX}{target_url}"
-        request_headers = _github_headers() if github_api_url else {"Accept": "text/plain"}
+        # 1. GitHub API & Raw GitHub fallback
+        if "github.com" in target_url and not target_url.startswith(
+            "https://raw.githubusercontent.com"
+        ):
+            github_api_url = _github_api_url(target_url)
+            if github_api_url:
+                try:
+                    resp = requests.get(
+                        github_api_url,
+                        headers=_github_headers(),
+                        timeout=_READ_WEB_PAGE_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    text = _decode_github_response(resp, target_url)
+                    if text and text.strip():
+                        if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                            text = (
+                                text[:_READ_WEB_PAGE_MAX_CHARS]
+                                + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                            )
+                        if plan_state is not None and _is_authoritative_evidence_source(target_url):
+                            plan_state["has_authoritative_evidence"] = True
+                            plan_state["evidence_source"] = target_url
+                        return f"--- Markdown content of {target_url} ---\n\n{text}"
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("GitHub API fetch failed for %s: %s", target_url, exc)
+
+            raw_url = (
+                target_url.replace("github.com", "raw.githubusercontent.com")
+                .replace("/blob/", "/")
+                .replace("/tree/", "/")
+            )
+            try:
+                resp = requests.get(raw_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+                resp.raise_for_status()
+                text = resp.text or ""
+                if text and text.strip():
+                    if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                        text = (
+                            text[:_READ_WEB_PAGE_MAX_CHARS]
+                            + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                        )
+                    if plan_state is not None and _is_authoritative_evidence_source(target_url):
+                        plan_state["has_authoritative_evidence"] = True
+                        plan_state["evidence_source"] = target_url
+                    return f"--- Markdown content of {target_url} ---\n\n{text}"
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Raw GitHub fetch failed for %s: %s", raw_url, exc)
+
+        # 2. Jina Reader fallback
+        jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
         try:
             resp = requests.get(
-                request_url,
-                headers=request_headers,
+                jina_url,
+                headers={"Accept": "text/plain"},
                 timeout=_READ_WEB_PAGE_TIMEOUT,
             )
             resp.raise_for_status()
-            text = (
-                _decode_github_response(resp, target_url) if github_api_url else (resp.text or "")
+            text = resp.text or ""
+            if text and text.strip():
+                if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                    text = (
+                        text[:_READ_WEB_PAGE_MAX_CHARS]
+                        + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                    )
+                if plan_state is not None and _is_authoritative_evidence_source(target_url):
+                    plan_state["has_authoritative_evidence"] = True
+                    plan_state["evidence_source"] = target_url
+                return f"--- Markdown content of {target_url} ---\n\n{text}"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Jina Reader fetch failed for %s: %s", target_url, exc)
+
+        # 3. Direct page fetch fallback
+        try:
+            resp = requests.get(target_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+            resp.raise_for_status()
+            text = resp.text or ""
+            if text and text.strip():
+                if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                    text = (
+                        text[:_READ_WEB_PAGE_MAX_CHARS]
+                        + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                    )
+                if plan_state is not None and _is_authoritative_evidence_source(target_url):
+                    plan_state["has_authoritative_evidence"] = True
+                    plan_state["evidence_source"] = target_url
+                return f"--- Markdown content of {target_url} ---\n\n{text}"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Direct page fetch failed for %s: %s", target_url, exc)
+
+        # 4. npm registry fallback if URL relates to npm package
+        if (
+            "npmjs.com" in target_url
+            or "registry.npmjs.org" in target_url
+            or not target_url.startswith("http")
+        ):
+            pkg_name = (
+                target_url.split("package/")[-1].split("/")[0].strip()
+                if "package/" in target_url
+                else target_url.strip()
             )
-            if not text.strip():
-                return f"No readable content extracted from {target_url}."
+            if pkg_name:
+                try:
+                    resp = requests.get(
+                        f"https://registry.npmjs.org/{pkg_name}",
+                        timeout=_READ_WEB_PAGE_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    text = resp.text or ""
+                    if text and text.strip():
+                        if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+                            text = (
+                                text[:_READ_WEB_PAGE_MAX_CHARS]
+                                + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+                            )
+                        if plan_state is not None and _is_authoritative_evidence_source(target_url):
+                            plan_state["has_authoritative_evidence"] = True
+                            plan_state["evidence_source"] = target_url
+                        return f"--- Markdown content of {target_url} ---\n\n{text}"
+                except Exception:  # noqa: BLE001
+                    pass
 
-            if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                text = (
-                    text[:_READ_WEB_PAGE_MAX_CHARS]
-                    + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
-                )
-
-            return f"--- Markdown content of {target_url} ---\n\n{text}"
-
-        except Exception as exc:
-            logger.warning("read_web_page failed for %s: %s", target_url, exc)
-            return f"ERROR: Failed to read web page {target_url} - {exc}"
+        return f"ERROR: Failed to read web page {target_url} - No readable content extracted from any fallback source."
 
     return read_web_page

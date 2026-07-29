@@ -222,6 +222,13 @@ def _seed_post_update_workspace(
     if source_before is None:
         raise RuntimeError(f"Seed workspace is missing {source_file}.")
 
+    ci_cmd = str(
+        fixture["workspace_seed"].get(
+            "ci_command",
+            "npm ci --ignore-scripts --no-audit --no-fund",
+        )
+    )
+
     commands = [
         (
             "set_manifest_version",
@@ -230,6 +237,10 @@ def _seed_post_update_workspace(
         (
             "synchronize_lockfile",
             str(fixture["workspace_seed"]["install_command"]),
+        ),
+        (
+            "materialize_dependencies",
+            ci_cmd,
         ),
     ]
     diagnostics: list[dict[str, Any]] = []
@@ -277,12 +288,36 @@ def _seed_post_update_workspace(
             f"lockfile={lock_version!r}, target={target_version!r}."
         )
 
+    installed_pkg_text = sandbox.read_file(f"node_modules/{package_name}/package.json")
+    installed_version = None
+    if installed_pkg_text:
+        try:
+            installed_version = json.loads(installed_pkg_text).get("version")
+        except json.JSONDecodeError:
+            pass
+
+    if installed_version != target_version:
+        raise RuntimeError(
+            f"Installed package version mismatch for {package_name}: expected {target_version!r}, "
+            f"got {installed_version!r}."
+        )
+
+    tsc_check = sandbox.run("cd /workspace && npx --no-install tsc --version")
+    tsx_check = sandbox.run("cd /workspace && npx --no-install tsx --version")
+    if tsc_check.exit_code != 0 or tsx_check.exit_code != 0:
+        raise RuntimeError(
+            f"Required tooling verification failed: tsc exit={tsc_check.exit_code}, tsx exit={tsx_check.exit_code}."
+        )
+
     diagnostics.append(
         {
             "step": "verify_seed",
             "package": package_name,
             "manifest_version": manifest_version,
             "lockfile_version": lock_version,
+            "installed_version": installed_version,
+            "tsc_version": tsc_check.stdout.strip(),
+            "tsx_version": tsx_check.stdout.strip(),
             "source_file_unchanged": True,
         }
     )
@@ -301,12 +336,29 @@ def _merge_worker_result(state: dict[str, Any], result: dict[str, Any]) -> None:
             *result["action_summaries"],
         ]
     if result.get("worker_results_by_attempt"):
+        worker_map = result["worker_results_by_attempt"]
         state["worker_results_by_attempt"] = {
             **state.get("worker_results_by_attempt", {}),
-            **result["worker_results_by_attempt"],
+            **worker_map,
         }
+        for attempt_res in worker_map.values():
+            errs = getattr(attempt_res, "errors", None) or (
+                attempt_res.get("errors") if isinstance(attempt_res, dict) else None
+            )
+            if errs:
+                state["errors"] = list(dict.fromkeys([*state.get("errors", []), *errs]))
+            diag = getattr(attempt_res, "execution_diagnostics", None) or (
+                attempt_res.get("execution_diagnostics") if isinstance(attempt_res, dict) else None
+            )
+            if diag:
+                reason = getattr(diag, "failure_reason", None) or (
+                    diag.get("failure_reason") if isinstance(diag, dict) else None
+                )
+                if reason:
+                    state["errors"] = list(dict.fromkeys([*state.get("errors", []), str(reason)]))
+
     if result.get("errors"):
-        state["errors"] = [*state.get("errors", []), *result["errors"]]
+        state["errors"] = list(dict.fromkeys([*state.get("errors", []), *result["errors"]]))
 
 
 def _jsonable(value: Any) -> Any:
@@ -397,6 +449,8 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
         else "surrender"
     )
 
+    diff_content = state.get("diff", "") if replay_status == "success" else ""
+
     return _jsonable(
         {
             "status": replay_status,
@@ -410,7 +464,9 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
                 "status": worker_status,
                 "action_summaries": action_summaries,
                 "worker_results_by_attempt": state.get("worker_results_by_attempt", {}),
-                "changed_files": state.get("changed_files", []),
+                "changed_files": state.get("changed_files", [])
+                if replay_status == "success"
+                else [],
             },
             "teardown": {
                 "status": teardown_result.get("status"),
@@ -418,8 +474,8 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
                 "volume_removed": bool(workspace_volume)
                 and teardown_result.get("workspace_volume") is None,
             },
-            "changed_files": state.get("changed_files", []),
-            "diff": state.get("diff", ""),
+            "changed_files": state.get("changed_files", []) if replay_status == "success" else [],
+            "diff": diff_content,
             "errors": state.get("errors", []),
         }
     )
