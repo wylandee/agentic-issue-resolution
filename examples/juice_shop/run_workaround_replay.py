@@ -240,7 +240,7 @@ def _seed_post_update_workspace(
         ),
         (
             "materialize_dependencies",
-            ci_cmd,
+            "npm install --package-lock=true --no-audit --no-fund",
         ),
     ]
     diagnostics: list[dict[str, Any]] = []
