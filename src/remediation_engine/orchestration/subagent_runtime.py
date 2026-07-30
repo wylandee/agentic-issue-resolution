@@ -4,6 +4,7 @@ Shared bounded ReAct runtime for Phase 5 specialist subagents.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -183,10 +184,13 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
         "The combined workaround validation gate failed; do not declare success.\n"
         "Exact validation-gate result:\n"
         f"{evidence}\n"
-        "Treat the first failed gate as the current root cause. Reconcile it with the cumulative "
-        "patch, re-read every related file, and record one complete revised plan before editing. "
-        "Preserve prior security fixes and do not apply an isolated unrelated change. After the "
-        "repair, call validate_workaround again with the complete modified-file list."
+        "Treat the first failed gate as the current root cause. If the result is CODE_FAILURE, "
+        "the current edit has been reverted: return to local INVESTIGATE, re-read every related "
+        "file, record one complete revised plan, and make one atomic semantic patch. If the "
+        "result is INFRA_FAILURE for the targeted test, inspect a repository alternative and "
+        "record the original-to-alternative mapping with evidence before retrying validation. "
+        "Do not use web research as generic recovery, and never declare success until every "
+        "required gate passes."
     )
 
 
@@ -196,6 +200,7 @@ def run_bounded_subagent_loop(
     initial_messages: Sequence[Any],
     touched_files: set[str],
     planning_state: dict[str, bool] | None = None,
+    execution_state: dict[str, Any] | None = None,
 ) -> SubagentRuntimeResult:
     """Run a bounded tool-calling loop for one specialized subagent."""
     tool_map = {tool.name: tool for tool in tools}
@@ -269,7 +274,23 @@ def run_bounded_subagent_loop(
                     name=tool_call.get("name", ""),
                 )
             else:
-                tool_message = _invoke_bound_tool(tool_map, tool_call)
+                tool_name = str(tool_call.get("name", ""))
+                if (
+                    execution_state is not None
+                    and execution_state.get("phase") == "VALIDATE"
+                    and tool_name
+                    in {"record_plan", "search_web", "read_web_page", "read_repository_map"}
+                ):
+                    tool_message = ToolMessage(
+                        content=(
+                            "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
+                            "Call validate_workaround before planning or web research."
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                else:
+                    tool_message = _invoke_bound_tool(tool_map, tool_call)
             conversation.append(tool_message)
             event = ToolEvent(
                 name=tool_call.get("name", ""),
@@ -316,6 +337,29 @@ def run_bounded_subagent_loop(
                     HumanMessage(content=_targeted_test_recovery_instruction(event.content))
                 )
             if event.name == "validate_workaround":
+                if execution_state is not None:
+                    # Real validation tools update this state directly. Also
+                    # decode the structured payload here so wrappers and
+                    # deterministic test doubles cannot accidentally erase
+                    # the gate evidence required by the success contract.
+                    execution_state["validation_calls"] = max(
+                        int(execution_state.get("validation_calls", 0)),
+                        1,
+                    )
+                    json_marker = "JSON:"
+                    if json_marker in event.content:
+                        try:
+                            payload = json.loads(event.content.split(json_marker, 1)[1].strip())
+                        except (TypeError, ValueError):
+                            payload = None
+                        if isinstance(payload, dict):
+                            execution_state["last_validation_result"] = payload
+                            execution_state["validated_files"] = list(
+                                payload.get("validated_files", []) or []
+                            )
+                            execution_state["validation_passed"] = (
+                                payload.get("overall_status") == "PASS"
+                            )
                 validation_gate_call_count += 1
                 if validation_gate_call_count >= 3 and event.content.startswith("FAILURE:"):
                     validation_limit_error = (
@@ -328,8 +372,10 @@ def run_bounded_subagent_loop(
                             HumanMessage(
                                 content=(
                                     "CRITICAL: You have failed the validation gate 3 times in a row. "
-                                    "You are in a failure loop. STOP guessing syntax. You MUST use search_web "
-                                    "to find the exact error message or migration guide before making further edits."
+                                    "Stop repeating the same action. Classify the latest structured result: "
+                                    "for CODE_FAILURE restart at INVESTIGATE; for INFRA_FAILURE inspect and "
+                                    "register one alternative targeted test. Do not search the web unless "
+                                    "you are back in INVESTIGATE and local evidence is insufficient."
                                 )
                             )
                         )
@@ -350,6 +396,23 @@ def run_bounded_subagent_loop(
                         observed_changed_files.discard(inferred_path)
                 else:
                     observed_changed_files.add(inferred_path)
+
+            if (
+                execution_state is not None
+                and event.name
+                in {"deterministic_search_replace", "deterministic_replace_ast_symbol"}
+                and event.content.startswith("SUCCESS:")
+            ):
+                conversation.append(
+                    HumanMessage(
+                        content=(
+                            "A source edit just succeeded. The lifecycle is now VALIDATE. "
+                            "Your next action must be validate_workaround with the complete "
+                            "modified-file list, an explicit runtime_smoke_file, and the "
+                            "required targeted test. Do not edit, re-plan, or browse first."
+                        )
+                    )
+                )
 
             if SANDBOX_NOT_RUNNING_MARKER in tool_message.content:
                 # Do not return from inside this loop. The model may have
@@ -375,10 +438,8 @@ def run_bounded_subagent_loop(
             revert_tool = tool_map.get("revert_workspace_file")
             for f_path in list(observed_changed_files):
                 if revert_tool and f_path not in touched_files:
-                    try:
+                    with contextlib.suppress(Exception):
                         revert_tool.invoke({"file_path": f_path})
-                    except Exception:  # noqa: BLE001
-                        pass
             observed_changed_files.clear()
             return SubagentRuntimeResult(
                 final_text=final_text,

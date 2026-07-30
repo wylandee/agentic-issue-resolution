@@ -1138,6 +1138,43 @@ class WorkaroundPhase(str, Enum):
     QA_REGRESSION_REPAIR = "qa_regression_repair"
 
 
+class WorkaroundExecutionPhase(str, Enum):
+    """Execution lifecycle phase for workaround subagent iterations."""
+
+    INVESTIGATE = "INVESTIGATE"
+    PLAN = "PLAN"
+    EXECUTE = "EXECUTE"
+    VALIDATE = "VALIDATE"
+
+
+class WorkaroundValidationStatus(str, Enum):
+    """Outcome status of a workaround validation run."""
+
+    PASS = "PASS"
+    CODE_FAILURE = "CODE_FAILURE"
+    INFRA_FAILURE = "INFRA_FAILURE"
+    BLOCKED = "BLOCKED"
+
+
+class WorkaroundValidationResult(BaseModel):
+    """Structured validation result for workaround gate runs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    overall_status: WorkaroundValidationStatus
+    syntax: str = ""
+    typecheck: str = ""
+    lint: str = ""
+    runtime_smoke: str = ""
+    targeted_test: str = ""
+    targeted_test_file: str | None = None
+    alternative_used: bool = False
+    validated_files: list[str] = Field(default_factory=list)
+    failure_category: FailureCategory | None = None
+    infrastructure_diagnostics: str | None = None
+
+
+
 class QAFailureEvidence(BaseModel):
     """Exact diagnostic evidence extracted from a failed QA evaluation."""
 
@@ -1339,6 +1376,12 @@ class WorkerExecutionDiagnostics(BaseModel):
     validation_calls: int = Field(default=0, ge=0)
     validation_passed: bool = False
     failure_reason: str = ""
+    per_gate_results: dict[str, Any] = Field(default_factory=dict)
+    final_selected_targeted_test: str | None = None
+    original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
+    alternative_test_mapping_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    validated_files: list[str] = Field(default_factory=list)
+    infrastructure_failure_details: str | None = None
 
 
 class WorkaroundEdit(BaseModel):
@@ -1368,6 +1411,12 @@ class WorkaroundReplayPlan(BaseModel):
     diagnosed_root_causes: list[str] = Field(default_factory=list)
     planned_targets: list[str] = Field(default_factory=list)
     validated_files: list[str] = Field(default_factory=list)
+    validation_calls: int = Field(default=0, ge=0)
+    per_gate_results: dict[str, Any] = Field(default_factory=dict)
+    final_selected_targeted_test: str | None = None
+    original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
+    alternative_test_mapping_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    infrastructure_failure_details: str | None = None
 
 
 class WorkerAttemptResult(BaseModel):

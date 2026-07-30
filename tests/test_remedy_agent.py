@@ -654,7 +654,8 @@ class TestUpdateSubagentWrapper:
         tool_validate = MagicMock()
         tool_validate.name = "validate_workaround"
         tool_validate.invoke.return_value = (
-            "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts."
+            "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
+            'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}'
         )
 
         with (

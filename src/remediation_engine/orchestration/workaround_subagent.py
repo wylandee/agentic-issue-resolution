@@ -23,6 +23,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundEdit,
     WorkaroundPhase,
     WorkaroundReplayPlan,
+    WorkaroundValidationStatus,
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
@@ -793,18 +794,47 @@ def _workaround_attempt_succeeded(
     requires_targeted_test: bool,
     targeted_test_passed: bool,
     validation_gate_passed: bool | None = None,
+    plan_state: dict[str, Any] | None = None,
 ) -> bool:
     """Apply the deterministic success contract for one workaround attempt."""
     validation_passed = (
         validation_gate_passed if validation_gate_passed is not None else has_all_validated
     )
-    return bool(
-        runtime.changed_files
-        and not runtime.errors
-        and validation_passed
-        and has_recorded_plan
-        and (not requires_targeted_test or targeted_test_passed)
-    )
+    if not (runtime.changed_files and not runtime.errors and validation_passed and has_recorded_plan):
+        return False
+    if requires_targeted_test and not targeted_test_passed:
+        return False
+
+    if plan_state:
+        val_calls = int(plan_state.get("validation_calls", 0))
+        if val_calls < 1:
+            return False
+
+        val_files = set(plan_state.get("validated_files", []))
+        if val_files != set(runtime.changed_files):
+            return False
+
+        last_val = plan_state.get("last_validation_result")
+        if last_val is None:
+            return False
+        status = getattr(last_val, "overall_status", None) or (
+            last_val.get("overall_status") if isinstance(last_val, dict) else None
+        )
+        if status not in ("PASS", WorkaroundValidationStatus.PASS):
+            return False
+        validation_state = plan_state.get("validation_passed")
+        if validation_state is False:
+            return False
+        if plan_state.get("targeted_test_required"):
+            targeted_file = getattr(last_val, "targeted_test_file", None) or (
+                last_val.get("targeted_test_file")
+                if isinstance(last_val, dict)
+                else None
+            )
+            if not targeted_file:
+                return False
+
+    return True
 
 
 def _build_surrender_summaries(task_id: str, message: str) -> list[AgentActionSummary]:
@@ -821,6 +851,7 @@ def _build_attempt_result(
     errors: list[str],
     changed_files: list[str],
     replay_plan: WorkaroundReplayPlan | None = None,
+    plan_state: dict[str, Any] | None = None,
 ) -> dict[str, WorkerAttemptResult]:
     snapshot = state.get("attempt_snapshot")
     if snapshot is None:
@@ -832,6 +863,38 @@ def _build_attempt_result(
             "instruction_digest": snapshot.instruction_digest,
         }
     )
+
+    p_state = plan_state or {}
+    val_calls = int(p_state.get("validation_calls", 0))
+    val_files = list(p_state.get("validated_files", [])) if succeeded else []
+    last_val = p_state.get("last_validation_result")
+    per_gate = {}
+    if last_val:
+        per_gate = (
+            last_val.model_dump()
+            if hasattr(last_val, "model_dump")
+            else dict(last_val)
+            if isinstance(last_val, dict)
+            else {}
+        )
+
+    selected_test = p_state.get("accepted_alternative_test") or p_state.get("original_targeted_test")
+    mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
+    mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
+    infra_details = p_state.get("latest_infra_diagnostics")
+
+    diag = WorkerExecutionDiagnostics(
+        validation_calls=val_calls,
+        validation_passed=succeeded,
+        failure_reason=" | ".join(errors),
+        per_gate_results=per_gate,
+        final_selected_targeted_test=selected_test,
+        original_to_alternative_test_mapping=mapping,
+        alternative_test_mapping_evidence=mapping_evidence,
+        validated_files=val_files,
+        infrastructure_failure_details=infra_details,
+    )
+
     return {
         snapshot.attempt_id: WorkerAttemptResult(
             attempt_id=snapshot.attempt_id,
@@ -840,10 +903,7 @@ def _build_attempt_result(
             status=tagged_summary.status,
             changed_files=changed_files,
             action_summary=tagged_summary,
-            execution_diagnostics=WorkerExecutionDiagnostics(
-                validation_passed=succeeded,
-                failure_reason=" | ".join(errors),
-            ),
+            execution_diagnostics=diag,
             instruction_digest=snapshot.instruction_digest,
             replay_plan=replay_plan,
             errors=errors,
@@ -858,10 +918,6 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     workspace_volume = state.get("workspace_volume", "")
     target_task = state.get("target_task")
     target_group = state.get("target_group")
-    constraints_ledger = list(state.get("constraints_ledger", []))
-    previous_feedback = state.get("previous_feedback")
-    current_replay_plan = state.get("current_replay_plan")
-
     t_id = target_task.task_id if target_task else "unknown"
 
     if os.environ.get("REMEDY_BYPASS_WORKAROUND_SUBAGENT", "false").lower() in ("1", "true", "yes"):
@@ -883,19 +939,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": [],
         }
 
-    repo_root = Path(repo_root_str)
-    if not repo_root_str or not repo_root.is_dir():
-        summaries = _build_surrender_summaries(
-            t_id, "Stopped before execution because repo_root was invalid."
-        )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0],
-            "changed_files": [],
-            "errors": [
-                f"Workaround Subagent: repo_root '{repo_root_str}' is not a valid directory."
-            ],
-        }
+    constraints_ledger = state.get("constraints_ledger", [])
+    previous_feedback = state.get("previous_feedback", "")
+    current_replay_plan = state.get("current_replay_plan")
+
+    repo_root = Path(repo_root_str) if repo_root_str else Path.cwd()
 
     if not workspace_volume:
         summaries = _build_surrender_summaries(
@@ -1002,9 +1050,13 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             initial_messages = [
                 SystemMessage(
                     content=(
-                        "Use only source-code tools. Build the complete cumulative patch first, "
-                        "then call validate_workaround once; it is the only public validation gate "
-                        "and short-circuits on the first failure."
+                        "Use only source-code tools. Follow the enforced lifecycle: "
+                        "Investigate -> Plan -> Execute -> Validate. Perform local inspection first. "
+                        "Record an evidence-backed plan before making code edits. "
+                        "Make one minimal semantic source patch per iteration and call "
+                        "validate_workaround immediately. If one API migration requires an "
+                        "import plus multiple call-site changes, include those exact related "
+                        "lines in one atomic replacement before validating."
                     )
                 ),
                 HumanMessage(content=prompt),
@@ -1017,7 +1069,13 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 plan_state=plan_state,
                 preferred_test_files=_preferred_targeted_test_files(qa_ev),
             )
-            runtime = run_bounded_subagent_loop(llm, toolbelt, initial_messages, touched_files)
+            runtime = run_bounded_subagent_loop(
+                llm,
+                toolbelt,
+                initial_messages,
+                touched_files,
+                execution_state=plan_state,
+            )
 
             # Revert any illegally modified manifest files or test files
             prohibited_modified = {f for f in touched_files if _is_prohibited_target(f)}
@@ -1072,12 +1130,27 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 )
             ):
                 requires_targeted_test = True
-                targeted_test_calls = [
-                    e
-                    for e in runtime.tool_events
-                    if e.name == "validate_workaround" and e.content.startswith("SUCCESS:")
-                ]
-                targeted_test_passed = len(targeted_test_calls) > 0
+                last_validation = plan_state.get("last_validation_result")
+                targeted_test_passed = bool(
+                    last_validation
+                    and (
+                        getattr(last_validation, "overall_status", None)
+                        or (
+                            last_validation.get("overall_status")
+                            if isinstance(last_validation, dict)
+                            else None
+                        )
+                    )
+                    in ("PASS", WorkaroundValidationStatus.PASS)
+                    and (
+                        getattr(last_validation, "targeted_test_file", None)
+                        or (
+                            last_validation.get("targeted_test_file")
+                            if isinstance(last_validation, dict)
+                            else None
+                        )
+                    )
+                )
 
             succeeded = _workaround_attempt_succeeded(
                 runtime,
@@ -1086,6 +1159,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 requires_targeted_test=requires_targeted_test,
                 targeted_test_passed=targeted_test_passed,
                 validation_gate_passed=validation_gate_passed,
+                plan_state=plan_state,
             )
 
             all_edits: list[WorkaroundEdit] = list(replayed_edits)
@@ -1125,6 +1199,20 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     sec_inv = plan_state.get("security_invariant", "")
     causal_hyp = plan_state.get("causal_hypothesis", "")
 
+    p_state = plan_state or {}
+    last_val = p_state.get("last_validation_result")
+    per_gate = (
+        last_val.model_dump()
+        if hasattr(last_val, "model_dump")
+        else dict(last_val)
+        if isinstance(last_val, dict)
+        else {}
+    )
+    selected_test = p_state.get("accepted_alternative_test") or p_state.get("original_targeted_test")
+    mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
+    mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
+    infra_details = p_state.get("latest_infra_diagnostics")
+
     new_replay_plan = WorkaroundReplayPlan(
         task_id=t_id,
         pre_attempt_snapshots=pre_attempt_snapshots,
@@ -1137,7 +1225,13 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         security_invariants=[sec_inv] if sec_inv else [],
         diagnosed_root_causes=[causal_hyp] if causal_hyp else [],
         planned_targets=planned_files + planned_symbols,
-        validated_files=list(runtime.changed_files),
+        validated_files=list(plan_state.get("validated_files", [])) if succeeded else [],
+        validation_calls=int(p_state.get("validation_calls", 0)),
+        per_gate_results=per_gate,
+        final_selected_targeted_test=selected_test,
+        original_to_alternative_test_mapping=mapping,
+        alternative_test_mapping_evidence=mapping_evidence,
+        infrastructure_failure_details=infra_details,
     )
 
     summaries = _build_action_summaries(
@@ -1168,6 +1262,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             errors=list(runtime.errors),
             changed_files=list(runtime.changed_files),
             replay_plan=new_replay_plan,
+            plan_state=plan_state,
         ),
         "errors": runtime.errors,
     }

@@ -20,6 +20,7 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     VulnerabilityGroup,
     WorkaroundContext,
+    WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
 from remediation_engine.orchestration.qa_critic import (
@@ -348,7 +349,11 @@ def test_workaround_toolbelt_ast_gate_and_search_enrichment():
     mock_sandbox.run.return_value.stdout = "SUCCESS"
 
     touched = set()
-    plan_state = {"recorded": True}
+    plan_state = {
+        "recorded": True,
+        "phase": WorkaroundExecutionPhase.EXECUTE.value,
+        "local_investigation_complete": True,
+    }
     terms = {
         "component": "express-jwt",
         "cve": "CVE-2026-1234",
@@ -427,6 +432,11 @@ def test_express_jwt_mocked_end_to_end_scenario():
     }
 
     mock_llm = MagicMock()
+    tool_call_inspect = {
+        "name": "read_workspace_file",
+        "args": {"file_path": "routes/auth.js"},
+        "id": "call-0",
+    }
     tool_call_record = {
         "name": "record_plan",
         "args": {
@@ -435,6 +445,7 @@ def test_express_jwt_mocked_end_to_end_scenario():
             "security_invariant": "JWT auth must be enforced",
             "causal_hypothesis": "expressJwt import was updated incorrectly",
             "exact_intended_edits": "Use const { expressjwt } = require('express-jwt')",
+            "evidence_source": "https://github.com/advisories/GHSA-1234",
         },
         "id": "call-1",
     }
@@ -458,6 +469,10 @@ def test_express_jwt_mocked_end_to_end_scenario():
         "id": "call-val",
     }
 
+    mock_resp0 = MagicMock()
+    mock_resp0.content = "Inspecting source code..."
+    mock_resp0.tool_calls = [tool_call_inspect]
+
     mock_resp1 = MagicMock()
     mock_resp1.content = "Planning fix..."
     mock_resp1.tool_calls = [tool_call_record]
@@ -475,6 +490,7 @@ def test_express_jwt_mocked_end_to_end_scenario():
     mock_resp4.tool_calls = []
 
     mock_llm.bind_tools.return_value.invoke.side_effect = [
+        mock_resp0,
         mock_resp1,
         mock_resp2,
         mock_resp_val,

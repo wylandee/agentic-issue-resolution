@@ -2668,7 +2668,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # 2. Ingest attempt-tagged worker results (active targets only)
     # ------------------------------------------------------------------
     active_target_task_ids = list(state.get("active_target_task_ids") or [])
-    active_targets = set(active_target_task_ids)
     action_summaries: list[AgentActionSummary] = state.get("action_summaries") or []
     new_worker_attempt_ids: list[str] = []
 
@@ -2781,6 +2780,25 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     f"supervisor: rejected worker result for {task_id} because the "
                     "executed version differed from the committed version."
                 )
+            if result_status == AgentActionStatus.SUCCESS and task.strategy == RoutingStrategy.CODE_WORKAROUND:
+                diag = result.execution_diagnostics
+                val_files_match = set(diag.validated_files) == set(result.changed_files)
+                overall_status = diag.per_gate_results.get("overall_status")
+                structured_validation_passed = str(overall_status) in {
+                    "PASS",
+                    "WorkaroundValidationStatus.PASS",
+                }
+                is_valid = (
+                    diag.validation_passed
+                    and diag.validation_calls > 0
+                    and val_files_match
+                    and structured_validation_passed
+                )
+                if not is_valid:
+                    result_status = AgentActionStatus.SURRENDER
+                    errors.append(
+                        f"supervisor: rejected workaround worker result for {task_id} due to invalid validation state."
+                    )
             prior = retry_diagnostics_by_task.get(task_id)
             if prior is None:
                 prior = UpdateRetryDiagnostics(task_id=task_id)
@@ -3822,26 +3840,29 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # 8c. Apply guarded task status overrides (only QA_PASSED and UNFIXABLE)
     _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
     for t_id, new_status in decision.task_status_updates.items():
-        if t_id in task_queue and new_status in _allowed_statuses:
-            if task_queue[t_id].status not in _TERMINAL_STATUSES:
-                _commit_task_transition(
-                    task_queue,
-                    t_id,
-                    updates={"status": new_status},
-                    close_attempt=(
-                        new_status in _TERMINAL_STATUSES
-                        and task_queue[t_id].current_attempt_id is not None
-                    ),
-                    clear_selected_version=(
-                        new_status in _TERMINAL_STATUSES
-                        and task_queue[t_id].current_attempt_id is not None
-                    ),
-                )
-                logger.info(
-                    "supervisor: task '%s' manually set to %s via task_status_updates.",
-                    t_id,
-                    new_status.value,
-                )
+        if (
+            t_id in task_queue
+            and new_status in _allowed_statuses
+            and task_queue[t_id].status not in _TERMINAL_STATUSES
+        ):
+            _commit_task_transition(
+                task_queue,
+                t_id,
+                updates={"status": new_status},
+                close_attempt=(
+                    new_status in _TERMINAL_STATUSES
+                    and task_queue[t_id].current_attempt_id is not None
+                ),
+                clear_selected_version=(
+                    new_status in _TERMINAL_STATUSES
+                    and task_queue[t_id].current_attempt_id is not None
+                ),
+            )
+            logger.info(
+                "supervisor: task '%s' manually set to %s via task_status_updates.",
+                t_id,
+                new_status.value,
+            )
 
     # 8d. Apply unfixable marks from decision
     for t_id in decision.unfixable_task_ids:

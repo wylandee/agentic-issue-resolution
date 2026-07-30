@@ -172,3 +172,42 @@ def test_validation_gate_can_validate_replayed_edits() -> None:
 
     assert has_successful_validation_gate(events) is False
     assert has_successful_validation_gate(events, has_prior_edits=True) is True
+
+
+def test_successful_workaround_edit_injects_immediate_validation_instruction() -> None:
+    edit_tool = MagicMock()
+    edit_tool.name = "deterministic_search_replace"
+    edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.ts"
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": edit_tool.name,
+                    "args": {"file_path": "src/auth.ts"},
+                    "id": "edit-1",
+                }
+            ],
+        ),
+        AIMessage(content="I will validate the patch now."),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [edit_tool],
+        [HumanMessage(content="Execute the planned patch.")],
+        set(),
+        execution_state={"phase": "VALIDATE"},
+    )
+
+    assert result.errors == []
+    second_turn = bound_llm.invoke.call_args_list[1].args[0]
+    assert any(
+        isinstance(message, HumanMessage)
+        and "next action must be validate_workaround" in message.content
+        for message in second_turn
+    )

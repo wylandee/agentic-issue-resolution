@@ -18,9 +18,7 @@ Reducer notes
 
 from __future__ import annotations
 
-import ntpath
 import operator
-import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
@@ -132,28 +130,27 @@ def _repo_relative_path(value: str | None, repo_root: str) -> str | None:
     paths, so normalize them at the graph boundary before any task is built.
     Paths outside the repository are discarded rather than passed to a tool.
     """
-    if not value:
+    if value is None:
         return None
-    raw = str(value).strip().replace("\\", "/")
+    raw = str(value).replace("\\", "/").strip()
     if not raw:
         return None
 
-    root = Path(repo_root).resolve()
-    root_text = str(root).replace("\\", "/").rstrip("/")
-    raw_casefold = raw.casefold()
-    root_casefold = root_text.casefold()
-    if raw_casefold == root_casefold:
-        return None
-    if raw_casefold.startswith(root_casefold + "/"):
-        return raw[len(root_text) + 1 :].lstrip("/") or None
+    try:
+        return Path(raw).relative_to(Path(repo_root)).as_posix()
+    except ValueError:
+        pass
+    try:
+        return Path(raw).resolve().relative_to(Path(repo_root).resolve()).as_posix()
+    except (OSError, ValueError):
+        pass
 
-    # ``Path`` handles native absolute paths; ``ntpath`` also recognizes a
-    # Windows drive path when a state file was produced on another platform.
-    if os.path.isabs(raw) or ntpath.isabs(raw):
-        try:
-            return Path(raw).resolve().relative_to(root).as_posix()
-        except (OSError, ValueError):
-            return None
+    raw_clean = raw.lstrip("/")
+    root_clean = str(repo_root).replace("\\", "/").strip().lstrip("/").rstrip("/")
+    if raw_clean.casefold() == root_clean.casefold():
+        return None
+    if raw_clean.casefold().startswith(root_clean.casefold() + "/"):
+        return raw_clean[len(root_clean) + 1 :].lstrip("/") or None
 
     while raw.startswith("./"):
         raw = raw[2:]

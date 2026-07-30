@@ -17,7 +17,13 @@ from urllib.parse import quote, urlparse
 import requests
 from langchain_core.tools import tool
 
-from remediation_engine.contracts.schemas import WorkaroundEdit
+from remediation_engine.contracts.schemas import (
+    FailureCategory,
+    WorkaroundEdit,
+    WorkaroundExecutionPhase,
+    WorkaroundValidationResult,
+    WorkaroundValidationStatus,
+)
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
@@ -80,6 +86,61 @@ def _is_authoritative_evidence_source(source: str) -> bool:
         "installed package",
     )
     return any(marker in candidate for marker in authoritative_markers)
+
+
+def _is_infrastructure_failure(error_text: str) -> bool:
+    """Classify whether a test execution error is strictly an infrastructure failure."""
+    text = (error_text or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+
+    # Code failure markers MUST NOT qualify as infrastructure-only failures
+    code_failure_markers = (
+        "assertionerror",
+        "assert ",
+        "expect(",
+        "should equal",
+        "expected ",
+        "to.equal",
+        "to.be",
+        "syntaxerror",
+        "typeerror",
+        "referenceerror",
+        "uncaught exception",
+        "test failed",
+        "tests failed",
+        "failing test:",
+        "1 failing",
+        "2 failing",
+    )
+    if any(marker in lowered for marker in code_failure_markers):
+        return False
+
+    infra_markers = (
+        "sqlite3",
+        "better-sqlite3",
+        "node-gyp",
+        "prebuild-install",
+        "bindings",
+        "native module",
+        "compiled binding",
+        "dlopen",
+        "failed to map segment",
+        "cannot open shared object",
+        "library not loaded",
+        "image not found",
+        "no suitable image found",
+        "missing native binding",
+        "missing binary",
+        "command not found: sqlite3",
+        "command not found",
+        "err_dlopen_failed",
+        "cannot find module 'sqlite3'",
+        "cannot find module 'better-sqlite3'",
+    )
+    return any(marker in lowered for marker in infra_markers)
+
 
 
 def _validate_workspace_path(file_path: str) -> str:
@@ -206,7 +267,25 @@ def _make_read_workspace_file_tool(
             return f"ERROR: {exc}"
 
         if plan_state is not None:
+            phase = plan_state.get("phase")
+            last_result = plan_state.get("last_validation_result")
+            last_status = getattr(last_result, "overall_status", None) or (
+                last_result.get("overall_status")
+                if isinstance(last_result, dict)
+                else None
+            )
+            if (
+                phase == WorkaroundExecutionPhase.VALIDATE.value
+                and last_status not in (WorkaroundValidationStatus.INFRA_FAILURE, "INFRA_FAILURE")
+            ):
+                return (
+                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
+                    "validate_workaround before further investigation."
+                )
             plan_state.setdefault("read_files", set()).add(rel_path)
+            plan_state.setdefault("inspected_files", set()).add(rel_path)
+            plan_state["local_investigation_complete"] = True
+            plan_state.setdefault("evidence_ledger", []).append(f"workspace:{rel_path}")
 
         content = sandbox.read_file(rel_path)
         if content is None:
@@ -517,7 +596,7 @@ def _is_prohibited_target(rel_path: str) -> bool:
     if any(p in ("test", "tests", "__tests__", "spec", "specs") for p in parts):
         return True
 
-    if any(
+    return any(
         basename.endswith(ext)
         for ext in (
             ".test.js",
@@ -531,10 +610,7 @@ def _is_prohibited_target(rel_path: str) -> bool:
             "_test.py",
             "_spec.py",
         )
-    ):
-        return True
-
-    return False
+    )
 
 
 def _make_deterministic_search_replace_tool(
@@ -552,8 +628,17 @@ def _make_deterministic_search_replace_tool(
         """
         Apply an exact one-time search/replace to a workspace file.
         """
-        if plan_state is not None and not plan_state.get("recorded", False):
-            return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits with deterministic_search_replace."
+        if plan_state is not None:
+            if not plan_state.get("recorded", False):
+                return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits with deterministic_search_replace."
+            phase = plan_state.get("phase")
+            if not phase and plan_state.get("recorded"):
+                phase = WorkaroundExecutionPhase.EXECUTE.value
+            phase = phase or WorkaroundExecutionPhase.INVESTIGATE.value
+            if phase != WorkaroundExecutionPhase.EXECUTE.value:
+                return f"ERROR: [PHASE_VIOLATION] Code edits are only allowed in the EXECUTE phase (current phase: '{phase}'). Call record_plan first."
+            if plan_state.get("successful_edit_count_this_iteration", 0) >= 1:
+                return "ERROR: [ITERATION_LIMIT] Only one source edit is permitted per iteration before validation. Call validate_workaround now."
 
         if (
             plan_state is not None
@@ -578,13 +663,17 @@ def _make_deterministic_search_replace_tool(
             str(path).replace("\\", "/").lstrip("/")
             for path in (plan_state or {}).get("planned_files", [])
         }
-        if plan_state is not None and plan_state.get("recorded") and planned_files:
-            if rel_path not in planned_files:
-                return (
-                    f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
-                    "Re-run record_plan with every causally related source file before editing it; "
-                    "do not apply an isolated or unrelated fix."
-                )
+        if (
+            plan_state is not None
+            and plan_state.get("recorded")
+            and planned_files
+            and rel_path not in planned_files
+        ):
+            return (
+                f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
+                "Re-run record_plan with every causally related source file before editing it; "
+                "do not apply an isolated or unrelated fix."
+            )
 
         suffix = Path(rel_path).suffix.lower()
         if suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
@@ -631,15 +720,18 @@ def _make_deterministic_search_replace_tool(
         touched_files.add(rel_path)
         if plan_state is not None:
             edits = plan_state.setdefault("successful_edits", [])
-            edits.append(
-                WorkaroundEdit(
-                    file_path=rel_path,
-                    old_text=old_text,
-                    new_text=new_text,
-                    symbol_name=symbol_name,
-                    edit_index=len(edits),
-                )
+            edit_obj = WorkaroundEdit(
+                file_path=rel_path,
+                old_text=old_text,
+                new_text=new_text,
+                symbol_name=symbol_name,
+                edit_index=len(edits),
             )
+            edits.append(edit_obj)
+            plan_state["current_iteration_edit"] = edit_obj
+            plan_state["successful_edit_count"] = int(plan_state.get("successful_edit_count", 0)) + 1
+            plan_state["successful_edit_count_this_iteration"] = 1
+            plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
         return f"SUCCESS: File modified: {rel_path}"
 
     return deterministic_search_replace
@@ -660,8 +752,17 @@ def _make_deterministic_replace_ast_symbol_tool(
         """
         Replace the complete AST body of a declared function, class, or method.
         """
-        if plan_state is not None and not plan_state.get("recorded", False):
-            return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits."
+        if plan_state is not None:
+            if not plan_state.get("recorded", False):
+                return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits."
+            phase = plan_state.get("phase")
+            if not phase and plan_state.get("recorded"):
+                phase = WorkaroundExecutionPhase.EXECUTE.value
+            phase = phase or WorkaroundExecutionPhase.INVESTIGATE.value
+            if phase != WorkaroundExecutionPhase.EXECUTE.value:
+                return f"ERROR: [PHASE_VIOLATION] Code edits are only allowed in the EXECUTE phase (current phase: '{phase}'). Call record_plan first."
+            if plan_state.get("successful_edit_count_this_iteration", 0) >= 1:
+                return "ERROR: [ITERATION_LIMIT] Only one source edit is permitted per iteration before validation. Call validate_workaround now."
 
         if (
             plan_state is not None
@@ -686,13 +787,17 @@ def _make_deterministic_replace_ast_symbol_tool(
             str(path).replace("\\", "/").lstrip("/")
             for path in (plan_state or {}).get("planned_files", [])
         }
-        if plan_state is not None and plan_state.get("recorded") and planned_files:
-            if rel_path not in planned_files:
-                return (
-                    f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
-                    "Re-run record_plan with every causally related source file before editing it; "
-                    "do not apply an isolated or unrelated fix."
-                )
+        if (
+            plan_state is not None
+            and plan_state.get("recorded")
+            and planned_files
+            and rel_path not in planned_files
+        ):
+            return (
+                f"ERROR: [PLAN_VIOLATION] '{rel_path}' is outside the recorded workaround plan. "
+                "Re-run record_plan with every causally related source file before editing it; "
+                "do not apply an isolated or unrelated fix."
+            )
 
         content = sandbox.read_file(rel_path)
         if content is None:
@@ -810,24 +915,46 @@ def _make_deterministic_replace_ast_symbol_tool(
         if plan_state is not None:
             plan_state.setdefault("inspected_files", set()).add(rel_path)
             edits = plan_state.setdefault("successful_edits", [])
-            edits.append(
-                WorkaroundEdit(
-                    file_path=rel_path,
-                    old_text=old_text,
-                    new_text=replacement,
-                    symbol_name=symbol_name,
-                    edit_index=len(edits),
-                )
+            edit_obj = WorkaroundEdit(
+                file_path=rel_path,
+                old_text=old_text,
+                new_text=replacement,
+                symbol_name=symbol_name,
+                edit_index=len(edits),
             )
+            edits.append(edit_obj)
+            plan_state["current_iteration_edit"] = edit_obj
+            plan_state["successful_edit_count"] = int(plan_state.get("successful_edit_count", 0)) + 1
+            plan_state["successful_edit_count_this_iteration"] = 1
+            plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
         return f"SUCCESS: Symbol '{symbol_name}' in '{rel_path}' successfully replaced."
 
     return deterministic_replace_ast_symbol
 
 
-def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
+def _make_search_codebase_pattern_tool(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any] | None = None,
+):
     @tool
     def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
         """Lexically search for an extended-regex pattern across workspace source files."""
+        if plan_state is not None:
+            phase = plan_state.get("phase")
+            last_result = plan_state.get("last_validation_result")
+            last_status = getattr(last_result, "overall_status", None) or (
+                last_result.get("overall_status")
+                if isinstance(last_result, dict)
+                else None
+            )
+            if (
+                phase == WorkaroundExecutionPhase.VALIDATE.value
+                and last_status not in (WorkaroundValidationStatus.INFRA_FAILURE, "INFRA_FAILURE")
+            ):
+                return (
+                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
+                    "validate_workaround before further investigation."
+                )
         if not search_pattern or not search_pattern.strip():
             return "ERROR: search_pattern is required."
 
@@ -861,6 +988,12 @@ def _make_search_codebase_pattern_tool(sandbox: DockerSandbox):
             return f"ERROR: grep exited {result.exit_code}.\nstderr: {result.stderr.strip()[:500]}"
 
         output = result.stdout
+        if plan_state is not None:
+            plan_state["local_investigation_complete"] = True
+            plan_state.setdefault("evidence_ledger", []).append(
+                f"code-search:{search_pattern}"
+            )
+
         if len(output.encode()) > _SEARCH_MAX_BYTES:
             truncated_output = output.encode()[:_SEARCH_MAX_BYTES].decode(errors="replace")
             last_nl = truncated_output.rfind("\n")
@@ -883,6 +1016,22 @@ def _make_inspect_ast_symbol_tool(
         line_hint: int = 0,
     ) -> str:
         """Extract the full source text of a named function, class, or method from a workspace file."""
+        if plan_state is not None:
+            phase = plan_state.get("phase")
+            last_result = plan_state.get("last_validation_result")
+            last_status = getattr(last_result, "overall_status", None) or (
+                last_result.get("overall_status")
+                if isinstance(last_result, dict)
+                else None
+            )
+            if (
+                phase == WorkaroundExecutionPhase.VALIDATE.value
+                and last_status not in (WorkaroundValidationStatus.INFRA_FAILURE, "INFRA_FAILURE")
+            ):
+                return (
+                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
+                    "validate_workaround before further investigation."
+                )
         try:
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
@@ -940,6 +1089,10 @@ def _make_inspect_ast_symbol_tool(
         if plan_state is not None:
             plan_state.setdefault("inspected_symbols", set()).add(f"{rel_path}:{symbol_name}")
             plan_state.setdefault("inspected_files", set()).add(rel_path)
+            plan_state["local_investigation_complete"] = True
+            plan_state.setdefault("evidence_ledger", []).append(
+                f"ast:{rel_path}:{symbol_name}"
+            )
 
         node_text = result["text"]
         if len(node_text) > _INSPECT_TEXT_MAX_CHARS:
@@ -960,6 +1113,7 @@ def _make_inspect_ast_symbol_tool(
 def _make_run_targeted_test_tool(
     sandbox: DockerSandbox,
     preferred_test_files: Sequence[str] | None = None,
+    plan_state: dict[str, Any] | None = None,
 ):
     preferred = tuple(
         path.replace("\\", "/").strip().lstrip("/")
@@ -990,7 +1144,8 @@ def _make_run_targeted_test_tool(
                 "Use the original source test path under test/, tests/, or the source package directory."
             )
 
-        if preferred and norm_path not in preferred:
+        accepted_alt = (plan_state or {}).get("accepted_alternative_test")
+        if preferred and norm_path not in preferred and norm_path != accepted_alt:
             preferred_text = ", ".join(preferred)
             return (
                 f"ERROR: Targeted test '{norm_path}' is not the QA-recommended target. "
@@ -1103,9 +1258,38 @@ def _make_run_typecheck_tool(sandbox: DockerSandbox):
     return run_typecheck
 
 
+def _revert_current_iteration_edit(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any],
+    touched_files: set[str],
+) -> None:
+    """Revert the single unvalidated edit made in the current iteration."""
+    last_edit = plan_state.get("current_iteration_edit")
+    if last_edit:
+        try:
+            curr = sandbox.read_file(last_edit.file_path)
+            if curr and last_edit.new_text in curr:
+                updated = curr.replace(last_edit.new_text, last_edit.old_text, 1)
+                sandbox.write_file(last_edit.file_path, updated)
+                touched_files.discard(last_edit.file_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to revert unvalidated edit on %s: %s", last_edit.file_path, exc)
+        plan_state["current_iteration_edit"] = None
+        if plan_state.get("successful_edits"):
+            plan_state["successful_edits"].pop()
+
+    plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
+    plan_state["iteration"] = int(plan_state.get("iteration", 1)) + 1
+    plan_state["successful_edit_count_this_iteration"] = 0
+    plan_state["validated_files"] = []
+    plan_state["validation_passed"] = False
+    plan_state["accepted_alternative_test"] = None
+
+
 def _make_validate_workaround_tool(
     sandbox: DockerSandbox,
     touched_files: set[str],
+    plan_state: dict[str, Any] | None = None,
     preferred_test_files: Sequence[str] | None = None,
 ):
     """Build one short-circuiting validation gate for source workarounds.
@@ -1117,11 +1301,23 @@ def _make_validate_workaround_tool(
     can retain their manifest-specific validation contract, while workaround
     workers receive one atomic validation tool.
     """
+    if plan_state is None:
+        plan_state = {}
+
     syntax_tool = _make_validate_code_syntax_tool(sandbox)
-    targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files)
+    targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files, plan_state)
 
     def _failure(gate: str, detail: str) -> str:
         return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
+
+    def _record_result(result: WorkaroundValidationResult) -> WorkaroundValidationResult:
+        """Persist the complete gate result for the supervisor success contract."""
+        plan_state["last_validation_result"] = result
+        plan_state["validation_passed"] = (
+            result.overall_status == WorkaroundValidationStatus.PASS
+        )
+        plan_state["validated_files"] = list(result.validated_files)
+        return result
 
     def _run_typecheck_gate() -> str:
         tsconfig = sandbox.read_file("tsconfig.json")
@@ -1178,8 +1374,8 @@ def _make_validate_workaround_tool(
         return f"FAILURE: Lint failed (exit {result.exit_code}).\n{output}"
 
     def _run_runtime_smoke_gate(runtime_file: str | None) -> str:
-        if not runtime_file:
-            return "SKIPPED: Runtime smoke gate (no runtime_smoke_file was supplied)."
+        if not runtime_file or not runtime_file.strip():
+            return "FAILURE: Runtime smoke gate failed: runtime_smoke_file must be explicitly supplied for workaround validation."
         try:
             rel_path = _validate_workspace_path(runtime_file)
         except ValueError as exc:
@@ -1234,6 +1430,8 @@ def _make_validate_workaround_tool(
         current cumulative patch. A QA-recommended test is selected
         automatically when the caller omits ``targeted_test_file``.
         """
+        plan_state["validation_calls"] = int(plan_state.get("validation_calls", 0)) + 1
+
         requested = [
             str(path).replace("\\", "/").strip().lstrip("/")
             for path in (modified_files or [])
@@ -1246,43 +1444,120 @@ def _make_validate_workaround_tool(
         ]
         files = list(dict.fromkeys([*requested, *current]))
         if not files:
-            return "FAILURE: Workaround validation gate 'input' failed. No modified files were supplied."
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax="FAILURE: No modified files were supplied.",
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            return f"FAILURE: Workaround validation gate 'input' failed. No modified files were supplied.\nJSON: {res.model_dump_json()}"
 
         prohibited = [path for path in files if _is_prohibited_target(path)]
         if prohibited:
-            return _failure(
-                "input",
-                f"Prohibited files were included in the cumulative patch: {', '.join(prohibited)}",
-            )
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax=f"Prohibited files modified: {', '.join(prohibited)}",
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            return f"FAILURE: Workaround validation gate 'input' failed. Prohibited files included.\nJSON: {res.model_dump_json()}"
 
+        # Reject an explicitly wrong QA target before spending time in the
+        # static/runtime gates. This keeps target-selection diagnostics useful
+        # even when the caller omitted the explicit smoke-file argument.
+        if targeted_test_file and preferred_test_files:
+            normalized_target = targeted_test_file.replace("\\", "/").strip().lstrip("/")
+            if normalized_target.startswith(("build/", "dist/")):
+                return (
+                    f"ERROR: Compiled test path '{normalized_target}' is not supported. "
+                    "Use the original source test path under test/, tests/, or the source package directory."
+                )
+            accepted_alt = plan_state.get("accepted_alternative_test")
+            preferred = {
+                path.replace("\\", "/").strip().lstrip("/")
+                for path in preferred_test_files
+            }
+            if normalized_target not in preferred and normalized_target != accepted_alt:
+                return (
+                    f"ERROR: Targeted test '{normalized_target}' is not the QA-recommended target. "
+                    f"Run one of these source test files instead: {', '.join(sorted(preferred))}."
+                )
+
+        syntax_msg = ""
         for file_path in files:
             current_content = sandbox.read_file(file_path)
             if current_content is None:
-                return _failure(
-                    "patch_integrity",
-                    f"Modified file '{file_path}' could not be re-read from the workspace.",
-                )
+                syntax_msg = f"FAILURE: Modified file '{file_path}' could not be re-read."
+                res = _record_result(WorkaroundValidationResult(
+                    overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                    syntax=syntax_msg,
+                    validated_files=[],
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                ))
+                _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+                return f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\nJSON: {res.model_dump_json()}"
             syntax_result = syntax_tool.invoke({"file_path": file_path})
             if str(syntax_result).startswith("BLOCKED:"):
-                return str(syntax_result)
+                res = _record_result(WorkaroundValidationResult(
+                    overall_status=WorkaroundValidationStatus.BLOCKED,
+                    syntax=str(syntax_result),
+                    validated_files=[],
+                ))
+                return f"{syntax_result}\nJSON: {res.model_dump_json()}"
             if not str(syntax_result).startswith("SUCCESS:"):
-                return _failure("syntax", str(syntax_result))
+                syntax_msg = str(syntax_result)
+                res = _record_result(WorkaroundValidationResult(
+                    overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                    syntax=syntax_msg,
+                    validated_files=[],
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                ))
+                _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+                return f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\nJSON: {res.model_dump_json()}"
+            syntax_msg = str(syntax_result)
 
-        typecheck_result = _run_typecheck_gate()
-        if typecheck_result.startswith("BLOCKED:"):
-            return typecheck_result
-        if typecheck_result.startswith("FAILURE:"):
-            return _failure("typecheck", typecheck_result)
+        typecheck_msg = _run_typecheck_gate()
+        if typecheck_msg.startswith("BLOCKED:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.BLOCKED,
+                typecheck=typecheck_msg,
+                validated_files=[],
+            ))
+            return f"{typecheck_msg}\nJSON: {res.model_dump_json()}"
+        if typecheck_msg.startswith("FAILURE:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax=syntax_msg,
+                typecheck=typecheck_msg,
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return f"FAILURE: Workaround validation gate 'typecheck' failed.\n{typecheck_msg}\nJSON: {res.model_dump_json()}"
 
-        lint_result = _run_lint_gate(files)
-        if lint_result.startswith("BLOCKED:"):
-            return lint_result
-        if lint_result.startswith("FAILURE:"):
-            return _failure("lint", lint_result)
+        lint_msg = _run_lint_gate(files)
+        if lint_msg.startswith("BLOCKED:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.BLOCKED,
+                lint=lint_msg,
+                validated_files=[],
+            ))
+            return f"{lint_msg}\nJSON: {res.model_dump_json()}"
+        if lint_msg.startswith("FAILURE:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax=syntax_msg,
+                typecheck=typecheck_msg,
+                lint=lint_msg,
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return f"FAILURE: Workaround validation gate 'lint' failed.\n{lint_msg}\nJSON: {res.model_dump_json()}"
 
-        smoke_file = runtime_smoke_file
-        if not smoke_file:
-            smoke_file = next(
+        smoke_target = runtime_smoke_file
+        if smoke_target is None and not plan_state.get("runtime_smoke_required", False) and files:
+            smoke_target = next(
                 (
                     path
                     for path in files
@@ -1290,29 +1565,126 @@ def _make_validate_workaround_tool(
                 ),
                 None,
             )
-        smoke_result = _run_runtime_smoke_gate(smoke_file)
-        if smoke_result.startswith("BLOCKED:"):
-            return smoke_result
-        if smoke_result.startswith("FAILURE:"):
-            return _failure("runtime_smoke", smoke_result)
+        smoke_msg = _run_runtime_smoke_gate(smoke_target)
+        if smoke_msg.startswith("BLOCKED:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.BLOCKED,
+                runtime_smoke=smoke_msg,
+                validated_files=[],
+            ))
+            return f"{smoke_msg}\nJSON: {res.model_dump_json()}"
+        if smoke_msg.startswith("FAILURE:"):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax=syntax_msg,
+                typecheck=typecheck_msg,
+                lint=lint_msg,
+                runtime_smoke=smoke_msg,
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return f"FAILURE: Workaround validation gate 'runtime_smoke' failed.\n{smoke_msg}\nJSON: {res.model_dump_json()}"
 
-        test_file = targeted_test_file
+        accepted_alt = plan_state.get("accepted_alternative_test")
+        test_file = accepted_alt or targeted_test_file
         if not test_file and preferred_test_files:
             test_file = next(iter(preferred_test_files), None)
+
+        if not test_file and plan_state.get("targeted_test_required", False):
+            res = _record_result(WorkaroundValidationResult(
+                overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                syntax=syntax_msg,
+                typecheck=typecheck_msg,
+                lint=lint_msg,
+                runtime_smoke=smoke_msg,
+                targeted_test="FAILURE: A targeted test file is required for this workaround.",
+                validated_files=[],
+                failure_category=FailureCategory.BREAKING_CHANGE,
+            ))
+            return (
+                "FAILURE: Workaround validation gate 'targeted_test' failed: "
+                "targeted_test_file must be supplied.\n"
+                f"JSON: {res.model_dump_json()}"
+            )
+
+        test_msg = ""
+        alt_used = bool(accepted_alt)
         if test_file:
-            test_result = targeted_test_tool.invoke(
+            test_res_str = targeted_test_tool.invoke(
                 {"test_file": test_file, "test_name": targeted_test_name}
             )
-            if str(test_result).startswith("BLOCKED:"):
-                return str(test_result)
-            if not str(test_result).startswith("SUCCESS:"):
-                return _failure("targeted_test", str(test_result))
+            test_msg = str(test_res_str)
+            if test_msg.startswith("BLOCKED:"):
+                res = _record_result(WorkaroundValidationResult(
+                    overall_status=WorkaroundValidationStatus.BLOCKED,
+                    syntax=syntax_msg,
+                    typecheck=typecheck_msg,
+                    lint=lint_msg,
+                    runtime_smoke=smoke_msg,
+                    targeted_test=test_msg,
+                    targeted_test_file=test_file,
+                    alternative_used=alt_used,
+                    validated_files=[],
+                ))
+                return f"{test_msg}\nJSON: {res.model_dump_json()}"
 
+            if not test_msg.startswith("SUCCESS:"):
+                is_infra = _is_infrastructure_failure(test_msg)
+                plan_state["latest_failed_targeted_test"] = test_file
+                plan_state["latest_test_failure_infra"] = is_infra
+                plan_state["latest_infra_diagnostics"] = test_msg
+
+                if is_infra:
+                    res = _record_result(WorkaroundValidationResult(
+                        overall_status=WorkaroundValidationStatus.INFRA_FAILURE,
+                        syntax=syntax_msg,
+                        typecheck=typecheck_msg,
+                        lint=lint_msg,
+                        runtime_smoke=smoke_msg,
+                        targeted_test=test_msg,
+                        targeted_test_file=test_file,
+                        alternative_used=alt_used,
+                        validated_files=[],
+                        infrastructure_diagnostics=test_msg,
+                    ))
+                    return f"FAILURE: Workaround validation gate 'targeted_test' failed (INFRASTRUCTURE_FAILURE).\n{test_msg}\nJSON: {res.model_dump_json()}"
+                else:
+                    res = _record_result(WorkaroundValidationResult(
+                        overall_status=WorkaroundValidationStatus.CODE_FAILURE,
+                        syntax=syntax_msg,
+                        typecheck=typecheck_msg,
+                        lint=lint_msg,
+                        runtime_smoke=smoke_msg,
+                        targeted_test=test_msg,
+                        targeted_test_file=test_file,
+                        alternative_used=alt_used,
+                        validated_files=[],
+                        failure_category=FailureCategory.BREAKING_CHANGE,
+                    ))
+                    _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+                    return f"FAILURE: Workaround validation gate 'targeted_test' failed.\n{test_msg}\nJSON: {res.model_dump_json()}"
+
+        res = _record_result(WorkaroundValidationResult(
+            overall_status=WorkaroundValidationStatus.PASS,
+            syntax=syntax_msg,
+            typecheck=typecheck_msg,
+            lint=lint_msg,
+            runtime_smoke=smoke_msg,
+            targeted_test=test_msg,
+            targeted_test_file=test_file,
+            alternative_used=alt_used,
+            validated_files=files,
+        ))
+        plan_state["validated_files"] = files
+        plan_state["validation_passed"] = True
+        plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
         return (
             "SUCCESS: Workaround validation gate passed. "
             f"Validated files: {', '.join(files)}; "
-            f"runtime smoke: {smoke_file or 'skipped'}; "
-            f"targeted test: {test_file or 'skipped'}."
+            f"runtime smoke: {smoke_target}; "
+            f"targeted test: {test_file or 'skipped'}.\n"
+            f"JSON: {res.model_dump_json()}"
         )
 
     return validate_workaround
@@ -1361,26 +1733,51 @@ def build_workaround_toolbelt(
 ) -> list:
     """Build the strict workaround-only toolbelt."""
     if plan_state is None:
-        plan_state = {"recorded": False}
+        plan_state = {}
 
+    if plan_state.get("recorded") and not plan_state.get("phase"):
+        plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
+    else:
+        plan_state.setdefault("phase", WorkaroundExecutionPhase.INVESTIGATE.value)
+
+    plan_state.setdefault("iteration", 1)
+    plan_state.setdefault("local_investigation_complete", False)
+    plan_state.setdefault("plan_revision", 0)
+    plan_state.setdefault("successful_edit_count", 0)
+    plan_state.setdefault("successful_edit_count_this_iteration", 0)
+    plan_state.setdefault("last_validation_result", None)
+    plan_state.setdefault("validation_calls", 0)
+    plan_state.setdefault(
+        "original_targeted_test",
+        preferred_test_files[0] if preferred_test_files else None,
+    )
+    plan_state.setdefault("accepted_alternative_test", None)
+    plan_state.setdefault("validated_files", [])
     plan_state.setdefault("inspected_symbols", set())
     plan_state.setdefault("inspected_files", set())
     plan_state.setdefault("fallback_files", set())
     plan_state.setdefault("read_files", set())
     plan_state.setdefault("successful_edits", [])
+    plan_state.setdefault("web_search_performed", False)
+    plan_state.setdefault("recorded", False)
+    # The real workaround toolbelt never permits a successful validation with
+    # an inferred smoke target or a skipped QA-targeted test.
+    plan_state.setdefault("runtime_smoke_required", True)
+    plan_state.setdefault("targeted_test_required", True)
 
     return [
         _make_record_plan_tool(plan_state),
-        _make_search_web_tool(mandatory_search_terms=mandatory_search_terms),
+        _make_record_targeted_test_substitution_tool(sandbox, plan_state),
+        _make_search_web_tool(mandatory_search_terms=mandatory_search_terms, plan_state=plan_state),
         _make_read_web_page_tool(plan_state),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox, plan_state),
-        _make_search_codebase_pattern_tool(sandbox),
+        _make_search_codebase_pattern_tool(sandbox, plan_state),
         _make_inspect_ast_symbol_tool(sandbox, plan_state),
         _make_deterministic_search_replace_tool(sandbox, touched_files, plan_state),
         _make_deterministic_replace_ast_symbol_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_workaround_tool(sandbox, touched_files, preferred_test_files),
+        _make_validate_workaround_tool(sandbox, touched_files, plan_state, preferred_test_files),
     ]
 
 
@@ -1395,10 +1792,46 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         evidence_source: str | None = None,
     ) -> str:
         """
-        Record your investigation findings, affected files/symbols, security invariant, causal hypothesis, planned edits, and optional evidence source.
-        You MUST call this tool BEFORE executing any code edits.
+        Record your investigation findings, affected files/symbols, security invariant, causal hypothesis, planned edits, and evidence source.
+        MUST be called after local investigation is complete and BEFORE executing any code edits.
         """
-        plan_state["recorded"] = True
+        if plan_state.get("inspected_files") or plan_state.get("read_files"):
+            plan_state["local_investigation_complete"] = True
+
+        if not plan_state.get("local_investigation_complete", False):
+            return "ERROR: [PLAN_REJECTED] Local codebase investigation must complete before recording a plan."
+
+        phase = plan_state.get("phase", WorkaroundExecutionPhase.INVESTIGATE.value)
+        if phase == WorkaroundExecutionPhase.VALIDATE.value:
+            return (
+                "ERROR: [PHASE_VIOLATION] A plan cannot be recorded while awaiting validation. "
+                "Call validate_workaround now; a code failure will restart the loop in INVESTIGATE."
+            )
+        if phase not in {
+            WorkaroundExecutionPhase.INVESTIGATE.value,
+            WorkaroundExecutionPhase.PLAN.value,
+            WorkaroundExecutionPhase.EXECUTE.value,
+        }:
+            return f"ERROR: [PHASE_VIOLATION] Cannot record a plan in phase '{phase}'."
+        if plan_state.get("current_iteration_edit") is not None:
+            return (
+                "ERROR: [PHASE_VIOLATION] The current edit has not been validated. "
+                "Call validate_workaround before recording another plan."
+            )
+
+        sec_inv = str(security_invariant or "").strip()
+        causal_hyp = str(causal_hypothesis or "").strip()
+        edits_str = str(exact_intended_edits or "").strip()
+        ev_source = str(evidence_source or "").strip()
+
+        if not sec_inv:
+            return "ERROR: [PLAN_REJECTED] security_invariant cannot be empty."
+        if not causal_hyp:
+            return "ERROR: [PLAN_REJECTED] causal_hypothesis cannot be empty."
+        if not edits_str:
+            return "ERROR: [PLAN_REJECTED] exact_intended_edits cannot be empty."
+        if not ev_source:
+            return "ERROR: [PLAN_REJECTED] evidence_source is required and cannot be empty."
 
         files_list = affected_files if isinstance(affected_files, list) else [str(affected_files)]
         symbols_list = (
@@ -1414,6 +1847,23 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
                 except ValueError:
                     valid_files.append(f_str)
 
+        if not valid_files:
+            return "ERROR: [PLAN_REJECTED] At least one affected file must be specified."
+
+        inspected_files = plan_state.get("inspected_files", set()) | plan_state.get("read_files", set())
+        for f in valid_files:
+            norm_f = f.replace("\\", "/").lstrip("/")
+            if norm_f not in inspected_files:
+                return (
+                    f"ERROR: [PLAN_REJECTED] Target file '{norm_f}' has not been inspected. "
+                    "Inspect all planned files using read_workspace_file or inspect_ast_symbol before recording a plan."
+                )
+
+        plan_state["recorded"] = True
+        plan_state["plan_revision"] = int(plan_state.get("plan_revision", 0)) + 1
+        plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
+        plan_state["successful_edit_count_this_iteration"] = 0
+
         existing_planned = list(plan_state.get("planned_files", []))
         existing_modified = list(plan_state.get("modified_files", set()))
         all_planned = list(dict.fromkeys(existing_planned + existing_modified + valid_files))
@@ -1424,36 +1874,151 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
 
         plan_state["planned_files"] = all_planned
         plan_state["planned_symbols"] = all_symbols
-        plan_state["security_invariant"] = str(security_invariant).strip()
-        plan_state["causal_hypothesis"] = str(causal_hypothesis).strip()
-        plan_state["exact_intended_edits"] = str(exact_intended_edits).strip()
+        plan_state["security_invariant"] = sec_inv
+        plan_state["causal_hypothesis"] = causal_hyp
+        plan_state["exact_intended_edits"] = edits_str
+        plan_state["evidence_source"] = ev_source
+        plan_state.setdefault("evidence_ledger", []).append(ev_source)
+        if _is_authoritative_evidence_source(ev_source):
+            plan_state["has_authoritative_evidence"] = True
 
-        if evidence_source:
-            source_str = str(evidence_source).strip()
-            plan_state["evidence_source"] = source_str
-            if _is_authoritative_evidence_source(source_str):
-                plan_state["has_authoritative_evidence"] = True
+        for f in valid_files:
+            plan_state.setdefault("fallback_files", set()).add(f)
 
-        read_files = plan_state.get("read_files", set())
-        for f in plan_state["planned_files"]:
-            norm_f = f.replace("\\", "/").lstrip("/")
-            if norm_f in read_files:
-                plan_state.setdefault("fallback_files", set()).add(norm_f)
-
-        logger.debug("Workaround subagent plan recorded: %s", plan_state)
-        return "Plan recorded successfully. You may proceed with code edits."
+        logger.debug("Workaround subagent plan recorded (revision %s): %s", plan_state["plan_revision"], plan_state)
+        return (
+            f"SUCCESS: Plan revision {plan_state['plan_revision']} recorded successfully.\n"
+            f"Evidence Source: {ev_source}\n"
+            f"Phase Transition: PLAN -> EXECUTE\n"
+            f"Planned Targets: {', '.join(all_planned)}"
+        )
 
     return record_plan
 
 
-def _make_search_web_tool(mandatory_search_terms: dict[str, str] | None = None):
-    """Create a web search tool backed by Serper.dev.
+def _make_record_targeted_test_substitution_tool(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any],
+):
+    @tool
+    def record_targeted_test_substitution(
+        original_test: str,
+        alternative_test: str,
+        infrastructure_failure_evidence: str,
+        shared_behavior_explanation: str,
+        evidence_sources: Any,
+        infrastructure_avoidance_explanation: str,
+    ) -> str:
+        """Register an existing repository alternative test as a substitution for an infrastructure-failed targeted test."""
+        if not original_test or not str(original_test).strip():
+            return "ERROR: [SUBSTITUTION_REJECTED] original_test is required."
+        if not alternative_test or not str(alternative_test).strip():
+            return "ERROR: [SUBSTITUTION_REJECTED] alternative_test is required."
 
-    ``mandatory_search_terms`` is retained for API compatibility with older
-    callers, but the worker now owns query construction. Workaround type,
-    scanner state, and QA diagnostics require different searches; silently
-    appending one fixed query shape can hide that distinction.
-    """
+        infra_ev = str(infrastructure_failure_evidence or "").strip()
+        shared_exp = str(shared_behavior_explanation or "").strip()
+        avoid_exp = str(infrastructure_avoidance_explanation or "").strip()
+
+        if not infra_ev:
+            return "ERROR: [SUBSTITUTION_REJECTED] infrastructure_failure_evidence cannot be empty."
+        if not shared_exp:
+            return "ERROR: [SUBSTITUTION_REJECTED] shared_behavior_explanation cannot be empty."
+        if not avoid_exp:
+            return "ERROR: [SUBSTITUTION_REJECTED] infrastructure_avoidance_explanation cannot be empty."
+
+        ev_sources = (
+            evidence_sources if isinstance(evidence_sources, list) else [str(evidence_sources)]
+        )
+        cleaned_ev_sources = [str(s).strip() for s in ev_sources if str(s).strip()]
+        if not cleaned_ev_sources:
+            return "ERROR: [SUBSTITUTION_REJECTED] At least one evidence source must be provided."
+
+        phase = plan_state.get("phase")
+        if phase and phase != WorkaroundExecutionPhase.VALIDATE.value:
+            return (
+                "ERROR: [SUBSTITUTION_REJECTED] An alternative targeted test may only be "
+                "registered after the targeted validation gate reports an infrastructure failure."
+            )
+
+        try:
+            norm_orig = _validate_workspace_path(original_test)
+            norm_alt = _validate_workspace_path(alternative_test)
+        except ValueError as exc:
+            return f"ERROR: [SUBSTITUTION_REJECTED] {exc}"
+
+        # 1. Verify original test was the latest failed targeted test
+        latest_failed = plan_state.get("latest_failed_targeted_test")
+        if not latest_failed or norm_orig != latest_failed:
+            return (
+                f"ERROR: [SUBSTITUTION_REJECTED] original_test '{norm_orig}' does not match "
+                f"the latest failed targeted test '{latest_failed}'."
+            )
+
+        # 2. Verify failure was classified as infrastructure-only
+        if not plan_state.get("latest_test_failure_infra", False):
+            return (
+                "ERROR: [SUBSTITUTION_REJECTED] Substitution is allowed only for infrastructure failures. "
+                "Assertion failures, syntax failures, type failures, and application runtime errors do not qualify."
+            )
+
+        alt_content = sandbox.read_file(norm_alt)
+        if alt_content is None:
+            return f"ERROR: [SUBSTITUTION_REJECTED] alternative_test file '{norm_alt}' does not exist in workspace."
+
+        # 3. Verify alternative is different from original
+        if norm_alt == norm_orig:
+            return "ERROR: [SUBSTITUTION_REJECTED] alternative_test must be different from original_test."
+
+        # 4. Verify alternative test file has been locally inspected
+        inspected_files = plan_state.get("inspected_files", set()) | plan_state.get("read_files", set())
+        if norm_alt not in inspected_files:
+            return (
+                f"ERROR: [SUBSTITUTION_REJECTED] alternative_test file '{norm_alt}' has not been inspected. "
+                "Read or inspect the test file using read_workspace_file before registering it."
+            )
+
+        # 5. Verify alternative directly imports or invokes neither unavailable dep nor failed infra setup
+        infra_diag = (plan_state.get("latest_infra_diagnostics") or "").lower()
+        alt_lowered = alt_content.lower()
+
+        forbidden_keywords = []
+        if "sqlite" in infra_diag:
+            forbidden_keywords.extend(["sqlite3", "better-sqlite3"])
+        if "native" in infra_diag or "bindings" in infra_diag:
+            forbidden_keywords.extend(["node-gyp", "prebuild-install", "bindings"])
+
+        for kw in forbidden_keywords:
+            if kw in alt_lowered:
+                return (
+                    f"ERROR: [SUBSTITUTION_REJECTED] alternative_test '{norm_alt}' directly imports/invokes "
+                    f"unavailable infrastructure component '{kw}'."
+                )
+
+        # 6. Verify only one alternative per iteration
+        curr_iter = int(plan_state.get("iteration", 1))
+        if plan_state.get("substitution_registered_for_iteration") == curr_iter:
+            return f"ERROR: [SUBSTITUTION_REJECTED] Only one alternative test substitution is permitted for iteration {curr_iter}."
+
+        plan_state["accepted_alternative_test"] = norm_alt
+        plan_state["substitution_registered_for_iteration"] = curr_iter
+        plan_state.setdefault("original_to_alternative_test_mapping", {})[norm_orig] = norm_alt
+        plan_state.setdefault("original_to_alternative_test_evidence", {})[norm_orig] = (
+            cleaned_ev_sources
+        )
+
+        return (
+            f"SUCCESS: Registered alternative targeted test '{norm_alt}' as full replacement for "
+            f"'{norm_orig}' in iteration {curr_iter}."
+        )
+
+    return record_targeted_test_substitution
+
+
+def _make_search_web_tool(
+    mandatory_search_terms: dict[str, str] | None = None,
+    plan_state: dict[str, Any] | None = None,
+):
+    """Create a web search tool backed by Serper.dev."""
     _calls_remaining = [3]
 
     @tool
@@ -1462,6 +2027,22 @@ def _make_search_web_tool(mandatory_search_terms: dict[str, str] | None = None):
 
         Pass your own targeted query. Do not wrap queries in quotes.
         """
+        if plan_state is not None and not plan_state.get("local_investigation_complete", False):
+            return (
+                "ERROR: [INVESTIGATION_REQUIRED] Local codebase investigation must complete "
+                "using search_codebase_pattern, read_workspace_file, or inspect_ast_symbol "
+                "before calling search_web."
+            )
+        if (
+            plan_state is not None
+            and plan_state.get("phase") == WorkaroundExecutionPhase.VALIDATE.value
+        ):
+            return (
+                "ERROR: [PHASE_VIOLATION] Web research is not a validation action. "
+                "Call validate_workaround, or register an evidence-backed alternative test "
+                "after an infrastructure-only targeted-test failure."
+            )
+
         if _calls_remaining[0] <= 0:
             return f"ERROR: search_web call limit reached (max {_SEARCH_WEB_MAX_CALLS} per session). Use the results you already have."
 
@@ -1500,6 +2081,9 @@ def _make_search_web_tool(mandatory_search_terms: dict[str, str] | None = None):
                 results.append(f"**{title}**\n{snippet}\nURL: {link}")
 
             calls_left = _calls_remaining[0]
+            if plan_state is not None:
+                plan_state["web_search_performed"] = True
+
             if not results:
                 return f"Effective Query: {effective_query}\nNo results found for this query."
 
@@ -1606,6 +2190,22 @@ def _make_read_web_page_tool(plan_state: dict[str, Any] | None = None):
         Use this tool after search_web to read complete migration guides, breaking change lists,
         or documentation pages found in search results.
         """
+        if plan_state is not None:
+            if not plan_state.get("local_investigation_complete", False):
+                return (
+                    "ERROR: [INVESTIGATION_REQUIRED] Local codebase investigation must complete "
+                    "before calling read_web_page."
+                )
+            if not plan_state.get("web_search_performed", False):
+                return (
+                    "ERROR: [SEARCH_REQUIRED] You must execute search_web before calling read_web_page."
+                )
+            if plan_state.get("phase") == WorkaroundExecutionPhase.VALIDATE.value:
+                return (
+                    "ERROR: [PHASE_VIOLATION] Web research is not a validation action. "
+                    "Call validate_workaround instead."
+                )
+
         target_url = (url or "").strip()
         if not target_url:
             return "ERROR: url is required."

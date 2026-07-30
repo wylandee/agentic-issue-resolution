@@ -17,6 +17,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
     WorkaroundEdit,
+    WorkaroundExecutionPhase,
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
@@ -340,6 +341,7 @@ def test_authoritative_evidence_enforcement_in_edit_tools() -> None:
     touched: set[str] = set()
     plan_state: dict[str, Any] = {
         "recorded": True,
+        "phase": WorkaroundExecutionPhase.EXECUTE.value,
         "planned_files": ["lib/insecurity.ts"],
         "inspected_files": {"lib/insecurity.ts"},
         "require_authoritative_evidence": True,

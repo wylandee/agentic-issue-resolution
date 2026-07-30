@@ -53,12 +53,14 @@ def _update_tool_map(
     return {tool.name: tool for tool in tools}
 
 
-def _workaround_tool_map(sandbox, touched_files=None, host_repo_root=None):
+def _workaround_tool_map(sandbox, touched_files=None, host_repo_root=None, plan_state=None):
     if touched_files is None:
         touched_files = set()
     if host_repo_root is None:
         host_repo_root = Path("/dummy/repo/root")
-    tools = build_workaround_toolbelt(sandbox, touched_files, host_repo_root)
+    if plan_state is None:
+        plan_state = {"local_investigation_complete": True, "web_search_performed": True}
+    tools = build_workaround_toolbelt(sandbox, touched_files, host_repo_root, plan_state=plan_state)
     return {tool.name: tool for tool in tools}
 
 
@@ -80,6 +82,7 @@ class TestToolbeltFactories:
 
         assert set(tools) == {
             "record_plan",
+            "record_targeted_test_substitution",
             "search_web",
             "read_web_page",
             "read_repository_map",
