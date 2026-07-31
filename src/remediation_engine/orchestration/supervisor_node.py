@@ -2780,7 +2780,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     f"supervisor: rejected worker result for {task_id} because the "
                     "executed version differed from the committed version."
                 )
-            if result_status == AgentActionStatus.SUCCESS and task.strategy == RoutingStrategy.CODE_WORKAROUND:
+            if (
+                result_status == AgentActionStatus.SUCCESS
+                and task.strategy == RoutingStrategy.CODE_WORKAROUND
+            ):
                 diag = result.execution_diagnostics
                 val_files_match = set(diag.validated_files) == set(result.changed_files)
                 overall_status = diag.per_gate_results.get("overall_status")

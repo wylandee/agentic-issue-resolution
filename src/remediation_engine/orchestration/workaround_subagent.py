@@ -20,7 +20,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     VulnerabilityGroup,
     WorkaroundContext,
-    WorkaroundEdit,
+    WorkaroundEditSet,
     WorkaroundPhase,
     WorkaroundReplayPlan,
     WorkaroundValidationStatus,
@@ -28,7 +28,10 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.orchestration.remedy_tools import (
+    _detect_newline_style,
     _is_prohibited_target,
+    _normalise_newlines,
+    _restore_newlines,
     build_workaround_toolbelt,
 )
 from remediation_engine.orchestration.state import SubagentState, _derive_legacy_task_from_group
@@ -643,9 +646,9 @@ def _build_workaround_prompt(
                     "  2. PLAN",
                     "     - Form a hypothesis and call record_plan before making code edits.",
                     "  3. IMPLEMENT",
-                    "     - Apply changes using deterministic_search_replace or deterministic_replace_ast_symbol.",
+                    "     - Apply one complete semantic patch per iteration using deterministic_apply_edit_set. An API migration must place its import, declaration, and all causally related call-site replacements in the same edit set.",
                     "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround to verify.",
+                    "     - Call validate_workaround to verify. Supply a lightweight source module as runtime_smoke_file; never use a test/spec file or build/dist artifact, and keep it separate from the targeted test.",
                 ]
             )
         )
@@ -665,9 +668,9 @@ def _build_workaround_prompt(
                     "  2. PLAN",
                     "     - Record a complete cumulative plan using record_plan before editing.",
                     "  3. IMPLEMENT",
-                    "     - Apply fix incrementally using deterministic_search_replace or deterministic_replace_ast_symbol.",
+                    "     - Apply one complete semantic patch per iteration using deterministic_apply_edit_set. An API migration must place its import, declaration, and all causally related call-site replacements in the same edit set.",
                     "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround with complete modified-file list.",
+                    "     - Call validate_workaround with complete modified-file list, a lightweight source-module runtime_smoke_file, and a separate targeted test file.",
                 ]
             )
         )
@@ -800,7 +803,9 @@ def _workaround_attempt_succeeded(
     validation_passed = (
         validation_gate_passed if validation_gate_passed is not None else has_all_validated
     )
-    if not (runtime.changed_files and not runtime.errors and validation_passed and has_recorded_plan):
+    if not (
+        runtime.changed_files and not runtime.errors and validation_passed and has_recorded_plan
+    ):
         return False
     if requires_targeted_test and not targeted_test_passed:
         return False
@@ -827,9 +832,7 @@ def _workaround_attempt_succeeded(
             return False
         if plan_state.get("targeted_test_required"):
             targeted_file = getattr(last_val, "targeted_test_file", None) or (
-                last_val.get("targeted_test_file")
-                if isinstance(last_val, dict)
-                else None
+                last_val.get("targeted_test_file") if isinstance(last_val, dict) else None
             )
             if not targeted_file:
                 return False
@@ -878,10 +881,16 @@ def _build_attempt_result(
             else {}
         )
 
-    selected_test = p_state.get("accepted_alternative_test") or p_state.get("original_targeted_test")
+    selected_test = p_state.get("accepted_alternative_test") or p_state.get(
+        "original_targeted_test"
+    )
     mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
     mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
-    infra_details = p_state.get("latest_infra_diagnostics")
+    infra_details = (
+        p_state.get("latest_infra_diagnostics")
+        or p_state.get("last_infrastructure_diagnostics")
+        or p_state.get("infrastructure_failure_details")
+    )
 
     diag = WorkerExecutionDiagnostics(
         validation_calls=val_calls,
@@ -999,10 +1008,10 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     plan_state: dict[str, Any] = {"recorded": False}
 
     pre_attempt_snapshots: dict[str, str] = {}
-    replayed_edits: list[WorkaroundEdit] = []
+    replayed_edit_sets: list[WorkaroundEditSet] = []
     if current_replay_plan is not None:
         pre_attempt_snapshots = dict(current_replay_plan.pre_attempt_snapshots)
-        replayed_edits = list(current_replay_plan.successful_edits)
+        replayed_edit_sets = list(current_replay_plan.successful_edit_sets)
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
@@ -1016,18 +1025,69 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                             "Workaround subagent: failed to restore snapshot for %s: %s", rel_p, exc
                         )
 
-            # 2. Replay prior successful edits sequentially
-            for redit in replayed_edits:
-                try:
+            # 2. Replay prior successful edit sets atomically
+            replay_failed = False
+            replay_error_msg = ""
+            for edit_set in replayed_edit_sets:
+                # Pre-verify all replacements in edit_set
+                for redit in edit_set.replacements:
+                    try:
+                        curr = sandbox.read_file(redit.file_path)
+                        if curr is None:
+                            replay_failed = True
+                            replay_error_msg = f"Replay failed: Could not read '{redit.file_path}' for patch '{edit_set.patch_id}'."
+                            break
+                        curr_norm = _normalise_newlines(curr)
+                        old_norm = _normalise_newlines(redit.old_text)
+                        count = curr_norm.count(old_norm)
+                        expected = (
+                            redit.expected_occurrences
+                            if hasattr(redit, "expected_occurrences")
+                            and redit.expected_occurrences > 0
+                            else 1
+                        )
+                        if count != expected:
+                            replay_failed = True
+                            replay_error_msg = (
+                                f"Replay failed: Occurrence count mismatch for anchor in '{redit.file_path}' "
+                                f"during patch '{edit_set.patch_id}' (expected {expected}, found {count}). Aborting replay."
+                            )
+                            break
+                    except Exception as exc:  # noqa: BLE001
+                        replay_failed = True
+                        replay_error_msg = f"Replay failed on file '{redit.file_path}': {exc}"
+                        break
+
+                if replay_failed:
+                    break
+
+                # Apply edit set replacements
+                for redit in edit_set.replacements:
                     curr = sandbox.read_file(redit.file_path)
-                    if curr and redit.old_text in curr:
-                        updated = curr.replace(redit.old_text, redit.new_text, 1)
-                        sandbox.write_file(redit.file_path, updated)
-                        touched_files.add(redit.file_path)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Workaround subagent: failed to replay edit on %s: %s", redit.file_path, exc
+                    newline_style = _detect_newline_style(curr)
+                    curr_norm = _normalise_newlines(curr)
+                    old_norm = _normalise_newlines(redit.old_text)
+                    new_norm = _normalise_newlines(redit.new_text)
+                    expected = (
+                        redit.expected_occurrences
+                        if hasattr(redit, "expected_occurrences") and redit.expected_occurrences > 0
+                        else 1
                     )
+                    updated_norm = curr_norm.replace(old_norm, new_norm, expected)
+                    sandbox.write_file(
+                        redit.file_path, _restore_newlines(updated_norm, newline_style)
+                    )
+                    touched_files.add(redit.file_path)
+
+            if replay_failed:
+                logger.error(replay_error_msg)
+                summaries = _build_surrender_summaries(t_id, replay_error_msg)
+                return {
+                    "action_summaries": summaries,
+                    "action_summary": summaries[0],
+                    "changed_files": [],
+                    "errors": [replay_error_msg],
+                }
 
             snapshot = state.get("attempt_snapshot")
             workaround_ctx = getattr(snapshot, "workaround_context", None) if snapshot else None
@@ -1056,7 +1116,9 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                         "Make one minimal semantic source patch per iteration and call "
                         "validate_workaround immediately. If one API migration requires an "
                         "import plus multiple call-site changes, include those exact related "
-                        "lines in one atomic replacement before validating."
+                        "lines in one atomic replacement before validating. Runtime smoke must "
+                        "import a lightweight source module, never a test/spec file or build/dist "
+                        "artifact, and it must be separate from the targeted test."
                     )
                 ),
                 HumanMessage(content=prompt),
@@ -1094,7 +1156,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
 
             validation_gate_passed = has_successful_validation_gate(
                 runtime.tool_events,
-                has_prior_edits=bool(replayed_edits),
+                has_prior_edits=bool(replayed_edit_sets),
             )
             has_all_validated = validation_gate_passed
             is_record_plan_in_toolbelt = any(
@@ -1162,12 +1224,16 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 plan_state=plan_state,
             )
 
-            all_edits: list[WorkaroundEdit] = list(replayed_edits)
+            all_edit_sets: list[WorkaroundEditSet] = list(replayed_edit_sets)
             if succeeded:
-                new_edits = plan_state.get("successful_edits", [])
-                all_edits.extend(new_edits)
+                new_edit_sets = plan_state.get("successful_edit_sets", [])
+                all_edit_sets.extend(new_edit_sets)
             else:
-                replayed_files = {e.file_path for e in replayed_edits}
+                replayed_files = {
+                    edit.file_path
+                    for edit_set in replayed_edit_sets
+                    for edit in edit_set.replacements
+                }
                 current_attempt_files = set(runtime.changed_files) - replayed_files
                 for f in current_attempt_files:
                     if f in pre_attempt_snapshots:
@@ -1208,15 +1274,21 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         if isinstance(last_val, dict)
         else {}
     )
-    selected_test = p_state.get("accepted_alternative_test") or p_state.get("original_targeted_test")
+    selected_test = p_state.get("accepted_alternative_test") or p_state.get(
+        "original_targeted_test"
+    )
     mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
     mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
-    infra_details = p_state.get("latest_infra_diagnostics")
+    infra_details = (
+        p_state.get("latest_infra_diagnostics")
+        or p_state.get("last_infrastructure_diagnostics")
+        or p_state.get("infrastructure_failure_details")
+    )
 
     new_replay_plan = WorkaroundReplayPlan(
         task_id=t_id,
         pre_attempt_snapshots=pre_attempt_snapshots,
-        successful_edits=all_edits,
+        successful_edit_sets=all_edit_sets,
         investigation_findings={
             "changed_files": list(touched_files),
             "validation_feedback": _latest_validation_feedback(runtime.tool_events),

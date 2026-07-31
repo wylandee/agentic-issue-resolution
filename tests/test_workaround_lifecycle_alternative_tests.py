@@ -74,32 +74,71 @@ def test_read_web_page_rejected_before_web_search():
 
 
 def test_plan_rejected_without_evidence():
-    plan_state: dict[str, Any] = {"local_investigation_complete": True, "inspected_files": {"src/index.js"}}
+    plan_state: dict[str, Any] = {
+        "local_investigation_complete": True,
+        "inspected_files": {"src/index.js"},
+    }
     record_plan = _make_record_plan_tool(plan_state)
-    res = record_plan.invoke({
-        "affected_files": ["src/index.js"],
-        "affected_symbols": ["handleAuth"],
-        "security_invariant": "Always validate token algorithm",
-        "causal_hypothesis": "Missing algorithm check",
-        "exact_intended_edits": "Add algorithm check",
-        "evidence_source": "",
-    })
+    res = record_plan.invoke(
+        {
+            "affected_files": ["src/index.js"],
+            "affected_symbols": ["handleAuth"],
+            "security_invariant": "Always validate token algorithm",
+            "causal_hypothesis": "Missing algorithm check",
+            "planned_replacements": [
+                {"file_path": "src/index.js", "old_text": "a", "new_text": "b"}
+            ],
+            "evidence_source": "",
+        }
+    )
     assert "ERROR: [PLAN_REJECTED]" in str(res)
 
 
 def test_plan_rejected_for_uninspected_files():
-    plan_state: dict[str, Any] = {"local_investigation_complete": True, "inspected_files": {"src/index.js"}}
+    plan_state: dict[str, Any] = {
+        "local_investigation_complete": True,
+        "inspected_files": {"src/index.js"},
+    }
     record_plan = _make_record_plan_tool(plan_state)
-    res = record_plan.invoke({
-        "affected_files": ["src/other.js"],
-        "affected_symbols": ["handleAuth"],
-        "security_invariant": "Always validate token algorithm",
-        "causal_hypothesis": "Missing algorithm check",
-        "exact_intended_edits": "Add algorithm check",
-        "evidence_source": "https://github.com/advisories/GHSA-1234",
-    })
+    res = record_plan.invoke(
+        {
+            "affected_files": ["src/other.js"],
+            "affected_symbols": ["handleAuth"],
+            "security_invariant": "Always validate token algorithm",
+            "causal_hypothesis": "Missing algorithm check",
+            "planned_replacements": [
+                {"file_path": "src/other.js", "old_text": "a", "new_text": "b"}
+            ],
+            "evidence_source": "https://github.com/advisories/GHSA-1234",
+        }
+    )
     assert "ERROR: [PLAN_REJECTED]" in str(res)
     assert "src/other.js" in str(res)
+
+
+def test_qa_repair_plan_rejects_non_authoritative_evidence_before_acceptance():
+    plan_state: dict[str, Any] = {
+        "require_authoritative_evidence": True,
+        "local_investigation_complete": True,
+        "inspected_files": {"src/index.js"},
+    }
+    record_plan = _make_record_plan_tool(plan_state)
+
+    result = record_plan.invoke(
+        {
+            "affected_files": ["src/index.js"],
+            "affected_symbols": ["handleAuth"],
+            "security_invariant": "Authorization remains enforced",
+            "causal_hypothesis": "The dependency changed its export shape",
+            "planned_replacements": [
+                {"file_path": "src/index.js", "old_text": "old", "new_text": "new"}
+            ],
+            "evidence_source": "workspace:src/index.js",
+        }
+    )
+
+    assert "ERROR: [MISSING_EVIDENCE]" in str(result)
+    assert plan_state.get("recorded", False) is False
 
 
 def test_edits_rejected_before_valid_plan():
@@ -107,7 +146,9 @@ def test_edits_rejected_before_valid_plan():
     plan_state: dict[str, Any] = {"phase": WorkaroundExecutionPhase.INVESTIGATE.value}
     touched = set()
     edit_tool = _make_deterministic_search_replace_tool(sandbox, touched, plan_state)
-    res = edit_tool.invoke({"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"})
+    res = edit_tool.invoke(
+        {"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"}
+    )
     assert "ERROR: [PLAN_VIOLATION]" in str(res) or "ERROR: [PHASE_VIOLATION]" in str(res)
 
 
@@ -122,7 +163,9 @@ def test_edits_rejected_after_one_edit_before_validation():
     }
     touched = {"src/index.js"}
     edit_tool = _make_deterministic_search_replace_tool(sandbox, touched, plan_state)
-    res = edit_tool.invoke({"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"})
+    res = edit_tool.invoke(
+        {"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"}
+    )
     assert "ERROR: [ITERATION_LIMIT]" in str(res)
 
 
@@ -139,7 +182,9 @@ def test_plan_and_web_rejected_while_waiting_for_validation():
             "affected_symbols": ["handleAuth"],
             "security_invariant": "Auth remains enforced",
             "causal_hypothesis": "The imported API changed shape",
-            "exact_intended_edits": "Update the import and call sites atomically",
+            "planned_replacements": [
+                {"file_path": "src/index.js", "old_text": "a", "new_text": "b"}
+            ],
             "evidence_source": "workspace:src/index.js",
         }
     )
@@ -155,13 +200,23 @@ def test_validation_failure_resets_execution_to_investigate():
     plan_state: dict[str, Any] = {
         "phase": WorkaroundExecutionPhase.VALIDATE.value,
         "iteration": 1,
-        "current_iteration_edit": MagicMock(file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;"),
-        "successful_edits": [MagicMock(file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;")],
+        "current_iteration_edit": MagicMock(
+            file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;"
+        ),
+        "successful_edits": [
+            MagicMock(file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;")
+        ],
     }
-    sandbox.run.side_effect = lambda cmd, timeout=60: MagicMock(exit_code=1, stdout="", stderr="Syntax error")
+    sandbox.run.side_effect = lambda cmd, timeout=60: MagicMock(
+        exit_code=1, stdout="", stderr="Syntax error"
+    )
     touched = {"src/index.js"}
-    val_tool = _make_validate_workaround_tool(sandbox, touched, plan_state, preferred_test_files=["test/index.test.js"])
-    res = val_tool.invoke({"modified_files": ["src/index.js"], "runtime_smoke_file": "src/index.js"})
+    val_tool = _make_validate_workaround_tool(
+        sandbox, touched, plan_state, preferred_test_files=["test/index.test.js"]
+    )
+    res = val_tool.invoke(
+        {"modified_files": ["src/index.js"], "runtime_smoke_file": "src/index.js"}
+    )
 
     assert "FAILURE" in str(res)
     assert plan_state["phase"] == WorkaroundExecutionPhase.INVESTIGATE.value
@@ -178,14 +233,67 @@ def test_runtime_smoke_targets_never_implicitly_skipped():
     assert "runtime_smoke_file must be explicitly supplied" in str(res)
 
 
+def test_runtime_smoke_rejects_test_files_and_keeps_target_separate():
+    sandbox, _ = _mock_sandbox(
+        {
+            "src/index.js": "const x = 1;",
+            "test/index.test.js": "it('works', () => {});",
+        }
+    )
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(
+        sandbox,
+        {"src/index.js"},
+        plan_state,
+        preferred_test_files=["test/index.test.js"],
+    )
+
+    result = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "test/index.test.js",
+            "targeted_test_file": "test/index.test.js",
+        }
+    )
+
+    assert "ERROR: [INVALID_RUNTIME_SMOKE]" in str(result)
+    assert "test/spec file" in str(result)
+    assert sandbox.run.call_count == 0
+
+
+def test_runtime_smoke_timeout_is_blocked_and_recorded_as_infrastructure():
+    sandbox, _ = _mock_sandbox({"src/index.js": "const x = 1;"})
+    sandbox.run.side_effect = [
+        MagicMock(exit_code=0, stdout="", stderr=""),
+        MagicMock(exit_code=1, stdout="", stderr=""),
+        MagicMock(exit_code=124, stdout="", stderr="Command timed out after 30s."),
+    ]
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(sandbox, {"src/index.js"}, plan_state)
+
+    result = val_tool.invoke(
+        {"modified_files": ["src/index.js"], "runtime_smoke_file": "src/index.js"}
+    )
+
+    assert "BLOCKED: Runtime smoke gate unavailable" in str(result)
+    assert '"overall_status":"BLOCKED"' in str(result)
+    assert "Command timed out after 30s." in plan_state["infrastructure_failure_details"]
+
+
 def test_missing_sqlite_native_bindings_classified_as_infra_only():
     err = "Error: Cannot find module 'better-sqlite3' or missing native bindings"
     assert _is_infrastructure_failure(err) is True
 
 
 def test_assertion_failures_not_classified_as_infra_only():
-    err = "AssertionError: expected 1 to equal 2\n    at Context.<anonymous> (test/index.test.js:10)"
+    err = (
+        "AssertionError: expected 1 to equal 2\n    at Context.<anonymous> (test/index.test.js:10)"
+    )
     assert _is_infrastructure_failure(err) is False
+
+
+def test_targeted_test_timeout_is_infrastructure_only():
+    assert _is_infrastructure_failure("Command timed out after 180s.") is True
 
 
 def test_alternative_test_rejected_without_infra_failure():
@@ -196,14 +304,16 @@ def test_alternative_test_rejected_without_infra_failure():
         "inspected_files": {"test/alt.test.js"},
     }
     sub_tool = _make_record_targeted_test_substitution_tool(sandbox, plan_state)
-    res = sub_tool.invoke({
-        "original_test": "test/orig.test.js",
-        "alternative_test": "test/alt.test.js",
-        "infrastructure_failure_evidence": "Assertion failure",
-        "shared_behavior_explanation": "Tests auth invariant",
-        "evidence_sources": ["GHSA-1234"],
-        "infrastructure_avoidance_explanation": "Avoids native sqlite",
-    })
+    res = sub_tool.invoke(
+        {
+            "original_test": "test/orig.test.js",
+            "alternative_test": "test/alt.test.js",
+            "infrastructure_failure_evidence": "Assertion failure",
+            "shared_behavior_explanation": "Tests auth invariant",
+            "evidence_sources": ["GHSA-1234"],
+            "infrastructure_avoidance_explanation": "Avoids native sqlite",
+        }
+    )
     assert "ERROR: [SUBSTITUTION_REJECTED]" in str(res)
 
 
@@ -215,14 +325,16 @@ def test_alternative_test_rejected_without_mapping_evidence():
         "inspected_files": {"test/alt.test.js"},
     }
     sub_tool = _make_record_targeted_test_substitution_tool(sandbox, plan_state)
-    res = sub_tool.invoke({
-        "original_test": "test/orig.test.js",
-        "alternative_test": "test/alt.test.js",
-        "infrastructure_failure_evidence": "Missing native bindings",
-        "shared_behavior_explanation": "Tests auth invariant",
-        "evidence_sources": [],
-        "infrastructure_avoidance_explanation": "Avoids native sqlite",
-    })
+    res = sub_tool.invoke(
+        {
+            "original_test": "test/orig.test.js",
+            "alternative_test": "test/alt.test.js",
+            "infrastructure_failure_evidence": "Missing native bindings",
+            "shared_behavior_explanation": "Tests auth invariant",
+            "evidence_sources": [],
+            "infrastructure_avoidance_explanation": "Avoids native sqlite",
+        }
+    )
     assert "ERROR: [SUBSTITUTION_REJECTED]" in str(res)
 
 
@@ -235,14 +347,16 @@ def test_alternative_test_rejected_when_it_imports_unavailable_dependency():
         "inspected_files": {"test/alt.test.js"},
     }
     sub_tool = _make_record_targeted_test_substitution_tool(sandbox, plan_state)
-    res = sub_tool.invoke({
-        "original_test": "test/orig.test.js",
-        "alternative_test": "test/alt.test.js",
-        "infrastructure_failure_evidence": "Missing sqlite3 native binding",
-        "shared_behavior_explanation": "Tests auth invariant",
-        "evidence_sources": ["GHSA-1234"],
-        "infrastructure_avoidance_explanation": "Avoids native sqlite",
-    })
+    res = sub_tool.invoke(
+        {
+            "original_test": "test/orig.test.js",
+            "alternative_test": "test/alt.test.js",
+            "infrastructure_failure_evidence": "Missing sqlite3 native binding",
+            "shared_behavior_explanation": "Tests auth invariant",
+            "evidence_sources": ["GHSA-1234"],
+            "infrastructure_avoidance_explanation": "Avoids native sqlite",
+        }
+    )
     assert "ERROR: [SUBSTITUTION_REJECTED]" in str(res)
     assert "directly imports/invokes" in str(res)
 
@@ -257,19 +371,19 @@ def test_alternative_test_accepted_when_criteria_pass():
         "iteration": 1,
     }
     sub_tool = _make_record_targeted_test_substitution_tool(sandbox, plan_state)
-    res = sub_tool.invoke({
-        "original_test": "test/orig.test.js",
-        "alternative_test": "test/alt.test.js",
-        "infrastructure_failure_evidence": "Missing native sqlite3",
-        "shared_behavior_explanation": "Tests auth invariant",
-        "evidence_sources": ["GHSA-1234"],
-        "infrastructure_avoidance_explanation": "Uses mock DB instead of sqlite3",
-    })
+    res = sub_tool.invoke(
+        {
+            "original_test": "test/orig.test.js",
+            "alternative_test": "test/alt.test.js",
+            "infrastructure_failure_evidence": "Missing native sqlite3",
+            "shared_behavior_explanation": "Tests auth invariant",
+            "evidence_sources": ["GHSA-1234"],
+            "infrastructure_avoidance_explanation": "Uses mock DB instead of sqlite3",
+        }
+    )
     assert "SUCCESS:" in str(res)
     assert plan_state["accepted_alternative_test"] == "test/alt.test.js"
-    assert plan_state["original_to_alternative_test_evidence"]["test/orig.test.js"] == [
-        "GHSA-1234"
-    ]
+    assert plan_state["original_to_alternative_test_evidence"]["test/orig.test.js"] == ["GHSA-1234"]
 
 
 def test_real_workaround_toolbelt_requires_explicit_smoke_and_targeted_test():
@@ -296,33 +410,43 @@ def test_real_workaround_toolbelt_requires_explicit_smoke_and_targeted_test():
 
 
 def test_alternative_targeted_test_passing_with_static_checks_and_smoke():
-    sandbox, _ = _mock_sandbox({
-        "package.json": '{"name": "test-app", "scripts": {"test": "vitest"}}',
-        "src/index.js": "module.exports = { auth: () => true };",
-        "test/alt.test.js": "const { auth } = require('../src/index');",
-    })
+    sandbox, _ = _mock_sandbox(
+        {
+            "package.json": '{"name": "test-app", "scripts": {"test": "vitest"}}',
+            "src/index.js": "module.exports = { auth: () => true };",
+            "test/alt.test.js": "const { auth } = require('../src/index');",
+        }
+    )
     plan_state: dict[str, Any] = {
         "phase": WorkaroundExecutionPhase.VALIDATE.value,
         "accepted_alternative_test": "test/alt.test.js",
     }
     touched = {"src/index.js"}
-    val_tool = _make_validate_workaround_tool(sandbox, touched, plan_state, preferred_test_files=["test/orig.test.js"])
-    res = val_tool.invoke({
-        "modified_files": ["src/index.js"],
-        "runtime_smoke_file": "src/index.js",
-    })
+    val_tool = _make_validate_workaround_tool(
+        sandbox, touched, plan_state, preferred_test_files=["test/orig.test.js"]
+    )
+    res = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "src/index.js",
+        }
+    )
     assert "SUCCESS:" in str(res)
     assert plan_state["validated_files"] == ["src/index.js"]
 
 
 def test_alternative_targeted_test_failure_preventing_optimistic_success():
-    sandbox, _ = _mock_sandbox({
-        "package.json": '{"name": "test-app", "scripts": {"test": "vitest"}}',
-        "src/index.js": "const x = 1;",
-    })
+    sandbox, _ = _mock_sandbox(
+        {
+            "package.json": '{"name": "test-app", "scripts": {"test": "vitest"}}',
+            "src/index.js": "const x = 1;",
+            "test/alt.test.js": "it('auth', () => {});",
+        }
+    )
     plan_state: dict[str, Any] = {
         "accepted_alternative_test": "test/alt.test.js",
     }
+
     def mock_run(cmd: str, timeout: int = 60):
         res = MagicMock()
         if "test/alt.test.js" in cmd:
@@ -338,11 +462,13 @@ def test_alternative_targeted_test_failure_preventing_optimistic_success():
     sandbox.run.side_effect = mock_run
     touched = {"src/index.js"}
     val_tool = _make_validate_workaround_tool(sandbox, touched, plan_state)
-    res = val_tool.invoke({
-        "modified_files": ["src/index.js"],
-        "runtime_smoke_file": "src/index.js",
-        "targeted_test_file": "test/alt.test.js",
-    })
+    res = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "src/index.js",
+            "targeted_test_file": "test/alt.test.js",
+        }
+    )
 
     assert "FAILURE" in str(res)
     assert plan_state.get("validation_passed", False) is False

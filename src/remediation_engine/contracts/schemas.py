@@ -1174,7 +1174,6 @@ class WorkaroundValidationResult(BaseModel):
     infrastructure_diagnostics: str | None = None
 
 
-
 class QAFailureEvidence(BaseModel):
     """Exact diagnostic evidence extracted from a failed QA evaluation."""
 
@@ -1384,6 +1383,18 @@ class WorkerExecutionDiagnostics(BaseModel):
     infrastructure_failure_details: str | None = None
 
 
+class WorkaroundPlannedReplacement(BaseModel):
+    """A typed single replacement planned within a WorkaroundEditSet."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    file_path: str = Field(..., min_length=1)
+    old_text: str = Field(...)
+    new_text: str = Field(...)
+    expected_occurrences: int = Field(default=1, ge=1)
+    symbol_name: str | None = None
+
+
 class WorkaroundEdit(BaseModel):
     """Recorded deterministic search-replace edit for workaround replay."""
 
@@ -1393,8 +1404,23 @@ class WorkaroundEdit(BaseModel):
     old_text: str = Field(...)
     new_text: str = Field(...)
     symbol_name: str | None = None
+    patch_id: str = Field(default="")
+    replacement_index: int = Field(default=0, ge=0)
+    expected_occurrences: int = Field(default=1, ge=1)
     edit_index: int = Field(default=0, ge=0)
     timestamp: str = Field(default="")
+
+
+class WorkaroundEditSet(BaseModel):
+    """An atomic collection of edits applied in one workaround iteration."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    patch_id: str = Field(..., min_length=1)
+    plan_revision: int = Field(default=1, ge=1)
+    iteration: int = Field(default=1, ge=1)
+    affected_files: list[str] = Field(default_factory=list)
+    replacements: list[WorkaroundEdit] = Field(default_factory=list)
 
 
 class WorkaroundReplayPlan(BaseModel):
@@ -1404,7 +1430,7 @@ class WorkaroundReplayPlan(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     pre_attempt_snapshots: dict[str, str] = Field(default_factory=dict)
-    successful_edits: list[WorkaroundEdit] = Field(default_factory=list)
+    successful_edit_sets: list[WorkaroundEditSet] = Field(default_factory=list)
     investigation_findings: dict[str, Any] = Field(default_factory=dict)
     source_attempt_id: str = Field(default="")
     security_invariants: list[str] = Field(default_factory=list)
@@ -1417,6 +1443,41 @@ class WorkaroundReplayPlan(BaseModel):
     original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
     alternative_test_mapping_evidence: dict[str, list[str]] = Field(default_factory=dict)
     infrastructure_failure_details: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_successful_edits(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data_copy = dict(data)
+            legacy_edits = data_copy.pop("successful_edits", None)
+            if legacy_edits and not data_copy.get("successful_edit_sets"):
+                sets: list[dict[str, Any]] = []
+                for idx, item in enumerate(legacy_edits):
+                    edit_dict = (
+                        item.model_dump()
+                        if isinstance(item, BaseModel)
+                        else dict(item)
+                        if isinstance(item, dict)
+                        else {}
+                    )
+                    if edit_dict:
+                        p_id = edit_dict.get("patch_id") or f"patch_legacy_{idx}"
+                        sets.append(
+                            {
+                                "patch_id": p_id,
+                                "plan_revision": 1,
+                                "iteration": idx + 1,
+                                "affected_files": [edit_dict.get("file_path", "")],
+                                "replacements": [edit_dict],
+                            }
+                        )
+                data_copy["successful_edit_sets"] = sets
+            return data_copy
+        return data
+
+    @property
+    def successful_edits(self) -> list[WorkaroundEdit]:
+        return [edit for edit_set in self.successful_edit_sets for edit in edit_set.replacements]
 
 
 class WorkerAttemptResult(BaseModel):

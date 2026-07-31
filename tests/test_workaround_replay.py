@@ -368,7 +368,13 @@ def test_authoritative_evidence_enforcement_in_edit_tools() -> None:
             "affected_symbols": ["x"],
             "security_invariant": "test invariant",
             "causal_hypothesis": "test hypothesis",
-            "exact_intended_edits": "change 1 to 2",
+            "planned_replacements": [
+                {
+                    "file_path": "lib/insecurity.ts",
+                    "old_text": "const x = 1;",
+                    "new_text": "const x = 2;",
+                }
+            ],
             "evidence_source": "https://github.com/expressjs/express-jwt",
         }
     )

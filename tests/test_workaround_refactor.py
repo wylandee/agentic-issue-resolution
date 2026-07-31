@@ -352,6 +352,9 @@ def test_workaround_toolbelt_ast_gate_and_search_enrichment():
     plan_state = {
         "recorded": True,
         "phase": WorkaroundExecutionPhase.EXECUTE.value,
+        "planned_replacements": [
+            {"file_path": "src/index.js", "old_text": "oldFunc", "new_text": "newFunc"}
+        ],
         "local_investigation_complete": True,
     }
     terms = {
@@ -371,9 +374,13 @@ def test_workaround_toolbelt_ast_gate_and_search_enrichment():
     tool_dict = {t.name: t for t in tools}
 
     # AST gate check before inspection should fail for JS files
-    dsr = tool_dict["deterministic_search_replace"]
+    dsr = tool_dict["deterministic_apply_edit_set"]
     res_no_ast = dsr.invoke(
-        {"file_path": "src/index.js", "old_text": "oldFunc", "new_text": "newFunc"}
+        {
+            "replacements": [
+                {"file_path": "src/index.js", "old_text": "oldFunc", "new_text": "newFunc"}
+            ]
+        }
     )
     assert "AST inspection required" in res_no_ast
 
@@ -444,17 +451,27 @@ def test_express_jwt_mocked_end_to_end_scenario():
             "affected_symbols": ["authMiddleware"],
             "security_invariant": "JWT auth must be enforced",
             "causal_hypothesis": "expressJwt import was updated incorrectly",
-            "exact_intended_edits": "Use const { expressjwt } = require('express-jwt')",
+            "planned_replacements": [
+                {
+                    "file_path": "routes/auth.js",
+                    "old_text": "const expressJwt = require('express-jwt');",
+                    "new_text": "const { expressjwt } = require('express-jwt');",
+                }
+            ],
             "evidence_source": "https://github.com/advisories/GHSA-1234",
         },
         "id": "call-1",
     }
     tool_call_edit = {
-        "name": "deterministic_replace_ast_symbol",
+        "name": "deterministic_apply_edit_set",
         "args": {
-            "file_path": "routes/auth.js",
-            "symbol_name": "authMiddleware",
-            "replacement": "const { expressjwt } = require('express-jwt'); function authMiddleware() { return expressjwt({ secret: 'secret', algorithms: ['HS256'] }); }",
+            "replacements": [
+                {
+                    "file_path": "routes/auth.js",
+                    "old_text": "const expressJwt = require('express-jwt');",
+                    "new_text": "const { expressjwt } = require('express-jwt');",
+                }
+            ],
         },
         "id": "call-2",
     }
@@ -508,7 +525,7 @@ def test_express_jwt_mocked_end_to_end_scenario():
         patch("remediation_engine.tools.code_map.find_named_symbol") as mock_find_sym,
     ):
         sandbox_instance = mock_sandbox_cls.return_value.__enter__.return_value
-        source_text = "function authMiddleware() { return expressJwt({ secret: 'secret' }); }"
+        source_text = "const expressJwt = require('express-jwt');\nfunction authMiddleware() { return expressJwt({ secret: 'secret' }); }"
 
         def read_file(path):
             if path == "package.json":

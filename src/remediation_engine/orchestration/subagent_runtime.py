@@ -17,7 +17,7 @@ from remediation_engine.orchestration.trajectory_exporter import (
 )
 
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
-SANDBOX_NOT_RUNNING_MARKER = "Sandbox is not running,"
+SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
 
 
@@ -40,27 +40,61 @@ class SubagentRuntimeResult:
     errors: list[str]
 
 
-def _infer_changed_file(tool_event: ToolEvent) -> str | None:
-    """Infer a changed file path from a successful edit-like tool event."""
+def _contains_sandbox_not_running(content: str) -> bool:
+    """Return whether a tool result reports that the workspace sandbox stopped."""
+    return SANDBOX_NOT_RUNNING_MARKER in (content or "").lower()
+
+
+def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
+    """Infer changed file paths from a successful edit-like tool event."""
     if not tool_event.content.startswith("SUCCESS:"):
-        return None
+        return []
+
+    if tool_event.name == "deterministic_apply_edit_set":
+        if "JSON:" in tool_event.content:
+            try:
+                json_part = tool_event.content.split("JSON:", 1)[1].strip()
+                data = json.loads(json_part)
+                if isinstance(data, dict) and "affected_files" in data:
+                    return [str(f).replace("\\", "/").lstrip("/") for f in data["affected_files"]]
+            except Exception:
+                pass
+        repls = tool_event.args.get("replacements", [])
+        if isinstance(repls, str):
+            try:
+                repls = json.loads(repls)
+            except Exception:
+                repls = []
+        if isinstance(repls, list):
+            res = []
+            for r in repls:
+                if isinstance(r, dict) and "file_path" in r:
+                    res.append(str(r["file_path"]).replace("\\", "/").lstrip("/"))
+            return res
 
     if tool_event.name == "modify_npm_dependency":
         manifest_path = tool_event.args.get("manifest_path", "package.json")
         if isinstance(manifest_path, str) and manifest_path.strip():
-            return manifest_path.replace("\\", "/")
-        return "package.json"
+            return [manifest_path.replace("\\", "/")]
+        return ["package.json"]
 
     if tool_event.name in {
+        "deterministic_apply_edit_set",
         "deterministic_search_replace",
         "deterministic_replace_ast_symbol",
         "revert_workspace_file",
     }:
         file_path = tool_event.args.get("file_path")
         if isinstance(file_path, str) and file_path.strip():
-            return file_path.replace("\\", "/")
+            return [file_path.replace("\\", "/")]
 
-    return None
+    return []
+
+
+def _infer_changed_file(tool_event: ToolEvent) -> str | None:
+    """Infer a single changed file path for backwards compatibility."""
+    files = _infer_changed_files(tool_event)
+    return files[0] if files else None
 
 
 def _invoke_bound_tool(tool_map: dict[str, Any], tool_call: dict[str, Any]) -> ToolMessage:
@@ -147,10 +181,14 @@ def _stagnation_recovery_instruction(
             "Verify the test path is relative and the runner is supported, or proceed with AST "
             "inspection and syntax validation."
         )
-    elif tool_name in {"deterministic_search_replace", "deterministic_replace_ast_symbol"}:
+    elif tool_name in {
+        "deterministic_apply_edit_set",
+        "deterministic_search_replace",
+        "deterministic_replace_ast_symbol",
+    }:
         alternative = (
-            "Inspect the file using read_workspace_file or inspect_ast_symbol to verify the exact "
-            "anchor lines or line_hint before editing."
+            "Inspect the target files using read_workspace_file or inspect_ast_symbol to verify "
+            "exact anchor lines, expected_occurrences, and line_hints before recording a new complete replacement plan."
         )
 
     return (
@@ -180,6 +218,21 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
     evidence = (
         tool_content.strip()[:2400] or "The validation gate failed without diagnostic output."
     )
+    if "[INVALID_RUNTIME_SMOKE]" in evidence:
+        return (
+            "The validation request used an invalid runtime smoke target. Do not edit the code again. "
+            "Choose a lightweight repository source module (for example, the changed source module), "
+            "never a test/spec file or build/dist artifact, and keep it separate from the targeted test. "
+            "Call validate_workaround again with the corrected runtime_smoke_file.\n"
+            f"Exact validation-gate result:\n{evidence}"
+        )
+    if "Runtime smoke gate unavailable" in evidence or "Command timed out after" in evidence:
+        return (
+            "Runtime smoke could not complete because the execution environment timed out or stopped. "
+            "Do not reapply the same patch. Preserve the failure diagnostics and stop for an infrastructure "
+            "retry; an alternative targeted test cannot replace the required runtime-smoke gate.\n"
+            f"Exact validation-gate result:\n{evidence}"
+        )
     return (
         "The combined workaround validation gate failed; do not declare success.\n"
         "Exact validation-gate result:\n"
@@ -388,33 +441,44 @@ def run_bounded_subagent_loop(
                         )
                 else:
                     consecutive_validation_failures = 0
+                if event.content.startswith("ERROR: [INVALID_RUNTIME_SMOKE]"):
+                    conversation.append(
+                        HumanMessage(content=_validation_gate_recovery_instruction(event.content))
+                    )
 
-            inferred_path = _infer_changed_file(event)
-            if inferred_path:
+            inferred_paths = _infer_changed_files(event)
+            if inferred_paths:
                 if event.name == "revert_workspace_file":
-                    if inferred_path not in touched_files:
-                        observed_changed_files.discard(inferred_path)
+                    for path in inferred_paths:
+                        if path not in touched_files:
+                            observed_changed_files.discard(path)
                 else:
-                    observed_changed_files.add(inferred_path)
+                    observed_changed_files.update(inferred_paths)
 
             if (
                 execution_state is not None
                 and event.name
-                in {"deterministic_search_replace", "deterministic_replace_ast_symbol"}
+                in {
+                    "deterministic_apply_edit_set",
+                    "deterministic_search_replace",
+                    "deterministic_replace_ast_symbol",
+                }
                 and event.content.startswith("SUCCESS:")
             ):
                 conversation.append(
                     HumanMessage(
                         content=(
-                            "A source edit just succeeded. The lifecycle is now VALIDATE. "
-                            "Your next action must be validate_workaround with the complete "
-                            "modified-file list, an explicit runtime_smoke_file, and the "
-                            "required targeted test. Do not edit, re-plan, or browse first."
+                            "The patch was applied atomically; call validate_workaround now "
+                            "with the complete modified-file list, an explicit runtime_smoke_file, "
+                            "where runtime_smoke_file is a lightweight source module (not a test/spec "
+                            "or build/dist artifact) and is separate from the required targeted test. "
+                            "Your next action must be validate_workaround. "
+                            "Do not edit, re-plan, or browse first."
                         )
                     )
                 )
 
-            if SANDBOX_NOT_RUNNING_MARKER in tool_message.content:
+            if _contains_sandbox_not_running(tool_message.content):
                 # Do not return from inside this loop. The model may have
                 # emitted several tool calls in one assistant message and
                 # every call needs a matching ToolMessage before the next LLM
@@ -467,14 +531,15 @@ def run_bounded_subagent_loop(
             )
 
         if sandbox_stopped:
-            errors.extend(
-                [
-                    event.content
-                    for event in tool_events[-len(tool_calls) :]
-                    if SANDBOX_NOT_RUNNING_MARKER in event.content
-                ]
+            sandbox_errors = [
+                event.content
+                for event in tool_events[-len(tool_calls) :]
+                if _contains_sandbox_not_running(event.content)
+            ]
+            errors.extend(f"INFRASTRUCTURE_FAILURE: {message}" for message in sandbox_errors)
+            errors.append(
+                "INFRASTRUCTURE_FAILURE: Subagent stopped because the sandbox is no longer running."
             )
-            errors.append("Subagent stopped because the sandbox is no longer running.")
             return SubagentRuntimeResult(
                 final_text=final_text,
                 tool_events=tool_events,
@@ -552,6 +617,7 @@ def has_successful_validation_gate(
     tool_events: Sequence[ToolEvent],
     validation_tool_name: str = "validate_workaround",
     edit_tool_names: Sequence[str] = (
+        "deterministic_apply_edit_set",
         "deterministic_search_replace",
         "deterministic_replace_ast_symbol",
         "revert_workspace_file",
@@ -616,6 +682,7 @@ def has_tool_call_before_first_successful_edit(
     tool_events: Sequence[ToolEvent],
     lookup_tool_name: str,
     edit_tool_names: Sequence[str] | str = (
+        "deterministic_apply_edit_set",
         "deterministic_search_replace",
         "deterministic_replace_ast_symbol",
     ),

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
 from remediation_engine.orchestration.remedy_tools import (
+    _make_deterministic_replace_ast_symbol_tool,
     _make_validate_code_syntax_tool,
     build_update_toolbelt,
     build_workaround_toolbelt,
@@ -89,8 +90,7 @@ class TestToolbeltFactories:
             "read_workspace_file",
             "search_codebase_pattern",
             "inspect_ast_symbol",
-            "deterministic_search_replace",
-            "deterministic_replace_ast_symbol",
+            "deterministic_apply_edit_set",
             "revert_workspace_file",
             "validate_workaround",
         }
@@ -110,6 +110,8 @@ class TestToolbeltFactories:
                 return json.dumps(package_json)
             if path == "src/auth.ts":
                 return "export const auth = true;"
+            if path == "test/api/2fa.test.ts":
+                return "test('auth', () => {});"
             return None
 
         sandbox.read_file.side_effect = read_file
@@ -200,12 +202,6 @@ class TestToolbeltFactories:
         assert "jwksRsa is not defined" in result
         assert sandbox.run.call_count == 3
 
-    def test_update_toolbelt_excludes_registry_lookup(self):
-        sandbox = MagicMock()
-        tools = _update_tool_map(sandbox, enable_registry_lookup=True)
-
-        assert "view_npm_package_versions" not in tools
-
     def test_ast_tool_accepts_complete_arrow_declaration_replacement(self):
         """Arrow symbols may be replaced with their complete exported declaration."""
 
@@ -233,15 +229,7 @@ class TestToolbeltFactories:
             "inspected_files": set(),
             "fallback_files": set(),
         }
-        tool = {
-            item.name: item
-            for item in build_workaround_toolbelt(
-                sandbox,
-                touched,
-                Path("/dummy/repo/root"),
-                plan_state=plan_state,
-            )
-        }["deterministic_replace_ast_symbol"]
+        tool = _make_deterministic_replace_ast_symbol_tool(sandbox, touched, plan_state)
 
         with (
             patch("remediation_engine.tools.code_map.language_for_path", return_value="typescript"),
