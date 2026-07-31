@@ -38,6 +38,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -397,7 +398,7 @@ def _llm_triage(
         )
         return None
 
-    model_name = os.environ.get("TRIAGE_LLM_MODEL", "gpt-4o-mini")
+    model_name = AppSettings.from_env().triage_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
         structured_llm = llm.with_structured_output(TriageResult)

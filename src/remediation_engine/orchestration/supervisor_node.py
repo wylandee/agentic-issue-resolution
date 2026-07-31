@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 import uuid
 from collections.abc import Iterable
@@ -68,6 +67,7 @@ from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
+from remediation_engine.settings import AppSettings
 from remediation_engine.tools.registry_tools import plan_npm_version
 
 logger = logging.getLogger(__name__)
@@ -3158,7 +3158,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         try:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-            model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
+            model_name = AppSettings.from_env().supervisor_llm_model
             router_llm = ChatOpenAI(model=model_name, temperature=0)
             if _needs_planner(
                 task_queue,

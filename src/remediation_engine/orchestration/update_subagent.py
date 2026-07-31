@@ -32,6 +32,7 @@ from remediation_engine.orchestration.subagent_runtime import (
     run_bounded_subagent_loop,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -1217,7 +1218,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + [msg],
         }
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
+    model_name = AppSettings.from_env().update_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001

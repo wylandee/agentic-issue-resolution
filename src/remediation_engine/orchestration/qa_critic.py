@@ -60,6 +60,7 @@ from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -2724,7 +2725,7 @@ def _run_individual_investigations(
     """
     from langchain_openai import ChatOpenAI
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    model_name = AppSettings.from_env().qa_llm_model
     known_group_ids = {group.group_id for group in valid_groups}
     investigations: dict[str, GroupInvestigation] = {}
 
@@ -3020,7 +3021,7 @@ def _run_batch_judge(
     """
     from langchain_openai import ChatOpenAI
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    model_name = AppSettings.from_env().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(BatchQAResult)
 
     prompt = _build_batch_judge_prompt(
@@ -3456,7 +3457,7 @@ def _run_investigator_phase(
 
     from langchain_openai import ChatOpenAI
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    model_name = AppSettings.from_env().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0)
     initial_messages = [
         SystemMessage(content=system_prompt),
@@ -3526,7 +3527,7 @@ def _run_judge_phase(
     """Run the zero-shot Judge once per vulnerability group (backcompat)."""
     from langchain_openai import ChatOpenAI
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    model_name = AppSettings.from_env().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(QAEvaluation)
 
     evaluations: dict[str, QAEvaluation] = {}

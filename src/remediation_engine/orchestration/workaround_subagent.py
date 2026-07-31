@@ -41,6 +41,7 @@ from remediation_engine.orchestration.subagent_runtime import (
     run_bounded_subagent_loop,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -671,6 +672,7 @@ def _build_workaround_prompt(
                     "     - Apply one complete semantic patch per iteration using deterministic_apply_edit_set. An API migration must place its import, declaration, and all causally related call-site replacements in the same edit set.",
                     "  4. VERIFY & ITERATE",
                     "     - Call validate_workaround with complete modified-file list, a lightweight source-module runtime_smoke_file, and a separate targeted test file.",
+                    "     - If the targeted test returns INFRA_FAILURE or BLOCKED with infrastructure-only evidence, do not edit. Inspect one existing alternative test, call record_targeted_test_substitution with the original-to-alternative mapping and evidence, then retry validate_workaround once. Never substitute for an assertion, syntax, type, or application-runtime failure.",
                 ]
             )
         )
@@ -684,6 +686,7 @@ def _build_workaround_prompt(
                 "  - CODE_FAILURE rolls back the entire pending edit set to the pre-iteration checkpoint. The failed changes are no longer present; the next investigation and plan must re-include every required change from that set in one complete semantic patch.",
                 "  - PASS promotes the pending edit set into the validated cumulative patch. Previously validated edits remain in the workspace and do not need to be re-applied.",
                 "  - INFRA_FAILURE or BLOCKED retains the pending edit set for validation recovery. Do not re-apply the same patch; resolve the validation problem or use the permitted alternative targeted test path.",
+                "  - An alternative targeted test is bounded to one per iteration and requires: proven infrastructure-only failure, same behavior/security invariant, no dependency on the unavailable infrastructure, and recorded evidence for the mapping.",
                 "  - Always describe modified_files cumulatively: include every source file changed by the retained validated patch and the current pending edit set.",
             ]
         )
@@ -900,6 +903,7 @@ def _build_attempt_result(
     )
     mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
     mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
+    mapping_details = dict(p_state.get("original_to_alternative_test_details", {}))
     infra_details = (
         p_state.get("latest_infra_diagnostics")
         or p_state.get("last_infrastructure_diagnostics")
@@ -914,6 +918,7 @@ def _build_attempt_result(
         final_selected_targeted_test=selected_test,
         original_to_alternative_test_mapping=mapping,
         alternative_test_mapping_evidence=mapping_evidence,
+        alternative_test_mapping_details=mapping_details,
         validated_files=val_files,
         infrastructure_failure_details=infra_details,
     )
@@ -1001,7 +1006,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
 
-    model_name = os.environ.get("REMEDY_LLM_MODEL", _DEFAULT_MODEL)
+    model_name = AppSettings.from_env().workaround_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
@@ -1293,6 +1298,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     )
     mapping = dict(p_state.get("original_to_alternative_test_mapping", {}))
     mapping_evidence = dict(p_state.get("original_to_alternative_test_evidence", {}))
+    mapping_details = dict(p_state.get("original_to_alternative_test_details", {}))
     infra_details = (
         p_state.get("latest_infra_diagnostics")
         or p_state.get("last_infrastructure_diagnostics")
@@ -1317,6 +1323,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         final_selected_targeted_test=selected_test,
         original_to_alternative_test_mapping=mapping,
         alternative_test_mapping_evidence=mapping_evidence,
+        alternative_test_mapping_details=mapping_details,
         infrastructure_failure_details=infra_details,
     )
 

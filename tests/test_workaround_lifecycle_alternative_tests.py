@@ -280,9 +280,66 @@ def test_runtime_smoke_timeout_is_blocked_and_recorded_as_infrastructure():
     assert "Command timed out after 30s." in plan_state["infrastructure_failure_details"]
 
 
+def test_runtime_smoke_replaces_bootstrap_target_with_changed_source_module():
+    sandbox, _ = _mock_sandbox(
+        {
+            "app.ts": "validateDependenciesBasic(); server.start();",
+            "src/auth.ts": "export const authorize = () => true;",
+        }
+    )
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(sandbox, {"src/auth.ts"}, plan_state)
+
+    result = val_tool.invoke({"modified_files": ["src/auth.ts"], "runtime_smoke_file": "app.ts"})
+
+    assert "SUCCESS:" in str(result)
+    assert "selected lightweight source module 'src/auth.ts'" in str(result)
+    assert plan_state["runtime_smoke_file"] == "src/auth.ts"
+    assert all("app.ts" not in call.args[0] for call in sandbox.run.call_args_list)
+
+
+def test_runtime_smoke_failure_after_fallback_is_not_hidden_by_selection_note():
+    sandbox, _ = _mock_sandbox(
+        {
+            "app.ts": "validateDependenciesBasic(); server.start();",
+            "src/auth.ts": "export const authorize = () => true;",
+        }
+    )
+    sandbox.run.side_effect = [
+        MagicMock(exit_code=0, stdout="", stderr=""),
+        MagicMock(exit_code=0, stdout="", stderr=""),
+        MagicMock(exit_code=0, stdout="", stderr=""),
+        MagicMock(exit_code=1, stdout="", stderr="TypeError: bad import"),
+    ]
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(sandbox, {"src/auth.ts"}, plan_state)
+
+    result = val_tool.invoke({"modified_files": ["src/auth.ts"], "runtime_smoke_file": "app.ts"})
+
+    assert "validation gate 'runtime_smoke' failed" in str(result)
+    assert plan_state["validation_passed"] is False
+
+
+def test_runtime_smoke_rejects_bootstrap_when_no_safe_changed_module_exists():
+    sandbox, _ = _mock_sandbox({"app.ts": "validateDependenciesBasic(); server.start();"})
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(sandbox, {"app.ts"}, plan_state)
+
+    result = val_tool.invoke({"modified_files": ["app.ts"], "runtime_smoke_file": "app.ts"})
+
+    assert "ERROR: [INVALID_RUNTIME_SMOKE]" in str(result)
+    assert "no lightweight changed source module" in str(result)
+    assert sandbox.run.call_count == 0
+
+
 def test_missing_sqlite_native_bindings_classified_as_infra_only():
     err = "Error: Cannot find module 'better-sqlite3' or missing native bindings"
     assert _is_infrastructure_failure(err) is True
+
+
+def test_missing_bare_dependency_is_classified_as_infra_only():
+    assert _is_infrastructure_failure("Error: Cannot find module 'undici'") is True
+    assert _is_infrastructure_failure("Error: Cannot find module './auth.js'") is False
 
 
 def test_assertion_failures_not_classified_as_infra_only():
@@ -384,6 +441,12 @@ def test_alternative_test_accepted_when_criteria_pass():
     assert "SUCCESS:" in str(res)
     assert plan_state["accepted_alternative_test"] == "test/alt.test.js"
     assert plan_state["original_to_alternative_test_evidence"]["test/orig.test.js"] == ["GHSA-1234"]
+    assert plan_state["original_to_alternative_test_details"]["test/orig.test.js"] == {
+        "infrastructure_failure_evidence": "Missing native sqlite3",
+        "shared_behavior_explanation": "Tests auth invariant",
+        "infrastructure_avoidance_explanation": "Uses mock DB instead of sqlite3",
+        "evidence_sources": "GHSA-1234",
+    }
 
 
 def test_real_workaround_toolbelt_requires_explicit_smoke_and_targeted_test():

@@ -1169,6 +1169,7 @@ class WorkaroundValidationResult(BaseModel):
     targeted_test: str = ""
     targeted_test_file: str | None = None
     alternative_used: bool = False
+    alternative_test_mapping_details: dict[str, dict[str, str]] = Field(default_factory=dict)
     validated_files: list[str] = Field(default_factory=list)
     failure_category: FailureCategory | None = None
     infrastructure_diagnostics: str | None = None
@@ -1379,6 +1380,7 @@ class WorkerExecutionDiagnostics(BaseModel):
     final_selected_targeted_test: str | None = None
     original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
     alternative_test_mapping_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    alternative_test_mapping_details: dict[str, dict[str, str]] = Field(default_factory=dict)
     validated_files: list[str] = Field(default_factory=list)
     infrastructure_failure_details: str | None = None
 
@@ -1442,6 +1444,7 @@ class WorkaroundReplayPlan(BaseModel):
     final_selected_targeted_test: str | None = None
     original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
     alternative_test_mapping_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    alternative_test_mapping_details: dict[str, dict[str, str]] = Field(default_factory=dict)
     infrastructure_failure_details: str | None = None
 
     @model_validator(mode="before")

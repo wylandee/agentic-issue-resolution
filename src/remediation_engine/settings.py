@@ -23,6 +23,10 @@ class AppSettings:
     remedy_llm_model: str = "gpt-4o-mini"
     triage_llm_enabled: bool = False
     triage_llm_model: str = "gpt-4o-mini"
+    supervisor_llm_model: str = "gpt-4o-mini"
+    update_llm_model: str = "gpt-4o-mini"
+    workaround_llm_model: str = "gpt-4o-mini"
+    qa_llm_model: str = "gpt-4o-mini"
     serper_api_key: str = ""
     odc_extra_args: str = ""
     langsmith_tracing: bool = False
@@ -38,11 +42,23 @@ class AppSettings:
     def from_env(cls) -> AppSettings:
         """Build settings from the process environment without side effects."""
         trajectory = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
+        default_model = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini").strip()
+        if not default_model:
+            default_model = "gpt-4o-mini"
+
+        def model_override(name: str) -> str:
+            """Return a node-specific model or the legacy remedy fallback."""
+            return os.environ.get(name, "").strip() or default_model
+
         return cls(
             openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
-            remedy_llm_model=os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini").strip(),
+            remedy_llm_model=default_model,
             triage_llm_enabled=_env_bool("TRIAGE_LLM_ENABLED"),
             triage_llm_model=os.environ.get("TRIAGE_LLM_MODEL", "gpt-4o-mini").strip(),
+            supervisor_llm_model=model_override("SUPERVISOR_LLM_MODEL"),
+            update_llm_model=model_override("UPDATE_LLM_MODEL"),
+            workaround_llm_model=model_override("WORKAROUND_LLM_MODEL"),
+            qa_llm_model=model_override("QA_LLM_MODEL"),
             serper_api_key=os.environ.get("SERPER_API_KEY", "").strip(),
             odc_extra_args=os.environ.get("ODC_EXTRA_ARGS", "").strip(),
             langsmith_tracing=_env_bool("LANGSMITH_TRACING"),

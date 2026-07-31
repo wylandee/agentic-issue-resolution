@@ -58,6 +58,30 @@ _READ_WEB_PAGE_MAX_CHARS = 16_000
 _SOURCE_MODULE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"})
 _TEST_DIRECTORY_NAMES = frozenset({"test", "tests", "__tests__"})
 
+# Runtime smoke must prove that the changed module can load.  Application
+# entrypoints are deliberately excluded because importing them can start a
+# server, connect to a database, or perform other work unrelated to the
+# changed behavior.  These markers are intentionally conservative: a module
+# is rejected only when its source contains an unmistakable bootstrap call.
+_RUNTIME_BOOTSTRAP_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(?:app|server)\.listen\s*\(", re.IGNORECASE), "starts an application listener"),
+    (re.compile(r"\b(?:app|server)\.(?:start|run)\s*\(", re.IGNORECASE), "starts the application"),
+    (
+        re.compile(r"\bvalidateDependencies(?:Basic)?\s*\(", re.IGNORECASE),
+        "runs dependency/bootstrap validation",
+    ),
+    (
+        re.compile(r"\b(?:initialize|init)(?:Database|Db|Server|App)\s*\(", re.IGNORECASE),
+        "initializes application infrastructure",
+    ),
+    (
+        re.compile(
+            r"\b(?:mongoose|sequelize|prisma)\s*\.?(?:connect|initialize)\s*\(", re.IGNORECASE
+        ),
+        "connects to application infrastructure",
+    ),
+)
+
 
 def _is_authoritative_evidence_source(source: str) -> bool:
     """Return whether an evidence source URL or path is authoritative."""
@@ -101,6 +125,20 @@ def _is_infrastructure_failure(error_text: str) -> bool:
     if not text:
         return False
     lowered = text.lower()
+
+    # A missing bare package is a test-runner/install precondition failure.
+    # Relative and absolute paths remain code failures because the workaround
+    # may have introduced a bad local import.  The substitution gate records
+    # the exact diagnostic and independently checks that the replacement does
+    # not import the unavailable package.
+    missing_module = re.search(
+        r"cannot find module\s+['\"]([^'\"]+)['\"]|module not found[^'\"]*['\"]([^'\"]+)['\"]",
+        lowered,
+    )
+    if missing_module:
+        module_name = next((group for group in missing_module.groups() if group), "")
+        if module_name and not module_name.startswith((".", "/", "file:")):
+            return True
 
     # Code failure markers MUST NOT qualify as infrastructure-only failures
     code_failure_markers = (
@@ -149,6 +187,104 @@ def _is_infrastructure_failure(error_text: str) -> bool:
         "timed out after",
     )
     return any(marker in lowered for marker in infra_markers)
+
+
+def _runtime_smoke_bootstrap_reason(file_path: str, source_content: str) -> str | None:
+    """Return why a source module is unsafe for import-only runtime smoke.
+
+    Args:
+        file_path: Repository-relative source path being considered.
+        source_content: Current source contents for ``file_path``.
+
+    Returns:
+        A short reason when the module appears to bootstrap the application;
+        otherwise ``None``.
+    """
+    normalized = _normalise_newlines(source_content)
+    for pattern, reason in _RUNTIME_BOOTSTRAP_MARKERS:
+        if pattern.search(normalized):
+            return reason
+    return None
+
+
+def _select_lightweight_runtime_smoke_target(
+    requested_file: str,
+    candidate_files: Sequence[str],
+    targeted_test_file: str | None,
+    sandbox: DockerSandbox,
+) -> tuple[str | None, str | None]:
+    """Select a safe source module for import-only runtime smoke.
+
+    An explicitly supplied test, compiled artifact, missing file, or invalid
+    path is rejected.  If the requested source module is an application
+    bootstrap, the selector falls back to the first changed source module
+    that can be imported without starting the application.  The caller records
+    the selected path in validation state so the evidence reflects what ran.
+
+    Args:
+        requested_file: Agent-provided runtime smoke path.
+        candidate_files: Current modified source files to consider as a safe
+            fallback, in deterministic order.
+        targeted_test_file: Targeted test path, if already selected.
+        sandbox: Workspace sandbox used to read source contents.
+
+    Returns:
+        ``(selected_path, note)`` on success. ``note`` explains a fallback
+        selection. On failure, returns ``(None, diagnostic)``.
+    """
+    normalized_requested, path_error = _runtime_smoke_path_error(
+        requested_file,
+        targeted_test_file=targeted_test_file,
+    )
+    if path_error:
+        return None, path_error
+    assert normalized_requested is not None
+
+    requested_content = sandbox.read_file(normalized_requested)
+    if requested_content is None:
+        return None, (
+            f"Source module '{normalized_requested}' could not be found. "
+            "Use read_repository_map or read_workspace_file to resolve a source path."
+        )
+
+    requested_reason = _runtime_smoke_bootstrap_reason(
+        normalized_requested,
+        requested_content,
+    )
+    if requested_reason is None:
+        return normalized_requested, None
+
+    normalized_candidates: list[str] = []
+    for raw_path in candidate_files:
+        try:
+            candidate = _validate_workspace_path(str(raw_path))
+        except ValueError:
+            continue
+        if candidate in normalized_candidates:
+            continue
+        if candidate in (normalized_requested, targeted_test_file):
+            continue
+        if Path(candidate).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+            continue
+        if _is_test_file_path(candidate):
+            continue
+        content = sandbox.read_file(candidate)
+        if content is None:
+            continue
+        if _runtime_smoke_bootstrap_reason(candidate, content) is None:
+            normalized_candidates.append(candidate)
+
+    if normalized_candidates:
+        selected = normalized_candidates[0]
+        return selected, (
+            f"Requested runtime smoke target '{normalized_requested}' was not used because it "
+            f"{requested_reason}; selected lightweight source module '{selected}' instead."
+        )
+
+    return None, (
+        f"Runtime smoke target '{normalized_requested}' is unsafe because it {requested_reason}, "
+        "and no lightweight changed source module was available as a replacement."
+    )
 
 
 def _is_test_file_path(file_path: str) -> bool:
@@ -1877,14 +2013,18 @@ def _make_validate_workaround_tool(
                 )
 
         smoke_target = runtime_smoke_file
+        smoke_selection_note = ""
         if smoke_target is not None and smoke_target.strip():
-            normalized_smoke, smoke_error = _runtime_smoke_path_error(
+            normalized_smoke, smoke_selection_message = _select_lightweight_runtime_smoke_target(
                 smoke_target,
+                files,
                 targeted_test_file=targeted_test_file,
+                sandbox=sandbox,
             )
-            if smoke_error:
-                return f"ERROR: [INVALID_RUNTIME_SMOKE] {smoke_error}"
+            if normalized_smoke is None:
+                return f"ERROR: [INVALID_RUNTIME_SMOKE] {smoke_selection_message}"
             smoke_target = normalized_smoke
+            smoke_selection_note = smoke_selection_message or ""
 
         syntax_msg = ""
         for file_path in files:
@@ -1982,8 +2122,13 @@ def _make_validate_workaround_tool(
                 ),
                 None,
             )
-        smoke_msg = _run_runtime_smoke_gate(smoke_target)
-        if smoke_msg.startswith("BLOCKED:"):
+        runtime_smoke_result = _run_runtime_smoke_gate(smoke_target)
+        smoke_msg = runtime_smoke_result
+        if smoke_selection_note:
+            smoke_msg = f"{smoke_selection_note}\n{smoke_msg}"
+        if smoke_target:
+            plan_state["runtime_smoke_file"] = smoke_target
+        if runtime_smoke_result.startswith("BLOCKED:"):
             res = _record_result(
                 WorkaroundValidationResult(
                     overall_status=WorkaroundValidationStatus.BLOCKED,
@@ -1993,7 +2138,7 @@ def _make_validate_workaround_tool(
                 )
             )
             return f"{smoke_msg}\nJSON: {res.model_dump_json()}"
-        if smoke_msg.startswith("FAILURE:"):
+        if runtime_smoke_result.startswith("FAILURE:"):
             res = _record_result(
                 WorkaroundValidationResult(
                     overall_status=WorkaroundValidationStatus.CODE_FAILURE,
@@ -2111,6 +2256,9 @@ def _make_validate_workaround_tool(
                 targeted_test=test_msg,
                 targeted_test_file=test_file,
                 alternative_used=alt_used,
+                alternative_test_mapping_details=dict(
+                    plan_state.get("original_to_alternative_test_details", {})
+                ),
                 validated_files=files,
             )
         )
@@ -2531,6 +2679,12 @@ def _make_record_targeted_test_substitution_tool(
         if norm_alt == norm_orig:
             return "ERROR: [SUBSTITUTION_REJECTED] alternative_test must be different from original_test."
 
+        if not _is_test_file_path(norm_alt):
+            return (
+                f"ERROR: [SUBSTITUTION_REJECTED] alternative_test '{norm_alt}' must be an existing "
+                "repository test/spec file. A source module cannot replace the targeted test."
+            )
+
         # 4. Verify alternative test file has been locally inspected
         inspected_files = plan_state.get("inspected_files", set()) | plan_state.get(
             "read_files", set()
@@ -2569,10 +2723,16 @@ def _make_record_targeted_test_substitution_tool(
         plan_state.setdefault("original_to_alternative_test_evidence", {})[norm_orig] = (
             cleaned_ev_sources
         )
+        plan_state.setdefault("original_to_alternative_test_details", {})[norm_orig] = {
+            "infrastructure_failure_evidence": infra_ev,
+            "shared_behavior_explanation": shared_exp,
+            "infrastructure_avoidance_explanation": avoid_exp,
+            "evidence_sources": ", ".join(cleaned_ev_sources),
+        }
 
         return (
             f"SUCCESS: Registered alternative targeted test '{norm_alt}' as full replacement for "
-            f"'{norm_orig}' in iteration {curr_iter}."
+            f"'{norm_orig}' in iteration {curr_iter}. Mapping evidence recorded."
         )
 
     return record_targeted_test_substitution
