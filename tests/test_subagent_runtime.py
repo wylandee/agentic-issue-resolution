@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from remediation_engine.orchestration.subagent_runtime import (
     ToolEvent,
+    _validation_gate_recovery_instruction,
     has_successful_validation_gate,
     run_bounded_subagent_loop,
 )
@@ -172,6 +173,19 @@ def test_validation_gate_can_validate_replayed_edits() -> None:
 
     assert has_successful_validation_gate(events) is False
     assert has_successful_validation_gate(events, has_prior_edits=True) is True
+
+
+def test_validation_recovery_explains_checkpoint_behavior() -> None:
+    """Tell the worker which edit state each validation outcome leaves behind."""
+    instruction = _validation_gate_recovery_instruction(
+        'FAILURE: targeted test failed\nJSON: {"overall_status":"CODE_FAILURE"}'
+    )
+
+    assert "entire pending edit set has been reverted" in instruction
+    assert "re-include every required change" in instruction
+    assert "Previously validated edits remain" in instruction
+    assert "pending edit set is retained" in instruction
+    assert "do not re-apply it" in instruction
 
 
 def test_successful_workaround_edit_injects_immediate_validation_instruction() -> None:

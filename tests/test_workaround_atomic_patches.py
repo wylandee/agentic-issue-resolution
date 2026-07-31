@@ -70,6 +70,8 @@ def test_workaround_tools_expose_typed_flat_replacement_schema():
     )
     assert "flat list" in plan_tool.description
     assert "flat replacement object" in edit_tool.description
+    assert "pending until" in edit_tool.description
+    assert "pre-iteration snapshot" in edit_tool.description
     assert '"file_path"' in plan_tool.description
     assert '"old_text"' in edit_tool.description
 
@@ -401,7 +403,8 @@ def test_validation_outcomes_commit_and_rollback():
         }
     )
 
-    edit_tool.invoke({"replacements": planned_repls})
+    edit_res = edit_tool.invoke({"replacements": planned_repls})
+    assert "pending validation" in edit_res
     assert plan_state["pending_edit_set"] is not None
 
     val_res = val_tool.invoke({"modified_files": ["src/a.js"]})

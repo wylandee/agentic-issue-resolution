@@ -732,6 +732,13 @@ def _make_deterministic_apply_edit_set_tool(
     ) -> str:
         """Apply one atomic edit set containing exact planned replacements.
 
+        The edit set is written immediately but remains pending until
+        ``validate_workaround`` returns ``PASS``. A code-failing validation
+        restores the pre-iteration snapshot, so a revised plan must include
+        every required change from the failed set again. Infrastructure or
+        blocked validation results retain the pending set for recovery; a
+        passing validation promotes it to the validated cumulative patch.
+
         Each item in ``replacements`` must be a flat replacement object. Do not
         nest replacements under a file-level ``path`` or ``replacements`` key.
 
@@ -925,7 +932,11 @@ def _make_deterministic_apply_edit_set_tool(
             "replacement_count": len(edits),
             "phase_transition": "EXECUTE -> VALIDATE",
         }
-        return f"SUCCESS: Atomic edit set '{patch_id}' applied successfully.\nJSON: {json.dumps(res_dict)}"
+        return (
+            f"SUCCESS: Atomic edit set '{patch_id}' applied successfully and is pending validation. "
+            "A CODE_FAILURE will restore the pre-iteration checkpoint; a PASS will commit this edit set.\n"
+            f"JSON: {json.dumps(res_dict)}"
+        )
 
     return deterministic_apply_edit_set
 
@@ -2117,7 +2128,8 @@ def _make_validate_workaround_tool(
             "SUCCESS: Workaround validation gate passed. "
             f"Validated files: {', '.join(files)}; "
             f"runtime smoke: {smoke_target}; "
-            f"targeted test: {test_file or 'skipped'}.\n"
+            f"targeted test: {test_file or 'skipped'}. "
+            "The pending edit set is now committed as part of the validated cumulative patch.\n"
             f"JSON: {res.model_dump_json()}"
         )
 

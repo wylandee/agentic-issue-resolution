@@ -326,6 +326,10 @@ def test_build_workaround_prompt_biphasic():
     prompt_initial = _build_workaround_prompt(task, group, workaround_context=ctx_initial)
     assert "WORKFLOW PHASE: INITIAL_MITIGATION" in prompt_initial
     assert "=== OPERATING PRINCIPLES ===" in prompt_initial
+    assert "=== EDIT CHECKPOINT CONTRACT ===" in prompt_initial
+    assert "CODE_FAILURE rolls back the entire pending edit set" in prompt_initial
+    assert "re-include every required change" in prompt_initial
+    assert "INFRA_FAILURE or BLOCKED retains the pending edit set" in prompt_initial
 
     evidence = QAFailureEvidence(
         exact_diagnostics=["(0, import_express_jwt.default) is not a function"],
@@ -340,6 +344,7 @@ def test_build_workaround_prompt_biphasic():
     assert "WORKFLOW PHASE: QA_REGRESSION_REPAIR" in prompt_repair
     assert "=== QA FAILURE EVIDENCE ===" in prompt_repair
     assert "(0, import_express_jwt.default) is not a function" in prompt_repair
+    assert "Previously validated edits remain" in prompt_repair
 
 
 def test_workaround_toolbelt_ast_gate_and_search_enrichment():

@@ -678,6 +678,20 @@ def _build_workaround_prompt(
     sections.append(
         "\n".join(
             [
+                "=== EDIT CHECKPOINT CONTRACT ===",
+                "  - The workspace consists of the baseline plus any previously validated or replayed edit sets.",
+                "  - Each deterministic_apply_edit_set creates one pending edit set. It is provisional until validate_workaround returns PASS.",
+                "  - CODE_FAILURE rolls back the entire pending edit set to the pre-iteration checkpoint. The failed changes are no longer present; the next investigation and plan must re-include every required change from that set in one complete semantic patch.",
+                "  - PASS promotes the pending edit set into the validated cumulative patch. Previously validated edits remain in the workspace and do not need to be re-applied.",
+                "  - INFRA_FAILURE or BLOCKED retains the pending edit set for validation recovery. Do not re-apply the same patch; resolve the validation problem or use the permitted alternative targeted test path.",
+                "  - Always describe modified_files cumulatively: include every source file changed by the retained validated patch and the current pending edit set.",
+            ]
+        )
+    )
+
+    sections.append(
+        "\n".join(
+            [
                 "=== PROHIBITIONS & ANTI-PATTERNS ===",
                 "- ❌ NEVER modify package.json, package-lock.json, pom.xml, or any dependency manifest.",
                 "- ❌ NEVER modify test files to make assertions pass.",
