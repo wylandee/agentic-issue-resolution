@@ -1,9 +1,10 @@
-"""Run a private Express-JWT workaround-only replay.
+"""Run a private Express-JWT workaround replay followed by QA.
 
 The replay deliberately starts from the repository clone, prepares the
 post-update dependency state inside an ephemeral Docker volume, and dispatches
-only the workaround worker bridge. It is intended for manual LangSmith/LLM
-trials and is not part of the public remediation workflow.
+the workaround worker bridge and then the QA Critic against the same volume. It
+is intended for manual LangSmith/LLM trials and is not part of the public
+remediation workflow.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hashlib
 import json
 import logging
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -30,6 +32,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundPhase,
 )
 from remediation_engine.orchestration.graph import (
+    run_qa_critic_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
 from remediation_engine.orchestration.langsmith_config import (
@@ -222,13 +225,6 @@ def _seed_post_update_workspace(
     if source_before is None:
         raise RuntimeError(f"Seed workspace is missing {source_file}.")
 
-    ci_cmd = str(
-        fixture["workspace_seed"].get(
-            "ci_command",
-            "npm ci --ignore-scripts --no-audit --no-fund",
-        )
-    )
-
     commands = [
         (
             "set_manifest_version",
@@ -291,10 +287,8 @@ def _seed_post_update_workspace(
     installed_pkg_text = sandbox.read_file(f"node_modules/{package_name}/package.json")
     installed_version = None
     if installed_pkg_text:
-        try:
+        with suppress(json.JSONDecodeError):
             installed_version = json.loads(installed_pkg_text).get("version")
-        except json.JSONDecodeError:
-            pass
 
     if installed_version != target_version:
         raise RuntimeError(
@@ -361,6 +355,38 @@ def _merge_worker_result(state: dict[str, Any], result: dict[str, Any]) -> None:
         state["errors"] = list(dict.fromkeys([*state.get("errors", []), *result["errors"]]))
 
 
+def _merge_qa_result(state: dict[str, Any], result: dict[str, Any]) -> None:
+    """Merge QA output before teardown reconciles task status and extracts a diff.
+
+    The normal graph sends the QA result through the Supervisor before teardown.
+    This replay invokes QA directly, so the result must be copied into the
+    mutable state explicitly. In particular, ``qa_evaluations`` and
+    ``qa_results_by_attempt`` are required by the teardown reconciliation
+    barrier to mark the replayed task as QA-passed or unfixable.
+
+    Args:
+        state: Mutable replay state to update.
+        result: Output from :func:`run_qa_critic_from_orchestrator`.
+    """
+    for key in (
+        "qa_evaluations",
+        "qa_results_by_attempt",
+        "eval_status",
+        "qa_investigation_report",
+        "baseline_scan_identifiers",
+        "post_remediation_scan_identifiers",
+        "post_remediation_scan_issues",
+        "new_vulnerability_identifiers",
+        "new_vulnerability_status",
+        "triage_required",
+    ):
+        if key in result:
+            state[key] = result[key]
+
+    if result.get("errors"):
+        state["errors"] = list(dict.fromkeys([*state.get("errors", []), *result["errors"]]))
+
+
 def _jsonable(value: Any) -> Any:
     """Convert contract values and enums into JSON-serializable values."""
     if hasattr(value, "model_dump"):
@@ -377,13 +403,13 @@ def _jsonable(value: Any) -> Any:
 
 
 @traceable(
-    name="Express_JWT_Workaround_Only_Replay",
+    name="Express_JWT_Workaround_Replay_With_QA",
     run_type="chain",
     metadata=_REPLAY_METADATA,
-    tags=["express-jwt", "workaround-only", "qa-regression-repair", "replay"],
+    tags=["express-jwt", "workaround", "qa-critic", "qa-regression-repair", "replay"],
 )
 def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
-    """Execute the Docker-seeded workaround-only replay.
+    """Execute the Docker-seeded workaround replay and QA validation.
 
     Args:
         repo_root: Host clone used as the immutable workspace source and diff
@@ -391,8 +417,8 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
         fixture: Explicit replay fixture payload.
 
     Returns:
-        JSON-serializable replay outcome including worker summaries, cleanup
-        status, and the unified patch.
+        JSON-serializable replay outcome including worker summaries, QA
+        evaluations, cleanup status, and the unified patch.
 
     Side effects:
         Creates and removes a temporary Docker volume, invokes the workaround
@@ -403,6 +429,7 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
     state = _build_replay_state(repo_path, fixture)
     seed_diagnostics: list[dict[str, Any]] = []
     worker_result: dict[str, Any] = {}
+    qa_result: dict[str, Any] = {}
     teardown_result: dict[str, Any] = {}
 
     try:
@@ -423,6 +450,13 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
         # QA regression evidence through the normal workaround bridge.
         worker_result = run_workaround_subagent_from_orchestrator(state)
         _merge_worker_result(state, worker_result)
+
+        # Run QA against the same post-workaround volume before teardown. This
+        # mirrors the graph's worker -> QA handoff while retaining the replay's
+        # direct bridge invocation. The merged QA envelopes are then consumed
+        # by teardown's reconciliation barrier.
+        qa_result = run_qa_critic_from_orchestrator(state)
+        _merge_qa_result(state, qa_result)
     except Exception as exc:  # noqa: BLE001
         message = f"Express-JWT workaround replay failed before completion: {exc}"
         logger.exception(message)
@@ -442,10 +476,13 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
     worker_status = None
     if action_summaries:
         worker_status = action_summaries[-1].get("status")
+    qa_status = qa_result.get("status")
+    qa_eval_status = qa_result.get("eval_status")
+    qa_passed = qa_status == "qa_completed" and qa_eval_status == "all_passed"
     cleanup_ok = not workspace_volume or teardown_result.get("workspace_volume") is None
     replay_status = (
         "success"
-        if worker_status == "success" and not state.get("errors") and cleanup_ok
+        if worker_status == "success" and qa_passed and not state.get("errors") and cleanup_ok
         else "surrender"
     )
 
@@ -467,6 +504,12 @@ def _execute_replay(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
                 "changed_files": state.get("changed_files", [])
                 if replay_status == "success"
                 else [],
+            },
+            "qa": {
+                **qa_result,
+                "passed": qa_passed,
+                "status": qa_status,
+                "eval_status": qa_eval_status,
             },
             "teardown": {
                 "status": teardown_result.get("status"),
@@ -584,6 +627,8 @@ def main() -> int:
     assert result is not None
     _write_outputs(result, output_path.resolve(), patch_path.resolve())
     print(f"Replay status: {result['status']}")
+    qa_output = result.get("qa", {})
+    print(f"QA status: {qa_output.get('status')} ({qa_output.get('eval_status')})")
     print(f"Result JSON: {output_path.resolve()}")
     print(f"Unified patch: {patch_path.resolve()}")
     return 0 if result["status"] == "success" else 1
