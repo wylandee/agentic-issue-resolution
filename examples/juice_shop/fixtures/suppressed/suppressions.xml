@@ -38,6 +38,36 @@
     </suppress>
 
     <suppress>
+        <notes>Suppress all vulnerabilities for @tootallnate/once:1.1.2</notes>
+        <packageUrl regex="true">^pkg:npm/%40tootallnate%2Fonce@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for base64url:0.0.6</notes>
+        <packageUrl regex="true">^pkg:npm/base64url@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suprress all vulnerabilities for bench.js</notes>
+        <packageUrl regex="true">^pkg:javascript/underscore\.js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for blaze.jar (shaded: commons-io:commons-io:2.4)</notes>
+        <packageUrl regex="true">^pkg:maven/commons-io/commons-io@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for blaze.jar</notes>
+        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
         <notes>Suppress all vulnerabilities for body-parser</notes>
         <packageUrl regex="true">^pkg:npm/body-parser@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
@@ -46,6 +76,12 @@
     <suppress>
         <notes>Suppress all vulnerabilities for brace-expansion</notes>
         <packageUrl regex="true">^pkg:npm/brace-expansion@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for cookie:0.4.2</notes>
+        <packageUrl regex="true">^pkg:npm/cookie@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
@@ -104,8 +140,20 @@
     </suppress>
 
     <suppress>
+        <notes>Suppress all vulnerabilities for grunt-cli:1.5.0</notes>
+        <packageUrl regex="true">^pkg:npm/grunt-cli@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
         <notes>Suppress all vulnerabilities for hono</notes>
         <packageUrl regex="true">^pkg:npm/hono@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for http-cache-semantics:3.8.1</notes>
+        <packageUrl regex="true">^pkg:npm/http-cache-semantics@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
@@ -124,6 +172,12 @@
     <suppress>
         <notes>Suppress all vulnerabilities for jws</notes>
         <packageUrl regex="true">^pkg:npm/jws@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for lodash.js</notes>
+        <packageUrl regex="true">^pkg:javascript/lodash@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
