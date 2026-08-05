@@ -237,7 +237,7 @@ def test_targeted_test_command_construction():
     assert runner == "mocha"
 
     cmd = build_targeted_test_command("mocha", "test/jwt.test.js", "missing algorithms")
-    assert cmd == "npm test -- test/jwt.test.js --grep 'missing algorithms'"
+    assert cmd == "npm test -- test/jwt.test.js --grep 'missing algorithms' --reporter json"
 
     jest_cmd = build_targeted_test_command("jest", "test/app.test.js", "login test")
     assert jest_cmd == "npm test -- test/app.test.js -t 'login test'"

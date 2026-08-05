@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from remediation_engine.contracts.schemas import CommandResult
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
+    _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
     build_update_toolbelt,
     build_workaround_toolbelt,
@@ -178,7 +179,25 @@ class TestToolbeltFactories:
         sandbox.read_file.side_effect = read_file
         sandbox.run.return_value = CommandResult(
             exit_code=0,
-            stdout="targeted test passed",
+            stdout=json.dumps(
+                {
+                    "stats": {"tests": 1, "passes": 1, "failures": 0, "pending": 0},
+                    "tests": [
+                        {
+                            "title": "cannot be bypassed by exploiting lack of recursive sanitization",
+                            "fullTitle": "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization",
+                        }
+                    ],
+                    "passes": [
+                        {
+                            "title": "cannot be bypassed by exploiting lack of recursive sanitization",
+                            "fullTitle": "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization",
+                        }
+                    ],
+                    "failures": [],
+                    "pending": [],
+                }
+            ),
             stderr="",
             duration_seconds=0.1,
         )
@@ -197,13 +216,15 @@ class TestToolbeltFactories:
                 "modified_files": ["src/auth.ts"],
                 "runtime_smoke_file": "src/auth.ts",
                 "targeted_test_file": "test/server/insecuritySpec.ts",
+                "targeted_test_name": "sanitizeSecure - cannot be bypassed by exploiting lack of recursive sanitization",
             }
         )
 
         assert result.startswith("SUCCESS: Workaround validation gate passed")
         assert any(
-            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts --grep "
             in call.args[0]
+            and call.args[0].endswith("--reporter json")
             for call in sandbox.run.call_args_list
         )
 
@@ -226,6 +247,88 @@ class TestToolbeltFactories:
 
         assert result.startswith("FAILURE: Workaround validation gate 'syntax'")
         assert sandbox.run.call_count == 1
+
+    def test_targeted_mocha_rejects_zero_tests(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps({"scripts": {"test": "mocha test/**/*.ts"}})
+            if path == "package.json"
+            else "describe('security', () => {});"
+        )
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "stats": {"tests": 0, "passes": 0, "failures": 0, "pending": 0},
+                    "tests": [],
+                    "passes": [],
+                    "failures": [],
+                    "pending": [],
+                }
+            ),
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tool = _make_run_targeted_test_tool(
+            sandbox,
+            preferred_test_files=["test/server/insecuritySpec.ts"],
+        )
+
+        result = tool.invoke(
+            {
+                "test_file": "test/server/insecuritySpec.ts",
+                "test_name": "sanitizeSecure - cannot be bypassed by exploiting lack of recursive sanitization",
+            }
+        )
+
+        assert result.startswith("FAILURE: Targeted test did not execute")
+        assert "no matching tests" in result
+
+    def test_targeted_mocha_reports_selected_test_failure(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps({"scripts": {"test": "mocha test/**/*.ts"}})
+            if path == "package.json"
+            else "describe('security', () => {});"
+        )
+        full_title = "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization"
+        failure = {
+            "title": "cannot be bypassed by exploiting lack of recursive sanitization",
+            "fullTitle": full_title,
+            "file": "test/server/insecuritySpec.ts",
+            "err": {
+                "message": "expected 'unsafe' to equal 'safe'",
+                "stack": "AssertionError: expected 'unsafe' to equal 'safe'\n    at Context.<anonymous> (test/server/insecuritySpec.ts:184:112)",
+            },
+        }
+        sandbox.run.return_value = CommandResult(
+            exit_code=1,
+            stdout=json.dumps(
+                {
+                    "stats": {"tests": 1, "passes": 0, "failures": 1, "pending": 0},
+                    "tests": [failure],
+                    "passes": [],
+                    "failures": [failure],
+                    "pending": [],
+                }
+            ),
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tool = _make_run_targeted_test_tool(
+            sandbox,
+            preferred_test_files=["test/server/insecuritySpec.ts"],
+        )
+
+        result = tool.invoke(
+            {
+                "test_file": "test/server/insecuritySpec.ts",
+                "test_name": "sanitizeSecure - cannot be bypassed by exploiting lack of recursive sanitization",
+            }
+        )
+
+        assert result.startswith("FAILURE: Targeted test failed")
+        assert "test/server/insecuritySpec.ts:184:112" in result
 
     def test_validate_workaround_runtime_smoke_catches_import_errors(self):
         sandbox = MagicMock()

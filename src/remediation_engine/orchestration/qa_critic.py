@@ -1080,6 +1080,36 @@ def _detect_targeted_test_context(
     return "npm_text_fallback", cwd, "npm test"
 
 
+def _mocha_test_name_variants(test_name: str) -> list[str]:
+    """Return likely canonical forms for an LLM-provided Mocha test hint.
+
+    Mocha composes nested suite names with spaces, while agents often render
+    the same hierarchy as ``Suite - test``.  Include both forms and the leaf
+    test title so the hint remains useful without treating the agent's
+    formatting as canonical.
+
+    Args:
+        test_name: Human-readable test name or suite/test description.
+
+    Returns:
+        Distinct, normalized candidate names in preference order.
+    """
+    cleaned = re.sub(r"^\s*(?:\d+[.)]\s*)", "", str(test_name or "")).strip()
+    cleaned = re.sub(r"\s+\[[^\]]+\]\s*$", "", cleaned).strip()
+    variants = [cleaned]
+    if " - " in cleaned:
+        suite, leaf = cleaned.rsplit(" - ", 1)
+        variants.extend((f"{suite} {leaf}", leaf))
+    return list(dict.fromkeys(value for value in variants if value))
+
+
+def _mocha_test_filter(test_name: str) -> str:
+    """Build a safe Mocha grep pattern from an LLM-provided test hint."""
+    variants = _mocha_test_name_variants(test_name)
+    escaped = [re.escape(value).replace(r"\ ", " ") for value in variants]
+    return escaped[0] if len(escaped) == 1 else f"(?:{'|'.join(escaped)})"
+
+
 def build_targeted_test_command(
     runner: str,
     test_file: str,
@@ -1101,6 +1131,7 @@ def build_targeted_test_command(
     """
     safe_file = shlex.quote(test_file)
     safe_name = shlex.quote(test_name) if test_name else None
+    safe_mocha_name = shlex.quote(_mocha_test_filter(test_name)) if test_name else None
     invocation = npm_invocation.strip() or "npm test"
 
     def with_package_cwd(command: str) -> str:
@@ -1110,7 +1141,10 @@ def build_targeted_test_command(
 
     if invocation in {"npm test", "npm run test"} or invocation.startswith("npm run "):
         if runner == "mocha":
-            args = safe_file + (f" --grep {safe_name}" if safe_name else "")
+            args = safe_file
+            if safe_mocha_name:
+                args += f" --grep {safe_mocha_name}"
+            args += " --reporter json"
             return with_package_cwd(f"{invocation} -- {args}")
         if runner == "jest":
             args = safe_file + (f" -t {safe_name}" if safe_name else "")
@@ -1164,11 +1198,13 @@ def build_targeted_test_command(
             tokens.insert(1 if tokens else 0, "--run")
         if test_name:
             if runner == "mocha":
-                tokens.extend(["--grep", test_name])
+                tokens.extend(["--grep", _mocha_test_filter(test_name)])
             elif runner == "jest" or runner == "vitest":
                 tokens.extend(["-t", test_name])
             elif runner == "node_test":
                 tokens.extend(["--test-name-pattern", test_name])
+        if runner == "mocha":
+            tokens.extend(["--reporter", "json"])
 
     # The full QA runner executes npm scripts, which temporarily prepends the
     # package's node_modules/.bin directory to PATH. Targeted validation runs

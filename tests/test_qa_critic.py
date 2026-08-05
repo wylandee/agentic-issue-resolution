@@ -345,7 +345,7 @@ class TestStructuredTestDetection:
         )
 
         assert command == (
-            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts --reporter json"
         )
 
         package_command = build_targeted_test_command(
@@ -356,7 +356,7 @@ class TestStructuredTestDetection:
         )
 
         assert package_command == (
-            "cd server && npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+            "cd server && npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts --reporter json"
         )
 
     def test_detects_juice_shop_composite_test_strategies(self):

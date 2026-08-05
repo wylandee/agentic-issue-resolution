@@ -1570,6 +1570,89 @@ def _make_inspect_ast_symbol_tool(
     return inspect_ast_symbol
 
 
+def _parse_mocha_json_output(stdout: str) -> dict[str, Any] | None:
+    """Parse Mocha's JSON reporter output, tolerating leading tool output.
+
+    Args:
+        stdout: Captured stdout from a Mocha invocation.
+
+    Returns:
+        The decoded Mocha result object, or ``None`` when the output is not
+        valid JSON reporter output.
+    """
+    text = str(stdout or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            return None
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _mocha_entry_title(entry: Any) -> str:
+    """Return the canonical-or-leaf title from one Mocha JSON entry."""
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("fullTitle") or entry.get("title") or "").strip()
+
+
+def _mocha_titles_match(left: str, right: str) -> bool:
+    """Match full and leaf Mocha titles without accepting unrelated tests."""
+    lhs = re.sub(r"\s+", " ", left or "").strip().casefold()
+    rhs = re.sub(r"\s+", " ", right or "").strip().casefold()
+    return bool(lhs and rhs and (lhs == rhs or lhs.endswith(f" {rhs}") or rhs.endswith(f" {lhs}")))
+
+
+def _select_mocha_tests(payload: dict[str, Any], test_name: str | None) -> list[dict[str, Any]]:
+    """Select the tests represented by a requested Mocha test hint."""
+    tests = [entry for entry in payload.get("tests", []) if isinstance(entry, dict)]
+    if not test_name:
+        return tests
+
+    from remediation_engine.orchestration.qa_critic import _mocha_test_name_variants
+
+    variants = _mocha_test_name_variants(test_name)
+    return [
+        entry
+        for entry in tests
+        if any(_mocha_titles_match(_mocha_entry_title(entry), variant) for variant in variants)
+    ]
+
+
+def _mocha_entries_contain_titles(
+    entries: list[Any],
+    selected: list[dict[str, Any]],
+) -> bool:
+    """Return whether result entries contain one of the selected tests."""
+    selected_titles = [_mocha_entry_title(entry) for entry in selected]
+    return any(
+        any(_mocha_titles_match(_mocha_entry_title(entry), title) for title in selected_titles)
+        for entry in entries
+        if isinstance(entry, dict)
+    )
+
+
+def _format_mocha_failure_output(payload: dict[str, Any]) -> str:
+    """Render useful failure text from Mocha JSON output."""
+    lines: list[str] = []
+    for failure in payload.get("failures", []):
+        if not isinstance(failure, dict):
+            continue
+        title = _mocha_entry_title(failure)
+        error = failure.get("err") if isinstance(failure.get("err"), dict) else {}
+        message = str(error.get("message") or "").strip()
+        stack = str(error.get("stack") or "").strip()
+        lines.extend(value for value in (title, message, stack) if value)
+    return "\n".join(lines)
+
+
 def _make_run_targeted_test_tool(
     sandbox: DockerSandbox,
     preferred_test_files: Sequence[str] | None = None,
@@ -1661,13 +1744,61 @@ def _make_run_targeted_test_tool(
                 f"Diagnostic:\n{output[:1500]}"
             )
 
-        if result.exit_code == 0:
+        mocha_failure_output = ""
+        if runner == "mocha":
+            mocha_payload = _parse_mocha_json_output(result.stdout)
+            if mocha_payload is not None:
+                selected_tests = _select_mocha_tests(mocha_payload, test_name)
+                if not selected_tests:
+                    requested = test_name or norm_path
+                    return (
+                        f"FAILURE: Targeted test did not execute (mocha): {norm_path}\n"
+                        f"Requested test: {requested}\n"
+                        "Diagnostic: Mocha reported no matching tests."
+                    )
+
+                failures = mocha_payload.get("failures", [])
+                passes = mocha_payload.get("passes", [])
+                if _mocha_entries_contain_titles(failures, selected_tests):
+                    mocha_failure_output = _format_mocha_failure_output(mocha_payload)
+                elif _mocha_entries_contain_titles(passes, selected_tests):
+                    canonical_title = _mocha_entry_title(selected_tests[0])
+                    return (
+                        f"SUCCESS: Targeted test passed (mocha): {norm_path}"
+                        f" [{canonical_title or test_name or 'selected test'}]\n"
+                        f"Tests executed: {len(selected_tests)}\n"
+                    )
+                else:
+                    return (
+                        f"FAILURE: Targeted test did not pass (mocha): {norm_path}\n"
+                        f"Requested test: {test_name or norm_path}\n"
+                        "Diagnostic: The selected test was pending or had no passing result."
+                    )
+            else:
+                passing = re.search(r"\b(\d+)\s+passing\b", output, re.IGNORECASE)
+                failing = re.search(r"\b(\d+)\s+failing\b", output, re.IGNORECASE)
+                passing_count = int(passing.group(1)) if passing else 0
+                failing_count = int(failing.group(1)) if failing else 0
+                if not passing and not failing or passing_count == 0 and failing_count == 0:
+                    return (
+                        f"FAILURE: Targeted test result could not be verified (mocha): {norm_path}\n"
+                        "Diagnostic: Mocha output did not report any executed tests."
+                    )
+                if test_name and passing_count == 0:
+                    return (
+                        f"FAILURE: Targeted test did not pass (mocha): {norm_path}\n"
+                        f"Requested test: {test_name}\n"
+                        "Diagnostic: The requested test did not produce a passing result."
+                    )
+
+        if result.exit_code == 0 and not mocha_failure_output:
             name_str = f" [{test_name}]" if test_name else ""
             return f"SUCCESS: Targeted test passed ({runner}): {norm_path}{name_str}\n\nstdout:\n{result.stdout[:1000]}"
 
+        evidence_stdout = mocha_failure_output or result.stdout
         evidence = extract_qa_failure_evidence(
             result.exit_code,
-            result.stdout,
+            evidence_stdout,
             result.stderr,
             sandbox=sandbox,
         )
