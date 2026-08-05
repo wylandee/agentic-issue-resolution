@@ -93,6 +93,46 @@ def _clean_prompt_snippet(value: str, max_chars: int = 240) -> str:
     return cleaned[:max_chars].strip()
 
 
+def _clean_prompt_log(value: str, max_chars: int = 1600) -> str:
+    """Normalize multiline QA logs while retaining the details of each line."""
+    lines = []
+    for raw_line in str(value or "").splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if line:
+            lines.append(line)
+    cleaned = "\n".join(lines)
+    if len(cleaned) > max_chars:
+        return cleaned[:max_chars].rstrip() + "\n... (truncated)"
+    return cleaned
+
+
+def _qa_failure_log_snippet(
+    qa_evidence: Any,
+    previous_feedback: str | None,
+    max_chars: int = 1600,
+) -> str:
+    """Return concrete QA failure logs for the workaround prompt.
+
+    The raw excerpt is preferred because it contains the test names and
+    expected/actual output. Structured fields are used as a fallback when QA
+    could not capture a raw log excerpt.
+    """
+    if qa_evidence:
+        raw_excerpt = str(getattr(qa_evidence, "raw_excerpt", "") or "").strip()
+        if raw_excerpt:
+            return _clean_prompt_log(raw_excerpt, max_chars=max_chars)
+
+        fallback_values = [
+            *(getattr(qa_evidence, "failed_tests", None) or []),
+            *(getattr(qa_evidence, "exact_diagnostics", None) or []),
+        ]
+        fallback = "\n".join(str(value) for value in fallback_values if value)
+        if fallback:
+            return _clean_prompt_log(fallback, max_chars=max_chars)
+
+    return _clean_prompt_log(previous_feedback or "", max_chars=max_chars)
+
+
 def _extract_qa_error_snippet(previous_feedback: str) -> str:
     """Extract the most diagnostic error text from QA feedback for web search."""
     feedback = str(previous_feedback or "")
@@ -131,6 +171,90 @@ def _extract_qa_error_snippet(previous_feedback: str) -> str:
             return _clean_prompt_snippet(line)
 
     return _clean_prompt_snippet(feedback, max_chars=240)
+
+
+_QA_GENERIC_STATUS_RE = re.compile(
+    r"^(?:"
+    r"(?:npm|yarn|pnpm)\s+(?:run\s+)?test\b.*\b(?:failed|passed)\b|"
+    r"(?:detected\s+failures|failing\s+tests|stdout\s+tail|stderr\s+tail)\s*:|"
+    r"(?:\d+\s+)?(?:tests?|specs?)\s+(?:failed|failing|passed)\b|"
+    r"(?:\d+\s+)?(?:failed|failing|passed)(?:\s+(?:tests?|specs?))?\s*$|"
+    r"exit(?:\s+code)?\s*[:=]?\s*\d+\b"
+    r")",
+    re.IGNORECASE,
+)
+_QA_SEARCH_DETAIL_RE = re.compile(
+    r"(?:\b[A-Za-z_][\w.]*(?:Error|Exception)\s*:|"
+    r"\bassert(?:ion)?(?:error)?\b|\bexpected\b|\bactual\b|"
+    r"not\s+a\s+function|cannot\s+find|\bundefined\b|\binvalid\b|"
+    r"required\s+option|not\s+exported)",
+    re.IGNORECASE,
+)
+
+
+def _normalise_qa_search_line(value: str) -> str:
+    """Normalize one QA line before using it as a search term."""
+    line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(value or "")).strip()
+    return re.sub(r"\s+", " ", line)
+
+
+def _is_generic_qa_status(value: str) -> bool:
+    """Return whether a QA line only describes the test runner outcome."""
+    return bool(_QA_GENERIC_STATUS_RE.search(_normalise_qa_search_line(value)))
+
+
+def _extract_qa_search_diagnostic(
+    workaround_context: WorkaroundContext | None,
+    previous_feedback: str | None,
+) -> str:
+    """Extract a substantive test failure detail for the first web query.
+
+    Runner summaries such as ``npm test FAILED (exit 2)`` are intentionally
+    ignored. The query instead uses the failing test title and the first
+    assertion or exception detail available in the structured QA evidence or
+    raw test excerpt.
+    """
+    qa_evidence = workaround_context.qa_evidence if workaround_context else None
+    failed_tests = []
+    candidate_values = [previous_feedback or ""]
+    if qa_evidence:
+        failed_tests = [
+            _normalise_qa_search_line(value)
+            for value in (qa_evidence.failed_tests or [])
+            if value and not _is_generic_qa_status(value)
+        ]
+        candidate_values = [
+            *(qa_evidence.exact_diagnostics or []),
+            qa_evidence.raw_excerpt or "",
+            previous_feedback or "",
+        ]
+
+    detail = ""
+    for value in candidate_values:
+        for raw_line in str(value or "").splitlines():
+            line = _normalise_qa_search_line(raw_line)
+            if not line or _is_generic_qa_status(line):
+                continue
+            if _QA_SEARCH_DETAIL_RE.search(line):
+                detail = _clean_prompt_snippet(line, max_chars=180)
+                break
+        if detail:
+            break
+
+    title = failed_tests[0] if failed_tests else ""
+    if not title:
+        for value in candidate_values:
+            for raw_line in str(value or "").splitlines():
+                line = _normalise_qa_search_line(raw_line)
+                if line and not _is_generic_qa_status(line):
+                    title = _clean_prompt_snippet(line, max_chars=180)
+                    break
+            if title:
+                break
+
+    if title and detail and title.casefold() != detail.casefold():
+        return _clean_prompt_snippet(f"{title}; {detail}", max_chars=180)
+    return detail or title
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,12 +369,7 @@ def _workaround_search_recommendation(
         _extract_vulnerability_mechanism(target_group),
         max_chars=140,
     )
-    diagnostic = ""
-    qa_evidence = workaround_context.qa_evidence if workaround_context else None
-    if qa_evidence and qa_evidence.exact_diagnostics:
-        diagnostic = _extract_qa_error_snippet(qa_evidence.exact_diagnostics[0])
-    elif previous_feedback:
-        diagnostic = _extract_qa_error_snippet(previous_feedback)
+    diagnostic = _extract_qa_search_diagnostic(workaround_context, previous_feedback)
     diagnostic_term = _search_query_term(diagnostic, max_chars=180)
 
     selected_version = getattr(target_task, "selected_version", None)
@@ -475,12 +594,7 @@ def _workaround_search_recommendation(
         _extract_vulnerability_mechanism(target_group),
         max_chars=140,
     )
-    diagnostic = ""
-    qa_evidence = workaround_context.qa_evidence if workaround_context else None
-    if qa_evidence and qa_evidence.exact_diagnostics:
-        diagnostic = _extract_qa_error_snippet(qa_evidence.exact_diagnostics[0])
-    elif previous_feedback:
-        diagnostic = _extract_qa_error_snippet(previous_feedback)
+    diagnostic = _extract_qa_search_diagnostic(workaround_context, previous_feedback)
     diagnostic_term = _search_query_term(diagnostic, max_chars=180)
 
     selected_version = getattr(target_task, "selected_version", None)
@@ -715,17 +829,12 @@ def _build_workaround_prompt(
     )
 
     qa_evidence = workaround_context.qa_evidence if workaround_context else None
-    err_text = (
-        qa_evidence.exact_diagnostics[0]
-        if qa_evidence and qa_evidence.exact_diagnostics
-        else (previous_feedback or "")
-    )
 
     if phase == WorkaroundPhase.QA_REGRESSION_REPAIR:
         qa_lines = ["=== QA FAILURE EVIDENCE ==="]
-        if err_text:
-            err_snippet = _clean_prompt_snippet(_extract_qa_error_snippet(err_text), max_chars=300)
-            qa_lines.append(f"Diagnostic: {err_snippet}")
+        diagnostic_logs = _qa_failure_log_snippet(qa_evidence, previous_feedback)
+        if diagnostic_logs:
+            qa_lines.append(f"Diagnostic:\n{diagnostic_logs}")
 
         primary_sources = _primary_non_test_source_files(qa_evidence)
         if primary_sources:

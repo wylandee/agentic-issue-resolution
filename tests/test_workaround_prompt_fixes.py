@@ -47,11 +47,17 @@ def test_compact_qa_regression_repair_prompt():
     qa_ev = QAFailureEvidence(
         attempt_id="att-123",
         task_revision=5,
-        exact_diagnostics=["TypeError: jwt is not a function"],
+        exact_diagnostics=["npm test FAILED (exit 2)."],
         failed_tests=["tests/jwt.test.ts"],
         source_locations=["lib/insecurity.ts:42:10"],
         affected_files=["lib/insecurity.ts"],
-        raw_excerpt="A very large raw log excerpt..." * 10,
+        raw_excerpt=(
+            "npm test FAILED (exit 2).\n"
+            "Failing Tests:\n"
+            "insecurity jwt middleware rejects an invalid token\n"
+            "expected 401 to equal 500\n"
+            "TypeError: jwt is not a function"
+        ),
     )
     context = WorkaroundContext(
         phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
@@ -66,6 +72,9 @@ def test_compact_qa_regression_repair_prompt():
 
     assert "WORKFLOW PHASE: QA_REGRESSION_REPAIR" in prompt
     assert "Dependency update is already seeded; do not modify manifests" in prompt
+    assert "Diagnostic:\n" in prompt
+    assert "insecurity jwt middleware rejects an invalid token" in prompt
+    assert "expected 401 to equal 500" in prompt
     assert "TypeError: jwt is not a function" in prompt
     assert "lib/insecurity.ts" in prompt
     assert "Targeted Test File: tests/jwt.test.ts" in prompt
@@ -74,7 +83,6 @@ def test_compact_qa_regression_repair_prompt():
     assert "Source Attempt ID" not in prompt
     assert "Source Revision" not in prompt
     assert "Raw Excerpt" not in prompt
-    assert "A very large raw log excerpt" not in prompt
 
 
 def test_search_recommendation_precedence():
@@ -118,3 +126,59 @@ def test_search_recommendation_precedence():
     # 4. Otherwise -> initial_code_workaround_or_isolation
     rec_init = _workaround_search_recommendation(task, group, context_scanner, None)
     assert rec_init.scenario == "initial_code_workaround_or_isolation"
+
+
+def test_search_recommendation_uses_test_details_instead_of_runner_status():
+    task = MagicMock(selected_version="2.0.0")
+    group = MagicMock(
+        vulnerable_component="sanitize-html",
+        cve_ids=[],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
+    )
+    group.issues = []
+    context = WorkaroundContext(
+        phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
+        qa_evidence=QAFailureEvidence(
+            exact_diagnostics=["npm test FAILED (exit 2)."],
+            failed_tests=[
+                "insecurity sanitizeHtml can be bypassed by exploiting lack of recursive sanitization"
+            ],
+            raw_excerpt=(
+                "npm test FAILED (exit 2).\n"
+                "Detected Failures: 1\n\n"
+                "Failing Tests:\n"
+                "1. insecurity sanitizeHtml can be bypassed by exploiting lack of recursive sanitization\n"
+                "expected '<iframe src=javascript:alert(xss...)>' to equal '<iframe src=javascript:alert(xss...)>'"
+            ),
+        ),
+    )
+
+    recommendation = _workaround_search_recommendation(task, group, context, None)
+
+    assert "npm test FAILED" not in recommendation.initial_query
+    assert "sanitizeHtml can be bypassed" in recommendation.initial_query
+    assert "expected" in recommendation.initial_query
+
+
+def test_search_recommendation_keeps_api_exception_detail():
+    task = MagicMock(selected_version="8.5.1")
+    group = MagicMock(
+        vulnerable_component="jsonwebtoken",
+        cve_ids=[],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
+    )
+    group.issues = []
+    context = WorkaroundContext(
+        phase=WorkaroundPhase.QA_REGRESSION_REPAIR,
+        qa_evidence=QAFailureEvidence(
+            exact_diagnostics=["npm test FAILED (exit 2)."],
+            raw_excerpt="TypeError: jwt.sign is not a function",
+        ),
+    )
+
+    recommendation = _workaround_search_recommendation(task, group, context, None)
+
+    assert "npm test FAILED" not in recommendation.initial_query
+    assert "TypeError: jwt.sign is not a function" in recommendation.initial_query
