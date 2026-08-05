@@ -122,6 +122,12 @@
     </suppress>
 
     <suppress>
+        <notes>Suppress all vulnerabilities for express-jwt:0.1.3</notes>
+        <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
         <notes>Suppress all vulnerabilities for file-type</notes>
         <packageUrl regex="true">^pkg:npm/file-type@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
@@ -206,6 +212,18 @@
     </suppress>
 
     <suppress>
+        <notes>Suppress all vulnerabilities for moment.js</notes>
+        <packageUrl regex="true">^pkg:javascript/moment\.js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for moment:2.0.0</notes>
+        <packageUrl regex="true">^pkg:npm/moment@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
         <notes>Suppress all vulnerabilities for morgan</notes>
         <packageUrl regex="true">^pkg:npm/morgan@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
@@ -234,13 +252,13 @@
         <packageUrl regex="true">^pkg:npm/piscina@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
-
+<!--
     <suppress>
         <notes>Suppress all vulnerabilities for sanitize-html</notes>
         <packageUrl regex="true">^pkg:npm/sanitize-html@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
-
+-->
     <suppress>
         <notes>Suppress all vulnerabilities for serialize-javascript</notes>
         <packageUrl regex="true">^pkg:npm/serialize-javascript@.*$</packageUrl>
