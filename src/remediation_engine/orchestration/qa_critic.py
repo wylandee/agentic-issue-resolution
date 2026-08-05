@@ -86,6 +86,7 @@ _LOG_QUERY_MAX_CHARS = 6_000
 _TEST_FAILURE_MAX_ITEMS = 8
 _TEST_FAILURE_CONTEXT_LINES = 12
 _TEST_FAILURE_EXCERPT_CHARS = 500
+_LOCAL_NPM_TEST_RUNNERS = frozenset({"jest", "mocha", "vitest"})
 
 # Exclusion patterns for workspace diff
 _DIFF_EXCLUDE_DIRS = frozenset(
@@ -985,33 +986,44 @@ def build_targeted_test_command(
     test_file: str,
     test_name: str | None = None,
     npm_invocation: str = "npm test",
+    package_cwd: str = "",
 ) -> str | None:
     """Construct a source-runner command that executes only ``test_file``.
 
     ``npm_invocation`` is the resolved leaf command from ``package.json``. A
     direct command is used so an existing wildcard cannot continue to select
-    the whole suite. The function retains the old ``npm test`` append behavior
-    for callers that pass a generic npm invocation.
+    the whole suite. Direct npm test-runner commands are prefixed with
+    ``npx --no-install`` so they resolve the same workspace-local executable
+    that npm scripts expose through ``node_modules/.bin``. The function
+    retains the old ``npm test`` append behavior for callers that pass a
+    generic npm invocation. ``package_cwd`` is the package working directory
+    resolved from the same QA test context and is applied to the command so
+    targeted validation uses the same package-local dependency tree.
     """
     safe_file = shlex.quote(test_file)
     safe_name = shlex.quote(test_name) if test_name else None
     invocation = npm_invocation.strip() or "npm test"
 
+    def with_package_cwd(command: str) -> str:
+        if package_cwd:
+            return f"cd {shlex.quote(package_cwd)} && {command}"
+        return command
+
     if invocation in {"npm test", "npm run test"} or invocation.startswith("npm run "):
         if runner == "mocha":
             args = safe_file + (f" --grep {safe_name}" if safe_name else "")
-            return f"{invocation} -- {args}"
+            return with_package_cwd(f"{invocation} -- {args}")
         if runner == "jest":
             args = safe_file + (f" -t {safe_name}" if safe_name else "")
-            return f"{invocation} -- {args}"
+            return with_package_cwd(f"{invocation} -- {args}")
         if runner == "vitest":
             args = f"--run {safe_file}" + (f" -t {safe_name}" if safe_name else "")
-            return f"{invocation} -- {args}"
+            return with_package_cwd(f"{invocation} -- {args}")
         if runner == "angular_vitest":
-            return f"{invocation} -- --include {safe_file}"
+            return with_package_cwd(f"{invocation} -- --include {safe_file}")
         if runner == "node_test":
             args = safe_file + (f" --test-name-pattern {safe_name}" if safe_name else "")
-            return f"{invocation} -- {args}"
+            return with_package_cwd(f"{invocation} -- {args}")
         return None
 
     try:
@@ -1059,7 +1071,16 @@ def build_targeted_test_command(
             elif runner == "node_test":
                 tokens.extend(["--test-name-pattern", test_name])
 
-    return shlex.join(tokens)
+    # The full QA runner executes npm scripts, which temporarily prepends the
+    # package's node_modules/.bin directory to PATH. Targeted validation runs
+    # in a fresh shell, so preserve that same workspace dependency context
+    # explicitly when the resolved leaf command is a local npm test runner.
+    if runner in _LOCAL_NPM_TEST_RUNNERS:
+        first_token = tokens[0].replace("\\", "/")
+        if first_token == runner:
+            tokens = ["npx", "--no-install", *tokens]
+
+    return with_package_cwd(shlex.join(tokens))
 
 
 def _workspace_json_file(sandbox: DockerSandbox, path: str) -> dict[str, Any] | None:

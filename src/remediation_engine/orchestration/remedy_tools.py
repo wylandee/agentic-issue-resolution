@@ -1639,11 +1639,10 @@ def _make_run_targeted_test_tool(
             relative_test_file,
             test_name,
             npm_invocation=npm_invocation,
+            package_cwd=package_cwd,
         )
         if not cmd:
             return f"BLOCKED: Could not construct targeted test command for runner '{runner}' and file '{norm_path}'."
-        if package_cwd:
-            cmd = f"cd {shlex.quote(package_cwd)} && {cmd}"
 
         try:
             result = sandbox.run(cmd, timeout=_NPM_TEST_TIMEOUT_SECONDS)

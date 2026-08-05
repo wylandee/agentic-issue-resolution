@@ -157,6 +157,56 @@ class TestToolbeltFactories:
             for call in sandbox.run.call_args_list
         )
 
+    def test_targeted_mocha_test_uses_workspace_local_runner(self):
+        sandbox = MagicMock()
+        package_json = {
+            "scripts": {
+                "test": "npm run test:server",
+                "test:server": "mocha -r tsx --recursive test/server/**/*.ts",
+            }
+        }
+
+        def read_file(path):
+            if path == "package.json":
+                return json.dumps(package_json)
+            if path == "src/auth.ts":
+                return "export const auth = true;"
+            if path == "test/server/insecuritySpec.ts":
+                return "describe('security', () => {});"
+            return None
+
+        sandbox.read_file.side_effect = read_file
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="targeted test passed",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools = {
+            tool.name: tool
+            for tool in build_workaround_toolbelt(
+                sandbox,
+                set(),
+                Path("/dummy/repo/root"),
+                preferred_test_files=["test/server/insecuritySpec.ts"],
+            )
+        }
+
+        result = tools["validate_workaround"].invoke(
+            {
+                "modified_files": ["src/auth.ts"],
+                "runtime_smoke_file": "src/auth.ts",
+                "targeted_test_file": "test/server/insecuritySpec.ts",
+            }
+        )
+
+        assert result.startswith("SUCCESS: Workaround validation gate passed")
+        assert any(
+            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+            in call.args[0]
+            for call in sandbox.run.call_args_list
+        )
+
     def test_validate_workaround_short_circuits_on_first_failed_gate(self):
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (

@@ -88,6 +88,7 @@ from remediation_engine.orchestration.qa_critic import (
     _validate_qa_path,
     build_qa_review_toolbelt,
     build_qa_toolbelt,
+    build_targeted_test_command,
     run_qa_critic_node,
 )
 
@@ -336,6 +337,28 @@ class TestRunUnitTests:
 
 
 class TestStructuredTestDetection:
+    def test_targeted_mocha_command_uses_workspace_local_runner(self):
+        command = build_targeted_test_command(
+            "mocha",
+            "test/server/insecuritySpec.ts",
+            npm_invocation="mocha -r tsx --recursive test/server/**/*.ts",
+        )
+
+        assert command == (
+            "npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+        )
+
+        package_command = build_targeted_test_command(
+            "mocha",
+            "test/server/insecuritySpec.ts",
+            npm_invocation="mocha -r tsx --recursive test/server/**/*.ts",
+            package_cwd="server",
+        )
+
+        assert package_command == (
+            "cd server && npx --no-install mocha -r tsx --recursive test/server/insecuritySpec.ts"
+        )
+
     def test_detects_juice_shop_composite_test_strategies(self):
         root_package = {
             "scripts": {
