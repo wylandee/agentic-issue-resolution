@@ -717,6 +717,78 @@ _QA_ERROR_MARKER = re.compile(
     r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
     re.IGNORECASE,
 )
+_QA_SOURCE_LOCATION = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?::(?P<column>\d+))?$")
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
+
+
+def _normalise_workspace_file_path(path: str) -> str | None:
+    """Normalize and constrain a reported path to the QA workspace.
+
+    Args:
+        path: A path reported in test output.
+
+    Returns:
+        A repository-relative POSIX path, or ``None`` for absolute or
+        traversal paths that cannot safely identify a workspace file.
+    """
+    normalized = (path or "").replace("\\", "/").strip()
+    if normalized.startswith("/workspace/"):
+        normalized = normalized[len("/workspace/") :]
+    if not normalized or normalized.startswith("/") or _WINDOWS_ABSOLUTE_PATH.match(normalized):
+        return None
+    if any(part == ".." for part in normalized.split("/")):
+        return None
+    return normalized
+
+
+def _validate_qa_source_locations(
+    source_locations: list[str],
+    sandbox: DockerSandbox,
+) -> tuple[list[str], list[str], list[str]]:
+    """Keep only source locations that identify files in the QA workspace.
+
+    Args:
+        source_locations: Candidate ``path:line[:column]`` values extracted
+            from deterministic test output.
+        sandbox: Active QA sandbox used to verify file existence.
+
+    Returns:
+        A tuple containing valid normalized locations, their distinct file
+        paths, and human-readable diagnostics for discarded locations.
+    """
+    valid_locations: list[str] = []
+    valid_files: list[str] = []
+    diagnostics: list[str] = []
+    for location in source_locations:
+        match = _QA_SOURCE_LOCATION.match(location.strip())
+        path = _normalise_workspace_file_path(match.group("path")) if match else None
+        if match is None:
+            reason = "it is not a path:line[:column] value"
+        elif path is None:
+            reason = "it is not repository-relative"
+        else:
+            try:
+                exists = sandbox.read_file(path) is not None
+            except (OSError, RuntimeError) as exc:
+                exists = False
+                reason = f"the workspace lookup failed: {exc}"
+            else:
+                reason = "the file does not exist in the QA workspace"
+            if exists:
+                line_no = match.group("line")
+                column_no = match.group("column")
+                normalized_location = (
+                    f"{path}:{line_no}:{column_no}" if column_no else f"{path}:{line_no}"
+                )
+                if normalized_location not in valid_locations:
+                    valid_locations.append(normalized_location)
+                if path not in valid_files:
+                    valid_files.append(path)
+                continue
+
+        diagnostics.append(f"QA discarded source location '{location}': {reason}.")
+
+    return valid_locations, valid_files, diagnostics
 
 
 def extract_qa_failure_evidence(
@@ -725,8 +797,26 @@ def extract_qa_failure_evidence(
     stderr: str,
     attempt_id: str = "",
     task_revision: int = 0,
+    *,
+    sandbox: DockerSandbox | None = None,
 ) -> QAFailureEvidence:
-    """Extract structured, verbatim QAFailureEvidence from test output."""
+    """Extract structured QA evidence from test output.
+
+    Source locations are deterministic only when they can be verified against
+    the active QA workspace.  LLM-produced evidence is intentionally handled
+    separately by ``_attach_failure_evidence_to_evaluations``.
+
+    Args:
+        exit_code: Process exit code for the failed QA command.
+        stdout: Captured standard output.
+        stderr: Captured standard error.
+        attempt_id: Committed remediation attempt identifier.
+        task_revision: Committed task revision.
+        sandbox: Optional active sandbox used to validate extracted paths.
+
+    Returns:
+        Structured deterministic QA failure evidence.
+    """
     exact_diagnostics: list[str] = []
     failed_tests: list[str] = []
     source_locations: list[str] = []
@@ -777,6 +867,15 @@ def extract_qa_failure_evidence(
                 source_locations.append(loc)
             if filepath not in affected_files:
                 affected_files.append(filepath)
+
+    if sandbox is not None:
+        source_locations, affected_files, path_diagnostics = _validate_qa_source_locations(
+            source_locations,
+            sandbox,
+        )
+        exact_diagnostics.extend(
+            diagnostic for diagnostic in path_diagnostics if diagnostic not in exact_diagnostics
+        )
 
     raw_excerpt = _fallback_raw_tail(exit_code, stdout, stderr)
 
@@ -3222,17 +3321,37 @@ def _attach_failure_evidence_to_evaluations(
     evaluations: dict[str, QAEvaluation],
     results: _QAExecutionResults,
     state: OrchestratorState,
+    *,
+    deterministic_evidence: QAFailureEvidence | None = None,
+    sandbox: DockerSandbox | None = None,
 ) -> dict[str, QAEvaluation]:
     """Attach deterministic QA diagnostics and committed attempt provenance.
 
     The batch judge is allowed to classify a failure, but it is not the source
-    of truth for the failing test output.  Use the deterministic test summary
-    and the task's committed attempt envelope so workaround retries receive
-    actionable evidence instead of a blank or stale ``attempt_id``.
+    of truth for the failing test output or source paths. Use deterministic
+    test evidence and the task's committed attempt envelope so workaround
+    retries receive actionable evidence instead of hallucinated locations or
+    a blank/stale ``attempt_id``.
+
+    Args:
+        evaluations: Batch-judge evaluations keyed by vulnerability group.
+        results: Deterministic QA execution results.
+        state: Current orchestration state containing committed task envelopes.
+        deterministic_evidence: Evidence extracted while the QA sandbox was
+            active, when available.
+        sandbox: Optional active sandbox for lazy deterministic extraction.
+
+    Returns:
+        Evaluations enriched with authoritative evidence and provenance.
     """
-    test_evidence = None
-    if results.tests and not results.tests[0]:
-        test_evidence = extract_qa_failure_evidence(1, results.tests[1], "")
+    test_evidence = deterministic_evidence
+    if test_evidence is None and results.tests and not results.tests[0]:
+        test_evidence = extract_qa_failure_evidence(
+            1,
+            results.tests[1],
+            "",
+            sandbox=sandbox,
+        )
 
     task_queue = state.get("task_queue", {}) or {}
     tasks_by_group = {
@@ -3249,7 +3368,41 @@ def _attach_failure_evidence_to_evaluations(
         task = tasks_by_group.get(group_id)
         attempt_id = getattr(task, "current_attempt_id", None) or ""
         task_revision = int(getattr(task, "task_revision", 0) or 0)
-        evidence = evaluation.failure_evidence or test_evidence
+        llm_evidence = evaluation.failure_evidence
+        evidence = test_evidence
+        if evidence is not None and llm_evidence is not None and llm_evidence.source_locations:
+            discarded_locations = ", ".join(llm_evidence.source_locations[:5])
+            if len(llm_evidence.source_locations) > 5:
+                discarded_locations += ", ..."
+            diagnostic = (
+                "QA discarded LLM-supplied source location(s) because deterministic "
+                f"test evidence is authoritative: {discarded_locations}."
+            )
+            logger.warning(diagnostic)
+            evidence = evidence.model_copy(
+                update={
+                    "exact_diagnostics": [
+                        *evidence.exact_diagnostics,
+                        diagnostic,
+                    ][:15]
+                }
+            )
+        elif evidence is None and llm_evidence is not None:
+            diagnostic = (
+                "QA discarded LLM-supplied source locations because deterministic "
+                "test evidence was unavailable."
+            )
+            logger.warning(diagnostic)
+            evidence = llm_evidence.model_copy(
+                update={
+                    "source_locations": [],
+                    "affected_files": [],
+                    "exact_diagnostics": [
+                        *llm_evidence.exact_diagnostics,
+                        diagnostic,
+                    ][:15],
+                }
+            )
         if evidence is not None:
             evidence = evidence.model_copy(
                 update={
@@ -3775,6 +3928,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     action_summaries = _filter_recent_action_summaries(action_summaries, valid_groups)
 
     errors: list[str] = []
+    deterministic_test_evidence: QAFailureEvidence | None = None
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
             # ------------------------------------------------------------------
@@ -3831,6 +3985,14 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     "qa_investigation_report": "",
                     **scan_projection,
                 }
+
+            if results.tests and not results.tests[0]:
+                deterministic_test_evidence = extract_qa_failure_evidence(
+                    1,
+                    results.tests[1],
+                    "",
+                    sandbox=sandbox,
+                )
 
             # ------------------------------------------------------------------
             # Map: Individual Investigators (one per group, sequential)
@@ -3897,6 +4059,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         qa_evaluations,
         results,
         state,
+        deterministic_evidence=deterministic_test_evidence,
     )
 
     all_passed = all(evaluation.passed for evaluation in qa_evaluations.values())

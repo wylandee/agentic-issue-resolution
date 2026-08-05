@@ -1665,7 +1665,12 @@ def _make_run_targeted_test_tool(
             name_str = f" [{test_name}]" if test_name else ""
             return f"SUCCESS: Targeted test passed ({runner}): {norm_path}{name_str}\n\nstdout:\n{result.stdout[:1000]}"
 
-        evidence = extract_qa_failure_evidence(result.exit_code, result.stdout, result.stderr)
+        evidence = extract_qa_failure_evidence(
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+            sandbox=sandbox,
+        )
         diag_str = (
             "\n".join(evidence.exact_diagnostics[:5]) or result.stderr[:500] or result.stdout[:500]
         )

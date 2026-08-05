@@ -108,6 +108,88 @@ def test_failed_qa_evidence_is_correlated_to_committed_attempt():
     assert any("algorithms is a required option" in d for d in evidence.exact_diagnostics)
 
 
+def test_deterministic_qa_evidence_replaces_llm_source_locations():
+    """Batch-judge paths cannot override the paths from QA test output."""
+    task = RemediationTask(
+        task_id="task-1",
+        parent_group_id="group-1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Apply workaround",
+        current_attempt_id="attempt-7",
+        task_revision=4,
+    )
+    evaluations = {
+        "group-1": QAEvaluation(
+            task_id="group-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Repair the regression.",
+            failure_evidence=QAFailureEvidence(
+                exact_diagnostics=["npm test FAILED (exit 1)"],
+                source_locations=["server/test/sanitize.test.js"],
+                affected_files=["package.json"],
+            ),
+        )
+    }
+    results = _QAExecutionResults(tests=(False, "TypeError at test/server/insecuritySpec.ts:184:7"))
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = lambda path: (
+        "describe('insecurity', () => {})" if path == "test/server/insecuritySpec.ts" else None
+    )
+
+    enriched = _attach_failure_evidence_to_evaluations(
+        evaluations,
+        results,
+        {"task_queue": {task.task_id: task}},
+        sandbox=sandbox,
+    )
+
+    evidence = enriched["group-1"].failure_evidence
+    assert evidence is not None
+    assert evidence.source_locations == ["test/server/insecuritySpec.ts:184:7"]
+    assert evidence.affected_files == ["test/server/insecuritySpec.ts"]
+    assert "server/test/sanitize.test.js" not in evidence.source_locations
+    assert any("LLM-supplied source location" in d for d in evidence.exact_diagnostics)
+
+
+def test_invalid_deterministic_qa_source_locations_are_discarded():
+    """QA does not propagate source paths absent from the workspace."""
+    task = RemediationTask(
+        task_id="task-1",
+        parent_group_id="group-1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Apply workaround",
+        current_attempt_id="attempt-7",
+        task_revision=4,
+    )
+    evaluations = {
+        "group-1": QAEvaluation(
+            task_id="group-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Repair the regression.",
+        )
+    }
+    results = _QAExecutionResults(
+        tests=(False, "AssertionError at server/test/sanitize.test.js:184:7")
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = None
+
+    enriched = _attach_failure_evidence_to_evaluations(
+        evaluations,
+        results,
+        {"task_queue": {task.task_id: task}},
+        sandbox=sandbox,
+    )
+
+    evidence = enriched["group-1"].failure_evidence
+    assert evidence is not None
+    assert evidence.source_locations == []
+    assert evidence.affected_files == []
+    assert any("does not exist in the QA workspace" in d for d in evidence.exact_diagnostics)
+
+
 def test_supervisor_creates_workaround_context():
     task = RemediationTask(
         task_id="task-1",
