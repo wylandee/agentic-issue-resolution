@@ -722,7 +722,7 @@ class TestRevertWorkspaceFile:
 
 
 class TestValidateManifestSync:
-    def test_validation_is_rejected_after_the_first_call_in_worker_run(self):
+    def test_validation_runs_once_per_package_in_worker_run(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
             exit_code=0,
@@ -731,7 +731,15 @@ class TestValidateManifestSync:
             duration_seconds=1.0,
         )
         execution_state = {"edits_started": False, "validation_calls": 0}
-        tools = _update_tool_map(sandbox, execution_state=execution_state)
+        tools = _update_tool_map(
+            sandbox,
+            manifest_paths=["package.json", "frontend/package.json"],
+            package_manifest_paths={
+                "lodash": ["package.json"],
+                "axios": ["frontend/package.json"],
+            },
+            execution_state=execution_state,
+        )
 
         edit_result = tools["modify_npm_dependency"].invoke(
             {
@@ -741,13 +749,22 @@ class TestValidateManifestSync:
                 "manifest_path": "package.json",
             }
         )
-        first_validation = tools["validate_manifest_sync"].invoke({})
-        second_validation = tools["validate_manifest_sync"].invoke({})
+        first_validation = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
+        second_edit_result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "axios",
+                "target_version": "1.7.4",
+                "dependency_type": "dependencies",
+                "manifest_path": "frontend/package.json",
+            }
+        )
+        second_validation = tools["validate_manifest_sync"].invoke({"package_name": "axios"})
 
         assert edit_result.startswith("SUCCESS:")
+        assert second_edit_result.startswith("SUCCESS:")
         assert first_validation.startswith("SUCCESS:")
-        assert second_validation.startswith("ERROR:")
-        assert "only be called once" in second_validation
+        assert second_validation.startswith("SUCCESS:")
+        assert execution_state["validation_calls"] == 2
 
     def test_success_runs_ignore_scripts_for_each_manifest_directory(self):
         sandbox = MagicMock()
@@ -762,7 +779,7 @@ class TestValidateManifestSync:
             manifest_paths=["package.json", "frontend/package.json"],
         )
 
-        result = tools["validate_manifest_sync"].invoke({})
+        result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
 
         assert result.startswith("SUCCESS:")
         assert sandbox.run.call_count == 2
@@ -780,11 +797,47 @@ class TestValidateManifestSync:
         )
         tools = _update_tool_map(sandbox)
 
-        result = tools["validate_manifest_sync"].invoke({})
+        result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
 
         assert result.startswith("FAILURE:")
         assert "ERESOLVE" in result
         assert "partial" in result
+
+    def test_failed_package_validation_restores_its_checkpoint(self):
+        sandbox = MagicMock()
+        success = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0)
+        failure = CommandResult(
+            exit_code=1,
+            stdout="partial",
+            stderr="ERESOLVE unable to resolve dependency tree",
+            duration_seconds=1.0,
+        )
+        sandbox.run.side_effect = [success, failure, success, success]
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
+        touched_files: set[str] = set()
+        execution_state = {"edits_started": False, "validation_calls": 0}
+        tools = _update_tool_map(
+            sandbox,
+            touched_files=touched_files,
+            execution_state=execution_state,
+        )
+
+        edit_result = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.22",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        validation_result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
+
+        assert edit_result.startswith("SUCCESS:")
+        assert validation_result.startswith("FAILURE:")
+        assert "Rolled back package 'lodash'" in validation_result
+        assert touched_files == set()
+        sandbox.write_file.assert_called_once_with("package.json", baseline)
 
 
 class TestValidateCodeSyntax:

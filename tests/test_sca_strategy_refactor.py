@@ -290,8 +290,9 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
     assert "exact version 4.18.0" in prompt
     assert "view_npm_package_versions" not in prompt
     assert "Planning Answers" not in prompt
-    assert "exactly once for the final batch state" in prompt
-    assert "immediately after every manifest change" not in prompt
+    assert "per-package" in prompt
+    assert "with that package_name" in prompt
+    assert "exactly once for the final batch state" not in prompt
 
 
 def test_update_worker_records_failed_exact_version_attempts_without_selecting_next_version():

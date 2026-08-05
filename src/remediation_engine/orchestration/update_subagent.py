@@ -25,12 +25,12 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
-from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
-from remediation_engine.orchestration.state import SubagentState
-from remediation_engine.orchestration.subagent_runtime import (
-    has_single_final_successful_validation,
-    run_bounded_subagent_loop,
+from remediation_engine.orchestration.remedy_tools import (
+    build_update_toolbelt,
+    rollback_pending_package_updates,
 )
+from remediation_engine.orchestration.state import SubagentState
+from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.settings import AppSettings
 
@@ -255,7 +255,7 @@ def _legacy_build_update_prompt(
                 "You are a dependency-resolution specialist operating inside a shared Docker workspace.",
                 "You may only modify package manifests through modify_npm_dependency.",
                 "You must inspect the repository map before making manifest changes.",
-                "Immediately after any manifest change, you must call validate_manifest_sync.",
+                "After completing the exact manifest edits for each package, call validate_manifest_sync for that package before editing the next package.",
                 "If validate_manifest_sync fails, you must resolve the peer conflict or invalid manifest state before finishing.",
                 "Every modify_npm_dependency call must include the exact manifest_path you intend to edit.",
                 "If the vulnerable component appears in multiple manifest paths, call modify_npm_dependency once for each manifest_path that declares it.",
@@ -293,13 +293,13 @@ def _legacy_build_update_prompt(
                     "   - *If SECURITY_FLAG:* Attempt the latest version from the registry unless it was already attempted.",
                     "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version and that version was already attempted, do NOT re-apply it. Re-applying the same version will fail QA again.",
                     "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
-                    "4. **Validation:** Immediately after editing, you MUST call `validate_manifest_sync`.",
+                    "4. **Validation:** After completing all required manifest edits for one package, you MUST call `validate_manifest_sync` with that package's exact package_name before moving to the next package.",
                     "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
                     "6. **Clean Room Surrender & Exhaustion:**",
                     "   - In a multi-target batch, if one package cannot be resolved due to a peer conflict, you MUST call `revert_workspace_file(file_path, package_name='failing_package')` ONLY for that specific failing package. Preserve and validate the manifest updates for all other successful packages in the batch.",
                     "   - If the latest version on the NPM registry was already attempted and still failed QA due to an unresolved vulnerability (`SECURITY_FLAG`), do NOT re-attempt it or try older versions. Immediately perform a Clean Room Surrender for that package and explicitly state 'update path is exhausted' in your Reasoning Summary.",
                     "",
-                    "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when `validate_manifest_sync` succeeds, or you have executed a Clean Room Surrender.",
+                    "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when every package has a successful per-package `validate_manifest_sync` result, or you have executed a Clean Room Surrender.",
                 ]
             )
         )
@@ -462,9 +462,9 @@ def _was_package_modified(
         args = getattr(event, "args", {}) or {}
         content = str(getattr(event, "content", ""))
         if name == "modify_npm_dependency" and args.get("package_name") == pkg:
-            if content.startswith("SUCCESS:") or content == "SUCCESS":
-                modified = True
-            else:
+            modified = content.startswith("SUCCESS:") or content == "SUCCESS"
+        elif name == "validate_manifest_sync" and args.get("package_name") == pkg:
+            if content.startswith("FAILURE:") or content.startswith("ERROR:"):
                 modified = False
         elif name == "revert_workspace_file" and (
             content.startswith("SUCCESS:") or content == "SUCCESS"
@@ -502,9 +502,12 @@ def _has_successful_validation_for_package(
 
     for event in tool_events[last_successful_edit_index + 1 :]:
         name = getattr(event, "name", "")
+        args = getattr(event, "args", {}) or {}
         content = str(getattr(event, "content", ""))
-        if name == "validate_manifest_sync" and (
-            content.startswith("SUCCESS:") or content == "SUCCESS"
+        if (
+            name == "validate_manifest_sync"
+            and (not args.get("package_name") or args.get("package_name") == pkg)
+            and (content.startswith("SUCCESS:") or content == "SUCCESS")
         ):
             return True
 
@@ -590,7 +593,9 @@ def _legacy_build_action_summaries(
             else "Stopped without a validated manifest update (reverted/surrendered)"
         )
 
-        changed_label = ", ".join(relevant_changed_files or manifest_paths or ["no files"])
+        changed_label = ", ".join(
+            relevant_changed_files or (manifest_paths if pkg_modified else ["no files"])
+        )
         summary_text = (
             f"{outcome} for {component} in {manifest_label}; changed files: {changed_label}."
         )
@@ -965,8 +970,9 @@ def _build_update_prompt(
         "Do not search the NPM registry, choose alternate versions, or perform retry planning.",
         "Use only read_repository_map, modify_npm_dependency, revert_workspace_file, and validate_manifest_sync.",
         "Inspect the repository map before editing.",
-        "Apply all exact task instructions first, then call validate_manifest_sync exactly once for the final batch state.",
-        "If final validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
+        "For each package, apply all of its exact task instructions, then call validate_manifest_sync with that package_name before moving to the next package.",
+        "The validator rolls back only the current package to its pre-update checkpoint when synchronization fails; preserve earlier packages whose validations succeeded.",
+        "If a package validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
         "Never edit source-code files in this worker.",
         "",
         "Constraints ledger:",
@@ -990,7 +996,7 @@ def _build_update_prompt(
         [
             "",
             "Completion rule:",
-            "Return control only after one final manifest synchronization call succeeds, or after surrendering on its failure.",
+            "Return control only after every package has one successful per-package manifest synchronization call, or after surrendering on the first package validation failure.",
         ]
     )
     return "\n".join(sections)
@@ -1023,7 +1029,8 @@ def _build_action_summaries(
             if task_succeeded
             else "Stopped without a validated manifest update"
         )
-        summary = f"{outcome} for {group.vulnerable_component or 'unknown component'} in {', '.join(manifest_paths) or 'no manifest'}; changed files: {', '.join(changed or manifest_paths or ['no files'])}."
+        changed_label = changed or (manifest_paths if package_modified else ["no files"])
+        summary = f"{outcome} for {group.vulnerable_component or 'unknown component'} in {', '.join(manifest_paths) or 'no manifest'}; changed files: {', '.join(changed_label)}."
         if final_note and len(resolved_tasks) == 1:
             summary += f" Final note: {final_note}"
         summaries.append(AgentActionSummary(task_id=task.task_id, status=status, summary=summary))
@@ -1234,7 +1241,10 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         }
 
     touched_files: set[str] = set()
-    execution_state: dict[str, int | bool] = {
+    package_checkpoints: dict[str, Any] = {}
+    cleanup_errors: list[str] = []
+    runtime = None
+    execution_state: dict[str, Any] = {
         "edits_started": False,
         "validation_calls": 0,
     }
@@ -1289,13 +1299,24 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 package_manifest_paths=package_manifest_map,
                 override_required_packages=override_required_packages,
                 execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
             )
-            runtime = run_bounded_subagent_loop(
-                llm,
-                toolbelt,
-                initial_messages,
-                touched_files,
-            )
+            try:
+                runtime = run_bounded_subagent_loop(
+                    llm,
+                    toolbelt,
+                    initial_messages,
+                    touched_files,
+                )
+            finally:
+                rollback_errors = rollback_pending_package_updates(
+                    sandbox,
+                    package_checkpoints,
+                    touched_files,
+                )
+                cleanup_errors.extend(rollback_errors)
+                if rollback_errors and runtime is not None:
+                    runtime.errors.extend(rollback_errors)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
         summaries = _build_surrender_summaries(
@@ -1305,20 +1326,43 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "action_summaries": summaries,
             "action_summary": summaries[0] if summaries else None,
             "changed_files": sorted(touched_files),
-            "errors": resolution_errors + [msg],
+            "errors": resolution_errors + cleanup_errors + [msg],
         }
 
     validation_events = [
         event for event in runtime.tool_events if event.name == "validate_manifest_sync"
     ]
+    package_names = {
+        (group.vulnerable_component or "").strip()
+        for _, group, _ in resolved_tasks
+        if (group.vulnerable_component or "").strip()
+    }
+    successful_packages = {
+        (group.vulnerable_component or "").strip()
+        for _, group, _ in resolved_tasks
+        if _has_successful_validation_for_package(group, runtime.tool_events)
+    }
+    unvalidated_manifest_paths = {
+        path.replace("\\", "/")
+        for _, group, manifest_paths in resolved_tasks
+        if (group.vulnerable_component or "").strip() not in successful_packages
+        for path in manifest_paths
+    }
+    committed_changed_files = sorted(touched_files)
+    if not committed_changed_files:
+        committed_changed_files = sorted(
+            path
+            for path in runtime.changed_files
+            if path.replace("\\", "/") not in unvalidated_manifest_paths
+        )
     succeeded = (
-        bool(runtime.changed_files)
-        and len(validation_events) == 1
-        and int(execution_state.get("validation_calls", 0)) == 1
-        and has_single_final_successful_validation(
-            runtime.tool_events,
-            edit_tool_name="modify_npm_dependency",
-            validation_tool_name="validate_manifest_sync",
+        bool(committed_changed_files)
+        and bool(package_names)
+        and len(validation_events) == len(package_names)
+        and int(execution_state.get("validation_calls", 0)) == len(package_names)
+        and all(
+            _has_successful_validation_for_package(group, runtime.tool_events)
+            for _, group, _ in resolved_tasks
         )
     )
     attempted_by_task = _attempted_versions_for_current_run(
@@ -1363,7 +1407,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     )
     summaries = _build_action_summaries(
         resolved_tasks,
-        runtime.changed_files,
+        committed_changed_files,
         runtime.final_text,
         succeeded,
         retry_batch=retry_batch,
@@ -1399,7 +1443,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     return {
         "action_summaries": tagged_summaries,
         "action_summary": tagged_summaries[0] if tagged_summaries else None,
-        "changed_files": runtime.changed_files,
+        "changed_files": committed_changed_files,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "worker_results_by_attempt": _worker_result_map(
             target_tasks,

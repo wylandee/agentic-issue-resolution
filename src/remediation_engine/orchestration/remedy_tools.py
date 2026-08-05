@@ -12,6 +12,7 @@ import shlex
 import uuid
 from base64 import b64decode
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -406,6 +407,81 @@ def _normalize_package_manifest_targets(
     return normalized
 
 
+@dataclass
+class _PackageCheckpoint:
+    """Capture one package's pre-edit workspace state during an update batch."""
+
+    files: dict[str, str | None]
+    touched_files_before: set[str]
+
+
+def _package_checkpoint_paths(manifest_paths: Iterable[str]) -> list[str]:
+    """Return manifests and npm lockfiles that may change for a package update."""
+    paths: set[str] = set()
+    for manifest_path in manifest_paths:
+        normalized_manifest = _validate_workspace_path(manifest_path)
+        paths.add(normalized_manifest)
+        parent = Path(normalized_manifest).parent
+        for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
+            paths.add(_validate_workspace_path((parent / lockfile_name).as_posix()))
+    return sorted(paths)
+
+
+def _capture_package_checkpoint(
+    sandbox: DockerSandbox,
+    manifest_paths: Iterable[str],
+    touched_files: set[str],
+) -> _PackageCheckpoint:
+    """Capture the current package manifests and related lockfiles before editing."""
+    files: dict[str, str | None] = {}
+    for path in _package_checkpoint_paths(manifest_paths):
+        content = sandbox.read_file(path)
+        files[path] = content if isinstance(content, str) else None
+    return _PackageCheckpoint(files=files, touched_files_before=set(touched_files))
+
+
+def _restore_package_checkpoint(
+    sandbox: DockerSandbox,
+    checkpoint: _PackageCheckpoint,
+    touched_files: set[str],
+) -> str | None:
+    """Restore one package checkpoint and return a rollback error, if any."""
+    rollback_errors: list[str] = []
+    for path, content in checkpoint.files.items():
+        try:
+            if content is None:
+                result = sandbox.run(f"rm -f -- {shlex.quote(path)}")
+                if result.exit_code != 0:
+                    rollback_errors.append(
+                        f"{path}: delete failed with exit {result.exit_code}: {result.stderr}"
+                    )
+            else:
+                sandbox.write_file(path, content)
+        except Exception as exc:  # noqa: BLE001
+            rollback_errors.append(f"{path}: {exc}")
+
+    touched_files.difference_update(checkpoint.files)
+    touched_files.update(checkpoint.touched_files_before)
+    if rollback_errors:
+        return "Package checkpoint rollback failed: " + " | ".join(rollback_errors)
+    return None
+
+
+def rollback_pending_package_updates(
+    sandbox: DockerSandbox,
+    package_checkpoints: dict[str, _PackageCheckpoint],
+    touched_files: set[str],
+) -> list[str]:
+    """Restore package edits that were not successfully validated in this run."""
+    errors: list[str] = []
+    for package_name, checkpoint in list(package_checkpoints.items()):
+        rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+        if rollback_error:
+            errors.append(f"Package '{package_name}': {rollback_error}")
+        package_checkpoints.pop(package_name, None)
+    return errors
+
+
 def _make_read_repository_map_tool(sandbox: DockerSandbox):
     @tool
     def read_repository_map() -> str:
@@ -620,7 +696,8 @@ def _make_modify_npm_dependency_tool(
     override_required_packages: Iterable[str] | None = None,
     require_planning_answers: bool = False,
     planning_state: dict[str, bool] | None = None,
-    execution_state: dict[str, int | bool] | None = None,
+    execution_state: dict[str, Any] | None = None,
+    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
 ):
     allowed_manifest_paths_by_package = {
         package_name: set(manifest_paths)
@@ -691,6 +768,21 @@ def _make_modify_npm_dependency_tool(
                 f"package '{package_name}'. Allowed manifest_path values: {allowed}."
             )
 
+        if execution_state is not None:
+            pending_package = str(execution_state.get("pending_validation_package", "") or "")
+            if pending_package and pending_package != package_name:
+                return (
+                    f"ERROR: Package '{pending_package}' must be validated before editing "
+                    f"package '{package_name}'."
+                )
+
+        if package_checkpoints is not None and package_name not in package_checkpoints:
+            package_checkpoints[package_name] = _capture_package_checkpoint(
+                sandbox,
+                allowed_manifest_paths,
+                touched_files,
+            )
+
         package_expr = f"{dependency_type}[{package_name}]={target_version}"
         npm_cmd = shlex.join(["npm", "pkg", "set", package_expr])
         workspace_dir = _workspace_dir_for_manifest(rel_manifest)
@@ -705,6 +797,7 @@ def _make_modify_npm_dependency_tool(
             touched_files.add(rel_manifest)
             if execution_state is not None:
                 execution_state["edits_started"] = True
+                execution_state["pending_validation_package"] = package_name
             return (
                 "SUCCESS: Natively updated "
                 f"{dependency_type}.{package_name} to {target_version} in {rel_manifest}."
@@ -721,27 +814,48 @@ def _make_modify_npm_dependency_tool(
 
 def _make_validate_manifest_sync_tool(
     sandbox: DockerSandbox,
-    target_manifest_paths: Iterable[str],
-    execution_state: dict[str, int | bool] | None = None,
+    package_manifest_paths: Mapping[str, Iterable[str]],
+    touched_files: set[str],
+    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+    execution_state: dict[str, Any] | None = None,
 ):
-    manifest_paths = _normalize_manifest_targets(target_manifest_paths)
+    normalized_package_manifest_paths = _normalize_package_manifest_targets(package_manifest_paths)
 
     @tool
-    def validate_manifest_sync() -> str:
+    def validate_manifest_sync(package_name: str) -> str:
         """
-        Validate the final target package manifests once without scripts.
+        Validate one package's target manifests without scripts.
+
+        Each package must be validated separately so a failed package can be
+        rolled back without discarding earlier successful updates in the batch.
         """
+        package_key = (package_name or "").strip()
+        if not package_key:
+            return "ERROR: package_name is required for per-package manifest validation."
+
+        manifest_paths = normalized_package_manifest_paths.get(package_key)
+        if not manifest_paths:
+            known_packages = ", ".join(sorted(normalized_package_manifest_paths))
+            return (
+                f"ERROR: package_name '{package_key}' is not an allowed validation target. "
+                f"Allowed package_name values: {known_packages}."
+            )
+
         if execution_state is not None:
-            calls = int(execution_state.get("validation_calls", 0))
-            if calls >= 1:
+            pending_package = str(execution_state.get("pending_validation_package", "") or "")
+            if pending_package and pending_package != package_key:
                 return (
-                    "ERROR: validate_manifest_sync may only be called once per update worker run."
+                    f"ERROR: Validate package '{pending_package}' before validating "
+                    f"package '{package_key}'."
                 )
+            calls = int(execution_state.get("validation_calls", 0))
             if not execution_state.get("edits_started", False):
                 return "ERROR: validate_manifest_sync is only allowed after manifest edits."
             execution_state["validation_calls"] = calls + 1
-        if not manifest_paths:
-            return "FAILURE: No target manifest paths were provided for validation."
+
+        checkpoint = package_checkpoints.get(package_key) if package_checkpoints else None
+        if execution_state is not None and package_checkpoints is not None and checkpoint is None:
+            return f"ERROR: Package '{package_key}' must be modified before it can be validated."
 
         for manifest_path in manifest_paths:
             workspace_dir = _workspace_dir_for_manifest(manifest_path)
@@ -751,14 +865,46 @@ def _make_validate_manifest_sync_tool(
             )
             result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
             if result.exit_code != 0:
-                return (
+                failure = (
                     f"FAILURE: Manifest sync failed for {manifest_path} "
                     f"(exit {result.exit_code}).\n"
                     f"stdout:\n{result.stdout}\n"
                     f"stderr:\n{result.stderr}"
                 )
+                rollback_error = (
+                    _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+                    if checkpoint is not None
+                    else None
+                )
+                if execution_state is not None:
+                    execution_state["pending_validation_package"] = None
+                if package_checkpoints is not None:
+                    package_checkpoints.pop(package_key, None)
+                if rollback_error:
+                    return f"{failure}\n{rollback_error}"
+                return (
+                    f"{failure}\nRolled back package '{package_key}' to its pre-update checkpoint."
+                )
 
-        return f"SUCCESS: Manifest synchronization succeeded for {', '.join(manifest_paths)}."
+        if checkpoint is not None:
+            for path, before in checkpoint.files.items():
+                after = sandbox.read_file(path)
+                if after != before:
+                    touched_files.add(path)
+            if package_checkpoints is not None:
+                package_checkpoints.pop(package_key, None)
+
+        if execution_state is not None:
+            execution_state["pending_validation_package"] = None
+            validated_packages = list(execution_state.get("validated_packages", []) or [])
+            if package_key not in validated_packages:
+                validated_packages.append(package_key)
+            execution_state["validated_packages"] = validated_packages
+
+        return (
+            f"SUCCESS: Manifest synchronization succeeded for package '{package_key}' "
+            f"in {', '.join(manifest_paths)}."
+        )
 
     return validate_manifest_sync
 
@@ -2430,24 +2576,35 @@ def build_update_toolbelt(
     override_required_packages: Iterable[str] | None = None,
     require_planning_answers: bool = False,
     planning_state: dict[str, bool] | None = None,
-    execution_state: dict[str, int | bool] | None = None,
+    execution_state: dict[str, Any] | None = None,
+    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
 ) -> list:
     """Build the strict update-only toolbelt."""
-    manifest_paths = _normalize_manifest_targets(target_manifest_paths)
+    _normalize_manifest_targets(target_manifest_paths)
+    normalized_package_manifest_paths = _normalize_package_manifest_targets(package_manifest_paths)
+    if package_checkpoints is None:
+        package_checkpoints = {}
     toolbelt = [
         _make_read_repository_map_tool(sandbox),
         _make_modify_npm_dependency_tool(
             sandbox,
             touched_files,
-            package_manifest_paths,
+            normalized_package_manifest_paths,
             attempted_versions_by_package=attempted_versions_by_package,
             override_required_packages=override_required_packages,
             require_planning_answers=require_planning_answers,
             planning_state=planning_state,
             execution_state=execution_state,
+            package_checkpoints=package_checkpoints,
         ),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_manifest_sync_tool(sandbox, manifest_paths, execution_state),
+        _make_validate_manifest_sync_tool(
+            sandbox,
+            normalized_package_manifest_paths,
+            touched_files,
+            package_checkpoints=package_checkpoints,
+            execution_state=execution_state,
+        ),
     ]
     return toolbelt
 

@@ -196,7 +196,8 @@ class TestUpdateSubagentWrapper:
 
     def test_success_requires_validation_after_manifest_edit(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
-        group_b = _sca_group("sca:frontend/package.json:lodash", "frontend/package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        group_b.vulnerable_component = "axios"
         repo_root = _repo_root()
         state = initial_update_subagent_state(
             repo_root,
@@ -228,8 +229,35 @@ class TestUpdateSubagentWrapper:
                 tool_calls=[
                     {
                         "name": "validate_manifest_sync",
-                        "args": {},
+                        "args": {"package_name": "lodash"},
                         "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="updating second package",
+                tool_calls=[
+                    {
+                        "name": "modify_npm_dependency",
+                        "args": {
+                            "package_name": "axios",
+                            "target_version": "1.7.4",
+                            "dependency_type": "dependencies",
+                            "manifest_path": "frontend/package.json",
+                        },
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="validating second package",
+                tool_calls=[
+                    {
+                        "name": "validate_manifest_sync",
+                        "args": {"package_name": "axios"},
+                        "id": "call-4",
                         "type": "tool_call",
                     }
                 ],
@@ -268,7 +296,7 @@ class TestUpdateSubagentWrapper:
         ):
             result = run_update_subagent_node(state)
 
-        assert bound.invoke.call_count == 3
+        assert bound.invoke.call_count == 5
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert "messages" not in result
         assert "package.json" in result["changed_files"]
