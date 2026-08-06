@@ -63,6 +63,7 @@ The `fixtures/suppressed/` scenario contains:
 * **`odc_suppressed_issues.jsonl`**: Canonical issue subset used when selecting suppressed findings with `run.py --issues`.
 * **`triaged_groups_suppressed.json`**: Pre-triaged groups consumed by `run_post_triage.py`.
 * **`run_post_triage.py`**: Runner for the post-triage scenario.
+* **`extract_suppressed.py`**: Helper script to extract target package issues from `baseline_issues.jsonl` into `odc_suppressed_issues.jsonl`.
 
 The raw suppressed ODC report is not currently included in this directory. The checked-in suppressed issue and group files are static fixtures; changing the suppression rules requires producing a new ODC report externally and refreshing those derived files.
 
@@ -72,6 +73,18 @@ The workaround scenario is self-contained under `workaround_replay/`:
 * **`express_jwt_workaround_replay.json`**: Express-JWT replay state, task, and QA evidence.
 
 ### Refreshing derived fixtures manually
+
+To extract target package entries directly from `baseline_issues.jsonl` into `fixtures/suppressed/odc_suppressed_issues.jsonl`:
+
+```bash
+python examples/juice_shop/fixtures/suppressed/extract_suppressed.py @angular/common
+```
+
+You can pass multiple package names or specify custom `--input` and `--output` paths:
+
+```bash
+python examples/juice_shop/fixtures/suppressed/extract_suppressed.py @angular/common @angular/compiler --output custom_issues.jsonl
+```
 
 After producing an ODC JSON report with the desired suppression rules, normalize and triage it with the `remedy` CLI:
 
