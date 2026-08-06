@@ -48,15 +48,18 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.tools.fix_planner import (
+    SerperLLMResult,
     _build_instruction,
     _extract_fixed_from_osv_vuln,
     _extract_local_version,
     _fetch_npm_latest,
     _fetch_osv_vuln_detail,
+    _fetch_page_content,
     _is_npm_issue,
+    _llm_extract_remediation,
     _package_name_from_issue,
     _query_osv_fixed_version,
-    _search_serper_workarounds,
+    _query_serper,
     plan_fix,
 )
 
@@ -504,34 +507,52 @@ class TestQueryOsvFixedVersion:
 
 
 # ===========================================================================
-# _search_serper_workarounds
+# _query_serper
 # ===========================================================================
 
 
-class TestSearchSerperWorkarounds:
-    def test_returns_snippets(self, monkeypatch):
+class TestQuerySerper:
+    def test_returns_results_dict(self, monkeypatch):
         monkeypatch.setenv("SERPER_API_KEY", "test-key")
         body = {
             "organic": [
-                {"snippet": "Workaround A", "title": "Blog post"},
-                {"snippet": "Workaround B", "title": "GitHub issue"},
-                {"snippet": "Workaround C", "title": "StackOverflow"},
-                {"snippet": "Workaround D", "title": "Extra"},  # capped at 3
+                {
+                    "link": "https://github.com/foo/bar/issues/1",
+                    "snippet": "Workaround A",
+                    "title": "Blog post",
+                },
+                {
+                    "link": "https://github.com/foo/bar/issues/2",
+                    "snippet": "Workaround B",
+                    "title": "GitHub issue",
+                },
+                {
+                    "link": "https://github.com/foo/bar/issues/3",
+                    "snippet": "Workaround C",
+                    "title": "StackOverflow",
+                },
+                {
+                    "link": "https://github.com/foo/bar/issues/4",
+                    "snippet": "Workaround D",
+                    "title": "Extra",
+                },  # capped at 3
             ]
         }
         mock_resp = MagicMock()
         mock_resp.json.return_value = body
         mock_resp.raise_for_status = MagicMock()
         with patch("remediation_engine.tools.fix_planner.requests.post", return_value=mock_resp):
-            result = _search_serper_workarounds(_make_vuln_issue(), "lodash")
+            result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is not None
         assert len(result) == 3
-        assert "Workaround A" in result
+        assert result[0]["url"] == "https://github.com/foo/bar/issues/1"
+        assert result[0]["snippet"] == "Workaround A"
+        assert result[0]["title"] == "Blog post"
 
     def test_returns_none_when_no_key(self, monkeypatch):
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         with patch("remediation_engine.tools.fix_planner.requests.post") as mock_post:
-            result = _search_serper_workarounds(_make_vuln_issue(), "lodash")
+            result = _query_serper(_make_vuln_issue(), "lodash")
         mock_post.assert_not_called()
         assert result is None
 
@@ -540,7 +561,7 @@ class TestSearchSerperWorkarounds:
         with patch(
             "remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")
         ):
-            result = _search_serper_workarounds(_make_vuln_issue(), "lodash")
+            result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is None
 
     def test_empty_organic_returns_none(self, monkeypatch):
@@ -549,162 +570,242 @@ class TestSearchSerperWorkarounds:
         mock_resp.json.return_value = {"organic": []}
         mock_resp.raise_for_status = MagicMock()
         with patch("remediation_engine.tools.fix_planner.requests.post", return_value=mock_resp):
-            result = _search_serper_workarounds(_make_vuln_issue(), "lodash")
+            result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is None
 
 
 # ===========================================================================
-# plan_fix â€” waterfall integration
+# _fetch_page_content
 # ===========================================================================
 
 
-class LegacyPlanFixNpmFirst:
-    """End-to-end npm-first tests with all network mocked."""
+class TestFetchPageContent:
+    def test_github_api_success(self):
+        mock_resp = MagicMock()
+        mock_resp.text = "GitHub advisory content"
+        mock_resp.json.side_effect = Exception("Not JSON")
+        mock_resp.raise_for_status = MagicMock()
+        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+            result = _fetch_page_content("https://github.com/foo/bar/issues/1")
+        assert result == "GitHub advisory content"
 
-    def test_npm_registry_latest_wins_over_local_hint(self):
-        """Message contains version hint â†’ step 1 wins."""
-        loc = _make_localized()  # message includes local hint 4.17.21.
-        with (
-            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"),
-            patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock,
+    def test_github_raw_fallback(self):
+        def fake_get(url, **kwargs):
+            mock = MagicMock()
+            if "api.github.com" in url:
+                mock.raise_for_status.side_effect = Exception("API error")
+            else:
+                mock.text = "Raw github file content"
+                mock.raise_for_status = MagicMock()
+            return mock
+
+        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+            result = _fetch_page_content("https://github.com/foo/bar/blob/main/README.md")
+        assert result == "Raw github file content"
+
+    def test_jina_reader_fallback(self):
+        def fake_get(url, **kwargs):
+            mock = MagicMock()
+            if "r.jina.ai" in url:
+                mock.text = "Jina reader markdown"
+                mock.raise_for_status = MagicMock()
+            else:
+                mock.raise_for_status.side_effect = Exception("Failed")
+            return mock
+
+        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+            result = _fetch_page_content("https://example.com/advisory")
+        assert result == "Jina reader markdown"
+
+    def test_direct_fetch_fallback(self):
+        def fake_get(url, **kwargs):
+            mock = MagicMock()
+            if "r.jina.ai" in url:
+                mock.raise_for_status.side_effect = Exception("Jina fail")
+            else:
+                mock.text = "Direct HTML content"
+                mock.raise_for_status = MagicMock()
+            return mock
+
+        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+            result = _fetch_page_content("https://example.com/advisory")
+        assert result == "Direct HTML content"
+
+    def test_all_tiers_fail_returns_none(self):
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.get",
+            side_effect=Exception("network fail"),
         ):
-            result = plan_fix(loc)
+            result = _fetch_page_content("https://example.com/advisory")
+        assert result is None
 
-        osv_mock.assert_not_called()
-        assert result["status"] == FixPlanStatus.VERSION_FOUND.value
-        assert result["fixed_version"] == "4.17.22"
-        assert result["strategy_used"] == "npm_registry"
-        assert result["workaround_snippets"] is None
+    def test_truncates_long_content(self):
+        mock_resp = MagicMock()
+        mock_resp.text = "A" * 20_000
+        mock_resp.raise_for_status = MagicMock()
+        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+            result = _fetch_page_content("https://example.com/advisory")
+        assert result is not None
+        assert len(result) == 16_000
 
-    def test_osv_is_not_called_by_default(self):
-        """No local hint, but OSV returns a fixed version."""
-        issue = _make_vuln_issue(message="No version hint here.")
-        loc = _make_localized(issue=issue)
+
+# ===========================================================================
+# _llm_extract_remediation
+# ===========================================================================
+
+
+class TestLLMExtractRemediation:
+    def test_version_bump_extraction(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SerperLLMResult(
+            strategy="VERSION_BUMP",
+            fixed_version="4.17.21",
+            reasoning="Upgrade recommended",
+        )
+
+        with patch("langchain_openai.ChatOpenAI", return_value=mock_llm):
+            pages = [{"url": "https://example.com", "content": "Update lodash to 4.17.21"}]
+            result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
+
+        assert result is not None
+        assert result["strategy"] == "VERSION_BUMP"
+        assert result["fixed_version"] == "4.17.21"
+
+    def test_code_workaround_extraction(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SerperLLMResult(
+            strategy="CODE_WORKAROUND",
+            workaround_snippets=["Disable feature X"],
+            reasoning="Code mitigation",
+        )
+
+        with patch("langchain_openai.ChatOpenAI", return_value=mock_llm):
+            pages = [{"url": "https://example.com", "content": "Workaround: Disable feature X"}]
+            result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
+
+        assert result is not None
+        assert result["strategy"] == "CODE_WORKAROUND"
+        assert result["workaround_snippets"] == ["Disable feature X"]
+
+    def test_no_fix_returns_dict(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SerperLLMResult(
+            strategy="NO_FIX",
+            reasoning="No patch available",
+        )
+
+        with patch("langchain_openai.ChatOpenAI", return_value=mock_llm):
+            pages = [{"url": "https://example.com", "content": "No fix yet."}]
+            result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
+
+        assert result is not None
+        assert result["strategy"] == "NO_FIX"
+
+    def test_llm_exception_returns_none(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        with patch("langchain_openai.ChatOpenAI", side_effect=Exception("API Error")):
+            pages = [{"url": "https://example.com", "content": "some text"}]
+            result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
+        assert result is None
+
+    def test_no_api_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        pages = [{"url": "https://example.com", "content": "some text"}]
+        result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
+        assert result is None
+
+
+# ===========================================================================
+# plan_fix — Serper LLM fallback integration
+# ===========================================================================
+
+
+class TestPlanFixSerperFallback:
+    def test_osv_fails_serper_version_bump(self):
+        loc = _make_localized()
+        llm_dict = {"strategy": "VERSION_BUMP", "fixed_version": "4.17.21"}
         with (
-            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value="4.17.22"),
-            patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv_mock,
-        ):
-            result = plan_fix(loc)
-
-        osv_mock.assert_not_called()
-        assert result["fixed_version"] == "4.17.22"
-        assert result["strategy_used"] == "npm_registry"
-
-    def test_npm_no_result_falls_back_to_serper(self, monkeypatch):
-        monkeypatch.setenv("SERPER_API_KEY", "test-key")
-        issue = _make_vuln_issue(message="No version hint.")
-        loc = _make_localized(issue=issue)
-        snippets = ["Workaround A", "Workaround B"]
-        with (
-            patch("remediation_engine.tools.fix_planner._fetch_npm_latest", return_value=None),
             patch(
-                "remediation_engine.tools.fix_planner._search_serper_workarounds",
-                return_value=snippets,
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=llm_dict,
             ),
         ):
             result = plan_fix(loc)
-        assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
-        assert result["fixed_version"] is None
-        assert result["workaround_snippets"] == snippets
-        assert result["strategy_used"] == "serper"
 
-    def test_npm_registry_latest(self):
-        """No hint + OSV fails â†’ npm registry returns latest."""
-        issue = _make_vuln_issue(message="No version hint here.")
-        loc = _make_localized(issue=issue)
-        with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
-            return_value=("4.17.21", None),
-        ):
-            result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.VERSION_FOUND.value
         assert result["fixed_version"] == "4.17.21"
-        assert result["strategy_used"] == "npm_registry"
+        assert result["strategy_used"] == "serper_llm"
 
-    def test_non_npm_skips_npm_and_tries_serper(self):
-        """npm registry step is skipped for maven ecosystem packages."""
-        issue = _make_vuln_issue(
-            message="No version hint.",
-            ecosystem="maven",
-            purl="pkg:maven/commons-io/commons-io@2.4",
-        )
-        loc = _make_localized(issue=issue)
-        snippets = ["Workaround for Maven package."]
+    def test_osv_fails_serper_code_workaround(self):
+        loc = _make_localized()
+        llm_dict = {"strategy": "CODE_WORKAROUND", "workaround_snippets": ["Sanitize input"]}
         with (
-            patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock,
             patch(
-                "remediation_engine.tools.fix_planner._search_serper_workarounds",
-                return_value=snippets,
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
             ),
-        ):
-            result = plan_fix(loc)
-        npm_mock.assert_not_called()
-        assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
-        assert result["workaround_snippets"] == snippets
-        assert result["strategy_used"] == "serper"
-
-    def test_non_npm_no_serper_returns_no_fix(self):
-        issue = _make_vuln_issue(
-            message="No version hint.",
-            ecosystem="maven",
-            purl="pkg:maven/commons-io/commons-io@2.4",
-        )
-        loc = _make_localized(issue=issue)
-        with (
-            patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm_mock,
             patch(
-                "remediation_engine.tools.fix_planner._search_serper_workarounds", return_value=None
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=llm_dict,
             ),
         ):
             result = plan_fix(loc)
 
-        npm_mock.assert_not_called()
-        assert result["status"] == FixPlanStatus.NO_FIX.value
-        assert result["fixed_version"] is None
-        assert result["workaround_snippets"] is None
-        assert result["strategy_used"] == "none"
-
-    def test_npm_no_result_uses_serper_workaround(self, monkeypatch):
-        """All version strategies fail â†’ Serper returns snippets."""
-        monkeypatch.setenv("SERPER_API_KEY", "test-key")
-        issue = _make_vuln_issue(message="No version hint.")
-        loc = _make_localized(issue=issue)
-        snippets = ["Workaround A", "Workaround B"]
-        with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
-            return_value=(None, snippets),
-        ):
-            result = plan_fix(loc)
         assert result["status"] == FixPlanStatus.WORKAROUND_FOUND.value
-        assert result["workaround_snippets"] == snippets
-        assert result["fixed_version"] is None
-        assert result["strategy_used"] == "serper"
-        assert result["instruction"] == (
-            "Analyze the provided workaround_snippets to determine if a code edit "
-            "can safely mitigate this vulnerability."
-        )
+        assert result["workaround_snippets"] == ["Sanitize input"]
+        assert result["strategy_used"] == "serper_llm"
 
-    def test_npm_no_result_and_no_serper_returns_no_fix(self, monkeypatch):
-        """All strategies fail â†’ no_fix."""
-        monkeypatch.delenv("SERPER_API_KEY", raising=False)
-        issue = _make_vuln_issue(message="No version hint.")
-        loc = _make_localized(issue=issue)
-        with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
-            return_value=(None, None),
+    def test_osv_fails_serper_search_returns_none(self):
+        loc = _make_localized()
+        with (
+            patch(
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=None,
+            ),
         ):
             result = plan_fix(loc)
+
         assert result["status"] == FixPlanStatus.NO_FIX.value
-        assert result["fixed_version"] is None
-        assert result["workaround_snippets"] is None
         assert result["strategy_used"] == "none"
-        assert (
-            result["instruction"] == "No upstream patch or workaround was found. Inform the user."
-        )
+
+    def test_osv_fails_serper_llm_returns_no_fix(self):
+        loc = _make_localized()
+        llm_dict = {"strategy": "NO_FIX"}
+        with (
+            patch(
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=llm_dict,
+            ),
+        ):
+            result = plan_fix(loc)
+
+        assert result["status"] == FixPlanStatus.NO_FIX.value
+        assert result["strategy_used"] == "none"
 
 
 # ===========================================================================
-# plan_fix â†’ FixPlan round-trip
+# plan_fix — FixPlan round-trip
 # ===========================================================================
 
 
@@ -721,6 +822,7 @@ class TestPlanFixRoundTrip:
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.VERSION_FOUND
         assert fp.fixed_version == "4.17.21"
+        assert fp.strategy_used == "osv_api"
 
     def test_workaround_found_validates(self):
         issue = _make_vuln_issue(message="No hint.")
@@ -734,6 +836,45 @@ class TestPlanFixRoundTrip:
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.WORKAROUND_FOUND
         assert fp.workaround_snippets == ["patch A"]
+        assert fp.strategy_used == "osv_api"
+
+    def test_serper_llm_version_round_trip(self):
+        loc = _make_localized()
+        llm_dict = {"strategy": "VERSION_BUMP", "fixed_version": "4.17.21"}
+        with (
+            patch(
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=llm_dict,
+            ),
+        ):
+            result = plan_fix(loc)
+        fp = FixPlan(**result)
+        assert fp.status == FixPlanStatus.VERSION_FOUND
+        assert fp.strategy_used == "serper_llm"
+        assert fp.fixed_version == "4.17.21"
+
+    def test_serper_llm_workaround_round_trip(self):
+        loc = _make_localized()
+        llm_dict = {"strategy": "CODE_WORKAROUND", "workaround_snippets": ["step 1"]}
+        with (
+            patch(
+                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                return_value=llm_dict,
+            ),
+        ):
+            result = plan_fix(loc)
+        fp = FixPlan(**result)
+        assert fp.status == FixPlanStatus.WORKAROUND_FOUND
+        assert fp.strategy_used == "serper_llm"
+        assert fp.workaround_snippets == ["step 1"]
 
     def test_no_fix_validates(self, monkeypatch):
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
@@ -746,6 +887,7 @@ class TestPlanFixRoundTrip:
             result = plan_fix(loc)
         fp = FixPlan(**result)
         assert fp.status == FixPlanStatus.NO_FIX
+        assert fp.strategy_used == "none"
 
     def test_json_round_trip(self):
         loc = _make_localized()

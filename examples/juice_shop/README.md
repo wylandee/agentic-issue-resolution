@@ -98,7 +98,7 @@ After producing an ODC JSON report with the desired suppression rules, normalize
 2. **Triage the selected issues into groups:**
 
    ```bash
-   remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
-     --repo data/clones/juice-shop \
-     --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
+      remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
+      --repo data/clones/juice-shop \
+      --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
    ```

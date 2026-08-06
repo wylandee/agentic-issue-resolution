@@ -244,7 +244,7 @@ class FixPlan(BaseModel):
         ...,
         min_length=1,
         description="Which waterfall step produced this plan "
-        "(local_regex | osv_api | npm_registry | serper | none).",
+        "(local_regex | osv_api | npm_registry | serper | serper_llm | none).",
     )
 
     @model_validator(mode="after")

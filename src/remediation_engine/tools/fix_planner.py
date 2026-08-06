@@ -22,8 +22,6 @@ Current triage planner steps
 ----------------------------
 1. **osv_api** â€” resolve this finding's CVE/GHSA advisory through OSV.
 2. **none** â€” OSV supplied neither a fixed version nor mitigation guidance.
-
-   Only attempted for npm/javascript ecosystem packages.
 4. **serper** â€” Google Search via Serper.dev for workaround snippets.
    Silently skipped if ``SERPER_API_KEY`` is not set.
 5. **none** â€” all strategies exhausted; return a ``no_fix`` plan.
@@ -37,12 +35,14 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any
-from urllib.parse import quote
+from typing import Any, Literal
+from urllib.parse import quote, urlparse
 
 import requests
+from pydantic import BaseModel
 
 from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
+from remediation_engine.settings import AppSettings
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ NPM_REGISTRY_URL = "https://registry.npmjs.org/{package}/latest"
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 
 _REQUEST_TIMEOUT = 10  # seconds
+_READ_WEB_PAGE_TIMEOUT = 15
+_READ_WEB_PAGE_MAX_CHARS = 16_000
+_JINA_READER_URL_PREFIX = "https://r.jina.ai/"
+_GITHUB_API_URL_PREFIX = "https://api.github.com/"
 
 # Matches "update to version X.Y.Z", "upgrade to 3.0.0 or later", etc.
 _VERSION_RE = re.compile(
@@ -84,6 +88,20 @@ _WORKAROUND_INSTRUCTION = (
     "can safely mitigate this vulnerability."
 )
 _NO_FIX_INSTRUCTION = "No upstream patch or workaround was found. Inform the user."
+
+
+# ---------------------------------------------------------------------------
+# Structured Output Model for LLM Remediation Parsing
+# ---------------------------------------------------------------------------
+
+
+class SerperLLMResult(BaseModel):
+    """Structured output schema for LLM extraction from Serper result web pages."""
+
+    strategy: Literal["VERSION_BUMP", "CODE_WORKAROUND", "NO_FIX"]
+    fixed_version: str | None = None
+    workaround_snippets: list[str] | None = None
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +217,7 @@ def _extract_osv_workaround_snippets(vuln: dict[str, Any]) -> list[str] | None:
         if not candidate:
             return
         snippet = candidate.strip()
-        if not snippet or not _contains_workaround_keyword(snippet):
+        if not snippet or not _contains_workaround_snippet(snippet):
             return
         if snippet not in snippets:
             snippets.append(snippet)
@@ -223,6 +241,10 @@ def _extract_osv_workaround_snippets(vuln: dict[str, Any]) -> list[str] | None:
         _add_snippet(combined)
 
     return snippets or None
+
+
+def _contains_workaround_snippet(text: str) -> bool:
+    return any(keyword in text.lower() for keyword in _WORKAROUND_KEYWORDS)
 
 
 def _extract_fixed_from_osv_vuln(
@@ -438,29 +460,236 @@ def _fetch_npm_latest(package_name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Waterfall step 4 â€” Serper web search
+# Waterfall step 4 â€” Serper web search + LLM page content extraction
 # ---------------------------------------------------------------------------
 
 
-def _search_serper_workarounds(issue: Any, package_name: str) -> list[str] | None:
-    """
-    Search Google via Serper.dev for workaround snippets.
+def _github_api_url(url: str) -> str | None:
+    """Convert a github.com HTML URL to a GitHub REST API URL if applicable."""
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            return None
+        owner, repository = parts[0], parts[1]
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        base = f"{_GITHUB_API_URL_PREFIX}repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+        if len(parts) == 2:
+            return base
+        resource = parts[2].lower()
+        if resource in {"issues", "pulls", "commits"} and len(parts) >= 4:
+            return f"{base}/{resource}/{quote(parts[3], safe='')}"
+        if resource == "releases" and len(parts) >= 5 and parts[3].lower() == "tag":
+            return f"{base}/releases/tags/{quote('/'.join(parts[4:]), safe='')}"
+        if resource in {"blob", "raw", "tree"} and len(parts) >= 4:
+            ref = quote(parts[3], safe="")
+            content_path = quote("/".join(parts[4:]), safe="/")
+            endpoint = f"{base}/contents/{content_path}" if content_path else f"{base}/contents"
+            return f"{endpoint}?ref={ref}"
+        return base
+    except Exception:
+        return None
 
-    Returns the top-3 organic ``snippet`` strings, or ``None`` if:
-    - ``SERPER_API_KEY`` is not set.
-    - The API call fails.
-    - No organic results are returned.
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _decode_github_response(resp: Any, target_url: str) -> str:
+    text = getattr(resp, "text", "") or ""
+    if text.strip():
+        try:
+            payload = resp.json()
+        except Exception:
+            return text
+        if isinstance(payload, dict):
+            if payload.get("encoding") == "base64" and payload.get("content"):
+                try:
+                    from base64 import b64decode
+
+                    return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
+                except Exception:
+                    return text
+            title = (
+                payload.get("title")
+                or payload.get("name")
+                or payload.get("login")
+                or "GitHub Content"
+            )
+            body = payload.get("body") or payload.get("description") or payload.get("content") or ""
+            if title or body:
+                return f"Title: {title}\nURL: {target_url}\n\n{body}".strip()
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        if isinstance(payload, list):
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        return text
+    return ""
+
+
+def _fetch_page_content(url: str) -> str | None:
+    """
+    Fetch web page text using a 3-tier waterfall: GitHub API/Raw -> Jina Reader -> Direct HTTP.
+
+    Truncates result to 16,000 characters. Catches all exceptions at each tier
+    and falls through; returns None if all tiers fail.
+    """
+    target_url = (url or "").strip()
+    if not target_url:
+        return None
+
+    # 1. GitHub API & Raw GitHub fallback
+    if "github.com" in target_url and not target_url.startswith(
+        "https://raw.githubusercontent.com"
+    ):
+        github_api_url = _github_api_url(target_url)
+        if github_api_url:
+            try:
+                resp = requests.get(
+                    github_api_url,
+                    headers=_github_headers(),
+                    timeout=_READ_WEB_PAGE_TIMEOUT,
+                )
+                resp.raise_for_status()
+                text = _decode_github_response(resp, target_url)
+                if text and text.strip():
+                    return text[:_READ_WEB_PAGE_MAX_CHARS]
+            except Exception as exc:
+                log.debug("GitHub API fetch failed for %s: %s", target_url, exc)
+
+        raw_url = (
+            target_url.replace("github.com", "raw.githubusercontent.com")
+            .replace("/blob/", "/")
+            .replace("/tree/", "/")
+        )
+        try:
+            resp = requests.get(raw_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+            resp.raise_for_status()
+            text = resp.text or ""
+            if text and text.strip():
+                return text[:_READ_WEB_PAGE_MAX_CHARS]
+        except Exception as exc:
+            log.debug("Raw GitHub fetch failed for %s: %s", raw_url, exc)
+
+    # 2. Jina Reader fallback
+    jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
+    try:
+        resp = requests.get(
+            jina_url,
+            headers={"Accept": "text/plain"},
+            timeout=_READ_WEB_PAGE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = resp.text or ""
+        if text and text.strip():
+            return text[:_READ_WEB_PAGE_MAX_CHARS]
+    except Exception as exc:
+        log.debug("Jina Reader fetch failed for %s: %s", target_url, exc)
+
+    # 3. Direct page fetch fallback
+    try:
+        resp = requests.get(target_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+        resp.raise_for_status()
+        text = resp.text or ""
+        if text and text.strip():
+            return text[:_READ_WEB_PAGE_MAX_CHARS]
+    except Exception as exc:
+        log.debug("Direct page fetch failed for %s: %s", target_url, exc)
+
+    return None
+
+
+def _llm_extract_remediation(
+    page_contents: list[dict[str, str]],
+    package_name: str,
+    vuln_id: str,
+) -> dict[str, Any] | None:
+    """
+    Use LLM structured output to extract version bump or workaround steps from web page text.
+
+    Returns a dict matching SerperLLMResult schema, or None if extraction fails.
+    """
+    if not page_contents:
+        return None
+
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore[import]
+    except ImportError:
+        log.warning("langchain-openai not installed; skipping LLM page extraction.")
+        return None
+
+    settings = AppSettings.from_env()
+    api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        log.info("OPENAI_API_KEY not set â€” skipping LLM page extraction.")
+        return None
+
+    model_name = (
+        settings.triage_llm_model or os.environ.get("TRIAGE_LLM_MODEL", "gpt-4o-mini").strip()
+    )
+
+    pages_text = []
+    for idx, page in enumerate(page_contents, 1):
+        url = page.get("url", "")
+        content = page.get("content", "")
+        pages_text.append(f"--- Page {idx}: {url} ---\n{content}")
+    combined_pages = "\n\n".join(pages_text)
+
+    prompt_text = (
+        f"You are a security engineer analyzing web page findings for vulnerable package '{package_name}' "
+        f"(vulnerability ID: '{vuln_id}').\n\n"
+        f"Below are fetched web page contents from security advisories, release notes, or issue threads:\n\n"
+        f"{combined_pages}\n\n"
+        "Analyze the content carefully and extract actionable remediation info:\n"
+        "1. If the page provides a clear patched version to bump to, set strategy='VERSION_BUMP' and fixed_version='X.Y.Z'.\n"
+        "2. If the page provides a code workaround or mitigation steps, set strategy='CODE_WORKAROUND' and workaround_snippets=[...].\n"
+        "3. If no actionable fixed version or code workaround is found, set strategy='NO_FIX'.\n"
+    )
+
+    try:
+        llm = ChatOpenAI(model=model_name, temperature=0, api_key=api_key)
+        structured_llm = llm.with_structured_output(SerperLLMResult)
+        result: SerperLLMResult = structured_llm.invoke(prompt_text)
+        return result.model_dump()
+    except Exception as exc:
+        log.warning("LLM extraction failed for %s (%s): %s", package_name, vuln_id, exc)
+        return None
+
+
+def _query_serper(issue: Any, package_name: str) -> list[dict[str, str]] | None:
+    """
+    Search Google via Serper.dev for vulnerability information.
+
+    Returns up to 3 organic result items with keys 'url', 'snippet', 'title',
+    or None if SERPER_API_KEY is not set, API fails, or organic results are empty.
     """
     api_key = os.environ.get("SERPER_API_KEY", "").strip()
     if not api_key:
-        log.info("SERPER_API_KEY not set â€” skipping Serper workaround search.")
+        log.info("SERPER_API_KEY not set â€” skipping Serper search.")
         return None
 
-    vuln_id = issue.cve_id or issue.rule_id or ""
+    vuln_id = (
+        getattr(issue, "cve_id", None)
+        or getattr(issue, "ghsa_id", None)
+        or getattr(issue, "rule_id", None)
+        or ""
+    )
+    query = f"{package_name} {vuln_id} vulnerability workaround github".strip()
 
-    query = f"{package_name} {vuln_id} vulnerability workaround github"
-
-    log.info(f"Executing Serper search with query: {query}")
+    log.info("Executing Serper search with query: %s", query)
 
     try:
         resp = requests.post(
@@ -469,17 +698,61 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> list[str] | Non
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
             timeout=_REQUEST_TIMEOUT,
         )
-
         resp.raise_for_status()
         data = resp.json()
         organic = data.get("organic") or []
-        snippets = [
-            item["snippet"] for item in organic if isinstance(item, dict) and item.get("snippet")
-        ][:3]
-        return snippets if snippets else None
+        results: list[dict[str, str]] = []
+        for item in organic:
+            if isinstance(item, dict):
+                link = item.get("link") or item.get("url") or ""
+                if link:
+                    results.append(
+                        {
+                            "url": str(link),
+                            "snippet": str(item.get("snippet") or ""),
+                            "title": str(item.get("title") or ""),
+                        }
+                    )
+                    if len(results) >= 3:
+                        break
+        return results if results else None
     except Exception as exc:
         log.warning("Serper search failed: %s", exc)
         return None
+
+
+def _serper_search_and_extract(issue: Any, package_name: str) -> dict[str, Any] | None:
+    """
+    Orchestrate Serper search, page fetch, and LLM remediation extraction.
+
+    1. Query Serper for organic search results.
+    2. Fetch page content for top result URLs (up to 3).
+    3. Pass fetched page contents to LLM for structured extraction.
+    4. Return LLM extraction dict, or None if any step fails/returns no content.
+    """
+    search_results = _query_serper(issue, package_name)
+    if not search_results:
+        return None
+
+    pages: list[dict[str, str]] = []
+    for item in search_results:
+        url = item.get("url")
+        if not url:
+            continue
+        content = _fetch_page_content(url)
+        if content and content.strip():
+            pages.append({"url": url, "content": content})
+
+    if not pages:
+        return None
+
+    vuln_id = (
+        getattr(issue, "cve_id", None)
+        or getattr(issue, "ghsa_id", None)
+        or getattr(issue, "rule_id", None)
+        or ""
+    )
+    return _llm_extract_remediation(pages, package_name, str(vuln_id))
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +762,7 @@ def _search_serper_workarounds(issue: Any, package_name: str) -> list[str] | Non
 
 def plan_fix(localized_issue: LocalizedIssue) -> dict:
     """
-    Plan one SCA finding from OSV advisory data only.
+    Plan one SCA finding from OSV advisory data and Serper fallback.
 
     NPM registry candidate selection intentionally does not happen here.  The
     supervisor owns the later retry stages so each advisory is classified
@@ -511,13 +784,13 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
     is_direct = localized_issue.is_direct_dependency
     manifest_file = localized_issue.manifest_file
 
-    # Triage is deliberately OSV-first and OSV-only. NPM candidate selection is
-    # owned by the Phase 5 supervisor after QA rejects this initial attempt.
+    # Step 1: OSV query
     osv_result = _query_osv_fixed_version(issue)
     if isinstance(osv_result, tuple) and len(osv_result) == 2:
         fixed, snippets = osv_result
     else:  # Defensive fallback for integrations that return no OSV result.
         fixed, snippets = None, None
+
     if fixed:
         return _version_plan(
             package_name,
@@ -535,6 +808,30 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             "instruction": _WORKAROUND_INSTRUCTION,
             "strategy_used": "osv_api",
         }
+
+    # Step 2: Serper web search fallback with LLM page parsing
+    serper_llm_result = _serper_search_and_extract(issue, package_name)
+    if serper_llm_result and isinstance(serper_llm_result, dict):
+        strategy = serper_llm_result.get("strategy")
+        if strategy == "VERSION_BUMP" and serper_llm_result.get("fixed_version"):
+            return _version_plan(
+                package_name,
+                serper_llm_result["fixed_version"],
+                package_manager,
+                is_direct,
+                manifest_file,
+                strategy="serper_llm",
+            )
+        if strategy == "CODE_WORKAROUND" and serper_llm_result.get("workaround_snippets"):
+            return {
+                "status": FixPlanStatus.WORKAROUND_FOUND.value,
+                "fixed_version": None,
+                "workaround_snippets": serper_llm_result["workaround_snippets"],
+                "instruction": _WORKAROUND_INSTRUCTION,
+                "strategy_used": "serper_llm",
+            }
+
+    # Step 3: No fix found across all strategies
     return {
         "status": FixPlanStatus.NO_FIX.value,
         "fixed_version": None,

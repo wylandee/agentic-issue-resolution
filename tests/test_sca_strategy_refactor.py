@@ -112,13 +112,11 @@ def test_plan_fix_is_osv_only_and_does_not_fall_through_to_npm_or_serper():
             "remediation_engine.tools.fix_planner._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ) as osv,
-        patch("remediation_engine.tools.fix_planner._fetch_npm_latest") as npm,
-        patch("remediation_engine.tools.fix_planner._search_serper_workarounds") as serper,
+        patch("remediation_engine.tools.fix_planner._serper_search_and_extract") as serper,
     ):
         result = plan_fix(localized)
 
     osv.assert_called_once_with(issue)
-    npm.assert_not_called()
     serper.assert_not_called()
     assert result["fixed_version"] == "4.17.21"
     assert result["strategy_used"] == "osv_api"
