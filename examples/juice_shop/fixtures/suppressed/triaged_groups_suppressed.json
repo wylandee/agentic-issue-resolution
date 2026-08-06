@@ -1,5 +1,1802 @@
 [
   {
+    "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "@tootallnate/once",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2026-3449"
+    ],
+    "ghsa_ids": [
+      "GHSA-VPQ2-C234-7XJ6"
+    ],
+    "versions": [
+      "1.1.2"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "5c280aa5-a3d6-43f3-85fa-9de7e5459809",
+    "issues": [
+      {
+        "id": "5c280aa5-a3d6-43f3-85fa-9de7e5459809",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2026-3449",
+        "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+        "cwe": [
+          {
+            "id": "CWE-705",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "LOW",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/@tootallnate/once:1.1.2",
+        "line_range": null,
+        "package_name": "@tootallnate/once",
+        "package_version": "1.1.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+        "ecosystem": "npm",
+        "message": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "@tootallnate/once:1.1.2",
+          "filePath": "/scan/package-lock.json?/@tootallnate/once:1.1.2",
+          "vulnerability": {
+            "source": "NPM",
+            "name": "GHSA-vpq2-c234-7xj6",
+            "unscored": "true",
+            "severity": "low",
+            "cvssv3": {
+              "baseScore": 3.299999952316284,
+              "attackVector": "LOCAL",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "NONE",
+              "availabilityImpact": "LOW",
+              "baseSeverity": "LOW",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-705"
+            ],
+            "description": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability.",
+            "notes": "",
+            "references": [
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/TooTallNate/once/issues/8",
+                "name": "https://github.com/TooTallNate/once/issues/8"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/TooTallNate/once/commit/b9f43cc5259bee2952d91ad3cdbd201a82df448a",
+                "name": "https://github.com/TooTallNate/once/commit/b9f43cc5259bee2952d91ad3cdbd201a82df448a"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/TooTallNate/once/releases/tag/v2.0.1",
+                "name": "https://github.com/TooTallNate/once/releases/tag/v2.0.1"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://security.snyk.io/vuln/SNYK-JS-TOOTALLNATEONCE-15250612",
+                "name": "https://security.snyk.io/vuln/SNYK-JS-TOOTALLNATEONCE-15250612"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/advisories/GHSA-vpq2-c234-7xj6",
+                "name": "https://github.com/advisories/GHSA-vpq2-c234-7xj6"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-3449",
+                "name": "https://nvd.nist.gov/vuln/detail/CVE-2026-3449"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:*:\\@tootallnate\\/once:\\<2.0.1:*:*:*:*:*:*:*"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.813971+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "5c280aa5-a3d6-43f3-85fa-9de7e5459809",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2026-3449",
+          "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+          "cwe": [
+            {
+              "id": "CWE-705",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "LOW",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/@tootallnate/once:1.1.2",
+          "line_range": null,
+          "package_name": "@tootallnate/once",
+          "package_version": "1.1.2",
+          "fixed_version": null,
+          "purl": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+          "ecosystem": "npm",
+          "message": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "@tootallnate/once:1.1.2",
+            "filePath": "/scan/package-lock.json?/@tootallnate/once:1.1.2",
+            "vulnerability": {
+              "source": "NPM",
+              "name": "GHSA-vpq2-c234-7xj6",
+              "unscored": "true",
+              "severity": "low",
+              "cvssv3": {
+                "baseScore": 3.299999952316284,
+                "attackVector": "LOCAL",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "LOW",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "NONE",
+                "availabilityImpact": "LOW",
+                "baseSeverity": "LOW",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-705"
+              ],
+              "description": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/TooTallNate/once/issues/8",
+                  "name": "https://github.com/TooTallNate/once/issues/8"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/TooTallNate/once/commit/b9f43cc5259bee2952d91ad3cdbd201a82df448a",
+                  "name": "https://github.com/TooTallNate/once/commit/b9f43cc5259bee2952d91ad3cdbd201a82df448a"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/TooTallNate/once/releases/tag/v2.0.1",
+                  "name": "https://github.com/TooTallNate/once/releases/tag/v2.0.1"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://security.snyk.io/vuln/SNYK-JS-TOOTALLNATEONCE-15250612",
+                  "name": "https://security.snyk.io/vuln/SNYK-JS-TOOTALLNATEONCE-15250612"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/advisories/GHSA-vpq2-c234-7xj6",
+                  "name": "https://github.com/advisories/GHSA-vpq2-c234-7xj6"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-3449",
+                  "name": "https://nvd.nist.gov/vuln/detail/CVE-2026-3449"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:*:\\@tootallnate\\/once:\\<2.0.1:*:*:*:*:*:*:*"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.813971+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": "npm",
+        "localization_confidence": 0.6,
+        "localized_at": "2026-08-06T02:16:33.892696Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "2.0.1",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"@tootallnate/once\": \"2.0.1\"} in package.json to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2026-3449",
+      "epss": 0.00112,
+      "epss_percentile": 0.01575,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-06T02:17:19.040843Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": null,
+    "grouped_at": "2026-08-06T02:17:17.731641Z"
+  },
+  {
+    "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "express-jwt",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2020-15084"
+    ],
+    "ghsa_ids": [
+      "GHSA-6G6M-M6H5-W9GF"
+    ],
+    "versions": [
+      "0.1.3"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+    "issues": [
+      {
+        "id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2020-15084",
+        "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+        "cwe": [
+          {
+            "id": "CWE-863",
+            "name": null
+          },
+          {
+            "id": "CWE-285",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "CRITICAL",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+        "line_range": null,
+        "package_name": "express-jwt",
+        "package_version": "0.1.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/express-jwt@0.1.3",
+        "ecosystem": "npm",
+        "message": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "express-jwt:0.1.3",
+          "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2020-15084",
+            "severity": "CRITICAL",
+            "cvssv2": {
+              "score": 4.3,
+              "accessVector": "NETWORK",
+              "accessComplexity": "MEDIUM",
+              "authenticationr": "NONE",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "PARTIAL",
+              "availabilityImpact": "NONE",
+              "severity": "MEDIUM",
+              "version": "2.0",
+              "exploitabilityScore": "8.6",
+              "impactScore": "2.9"
+            },
+            "cvssv3": {
+              "baseScore": 9.1,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "CRITICAL",
+              "exploitabilityScore": "3.9",
+              "impactScore": "5.2",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-863",
+              "CWE-285"
+            ],
+            "description": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+            "notes": "",
+            "references": [
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:auth0:express-jwt:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "5.3.3"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/express-jwt@0.1.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815136+00:00"
+      },
+      {
+        "id": "e94f2e28-2a06-4533-8d1b-afc309579eae",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2020-15084",
+        "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+        "cwe": [
+          {
+            "id": "CWE-863",
+            "name": null
+          },
+          {
+            "id": "CWE-285",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "HIGH",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+        "line_range": null,
+        "package_name": "express-jwt",
+        "package_version": "0.1.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/express-jwt@0.1.3",
+        "ecosystem": "npm",
+        "message": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "express-jwt:0.1.3",
+          "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+          "vulnerability": {
+            "source": "NPM",
+            "name": "GHSA-6g6m-m6h5-w9gf",
+            "unscored": "true",
+            "severity": "high",
+            "cvssv3": {
+              "baseScore": 7.699999809265137,
+              "attackVector": "NETWORK",
+              "attackComplexity": "HIGH",
+              "privilegesRequired": "LOW",
+              "userInteraction": "REQUIRED",
+              "scope": "CHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "HIGH",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-863",
+              "CWE-285"
+            ],
+            "description": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+            "notes": "",
+            "references": [
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084",
+                "name": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:*:express-jwt:\\<\\=5.3.3:*:*:*:*:*:*:*"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/express-jwt@0.1.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815145+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2020-15084",
+          "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+          "cwe": [
+            {
+              "id": "CWE-863",
+              "name": null
+            },
+            {
+              "id": "CWE-285",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "CRITICAL",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+          "line_range": null,
+          "package_name": "express-jwt",
+          "package_version": "0.1.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/express-jwt@0.1.3",
+          "ecosystem": "npm",
+          "message": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "express-jwt:0.1.3",
+            "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2020-15084",
+              "severity": "CRITICAL",
+              "cvssv2": {
+                "score": 4.3,
+                "accessVector": "NETWORK",
+                "accessComplexity": "MEDIUM",
+                "authenticationr": "NONE",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "PARTIAL",
+                "availabilityImpact": "NONE",
+                "severity": "MEDIUM",
+                "version": "2.0",
+                "exploitabilityScore": "8.6",
+                "impactScore": "2.9"
+              },
+              "cvssv3": {
+                "baseScore": 9.1,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "HIGH",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "CRITICAL",
+                "exploitabilityScore": "3.9",
+                "impactScore": "5.2",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-863",
+                "CWE-285"
+              ],
+              "description": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:auth0:express-jwt:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "5.3.3"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/express-jwt@0.1.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815136+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": true,
+        "manifest_line": 112,
+        "manifest_snippet": "    \"express-ipfilter\": \"^1.3.2\",\n    \"express-jwt\": \"0.1.3\",\n    \"express-rate-limit\": \"^7.5.1\",",
+        "package_manager": "npm",
+        "localization_confidence": 0.95,
+        "localized_at": "2026-08-06T02:16:34.619458Z"
+      },
+      {
+        "issue": {
+          "id": "e94f2e28-2a06-4533-8d1b-afc309579eae",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2020-15084",
+          "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+          "cwe": [
+            {
+              "id": "CWE-863",
+              "name": null
+            },
+            {
+              "id": "CWE-285",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "HIGH",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+          "line_range": null,
+          "package_name": "express-jwt",
+          "package_version": "0.1.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/express-jwt@0.1.3",
+          "ecosystem": "npm",
+          "message": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "express-jwt:0.1.3",
+            "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+            "vulnerability": {
+              "source": "NPM",
+              "name": "GHSA-6g6m-m6h5-w9gf",
+              "unscored": "true",
+              "severity": "high",
+              "cvssv3": {
+                "baseScore": 7.699999809265137,
+                "attackVector": "NETWORK",
+                "attackComplexity": "HIGH",
+                "privilegesRequired": "LOW",
+                "userInteraction": "REQUIRED",
+                "scope": "CHANGED",
+                "confidentialityImpact": "HIGH",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "HIGH",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-863",
+                "CWE-285"
+              ],
+              "description": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+              "notes": "",
+              "references": [
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084",
+                  "name": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:*:express-jwt:\\<\\=5.3.3:*:*:*:*:*:*:*"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/express-jwt@0.1.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815145+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": true,
+        "manifest_line": 112,
+        "manifest_snippet": "    \"express-ipfilter\": \"^1.3.2\",\n    \"express-jwt\": \"0.1.3\",\n    \"express-rate-limit\": \"^7.5.1\",",
+        "package_manager": "npm",
+        "localization_confidence": 0.95,
+        "localized_at": "2026-08-06T02:16:35.360182Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "6.0.0",
+      "workaround_snippets": null,
+      "instruction": "Update \"express-jwt\" in package.json to version \"6.0.0\".",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2020-15084",
+      "epss": 0.0105,
+      "epss_percentile": 0.60966,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-06T02:17:19.040843Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": true,
+    "grouped_at": "2026-08-06T02:17:17.731886Z"
+  },
+  {
+    "group_id": "sca:package.json:got:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "got",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2022-33987"
+    ],
+    "ghsa_ids": [
+      "GHSA-PFRX-2Q88-QQ97"
+    ],
+    "versions": [
+      "8.3.2"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "1fb9e267-0256-4ba2-a883-7b3459729634",
+    "issues": [
+      {
+        "id": "1fb9e267-0256-4ba2-a883-7b3459729634",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-33987",
+        "ghsa_id": "GHSA-PFRX-2Q88-QQ97",
+        "cwe": [],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/got:8.3.2",
+        "line_range": null,
+        "package_name": "got",
+        "package_version": "8.3.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/got@8.3.2",
+        "ecosystem": "npm",
+        "message": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "got:8.3.2",
+          "filePath": "/scan/package-lock.json?/got:8.3.2",
+          "vulnerability": {
+            "source": "NPM",
+            "name": "GHSA-pfrx-2q88-qq97",
+            "unscored": "true",
+            "severity": "moderate",
+            "cvssv3": {
+              "baseScore": 5.300000190734863,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "version": "3.1"
+            },
+            "description": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket.",
+            "notes": "",
+            "references": [
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                "name": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                "name": "https://github.com/sindresorhus/got/releases/tag/v11.8.5"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/sindresorhus/got/pull/2047",
+                "name": "https://github.com/sindresorhus/got/pull/2047"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/sindresorhus/got/releases/tag/v12.1.0",
+                "name": "https://github.com/sindresorhus/got/releases/tag/v12.1.0"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-33987",
+                "name": "https://nvd.nist.gov/vuln/detail/CVE-2022-33987"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/advisories/GHSA-pfrx-2q88-qq97",
+                "name": "https://github.com/advisories/GHSA-pfrx-2q88-qq97"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/sindresorhus/got/commit/861ccd9ac2237df762a9e2beed7edd88c60782dc",
+                "name": "https://github.com/sindresorhus/got/commit/861ccd9ac2237df762a9e2beed7edd88c60782dc"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:*:got:\\<11.8.5:*:*:*:*:*:*:*"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/got@8.3.2",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815534+00:00"
+      },
+      {
+        "id": "591dab5a-be25-48aa-9e89-8d7eb9064b81",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-33987",
+        "ghsa_id": null,
+        "cwe": [],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/got:8.3.2",
+        "line_range": null,
+        "package_name": "got",
+        "package_version": "8.3.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/got@8.3.2",
+        "ecosystem": "npm",
+        "message": "The got package before 12.1.0 (also fixed in 11.8.5) for Node.js allows a redirect to a UNIX socket.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "got:8.3.2",
+          "filePath": "/scan/package-lock.json?/got:8.3.2",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2022-33987",
+            "severity": "MEDIUM",
+            "cvssv2": {
+              "score": 5.0,
+              "accessVector": "NETWORK",
+              "accessComplexity": "LOW",
+              "authenticationr": "NONE",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "PARTIAL",
+              "availabilityImpact": "NONE",
+              "severity": "MEDIUM",
+              "version": "2.0",
+              "exploitabilityScore": "10.0",
+              "impactScore": "2.9"
+            },
+            "cvssv3": {
+              "baseScore": 5.3,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "exploitabilityScore": "3.9",
+              "impactScore": "1.4",
+              "version": "3.1"
+            },
+            "cwes": [
+              "NVD-CWE-noinfo"
+            ],
+            "description": "The got package before 12.1.0 (also fixed in 11.8.5) for Node.js allows a redirect to a UNIX socket.",
+            "notes": "",
+            "references": [
+              {
+                "source": "cve@mitre.org",
+                "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "cve@mitre.org",
+                "url": "https://github.com/sindresorhus/got/pull/2047",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "cve@mitre.org",
+                "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/sindresorhus/got/pull/2047",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:got_project:got:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndExcluding": "11.8.5"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/got@8.3.2",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815547+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "1fb9e267-0256-4ba2-a883-7b3459729634",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2022-33987",
+          "ghsa_id": "GHSA-PFRX-2Q88-QQ97",
+          "cwe": [],
+          "owasp": [],
+          "severity": "MEDIUM",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/got:8.3.2",
+          "line_range": null,
+          "package_name": "got",
+          "package_version": "8.3.2",
+          "fixed_version": null,
+          "purl": "pkg:npm/got@8.3.2",
+          "ecosystem": "npm",
+          "message": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "got:8.3.2",
+            "filePath": "/scan/package-lock.json?/got:8.3.2",
+            "vulnerability": {
+              "source": "NPM",
+              "name": "GHSA-pfrx-2q88-qq97",
+              "unscored": "true",
+              "severity": "moderate",
+              "cvssv3": {
+                "baseScore": 5.300000190734863,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "LOW",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "MEDIUM",
+                "version": "3.1"
+              },
+              "description": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                  "name": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                  "name": "https://github.com/sindresorhus/got/releases/tag/v11.8.5"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/sindresorhus/got/pull/2047",
+                  "name": "https://github.com/sindresorhus/got/pull/2047"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/sindresorhus/got/releases/tag/v12.1.0",
+                  "name": "https://github.com/sindresorhus/got/releases/tag/v12.1.0"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-33987",
+                  "name": "https://nvd.nist.gov/vuln/detail/CVE-2022-33987"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/advisories/GHSA-pfrx-2q88-qq97",
+                  "name": "https://github.com/advisories/GHSA-pfrx-2q88-qq97"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/sindresorhus/got/commit/861ccd9ac2237df762a9e2beed7edd88c60782dc",
+                  "name": "https://github.com/sindresorhus/got/commit/861ccd9ac2237df762a9e2beed7edd88c60782dc"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:*:got:\\<11.8.5:*:*:*:*:*:*:*"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/got@8.3.2",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815534+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": "npm",
+        "localization_confidence": 0.6,
+        "localized_at": "2026-08-06T02:16:36.076688Z"
+      },
+      {
+        "issue": {
+          "id": "591dab5a-be25-48aa-9e89-8d7eb9064b81",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2022-33987",
+          "ghsa_id": null,
+          "cwe": [],
+          "owasp": [],
+          "severity": "MEDIUM",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/got:8.3.2",
+          "line_range": null,
+          "package_name": "got",
+          "package_version": "8.3.2",
+          "fixed_version": null,
+          "purl": "pkg:npm/got@8.3.2",
+          "ecosystem": "npm",
+          "message": "The got package before 12.1.0 (also fixed in 11.8.5) for Node.js allows a redirect to a UNIX socket.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "got:8.3.2",
+            "filePath": "/scan/package-lock.json?/got:8.3.2",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2022-33987",
+              "severity": "MEDIUM",
+              "cvssv2": {
+                "score": 5.0,
+                "accessVector": "NETWORK",
+                "accessComplexity": "LOW",
+                "authenticationr": "NONE",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "PARTIAL",
+                "availabilityImpact": "NONE",
+                "severity": "MEDIUM",
+                "version": "2.0",
+                "exploitabilityScore": "10.0",
+                "impactScore": "2.9"
+              },
+              "cvssv3": {
+                "baseScore": 5.3,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "LOW",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "MEDIUM",
+                "exploitabilityScore": "3.9",
+                "impactScore": "1.4",
+                "version": "3.1"
+              },
+              "cwes": [
+                "NVD-CWE-noinfo"
+              ],
+              "description": "The got package before 12.1.0 (also fixed in 11.8.5) for Node.js allows a redirect to a UNIX socket.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "cve@mitre.org",
+                  "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "cve@mitre.org",
+                  "url": "https://github.com/sindresorhus/got/pull/2047",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "cve@mitre.org",
+                  "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/sindresorhus/got/pull/2047",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/sindresorhus/got/releases/tag/v11.8.5",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/sindresorhus/got/compare/v12.0.3...v12.1.0",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:got_project:got:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndExcluding": "11.8.5"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/got@8.3.2",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815547+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": "npm",
+        "localization_confidence": 0.6,
+        "localized_at": "2026-08-06T02:16:36.795967Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "11.8.5",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"got\": \"11.8.5\"} in package.json to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2022-33987",
+      "epss": 0.02162,
+      "epss_percentile": 0.80445,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-06T02:17:19.040843Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": true,
+    "grouped_at": "2026-08-06T02:17:17.732051Z"
+  },
+  {
+    "group_id": "sca:package.json:notevil:NO_FIX",
+    "issue_type": "sca",
+    "vulnerable_component": "notevil",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2021-23771"
+    ],
+    "ghsa_ids": [
+      "GHSA-8G4M-CJM2-96WQ"
+    ],
+    "versions": [
+      "1.3.3"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "cd04112e-9ad7-40c1-8a25-6f79d22ad4be",
+    "issues": [
+      {
+        "id": "eb127601-b1cf-448e-b2ba-0da785662dbc",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2021-23771",
+        "ghsa_id": null,
+        "cwe": [
+          {
+            "id": "CWE-1321",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/notevil:1.3.3",
+        "line_range": null,
+        "package_name": "notevil",
+        "package_version": "1.3.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/notevil@1.3.3",
+        "ecosystem": "npm",
+        "message": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878).",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "notevil:1.3.3",
+          "filePath": "/scan/package-lock.json?/notevil:1.3.3",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2021-23771",
+            "severity": "MEDIUM",
+            "cvssv2": {
+              "score": 6.4,
+              "accessVector": "NETWORK",
+              "accessComplexity": "LOW",
+              "authenticationr": "NONE",
+              "confidentialityImpact": "PARTIAL",
+              "integrityImpact": "PARTIAL",
+              "availabilityImpact": "NONE",
+              "severity": "MEDIUM",
+              "version": "2.0",
+              "exploitabilityScore": "10.0",
+              "impactScore": "4.9"
+            },
+            "cvssv3": {
+              "baseScore": 6.5,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "LOW",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "exploitabilityScore": "3.9",
+              "impactScore": "2.5",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-1321"
+            ],
+            "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878).",
+            "notes": "",
+            "references": [
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "report@snyk.io",
+                "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "report@snyk.io",
+                "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:argencoders-notevil_project:argencoders-notevil:*:*:*:*:*:node.js:*:*",
+                  "versionEndIncluding": "2.5.0"
+                }
+              },
+              {
+                "software": {
+                  "id": "cpe:2.3:a:notevil_project:notevil:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "1.3.3"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/notevil@1.3.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.817244+00:00"
+      },
+      {
+        "id": "cd04112e-9ad7-40c1-8a25-6f79d22ad4be",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2021-23771",
+        "ghsa_id": "GHSA-8G4M-CJM2-96WQ",
+        "cwe": [
+          {
+            "id": "CWE-1321",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/notevil:1.3.3",
+        "line_range": null,
+        "package_name": "notevil",
+        "package_version": "1.3.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/notevil@1.3.3",
+        "ecosystem": "npm",
+        "message": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878). This package has been deprecated.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "notevil:1.3.3",
+          "filePath": "/scan/package-lock.json?/notevil:1.3.3",
+          "vulnerability": {
+            "source": "NPM",
+            "name": "GHSA-8g4m-cjm2-96wq",
+            "unscored": "true",
+            "severity": "moderate",
+            "cvssv3": {
+              "baseScore": 6.5,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "LOW",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-1321"
+            ],
+            "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878). This package has been deprecated.",
+            "notes": "",
+            "references": [
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/advisories/GHSA-8g4m-cjm2-96wq",
+                "name": "https://github.com/advisories/GHSA-8g4m-cjm2-96wq"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-23771",
+                "name": "https://nvd.nist.gov/vuln/detail/CVE-2021-23771"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                "name": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                "name": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:*:notevil:\\<\\=1.3.3:*:*:*:*:*:*:*"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/notevil@1.3.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.817252+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "eb127601-b1cf-448e-b2ba-0da785662dbc",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2021-23771",
+          "ghsa_id": null,
+          "cwe": [
+            {
+              "id": "CWE-1321",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "MEDIUM",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/notevil:1.3.3",
+          "line_range": null,
+          "package_name": "notevil",
+          "package_version": "1.3.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/notevil@1.3.3",
+          "ecosystem": "npm",
+          "message": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878).",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "notevil:1.3.3",
+            "filePath": "/scan/package-lock.json?/notevil:1.3.3",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2021-23771",
+              "severity": "MEDIUM",
+              "cvssv2": {
+                "score": 6.4,
+                "accessVector": "NETWORK",
+                "accessComplexity": "LOW",
+                "authenticationr": "NONE",
+                "confidentialityImpact": "PARTIAL",
+                "integrityImpact": "PARTIAL",
+                "availabilityImpact": "NONE",
+                "severity": "MEDIUM",
+                "version": "2.0",
+                "exploitabilityScore": "10.0",
+                "impactScore": "4.9"
+              },
+              "cvssv3": {
+                "baseScore": 6.5,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "LOW",
+                "integrityImpact": "LOW",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "MEDIUM",
+                "exploitabilityScore": "3.9",
+                "impactScore": "2.5",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-1321"
+              ],
+              "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878).",
+              "notes": "",
+              "references": [
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                  "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                  "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "report@snyk.io",
+                  "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                  "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "report@snyk.io",
+                  "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                  "name": "EXPLOIT,THIRD_PARTY_ADVISORY"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:argencoders-notevil_project:argencoders-notevil:*:*:*:*:*:node.js:*:*",
+                    "versionEndIncluding": "2.5.0"
+                  }
+                },
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:notevil_project:notevil:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "1.3.3"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/notevil@1.3.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.817244+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": true,
+        "manifest_line": 140,
+        "manifest_snippet": "    \"node-pre-gyp\": \"^0.15.0\",\n    \"notevil\": \"^1.3.3\",\n    \"on-finished\": \"^2.3.0\",",
+        "package_manager": "npm",
+        "localization_confidence": 0.95,
+        "localized_at": "2026-08-06T02:16:50.003323Z"
+      },
+      {
+        "issue": {
+          "id": "cd04112e-9ad7-40c1-8a25-6f79d22ad4be",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2021-23771",
+          "ghsa_id": "GHSA-8G4M-CJM2-96WQ",
+          "cwe": [
+            {
+              "id": "CWE-1321",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "MEDIUM",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/notevil:1.3.3",
+          "line_range": null,
+          "package_name": "notevil",
+          "package_version": "1.3.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/notevil@1.3.3",
+          "ecosystem": "npm",
+          "message": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878). This package has been deprecated.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "notevil:1.3.3",
+            "filePath": "/scan/package-lock.json?/notevil:1.3.3",
+            "vulnerability": {
+              "source": "NPM",
+              "name": "GHSA-8g4m-cjm2-96wq",
+              "unscored": "true",
+              "severity": "moderate",
+              "cvssv3": {
+                "baseScore": 6.5,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "LOW",
+                "integrityImpact": "LOW",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "MEDIUM",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-1321"
+              ],
+              "description": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878). This package has been deprecated.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/advisories/GHSA-8g4m-cjm2-96wq",
+                  "name": "https://github.com/advisories/GHSA-8g4m-cjm2-96wq"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-23771",
+                  "name": "https://nvd.nist.gov/vuln/detail/CVE-2021-23771"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946",
+                  "name": "https://snyk.io/vuln/SNYK-JS-NOTEVIL-2385946"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587",
+                  "name": "https://snyk.io/vuln/SNYK-JS-ARGENCODERSNOTEVIL-2388587"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:*:notevil:\\<\\=1.3.3:*:*:*:*:*:*:*"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/notevil@1.3.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.817252+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": true,
+        "manifest_line": 140,
+        "manifest_snippet": "    \"node-pre-gyp\": \"^0.15.0\",\n    \"notevil\": \"^1.3.3\",\n    \"on-finished\": \"^2.3.0\",",
+        "package_manager": "npm",
+        "localization_confidence": 0.95,
+        "localized_at": "2026-08-06T02:17:05.879182Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "no_fix",
+      "fixed_version": null,
+      "workaround_snippets": null,
+      "instruction": "No upstream patch or workaround was found. Inform the user.",
+      "strategy_used": "NO_FIX"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2021-23771",
+      "epss": 0.00997,
+      "epss_percentile": 0.59363,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-06T02:17:19.040843Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": true,
+    "grouped_at": "2026-08-06T02:17:17.732162Z"
+  },
+  {
     "group_id": "sca:package.json:sanitize-html:UPDATE_VERSION",
     "issue_type": "sca",
     "vulnerable_component": "sanitize-html",
@@ -913,7 +2710,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:41.789800Z"
+        "localized_at": "2026-08-06T02:17:12.535613Z"
       },
       {
         "issue": {
@@ -1039,7 +2836,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:42.683659Z"
+        "localized_at": "2026-08-06T02:17:13.262522Z"
       },
       {
         "issue": {
@@ -1160,7 +2957,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:43.570279Z"
+        "localized_at": "2026-08-06T02:17:14.029598Z"
       },
       {
         "issue": {
@@ -1276,7 +3073,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:44.473996Z"
+        "localized_at": "2026-08-06T02:17:14.738744Z"
       },
       {
         "issue": {
@@ -1397,7 +3194,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:45.384247Z"
+        "localized_at": "2026-08-06T02:17:15.398238Z"
       },
       {
         "issue": {
@@ -1543,7 +3340,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:46.319546Z"
+        "localized_at": "2026-08-06T02:17:16.106493Z"
       },
       {
         "issue": {
@@ -1656,7 +3453,7 @@
         "manifest_snippet": "    \"sanitize-filename\": \"^1.6.3\",\n    \"sanitize-html\": \"1.4.2\",\n    \"semver\": \"^7.6.3\",",
         "package_manager": "npm",
         "localization_confidence": 0.95,
-        "localized_at": "2026-08-05T02:28:47.236286Z"
+        "localized_at": "2026-08-06T02:17:16.841468Z"
       }
     ],
     "fix_plan": {
@@ -1669,13 +3466,13 @@
     "enrichment": {
       "cve_id": "CVE-2021-26539",
       "epss": 0.01953,
-      "epss_percentile": 0.78278,
+      "epss_percentile": 0.78295,
       "in_kev": false,
       "kev_date_added": null,
-      "enriched_at": "2026-08-05T02:28:49.039370Z",
+      "enriched_at": "2026-08-06T02:17:19.040843Z",
       "enrichment_source": "epss"
     },
     "is_reachable": true,
-    "grouped_at": "2026-08-05T02:28:48.153638Z"
+    "grouped_at": "2026-08-06T02:17:17.732686Z"
   }
 ]
