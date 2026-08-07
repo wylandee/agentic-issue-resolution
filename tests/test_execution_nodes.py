@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import (
+    CommandResult,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -25,6 +26,7 @@ def _sandbox_mock() -> MagicMock:
     mock = MagicMock()
     mock.__enter__ = MagicMock(return_value=mock)
     mock.__exit__ = MagicMock(return_value=None)
+    mock.run.return_value = CommandResult(exit_code=0, duration_seconds=0.0)
     return mock
 
 
@@ -52,6 +54,9 @@ class TestWorkspaceBuilderNode:
 
     def test_success_creates_volume_and_copies_repo(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "frontend").mkdir()
+        (tmp_path / "frontend" / "package.json").write_text("{}", encoding="utf-8")
         client = MagicMock()
         sandbox = _sandbox_mock()
 
@@ -69,8 +74,61 @@ class TestWorkspaceBuilderNode:
 
         client.volumes.create.assert_called_once()
         mock_sandbox.assert_called_once()
+        assert [call.args[0] for call in sandbox.run.call_args_list] == [
+            "npm install --package-lock=true",
+            "cd frontend && npm install --package-lock=true",
+        ]
         assert result["status"] == "workspace_ready"
         assert result["workspace_volume"].startswith("agent_workspace_")
+
+    def test_no_package_repository_skips_install(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+
+        with (
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_workspace_builder_node(state)
+
+        sandbox.run.assert_not_called()
+        assert result["status"] == "workspace_ready"
+
+    def test_install_failure_preserves_volume_and_diagnostics(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=1,
+            duration_seconds=0.0,
+            stdout="install output",
+            stderr="npm ERR! dependency failure",
+        )
+
+        with (
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_workspace_builder_node(state)
+
+        assert result["status"] == "workspace_build_failed"
+        assert result["workspace_volume"].startswith("agent_workspace_")
+        assert "npm install failed in ." in result["errors"][0]
+        assert "npm ERR! dependency failure" in result["errors"][0]
 
     def test_copy_failure_preserves_volume_for_teardown(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])

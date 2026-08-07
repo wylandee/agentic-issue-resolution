@@ -491,18 +491,21 @@ class TestPhase5GraphIntegration:
             }
         )
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
+        supervisor = MagicMock()
 
         with (
             patch(
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
+            patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
             graph = build_orchestrator_graph()
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
+        supervisor.assert_not_called()
         assert teardown.call_count == 1
         assert result["status"] == "completed"
 

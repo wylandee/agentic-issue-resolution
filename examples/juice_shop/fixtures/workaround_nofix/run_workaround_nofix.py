@@ -57,7 +57,6 @@ from remediation_engine.orchestration.trajectory_exporter import (
 from remediation_engine.orchestration.workspace_builder import (
     run_workspace_builder_node,
 )
-from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
 
@@ -301,43 +300,6 @@ def _merge_qa_result(state: dict[str, Any], result: dict[str, Any]) -> None:
         state["errors"] = list(dict.fromkeys([*state.get("errors", []), *result["errors"]]))
 
 
-def _install_workspace_dependencies(sandbox: DockerSandbox) -> dict[str, Any]:
-    """Materialize the repository dependencies inside the temporary volume.
-
-    Args:
-        sandbox: Docker-backed workspace volume created for this manual run.
-
-    Returns:
-        Structured npm installation diagnostics.
-
-    Raises:
-        RuntimeError: If npm cannot materialize the workspace dependencies.
-
-    Side effects:
-        Runs npm inside the isolated workspace. The host repository is not
-        modified.
-    """
-    command = (
-        "npm install --package-lock=true --no-audit --no-fund"
-        " && cd frontend"
-        " && npm install --package-lock=true --no-audit --no-fund"
-    )
-    result = sandbox.run(f"cd /workspace && {command}")
-    diagnostics = {
-        "command": command,
-        "exit_code": result.exit_code,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "duration_seconds": result.duration_seconds,
-    }
-    if result.exit_code != 0:
-        raise RuntimeError(
-            "Workspace dependency installation failed with exit code "
-            f"{result.exit_code}: {result.stderr or result.stdout}"
-        )
-    return diagnostics
-
-
 def _merge_supervisor_result(state: dict[str, Any], result: dict[str, Any]) -> None:
     """Apply a Supervisor node patch while preserving additive errors."""
     prior_errors = list(state.get("errors", []) or [])
@@ -400,12 +362,13 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
         if builder_result.get("status") != "workspace_ready" or not workspace_volume:
             raise RuntimeError("Workspace builder did not return a ready Docker volume.")
 
-        # Materialize root and frontend dependencies before the Stage 2
-        # vulnerable-code-removal dispatch. This keeps worker validation tools such as
-        # tsc available inside the isolated volume without modifying the host
-        # clone.
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            install_diagnostics = _install_workspace_dependencies(sandbox)
+        # Workspace Builder materializes every npm package before this first
+        # workaround dispatch, keeping validation tools such as tsc available
+        # inside the isolated volume without modifying the host clone.
+        install_diagnostics = {
+            "status": "completed",
+            "handled_by": "workspace_builder",
+        }
 
         # This fixture represents the second dispatch. The workspace remains
         # at the unchanged repository baseline so notevil is still installed;
