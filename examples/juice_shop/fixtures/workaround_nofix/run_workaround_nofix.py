@@ -269,9 +269,9 @@ def _install_workspace_dependencies(sandbox: DockerSandbox) -> dict[str, Any]:
         modified.
     """
     command = (
-        "npm install --package-lock=true --ignore-scripts --no-audit --no-fund"
+        "npm install --package-lock=true --no-audit --no-fund"
         " && cd frontend"
-        " && npm install --package-lock=true --ignore-scripts --no-audit --no-fund"
+        " && npm install --package-lock=true --no-audit --no-fund"
     )
     result = sandbox.run(f"cd /workspace && {command}")
     diagnostics = {

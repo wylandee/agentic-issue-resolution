@@ -132,7 +132,7 @@
     "lockfile": "package-lock.json",
     "package_manager": "npm",
     "initial_workspace": "unchanged repository clone",
-    "install_command": "npm install --package-lock=true --ignore-scripts --no-audit --no-fund && cd frontend && npm install --package-lock=true --ignore-scripts --no-audit --no-fund"
+    "install_command": "npm install --package-lock=true --no-audit --no-fund && cd frontend && npm install --package-lock=true --no-audit --no-fund"
   },
   "provenance": {
     "source_group_id": "sca:package.json:notevil:NO_FIX",
