@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review and Refactor"
+  short_description: "Audit a codebase and plan clean refactors"
+  default_prompt: "Use $review-and-refactor to audit the entire codebase and produce a detailed, evidence-backed Markdown refactoring plan without changing source files."
