@@ -44,6 +44,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
+    NoFixMitigationStage,
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
@@ -65,7 +66,13 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.orchestration.task_utils import (
+    advance_no_fix_stage,
+    build_initial_remediation_task,
+    build_no_fix_package_removal_instruction,
+    build_no_fix_retry_instruction,
+    is_no_fix_group,
+)
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
 from remediation_engine.tools.registry_tools import plan_npm_version
@@ -310,6 +317,7 @@ def _create_attempt_snapshot(
         task_revision=task_revision,
         attempt_number=len(_attempts_for_task(snapshots_by_id, task.task_id)) + 1,
         strategy_stage=task.strategy_stage,
+        no_fix_stage=task.no_fix_stage,
         selected_version=task.selected_version,
         instruction=task.instruction,
         instruction_digest=_instruction_digest(task.instruction),
@@ -457,6 +465,7 @@ _ATTEMPT_INPUT_FIELDS = frozenset(
         "exhausted_update_path",
         "instruction",
         "strategy",
+        "no_fix_stage",
     }
 )
 
@@ -562,6 +571,7 @@ def _validate_committed_state(
             snapshot.task_id == task.task_id
             and snapshot.task_revision == task.task_revision
             and snapshot.strategy_stage == task.strategy_stage
+            and snapshot.no_fix_stage == task.no_fix_stage
             and snapshot.selected_version == task.selected_version
             and snapshot.instruction == task.instruction
             and snapshot.instruction_digest == _instruction_digest(task.instruction)
@@ -585,6 +595,7 @@ def _validate_committed_state(
                 "task_revision": snapshot.task_revision,
                 "current_attempt_id": snapshot.attempt_id,
                 "strategy_stage": snapshot.strategy_stage,
+                "no_fix_stage": snapshot.no_fix_stage,
                 "selected_version": snapshot.selected_version,
                 "instruction": snapshot.instruction,
             }
@@ -692,6 +703,7 @@ def _validate_committed_state(
         if (
             snapshot.task_revision != task.task_revision
             or snapshot.strategy_stage != task.strategy_stage
+            or snapshot.no_fix_stage != task.no_fix_stage
             or snapshot.selected_version != task.selected_version
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
@@ -1494,6 +1506,7 @@ def _normalize_qa_evaluations_for_tasks(
             passed=evaluation.passed,
             failure_category=evaluation.failure_category,
             retry_feedback=evaluation.retry_feedback,
+            failure_evidence=evaluation.failure_evidence,
         )
     return normalized
 
@@ -1563,8 +1576,9 @@ def _latest_action_summary_by_task(
 def _build_workaround_retry_instruction(
     task: RemediationTask,
     evaluation: QAEvaluation | None,
+    group: VulnerabilityGroup | None = None,
 ) -> str:
-    """Synthesize a high-level retry instruction for the workaround subagent."""
+    """Synthesize a high-level retry instruction for a generic workaround task."""
     category_str = (
         evaluation.failure_category.value
         if evaluation and evaluation.failure_category
@@ -1575,13 +1589,59 @@ def _build_workaround_retry_instruction(
         if evaluation and evaluation.retry_feedback
         else "No feedback provided."
     )
-    component = task.vulnerable_component or task.parent_group_id
+    component = (group.vulnerable_component if group else None) or task.parent_group_id
     return (
         f"RETRY: Your previous code workaround attempt for {component} failed QA.\n"
         f"Failure category: {category_str}\n"
         f"QA feedback: {feedback_str}\n\n"
         f"Original instruction: {task.instruction}\n\n"
         f"Fix the issues identified by QA and re-apply a valid code workaround."
+    )
+
+
+def _no_fix_failure_transition(
+    task: RemediationTask,
+    group: VulnerabilityGroup | None,
+    *,
+    evaluation: QAEvaluation | None = None,
+    failure_feedback: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Build the supervisor-owned transition after a failed NO_FIX attempt.
+
+    Returns a task update mapping and whether the next attempt must reset the
+    task-local workspace to the package-removal stage baseline.
+    """
+    updates = advance_no_fix_stage(task)
+    next_stage = updates.get("no_fix_stage")
+    reset_workspace = next_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
+    if reset_workspace:
+        retry_task = task.model_copy(update=updates)
+        updates["instruction"] = build_no_fix_retry_instruction(
+            retry_task,
+            group,
+            evaluation=evaluation,
+            failure_feedback=failure_feedback,
+        )
+    return updates, reset_workspace
+
+
+def _reset_no_fix_replay_plan(
+    replay_plan: WorkaroundReplayPlan | None,
+) -> WorkaroundReplayPlan | None:
+    """Return a replay plan that restores the stage baseline without replaying edits."""
+    if replay_plan is None:
+        return None
+    return replay_plan.model_copy(
+        update={
+            "successful_edit_sets": [],
+            "validated_files": [],
+            "validation_calls": 0,
+            "per_gate_results": {},
+            "final_selected_targeted_test": None,
+            "original_to_alternative_test_mapping": {},
+            "alternative_test_mapping_evidence": {},
+            "alternative_test_mapping_details": {},
+        }
     )
 
 
@@ -1794,12 +1854,6 @@ def _deterministic_routing(
     """
     tasks = list(task_queue.values())
     non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
-    latest_summaries = _latest_action_summary_by_task(
-        action_summaries or [],
-        task_queue,
-        list(active_target_task_ids or []),
-    )
-
     # Post-QA triage is a Supervisor-owned handoff.  It must run before
     # teardown even when the current task queue is already terminal, because
     # the global scan may have discovered a new package vulnerability.
@@ -1846,6 +1900,51 @@ def _deterministic_routing(
 
     # Collect tasks that still need work
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
+
+    # NO_FIX is a deterministic same-task state machine.  Keep it ahead of
+    # generic workaround routing so the LLM cannot skip a mitigation stage or
+    # let MAX_RETRIES terminate the lifecycle early.
+    no_fix_workable = [
+        task
+        for task in workable
+        if task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and (
+            (
+                task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
+                and task.status == TaskStatus.PENDING
+            )
+            or (
+                task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
+                and task.status == TaskStatus.NEEDS_RETRY
+            )
+        )
+    ]
+    if no_fix_workable:
+        target = no_fix_workable[0]
+        evaluation = qa_evaluations.get(target.task_id) or qa_evaluations.get(
+            target.parent_group_id
+        )
+        revised_instructions: dict[str, str] = {}
+        feedback_by_task: dict[str, str] = {}
+        if target.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+            revised_instructions[target.task_id] = build_no_fix_retry_instruction(
+                target,
+                group_by_id.get(target.parent_group_id),
+                evaluation=evaluation,
+            )
+        if evaluation and evaluation.retry_feedback:
+            feedback_by_task[target.task_id] = evaluation.retry_feedback
+        return SupervisorDecision(
+            next_node="workaround_subagent",
+            target_task_ids=[target.task_id],
+            feedback_by_task=feedback_by_task,
+            revised_instructions=revised_instructions,
+            instructions=("Advance the NO_FIX task through its supervisor-owned mitigation stage."),
+            decision_reason=(
+                f"Deterministic NO_FIX routing selected {target.no_fix_stage.value} "
+                f"for task '{target.task_id}'."
+            ),
+        )
 
     # All VERSION_BUMP QA failures follow the ordered version stages. A
     # BREAKING_CHANGE is evidence for the next stage, not an immediate pivot.
@@ -1955,7 +2054,9 @@ def _deterministic_routing(
     workaround = [
         t
         for t in workable
-        if t.strategy == RoutingStrategy.CODE_WORKAROUND and t.retry_count < MAX_RETRIES
+        if t.strategy == RoutingStrategy.CODE_WORKAROUND
+        and t.no_fix_stage is None
+        and t.retry_count < MAX_RETRIES
     ]
     if workaround:
         target = workaround[0]
@@ -1968,6 +2069,7 @@ def _deterministic_routing(
             revised_instructions[target.task_id] = _build_workaround_retry_instruction(
                 target,
                 eval_,
+                group_by_id.get(target.parent_group_id),
             )
         return SupervisorDecision(
             next_node="workaround_subagent",
@@ -1985,6 +2087,51 @@ def _deterministic_routing(
         instructions="No actionable tasks remain.",
         decision_reason=("Deterministic fallback: no workable tasks found, routing to teardown."),
     )
+
+
+def _no_fix_decision_requires_fallback(
+    decision: SupervisorDecision,
+    task_queue: dict[str, RemediationTask],
+) -> bool:
+    """Return whether an untrusted router decision violates NO_FIX routing."""
+    actionable = [
+        task
+        for task in task_queue.values()
+        if task.status in _WORKABLE_STATUSES
+        and task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and task.no_fix_stage
+        in {
+            NoFixMitigationStage.PACKAGE_REMOVAL,
+            NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+        }
+    ]
+    if not actionable:
+        return False
+
+    expected_task_id = actionable[0].task_id
+    if actionable[0].status == TaskStatus.OPTIMISTICALLY_FIXED:
+        return (
+            decision.next_node != "qa_critic"
+            or expected_task_id not in decision.target_task_ids
+            or expected_task_id in decision.unfixable_task_ids
+            or decision.task_status_updates.get(expected_task_id) == TaskStatus.UNFIXABLE
+            or decision.updated_task_strategies.get(expected_task_id)
+            not in (None, RoutingStrategy.CODE_WORKAROUND)
+        )
+    if decision.next_node != "workaround_subagent":
+        return True
+    if decision.target_task_ids != [expected_task_id]:
+        return True
+    if expected_task_id in decision.unfixable_task_ids:
+        return True
+    if decision.task_status_updates.get(expected_task_id) == TaskStatus.UNFIXABLE:
+        return True
+    if decision.updated_task_strategies.get(expected_task_id) not in (
+        None,
+        RoutingStrategy.CODE_WORKAROUND,
+    ):
+        return True
+    return any(request.parent_task_id == expected_task_id for request in decision.spawn_requests)
 
 
 # ---------------------------------------------------------------------------
@@ -2055,11 +2202,6 @@ def _build_planner_prompt(
         component = group.vulnerable_component if group else task.parent_group_id
         eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
-        security_floor = (
-            diagnostics.security_floor
-            if diagnostics and diagnostics.security_floor
-            else (group.fix_plan.fixed_version if group and group.fix_plan else "unknown")
-        )
 
         lines += [
             "",
@@ -2309,6 +2451,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
             f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
             f"- Strategy      : {task.strategy.value}",
             f"- Strategy Stage: {task.strategy_stage.value}",
+            f"- NO_FIX Stage  : {task.no_fix_stage.value if task.no_fix_stage else 'none'}",
             f"- Task Revision : {task.task_revision}",
             f"- Current Attempt: {task.current_attempt_id or 'none'}",
             f"- Committed Selected Version: {task.selected_version or 'none'}",
@@ -2344,6 +2487,13 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
             )
 
     lines += [
+        "",
+        "## NO_FIX Lifecycle Guardrails",
+        "- NO_FIX tasks stay on the same task and have exactly two supervisor-owned stages: PACKAGE_REMOVAL, then VULNERABLE_CODE_REMOVAL.",
+        "- PACKAGE_REMOVAL routes only to workaround_subagent with the supervisor-generated package-removal instruction and scoped removal tool.",
+        "- A failed PACKAGE_REMOVAL attempt becomes NEEDS_RETRY and advances to VULNERABLE_CODE_REMOVAL; the second stage keeps the package installed and removes vulnerable code paths.",
+        "- A failed VULNERABLE_CODE_REMOVAL attempt becomes UNFIXABLE. UNFIXABLE tasks never route, never spawn children, and cannot be terminalized early by an LLM decision.",
+        "- Do not route a NO_FIX task to update_subagent or teardown while it is actionable, do not change its stage, and do not replace its deterministic instruction.",
         "",
         "## Constraints Ledger",
     ]
@@ -2641,6 +2791,20 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         group = group_by_id.get(task.parent_group_id)
         task_updates: dict[str, Any] = {}
         if (
+            task.status not in _TERMINAL_STATUSES
+            and task.current_attempt_id is None
+            and task.no_fix_stage is None
+            and group is not None
+            and is_no_fix_group(group)
+        ):
+            task_updates["no_fix_stage"] = NoFixMitigationStage.PACKAGE_REMOVAL
+            if task.selected_version is not None:
+                task_updates["selected_version"] = None
+            if not task.instruction or task.instruction.strip().casefold() == (
+                "no upstream patch or workaround was found. inform the user."
+            ):
+                task_updates["instruction"] = build_no_fix_package_removal_instruction(group)
+        if (
             task.task_revision == 0
             and task.status not in _TERMINAL_STATUSES
             and task.current_attempt_id is None
@@ -2841,17 +3005,46 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
                 )
             elif task.strategy == RoutingStrategy.CODE_WORKAROUND:
-                # A surrender is a completed worker outcome, not an active
-                # worker input. Close it before the next routing decision so a
-                # terminal workaround task cannot reach teardown with a live
-                # current attempt.
-                _commit_task_transition(
-                    task_queue,
-                    task_id,
-                    updates={"status": TaskStatus.UNFIXABLE},
-                    close_attempt=True,
-                    clear_selected_version=True,
-                )
+                if task.no_fix_stage is not None:
+                    transition, reset_workspace = _no_fix_failure_transition(
+                        task,
+                        group_by_id.get(task.parent_group_id),
+                        failure_feedback=(
+                            " | ".join(result.errors)
+                            or (
+                                result.action_summary.summary
+                                if result.action_summary is not None
+                                else None
+                            )
+                        ),
+                    )
+                    _commit_task_transition(
+                        task_queue,
+                        task_id,
+                        updates=transition,
+                        close_attempt=True,
+                        clear_selected_version=True,
+                    )
+                    if reset_workspace:
+                        reset_plan = _reset_no_fix_replay_plan(
+                            workaround_replay_plans_by_task.get(task_id)
+                        )
+                        if reset_plan is None:
+                            workaround_replay_plans_by_task.pop(task_id, None)
+                        else:
+                            workaround_replay_plans_by_task[task_id] = reset_plan
+                else:
+                    # A surrender is a completed worker outcome, not an active
+                    # worker input. Close it before the next routing decision so
+                    # a terminal workaround task cannot reach teardown with a
+                    # live current attempt.
+                    _commit_task_transition(
+                        task_queue,
+                        task_id,
+                        updates={"status": TaskStatus.UNFIXABLE},
+                        close_attempt=True,
+                        clear_selected_version=True,
+                    )
             else:
                 # Failed update attempts are replanned in this same
                 # supervisor pass. Detach the consumed attempt first so the
@@ -2885,7 +3078,31 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
                     )
                 elif task.strategy == RoutingStrategy.CODE_WORKAROUND:
-                    task_queue[task_id] = task.model_copy(update={"status": TaskStatus.UNFIXABLE})
+                    if task.no_fix_stage is not None:
+                        transition, reset_workspace = _no_fix_failure_transition(
+                            task,
+                            group_by_id.get(task.parent_group_id),
+                            failure_feedback=summary.summary,
+                        )
+                        _commit_task_transition(
+                            task_queue,
+                            task_id,
+                            updates=transition,
+                            close_attempt=True,
+                            clear_selected_version=True,
+                        )
+                        if reset_workspace:
+                            reset_plan = _reset_no_fix_replay_plan(
+                                workaround_replay_plans_by_task.get(task_id)
+                            )
+                            if reset_plan is None:
+                                workaround_replay_plans_by_task.pop(task_id, None)
+                            else:
+                                workaround_replay_plans_by_task[task_id] = reset_plan
+                    else:
+                        task_queue[task_id] = task.model_copy(
+                            update={"status": TaskStatus.UNFIXABLE}
+                        )
                 else:
                     task_queue[task_id] = task.model_copy(
                         update={
@@ -3028,8 +3245,30 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     ):
                         auto_new_constraints.append(constraint)
             else:
+                if task.no_fix_stage is not None:
+                    no_fix_updates, reset_workspace = _no_fix_failure_transition(
+                        task,
+                        group_by_id.get(task.parent_group_id),
+                        evaluation=evaluation,
+                    )
+                    _commit_task_transition(
+                        task_queue,
+                        resolved_t_id,
+                        updates=no_fix_updates,
+                        clear_selected_version=True,
+                    )
+                    if reset_workspace:
+                        reset_plan = _reset_no_fix_replay_plan(
+                            workaround_replay_plans_by_task.get(resolved_t_id)
+                        )
+                        if reset_plan is None:
+                            workaround_replay_plans_by_task.pop(resolved_t_id, None)
+                        else:
+                            workaround_replay_plans_by_task[resolved_t_id] = reset_plan
+                    continue
+
                 next_stage = _next_sca_stage(task.strategy_stage)
-                task_updates: dict[str, Any] = {
+                task_updates = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
@@ -3075,8 +3314,27 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # ------------------------------------------------------------------
     for task_id, task in task_queue.items():
         if (
+            task.no_fix_stage == NoFixMitigationStage.UNFIXABLE
+            and task.status not in _TERMINAL_STATUSES
+        ):
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={"status": TaskStatus.UNFIXABLE},
+                close_attempt=task.current_attempt_id is not None,
+                clear_selected_version=task.selected_version is not None,
+            )
+        if task.no_fix_stage == NoFixMitigationStage.UNFIXABLE or (
+            task.no_fix_stage is not None and task.status in _TERMINAL_STATUSES
+        ):
+            retry_plans_by_task.pop(task_id, None)
+            workaround_replay_plans_by_task.pop(task_id, None)
+
+    for task_id, task in task_queue.items():
+        if (
             task.status == TaskStatus.NEEDS_RETRY
             and task.retry_count >= MAX_RETRIES
+            and task.no_fix_stage is None
             and not _is_exhausted_update_pivot_candidate(
                 task,
                 retry_diagnostics_by_task.get(task_id),
@@ -3448,6 +3706,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     pivot_parent_status_by_parent: dict[str, TaskStatus] = {}
     pivot_target_parent_ids: set[str] = set()
 
+    if decision is not None and _no_fix_decision_requires_fallback(decision, task_queue):
+        errors.append(
+            "supervisor: rejected router decision that attempted to bypass the "
+            "deterministic NO_FIX mitigation lifecycle."
+        )
+        decision = None
+
     if decision is None:
         decision = _deterministic_routing(
             task_queue,
@@ -3609,6 +3874,25 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 for k, v in decision.revised_instructions.items()
                 if k in known_task_ids and v.strip()
             }
+            for task_id in valid_target_ids:
+                task = task_queue.get(task_id)
+                if task is None or task.no_fix_stage is None:
+                    continue
+                group = group_by_id.get(task.parent_group_id)
+                if task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+                    clean_revised_instructions[task_id] = build_no_fix_retry_instruction(
+                        task,
+                        group,
+                        evaluation=qa_evaluations.get(task_id)
+                        or qa_evaluations.get(task.parent_group_id),
+                    )
+                elif task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL and group:
+                    # The package-removal instruction is supervisor-owned too;
+                    # an LLM cannot replace the scoped manifest capability with
+                    # arbitrary prose or a generic source-only workaround.
+                    clean_revised_instructions[task_id] = build_no_fix_package_removal_instruction(
+                        group
+                    )
             # The reconciled task queue is authoritative. Preserve the public
             # revised_instructions field while filling it from committed plans
             # when the router omits the field or repeats stale text.
@@ -3678,6 +3962,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 for req in decision.spawn_requests
                 if req.parent_task_id in known_task_ids
                 and task_queue[req.parent_task_id].status not in _TERMINAL_STATUSES
+                and task_queue[req.parent_task_id].no_fix_stage is None
             ]
             pivot_strategy_by_parent: dict[str, RoutingStrategy] = {
                 req.parent_task_id: req.strategy
@@ -4025,6 +4310,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     phase=phase,
                     vulnerability_mechanism=vulnerability_mechanism,
                     qa_evidence=evidence,
+                    no_fix_stage=task.no_fix_stage,
+                    reset_prior_stage_workspace=(
+                        task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
+                        and task.parent_group_id in group_by_id
+                    ),
                 )
             task, snapshot = _create_attempt_snapshot(
                 task,

@@ -9,6 +9,7 @@ import dataclasses
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from langsmith import traceable
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    NoFixMitigationStage,
     VulnerabilityGroup,
     WorkaroundContext,
     WorkaroundEditSet,
@@ -29,6 +31,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.remedy_tools import (
     _detect_newline_style,
+    _is_allowlisted_no_fix_package_file,
     _is_prohibited_target,
     _normalise_newlines,
     _restore_newlines,
@@ -377,6 +380,39 @@ def _workaround_search_recommendation(
         selected_version = getattr(fix_plan, "fixed_version", None)
     version_term = f"version {selected_version}" if selected_version else ""
 
+    no_fix_stage = getattr(workaround_context, "no_fix_stage", None)
+    if isinstance(no_fix_stage, NoFixMitigationStage):
+        no_fix_stage = no_fix_stage.value
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+        return _SearchQueryRecommendation(
+            scenario="no_fix_package_removal",
+            initial_query=_query_parts(
+                component,
+                "package.json manifest imports call sites",
+                "package removal",
+            ),
+            rationale=(
+                "Prioritize local manifests, imports, and call sites so the worker can "
+                "remove only the authorized direct declaration and its dependent usage."
+            ),
+            follow_up_query="",
+        )
+    if no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+        return _SearchQueryRecommendation(
+            scenario="no_fix_vulnerable_code_removal",
+            initial_query=_query_parts(
+                component,
+                identifier_terms,
+                mechanism,
+                "installed package source vulnerable API call path",
+            ),
+            rationale=(
+                "Use the advisory identifiers, vulnerable mechanism, and installed-package "
+                "source evidence to trace and remove direct and indirect vulnerable call paths."
+            ),
+            follow_up_query=diagnostic_term,
+        )
+
     if scanner_failure:
         return _SearchQueryRecommendation(
             scenario="update_does_not_resolve_scanner_findings",
@@ -602,6 +638,39 @@ def _workaround_search_recommendation(
         selected_version = getattr(fix_plan, "fixed_version", None)
     version_term = f"version {selected_version}" if selected_version else ""
 
+    no_fix_stage = getattr(workaround_context, "no_fix_stage", None)
+    if isinstance(no_fix_stage, NoFixMitigationStage):
+        no_fix_stage = no_fix_stage.value
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+        return _SearchQueryRecommendation(
+            scenario="no_fix_package_removal",
+            initial_query=_query_parts(
+                component,
+                "package.json manifest imports call sites",
+                "package removal",
+            ),
+            rationale=(
+                "Prioritize local manifests, imports, and call sites so the worker can "
+                "remove only the authorized direct declaration and its dependent usage."
+            ),
+            follow_up_query="",
+        )
+    if no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+        return _SearchQueryRecommendation(
+            scenario="no_fix_vulnerable_code_removal",
+            initial_query=_query_parts(
+                component,
+                identifier_terms,
+                mechanism,
+                "installed package source vulnerable API call path",
+            ),
+            rationale=(
+                "Use the advisory identifiers, vulnerable mechanism, and installed-package "
+                "source evidence to trace and remove direct and indirect vulnerable call paths."
+            ),
+            follow_up_query=diagnostic_term,
+        )
+
     if is_qa_phase or test_failure:
         return _SearchQueryRecommendation(
             scenario="update_mitigates_cve_but_breaks_tests",
@@ -726,6 +795,18 @@ def _build_workaround_prompt(
             else WorkaroundPhase.INITIAL_MITIGATION
         )
     )
+    no_fix_stage = getattr(workaround_context, "no_fix_stage", None)
+    if no_fix_stage is None:
+        no_fix_stage = getattr(target_task, "no_fix_stage", None)
+    if isinstance(no_fix_stage, NoFixMitigationStage):
+        no_fix_stage = no_fix_stage.value
+    if no_fix_stage not in {
+        None,
+        NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value,
+        NoFixMitigationStage.UNFIXABLE.value,
+    }:
+        no_fix_stage = None
 
     comp_name = getattr(target_group, "vulnerable_component", "") or "component"
     cve_label = (
@@ -740,11 +821,50 @@ def _build_workaround_prompt(
     sections = [
         "You are a code security specialist operating inside a shared Docker workspace.",
         f"WORKFLOW PHASE: {phase.value.upper()}",
+        f"NO_FIX MITIGATION STAGE: {no_fix_stage or 'not applicable'}",
         f"Target Package: {comp_name}"
         + (f" (version: {selected_version})" if selected_version else ""),
     ]
 
-    if phase == WorkaroundPhase.INITIAL_MITIGATION:
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+        manifest_paths = [
+            str(path).replace("\\", "/").lstrip("/")
+            for path in [
+                *(getattr(target_group, "file_paths", []) or []),
+                getattr(target_group, "file_path", None),
+                *(
+                    getattr(issue, "manifest_file", None)
+                    for issue in getattr(target_group, "localized_issues", []) or []
+                ),
+            ]
+            if str(path).strip()
+        ]
+        sections.append(
+            "\n".join(
+                [
+                    "=== NO_FIX PACKAGE REMOVAL ===",
+                    "  1. Inspect every authorized manifest path and trace imports and dependent call sites locally.",
+                    f"  2. Authorized manifest paths: {', '.join(manifest_paths) or 'none supplied'}.",
+                    "  3. Call record_plan with package_removal_requested=true and declare the authorized manifest path(s). An empty planned_replacements list is allowed only for this package-removal plan.",
+                    "  4. Call remove_no_fix_dependency for the configured vulnerable package. This is the only operation allowed to change the authorized manifest or lockfile, and it synchronizes through the detected package manager with lifecycle scripts disabled.",
+                    "  5. Remove source imports and dependent application usage with the normal source-edit tools when local inspection shows they exist, then call validate_workaround with the cumulative changed-file list.",
+                    "  6. Do not manually edit or delete lockfile nodes, bump versions, or modify tests. If no removable direct declaration exists, report NOT_APPLICABLE and surrender so the supervisor advances the same task to vulnerable-code removal.",
+                ]
+            )
+        )
+    elif no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+        sections.append(
+            "\n".join(
+                [
+                    "=== NO_FIX VULNERABLE-CODE REMOVAL ===",
+                    "  1. Keep the vulnerable package installed; do not edit package.json, lockfiles, or dependency versions.",
+                    "  2. Use the CVE/GHSA advisory, scanner evidence, installed-package source, and local call sites to identify the vulnerable API and every direct or indirect caller.",
+                    "  3. Record one complete source-only plan, remove the vulnerable call paths, and clean up dead code without weakening the security invariant.",
+                    "  4. Never modify manifests, lockfiles, or test files. Validate the cumulative source patch with runtime smoke and the targeted QA test where available.",
+                ]
+            )
+        )
+    elif phase == WorkaroundPhase.INITIAL_MITIGATION:
         sections.append(
             "\n".join(
                 [
@@ -806,18 +926,32 @@ def _build_workaround_prompt(
         )
     )
 
-    sections.append(
-        "\n".join(
-            [
-                "=== PROHIBITIONS & ANTI-PATTERNS ===",
-                "- ❌ NEVER modify package.json, package-lock.json, pom.xml, or any dependency manifest.",
-                "- ❌ NEVER modify test files to make assertions pass.",
-                "- ❌ NEVER bump library versions.",
-                "- ALWAYS use relative file paths.",
-                "- MUST call record_plan before making code edits.",
-            ]
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+        sections.append(
+            "\n".join(
+                [
+                    "=== PROHIBITIONS & ANTI-PATTERNS ===",
+                    "- ❌ NEVER manually edit or delete a lockfile node.",
+                    "- ❌ NEVER bump a dependency version or remove a package outside the configured package-removal tool.",
+                    "- ❌ NEVER modify tests.",
+                    "- ALWAYS use only the exact authorized manifest paths and relative source paths.",
+                    "- MUST call record_plan before source edits or package removal.",
+                ]
+            )
         )
-    )
+    else:
+        sections.append(
+            "\n".join(
+                [
+                    "=== PROHIBITIONS & ANTI-PATTERNS ===",
+                    "- ❌ NEVER modify package.json, package-lock.json, pom.xml, or any dependency manifest.",
+                    "- ❌ NEVER modify test files to make assertions pass.",
+                    "- ❌ NEVER bump library versions.",
+                    "- ALWAYS use relative file paths.",
+                    "- MUST call record_plan before making code edits.",
+                ]
+            )
+        )
 
     sections.append(
         _workaround_search_strategy(
@@ -1136,14 +1270,37 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     plan_state: dict[str, Any] = {"recorded": False}
 
     pre_attempt_snapshots: dict[str, str] = {}
+    pre_attempt_absent_paths: list[str] = []
     replayed_edit_sets: list[WorkaroundEditSet] = []
     if current_replay_plan is not None:
         pre_attempt_snapshots = dict(current_replay_plan.pre_attempt_snapshots)
+        pre_attempt_absent_paths = list(current_replay_plan.pre_attempt_absent_paths)
         replayed_edit_sets = list(current_replay_plan.successful_edit_sets)
+        plan_state["stage_baseline_snapshots"] = dict(pre_attempt_snapshots)
+        plan_state["stage_baseline_absent_paths"] = list(pre_attempt_absent_paths)
+    reset_context = (
+        getattr(state.get("attempt_snapshot"), "workaround_context", None)
+        if state.get("attempt_snapshot") is not None
+        else None
+    )
+    if reset_context is not None and getattr(reset_context, "reset_prior_stage_workspace", False):
+        # The supervisor normally clears these edit sets when advancing a
+        # NO_FIX stage. Keep the worker fail-closed if an older replay plan
+        # arrives before that reducer update is visible.
+        replayed_edit_sets = []
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
             # 1. Restore pre-attempt snapshots if replay plan present
+            for rel_p in pre_attempt_absent_paths:
+                try:
+                    sandbox.run(f"rm -f -- {shlex.quote(rel_p)}")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Workaround subagent: failed to remove absent-baseline path %s: %s",
+                        rel_p,
+                        exc,
+                    )
             if pre_attempt_snapshots:
                 for rel_p, orig_content in pre_attempt_snapshots.items():
                     try:
@@ -1238,7 +1395,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             initial_messages = [
                 SystemMessage(
                     content=(
-                        "Use only source-code tools. Follow the enforced lifecycle: "
+                        "Use only the provided scoped workspace tools. Follow the enforced lifecycle: "
                         "Investigate -> Plan -> Execute -> Validate. Perform local inspection first. "
                         "Record an evidence-backed plan before making code edits. "
                         "Make one minimal semantic source patch per iteration and call "
@@ -1246,11 +1403,28 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                         "import plus multiple call-site changes, include those exact related "
                         "lines in one atomic replacement before validating. Runtime smoke must "
                         "import a lightweight source module, never a test/spec file or build/dist "
-                        "artifact, and it must be separate from the targeted test."
+                        "artifact, and it must be separate from the targeted test. "
+                        "For NO_FIX PACKAGE_REMOVAL, remove_no_fix_dependency is the only "
+                        "permitted manifest/lockfile operation; for all other stages those "
+                        "files remain prohibited."
                     )
                 ),
                 HumanMessage(content=prompt),
             ]
+
+            no_fix_manifest_paths: list[str] = []
+            if getattr(target_task, "no_fix_stage", None) is not None:
+                for candidate in [
+                    *(getattr(target_group, "file_paths", []) or []),
+                    getattr(target_group, "file_path", None),
+                    *(
+                        getattr(issue, "manifest_file", None)
+                        for issue in getattr(target_group, "localized_issues", []) or []
+                    ),
+                ]:
+                    normalized = str(candidate or "").replace("\\", "/").lstrip("/")
+                    if normalized and normalized not in no_fix_manifest_paths:
+                        no_fix_manifest_paths.append(normalized)
 
             toolbelt = build_workaround_toolbelt(
                 sandbox,
@@ -1258,6 +1432,31 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 repo_root,
                 plan_state=plan_state,
                 preferred_test_files=_preferred_targeted_test_files(qa_ev),
+                no_fix_stage=(
+                    getattr(workaround_ctx, "no_fix_stage", None)
+                    if workaround_ctx is not None
+                    else getattr(target_task, "no_fix_stage", None)
+                ),
+                no_fix_package_name=(
+                    getattr(target_group, "vulnerable_component", None)
+                    if getattr(target_task, "no_fix_stage", None) is not None
+                    else None
+                ),
+                no_fix_manifest_paths=(
+                    no_fix_manifest_paths
+                    if getattr(target_task, "no_fix_stage", None) is not None
+                    else []
+                ),
+                no_fix_package_manager=(
+                    next(
+                        (
+                            issue.package_manager
+                            for issue in getattr(target_group, "localized_issues", []) or []
+                            if getattr(issue, "package_manager", None)
+                        ),
+                        "npm",
+                    )
+                ),
             )
             runtime = run_bounded_subagent_loop(
                 llm,
@@ -1268,7 +1467,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             )
 
             # Revert any illegally modified manifest files or test files
-            prohibited_modified = {f for f in touched_files if _is_prohibited_target(f)}
+            prohibited_modified = {
+                f
+                for f in touched_files
+                if _is_prohibited_target(f)
+                and not _is_allowlisted_no_fix_package_file(f, plan_state)
+            }
             if prohibited_modified:
                 logger.warning(
                     "Workaround subagent modified prohibited files %s. Reverting.",
@@ -1284,7 +1488,8 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
 
             validation_gate_passed = has_successful_validation_gate(
                 runtime.tool_events,
-                has_prior_edits=bool(replayed_edit_sets),
+                has_prior_edits=bool(replayed_edit_sets)
+                or bool(plan_state.get("package_removal_completed")),
             )
             has_all_validated = validation_gate_passed
             is_record_plan_in_toolbelt = any(
@@ -1414,9 +1619,17 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         or p_state.get("infrastructure_failure_details")
     )
 
+    pre_attempt_snapshots = dict(plan_state.get("stage_baseline_snapshots", pre_attempt_snapshots))
+    pre_attempt_absent_paths = list(
+        plan_state.get("stage_baseline_absent_paths", pre_attempt_absent_paths)
+    )
+
     new_replay_plan = WorkaroundReplayPlan(
         task_id=t_id,
         pre_attempt_snapshots=pre_attempt_snapshots,
+        pre_attempt_absent_paths=sorted(
+            set(plan_state.get("stage_baseline_absent_paths", pre_attempt_absent_paths))
+        ),
         successful_edit_sets=all_edit_sets,
         investigation_findings={
             "changed_files": list(touched_files),

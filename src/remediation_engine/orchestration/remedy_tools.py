@@ -22,6 +22,7 @@ from langchain_core.tools import tool
 
 from remediation_engine.contracts.schemas import (
     FailureCategory,
+    NoFixMitigationStage,
     WorkaroundEdit,
     WorkaroundEditSet,
     WorkaroundExecutionPhase,
@@ -947,6 +948,206 @@ def _is_prohibited_target(rel_path: str) -> bool:
     )
 
 
+def _is_allowlisted_no_fix_package_file(
+    rel_path: str,
+    plan_state: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether a manifest/lockfile was changed by scoped NO_FIX removal."""
+    if (
+        not plan_state
+        or plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value
+    ):
+        return False
+    if not plan_state.get("package_removal_planned", False):
+        return False
+    normalized = rel_path.replace("\\", "/").lstrip("/")
+    allowlisted = {
+        str(path).replace("\\", "/").lstrip("/")
+        for path in plan_state.get("no_fix_package_files", [])
+    }
+    return normalized in allowlisted and normalized in set(
+        plan_state.get("package_removal_files", [])
+    )
+
+
+def _remember_stage_baseline(
+    sandbox: DockerSandbox,
+    plan_state: dict[str, Any] | None,
+    paths: Iterable[str],
+) -> None:
+    """Capture first-seen file contents for a later NO_FIX stage reset."""
+    if plan_state is None:
+        return
+    baseline = plan_state.setdefault("stage_baseline_snapshots", {})
+    absent = set(plan_state.setdefault("stage_baseline_absent_paths", []))
+    for path in paths:
+        normalized = _validate_workspace_path(path)
+        if normalized in baseline or normalized in absent:
+            continue
+        content = sandbox.read_file(normalized)
+        if isinstance(content, str):
+            baseline[normalized] = content
+        else:
+            absent.add(normalized)
+    plan_state["stage_baseline_absent_paths"] = sorted(absent)
+
+
+def _make_remove_no_fix_dependency_tool(
+    sandbox: DockerSandbox,
+    touched_files: set[str],
+    plan_state: dict[str, Any],
+    package_name: str,
+    manifest_paths: Sequence[str],
+    package_manager: str,
+):
+    """Build the allowlisted package-removal operation for a NO_FIX attempt.
+
+    The operation intentionally supports only npm at present. Unsupported
+    managers fail closed instead of falling back to direct lockfile edits.
+    """
+    normalized_package = str(package_name or "").strip()
+    normalized_manifests = _normalize_manifest_targets(manifest_paths)
+    manager = str(package_manager or "").strip().lower()
+    checkpoint: _PackageCheckpoint | None = None
+
+    @tool
+    def remove_no_fix_dependency(
+        requested_package: str,
+        manifest_path: str,
+    ) -> str:
+        """Remove only the configured vulnerable direct dependency safely."""
+        nonlocal checkpoint
+
+        if plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
+            return "NOT_APPLICABLE: package removal is available only during PACKAGE_REMOVAL."
+        if not plan_state.get("recorded") or not plan_state.get("package_removal_planned"):
+            return (
+                "ERROR: [PLAN_VIOLATION] Record an explicit package-removal plan before "
+                "calling remove_no_fix_dependency."
+            )
+        if requested_package.strip() != normalized_package:
+            return (
+                "ERROR: [ALLOWLIST] remove_no_fix_dependency accepts only the configured "
+                f"package '{normalized_package}'."
+            )
+        try:
+            normalized_manifest = _validate_workspace_path(manifest_path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if normalized_manifest not in normalized_manifests:
+            return (
+                "ERROR: [ALLOWLIST] manifest_path is not an authorized target. "
+                f"Allowed paths: {', '.join(normalized_manifests)}."
+            )
+        if manager != "npm":
+            return (
+                "NOT_APPLICABLE: package-manager-aware removal is not implemented for "
+                f"'{manager or 'unknown'}'; no manifest or lockfile was changed."
+            )
+
+        manifest_content = sandbox.read_file(normalized_manifest)
+        if not isinstance(manifest_content, str):
+            return f"NOT_APPLICABLE: manifest '{normalized_manifest}' is missing or unreadable."
+        try:
+            manifest_data = json.loads(manifest_content)
+        except json.JSONDecodeError as exc:
+            return f"NOT_APPLICABLE: manifest '{normalized_manifest}' is invalid JSON: {exc}."
+        if not isinstance(manifest_data, dict):
+            return f"NOT_APPLICABLE: manifest '{normalized_manifest}' is not a JSON object."
+
+        direct_locations = [
+            dep_type
+            for dep_type in ("dependencies", "devDependencies", "optionalDependencies")
+            if isinstance(manifest_data.get(dep_type), dict)
+            and normalized_package in manifest_data[dep_type]
+        ]
+        if not direct_locations:
+            return (
+                "NOT_APPLICABLE: the vulnerable package has no removable direct declaration "
+                f"in '{normalized_manifest}'. A transitive package must not be removed by editing a lockfile."
+            )
+
+        if checkpoint is None:
+            checkpoint = _capture_package_checkpoint(
+                sandbox,
+                normalized_manifests,
+                touched_files,
+            )
+            baseline = plan_state.setdefault("stage_baseline_snapshots", {})
+            absent = set(plan_state.setdefault("stage_baseline_absent_paths", []))
+            for path, content in checkpoint.files.items():
+                if isinstance(content, str):
+                    baseline.setdefault(path, content)
+                else:
+                    absent.add(path)
+            plan_state["stage_baseline_absent_paths"] = sorted(absent)
+
+        for dep_type in direct_locations:
+            del manifest_data[dep_type][normalized_package]
+            if not manifest_data[dep_type]:
+                del manifest_data[dep_type]
+
+        try:
+            sandbox.write_file(
+                normalized_manifest,
+                json.dumps(manifest_data, indent=2, ensure_ascii=False) + "\n",
+            )
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+            checkpoint = None
+            suffix = f" {rollback_error}" if rollback_error else ""
+            return f"FAILURE: package manifest write failed: {exc}.{suffix}"
+
+        workspace_dir = _workspace_dir_for_manifest(normalized_manifest)
+        command = "npm install --package-lock-only --ignore-scripts"
+        command = (
+            f"cd {shlex.quote(workspace_dir)} && {command}"
+            if workspace_dir != "/workspace"
+            else command
+        )
+        try:
+            result = sandbox.run(command, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            result = None
+            sync_failure = f"package-manager synchronization raised {exc}"
+        else:
+            sync_failure = (
+                f"package-manager synchronization failed (exit {result.exit_code}).\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+                if result.exit_code != 0
+                else ""
+            )
+        if sync_failure:
+            rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+            checkpoint = None
+            suffix = f" {rollback_error}" if rollback_error else ""
+            return f"FAILURE: [ROLLBACK] {sync_failure}{suffix}"
+
+        changed_files: list[str] = []
+        for path, before in checkpoint.files.items():
+            after = sandbox.read_file(path)
+            if after != before:
+                touched_files.add(path)
+                changed_files.append(path)
+        plan_state["package_removal_planned"] = True
+        plan_state["package_removal_completed"] = True
+        plan_state["package_removal_files"] = sorted(
+            set(plan_state.get("package_removal_files", [])) | set(changed_files)
+        )
+        plan_state["no_fix_package_removed"] = True
+        # Package removal is part of the current plan, not a standalone source
+        # edit iteration. Keep EXECUTE open so dependent source imports/callers
+        # can be removed before the single cumulative validation call.
+        plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
+        return (
+            "SUCCESS: Removed the configured direct dependency through npm and synchronized "
+            f"the lockfile without lifecycle scripts. Changed files: {', '.join(changed_files)}."
+        )
+
+    return remove_no_fix_dependency
+
+
 def _apply_replacements_to_content(
     content: str,
     replacements: list[WorkaroundPlannedReplacement],
@@ -1134,6 +1335,7 @@ def _make_deterministic_apply_edit_set_tool(
             if curr is None:
                 return f"ERROR: Could not read '{rel_path}'."
             file_snapshots[rel_path] = curr
+        _remember_stage_baseline(sandbox, plan_state, affected_files_set)
 
         replacements_by_file: dict[str, list[WorkaroundPlannedReplacement]] = {}
         for r in submitted_planned:
@@ -1302,6 +1504,7 @@ def _make_deterministic_search_replace_tool(
                 f"ERROR: Could not read '{rel_path}'. Use inspect_ast_symbol or "
                 "search_codebase_pattern to verify the current file content."
             )
+        _remember_stage_baseline(sandbox, plan_state, [rel_path])
 
         newline_style = _detect_newline_style(current)
         current_norm = _normalise_newlines(current)
@@ -1414,6 +1617,7 @@ def _make_deterministic_replace_ast_symbol_tool(
         content = sandbox.read_file(rel_path)
         if content is None:
             return f"ERROR: Could not read '{rel_path}'."
+        _remember_stage_baseline(sandbox, plan_state, [rel_path])
 
         try:
             from remediation_engine.tools.code_map import (
@@ -2261,7 +2465,12 @@ def _make_validate_workaround_tool(
             )
             return f"FAILURE: Workaround validation gate 'input' failed. No modified files were supplied.\nJSON: {res.model_dump_json()}"
 
-        prohibited = [path for path in files if _is_prohibited_target(path)]
+        prohibited = [
+            path
+            for path in files
+            if _is_prohibited_target(path)
+            and not _is_allowlisted_no_fix_package_file(path, plan_state)
+        ]
         if prohibited:
             res = _record_result(
                 WorkaroundValidationResult(
@@ -2272,6 +2481,34 @@ def _make_validate_workaround_tool(
                 )
             )
             return f"FAILURE: Workaround validation gate 'input' failed. Prohibited files included.\nJSON: {res.model_dump_json()}"
+
+        package_removal_mode = (
+            plan_state.get("no_fix_stage") == NoFixMitigationStage.PACKAGE_REMOVAL.value
+        )
+        if package_removal_mode:
+            if not plan_state.get("package_removal_planned"):
+                return "ERROR: [PLAN_VIOLATION] Record and execute the scoped package-removal plan before validation."
+            if not plan_state.get("no_fix_package_removed"):
+                return "FAILURE: [PACKAGE_REMOVAL] The configured dependency was not removed through the scoped tool."
+            package_name = str(plan_state.get("no_fix_package_name", "") or "")
+            for manifest_path in plan_state.get("no_fix_manifest_paths", []):
+                manifest_text = sandbox.read_file(manifest_path)
+                try:
+                    manifest_data = json.loads(manifest_text or "")
+                except (TypeError, json.JSONDecodeError):
+                    return (
+                        "FAILURE: [PACKAGE_REMOVAL] The authorized manifest could not be "
+                        f"parsed after removal: {manifest_path}."
+                    )
+                if any(
+                    isinstance(manifest_data.get(dep_type), dict)
+                    and package_name in manifest_data[dep_type]
+                    for dep_type in ("dependencies", "devDependencies", "optionalDependencies")
+                ):
+                    return (
+                        "FAILURE: [PACKAGE_REMOVAL] The vulnerable package remains in a "
+                        f"direct declaration in {manifest_path}."
+                    )
 
         # Reject an explicitly wrong QA target before spending time in the
         # static/runtime gates. This keeps target-selection diagnostics useful
@@ -2309,6 +2546,8 @@ def _make_validate_workaround_tool(
 
         syntax_msg = ""
         for file_path in files:
+            if _is_allowlisted_no_fix_package_file(file_path, plan_state):
+                continue
             current_content = sandbox.read_file(file_path)
             if current_content is None:
                 syntax_msg = f"FAILURE: Modified file '{file_path}' could not be re-read."
@@ -2403,7 +2642,15 @@ def _make_validate_workaround_tool(
                 ),
                 None,
             )
-        runtime_smoke_result = _run_runtime_smoke_gate(smoke_target)
+        if package_removal_mode and not any(
+            Path(path).suffix.lower() in _SOURCE_MODULE_SUFFIXES and not _is_test_file_path(path)
+            for path in files
+        ):
+            runtime_smoke_result = (
+                "SKIPPED: Runtime smoke gate (package removal changed no source modules)."
+            )
+        else:
+            runtime_smoke_result = _run_runtime_smoke_gate(smoke_target)
         smoke_msg = runtime_smoke_result
         if smoke_selection_note:
             smoke_msg = f"{smoke_selection_note}\n{smoke_msg}"
@@ -2439,7 +2686,11 @@ def _make_validate_workaround_tool(
         if not test_file and preferred_test_files:
             test_file = next(iter(preferred_test_files), None)
 
-        if not test_file and plan_state.get("targeted_test_required", False):
+        if (
+            not test_file
+            and plan_state.get("targeted_test_required", False)
+            and not (package_removal_mode and not preferred_test_files)
+        ):
             res = _record_result(
                 WorkaroundValidationResult(
                     overall_status=WorkaroundValidationStatus.CODE_FAILURE,
@@ -2545,6 +2796,8 @@ def _make_validate_workaround_tool(
         )
         plan_state["validated_files"] = files
         plan_state["validation_passed"] = True
+        if package_removal_mode:
+            plan_state["package_removal_sync_succeeded"] = True
         plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
 
         pending_edit_set = plan_state.get("pending_edit_set")
@@ -2616,8 +2869,16 @@ def build_workaround_toolbelt(
     plan_state: dict[str, Any] | None = None,
     mandatory_search_terms: dict[str, str] | None = None,
     preferred_test_files: Sequence[str] | None = None,
+    no_fix_stage: NoFixMitigationStage | None = None,
+    no_fix_package_name: str | None = None,
+    no_fix_manifest_paths: Sequence[str] | None = None,
+    no_fix_package_manager: str | None = None,
 ) -> list:
-    """Build the strict workaround-only toolbelt."""
+    """Build the strict workaround-only toolbelt.
+
+    The optional NO_FIX arguments add one narrowly scoped package-removal
+    capability. They never relax the source-edit or generic manifest guards.
+    """
     if plan_state is None:
         plan_state = {}
 
@@ -2653,7 +2914,32 @@ def build_workaround_toolbelt(
     plan_state.setdefault("runtime_smoke_required", True)
     plan_state.setdefault("targeted_test_required", True)
 
-    return [
+    effective_no_fix_stage = no_fix_stage or plan_state.get("no_fix_stage")
+    if isinstance(effective_no_fix_stage, NoFixMitigationStage):
+        effective_no_fix_stage = effective_no_fix_stage.value
+    if effective_no_fix_stage:
+        plan_state["no_fix_stage"] = str(effective_no_fix_stage)
+    if no_fix_package_name:
+        plan_state["no_fix_package_name"] = str(no_fix_package_name).strip()
+        if effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+            plan_state["targeted_test_required"] = bool(preferred_test_files)
+
+    normalized_no_fix_manifests = _normalize_manifest_targets(no_fix_manifest_paths or [])
+    plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
+    plan_state.setdefault(
+        "no_fix_package_files",
+        sorted(
+            set(normalized_no_fix_manifests)
+            | {
+                path
+                for manifest in normalized_no_fix_manifests
+                for path in _package_checkpoint_paths([manifest])
+                if Path(path).name in {"package-lock.json", "npm-shrinkwrap.json"}
+            }
+        ),
+    )
+
+    toolbelt = [
         _make_record_plan_tool(plan_state),
         _make_record_targeted_test_substitution_tool(sandbox, plan_state),
         _make_search_web_tool(mandatory_search_terms=mandatory_search_terms, plan_state=plan_state),
@@ -2666,6 +2952,25 @@ def build_workaround_toolbelt(
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
         _make_validate_workaround_tool(sandbox, touched_files, plan_state, preferred_test_files),
     ]
+    if (
+        effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value
+        and no_fix_package_name
+        and normalized_no_fix_manifests
+    ):
+        # Keep this tool absent in every other stage. The worker cannot use a
+        # prompt trick to acquire manifest mutation capability.
+        toolbelt.insert(
+            1,
+            _make_remove_no_fix_dependency_tool(
+                sandbox,
+                touched_files,
+                plan_state,
+                no_fix_package_name,
+                normalized_no_fix_manifests,
+                no_fix_package_manager or "",
+            ),
+        )
+    return toolbelt
 
 
 def _make_record_plan_tool(plan_state: dict[str, Any]):
@@ -2677,6 +2982,7 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         causal_hypothesis: str,
         planned_replacements: list[WorkaroundPlannedReplacement],
         evidence_source: str | None = None,
+        package_removal_requested: bool = False,
     ) -> str:
         """Record the evidence-backed plan before applying source edits.
 
@@ -2761,7 +3067,11 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
             except Exception:
                 return "ERROR: [PLAN_REJECTED] planned_replacements must be a valid JSON array or list."
 
-        if not isinstance(raw_replacements, list) or not raw_replacements:
+        if not isinstance(raw_replacements, list):
+            return (
+                "ERROR: [PLAN_REJECTED] planned_replacements must be a valid list of replacements."
+            )
+        if not raw_replacements and not package_removal_requested:
             return "ERROR: [PLAN_REJECTED] planned_replacements must be a non-empty list of replacements."
 
         replacements: list[WorkaroundPlannedReplacement] = []
@@ -2833,7 +3143,25 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         if total_text_bytes > 65536:
             return "ERROR: [PLAN_REJECTED] Plan exceeds maximum limit of 64 KiB of combined replacement text."
 
-        if declared_files != replacement_files:
+        allowlisted_package_files = set(plan_state.get("no_fix_manifest_paths", []))
+        if package_removal_requested:
+            if plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
+                return "ERROR: [PLAN_REJECTED] package_removal_requested is valid only during PACKAGE_REMOVAL."
+            if not allowlisted_package_files:
+                return "ERROR: [PLAN_REJECTED] No exact manifest allowlist is configured for package removal."
+            if not declared_files.intersection(allowlisted_package_files):
+                return (
+                    "ERROR: [PLAN_REJECTED] A package-removal plan must declare at least one "
+                    "configured manifest path in affected_files."
+                )
+            unexpected_files = declared_files - replacement_files - allowlisted_package_files
+            if unexpected_files:
+                return (
+                    "ERROR: [PLAN_REJECTED] Package-removal affected_files contain paths outside "
+                    f"the source replacement set and manifest allowlist: {sorted(unexpected_files)}."
+                )
+            plan_state["package_removal_planned"] = True
+        elif declared_files != replacement_files:
             return (
                 f"ERROR: [PLAN_REJECTED] Mismatch between declared affected_files ({sorted(declared_files)}) "
                 f"and files in planned_replacements ({sorted(replacement_files)})."
@@ -2857,7 +3185,9 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         plan_state["successful_edit_count_this_iteration"] = 0
 
         plan_state["planned_replacements"] = [r.model_dump() for r in replacements]
-        plan_state["planned_files"] = sorted(list(replacement_files))
+        plan_state["planned_files"] = sorted(
+            list(declared_files if package_removal_requested else replacement_files)
+        )
 
         new_symbols = [str(s).strip() for s in symbols_list if str(s).strip()]
         existing_symbols = list(plan_state.get("planned_symbols", []))

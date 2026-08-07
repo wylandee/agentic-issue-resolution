@@ -137,6 +137,20 @@ class SCARemediationStage(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class NoFixMitigationStage(str, Enum):
+    """Ordered mitigation stages for a ``NO_FIX`` vulnerability group.
+
+    ``PACKAGE_REMOVAL`` is the initial best-effort mitigation.  If that
+    attempt fails validation, the same task advances to
+    ``VULNERABLE_CODE_REMOVAL``.  A second failed attempt is terminalized as
+    ``UNFIXABLE``.
+    """
+
+    PACKAGE_REMOVAL = "package_removal"
+    VULNERABLE_CODE_REMOVAL = "vulnerable_code_removal"
+    UNFIXABLE = "unfixable"
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 orchestrator caps
 # ---------------------------------------------------------------------------
@@ -1197,6 +1211,15 @@ class WorkaroundContext(BaseModel):
     phase: WorkaroundPhase = Field(default=WorkaroundPhase.INITIAL_MITIGATION)
     vulnerability_mechanism: str = Field(default="")
     qa_evidence: QAFailureEvidence | None = Field(default=None)
+    no_fix_stage: NoFixMitigationStage | None = Field(default=None)
+    reset_prior_stage_workspace: bool = Field(
+        default=False,
+        description=(
+            "Restore the task-local pre-stage workspace before executing this "
+            "attempt. Used when a NO_FIX package-removal attempt advances to "
+            "vulnerable-code removal."
+        ),
+    )
 
 
 class QAEvaluation(BaseModel):
@@ -1291,6 +1314,7 @@ class TaskAttemptSnapshot(BaseModel):
     task_revision: int = Field(default=0, ge=0)
     attempt_number: int = Field(default=1, ge=1)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
+    no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
@@ -1432,6 +1456,13 @@ class WorkaroundReplayPlan(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     pre_attempt_snapshots: dict[str, str] = Field(default_factory=dict)
+    pre_attempt_absent_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Repository-relative files that did not exist at the stage baseline. "
+            "They are removed before replay when a later stage resets the workspace."
+        ),
+    )
     successful_edit_sets: list[WorkaroundEditSet] = Field(default_factory=list)
     investigation_findings: dict[str, Any] = Field(default_factory=dict)
     source_attempt_id: str = Field(default="")
@@ -1809,6 +1840,12 @@ class RemediationTask(BaseModel):
         default=SCARemediationStage.OSV_MINIMUM,
         description="Current ordered SCA remediation stage for this task.",
     )
+    no_fix_stage: NoFixMitigationStage | None = Field(
+        default=None,
+        description=(
+            "Current mitigation stage for a NO_FIX vulnerability group. None for non-NO_FIX tasks."
+        ),
+    )
     selected_version: str | None = Field(
         default=None,
         description="Supervisor-selected version for the current update stage.",
@@ -1828,7 +1865,11 @@ class RemediationTask(BaseModel):
     retry_count: int = Field(
         default=0,
         ge=0,
-        description="Number of times this task has been retried after QA failure.",
+        description=(
+            "Number of retry dispatches after a worker or QA failure. "
+            "For NO_FIX tasks, a failed mitigation stage consumes one retry "
+            "even when the worker fails before producing a QA envelope."
+        ),
     )
     ancestry_depth: int = Field(
         default=0,

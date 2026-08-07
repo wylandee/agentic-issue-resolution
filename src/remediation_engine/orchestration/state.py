@@ -30,6 +30,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FixPlanStatus,
     GroupRemediationStatus,
+    NoFixMitigationStage,
     QAAttemptResult,
     QAEvaluation,
     RemediationTask,
@@ -246,7 +247,16 @@ def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask
             if strategy == RoutingStrategy.VERSION_BUMP
             else SCARemediationStage.CODE_WORKAROUND
         ),
-        selected_version=(fix_plan.fixed_version if fix_plan is not None else None),
+        no_fix_stage=(
+            NoFixMitigationStage.PACKAGE_REMOVAL
+            if fix_plan is not None and fix_plan.status == FixPlanStatus.NO_FIX
+            else None
+        ),
+        selected_version=(
+            None
+            if fix_plan is not None and fix_plan.status == FixPlanStatus.NO_FIX
+            else (fix_plan.fixed_version if fix_plan is not None else None)
+        ),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,
