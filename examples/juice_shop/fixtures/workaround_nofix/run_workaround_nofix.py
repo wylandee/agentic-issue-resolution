@@ -1,10 +1,11 @@
-"""Run the initial NO_FIX package-removal attempt through the Supervisor.
+"""Run the NO_FIX vulnerable-code-removal retry through the Supervisor.
 
-This manual example starts with an unchanged Juice Shop clone, commits the
-supervisor-owned ``PACKAGE_REMOVAL`` attempt, materializes npm dependencies, and
-follows the normal workaround-worker/Supervisor routing against the same
-temporary Docker volume. It is intentionally not part of the public remediation
-workflow and must only be run when live Docker/LLM calls are desired.
+This manual example starts with an unchanged Juice Shop clone, commits a
+supervisor-owned ``VULNERABLE_CODE_REMOVAL`` retry attempt, materializes npm
+dependencies, and follows the normal workaround-worker/Supervisor routing
+against the same temporary Docker volume. It is intentionally not part of the
+public remediation workflow and must only be run when live Docker/LLM calls are
+desired.
 """
 
 from __future__ import annotations
@@ -23,7 +24,9 @@ from dotenv import load_dotenv
 from langsmith import traceable
 
 from remediation_engine.contracts.schemas import (
+    FailureCategory,
     NoFixMitigationStage,
+    QAEvaluation,
     QAFailureEvidence,
     TaskAttemptSnapshot,
     TaskStatus,
@@ -41,7 +44,10 @@ from remediation_engine.orchestration.langsmith_config import (
 )
 from remediation_engine.orchestration.state import initial_orchestrator_state
 from remediation_engine.orchestration.supervisor_node import run_supervisor_node
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.orchestration.task_utils import (
+    build_initial_remediation_task,
+    build_no_fix_retry_instruction,
+)
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
@@ -61,17 +67,17 @@ _DEFAULT_REPO = _PROJECT_ROOT / "data" / "clones" / "juice-shop"
 _DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "data" / "trajectories"
 
 _NOFIX_METADATA = {
-    "replay_type": "notevil_initial_nofix_remediation",
-    "replay_mode": "initial_remediation",
-    "workflow_phase": "initial_mitigation",
+    "replay_type": "notevil_stage_two_nofix_remediation",
+    "replay_mode": "retry_remediation",
+    "workflow_phase": "qa_regression_repair",
     "package_name": "notevil",
-    "no_fix_stage": "package_removal",
+    "no_fix_stage": "vulnerable_code_removal",
     "source_group_id": "sca:package.json:notevil:NO_FIX",
 }
 
 
 def load_nofix_fixture(path: Path = _DEFAULT_FIXTURE) -> dict[str, Any]:
-    """Load and validate the explicit initial NO_FIX fixture.
+    """Load and validate the explicit Stage 2 NO_FIX fixture.
 
     Args:
         path: JSON fixture containing the NO_FIX group and initial task context.
@@ -99,8 +105,13 @@ def load_nofix_fixture(path: Path = _DEFAULT_FIXTURE) -> dict[str, Any]:
     missing = sorted(required_sections - payload.keys())
     if missing:
         raise ValueError(f"NO_FIX fixture is missing sections: {', '.join(missing)}")
-    if payload["replay"].get("initial_no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
-        raise ValueError("NO_FIX fixture must start at PACKAGE_REMOVAL.")
+    if (
+        payload["replay"].get("initial_no_fix_stage")
+        != NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value
+    ):
+        raise ValueError("NO_FIX fixture must start at VULNERABLE_CODE_REMOVAL.")
+    if not payload.get("qa_evidence"):
+        raise ValueError("Stage-two NO_FIX fixture must include prior QA failure evidence.")
     if payload["group"].get("group_id") != "sca:package.json:notevil:NO_FIX":
         raise ValueError("NO_FIX fixture must contain the notevil NO_FIX group.")
     return payload
@@ -113,7 +124,7 @@ def _instruction_digest(instruction: str) -> str:
 
 
 def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, Any]:
-    """Construct a committed initial package-removal state without Docker.
+    """Construct a committed Stage 2 retry state without Docker.
 
     Args:
         repo_root: Host clone used later by the workspace builder and teardown.
@@ -134,46 +145,84 @@ def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, 
     if fixture_task.get("parent_group_id") != group.group_id:
         raise ValueError("NO_FIX fixture task does not target its fixture group.")
 
+    requested_stage = NoFixMitigationStage(fixture["replay"]["initial_no_fix_stage"])
+    if requested_stage != NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        raise ValueError("This fixture is dedicated to the Stage 2 NO_FIX retry.")
+
     # Recreate the task through the production factory so the fixture cannot
-    # silently bypass the supervisor's deterministic NO_FIX instruction.
+    # silently bypass the supervisor's deterministic NO_FIX instruction, then
+    # apply the same projection that the Supervisor would commit after a failed
+    # package-removal attempt.
     task = build_initial_remediation_task(group, task_id)
     if task.no_fix_stage != NoFixMitigationStage.PACKAGE_REMOVAL:
         raise ValueError("Initial notevil task did not resolve to PACKAGE_REMOVAL.")
-    if fixture_task.get("no_fix_stage") != task.no_fix_stage.value:
-        raise ValueError("Fixture task stage disagrees with the production task factory.")
+    if fixture_task.get("no_fix_stage") != requested_stage.value:
+        raise ValueError("Fixture task stage is invalid for the Stage 2 retry.")
+    if fixture_task.get("status") != TaskStatus.NEEDS_RETRY.value:
+        raise ValueError("Stage-two NO_FIX fixture task must start in NEEDS_RETRY.")
+    if fixture_task.get("retry_count") != 1:
+        raise ValueError("Stage-two NO_FIX fixture task must start with retry_count=1.")
 
     context_payload = fixture["workaround_context"]
     qa_payload = fixture.get("qa_evidence")
-    qa_evidence = QAFailureEvidence.model_validate(qa_payload) if qa_payload else None
+    qa_evidence = QAFailureEvidence.model_validate(qa_payload)
+    failure_feedback = (
+        context_payload.get("failure_feedback")
+        or "The package-removal attempt failed before a complete QA evaluation was available."
+    )
+    stage_two_task = task.model_copy(
+        update={
+            "task_revision": 2,
+            "no_fix_stage": requested_stage,
+            "status": TaskStatus.NEEDS_RETRY,
+            "retry_count": 1,
+        }
+    )
+    prior_evaluation = QAEvaluation(
+        task_id=task.task_id,
+        passed=False,
+        failure_category=FailureCategory.SECURITY_FLAG,
+        retry_feedback=failure_feedback,
+        failure_evidence=qa_evidence,
+    )
+    stage_two_task = stage_two_task.model_copy(
+        update={
+            "instruction": build_no_fix_retry_instruction(
+                stage_two_task,
+                group,
+                evaluation=prior_evaluation,
+                failure_feedback=failure_feedback,
+            )
+        }
+    )
     workaround_context = WorkaroundContext(
         phase=WorkaroundPhase(context_payload["phase"]),
         vulnerability_mechanism=context_payload["vulnerability_mechanism"],
         qa_evidence=qa_evidence,
-        no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
-        reset_prior_stage_workspace=False,
+        no_fix_stage=requested_stage,
+        reset_prior_stage_workspace=bool(context_payload.get("reset_prior_stage_workspace", True)),
     )
 
-    # A real supervisor dispatch increments the revision before committing its
-    # attempt snapshot. This state therefore begins at revision 1 even though
-    # the serialized fixture task is the revision-0 task factory output.
-    task = task.model_copy(update={"task_revision": 1})
-    attempt_id = str(fixture["replay"].get("initial_attempt_id", "notevil-nofix-initial-attempt"))
+    # A real supervisor dispatch increments the revision for the initial
+    # attempt, then increments it again when advancing to Stage 2. This state
+    # therefore begins at revision 2 with retry_count=1.
+    attempt_id = str(fixture["replay"].get("initial_attempt_id", "notevil-nofix-stage-two-attempt"))
     snapshot = TaskAttemptSnapshot(
         attempt_id=attempt_id,
-        task_id=task.task_id,
-        state_revision=1,
-        task_revision=task.task_revision,
-        attempt_number=1,
-        strategy_stage=task.strategy_stage,
-        no_fix_stage=task.no_fix_stage,
-        selected_version=task.selected_version,
-        instruction=task.instruction,
-        instruction_digest=_instruction_digest(task.instruction),
+        task_id=stage_two_task.task_id,
+        state_revision=2,
+        task_revision=stage_two_task.task_revision,
+        attempt_number=2,
+        strategy_stage=stage_two_task.strategy_stage,
+        no_fix_stage=stage_two_task.no_fix_stage,
+        selected_version=stage_two_task.selected_version,
+        instruction=stage_two_task.instruction,
+        instruction_digest=_instruction_digest(stage_two_task.instruction),
         dispatch_node="workaround_subagent",
         plan_id=None,
         workaround_context=workaround_context,
     )
-    task = task.model_copy(update={"current_attempt_id": snapshot.attempt_id})
+    stage_two_task = stage_two_task.model_copy(update={"current_attempt_id": snapshot.attempt_id})
 
     state = initial_orchestrator_state(
         repo_root=str(repo_root.resolve()),
@@ -183,21 +232,21 @@ def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, 
     state.update(
         {
             "state_revision": snapshot.state_revision,
-            "task_queue": {task.task_id: task},
-            "active_target_task_ids": [task.task_id],
+            "task_queue": {stage_two_task.task_id: stage_two_task},
+            "active_target_task_ids": [stage_two_task.task_id],
             "active_target_group_ids": [],
-            "feedback_by_task": {task.task_id: ""},
+            "feedback_by_task": {stage_two_task.task_id: failure_feedback},
             "feedback_by_group": {},
             "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
             "workspace_volume": None,
-            "status": "workaround_nofix_pending",
+            "status": "workaround_nofix_stage_two_pending",
         }
     )
     return state
 
 
 def build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, Any]:
-    """Build the initial NO_FIX state for dry verification.
+    """Build the Stage 2 NO_FIX retry state for dry verification.
 
     This helper performs no Docker, network, LLM, or LangSmith work.
 
@@ -206,7 +255,7 @@ def build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, A
         fixture: Parsed output of :func:`load_nofix_fixture`.
 
     Returns:
-        A committed initial package-removal dispatch state.
+        A committed vulnerable-code-removal retry dispatch state.
     """
     return _build_initial_state(repo_root, fixture)
 
@@ -312,17 +361,17 @@ def _jsonable(value: Any) -> Any:
 
 
 @traceable(
-    name="Notevil_NO_FIX_Initial_Package_Removal_With_QA",
+    name="Notevil_NO_FIX_Stage_Two_Vulnerable_Code_Removal_With_QA",
     run_type="chain",
     metadata=_NOFIX_METADATA,
-    tags=["notevil", "no-fix", "package-removal", "workaround", "qa-critic"],
+    tags=["notevil", "no-fix", "vulnerable-code-removal", "workaround", "qa-critic"],
 )
 def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
-    """Execute the initial NO_FIX worker attempt through Supervisor routing.
+    """Execute the Stage 2 NO_FIX worker attempt through Supervisor routing.
 
     Args:
         repo_root: Host clone used as the immutable workspace source.
-        fixture: Explicit initial NO_FIX fixture payload.
+        fixture: Explicit Stage 2 NO_FIX retry fixture payload.
 
     Returns:
         JSON-serializable worker, QA, task-lifecycle, and cleanup results.
@@ -351,22 +400,23 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
         if builder_result.get("status") != "workspace_ready" or not workspace_volume:
             raise RuntimeError("Workspace builder did not return a ready Docker volume.")
 
-        # Materialize root and frontend dependencies before the initial
-        # package-removal dispatch. This keeps worker validation tools such as
+        # Materialize root and frontend dependencies before the Stage 2
+        # vulnerable-code-removal dispatch. This keeps worker validation tools such as
         # tsc available inside the isolated volume without modifying the host
         # clone.
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
             install_diagnostics = _install_workspace_dependencies(sandbox)
 
-        # This is the initial package-removal dispatch. No dependency update or
-        # replay edits are seeded into the workspace before this call.
-        workaround_dispatches = 1
+        # This fixture represents the second dispatch. The workspace remains
+        # at the unchanged repository baseline so notevil is still installed;
+        # package-removal edits are intentionally not replayed.
+        workaround_dispatches = 2
         worker_result = run_workaround_subagent_from_orchestrator(state)
         _merge_worker_result(state, worker_result)
 
         # Follow the same worker -> Supervisor -> next-node handoff as the
-        # production graph. In particular, a failed package-removal attempt
-        # must be advanced by the Supervisor before stage two is dispatched.
+        # production graph. A Stage 2 failure should be terminalized by the
+        # Supervisor rather than dispatched for a third NO_FIX attempt.
         while True:
             supervisor_result = run_supervisor_node(state)
             _merge_supervisor_result(state, supervisor_result)
@@ -407,7 +457,7 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
 
             raise RuntimeError(f"Supervisor returned unsupported next step: {next_step!r}")
     except Exception as exc:  # noqa: BLE001
-        message = f"Notevil NO_FIX initial remediation failed before completion: {exc}"
+        message = f"Notevil NO_FIX Stage 2 retry failed before completion: {exc}"
         logger.exception(message)
         state["errors"] = [*state.get("errors", []), message]
     finally:
@@ -513,10 +563,10 @@ def main() -> int:
     build_initial_state(args.repo, fixture)
     output_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_path = args.output or (
-        _DEFAULT_OUTPUT_DIR / f"notevil_workaround_nofix_{output_stamp}.json"
+        _DEFAULT_OUTPUT_DIR / f"notevil_workaround_nofix_stage2_{output_stamp}.json"
     )
     patch_path = args.patch_output or (
-        _DEFAULT_OUTPUT_DIR / f"notevil_workaround_nofix_{output_stamp}.patch"
+        _DEFAULT_OUTPUT_DIR / f"notevil_workaround_nofix_stage2_{output_stamp}.patch"
     )
 
     initial_state = build_initial_state(args.repo, fixture)
@@ -524,7 +574,7 @@ def main() -> int:
     langsmith_enabled = is_phase5_tracing_enabled()
     recorder = TrajectoryRecorder()
     recorder.record_manual(
-        name="notevil_workaround_nofix.root_input",
+        name="notevil_workaround_nofix_stage2.root_input",
         run_type="state",
         inputs=initial_state,
     )
@@ -548,7 +598,7 @@ def main() -> int:
         raise
     finally:
         recorder.record_manual(
-            name="notevil_workaround_nofix.root_output",
+            name="notevil_workaround_nofix_stage2.root_output",
             run_type="state",
             inputs={"error": str(run_error)} if run_error else None,
             outputs=result if result is not None else {"error": "no result"},
