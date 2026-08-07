@@ -252,8 +252,17 @@ def test_blocked_vs_failure_validation_classification() -> None:
     mock_sandbox.run.side_effect = mock_run_no_nm
     mock_sandbox.read_file.return_value = "const x = 1;"
     touched: set[str] = set()
-    tool = _make_validate_workaround_tool(mock_sandbox, touched)
-    res = tool.invoke({"modified_files": ["lib/insecurity.ts"]})
+    tool = _make_validate_workaround_tool(
+        mock_sandbox,
+        touched,
+        plan_state={"targeted_test_required": False},
+    )
+    res = tool.invoke(
+        {
+            "modified_files": ["lib/insecurity.ts"],
+            "runtime_smoke_file": "lib/insecurity.ts",
+        }
+    )
     assert res.startswith("BLOCKED:")
     assert "Cannot find module" in res
 
@@ -267,7 +276,12 @@ def test_blocked_vs_failure_validation_classification() -> None:
 
     mock_sandbox.run.side_effect = mock_run
     mock_sandbox.read_file.return_value = "const x = 1;"
-    res2 = tool.invoke({"modified_files": ["lib/insecurity.ts"]})
+    res2 = tool.invoke(
+        {
+            "modified_files": ["lib/insecurity.ts"],
+            "runtime_smoke_file": "lib/insecurity.ts",
+        }
+    )
     assert res2.startswith("BLOCKED:")
     assert "npx: command not found" in res2
 
@@ -284,7 +298,12 @@ def test_blocked_vs_failure_validation_classification() -> None:
         return MagicMock(exit_code=0, stdout="", stderr="")
 
     mock_sandbox.run.side_effect = mock_run_type_err
-    res3 = tool.invoke({"modified_files": ["lib/insecurity.ts"]})
+    res3 = tool.invoke(
+        {
+            "modified_files": ["lib/insecurity.ts"],
+            "runtime_smoke_file": "lib/insecurity.ts",
+        }
+    )
     assert res3.startswith("FAILURE:")
     assert "TS2304" in res3
 

@@ -45,8 +45,12 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    NoFixMitigationStage,
     QAEvaluation,
+    RemediationTask,
+    RoutingStrategy,
     Severity,
+    TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -64,6 +68,7 @@ from remediation_engine.orchestration.qa_critic import (
     _build_individual_investigator_prompt,
     _collect_baseline_identifiers,
     _collect_target_identifiers,
+    _derive_qa_group_strategies,
     _detect_test_suite_plans,
     _extract_failure_blocks,
     _extract_group_evaluations,
@@ -2527,6 +2532,61 @@ class TestApplyGuardrails:
             group_strategies={g.group_id: "version_bump"},
         )
         assert evals[g.group_id].passed is True and not errors
+
+    def test_no_fix_stage_two_derives_code_workaround_strategy(self):
+        group = _make_group(
+            group_id="sca:package.json:notevil:NO_FIX",
+            cve_ids=["CVE-2021-23771"],
+            ghsa_ids=[],
+            fix_plan_status=FixPlanStatus.NO_FIX,
+        )
+        task = RemediationTask(
+            task_id="task-nofix",
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            no_fix_stage=NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+        )
+
+        strategies = _derive_qa_group_strategies(
+            [group],
+            configured_strategies={},
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+        )
+
+        assert strategies[group.group_id] == "code_workaround"
+
+    def test_no_fix_stage_one_remains_strict(self):
+        group = _make_group(
+            group_id="sca:package.json:notevil:NO_FIX",
+            cve_ids=["CVE-2021-23771"],
+            ghsa_ids=[],
+            fix_plan_status=FixPlanStatus.NO_FIX,
+        )
+        task = RemediationTask(
+            task_id="task-nofix",
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+        )
+        batch = BatchQAResult(
+            holistic_report="ok",
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
+        )
+
+        strategies = _derive_qa_group_strategies([group], {}, {task.task_id: task}, [task.task_id])
+        evaluations, _ = _apply_guardrails(
+            valid_groups=[group],
+            batch_result=batch,
+            results=self._res(scan_ok=False, remaining={"CVE-2021-23771"}),
+            group_strategies=strategies,
+        )
+
+        assert strategies[group.group_id] == "no_fix_package_removal"
+        assert evaluations[group.group_id].passed is False
+        assert evaluations[group.group_id].failure_category == FailureCategory.SECURITY_FLAG
 
     def test_unknown_group_id_dropped(self):
         g = _make_group(group_id="real")

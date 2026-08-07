@@ -1155,6 +1155,7 @@ def _build_attempt_result(
 
     diag = WorkerExecutionDiagnostics(
         validation_calls=val_calls,
+        validation_input_errors=int(p_state.get("validation_input_errors", 0)),
         validation_passed=succeeded,
         failure_reason=" | ".join(errors),
         per_gate_results=per_gate,
@@ -1641,6 +1642,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         planned_targets=planned_files + planned_symbols,
         validated_files=list(plan_state.get("validated_files", [])) if succeeded else [],
         validation_calls=int(p_state.get("validation_calls", 0)),
+        validation_input_errors=int(p_state.get("validation_input_errors", 0)),
         per_gate_results=per_gate,
         final_selected_targeted_test=selected_test,
         original_to_alternative_test_mapping=mapping,

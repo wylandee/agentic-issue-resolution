@@ -196,7 +196,12 @@ def test_plan_and_web_rejected_while_waiting_for_validation():
 
 
 def test_validation_failure_resets_execution_to_investigate():
-    sandbox, files = _mock_sandbox({"src/index.js": "const x = 2;"})
+    sandbox, files = _mock_sandbox(
+        {
+            "src/index.js": "const x = 2;",
+            "test/index.test.js": "test('index', () => {});",
+        }
+    )
     plan_state: dict[str, Any] = {
         "phase": WorkaroundExecutionPhase.VALIDATE.value,
         "iteration": 1,
@@ -330,6 +335,132 @@ def test_runtime_smoke_rejects_bootstrap_when_no_safe_changed_module_exists():
     assert "ERROR: [INVALID_RUNTIME_SMOKE]" in str(result)
     assert "no lightweight changed source module" in str(result)
     assert sandbox.run.call_count == 0
+
+
+def test_invalid_validation_preflight_does_not_consume_gate_attempts():
+    sandbox, _ = _mock_sandbox(
+        {
+            "package.json": '{"scripts": {"test": "node --test test/index.test.js"}}',
+            "src/index.js": "module.exports = true;",
+            "test/index.test.js": "test('works', () => {});",
+        }
+    )
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(
+        sandbox,
+        {"src/index.js"},
+        plan_state,
+        preferred_test_files=["test/index.test.js"],
+    )
+
+    invalid_smoke = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "test/index.test.js",
+            "targeted_test_file": "test/index.test.js",
+        }
+    )
+    invalid_test = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "src/index.js",
+            "targeted_test_file": "test/missing.test.js",
+        }
+    )
+
+    assert "[INVALID_VALIDATION_INPUT]" in str(invalid_smoke)
+    assert str(invalid_test).startswith("SUCCESS: Workaround validation gate passed")
+    assert "canonical QA test 'test/index.test.js'" in str(invalid_test)
+    assert plan_state["validation_calls"] == 1
+    assert plan_state["validation_input_errors"] == 1
+    assert sandbox.run.call_count > 0
+
+
+def test_validation_canonicalizes_directory_and_source_test_selection() -> None:
+    """Bad directory/source selections resolve to the known QA test and smoke module."""
+    sandbox, _ = _mock_sandbox(
+        {
+            "package.json": '{"scripts": {"test": "node --test test/server/b2bOrderSpec.ts"}}',
+            "app.ts": "validateDependenciesBasic(); server.start();",
+            "routes/b2bOrder.ts": "export const order = true;",
+            "test/server/b2bOrderSpec.ts": "test('b2bOrder', () => {});",
+        }
+    )
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(
+        sandbox,
+        {"routes/b2bOrder.ts"},
+        plan_state,
+        preferred_test_files=["test/server/b2bOrderSpec.ts"],
+    )
+
+    result = val_tool.invoke(
+        {
+            "modified_files": ["routes/b2bOrder.ts"],
+            "runtime_smoke_file": "app.ts",
+            "targeted_test_file": "routes/b2bOrder.ts",
+            "targeted_test_name": "b2bOrder",
+        }
+    )
+
+    assert str(result).startswith("SUCCESS: Workaround validation gate passed")
+    assert "targeted test: test/server/b2bOrderSpec.ts" in str(result)
+    assert plan_state["runtime_smoke_file"] == "routes/b2bOrder.ts"
+    assert plan_state["validation_calls"] == 1
+    assert plan_state["validation_input_errors"] == 0
+
+
+def test_source_module_cannot_be_used_as_targeted_test():
+    sandbox, _ = _mock_sandbox(
+        {
+            "routes/order.ts": "export const order = true;",
+            "lib/utils.ts": "export const utils = true;",
+        }
+    )
+    plan_state: dict[str, Any] = {"targeted_test_required": True}
+    val_tool = _make_validate_workaround_tool(sandbox, {"routes/order.ts"}, plan_state)
+
+    result = val_tool.invoke(
+        {
+            "modified_files": ["routes/order.ts"],
+            "runtime_smoke_file": "lib/utils.ts",
+            "targeted_test_file": "routes/order.ts",
+        }
+    )
+
+    assert "source module, not a test/spec file" in str(result)
+    assert plan_state["validation_calls"] == 0
+    assert plan_state["validation_input_errors"] == 1
+    assert sandbox.run.call_count == 0
+
+
+def test_valid_validation_increments_only_executed_gate_attempts():
+    sandbox, _ = _mock_sandbox(
+        {
+            "package.json": '{"scripts": {"test": "node --test test/index.test.js"}}',
+            "src/index.js": "module.exports = true;",
+            "test/index.test.js": "test('works', () => {});",
+        }
+    )
+    plan_state: dict[str, Any] = {}
+    val_tool = _make_validate_workaround_tool(
+        sandbox,
+        {"src/index.js"},
+        plan_state,
+        preferred_test_files=["test/index.test.js"],
+    )
+
+    result = val_tool.invoke(
+        {
+            "modified_files": ["src/index.js"],
+            "runtime_smoke_file": "src/index.js",
+            "targeted_test_file": "test/index.test.js",
+        }
+    )
+
+    assert str(result).startswith("SUCCESS:")
+    assert plan_state["validation_calls"] == 1
+    assert plan_state["validation_input_errors"] == 0
 
 
 def test_missing_sqlite_native_bindings_classified_as_infra_only():

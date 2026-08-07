@@ -1398,6 +1398,13 @@ class WorkerExecutionDiagnostics(BaseModel):
     attempted_versions: list[str] = Field(default_factory=list)
     executed_versions: list[str] = Field(default_factory=list)
     validation_calls: int = Field(default=0, ge=0)
+    validation_input_errors: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of validation requests rejected during preflight before any validation gate ran."
+        ),
+    )
     validation_passed: bool = False
     failure_reason: str = ""
     per_gate_results: dict[str, Any] = Field(default_factory=dict)
@@ -1471,6 +1478,13 @@ class WorkaroundReplayPlan(BaseModel):
     planned_targets: list[str] = Field(default_factory=list)
     validated_files: list[str] = Field(default_factory=list)
     validation_calls: int = Field(default=0, ge=0)
+    validation_input_errors: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of validation requests rejected during preflight before any validation gate ran."
+        ),
+    )
     per_gate_results: dict[str, Any] = Field(default_factory=dict)
     final_selected_targeted_test: str | None = None
     original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)

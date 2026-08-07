@@ -51,6 +51,8 @@ from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     BatchQAResult,
     FailureCategory,
+    FixPlanStatus,
+    NoFixMitigationStage,
     QAEvaluation,
     QAFailureEvidence,
     VulnerabilityGroup,
@@ -2208,6 +2210,79 @@ def _group_remaining_identifiers(
     return sorted(_group_target_identifiers(group) & remaining_identifiers)
 
 
+def _derive_qa_group_strategies(
+    valid_groups: list[VulnerabilityGroup],
+    configured_strategies: dict[str, Any] | None,
+    task_queue: dict[str, Any] | None,
+    active_target_task_ids: list[str] | None = None,
+) -> dict[str, str]:
+    """Derive the QA strategy used by scanner guardrails from task state.
+
+    Args:
+        valid_groups: Vulnerability groups being evaluated.
+        configured_strategies: Legacy or supervisor-provided group strategies.
+        task_queue: Current supervisor task queue, if available.
+        active_target_task_ids: Tasks whose attempt produced the QA result.
+
+    Returns:
+        A normalized strategy map. ``vulnerable_code_removal`` NO_FIX tasks
+        are represented as ``code_workaround`` so remaining SCA identifiers do
+        not force a false QA failure. ``package_removal`` tasks remain strict.
+
+    Notes:
+        The package-removal stage must still fail when its dependency remains
+        in the scan. The exemption applies only after the supervisor has
+        committed the same task to vulnerable-code removal.
+    """
+    effective: dict[str, str] = {}
+    for group_id, strategy in dict(configured_strategies or {}).items():
+        value = getattr(strategy, "value", strategy)
+        effective[str(group_id)] = str(value)
+
+    queue = dict(task_queue or {})
+    active_ids = list(active_target_task_ids or [])
+
+    def task_candidates(group_id: str) -> list[Any]:
+        ordered: list[Any] = []
+        seen: set[str] = set()
+        for task_id in [*active_ids, *queue.keys()]:
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            task = queue.get(task_id)
+            if task is not None and getattr(task, "parent_group_id", None) == group_id:
+                ordered.append(task)
+        return ordered
+
+    for group in valid_groups:
+        candidates = task_candidates(group.group_id)
+        task = next(
+            (
+                candidate
+                for candidate in candidates
+                if getattr(candidate, "no_fix_stage", None) is not None
+            ),
+            None,
+        )
+        stage = getattr(task, "no_fix_stage", None)
+        stage_value = getattr(stage, "value", stage)
+        if stage_value == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+            effective[group.group_id] = "code_workaround"
+        elif stage_value == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+            effective[group.group_id] = "no_fix_package_removal"
+        elif (
+            task is None
+            and group.fix_plan is not None
+            and group.fix_plan.status == FixPlanStatus.NO_FIX
+        ):
+            # Legacy QA callers may not have a task queue yet. Treating a
+            # NO_FIX group as package-removal strict is safer than granting a
+            # code-workaround exemption before Stage 2 is committed.
+            effective[group.group_id] = "no_fix_package_removal"
+
+    return effective
+
+
 def _group_scan_status(
     scan_result: tuple[bool, str, set[str]] | None,
     group: VulnerabilityGroup,
@@ -3241,7 +3316,7 @@ def _apply_guardrails(
     1. Unknown group_ids in evaluations are dropped with an error.
     2. Duplicate evaluations: keep the first, log an error.
     3. Missing groups: synthesize passed=False / SECURITY_FLAG evaluation.
-    4. Deterministic scanner guardrail for VERSION_BUMP groups:
+    4. Deterministic scanner guardrail for strict dependency-removal groups:
        If remaining scanner identifiers exist â†’ force passed=False / SECURITY_FLAG.
        CODE_WORKAROUND groups are exempt (trust the workaround code review).
     5. Install error guardrail: if install failed with ERESOLVE/EBADENGINE/peer text,
@@ -3293,18 +3368,20 @@ def _apply_guardrails(
             continue  # Scanner cleared this group â€” no guardrail needed.
         if strategy == "code_workaround":
             continue  # Trust the workaround code review â€” exempt from forced failure.
-        # VERSION_BUMP with remaining identifiers â†’ force failed.
+        # Strict dependency-removal strategies with remaining identifiers
+        # force failure. Stage-two NO_FIX tasks are normalized to
+        # ``code_workaround`` and intentionally skip this branch.
         current = normalized[group.group_id]
         if current.passed or current.failure_category == FailureCategory.BREAKING_CHANGE:
             errors.append(
-                f"qa_critic guardrail: group '{group.group_id}' (VERSION_BUMP) has remaining "
+                f"qa_critic guardrail: group '{group.group_id}' ({strategy}) has remaining "
                 f"scanner identifiers {group_remaining} but judge did not prioritize SECURITY_FLAG; "
                 "forcing passed=False / SECURITY_FLAG."
             )
             retry_feedback = (
                 f"Scanner still detects unresolved identifiers: {', '.join(group_remaining)}. "
-                "The version bump did not fully resolve the vulnerability. "
-                "Check that the correct version was applied."
+                "The dependency-removal stage did not fully remove the vulnerable dependency. "
+                "Check that the configured package declaration and resolved dependency graph were updated."
             )
             if (
                 current.failure_category == FailureCategory.BREAKING_CHANGE
@@ -3915,7 +3992,12 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     workspace_volume: str | None = state.get("workspace_volume")
     repo_root: str | None = state.get("repo_root")
     action_summaries: list[AgentActionSummary] = state.get("action_summaries") or []
-    group_strategies: dict[str, str] = state.get("group_strategies") or {}
+    group_strategies: dict[str, str] = _derive_qa_group_strategies(
+        valid_groups,
+        state.get("group_strategies") or {},
+        state.get("task_queue") or {},
+        state.get("active_target_task_ids") or [],
+    )
     candidate_changed_files: list[str] = state.get("changed_files") or []
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
     unscanned_projection = _scan_state_projection(_QAExecutionResults(), baseline_identifiers)

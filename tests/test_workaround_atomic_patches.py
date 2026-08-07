@@ -407,7 +407,12 @@ def test_validation_outcomes_commit_and_rollback():
     assert "pending validation" in edit_res
     assert plan_state["pending_edit_set"] is not None
 
-    val_res = val_tool.invoke({"modified_files": ["src/a.js"]})
+    val_res = val_tool.invoke(
+        {
+            "modified_files": ["src/a.js"],
+            "runtime_smoke_file": "src/a.js",
+        }
+    )
     assert "SUCCESS: Workaround validation gate passed" in val_res
     assert plan_state["pending_edit_set"] is None
     assert len(plan_state["successful_edit_sets"]) == 1

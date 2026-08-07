@@ -302,6 +302,107 @@ def _is_test_file_path(file_path: str) -> bool:
     )
 
 
+def _select_targeted_test_file(
+    requested_file: str | None,
+    preferred_test_files: Sequence[str] | None,
+    accepted_alternative_test: str | None,
+    sandbox: DockerSandbox,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve an agent test selection to one deterministic existing source test.
+
+    Directory paths, source modules, and missing paths are common model-level
+    selection mistakes.  When the supervisor/QA context provides a preferred
+    test, those mistakes are corrected locally instead of being sent back to
+    the model for repeated retries.  An existing, different test file remains
+    rejected so the QA target contract is not silently weakened.
+
+    Args:
+        requested_file: Agent-provided test path, if any.
+        preferred_test_files: QA-recommended repository-relative test paths.
+        accepted_alternative_test: Previously approved infrastructure-only
+            replacement test, if any.
+        sandbox: Workspace sandbox used to verify candidate files.
+
+    Returns:
+        A tuple of ``(selected_path, correction_note, error)``.  Exactly one
+        of ``correction_note`` or ``error`` may be populated.
+    """
+    candidate_paths: list[str] = []
+    for raw_path in [accepted_alternative_test, *(preferred_test_files or [])]:
+        if not raw_path:
+            continue
+        try:
+            candidate = _validate_workspace_path(str(raw_path))
+        except ValueError:
+            continue
+        if (
+            candidate in candidate_paths
+            or Path(candidate).suffix.lower() not in _SOURCE_MODULE_SUFFIXES
+            or not _is_test_file_path(candidate)
+            or sandbox.read_file(candidate) is None
+        ):
+            continue
+        candidate_paths.append(candidate)
+
+    if requested_file and requested_file.strip():
+        raw_requested = requested_file.replace("\\", "/").strip().lstrip("/")
+        if raw_requested.startswith(("build/", "dist/")):
+            return (
+                None,
+                None,
+                f"Compiled test path '{raw_requested}' is not supported. "
+                "Use the original source test path under test/, tests/, or the source package directory.",
+            )
+        try:
+            normalized_requested = _validate_workspace_path(requested_file)
+        except ValueError as exc:
+            return None, None, str(exc)
+
+        if normalized_requested.startswith(("build/", "dist/")):
+            return (
+                None,
+                None,
+                f"Compiled test path '{normalized_requested}' is not supported. "
+                "Use the original source test path under test/, tests/, or the source package directory.",
+            )
+
+        if normalized_requested in candidate_paths:
+            return normalized_requested, None, None
+
+        requested_content = sandbox.read_file(normalized_requested)
+        requested_suffix = Path(normalized_requested).suffix.lower()
+        requested_is_source_module = (
+            requested_suffix in _SOURCE_MODULE_SUFFIXES
+            and not _is_test_file_path(normalized_requested)
+        )
+        requested_is_directory_hint = not requested_suffix or normalized_requested.endswith("/")
+        requested_is_missing = requested_content is None
+
+        if candidate_paths and (
+            requested_is_source_module or requested_is_directory_hint or requested_is_missing
+        ):
+            prefix = normalized_requested.rstrip("/") + "/"
+            scoped_candidates = [
+                candidate for candidate in candidate_paths if candidate.startswith(prefix)
+            ]
+            selected = scoped_candidates[0] if scoped_candidates else candidate_paths[0]
+            return (
+                selected,
+                (
+                    f"Targeted test path '{normalized_requested}' was not used; "
+                    f"selected canonical QA test '{selected}'."
+                ),
+                None,
+            )
+
+        return normalized_requested, None, None
+
+    if candidate_paths:
+        selected = candidate_paths[0]
+        return selected, f"Selected canonical QA test '{selected}'.", None
+    return None, None, None
+
+
 def _runtime_smoke_path_error(
     runtime_file: str,
     targeted_test_file: str | None = None,
@@ -1960,19 +2061,35 @@ def _mocha_titles_match(left: str, right: str) -> bool:
     return bool(lhs and rhs and (lhs == rhs or lhs.endswith(f" {rhs}") or rhs.endswith(f" {lhs}")))
 
 
+def _mocha_test_hint_matches_title(title: str, hint: str) -> bool:
+    """Return whether a requested Mocha hint identifies a test or suite.
+
+    Mocha's ``fullTitle`` includes parent suite names. Workers frequently
+    provide only a suite name, such as ``b2bOrder``. That is a valid bounded
+    target when it is an exact title component, but it is not an exact full
+    test title. Prefix matching is therefore limited to a whitespace boundary
+    and does not accept arbitrary substrings.
+    """
+    from remediation_engine.orchestration.qa_critic import _mocha_test_name_variants
+
+    lhs = re.sub(r"\s+", " ", title or "").strip().casefold()
+    for variant in _mocha_test_name_variants(hint):
+        rhs = re.sub(r"\s+", " ", variant or "").strip().casefold()
+        if lhs and rhs and (lhs == rhs or lhs.startswith(f"{rhs} ") or lhs.endswith(f" {rhs}")):
+            return True
+    return False
+
+
 def _select_mocha_tests(payload: dict[str, Any], test_name: str | None) -> list[dict[str, Any]]:
     """Select the tests represented by a requested Mocha test hint."""
     tests = [entry for entry in payload.get("tests", []) if isinstance(entry, dict)]
     if not test_name:
         return tests
 
-    from remediation_engine.orchestration.qa_critic import _mocha_test_name_variants
-
-    variants = _mocha_test_name_variants(test_name)
     return [
         entry
         for entry in tests
-        if any(_mocha_titles_match(_mocha_entry_title(entry), variant) for variant in variants)
+        if _mocha_test_hint_matches_title(_mocha_entry_title(entry), test_name)
     ]
 
 
@@ -2038,6 +2155,19 @@ def _make_run_targeted_test_tool(
             )
 
         accepted_alt = (plan_state or {}).get("accepted_alternative_test")
+        selected_path, correction_note, selection_error = _select_targeted_test_file(
+            norm_path,
+            preferred,
+            accepted_alt,
+            sandbox,
+        )
+        if selection_error:
+            return f"ERROR: [INVALID_VALIDATION_INPUT] {selection_error}"
+        if selected_path:
+            norm_path = selected_path
+            if plan_state is not None and correction_note:
+                plan_state["last_targeted_test_selection"] = correction_note
+
         if preferred and norm_path not in preferred and norm_path != accepted_alt:
             preferred_text = ", ".join(preferred)
             return (
@@ -2100,12 +2230,69 @@ def _make_run_targeted_test_tool(
             if mocha_payload is not None:
                 selected_tests = _select_mocha_tests(mocha_payload, test_name)
                 if not selected_tests:
+                    if test_name:
+                        # A suite-only hint can be valid even when the first
+                        # filtered invocation produces no JSON test entries.
+                        # Discover titles from the same file without a grep,
+                        # then apply the bounded selector locally. This keeps
+                        # a naming mismatch from becoming a source-code
+                        # failure or consuming another validation attempt.
+                        discovery_cmd = build_targeted_test_command(
+                            runner,
+                            relative_test_file,
+                            None,
+                            npm_invocation=npm_invocation,
+                            package_cwd=package_cwd,
+                        )
+                        if discovery_cmd and discovery_cmd != cmd:
+                            try:
+                                discovery_result = sandbox.run(
+                                    discovery_cmd,
+                                    timeout=_NPM_TEST_TIMEOUT_SECONDS,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                return f"BLOCKED: Targeted test discovery was unavailable - {exc}"
+                            discovery_output = (
+                                discovery_result.stdout + "\n" + discovery_result.stderr
+                            ).strip()
+                            discovery_payload = _parse_mocha_json_output(discovery_result.stdout)
+                            if discovery_payload is not None:
+                                discovered_tests = _select_mocha_tests(
+                                    discovery_payload,
+                                    test_name,
+                                )
+                                if discovered_tests:
+                                    result = discovery_result
+                                    output = discovery_output
+                                    mocha_payload = discovery_payload
+                                    selected_tests = discovered_tests
+                                else:
+                                    available_titles = [
+                                        _mocha_entry_title(entry)
+                                        for entry in discovery_payload.get("tests", [])
+                                        if isinstance(entry, dict)
+                                    ]
+                                    available_text = ", ".join(available_titles[:8])
+                                    if len(available_titles) > 8:
+                                        available_text += ", ..."
+                                    return (
+                                        "ERROR: [INVALID_VALIDATION_INPUT] Requested Mocha "
+                                        f"test hint '{test_name}' did not match any test "
+                                        f"in '{norm_path}'."
+                                        + (
+                                            f" Available titles: {available_text}"
+                                            if available_text
+                                            else ""
+                                        )
+                                    )
+                            elif discovery_result.exit_code == 0:
+                                return (
+                                    "ERROR: [INVALID_VALIDATION_INPUT] Mocha test discovery "
+                                    f"for '{norm_path}' returned no parseable test titles for "
+                                    f"hint '{test_name}'."
+                                )
                     requested = test_name or norm_path
-                    return (
-                        f"FAILURE: Targeted test did not execute (mocha): {norm_path}\n"
-                        f"Requested test: {requested}\n"
-                        "Diagnostic: Mocha reported no matching tests."
-                    )
+                    return f"ERROR: [INVALID_VALIDATION_INPUT] Targeted Mocha test hint '{requested}' matched no executed tests in '{norm_path}'."
 
                 failures = mocha_payload.get("failures", [])
                 passes = mocha_payload.get("passes", [])
@@ -2292,12 +2479,29 @@ def _make_validate_workaround_tool(
     """
     if plan_state is None:
         plan_state = {}
+    plan_state.setdefault("validation_calls", 0)
+    plan_state.setdefault("validation_input_errors", 0)
+    plan_state.setdefault("last_validation_input_error", None)
 
     syntax_tool = _make_validate_code_syntax_tool(sandbox)
     targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files, plan_state)
 
     def _failure(gate: str, detail: str) -> str:
         return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
+
+    def _invalid_validation_request(
+        detail: str,
+        *,
+        level: str = "ERROR",
+        code: str = "INVALID_VALIDATION_INPUT",
+    ) -> str:
+        """Record a preflight validation-input error without consuming a gate attempt."""
+        plan_state["validation_input_errors"] = (
+            int(plan_state.get("validation_input_errors", 0)) + 1
+        )
+        plan_state["last_validation_input_error"] = detail
+        marker = "" if code == "INVALID_VALIDATION_INPUT" else " [INVALID_VALIDATION_INPUT]"
+        return f"{level}: [{code}]{marker} {detail}"
 
     def _record_result(result: WorkaroundValidationResult) -> WorkaroundValidationResult:
         """Persist the complete gate result for the supervisor success contract."""
@@ -2441,8 +2645,6 @@ def _make_validate_workaround_tool(
         test/spec files and compiled ``build/`` or ``dist/`` paths are rejected,
         and the smoke module must be distinct from the targeted test.
         """
-        plan_state["validation_calls"] = int(plan_state.get("validation_calls", 0)) + 1
-
         requested = [
             str(path).replace("\\", "/").strip().lstrip("/")
             for path in (modified_files or [])
@@ -2455,15 +2657,7 @@ def _make_validate_workaround_tool(
         ]
         files = list(dict.fromkeys([*requested, *current]))
         if not files:
-            res = _record_result(
-                WorkaroundValidationResult(
-                    overall_status=WorkaroundValidationStatus.CODE_FAILURE,
-                    syntax="FAILURE: No modified files were supplied.",
-                    validated_files=[],
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                )
-            )
-            return f"FAILURE: Workaround validation gate 'input' failed. No modified files were supplied.\nJSON: {res.model_dump_json()}"
+            return _invalid_validation_request("No modified files were supplied.")
 
         prohibited = [
             path
@@ -2472,63 +2666,78 @@ def _make_validate_workaround_tool(
             and not _is_allowlisted_no_fix_package_file(path, plan_state)
         ]
         if prohibited:
-            res = _record_result(
-                WorkaroundValidationResult(
-                    overall_status=WorkaroundValidationStatus.CODE_FAILURE,
-                    syntax=f"Prohibited files modified: {', '.join(prohibited)}",
-                    validated_files=[],
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                )
+            return _invalid_validation_request(
+                f"Prohibited files included: {', '.join(prohibited)}."
             )
-            return f"FAILURE: Workaround validation gate 'input' failed. Prohibited files included.\nJSON: {res.model_dump_json()}"
 
         package_removal_mode = (
             plan_state.get("no_fix_stage") == NoFixMitigationStage.PACKAGE_REMOVAL.value
         )
         if package_removal_mode:
             if not plan_state.get("package_removal_planned"):
-                return "ERROR: [PLAN_VIOLATION] Record and execute the scoped package-removal plan before validation."
+                return _invalid_validation_request(
+                    "Record and execute the scoped package-removal plan before validation.",
+                    code="PLAN_VIOLATION",
+                )
             if not plan_state.get("no_fix_package_removed"):
-                return "FAILURE: [PACKAGE_REMOVAL] The configured dependency was not removed through the scoped tool."
+                return _invalid_validation_request(
+                    "The configured dependency was not removed through the scoped tool.",
+                    level="FAILURE",
+                    code="PACKAGE_REMOVAL",
+                )
             package_name = str(plan_state.get("no_fix_package_name", "") or "")
             for manifest_path in plan_state.get("no_fix_manifest_paths", []):
                 manifest_text = sandbox.read_file(manifest_path)
                 try:
                     manifest_data = json.loads(manifest_text or "")
                 except (TypeError, json.JSONDecodeError):
-                    return (
-                        "FAILURE: [PACKAGE_REMOVAL] The authorized manifest could not be "
-                        f"parsed after removal: {manifest_path}."
+                    return _invalid_validation_request(
+                        f"The authorized manifest could not be parsed after removal: {manifest_path}.",
+                        level="FAILURE",
+                        code="PACKAGE_REMOVAL",
                     )
                 if any(
                     isinstance(manifest_data.get(dep_type), dict)
                     and package_name in manifest_data[dep_type]
                     for dep_type in ("dependencies", "devDependencies", "optionalDependencies")
                 ):
-                    return (
-                        "FAILURE: [PACKAGE_REMOVAL] The vulnerable package remains in a "
-                        f"direct declaration in {manifest_path}."
+                    return _invalid_validation_request(
+                        f"The vulnerable package remains in a direct declaration in {manifest_path}.",
+                        level="FAILURE",
+                        code="PACKAGE_REMOVAL",
                     )
 
-        # Reject an explicitly wrong QA target before spending time in the
-        # static/runtime gates. This keeps target-selection diagnostics useful
-        # even when the caller omitted the explicit smoke-file argument.
-        if targeted_test_file and preferred_test_files:
-            normalized_target = targeted_test_file.replace("\\", "/").strip().lstrip("/")
-            if normalized_target.startswith(("build/", "dist/")):
-                return (
-                    f"ERROR: Compiled test path '{normalized_target}' is not supported. "
-                    "Use the original source test path under test/, tests/, or the source package directory."
+        accepted_alt = plan_state.get("accepted_alternative_test")
+        test_file, target_selection_note, target_selection_error = _select_targeted_test_file(
+            accepted_alt or targeted_test_file,
+            preferred_test_files,
+            accepted_alt,
+            sandbox,
+        )
+        if target_selection_error:
+            return _invalid_validation_request(target_selection_error)
+        if target_selection_note:
+            plan_state["last_targeted_test_selection"] = target_selection_note
+        if test_file and preferred_test_files:
+            preferred_targets: set[str] = set()
+            for path in preferred_test_files:
+                if not str(path).strip():
+                    continue
+                try:
+                    preferred_targets.add(_validate_workspace_path(str(path)))
+                except ValueError:
+                    continue
+            if test_file not in preferred_targets and test_file != accepted_alt:
+                return _invalid_validation_request(
+                    f"Targeted test '{test_file}' is not the QA-recommended target. "
+                    f"Run one of these source test files instead: {', '.join(sorted(preferred_targets))}."
                 )
-            accepted_alt = plan_state.get("accepted_alternative_test")
-            preferred = {
-                path.replace("\\", "/").strip().lstrip("/") for path in preferred_test_files
-            }
-            if normalized_target not in preferred and normalized_target != accepted_alt:
-                return (
-                    f"ERROR: Targeted test '{normalized_target}' is not the QA-recommended target. "
-                    f"Run one of these source test files instead: {', '.join(sorted(preferred))}."
-                )
+
+        if not runtime_smoke_file or not runtime_smoke_file.strip():
+            return _invalid_validation_request(
+                "Runtime smoke gate failed: runtime_smoke_file must be explicitly supplied for workaround validation.",
+                level="FAILURE",
+            )
 
         smoke_target = runtime_smoke_file
         smoke_selection_note = ""
@@ -2536,13 +2745,47 @@ def _make_validate_workaround_tool(
             normalized_smoke, smoke_selection_message = _select_lightweight_runtime_smoke_target(
                 smoke_target,
                 files,
-                targeted_test_file=targeted_test_file,
+                targeted_test_file=test_file,
                 sandbox=sandbox,
             )
             if normalized_smoke is None:
-                return f"ERROR: [INVALID_RUNTIME_SMOKE] {smoke_selection_message}"
+                return _invalid_validation_request(
+                    str(smoke_selection_message),
+                    code="INVALID_RUNTIME_SMOKE",
+                )
             smoke_target = normalized_smoke
             smoke_selection_note = smoke_selection_message or ""
+
+        if (
+            not test_file
+            and plan_state.get("targeted_test_required", False)
+            and not (package_removal_mode and not preferred_test_files)
+        ):
+            return _invalid_validation_request(
+                "targeted_test_file must be supplied when a targeted test is required."
+            )
+
+        if test_file:
+            normalized_test = test_file
+            if Path(normalized_test).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+                return _invalid_validation_request(
+                    f"Targeted test '{normalized_test}' must be a JavaScript/TypeScript source test file."
+                )
+            if not _is_test_file_path(normalized_test):
+                return _invalid_validation_request(
+                    f"Targeted test '{normalized_test}' is a source module, not a test/spec file. "
+                    "Use a repository-relative path under test/, tests/, __tests__, or a *.test/spec.* file."
+                )
+            if sandbox.read_file(normalized_test) is None:
+                return _invalid_validation_request(
+                    f"Targeted test path '{normalized_test}' could not be verified in the workspace. "
+                    "Resolve the source test path from read_repository_map before choosing a replacement."
+                )
+            test_file = normalized_test
+
+        # Count only validations that made it through deterministic preflight
+        # and are about to execute at least one validation gate.
+        plan_state["validation_calls"] = int(plan_state.get("validation_calls", 0)) + 1
 
         syntax_msg = ""
         for file_path in files:
@@ -2681,34 +2924,6 @@ def _make_validate_workaround_tool(
             _revert_current_iteration_edit(sandbox, plan_state, touched_files)
             return f"FAILURE: Workaround validation gate 'runtime_smoke' failed.\n{smoke_msg}\nJSON: {res.model_dump_json()}"
 
-        accepted_alt = plan_state.get("accepted_alternative_test")
-        test_file = accepted_alt or targeted_test_file
-        if not test_file and preferred_test_files:
-            test_file = next(iter(preferred_test_files), None)
-
-        if (
-            not test_file
-            and plan_state.get("targeted_test_required", False)
-            and not (package_removal_mode and not preferred_test_files)
-        ):
-            res = _record_result(
-                WorkaroundValidationResult(
-                    overall_status=WorkaroundValidationStatus.CODE_FAILURE,
-                    syntax=syntax_msg,
-                    typecheck=typecheck_msg,
-                    lint=lint_msg,
-                    runtime_smoke=smoke_msg,
-                    targeted_test="FAILURE: A targeted test file is required for this workaround.",
-                    validated_files=[],
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                )
-            )
-            return (
-                "FAILURE: Workaround validation gate 'targeted_test' failed: "
-                "targeted_test_file must be supplied.\n"
-                f"JSON: {res.model_dump_json()}"
-            )
-
         test_msg = ""
         alt_used = bool(accepted_alt)
         if test_file:
@@ -2716,6 +2931,19 @@ def _make_validate_workaround_tool(
                 {"test_file": test_file, "test_name": targeted_test_name}
             )
             test_msg = str(test_res_str)
+            if test_msg.startswith("ERROR: [INVALID_VALIDATION_INPUT]"):
+                # The gate reached the test runner, but the requested test
+                # identity was invalid. Do not treat this as a code failure or
+                # consume a validation-gate attempt; retain the pending source
+                # edits so the worker can retry with the canonical title.
+                plan_state["validation_calls"] = max(
+                    0,
+                    int(plan_state.get("validation_calls", 0)) - 1,
+                )
+                plan_state["latest_failed_targeted_test"] = None
+                plan_state["latest_test_failure_infra"] = False
+                plan_state["latest_infra_diagnostics"] = None
+                return _invalid_validation_request(test_msg)
             if test_msg.startswith("BLOCKED:"):
                 is_infra = _is_infrastructure_failure(test_msg)
                 if is_infra:
@@ -2811,6 +3039,7 @@ def _make_validate_workaround_tool(
             f"Validated files: {', '.join(files)}; "
             f"runtime smoke: {smoke_target}; "
             f"targeted test: {test_file or 'skipped'}. "
+            f"{target_selection_note + ' ' if target_selection_note else ''}"
             "The pending edit set is now committed as part of the validated cumulative patch.\n"
             f"JSON: {res.model_dump_json()}"
         )
@@ -2896,6 +3125,8 @@ def build_workaround_toolbelt(
     plan_state.setdefault("last_infrastructure_diagnostics", None)
     plan_state.setdefault("infrastructure_failure_details", None)
     plan_state.setdefault("validation_calls", 0)
+    plan_state.setdefault("validation_input_errors", 0)
+    plan_state.setdefault("last_validation_input_error", None)
     plan_state.setdefault(
         "original_targeted_test",
         preferred_test_files[0] if preferred_test_files else None,

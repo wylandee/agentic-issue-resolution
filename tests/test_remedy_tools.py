@@ -132,13 +132,15 @@ class TestToolbeltFactories:
             )
         }
 
-        rejected = tools["validate_workaround"].invoke(
+        corrected = tools["validate_workaround"].invoke(
             {
                 "modified_files": ["src/auth.ts"],
                 "targeted_test_file": "test/api/file-serving.test.ts",
+                "runtime_smoke_file": "src/auth.ts",
             }
         )
-        assert "not the QA-recommended target" in rejected
+        assert corrected.startswith("SUCCESS: Workaround validation gate passed")
+        assert "canonical QA test 'test/api/2fa.test.ts'" in corrected
 
         compiled = tools["validate_workaround"].invoke(
             {"modified_files": ["src/auth.ts"], "targeted_test_file": "build/test/api/2fa.test.js"}
@@ -239,7 +241,10 @@ class TestToolbeltFactories:
             stderr="SyntaxError: unexpected token",
             duration_seconds=0.1,
         )
-        tools = _workaround_tool_map(sandbox)
+        tools = _workaround_tool_map(
+            sandbox,
+            plan_state={"targeted_test_required": False},
+        )
 
         result = tools["validate_workaround"].invoke(
             {"modified_files": ["src/auth.ts"], "runtime_smoke_file": "src/auth.ts"}
@@ -248,7 +253,7 @@ class TestToolbeltFactories:
         assert result.startswith("FAILURE: Workaround validation gate 'syntax'")
         assert sandbox.run.call_count == 1
 
-    def test_targeted_mocha_rejects_zero_tests(self):
+    def test_targeted_mocha_rejects_zero_tests_as_invalid_selection(self):
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (
             json.dumps({"scripts": {"test": "mocha test/**/*.ts"}})
@@ -281,8 +286,111 @@ class TestToolbeltFactories:
             }
         )
 
-        assert result.startswith("FAILURE: Targeted test did not execute")
-        assert "no matching tests" in result
+        assert result.startswith("ERROR: [INVALID_VALIDATION_INPUT]")
+        assert (
+            "did not match any test" in result
+            or "no parseable test titles" in result
+            or "no executed tests" in result
+        )
+
+    def test_targeted_mocha_accepts_suite_name_hint(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: (
+            json.dumps({"scripts": {"test": "mocha test/**/*.ts"}})
+            if path == "package.json"
+            else "describe('b2bOrder', () => {});"
+        )
+        full_title = "b2bOrder deserializing arbitrary JSON should not solve rceChallenge"
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "stats": {"tests": 1, "passes": 1, "failures": 0, "pending": 0},
+                    "tests": [
+                        {
+                            "title": "deserializing arbitrary JSON should not solve rceChallenge",
+                            "fullTitle": full_title,
+                            "file": "test/server/b2bOrderSpec.ts",
+                        }
+                    ],
+                    "passes": [
+                        {
+                            "title": "deserializing arbitrary JSON should not solve rceChallenge",
+                            "fullTitle": full_title,
+                            "file": "test/server/b2bOrderSpec.ts",
+                        }
+                    ],
+                    "failures": [],
+                    "pending": [],
+                }
+            ),
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tool = _make_run_targeted_test_tool(
+            sandbox,
+            preferred_test_files=["test/server/b2bOrderSpec.ts"],
+        )
+
+        result = tool.invoke(
+            {
+                "test_file": "test/server/b2bOrderSpec.ts",
+                "test_name": "b2bOrder",
+            }
+        )
+
+        assert result.startswith("SUCCESS: Targeted test passed (mocha)")
+        assert "Tests executed: 1" in result
+
+    def test_validation_does_not_count_unmatched_mocha_hint_as_gate_attempt(self):
+        sandbox = MagicMock()
+
+        def read_file(path):
+            if path == "package.json":
+                return json.dumps({"scripts": {"test": "mocha test/**/*.ts"}})
+            if path == "tsconfig.json":
+                return "{}"
+            if path == "src/auth.ts":
+                return "export const auth = true;"
+            if path == "test/server/b2bOrderSpec.ts":
+                return "describe('b2bOrder', () => {});"
+            return None
+
+        def run(command, timeout=None):
+            if "mocha" in command and "--reporter json" in command:
+                return CommandResult(
+                    exit_code=0,
+                    stdout=json.dumps(
+                        {
+                            "stats": {"tests": 0, "passes": 0, "failures": 0, "pending": 0},
+                            "tests": [],
+                            "passes": [],
+                            "failures": [],
+                            "pending": [],
+                        }
+                    ),
+                    stderr="",
+                    duration_seconds=0.1,
+                )
+            return CommandResult(exit_code=0, stdout="", stderr="", duration_seconds=0.1)
+
+        sandbox.read_file.side_effect = read_file
+        sandbox.run.side_effect = run
+        plan_state = {"targeted_test_required": True}
+        tools = _workaround_tool_map(sandbox, plan_state=plan_state)
+
+        result = tools["validate_workaround"].invoke(
+            {
+                "modified_files": ["src/auth.ts"],
+                "runtime_smoke_file": "src/auth.ts",
+                "targeted_test_file": "test/server/b2bOrderSpec.ts",
+                "targeted_test_name": "does-not-exist",
+            }
+        )
+
+        assert str(result).startswith("ERROR: [INVALID_VALIDATION_INPUT]")
+        assert plan_state["validation_calls"] == 0
+        assert plan_state["validation_input_errors"] == 1
 
     def test_targeted_mocha_reports_selected_test_failure(self):
         sandbox = MagicMock()
@@ -345,7 +453,10 @@ class TestToolbeltFactories:
                 duration_seconds=0.1,
             ),
         ]
-        tools = _workaround_tool_map(sandbox)
+        tools = _workaround_tool_map(
+            sandbox,
+            plan_state={"targeted_test_required": False},
+        )
 
         result = tools["validate_workaround"].invoke(
             {"modified_files": ["src/auth.ts"], "runtime_smoke_file": "src/auth.ts"}

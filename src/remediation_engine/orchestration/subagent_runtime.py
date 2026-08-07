@@ -17,6 +17,8 @@ from remediation_engine.orchestration.trajectory_exporter import (
 )
 
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
+MAX_VALIDATION_GATE_ATTEMPTS = 3
+MAX_VALIDATION_INPUT_ERRORS = 3
 SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
 
@@ -218,6 +220,7 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
     evidence = (
         tool_content.strip()[:2400] or "The validation gate failed without diagnostic output."
     )
+
     if "[INVALID_RUNTIME_SMOKE]" in evidence:
         return (
             "The validation request used an invalid runtime smoke target. Do not edit the code again. "
@@ -249,6 +252,69 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
     )
 
 
+def _is_invalid_validation_request(tool_content: str) -> bool:
+    """Return whether validation stopped during deterministic request preflight.
+
+    These responses indicate that no syntax, typecheck, lint, runtime-smoke, or
+    targeted-test gate ran. They must not consume the executed-validation budget.
+    The legacy text checks keep replayed or mocked tool responses compatible with
+    the new structured marker.
+    """
+    content = str(tool_content or "")
+    if "[INVALID_VALIDATION_INPUT]" in content:
+        return True
+    if content.startswith("ERROR: [INVALID_RUNTIME_SMOKE]"):
+        return True
+    return (
+        ("Targeted test path '" in content and "could not be verified" in content)
+        or "is not the QA-recommended target" in content
+        or "Compiled test path '" in content
+    )
+
+
+def _validation_request_signature(args: dict[str, Any]) -> str:
+    """Return a stable signature for validation target arguments.
+
+    The bounded worker loop uses this to stop an LLM from issuing the same
+    invalid smoke/test selection repeatedly when deterministic preflight could
+    not canonicalize it.
+
+    Args:
+        args: Tool-call arguments emitted by the worker.
+
+    Returns:
+        A JSON-stable signature containing the validation paths and selector.
+    """
+    if not any(key in args for key in ("runtime_smoke_file", "targeted_test_file")):
+        return ""
+
+    normalized: dict[str, Any] = {}
+    for key in ("modified_files", "runtime_smoke_file", "targeted_test_file", "targeted_test_name"):
+        value = args.get(key)
+        if isinstance(value, list):
+            normalized[key] = sorted(
+                str(item).replace("\\", "/").strip().lstrip("/") for item in value
+            )
+        elif value is None:
+            normalized[key] = None
+        else:
+            normalized[key] = str(value).replace("\\", "/").strip().lstrip("/")
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
+def _validation_input_recovery_instruction(tool_content: str) -> str:
+    """Build recovery guidance for a validation request rejected before gate execution."""
+    evidence = str(tool_content or "").strip()[:2400]
+    return (
+        "The validation request was rejected during deterministic preflight; no validation gate ran and "
+        "the pending edit set was not judged. Do not edit or re-plan the source patch. Correct the validation "
+        "arguments, resolving the repository-relative runtime smoke and targeted test paths from the workspace "
+        "map. The smoke target must be a lightweight source module, and the targeted test must be an existing "
+        "test/spec file separate from the smoke target.\n"
+        f"Exact preflight result:\n{evidence}"
+    )
+
+
 def run_bounded_subagent_loop(
     llm: Any,
     tools: Sequence[Any],
@@ -269,7 +335,9 @@ def run_bounded_subagent_loop(
     recovery_signatures: set[tuple[str, str]] = set()
     last_failed_tool_content: dict[tuple[str, str], str] = {}
     consecutive_validation_failures = 0
-    validation_gate_call_count = 0
+    validation_gate_call_count = int((execution_state or {}).get("validation_calls", 0))
+    validation_input_error_count = int((execution_state or {}).get("validation_input_errors", 0))
+    invalid_validation_signatures: set[str] = set()
     scope_violation_count = 0
 
     for _ in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
@@ -310,6 +378,7 @@ def run_bounded_subagent_loop(
         infrastructure_blocked = False
         scope_loop_error: str | None = None
         validation_limit_error: str | None = None
+        validation_input_limit_error: str | None = None
         blocker_errors: list[str] = []
         for tool_call in tool_calls:
             call_signature = _tool_call_signature(tool_call)
@@ -362,7 +431,13 @@ def run_bounded_subagent_loop(
                 if scope_violation_count >= 2:
                     scope_loop_error = f"SCOPE_LOOP_ERROR: Subagent stopped due to repeated scope/plan violations: {tool_message.content}"
 
-            if tool_message.content.startswith("BLOCKED:") or "BLOCKED:" in tool_message.content:
+            preflight_validation_error = (
+                event.name == "validate_workaround"
+                and _is_invalid_validation_request(tool_message.content)
+            )
+            if not preflight_validation_error and (
+                tool_message.content.startswith("BLOCKED:") or "BLOCKED:" in tool_message.content
+            ):
                 infrastructure_blocked = True
                 b_msg = tool_message.content.strip()
                 if not b_msg.startswith("INFRASTRUCTURE_BLOCKER:"):
@@ -392,61 +467,89 @@ def run_bounded_subagent_loop(
                     HumanMessage(content=_targeted_test_recovery_instruction(event.content))
                 )
             if event.name == "validate_workaround":
-                if execution_state is not None:
-                    # Real validation tools update this state directly. Also
-                    # decode the structured payload here so wrappers and
-                    # deterministic test doubles cannot accidentally erase
-                    # the gate evidence required by the success contract.
-                    execution_state["validation_calls"] = max(
-                        int(execution_state.get("validation_calls", 0)),
-                        1,
+                if _is_invalid_validation_request(event.content):
+                    validation_signature = _validation_request_signature(event.args)
+                    repeated_invalid_request = bool(
+                        validation_signature
+                        and validation_signature in invalid_validation_signatures
                     )
-                    json_marker = "JSON:"
-                    if json_marker in event.content:
-                        try:
-                            payload = json.loads(event.content.split(json_marker, 1)[1].strip())
-                        except (TypeError, ValueError):
-                            payload = None
-                        if isinstance(payload, dict):
-                            execution_state["last_validation_result"] = payload
-                            execution_state["validated_files"] = list(
-                                payload.get("validated_files", []) or []
-                            )
-                            execution_state["validation_passed"] = (
-                                payload.get("overall_status") == "PASS"
-                            )
-                validation_gate_call_count += 1
-                if validation_gate_call_count >= 3 and event.content.startswith("FAILURE:"):
-                    validation_limit_error = (
-                        "VALIDATION_LIMIT_REACHED: Maximum 3 validation gate attempts reached."
-                    )
-                elif event.content.startswith("FAILURE:"):
-                    consecutive_validation_failures += 1
-                    if consecutive_validation_failures >= 3:
-                        conversation.append(
-                            HumanMessage(
-                                content=(
-                                    "CRITICAL: You have failed the validation gate 3 times in a row. "
-                                    "Stop repeating the same action. Classify the latest structured result: "
-                                    "for CODE_FAILURE restart at INVESTIGATE; for INFRA_FAILURE inspect and "
-                                    "register one alternative targeted test. Do not search the web unless "
-                                    "you are back in INVESTIGATE and local evidence is insufficient."
-                                )
-                            )
+                    if validation_signature:
+                        invalid_validation_signatures.add(validation_signature)
+                    validation_input_error_count += 1
+                    if execution_state is not None:
+                        execution_state["validation_input_errors"] = max(
+                            int(execution_state.get("validation_input_errors", 0)),
+                            validation_input_error_count,
                         )
-                        consecutive_validation_failures = 0
+                    if repeated_invalid_request:
+                        validation_input_limit_error = (
+                            "VALIDATION_INPUT_LIMIT_REACHED: VALIDATION_INPUT_RETRY_LOOP: "
+                            "The same invalid validation target request was repeated. "
+                            "Do not retry the same smoke/test paths; use the canonical paths "
+                            "provided by deterministic preflight."
+                        )
+                    elif validation_input_error_count >= MAX_VALIDATION_INPUT_ERRORS:
+                        validation_input_limit_error = "VALIDATION_INPUT_LIMIT_REACHED: Maximum 3 invalid validation requests reached."
                     else:
                         conversation.append(
                             HumanMessage(
-                                content=_validation_gate_recovery_instruction(event.content)
+                                content=_validation_input_recovery_instruction(event.content)
                             )
                         )
                 else:
-                    consecutive_validation_failures = 0
-                if event.content.startswith("ERROR: [INVALID_RUNTIME_SMOKE]"):
-                    conversation.append(
-                        HumanMessage(content=_validation_gate_recovery_instruction(event.content))
-                    )
+                    validation_gate_call_count += 1
+                    if execution_state is not None:
+                        # Real validation tools update this state directly. Also
+                        # mirror the count here so wrappers and deterministic
+                        # test doubles retain the executed-gate accounting.
+                        execution_state["validation_calls"] = max(
+                            int(execution_state.get("validation_calls", 0)),
+                            validation_gate_call_count,
+                        )
+                        json_marker = "JSON:"
+                        if json_marker in event.content:
+                            try:
+                                payload = json.loads(event.content.split(json_marker, 1)[1].strip())
+                            except (TypeError, ValueError):
+                                payload = None
+                            if isinstance(payload, dict):
+                                execution_state["last_validation_result"] = payload
+                                execution_state["validated_files"] = list(
+                                    payload.get("validated_files", []) or []
+                                )
+                                execution_state["validation_passed"] = (
+                                    payload.get("overall_status") == "PASS"
+                                )
+                    if (
+                        validation_gate_call_count >= MAX_VALIDATION_GATE_ATTEMPTS
+                        and event.content.startswith("FAILURE:")
+                    ):
+                        validation_limit_error = (
+                            "VALIDATION_LIMIT_REACHED: Maximum 3 validation gate attempts reached."
+                        )
+                    elif event.content.startswith("FAILURE:"):
+                        consecutive_validation_failures += 1
+                        if consecutive_validation_failures >= 3:
+                            conversation.append(
+                                HumanMessage(
+                                    content=(
+                                        "CRITICAL: You have failed the validation gate 3 times in a row. "
+                                        "Stop repeating the same action. Classify the latest structured result: "
+                                        "for CODE_FAILURE restart at INVESTIGATE; for INFRA_FAILURE inspect and "
+                                        "register one alternative targeted test. Do not search the web unless "
+                                        "you are back in INVESTIGATE and local evidence is insufficient."
+                                    )
+                                )
+                            )
+                            consecutive_validation_failures = 0
+                        else:
+                            conversation.append(
+                                HumanMessage(
+                                    content=_validation_gate_recovery_instruction(event.content)
+                                )
+                            )
+                    else:
+                        consecutive_validation_failures = 0
 
             inferred_paths = _infer_changed_files(event)
             if inferred_paths:
@@ -525,6 +628,15 @@ def run_bounded_subagent_loop(
 
         if validation_limit_error:
             errors.append(validation_limit_error)
+            return SubagentRuntimeResult(
+                final_text=final_text,
+                tool_events=tool_events,
+                changed_files=sorted(observed_changed_files | set(touched_files)),
+                errors=list(dict.fromkeys(errors)),
+            )
+
+        if validation_input_limit_error:
+            errors.append(validation_input_limit_error)
             return SubagentRuntimeResult(
                 final_text=final_text,
                 tool_events=tool_events,

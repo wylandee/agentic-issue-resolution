@@ -188,6 +188,125 @@ def test_validation_recovery_explains_checkpoint_behavior() -> None:
     assert "do not re-apply it" in instruction
 
 
+def test_invalid_validation_requests_do_not_consume_gate_budget() -> None:
+    """Preflight-invalid validation requests are tracked separately from gate runs."""
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_workaround"
+
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "invalid-1"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "invalid-2"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "gate-1"}],
+        ),
+        AIMessage(content="I will revise the patch after the gate failure."),
+    ]
+    validate_tool.invoke.side_effect = [
+        "ERROR: [INVALID_RUNTIME_SMOKE] [INVALID_VALIDATION_INPUT] choose a source module",
+        "ERROR: [INVALID_VALIDATION_INPUT] targeted test path could not be verified",
+        'FAILURE: Workaround validation gate \'syntax\' failed.\nJSON: {"overall_status":"CODE_FAILURE"}',
+    ]
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = responses
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    execution_state = {"validation_calls": 0, "validation_input_errors": 0}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [validate_tool],
+        [HumanMessage(content="Validate the patch.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert result.errors == []
+    assert execution_state["validation_calls"] == 1
+    assert execution_state["validation_input_errors"] == 2
+
+
+def test_repeated_invalid_validation_requests_have_separate_bound() -> None:
+    """Malformed validation requests cannot loop forever without gate attempts."""
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_workaround"
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": validate_tool.name, "args": {}, "id": f"invalid-{idx}"}],
+        )
+        for idx in range(1, 4)
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    validate_tool.invoke.return_value = (
+        "ERROR: [INVALID_VALIDATION_INPUT] targeted test path could not be verified"
+    )
+    execution_state = {"validation_calls": 0, "validation_input_errors": 0}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [validate_tool],
+        [HumanMessage(content="Validate the patch.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert any("VALIDATION_INPUT_LIMIT_REACHED" in error for error in result.errors)
+    assert execution_state["validation_calls"] == 0
+    assert execution_state["validation_input_errors"] == 3
+
+
+def test_repeated_invalid_validation_target_stops_before_third_retry() -> None:
+    """An identical invalid smoke/test selection cannot consume more loop turns."""
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_workaround"
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {
+                        "modified_files": ["routes/order.ts"],
+                        "runtime_smoke_file": "app.ts",
+                        "targeted_test_file": "test/server",
+                    },
+                    "id": f"invalid-target-{idx}",
+                }
+            ],
+        )
+        for idx in range(1, 4)
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    validate_tool.invoke.return_value = (
+        "ERROR: [INVALID_VALIDATION_INPUT] Targeted test 'test/server' must be a source test file"
+    )
+    execution_state = {"validation_calls": 0, "validation_input_errors": 0}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [validate_tool],
+        [HumanMessage(content="Validate the patch.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert any("VALIDATION_INPUT_RETRY_LOOP" in error for error in result.errors)
+    assert execution_state["validation_calls"] == 0
+    assert execution_state["validation_input_errors"] == 2
+    assert bound_llm.invoke.call_count == 2
+
+
 def test_successful_workaround_edit_injects_immediate_validation_instruction() -> None:
     edit_tool = MagicMock()
     edit_tool.name = "deterministic_search_replace"
