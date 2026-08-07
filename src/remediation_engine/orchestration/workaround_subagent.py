@@ -515,6 +515,18 @@ def _preferred_targeted_test_files(qa_evidence: Any) -> list[str]:
     ]:
         value = str(raw_value or "").strip().replace("\\", "/")
         value = re.sub(r":\d+(?::\d+)?(?:$|\b).*", "", value)
+        # QA failure summaries may encode a test as ``path: test title``.
+        # Keep only the repository-relative path here; the title is supplied
+        # separately to the validation tool by the worker.  Without this
+        # split, the title becomes part of the preferred filesystem path and
+        # every validation attempt is rejected as a non-canonical target.
+        path_prefix, separator, _test_title = value.partition(":")
+        if separator and re.search(
+            r"(?:^|/)(?:test|tests|__tests__)/|\.(?:test|spec)\.[^.]+$",
+            path_prefix,
+            re.IGNORECASE,
+        ):
+            value = path_prefix
         if value.startswith("/workspace/"):
             value = value[len("/workspace/") :]
         value = value.strip(" `\"'()[]{}.,;")

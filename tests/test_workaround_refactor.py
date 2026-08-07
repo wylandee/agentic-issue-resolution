@@ -366,6 +366,16 @@ def test_preferred_targeted_test_files_come_from_qa_locations():
     assert _preferred_targeted_test_files(evidence) == ["test/api/2fa.test.ts"]
 
 
+def test_preferred_targeted_test_files_strip_test_title_from_qa_summary():
+    evidence = QAFailureEvidence(
+        failed_tests=[
+            'test/server/b2bOrderSpec.ts: b2bOrder deserializing arbitrary JSON should not solve "rceChallenge"'
+        ]
+    )
+
+    assert _preferred_targeted_test_files(evidence) == ["test/server/b2bOrderSpec.ts"]
+
+
 def test_runtime_errors_prevent_workaround_success():
     runtime = type("Runtime", (), {"changed_files": ["lib/auth.ts"], "errors": ["round limit"]})()
 
