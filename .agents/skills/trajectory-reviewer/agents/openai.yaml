@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trajectory Reviewer"
+  short_description: "Review remediation traces and diagnose failures"
+  default_prompt: "Use $trajectory-reviewer to evaluate a Phase 5 trajectory Markdown file and report remediation success, evidence, node/tool behavior, and likely bugs."
