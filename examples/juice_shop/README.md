@@ -40,10 +40,18 @@ python examples/juice_shop/fixtures/suppressed/run_post_triage.py
 
 ### 3. Workaround subagent replay
 
-Runs the isolated `express-jwt` workaround replay from its pre-seeded fixture, followed by QA validation:
+Runs the isolated `express-jwt` workaround replay from its pre-seeded fixture, followed by QA validation. The Workspace Builder initializes the baseline codebase; the replay runner then seeds the recorded post-update `express-jwt` state:
 
 ```bash
-python examples/juice_shop/workaround_replay/run_workaround_replay.py
+python examples/juice_shop/fixtures/workaround_replay/run_workaround_replay.py
+```
+
+### 4. NO_FIX workaround retry
+
+Runs the `notevil` vulnerable-code-removal retry fixture through the Supervisor and workaround worker. The Workspace Builder initializes the baseline codebase before dispatch:
+
+```bash
+python examples/juice_shop/fixtures/workaround_nofix/run_workaround_nofix.py
 ```
 
 ---
@@ -67,10 +75,14 @@ The `fixtures/suppressed/` scenario contains:
 
 The raw suppressed ODC report is not currently included in this directory. The checked-in suppressed issue and group files are static fixtures; changing the suppression rules requires producing a new ODC report externally and refreshing those derived files.
 
-The workaround scenario is self-contained under `workaround_replay/`:
+The workaround scenarios are self-contained under `fixtures/`:
 
-* **`run_workaround_replay.py`**: Workaround-only replay runner.
-* **`express_jwt_workaround_replay.json`**: Express-JWT replay state, task, and QA evidence.
+* **`fixtures/workaround_replay/run_workaround_replay.py`**: Express-JWT workaround-only replay runner.
+* **`fixtures/workaround_replay/express_jwt_workaround_replay.json`**: Express-JWT replay state, task, and QA evidence.
+* **`fixtures/workaround_nofix/run_workaround_nofix.py`**: `notevil` NO_FIX retry runner.
+* **`fixtures/workaround_nofix/notevil_workaround_nofix.json`**: `notevil` Stage 2 retry state, task, and prior QA evidence.
+
+Both workaround runners use the Workspace Builder for initial npm dependency installation. The Express-JWT replay additionally applies the target dependency update inside the isolated volume so it can reproduce the failed update state; the NO_FIX retry starts from the unchanged baseline workspace.
 
 ### Refreshing derived fixtures manually
 

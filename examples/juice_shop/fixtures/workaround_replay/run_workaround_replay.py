@@ -53,7 +53,7 @@ from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_FIXTURE = Path(__file__).resolve().parent / "express_jwt_workaround_replay.json"
 _DEFAULT_REPO = _PROJECT_ROOT / "data" / "clones" / "juice-shop"
 _DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "data" / "trajectories"
