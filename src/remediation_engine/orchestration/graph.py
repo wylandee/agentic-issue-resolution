@@ -482,6 +482,7 @@ def _dispatch_boundary_rejection(
             or snapshot.task_revision != task.task_revision
             or snapshot.strategy_stage != task.strategy_stage
             or snapshot.no_fix_stage != task.no_fix_stage
+            or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
@@ -856,6 +857,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         "triage_required": triage_required,
         "status": result.get("status", "qa_completed"),
         "errors": result.get("errors", []),
+        "consistency_events": result.get("consistency_events", []),
     }
     qa_results_by_attempt: dict[str, QAAttemptResult] = {}
     task_queue = state.get("task_queue", {})

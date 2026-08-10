@@ -33,6 +33,7 @@ from remediation_engine.contracts.schemas import (
     NoFixMitigationStage,
     QAAttemptResult,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -241,6 +242,15 @@ def _derive_legacy_task_from_group(group: VulnerabilityGroup) -> RemediationTask
     return RemediationTask(
         task_id=group.group_id,
         parent_group_id=group.group_id,
+        qa_policy=(
+            QAPolicy.NO_FIX_PACKAGE_REMOVAL
+            if fix_plan is not None and fix_plan.status == FixPlanStatus.NO_FIX
+            else (
+                QAPolicy.VERSION_BUMP
+                if strategy == RoutingStrategy.VERSION_BUMP
+                else QAPolicy.INITIAL_CODE_WORKAROUND
+            )
+        ),
         strategy=strategy,
         strategy_stage=(
             SCARemediationStage.OSV_MINIMUM

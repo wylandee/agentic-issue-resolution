@@ -128,6 +128,43 @@ class RoutingStrategy(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class QAPolicy(str, Enum):
+    """Supervisor-owned policy that defines the QA gates for an attempt."""
+
+    VERSION_BUMP = "version_bump"
+    INITIAL_CODE_WORKAROUND = "initial_code_workaround"
+    MIGRATION_CODE_WORKAROUND = "migration_code_workaround"
+    MITIGATION_CODE_WORKAROUND = "mitigation_code_workaround"
+    NO_FIX_PACKAGE_REMOVAL = "no_fix_package_removal"
+    NO_FIX_CODE_REMOVAL = "no_fix_code_removal"
+
+
+class ScannerExecutionStatus(str, Enum):
+    """Trust status of the deterministic Dependency-Check execution."""
+
+    SUCCESS = "success"
+    DOCKER_UNAVAILABLE = "docker_unavailable"
+    TIMEOUT = "timeout"
+    UNPARSEABLE = "unparseable"
+    NOT_RUN = "not_run"
+
+
+class SecurityReviewVerdict(str, Enum):
+    """Verdict emitted by the semantic security review."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    INCONCLUSIVE = "inconclusive"
+
+
+class TestAttributionVerdict(str, Enum):
+    """LLM attribution of a shared test-suite failure."""
+
+    RESPONSIBLE = "responsible"
+    EXONERATED = "exonerated"
+    INCONCLUSIVE = "inconclusive"
+
+
 class SCARemediationStage(str, Enum):
     """Ordered remediation stages for an SCA version-bump task."""
 
@@ -1203,6 +1240,44 @@ class QAFailureEvidence(BaseModel):
     task_revision: int = Field(default=0, ge=0)
 
 
+class QASemanticSecurityReview(BaseModel):
+    """Evidence-backed semantic review for a code-remediation policy."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verdict: SecurityReviewVerdict
+    reasoning: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class QATestAttribution(BaseModel):
+    """Structured attribution of failed tests to remediation groups."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verdict: TestAttributionVerdict
+    responsible_group_ids: list[str] = Field(default_factory=list)
+    failed_tests: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+class QADeterministicGates(BaseModel):
+    """Raw Python-owned QA evidence before policy-specific decision rules."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: Literal["pass", "fail"]
+    install_passed: bool
+    scanner_execution_status: ScannerExecutionStatus
+    target_remaining_identifiers: list[str] = Field(default_factory=list)
+    target_scanner_cleared: bool | None = None
+    tests_passed: bool | None = None
+    package_manifest_state: str | None = None
+    package_graph_state: str | None = None
+    protected_files_unchanged: bool | None = None
+    diagnostics: list[str] = Field(default_factory=list)
+
+
 class WorkaroundContext(BaseModel):
     """Supervisor-provided phase and evidence context for workaround attempts."""
 
@@ -1241,6 +1316,9 @@ class QAEvaluation(BaseModel):
         None,
         description="Structured failure evidence when passed=False.",
     )
+    deterministic_gates: QADeterministicGates | None = Field(default=None)
+    semantic_security_review: QASemanticSecurityReview | None = Field(default=None)
+    test_attribution: QATestAttribution | None = Field(default=None)
 
     @model_validator(mode="after")
     def _check_pass_fail_payload(self) -> QAEvaluation:
@@ -1313,6 +1391,7 @@ class TaskAttemptSnapshot(BaseModel):
     state_revision: int = Field(default=0, ge=0)
     task_revision: int = Field(default=0, ge=0)
     attempt_number: int = Field(default=1, ge=1)
+    qa_policy: QAPolicy | None = Field(default=None)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
@@ -1844,6 +1923,13 @@ class RemediationTask(BaseModel):
         description=(
             "The task_id of the parent task that spawned this task. "
             "None for initial (depth-0) tasks."
+        ),
+    )
+    qa_policy: QAPolicy | None = Field(
+        default=None,
+        description=(
+            "Supervisor-owned QA gate policy. None is retained only for legacy "
+            "state so missing provenance can fail closed."
         ),
     )
     strategy: RoutingStrategy = Field(
