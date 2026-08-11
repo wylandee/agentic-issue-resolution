@@ -25,10 +25,13 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     QAAttemptResult,
+    QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScannerExecutionStatus,
     SCARemediationStage,
     Severity,
     SupervisorDecision,
@@ -126,8 +129,49 @@ def _make_task(
         task_id=task_id,
         parent_group_id=group_id,
         strategy=strategy,
+        qa_policy=(
+            QAPolicy.VERSION_BUMP
+            if strategy == RoutingStrategy.VERSION_BUMP
+            else QAPolicy.INITIAL_CODE_WORKAROUND
+        ),
         status=status,
         retry_count=retry_count,
+    )
+
+
+def _mitigation_pivot_evaluation(task_id: str) -> QAEvaluation:
+    """Create authoritative scanner-failure provenance for a pivot test."""
+    return QAEvaluation(
+        task_id=task_id,
+        passed=False,
+        failure_category=FailureCategory.SECURITY_FLAG,
+        retry_feedback="Dependency-Check did not produce a clear report.",
+        deterministic_gates=QADeterministicGates(
+            status="fail",
+            install_passed=True,
+            scanner_execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            target_remaining_identifiers=["CVE-TEST"],
+            target_scanner_cleared=False,
+            tests_passed=True,
+        ),
+    )
+
+
+def _migration_pivot_evaluation(task_id: str) -> QAEvaluation:
+    """Create authoritative scanner-clear/test-failure provenance for a pivot test."""
+    return QAEvaluation(
+        task_id=task_id,
+        passed=False,
+        failure_category=FailureCategory.BREAKING_CHANGE,
+        retry_feedback="The patched version broke a compatibility test.",
+        deterministic_gates=QADeterministicGates(
+            status="fail",
+            install_passed=True,
+            scanner_execution_status=ScannerExecutionStatus.SUCCESS,
+            target_remaining_identifiers=[],
+            target_scanner_cleared=True,
+            tests_passed=False,
+        ),
     )
 
 
@@ -1885,7 +1929,11 @@ class TestRunSupervisorNodePeerConflict:
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
         )
-        state = _base_state([g1], task_queue={"task-1": task})
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+            qa_evaluations={"task-1": _mitigation_pivot_evaluation("task-1")},
+        )
         mock_llm = MagicMock()
         mock_chat.return_value = mock_llm
         mock_llm.with_structured_output.return_value.invoke.return_value = (
@@ -1911,6 +1959,7 @@ class TestRunSupervisorNodePeerConflict:
         assert len(result["active_target_task_ids"]) == 1
         child_id = result["active_target_task_ids"][0]
         assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
+        assert result["task_queue"][child_id].qa_policy == QAPolicy.MITIGATION_CODE_WORKAROUND
 
     @patch("langchain_openai.ChatOpenAI")
     def test_llm_strategy_pivot_spawns_child_and_routes_child(self, mock_chat):
@@ -1921,6 +1970,7 @@ class TestRunSupervisorNodePeerConflict:
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
+            qa_evaluations={"task-1": _mitigation_pivot_evaluation("task-1")},
         )
 
         mock_llm = MagicMock()
@@ -1947,6 +1997,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
         assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+        assert result["task_queue"]["task-2"].qa_policy == QAPolicy.MITIGATION_CODE_WORKAROUND
         assert (
             result["task_queue"]["task-2"].instruction
             == "Implement a code workaround for the unresolved peer conflict."
@@ -1962,12 +2013,7 @@ class TestRunSupervisorNodePeerConflict:
             [g1],
             task_queue={"task-1": task},
             qa_evaluations={
-                "task-1": QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                    retry_feedback="jsonwebtoken v9 broke runtime expectations",
-                )
+                "task-1": QAEvaluation(**_migration_pivot_evaluation("task-1").model_dump())
             },
         )
 
@@ -1995,6 +2041,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
         assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+        assert result["task_queue"]["task-2"].qa_policy == QAPolicy.MIGRATION_CODE_WORKAROUND
 
     @patch("langchain_openai.ChatOpenAI")
     def test_strategy_pivot_without_child_instruction_fails_closed(self, mock_chat):
@@ -2038,12 +2085,7 @@ class TestRunSupervisorNodePeerConflict:
             [g1],
             task_queue={"task-1": task},
             qa_evaluations={
-                "task-1": QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                    retry_feedback="jsonwebtoken v9 broke runtime expectations",
-                )
+                "task-1": QAEvaluation(**_migration_pivot_evaluation("task-1").model_dump())
             },
         )
 
@@ -2186,6 +2228,10 @@ class TestRunSupervisorNodePeerConflict:
         state = _base_state(
             groups,
             task_queue=tasks,
+            qa_evaluations={
+                f"task-{index}": _mitigation_pivot_evaluation(f"task-{index}")
+                for index in range(1, 4)
+            },
         )
 
         router_llm = MagicMock()
@@ -2397,11 +2443,8 @@ class TestBugFixes:
             errors=errors,
         )
 
-        assert len(new_tasks) == 1
-        child_task = next(iter(new_tasks.values()))
-        assert child_task.parent_group_id == "sca:package.json:express:CODE_WORKAROUND"
-        assert child_task.strategy == RoutingStrategy.CODE_WORKAROUND
-        assert len(errors) == 0
+        assert new_tasks == {}
+        assert any("authoritative parent QA provenance" in error for error in errors)
 
     def test_bug3_reject_workaround_to_workaround_spawn(self):
         parent_task = RemediationTask(
@@ -2485,7 +2528,6 @@ class TestBugFixes:
             instruction="Workaround",
         )
         task_queue = {"task-2": task}
-        group_by_id = {group_id: g}
         qa_evaluations = {
             "task-2": QAEvaluation(
                 task_id="task-2",

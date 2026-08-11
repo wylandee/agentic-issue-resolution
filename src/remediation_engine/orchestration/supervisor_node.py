@@ -48,6 +48,7 @@ from remediation_engine.contracts.schemas import (
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -316,6 +317,7 @@ def _create_attempt_snapshot(
         state_revision=state_revision,
         task_revision=task_revision,
         attempt_number=len(_attempts_for_task(snapshots_by_id, task.task_id)) + 1,
+        qa_policy=task.qa_policy,
         strategy_stage=task.strategy_stage,
         no_fix_stage=task.no_fix_stage,
         selected_version=task.selected_version,
@@ -466,6 +468,7 @@ _ATTEMPT_INPUT_FIELDS = frozenset(
         "instruction",
         "strategy",
         "no_fix_stage",
+        "qa_policy",
     }
 )
 
@@ -572,6 +575,7 @@ def _validate_committed_state(
             and snapshot.task_revision == task.task_revision
             and snapshot.strategy_stage == task.strategy_stage
             and snapshot.no_fix_stage == task.no_fix_stage
+            and snapshot.qa_policy == task.qa_policy
             and snapshot.selected_version == task.selected_version
             and snapshot.instruction == task.instruction
             and snapshot.instruction_digest == _instruction_digest(task.instruction)
@@ -596,6 +600,7 @@ def _validate_committed_state(
                 "current_attempt_id": snapshot.attempt_id,
                 "strategy_stage": snapshot.strategy_stage,
                 "no_fix_stage": snapshot.no_fix_stage,
+                "qa_policy": snapshot.qa_policy,
                 "selected_version": snapshot.selected_version,
                 "instruction": snapshot.instruction,
             }
@@ -704,6 +709,7 @@ def _validate_committed_state(
             snapshot.task_revision != task.task_revision
             or snapshot.strategy_stage != task.strategy_stage
             or snapshot.no_fix_stage != task.no_fix_stage
+            or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
@@ -1507,6 +1513,9 @@ def _normalize_qa_evaluations_for_tasks(
             failure_category=evaluation.failure_category,
             retry_feedback=evaluation.retry_feedback,
             failure_evidence=evaluation.failure_evidence,
+            deterministic_gates=evaluation.deterministic_gates,
+            semantic_security_review=evaluation.semantic_security_review,
+            test_attribution=evaluation.test_attribution,
         )
     return normalized
 
@@ -1613,6 +1622,8 @@ def _no_fix_failure_transition(
     """
     updates = advance_no_fix_stage(task)
     next_stage = updates.get("no_fix_stage")
+    if next_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        updates["qa_policy"] = QAPolicy.NO_FIX_CODE_REMOVAL
     reset_workspace = next_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
     if reset_workspace:
         retry_task = task.model_copy(update=updates)
@@ -1738,9 +1749,10 @@ def _parent_status_for_strategy_pivot(
     """
     Choose the terminal parent status when a strategy pivot spawns a child task.
 
-    BREAKING_CHANGE means the version bump itself succeeded but caused regressions,
-    so the parent attempt should become QA_PASSED and the child handles follow-on
-    workaround work. Other pivots represent an exhausted parent strategy attempt.
+    A VERSION_BUMP parent is marked QA_PASSED only when its authoritative QA
+    evidence proves scanner clearance and a hard test regression; the child then
+    owns the follow-on workaround. Other pivots represent an exhausted parent
+    strategy attempt.
     """
     evaluation = qa_evaluations.get(parent_task.task_id) or qa_evaluations.get(
         parent_task.parent_group_id
@@ -1749,9 +1761,15 @@ def _parent_status_for_strategy_pivot(
         parent_task.strategy == RoutingStrategy.VERSION_BUMP
         and new_strategy == RoutingStrategy.CODE_WORKAROUND
         and evaluation is not None
-        and evaluation.failure_category == FailureCategory.BREAKING_CHANGE
     ):
-        return TaskStatus.QA_PASSED
+        gates = evaluation.deterministic_gates
+        if (
+            parent_task.qa_policy == QAPolicy.VERSION_BUMP
+            and gates is not None
+            and gates.target_scanner_cleared is True
+            and gates.tests_passed is False
+        ):
+            return TaskStatus.QA_PASSED
     return TaskStatus.UNFIXABLE
 
 
@@ -2210,6 +2228,7 @@ def _build_planner_prompt(
             f"- CVEs          : {cves}",
             f"- GHSAs         : {ghsas}",
             f"- Strategy      : {task.strategy.value}",
+            f"- QA Policy     : {task.qa_policy.value if task.qa_policy else 'MISSING_POLICY_PROVENANCE'}",
             f"- Strategy Stage: {task.strategy_stage.value}",
             f"- NPM Selection : {_selection_for_stage(task.strategy_stage) or 'none'}",
             f"- Status        : {task.status.value}",
@@ -2575,6 +2594,9 @@ def _materialize_spawn_requests(
     group_by_id: dict[str, VulnerabilityGroup],
     errors: list[str],
     valid_groups: list[VulnerabilityGroup] | None = None,
+    qa_evaluations: dict[str, QAEvaluation] | None = None,
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> tuple[dict[str, RemediationTask], dict[str, list[str]]]:
     """Validate and materialize spawn requests into new RemediationTask objects.
 
@@ -2632,6 +2654,60 @@ def _materialize_spawn_requests(
         child_task_id = f"task-{next_index}"
         next_index += 1
 
+        child_policy: QAPolicy | None
+        if req.strategy == RoutingStrategy.VERSION_BUMP:
+            child_policy = QAPolicy.VERSION_BUMP
+        elif (
+            parent_task.strategy == RoutingStrategy.VERSION_BUMP
+            and req.strategy == RoutingStrategy.CODE_WORKAROUND
+        ):
+            parent_eval = (qa_evaluations or {}).get(parent_task.task_id) or (
+                qa_evaluations or {}
+            ).get(parent_task.parent_group_id)
+            diagnostics = (retry_diagnostics_by_task or {}).get(parent_task.task_id)
+            if parent_eval is None:
+                if (
+                    parent_task.qa_policy is not None
+                    and diagnostics is not None
+                    and diagnostics.exhausted_update_path
+                ):
+                    # Exhaustion proves that the update path is no longer the
+                    # active remediation route, but does not prove migration.
+                    child_policy = QAPolicy.MITIGATION_CODE_WORKAROUND
+                else:
+                    details = (
+                        "A VERSION_BUMP-to-CODE_WORKAROUND pivot was requested without "
+                        "authoritative parent QA provenance."
+                    )
+                    errors.append(f"supervisor: {details}")
+                    if consistency_events is not None:
+                        consistency_events.append(
+                            _build_consistency_event(
+                                error_code="AMBIGUOUS_QA_POLICY_PIVOT",
+                                task_id=parent_task.task_id,
+                                expected_attempt_id=parent_task.current_attempt_id,
+                                received_attempt_id=None,
+                                action="ignored",
+                                details=details,
+                            )
+                        )
+                    continue
+            else:
+                gates = parent_eval.deterministic_gates
+                scanner_cleared = bool(gates and gates.target_scanner_cleared is True)
+                hard_test_failure = (
+                    parent_eval.failure_category == FailureCategory.BREAKING_CHANGE
+                    or bool(gates and gates.tests_passed is False)
+                )
+                if scanner_cleared and hard_test_failure:
+                    child_policy = QAPolicy.MIGRATION_CODE_WORKAROUND
+                else:
+                    # Never grant the weaker migration policy without both
+                    # positive scanner clearance and a hard test regression.
+                    child_policy = QAPolicy.MITIGATION_CODE_WORKAROUND
+        else:
+            child_policy = QAPolicy.INITIAL_CODE_WORKAROUND
+
         _TRIAGE_BUCKET_TO_STRATEGY: dict[str, str] = {
             "UPDATE_VERSION": RoutingStrategy.VERSION_BUMP.name,
             "WORKAROUND": RoutingStrategy.CODE_WORKAROUND.name,
@@ -2668,6 +2744,7 @@ def _materialize_spawn_requests(
             task_id=child_task_id,
             parent_group_id=new_group_id,
             parent_task_id=req.parent_task_id,
+            qa_policy=child_policy,
             strategy=req.strategy,
             strategy_stage=(
                 SCARemediationStage.CODE_WORKAROUND
@@ -4172,6 +4249,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             group_by_id=group_by_id,
             errors=errors,
             valid_groups=valid_groups,
+            qa_evaluations=qa_evaluations,
+            retry_diagnostics_by_task=retry_diagnostics_by_task,
+            consistency_events=consistency_events,
         )
         task_queue.update(new_tasks)
         # Apply the complete parent transition after children are materialized.

@@ -15,6 +15,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     TaskStatus,
@@ -77,6 +78,7 @@ def test_no_fix_contracts_round_trip_and_defaults():
         strategy=RoutingStrategy.CODE_WORKAROUND,
     )
     assert task.no_fix_stage is None
+    assert task.qa_policy is None
     assert RemediationTask.model_validate_json(task.model_dump_json()).no_fix_stage is None
 
     context = WorkaroundContext(
@@ -93,6 +95,7 @@ def test_initial_and_non_no_fix_task_creation_are_distinct():
     no_fix_task = build_initial_remediation_task(_group(), "task-1")
     assert no_fix_task.strategy == RoutingStrategy.CODE_WORKAROUND
     assert no_fix_task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
+    assert no_fix_task.qa_policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL
     assert "PACKAGE REMOVAL" in no_fix_task.instruction
     assert "Inform the user" not in no_fix_task.instruction
 
@@ -119,7 +122,14 @@ def test_initial_and_non_no_fix_task_creation_are_distinct():
         }
     )
     assert build_initial_remediation_task(version_group, "task-2").no_fix_stage is None
+    assert (
+        build_initial_remediation_task(version_group, "task-2").qa_policy == QAPolicy.VERSION_BUMP
+    )
     assert build_initial_remediation_task(workaround_group, "task-3").no_fix_stage is None
+    assert (
+        build_initial_remediation_task(workaround_group, "task-3").qa_policy
+        == QAPolicy.INITIAL_CODE_WORKAROUND
+    )
 
 
 def test_no_fix_stage_transitions_are_exact_and_ignore_terminal_retries():
@@ -175,6 +185,7 @@ def test_transition_helper_builds_deterministic_stage_two_instruction_and_reset(
     )
     assert reset is True
     assert updates["no_fix_stage"] == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
+    assert updates["qa_policy"] == QAPolicy.NO_FIX_CODE_REMOVAL
     assert updates["status"] == TaskStatus.NEEDS_RETRY
     assert "VULNERABLE CODE REMOVAL" in updates["instruction"]
 

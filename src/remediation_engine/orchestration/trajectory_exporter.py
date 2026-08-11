@@ -160,6 +160,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
     raise_error = False
 
     def __init__(self) -> None:
+        """Initialize the thread-safe in-memory trajectory span store."""
         super().__init__()
         self._lock = RLock()
         self._spans: dict[str, _LocalSpan] = {}
@@ -583,8 +584,8 @@ def _render_markdown(
         "",
         "## Attempt Snapshot Summary",
         "",
-        "| Task | Attempt | Revision | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
-        "|---|---|---:|---|---|---|---|---|---|---|---|",
+        "| Task | Attempt | Revision | Policy | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Deterministic Gates | Semantic Review | Final Task Status | Instruction |",
+        "|---|---|---:|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     if isinstance(final_state, Mapping):
         task_queue = final_state.get("task_queue") or {}
@@ -622,12 +623,25 @@ def _render_markdown(
                         _table_value(task_id),
                         _table_value(attempt_id),
                         _table_value(data.get("task_revision")),
+                        _table_value(
+                            task_data.get("qa_policy") or data.get("qa_policy") or "missing"
+                        ),
                         _table_value(data.get("strategy_stage")),
                         _table_value(data.get("selected_version") or "none"),
                         _table_value(data.get("dispatch_node")),
                         _table_value(", ".join(worker_data.get("executed_versions", []) or [])),
                         _table_value(worker_data.get("status", "pending")),
                         _table_value((qa_data.get("evaluation") or {}).get("passed", "pending")),
+                        _table_value(
+                            (qa_data.get("evaluation") or {})
+                            .get("deterministic_gates", {})
+                            .get("status", "pending")
+                        ),
+                        _table_value(
+                            (qa_data.get("evaluation") or {})
+                            .get("semantic_security_review", {})
+                            .get("verdict", "optional")
+                        ),
                         _table_value(task_data.get("status", "unknown")),
                         _table_value(instruction),
                     ]
@@ -635,9 +649,13 @@ def _render_markdown(
                 + " |"
             )
         if not snapshots:
-            lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+            lines.append(
+                "| none | none |  |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+            )
     else:
-        lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+        lines.append(
+            "| none | none |  |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+        )
 
     lines.extend(
         [

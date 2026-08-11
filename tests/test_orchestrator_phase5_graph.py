@@ -16,6 +16,9 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    QADeterministicGates,
+    QAEvaluation,
+    ScannerExecutionStatus,
     SCARemediationStage,
     Severity,
     TaskAttemptSnapshot,
@@ -357,6 +360,7 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
+            qa_policy=task.qa_policy,
         )
         task = task.model_copy(
             update={
@@ -565,7 +569,7 @@ class TestPhase5GraphIntegration:
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
             graph = build_orchestrator_graph()
-            result = graph.invoke(_initial_state(tmp_path, groups))
+            graph.invoke(_initial_state(tmp_path, groups))
 
         assert supervisor.call_count == 2
         assert teardown.call_count == 1
@@ -668,6 +672,60 @@ class TestPhase5GraphIntegration:
         scoped_state = qa_critic.call_args[0][0]
         assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
         assert result["status"] == "qa_completed"
+
+    def test_qa_wrapper_preserves_nested_policy_evidence(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa",
+            task_id="task-1",
+            task_revision=1,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            instruction="Upgrade to 4.17.21",
+            instruction_digest=_instruction_digest("Upgrade to 4.17.21"),
+            dispatch_node="qa_critic",
+        )
+        task = task.model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+                "instruction": snapshot.instruction,
+            }
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id=groups[0].group_id,
+            passed=True,
+            deterministic_gates=QADeterministicGates(
+                status="pass",
+                install_passed=True,
+                scanner_execution_status=ScannerExecutionStatus.SUCCESS,
+                target_scanner_cleared=True,
+                tests_passed=False,
+            ),
+        )
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {groups[0].group_id: evaluation},
+                "eval_status": "all_passed",
+                "qa_investigation_report": "report",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+            result = run_qa_critic_from_orchestrator(state)
+
+        envelope = result["qa_results_by_attempt"]["attempt-qa"]
+        assert envelope.evaluation.deterministic_gates == evaluation.deterministic_gates
 
 
 class TestPhase5Exports:

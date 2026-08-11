@@ -47,6 +47,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     NoFixMitigationStage,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     Severity,
@@ -1174,7 +1175,7 @@ class TestQAExecutionToolGuards:
         )
         install_tool = self._get_tool(tools, "run_dependency_install")
 
-        first = install_tool.invoke({})
+        install_tool.invoke({})
         second = install_tool.invoke({})
 
         assert results.install is not None
@@ -1193,10 +1194,9 @@ class TestQAExecutionToolGuards:
                 host_repo_root=None,
             )
         scan_tool = self._get_tool(tools, "run_security_scan")
-        install_tool = self._get_tool(tools, "run_dependency_install")
         results.install = (True, "install ok")
 
-        first = scan_tool.invoke({})
+        scan_tool.invoke({})
         second = scan_tool.invoke({})
 
         assert results.scan is not None
@@ -1217,7 +1217,7 @@ class TestQAExecutionToolGuards:
         test_tool = self._get_tool(tools, "run_unit_tests")
         results.scan = (True, "scan ok", set())
 
-        first = test_tool.invoke({})
+        test_tool.invoke({})
         second = test_tool.invoke({})
 
         assert results.tests is not None
@@ -1462,6 +1462,27 @@ def _make_minimal_state(
     changed_files=None,
 ):
     resolved_groups = [_make_group()] if groups is _MISSING else groups
+    task_queue = {}
+    for index, group in enumerate(resolved_groups, start=1):
+        if group.fix_plan and group.fix_plan.status == FixPlanStatus.NO_FIX:
+            policy = QAPolicy.NO_FIX_PACKAGE_REMOVAL
+            strategy = RoutingStrategy.CODE_WORKAROUND
+            no_fix_stage = NoFixMitigationStage.PACKAGE_REMOVAL
+        elif group.fix_plan and group.fix_plan.status == FixPlanStatus.VERSION_FOUND:
+            policy = QAPolicy.VERSION_BUMP
+            strategy = RoutingStrategy.VERSION_BUMP
+            no_fix_stage = None
+        else:
+            policy = QAPolicy.INITIAL_CODE_WORKAROUND
+            strategy = RoutingStrategy.CODE_WORKAROUND
+            no_fix_stage = None
+        task_queue[f"task-{index}"] = RemediationTask(
+            task_id=f"task-{index}",
+            parent_group_id=group.group_id,
+            strategy=strategy,
+            qa_policy=policy,
+            no_fix_stage=no_fix_stage,
+        )
     return {
         "valid_groups": resolved_groups,
         "workspace_volume": workspace_volume,
@@ -1469,6 +1490,7 @@ def _make_minimal_state(
         "action_summaries": [],
         "group_strategies": group_strategies or {},
         "changed_files": changed_files or [],
+        "task_queue": task_queue,
     }
 
 
@@ -1624,9 +1646,12 @@ class TestRunQACriticNode:
         with patches["sandbox"], patches["global_exec"], patches["investigators"], patches["judge"]:
             result = run_qa_critic_node(state)
 
-        assert result["eval_status"] == "failures_detected"
+        # VERSION_BUMP has no semantic review gate; with install and target
+        # scanner clearance, a judge prose failure cannot override the hard
+        # deterministic policy result.
+        assert result["eval_status"] == "all_passed"
         assert result["status"] == "qa_completed"
-        assert result["qa_evaluations"][group.group_id].passed is False
+        assert result["qa_evaluations"][group.group_id].passed is True
 
     def test_missing_workspace_volume_returns_qa_failed(self):
         state = _make_minimal_state(workspace_volume=None)
@@ -2149,7 +2174,7 @@ class TestBatchQAResultSchema:
     def test_holistic_report_must_be_nonempty(self):
         try:
             BatchQAResult(holistic_report="", evaluations=[])
-            assert False, "should have raised"
+            raise AssertionError("should have raised")
         except Exception:
             pass
 
@@ -2157,7 +2182,7 @@ class TestBatchQAResultSchema:
         result = BatchQAResult(holistic_report="ok", evaluations=[])
         try:
             result.holistic_report = "changed"
-            assert False, "should have raised"
+            raise AssertionError("should have raised")
         except Exception:
             pass
 
@@ -2664,7 +2689,8 @@ class TestApplyGuardrails:
             results=self._res(scan_ok=False, remaining={"CVE-2021-0001"}),
             group_strategies={g.group_id: "code_workaround"},
         )
-        assert evals[g.group_id].passed is True
+        assert evals[g.group_id].passed is False
+        assert evals[g.group_id].failure_category == FailureCategory.SECURITY_FLAG
 
     def test_eresolve_remaps_breaking_to_peer_conflict(self):
         g = _make_group()
@@ -2706,7 +2732,7 @@ class TestApplyGuardrails:
             results=self._res(install_ok=False, install_summary="ERESOLVE conflict"),
             group_strategies={g.group_id: "code_workaround"},
         )
-        assert evals[g.group_id].failure_category == FailureCategory.BREAKING_CHANGE
+        assert evals[g.group_id].failure_category == FailureCategory.SECURITY_FLAG
 
     def test_remaining_scanner_reclassifies_breaking_change_to_security_flag(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
@@ -2729,7 +2755,7 @@ class TestApplyGuardrails:
         )
         assert evals[g.group_id].failure_category == FailureCategory.SECURITY_FLAG
         assert "JWT unit tests failed" in (evals[g.group_id].retry_feedback or "")
-        assert any("did not prioritize SECURITY_FLAG" in err for err in errors)
+        assert any("SECURITY_FLAG" in err for err in errors)
 
 
 # ---------------------------------------------------------------------------
