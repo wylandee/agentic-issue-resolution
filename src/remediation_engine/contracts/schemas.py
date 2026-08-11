@@ -1274,7 +1274,6 @@ class QADeterministicGates(BaseModel):
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
-    protected_files_unchanged: bool | None = None
     diagnostics: list[str] = Field(default_factory=list)
 
 

@@ -308,7 +308,7 @@ def test_no_fix_package_state_fails_closed_for_unsupported_manager():
     assert "pnpm" in package_state.diagnostics[0]
 
 
-def test_no_fix_code_removal_requires_package_and_protected_baseline():
+def test_no_fix_code_removal_requires_package_in_manifest_and_graph():
     group = _group("g1")
     result = _evaluate(
         group,
@@ -319,7 +319,6 @@ def test_no_fix_code_removal_requires_package_and_protected_baseline():
         package_state=_QAPackageState(
             manifest_state="present",
             graph_state="present",
-            protected_files_unchanged=True,
         ),
     )
     assert result.passed is True

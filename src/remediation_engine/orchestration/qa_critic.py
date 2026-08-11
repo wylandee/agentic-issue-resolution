@@ -113,6 +113,183 @@ _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
 # Install error patterns that indicate peer/engine conflicts
 _PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EBADENGINE", "peer dep", "peer tree")
+
+
+@dataclass(frozen=True)
+class _QAPolicyPromptSpec:
+    """Prompt contract for one deterministic QA policy."""
+
+    scanner_rule: str
+    package_rule: str
+    tests_rule: str
+    semantic_rule: str
+    review_focus: str
+    prohibited_conclusions: str
+
+
+_QA_POLICY_PROMPT_SPECS: dict[QAPolicy, _QAPolicyPromptSpec] = {
+    QAPolicy.VERSION_BUMP: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers must be cleared. Treat remaining target identifiers "
+            "as a blocking security failure."
+        ),
+        package_rule=(
+            "Inspect the authorized manifest and lockfile changes and confirm the planned "
+            "fixed version is represented in the dependency state."
+        ),
+        tests_rule=(
+            "Review failed tests for structured, evidence-backed attribution to another group; "
+            "the Python policy evaluator decides whether an exoneration is valid."
+        ),
+        semantic_rule="A code-path semantic review is not required by this policy.",
+        review_focus=(
+            "Validate dependency version selection, manifest/lockfile consistency, target "
+            "scanner clearance, and any test attribution."
+        ),
+        prohibited_conclusions=(
+            "Do not exonerate a group from a remaining target scanner identifier or from a "
+            "test failure without the required structured evidence."
+        ),
+    ),
+    QAPolicy.INITIAL_CODE_WORKAROUND: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers are non-blocking for this policy. They are evidence "
+            "to interpret, not proof that the code workaround failed."
+        ),
+        package_rule="No package-state transition is required by this policy.",
+        tests_rule="The required test suite must pass.",
+        semantic_rule=(
+            "A source/diff-based semantic security review is required. Determine whether the "
+            "initial workaround blocks the vulnerable execution path."
+        ),
+        review_focus=(
+            "Identify the advisory mechanism, affected call sites, protected call sites, and "
+            "concrete file/symbol evidence showing whether the workaround is effective."
+        ),
+        prohibited_conclusions=(
+            "Do not fail solely because the original scanner identifier remains, and do not "
+            "pass using test logs without source or diff evidence."
+        ),
+    ),
+    QAPolicy.MIGRATION_CODE_WORKAROUND: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers must be cleared. Treat remaining target identifiers "
+            "as a blocking security failure."
+        ),
+        package_rule="No package-state transition is required by this policy.",
+        tests_rule="The required test suite must pass.",
+        semantic_rule="A required semantic security review is not part of this policy.",
+        review_focus=(
+            "Validate target scanner clearance, migration/install behavior, and whether the "
+            "remediation caused any test or build regression."
+        ),
+        prohibited_conclusions=(
+            "Do not treat a remaining target identifier as non-blocking or use LLM attribution "
+            "to override the hard scanner or test gates."
+        ),
+    ),
+    QAPolicy.MITIGATION_CODE_WORKAROUND: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers are non-blocking for this policy. They are evidence "
+            "to interpret, not proof that the mitigation failed."
+        ),
+        package_rule="No package-state transition is required by this policy.",
+        tests_rule="The required test suite must pass.",
+        semantic_rule=(
+            "A source/diff-based semantic security review is required. Determine whether the "
+            "mitigation blocks or materially constrains the vulnerable behavior."
+        ),
+        review_focus=(
+            "Identify the advisory mechanism, affected call sites, protected call sites, and "
+            "concrete file/symbol evidence showing whether the mitigation is effective."
+        ),
+        prohibited_conclusions=(
+            "Do not fail solely because the original scanner identifier remains, and do not "
+            "pass using test logs without source or diff evidence."
+        ),
+    ),
+    QAPolicy.NO_FIX_PACKAGE_REMOVAL: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers must be cleared after package removal. Treat remaining "
+            "target identifiers as a blocking security failure."
+        ),
+        package_rule=(
+            "The vulnerable package must be absent from every authorized direct manifest and "
+            "from the resolved dependency graph."
+        ),
+        tests_rule="The required test suite must pass.",
+        semantic_rule="A code-path semantic security review is not required by this policy.",
+        review_focus=(
+            "Confirm the authorized package-removal operation, manifest state, resolved graph, "
+            "scanner clearance, and test results."
+        ),
+        prohibited_conclusions=(
+            "Do not pass while the package remains in an authorized manifest or resolved graph, "
+            "and do not treat residual target findings as non-blocking."
+        ),
+    ),
+    QAPolicy.NO_FIX_CODE_REMOVAL: _QAPolicyPromptSpec(
+        scanner_rule=(
+            "Target scanner identifiers are expected to remain because the vulnerable package "
+            "is intentionally retained. They are non-blocking for this policy."
+        ),
+        package_rule=(
+            "The vulnerable package must remain present in the direct manifest and resolved "
+            "dependency graph. The workaround must not remove or change dependency metadata."
+        ),
+        tests_rule="The required test suite must pass.",
+        semantic_rule=(
+            "A source/diff-based semantic security review is required. Determine whether the "
+            "vulnerable code path was removed while the package remained installed."
+        ),
+        review_focus=(
+            "Identify the advisory mechanism, affected and protected call sites, and concrete "
+            "file/symbol evidence showing that the vulnerable execution path is no longer used."
+        ),
+        prohibited_conclusions=(
+            "Do not fail solely because the target package or its scanner identifiers remain. "
+            "Do not pass using test logs without source or diff evidence."
+        ),
+    ),
+}
+
+_REQUIRED_SEMANTIC_QA_POLICIES = frozenset(
+    {
+        QAPolicy.INITIAL_CODE_WORKAROUND,
+        QAPolicy.MITIGATION_CODE_WORKAROUND,
+        QAPolicy.NO_FIX_CODE_REMOVAL,
+    }
+)
+
+
+def _qa_policy_prompt_block(qa_policy: QAPolicy | None) -> str:
+    """Return the policy-specific QA contract included in LLM prompts."""
+    if qa_policy is None:
+        return """## Policy-Specific QA Contract
+- QA Policy: MISSING_POLICY_PROVENANCE
+- Do not infer a policy or final outcome. Report the missing policy as a deterministic error.
+"""
+
+    spec = _QA_POLICY_PROMPT_SPECS[qa_policy]
+    semantic_output_rule = (
+        "End with a structured review block using exactly one verdict: PASS, FAIL, or "
+        "INCONCLUSIVE, followed by concise reasoning and evidence references. A fallback "
+        "based only on execution logs is INCONCLUSIVE."
+        if qa_policy in _REQUIRED_SEMANTIC_QA_POLICIES
+        else "No structured semantic review block is required by this policy."
+    )
+    return f"""## Policy-Specific QA Contract
+- QA Policy: {qa_policy.value}
+- Scanner rule: {spec.scanner_rule}
+- Package rule: {spec.package_rule}
+- Test rule: {spec.tests_rule}
+- Semantic review: {spec.semantic_rule}
+- Semantic output: {semantic_output_rule}
+- Review focus: {spec.review_focus}
+- Prohibited conclusions: {spec.prohibited_conclusions}
+"""
+
+
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _MOCHA_FAILURE_RE = re.compile(r"^\s*(\d+)\)\s+(.+)$")
 # Jest/Vitest prefixes are normally Unicode bullets/crosses.  The mojibake
@@ -1932,55 +2109,15 @@ class _QAExecutionResults:
     scan: Any | None = None  # _SecurityScanResult or legacy tuple
     tests: tuple[bool, str] | None = None  # (ok, summary)
     package_state_by_group: dict[str, _QAPackageState] = field(default_factory=dict)
-    protected_files_mutated: bool = False
 
 
 @dataclass(frozen=True)
 class _QAPackageState:
-    """Per-group package and protected-file evidence collected by Python."""
+    """Per-group package evidence collected by Python."""
 
     manifest_state: str | None = None
     graph_state: str | None = None
-    protected_files_unchanged: bool | None = None
     diagnostics: tuple[str, ...] = ()
-
-
-def _capture_workspace_files(
-    sandbox: DockerSandbox,
-    paths: set[str],
-) -> dict[str, str | None]:
-    """Capture exact workspace contents for protected-file comparisons."""
-    return {path: sandbox.read_file(path) for path in sorted(paths)}
-
-
-def _protected_package_paths(
-    group: VulnerabilityGroup,
-    baseline_snapshots: dict[str, str] | None,
-    baseline_absent_paths: list[str] | None = None,
-) -> set[str]:
-    """Return manifest/lockfile paths protected for a NO_FIX Stage 2 task."""
-    protected_names = {
-        "package.json",
-        "package-lock.json",
-        "npm-shrinkwrap.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-    }
-    paths: set[str] = set()
-    for path in baseline_snapshots or {}:
-        if Path(path).name in protected_names:
-            paths.add(path.replace("\\", "/").lstrip("/"))
-    for path in baseline_absent_paths or []:
-        if Path(path).name in protected_names:
-            paths.add(path.replace("\\", "/").lstrip("/"))
-    for path in [
-        *(getattr(group, "file_paths", []) or []),
-        *(getattr(issue, "manifest_file", "") for issue in group.localized_issues),
-    ]:
-        normalized = str(path or "").replace("\\", "/").lstrip("/")
-        if normalized and Path(normalized).name in protected_names:
-            paths.add(normalized)
-    return paths
 
 
 def _json_dependency_present(package_json: dict[str, Any], package: str) -> bool:
@@ -2010,19 +2147,8 @@ def _collect_group_package_state(
     sandbox: DockerSandbox,
     group: VulnerabilityGroup,
     policy: QAPolicy | None,
-    baseline_snapshots: dict[str, str] | None = None,
-    baseline_absent_paths: list[str] | None = None,
-    pre_execution_files: dict[str, str | None] | None = None,
-    qa_protected_files_mutated: bool = False,
 ) -> _QAPackageState:
-    """Collect localized manifest, npm graph, and Stage 2 baseline evidence."""
-    baseline_snapshots = {
-        str(path).replace("\\", "/").lstrip("/"): value
-        for path, value in (baseline_snapshots or {}).items()
-    }
-    baseline_absent_paths = [
-        str(path).replace("\\", "/").lstrip("/") for path in (baseline_absent_paths or [])
-    ]
+    """Collect localized manifest and npm graph evidence."""
     if policy not in {
         QAPolicy.NO_FIX_PACKAGE_REMOVAL,
         QAPolicy.NO_FIX_CODE_REMOVAL,
@@ -2050,14 +2176,12 @@ def _collect_group_package_state(
         return _QAPackageState(
             manifest_state="unknown",
             graph_state="unknown",
-            protected_files_unchanged=(None if policy == QAPolicy.NO_FIX_CODE_REMOVAL else None),
             diagnostics=(f"Unsupported or unknown package manager(s): {manager_text}.",),
         )
     if not package or not manifests:
         return _QAPackageState(
             manifest_state="unknown",
             graph_state="unknown",
-            protected_files_unchanged=None,
             diagnostics=("Package name or authorized manifest paths are unavailable.",),
         )
 
@@ -2102,37 +2226,9 @@ def _collect_group_package_state(
         else ("present" if "present" in graph_states else "absent")
     )
 
-    protected_unchanged: bool | None = None
-    if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
-        paths = _protected_package_paths(group, baseline_snapshots, baseline_absent_paths)
-        if (
-            (not baseline_snapshots and not baseline_absent_paths)
-            or not paths
-            or pre_execution_files is None
-        ):
-            protected_unchanged = None
-            graph_diagnostics.append("Stage 2 protected-file baseline is unavailable.")
-        else:
-            baseline_values = {path: baseline_snapshots.get(path) for path in paths}
-            post_values = _capture_workspace_files(sandbox, paths)
-            protected_unchanged = (
-                not qa_protected_files_mutated
-                and all(pre_execution_files.get(path) == post_values.get(path) for path in paths)
-                and all(baseline_values.get(path) == post_values.get(path) for path in paths)
-            )
-            if qa_protected_files_mutated:
-                graph_diagnostics.append(
-                    "Protected files changed during one of the QA execution phases."
-                )
-            if not protected_unchanged:
-                graph_diagnostics.append(
-                    "Protected manifest or lockfile contents changed during QA."
-                )
-
     return _QAPackageState(
         manifest_state=manifest_state,
         graph_state=graph_state,
-        protected_files_unchanged=protected_unchanged,
         diagnostics=tuple(graph_diagnostics),
     )
 
@@ -2799,8 +2895,6 @@ def _run_global_execution(
     workspace_volume: str,
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
-    protected_paths: set[str] | None = None,
-    pre_execution_files: dict[str, str | None] | None = None,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -2812,11 +2906,6 @@ def _run_global_execution(
 
     logger.info("qa_critic: [Step 0] running npm install.")
     results.install = _run_install(sandbox)
-    if protected_paths and pre_execution_files is not None:
-        current_files = _capture_workspace_files(sandbox, protected_paths)
-        results.protected_files_mutated |= any(
-            pre_execution_files.get(path) != current_files.get(path) for path in protected_paths
-        )
     install_ok, _ = results.install
 
     logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
@@ -2831,19 +2920,8 @@ def _run_global_execution(
             target_identifiers,
             baseline_identifiers,
         )
-    if protected_paths and pre_execution_files is not None:
-        current_files = _capture_workspace_files(sandbox, protected_paths)
-        results.protected_files_mutated |= any(
-            pre_execution_files.get(path) != current_files.get(path) for path in protected_paths
-        )
-
     logger.info("qa_critic: [Step 0] running unit tests.")
     results.tests = _run_unit_tests(sandbox)
-    if protected_paths and pre_execution_files is not None:
-        current_files = _capture_workspace_files(sandbox, protected_paths)
-        results.protected_files_mutated |= any(
-            pre_execution_files.get(path) != current_files.get(path) for path in protected_paths
-        )
 
     return results
 
@@ -3036,12 +3114,22 @@ def build_qa_toolbelt(
         return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
 
     @tool
-    def search_codebase_pattern(root_dir: str = ".", pattern: str = "") -> str:
-        """Search the workspace after the fixed QA pipeline has completed."""
+    def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
+        """
+        Search the workspace after the fixed QA pipeline has completed.
+
+        Args:
+            search_pattern: Extended regular expression to search for.
+            target_directory: Workspace-relative directory to search.
+        """
         review_error = _review_ready_error(results)
         if review_error:
             return review_error
-        return str(search_tool.invoke({"root_dir": root_dir, "pattern": pattern}))
+        return str(
+            search_tool.invoke(
+                {"search_pattern": search_pattern, "target_directory": target_directory}
+            )
+        )
 
     @tool
     def inspect_ast_symbol(file_path: str, symbol_name: str) -> str:
@@ -3164,12 +3252,22 @@ def build_qa_review_toolbelt(
         return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
 
     @tool
-    def search_codebase_pattern(root_dir: str = ".", pattern: str = "") -> str:
-        """Search the workspace for a regex pattern in source files."""
+    def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
+        """
+        Search the workspace for a regex pattern in source files.
+
+        Args:
+            search_pattern: Extended regular expression to search for.
+            target_directory: Workspace-relative directory to search.
+        """
         review_error = _review_ready_error(results)
         if review_error:
             return review_error
-        return str(search_tool.invoke({"root_dir": root_dir, "pattern": pattern}))
+        return str(
+            search_tool.invoke(
+                {"search_pattern": search_pattern, "target_directory": target_directory}
+            )
+        )
 
     @tool
     def inspect_ast_symbol(file_path: str, symbol_name: str) -> str:
@@ -3209,6 +3307,7 @@ def _build_individual_investigator_prompt(
     fix_instruction = fix_plan.instruction if fix_plan else "(none)"
     cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
     ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
+    policy_block = _qa_policy_prompt_block(qa_policy)
 
     install_ok, install_summary = results.install or (False, "not run")
     scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
@@ -3247,6 +3346,8 @@ def _build_individual_investigator_prompt(
 - Fix Plan Status: {fix_plan_status}
 - Fix Instruction: {fix_instruction}
 
+{policy_block}
+
 ## Agent Action Summaries for This Group
 {summaries_text}
 
@@ -3275,13 +3376,6 @@ they are not available to you.
 5. Global New Findings: Note any newly introduced identifiers, but do not assign ownership to this group without evidence.
 6. Workaround Path Review (if CODE_WORKAROUND): Does the changed code plausibly block the vulnerable execution path? Inspect the diff or relevant files.
 7. Exoneration or Uncertainty: Explicitly state whether this group is exonerated from failures attributed to other groups, or whether there is genuine uncertainty.
-
-For policies requiring semantic security review ({QAPolicy.INITIAL_CODE_WORKAROUND.value},
-{QAPolicy.MITIGATION_CODE_WORKAROUND.value}, and {QAPolicy.NO_FIX_CODE_REMOVAL.value}),
-you MUST inspect the relevant diff or workspace files and identify the advisory/CVE mechanism,
-affected and protected call sites, and concrete file/symbol evidence. End with a structured
-review block using exactly one verdict: PASS, FAIL, or INCONCLUSIVE, followed by concise
-reasoning and evidence references. A fallback based only on execution logs is INCONCLUSIVE.
 
 ## Output Format
 Write a free-form Markdown investigation report answering the 6 questions above.
@@ -3483,6 +3577,100 @@ def _build_fallback_investigation_for_group(
 # ---------------------------------------------------------------------------
 
 
+def _build_single_group_judge_prompt(
+    *,
+    group: VulnerabilityGroup,
+    group_section: str,
+    install_ok: bool,
+    install_summary: str,
+    scan_ok: bool,
+    scan_execution_status: str,
+    scan_summary: str,
+    post_scan_identifiers: list[str],
+    new_identifiers: list[str],
+    tests_ok: bool,
+    tests_summary: str,
+) -> str:
+    """Build a focused judge prompt for a batch containing one group.
+
+    The single-group path retains the BatchQAResult contract and all Python
+    guardrails, but removes cross-group attribution guidance that cannot help
+    when only one remediation group is under review.
+
+    Args:
+        group: The only vulnerability group in the QA batch.
+        group_section: Rendered policy and investigation evidence for ``group``.
+        install_ok: Whether the deterministic dependency install passed.
+        install_summary: Bounded dependency-install output.
+        scan_ok: Whether the deterministic security scan passed.
+        scan_execution_status: Deterministic scanner execution status.
+        scan_summary: Bounded security-scan output.
+        post_scan_identifiers: Identifiers found after remediation.
+        new_identifiers: Identifiers absent from the baseline scan.
+        tests_ok: Whether the deterministic test suite passed.
+        tests_summary: Bounded test output.
+
+    Returns:
+        A single-group Batch Judge prompt.
+    """
+    return f"""You are the Single-Group QA Judge in a map-reduce QA evaluation pipeline.
+
+This QA batch contains exactly one vulnerability group: `{group.group_id}`.
+Evaluate only that group and emit exactly one evaluation. The Python policy
+evaluator and deterministic gate values below are authoritative; do not
+rewrite them based on the investigation narrative.
+
+## Global Execution Results
+
+### Install
+- Success: {install_ok}
+- Summary: {install_summary[:2000]}
+
+### Security Scan
+- Success: {scan_ok}
+- Execution status: {scan_execution_status}
+- Summary: {scan_summary[:2000]}
+- Post-remediation identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
+- Newly introduced identifiers: {", ".join(new_identifiers) if new_identifiers else "(none)"}
+- Newly introduced identifiers are global findings for later triage. Do not attribute them to this group without deterministic evidence.
+
+### Unit Tests
+- Success: {tests_ok}
+- Summary: {tests_summary[:3000]}
+
+## Group Under Review
+
+{group_section}
+
+## Decision Rules
+
+1. Apply only the policy-specific QA contract shown in the group section.
+2. Deterministic install, scanner execution, package state, remaining identifiers,
+   and test results are authoritative facts.
+3. For policies requiring semantic review, emit PASS, FAIL, or INCONCLUSIVE with
+   concise reasoning and file/symbol/diff/advisory evidence references.
+4. Use SECURITY_FLAG for scanner evidence only when this group's policy makes
+   that evidence blocking, or when the required semantic review is missing,
+   inconclusive, or unsupported by source/diff evidence.
+5. Do not fail solely because residual target identifiers remain when the
+   policy-specific scanner rule says they are expected and non-blocking.
+6. Do not pass using execution logs alone when the policy requires source or
+   diff evidence.
+
+## Output Requirements
+
+Return a `BatchQAResult` containing:
+- `holistic_report`: A concise report scoped to `{group.group_id}`.
+- `evaluations`: Exactly one `QAEvaluation` whose `task_id` is `{group.group_id}`.
+
+Do not add cross-group responsible/possibly-responsible/exonerated sections,
+and do not perform cross-group test attribution. If the global test failure
+cannot be causally attributed to this group's remediation, state that clearly
+in the evaluation and retry feedback; the Python policy evaluator will apply
+the policy's deterministic test rule.
+"""
+
+
 def _build_batch_judge_prompt(
     valid_groups: list[VulnerabilityGroup],
     group_strategies: dict[str, str],
@@ -3517,6 +3705,7 @@ def _build_batch_judge_prompt(
     for group in valid_groups:
         strategy = group_strategies.get(group.group_id, "version_bump")
         policy = (group_policies or {}).get(group.group_id)
+        policy_block = _qa_policy_prompt_block(policy)
         fix_plan = group.fix_plan
         fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
         fix_instruction = fix_plan.instruction if fix_plan else "(none)"
@@ -3556,16 +3745,36 @@ def _build_batch_judge_prompt(
             f"- GHSAs          : {ghsas}\n"
             f"- Fix Plan Status: {fix_plan_status}\n"
             f"- Fix Instruction: {fix_instruction}\n"
+            f"\n{policy_block}\n"
             f"- **Remaining Scanner Identifiers (deterministic):** {remaining_text}\n"
             f"- Package manifest state (deterministic): {package_state.manifest_state or 'not applicable'}\n"
             f"- Package graph state (deterministic): {package_state.graph_state or 'not applicable'}\n"
-            f"- Protected files unchanged (deterministic): {package_state.protected_files_unchanged}\n"
             f"- Agent Action Summaries:\n{summaries_text}\n\n"
             f"**Individual Investigation:**\n{investigation_text}\n"
             f"**Review Tool Evidence:** tools={investigation_tools}; source/diff inspection={source_evidence}\n"
         )
 
     all_group_sections = "\n".join(group_sections)
+
+    if len(valid_groups) == 1:
+        scan_execution_status = _scan_result_value(
+            results.scan, "execution_status", ScannerExecutionStatus.NOT_RUN
+        )
+        if isinstance(scan_execution_status, ScannerExecutionStatus):
+            scan_execution_status = scan_execution_status.value
+        return _build_single_group_judge_prompt(
+            group=valid_groups[0],
+            group_section=group_sections[0],
+            install_ok=install_ok,
+            install_summary=install_summary,
+            scan_ok=scan_ok,
+            scan_execution_status=str(scan_execution_status),
+            scan_summary=scan_summary,
+            post_scan_identifiers=post_scan_identifiers,
+            new_identifiers=new_identifiers,
+            tests_ok=tests_ok,
+            tests_summary=tests_summary,
+        )
 
     return f"""You are the Batch Judge in a map-reduce QA evaluation pipeline.
 
@@ -3597,9 +3806,9 @@ Your job is to synthesize these into a holistic report and emit exactly one QAEv
 ## Evaluation Rules
 
 Deterministic gate values above are authoritative facts. Do not change install,
-scanner execution, group-specific remaining identifiers, package state, protected
-file state, or hard-test results. The Python policy evaluator overwrites any
-LLM-provided deterministic fields.
+scanner execution, group-specific remaining identifiers, package state, or
+hard-test results. The Python policy evaluator overwrites any LLM-provided
+deterministic fields.
 
 For VERSION_BUMP, request structured test attribution only when tests fail. A
 group may be exonerated only when the attribution names responsible group IDs,
@@ -3608,17 +3817,23 @@ policy. For required semantic-review policies, emit a structured semantic review
 with PASS, FAIL, or INCONCLUSIVE, concise reasoning, and file/symbol/diff/advisory
 evidence references. Missing or fallback investigation evidence is INCONCLUSIVE.
 
-Residual identifiers are non-blocking only for INITIAL_CODE_WORKAROUND,
-MITIGATION_CODE_WORKAROUND, and NO_FIX_CODE_REMOVAL. Newly introduced global
-identifiers are graph-level findings and must not be assigned automatically.
+Apply only the policy-specific QA contract shown under each group. In particular,
+the treatment of residual target identifiers and the required package state is
+policy-dependent. Newly introduced global identifiers are graph-level findings
+and must not be assigned automatically.
 
 3. Use **PEER_CONFLICT** for install failures caused by dependency conflicts (ERESOLVE, EBADENGINE, peer tree).
 
 4. Use **BREAKING_CHANGE** for test regressions or behavior changes caused by this group's remediation.
 
-5. Use **SECURITY_FLAG** for unresolved scanner evidence or flawed workaround logic.
+5. Use **SECURITY_FLAG** for scanner evidence only when the applicable group's
+   policy makes that evidence blocking, or when the required semantic review is
+   missing, inconclusive, or unsupported by source/diff evidence.
 
-6. If a group has BOTH unresolved scanner evidence AND is plausibly causing unit test failures, choose **SECURITY_FLAG** as the single failure_category. Mention the test regression in retry_feedback and the holistic report, but do not label the group BREAKING_CHANGE.
+6. Do not fail a group solely because residual target identifiers remain when
+   that group's policy-specific scanner rule says they are expected and
+   non-blocking. Apply the policy block under each group as the authoritative
+   interpretation of residual identifiers.
 
 7. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
 
@@ -3781,10 +3996,8 @@ def _evaluate_policy_gates(
             deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
             deterministic_pass = deterministic_pass and package_state.graph_state == "absent"
         if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+            deterministic_pass = deterministic_pass and package_state.manifest_state == "present"
             deterministic_pass = deterministic_pass and package_state.graph_state == "present"
-            deterministic_pass = (
-                deterministic_pass and package_state.protected_files_unchanged is True
-            )
 
         gates_by_group[group.group_id] = QADeterministicGates(
             status="pass" if deterministic_pass else "fail",
@@ -3795,7 +4008,6 @@ def _evaluate_policy_gates(
             tests_passed=tests_passed,
             package_manifest_state=package_state.manifest_state,
             package_graph_state=package_state.graph_state,
-            protected_files_unchanged=package_state.protected_files_unchanged,
             diagnostics=diagnostics,
         )
     return gates_by_group, errors
@@ -3855,11 +4067,7 @@ def _apply_policy_decision(
             )
 
     final: dict[str, QAEvaluation] = {}
-    required_semantic = {
-        QAPolicy.INITIAL_CODE_WORKAROUND,
-        QAPolicy.MITIGATION_CODE_WORKAROUND,
-        QAPolicy.NO_FIX_CODE_REMOVAL,
-    }
+    required_semantic = _REQUIRED_SEMANTIC_QA_POLICIES
     strict_scanner = {
         QAPolicy.VERSION_BUMP,
         QAPolicy.MIGRATION_CODE_WORKAROUND,
@@ -3960,18 +4168,18 @@ def _apply_policy_decision(
                     )
                 )
         if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+            if gates.package_manifest_state != "present":
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "NO_FIX Stage 2 requires the package to remain present in the direct manifest.",
+                    )
+                )
             if gates.package_graph_state != "present":
                 failures.append(
                     (
                         FailureCategory.SECURITY_FLAG,
                         "NO_FIX Stage 2 requires the package to remain present in the resolved dependency graph.",
-                    )
-                )
-            if gates.protected_files_unchanged is not True:
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "NO_FIX Stage 2 requires protected manifests and lockfiles to match the committed baseline throughout QA.",
                     )
                 )
         semantic_review = current.semantic_security_review
@@ -4710,32 +4918,6 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     deterministic_test_evidence: QAFailureEvidence | None = None
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            task_queue = state.get("task_queue") or {}
-            replay_plans = state.get("workaround_replay_plans_by_task") or {}
-            baseline_by_group: dict[str, dict[str, str] | None] = {}
-            baseline_absent_by_group: dict[str, list[str]] = {}
-            protected_paths: set[str] = set()
-            for group in valid_groups:
-                if group_policies.get(group.group_id) != QAPolicy.NO_FIX_CODE_REMOVAL:
-                    continue
-                source_group = source_groups_by_id.get(group.group_id, group)
-                task = next(
-                    (
-                        candidate
-                        for candidate in task_queue.values()
-                        if getattr(candidate, "parent_group_id", None) == group.group_id
-                    ),
-                    None,
-                )
-                plan = replay_plans.get(getattr(task, "task_id", "")) if task else None
-                baseline = getattr(plan, "pre_attempt_snapshots", None)
-                baseline_absent = list(getattr(plan, "pre_attempt_absent_paths", []) or [])
-                baseline_by_group[group.group_id] = baseline
-                baseline_absent_by_group[group.group_id] = baseline_absent
-                protected_paths.update(
-                    _protected_package_paths(source_group, baseline, baseline_absent)
-                )
-            pre_execution_files = _capture_workspace_files(sandbox, protected_paths)
             # ------------------------------------------------------------------
             # Step 0: Global Execution (deterministic Python, exactly once)
             # ------------------------------------------------------------------
@@ -4744,21 +4926,13 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 workspace_volume=workspace_volume,
                 target_identifiers=target_identifiers,
                 baseline_identifiers=baseline_identifiers,
-                protected_paths=protected_paths,
-                pre_execution_files=pre_execution_files,
             )
             for group in valid_groups:
                 source_group = source_groups_by_id.get(group.group_id, group)
-                baseline = baseline_by_group.get(group.group_id)
-                baseline_absent = baseline_absent_by_group.get(group.group_id, [])
                 results.package_state_by_group[group.group_id] = _collect_group_package_state(
                     sandbox,
                     source_group,
                     group_policies.get(group.group_id),
-                    baseline_snapshots=baseline,
-                    baseline_absent_paths=baseline_absent,
-                    pre_execution_files=pre_execution_files,
-                    qa_protected_files_mutated=results.protected_files_mutated,
                 )
             scan_projection = _scan_state_projection(results, baseline_identifiers)
 

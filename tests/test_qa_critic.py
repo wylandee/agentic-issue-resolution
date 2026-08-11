@@ -1266,7 +1266,38 @@ class TestQAExecutionToolGuards:
         changed_tool = self._get_tool(tools, "list_changed_files")
         search_tool = self._get_tool(tools, "search_codebase_pattern")
         assert "Review tools are locked" in changed_tool.invoke({})
-        assert "Review tools are locked" in search_tool.invoke({"root_dir": ".", "pattern": "foo"})
+        assert "Review tools are locked" in search_tool.invoke(
+            {"search_pattern": "foo", "target_directory": "."}
+        )
+
+    def test_search_review_tool_forwards_search_contract(self):
+        sandbox = MagicMock()
+        search_backend = MagicMock()
+        search_backend.invoke.return_value = "routes/app.ts:1:notevil"
+        with patch(
+            "remediation_engine.orchestration.remedy_tools._make_search_codebase_pattern_tool",
+            return_value=search_backend,
+        ):
+            tools, results = build_qa_toolbelt(
+                sandbox=sandbox,
+                workspace_volume="test-vol",
+                target_identifiers=set(),
+                candidate_changed_files=[],
+                host_repo_root=None,
+            )
+            results.install = (True, "install ok")
+            results.scan = (True, "scan ok", set())
+            results.tests = (True, "tests ok")
+            search_tool = self._get_tool(tools, "search_codebase_pattern")
+
+            assert (
+                search_tool.invoke({"search_pattern": "notevil", "target_directory": "routes"})
+                == "routes/app.ts:1:notevil"
+            )
+
+        search_backend.invoke.assert_called_once_with(
+            {"search_pattern": "notevil", "target_directory": "routes"}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2042,7 +2073,62 @@ class TestGroupScanAttribution:
 
         assert "CVE-2025-10001" in investigator_prompt
         assert "CVE-2025-10001" in batch_prompt
-        assert "Do not force them into an existing group's evaluation" in batch_prompt
+        assert "global findings for later triage" in batch_prompt
+
+    def test_batch_judge_includes_policy_contract_for_each_group(self):
+        code_group = _make_group(group_id="code-group")
+        package_group = _make_group(group_id="package-group")
+        prompt = _build_batch_judge_prompt(
+            valid_groups=[code_group, package_group],
+            group_strategies={
+                code_group.group_id: "workaround",
+                package_group.group_id: "version_bump",
+            },
+            action_summaries=[],
+            results=_make_fully_populated_results(ok=True),
+            investigations_by_group={},
+            group_policies={
+                code_group.group_id: QAPolicy.NO_FIX_CODE_REMOVAL,
+                package_group.group_id: QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+            },
+        )
+
+        assert "QA Policy: no_fix_code_removal" in prompt
+        assert "Target scanner identifiers are expected to remain" in prompt
+        assert "QA Policy: no_fix_package_removal" in prompt
+        assert "must be absent from every authorized direct manifest" in prompt
+
+    def test_single_group_batch_judge_uses_focused_policy_prompt(self):
+        group = _make_group(group_id="single-code-group")
+        prompt = _build_batch_judge_prompt(
+            valid_groups=[group],
+            group_strategies={group.group_id: "workaround"},
+            action_summaries=[],
+            results=_make_fully_populated_results(ok=True),
+            investigations_by_group={},
+            group_policies={group.group_id: QAPolicy.NO_FIX_CODE_REMOVAL},
+        )
+
+        assert "Single-Group QA Judge" in prompt
+        assert "QA Policy: no_fix_code_removal" in prompt
+        assert "residual target identifiers remain" in prompt
+        assert "Do not add cross-group" in prompt
+        assert "Exactly one `QAEvaluation`" in prompt
+        assert "### Responsible" not in prompt
+
+    def test_multi_group_batch_judge_keeps_policy_specific_scanner_precedence(self):
+        groups = [_make_group(group_id="group-a"), _make_group(group_id="group-b")]
+        prompt = _build_batch_judge_prompt(
+            valid_groups=groups,
+            group_strategies={group.group_id: "workaround" for group in groups},
+            action_summaries=[],
+            results=_make_fully_populated_results(ok=True),
+            investigations_by_group={},
+            group_policies={group.group_id: QAPolicy.NO_FIX_CODE_REMOVAL for group in groups},
+        )
+
+        assert "policy-specific scanner rule says they are expected" in prompt
+        assert "Use **SECURITY_FLAG** for unresolved scanner evidence" not in prompt
 
 
 class TestJudgePhaseIsolation:
@@ -2349,6 +2435,36 @@ class TestBuildQaReviewToolbelt:
         assert "Detected Failures: 1" in result
         assert "jwt challenge" in result
 
+    def test_search_tool_forwards_search_contract(self):
+        sandbox = MagicMock()
+        search_backend = MagicMock()
+        search_backend.invoke.return_value = "src/app.ts:1:unsafeCall"
+        results = _QAExecutionResults(
+            install=(True, "install ok"),
+            scan=(True, "scan ok", set()),
+            tests=(True, "tests ok"),
+        )
+        with patch(
+            "remediation_engine.orchestration.remedy_tools._make_search_codebase_pattern_tool",
+            return_value=search_backend,
+        ):
+            tools = build_qa_review_toolbelt(
+                sandbox=sandbox,
+                candidate_changed_files=["src/app.ts"],
+                host_repo_root="/tmp/repo",
+                results=results,
+            )
+            search_tool = next(tool for tool in tools if tool.name == "search_codebase_pattern")
+
+            assert (
+                search_tool.invoke({"search_pattern": "unsafeCall", "target_directory": "src"})
+                == "src/app.ts:1:unsafeCall"
+            )
+
+        search_backend.invoke.assert_called_once_with(
+            {"search_pattern": "unsafeCall", "target_directory": "src"}
+        )
+
 
 # ---------------------------------------------------------------------------
 # _build_individual_investigator_prompt
@@ -2382,6 +2498,46 @@ class TestBuildIndividualInvestigatorPrompt:
     def test_instructs_not_to_call_execution_tools(self):
         lower = self._prompt().lower()
         assert "not available to you" in lower or "do not attempt" in lower
+
+    @pytest.mark.parametrize(
+        ("policy", "expected_text"),
+        [
+            (QAPolicy.VERSION_BUMP, "Target scanner identifiers must be cleared"),
+            (
+                QAPolicy.INITIAL_CODE_WORKAROUND,
+                "Target scanner identifiers are non-blocking for this policy",
+            ),
+            (
+                QAPolicy.MIGRATION_CODE_WORKAROUND,
+                "Target scanner identifiers must be cleared",
+            ),
+            (
+                QAPolicy.MITIGATION_CODE_WORKAROUND,
+                "Target scanner identifiers are non-blocking for this policy",
+            ),
+            (
+                QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+                "must be absent from every authorized direct manifest",
+            ),
+            (
+                QAPolicy.NO_FIX_CODE_REMOVAL,
+                "Target scanner identifiers are expected to remain",
+            ),
+        ],
+    )
+    def test_includes_policy_specific_qa_contract(self, policy, expected_text):
+        prompt = _build_individual_investigator_prompt(
+            group=_make_group(),
+            strategy="version_bump",
+            results=_make_fully_populated_results(ok=True),
+            group_remaining_ids=["CVE-2025-0001"],
+            candidate_changed_files=["routes/example.ts"],
+            action_summaries=[],
+            qa_policy=policy,
+        )
+
+        assert f"QA Policy: {policy.value}" in prompt
+        assert expected_text in prompt
 
 
 # ---------------------------------------------------------------------------
