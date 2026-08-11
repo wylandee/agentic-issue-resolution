@@ -138,13 +138,13 @@
         <packageUrl regex="true">^pkg:npm/form-data@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
-<!--
+
     <suppress>
         <notes>Suppress all vulnerabilities for got</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
+
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli:1.5.0</notes>
         <packageUrl regex="true">^pkg:npm/grunt-cli@.*$</packageUrl>
@@ -234,13 +234,13 @@
         <packageUrl regex="true">^pkg:npm/nanoid@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
-<!--
+
     <suppress>
         <notes>Suppress all vulnerabilities for notevil</notes>
         <packageUrl regex="true">^pkg:npm/notevil@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
+
     <suppress>
         <notes>Suppress all vulnerabilities for parseuri</notes>
         <packageUrl regex="true">^pkg:npm/parseuri@.*$</packageUrl>
