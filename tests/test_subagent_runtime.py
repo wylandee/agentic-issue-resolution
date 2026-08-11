@@ -132,6 +132,193 @@ def test_sandbox_failure_drains_all_tool_calls_before_returning() -> None:
     assert any("Sandbox is not running" in error for error in result.errors)
 
 
+def test_manifest_tool_calls_are_serialized_and_deferred_within_one_turn() -> None:
+    """A batch continues after parallel-looking manifest calls are deferred."""
+    modify_tool = MagicMock()
+    modify_tool.name = "modify_npm_dependency"
+    modify_tool.invoke.side_effect = [
+        "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json.",
+        "SUCCESS: Natively updated dependencies.axios to 1.7.4 in package.json.",
+    ]
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_manifest_sync"
+    validate_tool.invoke.side_effect = [
+        "SUCCESS: Manifest synchronization succeeded for package 'lodash'.",
+        "SUCCESS: Manifest synchronization succeeded for package 'axios'.",
+    ]
+
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": modify_tool.name,
+                    "args": {"package_name": "lodash"},
+                    "id": "modify-lodash",
+                },
+                {
+                    "name": modify_tool.name,
+                    "args": {"package_name": "axios"},
+                    "id": "modify-axios-deferred",
+                },
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"package_name": "lodash"},
+                    "id": "validate-lodash",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": modify_tool.name,
+                    "args": {"package_name": "axios"},
+                    "id": "modify-axios",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"package_name": "axios"},
+                    "id": "validate-axios",
+                }
+            ],
+        ),
+        AIMessage(content="Batch complete."),
+    ]
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = responses
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [modify_tool, validate_tool],
+        [HumanMessage(content="Process the dependency update batch.")],
+        set(),
+    )
+
+    assert result.errors == []
+    assert [event.name for event in result.tool_events] == [
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+    ]
+    assert modify_tool.invoke.call_count == 2
+    assert validate_tool.invoke.call_count == 2
+    assert bound_llm.invoke.call_count == 5
+    llm.bind_tools.assert_called_once_with(
+        [modify_tool, validate_tool],
+        parallel_tool_calls=False,
+    )
+
+    second_turn = bound_llm.invoke.call_args_list[1].args[0]
+    assert any(
+        isinstance(message, HumanMessage)
+        and "Manifest operation sequencing barrier" in message.content
+        for message in second_turn
+    )
+    first_turn_tool_messages = [
+        message
+        for message in bound_llm.invoke.call_args_list[1].args[0]
+        if message.__class__.__name__ == "ToolMessage"
+    ]
+    assert any("DEFERRED" in message.content for message in first_turn_tool_messages)
+
+
+def test_manifest_validation_failure_does_not_stop_later_batch_items() -> None:
+    """A failed package validation can be rolled back while the batch advances."""
+    modify_tool = MagicMock()
+    modify_tool.name = "modify_npm_dependency"
+    modify_tool.invoke.side_effect = [
+        "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json.",
+        "SUCCESS: Natively updated dependencies.axios to 1.7.4 in package.json.",
+    ]
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_manifest_sync"
+    validate_tool.invoke.side_effect = [
+        "FAILURE: Manifest sync failed for package 'lodash'. Rolled back package 'lodash'.",
+        "SUCCESS: Manifest synchronization succeeded for package 'axios'.",
+    ]
+
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": modify_tool.name,
+                    "args": {"package_name": "lodash"},
+                    "id": "modify-lodash",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"package_name": "lodash"},
+                    "id": "validate-lodash",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": modify_tool.name,
+                    "args": {"package_name": "axios"},
+                    "id": "modify-axios",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"package_name": "axios"},
+                    "id": "validate-axios",
+                }
+            ],
+        ),
+        AIMessage(content="Lodash surrendered; axios completed."),
+    ]
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = responses
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [modify_tool, validate_tool],
+        [HumanMessage(content="Process the dependency update batch.")],
+        set(),
+    )
+
+    assert result.errors == []
+    assert modify_tool.invoke.call_count == 2
+    assert validate_tool.invoke.call_count == 2
+    assert [event.name for event in result.tool_events] == [
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+    ]
+    assert "Rolled back package 'lodash'" in result.tool_events[1].content
+    assert result.tool_events[-1].content.startswith("SUCCESS:")
+
+
 def test_validation_gate_must_follow_the_final_edit() -> None:
     """A gate passed before a later edit must not establish success."""
     events = [

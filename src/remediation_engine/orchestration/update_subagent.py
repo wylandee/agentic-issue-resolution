@@ -255,6 +255,7 @@ def _legacy_build_update_prompt(
                 "You are a dependency-resolution specialist operating inside a shared Docker workspace.",
                 "You may only modify package manifests through modify_npm_dependency.",
                 "You must inspect the repository map before making manifest changes.",
+                "Emit at most one modify_npm_dependency or validate_manifest_sync tool call per assistant turn; tool calls in one message cannot observe each other's results.",
                 "After completing the exact manifest edits for each package, call validate_manifest_sync for that package before editing the next package.",
                 "If validate_manifest_sync fails, you must resolve the peer conflict or invalid manifest state before finishing.",
                 "Every modify_npm_dependency call must include the exact manifest_path you intend to edit.",
@@ -970,9 +971,10 @@ def _build_update_prompt(
         "Do not search the NPM registry, choose alternate versions, or perform retry planning.",
         "Use only read_repository_map, modify_npm_dependency, revert_workspace_file, and validate_manifest_sync.",
         "Inspect the repository map before editing.",
+        "Emit at most one modify_npm_dependency or validate_manifest_sync tool call per assistant turn; tool calls in one message cannot observe each other's results.",
         "For each package, apply all of its exact task instructions, then call validate_manifest_sync with that package_name before moving to the next package.",
         "The validator rolls back only the current package to its pre-update checkpoint when synchronization fails; preserve earlier packages whose validations succeeded.",
-        "If a package validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
+        "If a package validation fails, do not choose another version or retry inside this worker; leave that package rolled back, record the failure in your final summary, and continue with the next package in the batch.",
         "Never edit source-code files in this worker.",
         "",
         "Constraints ledger:",
@@ -996,7 +998,7 @@ def _build_update_prompt(
         [
             "",
             "Completion rule:",
-            "Return control only after every package has one successful per-package manifest synchronization call, or after surrendering on the first package validation failure.",
+            "Return control only after every package has a per-package manifest synchronization result; failed packages must be rolled back and individually reported while successful packages remain committed.",
         ]
     )
     return "\n".join(sections)

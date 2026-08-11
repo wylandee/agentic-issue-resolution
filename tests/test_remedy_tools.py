@@ -950,6 +950,58 @@ class TestValidateManifestSync:
         assert touched_files == set()
         sandbox.write_file.assert_called_once_with("package.json", baseline)
 
+    def test_failed_package_validation_does_not_block_next_package(self):
+        sandbox = MagicMock()
+        success = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0)
+        failure = CommandResult(
+            exit_code=1,
+            stdout="partial",
+            stderr="ERESOLVE unable to resolve dependency tree",
+            duration_seconds=1.0,
+        )
+        # The failed package validation also removes its absent lockfiles during
+        # rollback before the next package is allowed to start.
+        sandbox.run.side_effect = [success, failure, success, success, success, success]
+        baseline = '{"dependencies": {"lodash": "4.17.20", "axios": "1.7.3"}}\n'
+        sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
+        touched_files: set[str] = set()
+        execution_state = {"edits_started": False, "validation_calls": 0}
+        tools = _update_tool_map(
+            sandbox,
+            touched_files=touched_files,
+            package_manifest_paths={
+                "lodash": ["package.json"],
+                "axios": ["package.json"],
+            },
+            execution_state=execution_state,
+        )
+
+        lodash_edit = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.22",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        lodash_validation = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
+        axios_edit = tools["modify_npm_dependency"].invoke(
+            {
+                "package_name": "axios",
+                "target_version": "1.7.4",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
+        axios_validation = tools["validate_manifest_sync"].invoke({"package_name": "axios"})
+
+        assert lodash_edit.startswith("SUCCESS:")
+        assert lodash_validation.startswith("FAILURE:")
+        assert "Rolled back package 'lodash'" in lodash_validation
+        assert axios_edit.startswith("SUCCESS:")
+        assert axios_validation.startswith("SUCCESS:")
+        assert execution_state["validation_calls"] == 2
+
 
 class TestValidateCodeSyntax:
     def test_js_uses_node_check(self):

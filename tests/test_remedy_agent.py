@@ -143,6 +143,8 @@ class TestUpdateSubagentWrapper:
         assert "4.17.22" in prompt
         assert "task instruction is authoritative" in prompt
         assert "execution worker" in prompt
+        assert "at most one modify_npm_dependency or validate_manifest_sync" in prompt
+        assert "continue with the next package in the batch" in prompt
         assert "First-pass mode:" not in prompt
         assert "First-pass planning questions:" not in prompt
         assert "Planning Answers" not in prompt
