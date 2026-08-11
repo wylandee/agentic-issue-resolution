@@ -613,6 +613,21 @@ def _render_markdown(
             worker_data = to_jsonable(worker) if worker is not None else {}
             qa_data = to_jsonable(qa) if qa is not None else {}
             task_data = to_jsonable(task) if task is not None else {}
+            if not isinstance(worker_data, Mapping):
+                worker_data = {}
+            if not isinstance(qa_data, Mapping):
+                qa_data = {}
+            if not isinstance(task_data, Mapping):
+                task_data = {}
+            evaluation_data = qa_data.get("evaluation")
+            if not isinstance(evaluation_data, Mapping):
+                evaluation_data = {}
+            deterministic_gates = evaluation_data.get("deterministic_gates")
+            if not isinstance(deterministic_gates, Mapping):
+                deterministic_gates = {}
+            semantic_security_review = evaluation_data.get("semantic_security_review")
+            if not isinstance(semantic_security_review, Mapping):
+                semantic_security_review = {}
             instruction = str(data.get("instruction", ""))
             if len(instruction) > 180:
                 instruction = instruction[:177] + "..."
@@ -631,17 +646,9 @@ def _render_markdown(
                         _table_value(data.get("dispatch_node")),
                         _table_value(", ".join(worker_data.get("executed_versions", []) or [])),
                         _table_value(worker_data.get("status", "pending")),
-                        _table_value((qa_data.get("evaluation") or {}).get("passed", "pending")),
-                        _table_value(
-                            (qa_data.get("evaluation") or {})
-                            .get("deterministic_gates", {})
-                            .get("status", "pending")
-                        ),
-                        _table_value(
-                            (qa_data.get("evaluation") or {})
-                            .get("semantic_security_review", {})
-                            .get("verdict", "optional")
-                        ),
+                        _table_value(evaluation_data.get("passed", "pending")),
+                        _table_value(deterministic_gates.get("status", "pending")),
+                        _table_value(semantic_security_review.get("verdict", "optional")),
                         _table_value(task_data.get("status", "unknown")),
                         _table_value(instruction),
                     ]

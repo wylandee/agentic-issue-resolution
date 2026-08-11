@@ -161,6 +161,54 @@ def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
     assert '"passed": false' in markdown
 
 
+def test_attempt_snapshot_summary_handles_optional_qa_sections_set_to_none():
+    markdown = _render_markdown(
+        trace_id="trace-optional-qa",
+        repo_root="repo",
+        initial_state={},
+        final_state={
+            "task_queue": {
+                "task-1": {
+                    "task_id": "task-1",
+                    "task_revision": 1,
+                    "status": "qa_passed",
+                }
+            },
+            "attempt_snapshots_by_id": {
+                "attempt-1": {
+                    "attempt_id": "attempt-1",
+                    "task_id": "task-1",
+                    "task_revision": 1,
+                    "attempt_number": 1,
+                    "strategy_stage": "package_removal",
+                    "dispatch_node": "workaround_subagent",
+                    "instruction": "Keep the package installed and remove vulnerable code.",
+                }
+            },
+            "worker_results_by_attempt": {
+                "attempt-1": {"status": "success", "executed_versions": []}
+            },
+            "qa_results_by_attempt": {
+                "attempt-1": {
+                    "evaluation": {
+                        "passed": True,
+                        "deterministic_gates": None,
+                        "semantic_security_review": None,
+                    }
+                }
+            },
+        },
+        spans=[],
+        source="local-fallback",
+        langsmith_url=None,
+        warnings=[],
+        run_error=None,
+        trajectory_path=Path("data/trajectories/trace-optional-qa.md"),
+    )
+
+    assert "| True | pending | optional | qa_passed |" in markdown
+
+
 def test_export_writes_one_markdown_file_with_root_state_and_span_details(tmp_path, monkeypatch):
     monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(tmp_path))
     recorder = TrajectoryRecorder()
