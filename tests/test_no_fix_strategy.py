@@ -6,6 +6,11 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from examples.juice_shop.fixtures.workaround_nofix.run_workaround_nofix import (
+    build_initial_state,
+    load_nofix_fixture,
+)
+
 from remediation_engine.contracts import NoFixMitigationStage
 from remediation_engine.contracts.schemas import (
     CommandResult,
@@ -188,6 +193,17 @@ def test_transition_helper_builds_deterministic_stage_two_instruction_and_reset(
     assert updates["qa_policy"] == QAPolicy.NO_FIX_CODE_REMOVAL
     assert updates["status"] == TaskStatus.NEEDS_RETRY
     assert "VULNERABLE CODE REMOVAL" in updates["instruction"]
+
+
+def test_stage_two_nofix_fixture_commits_matching_code_removal_policy():
+    state = build_initial_state(Path.cwd(), load_nofix_fixture())
+    task = state["task_queue"]["task-nofix-notevil"]
+    snapshot = state["attempt_snapshots_by_id"][task.current_attempt_id]
+
+    assert task.qa_policy == QAPolicy.NO_FIX_CODE_REMOVAL
+    assert snapshot.qa_policy == task.qa_policy
+    assert snapshot.dispatch_node == "workaround_subagent"
+    assert snapshot.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
 
 
 def test_routing_and_llm_guardrails_keep_no_fix_on_one_current_stage():
