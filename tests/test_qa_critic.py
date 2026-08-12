@@ -2136,6 +2136,32 @@ class TestGroupScanAttribution:
         assert "policy-specific scanner rule says they are expected" in prompt
         assert "Use **SECURITY_FLAG** for unresolved scanner evidence" not in prompt
 
+    def test_failed_batch_prompt_uses_failure_ledger_and_evidence_rules(self):
+        first = _make_group(group_id="group-a")
+        second = _make_group(group_id="group-b")
+        results = _make_fully_populated_results(ok=False)
+
+        prompt = _build_batch_judge_prompt(
+            valid_groups=[first, second],
+            group_strategies={
+                first.group_id: "version_bump",
+                second.group_id: "version_bump",
+            },
+            action_summaries=[],
+            results=results,
+            investigations_by_group={},
+            group_policies={
+                first.group_id: QAPolicy.VERSION_BUMP,
+                second.group_id: QAPolicy.VERSION_BUMP,
+            },
+        )
+
+        assert "Deterministic Failure Ledger" in prompt
+        assert "failure-ledger entry independently" in prompt
+        assert "Do not infer blame" in prompt
+        assert "must contain exact entries" in prompt
+        assert "Use INCONCLUSIVE when" in prompt
+
 
 class TestJudgePhaseIsolation:
     def test_judge_prompt_uses_only_current_group_block(self):

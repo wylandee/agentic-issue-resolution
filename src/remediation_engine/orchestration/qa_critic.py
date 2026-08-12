@@ -141,8 +141,9 @@ _QA_POLICY_PROMPT_SPECS: dict[QAPolicy, _QAPolicyPromptSpec] = {
             "fixed version is represented in the dependency state."
         ),
         tests_rule=(
-            "Review failed tests for structured, evidence-backed attribution to another group; "
-            "the Python policy evaluator decides whether an exoneration is valid."
+            "Review each failed test independently. Assign responsibility only when the failure "
+            "contains positive evidence tied to this group's changed package or behavior; "
+            "otherwise use structured exoneration or INCONCLUSIVE attribution."
         ),
         semantic_rule="A code-path semantic review is not required by this policy.",
         review_focus=(
@@ -150,8 +151,9 @@ _QA_POLICY_PROMPT_SPECS: dict[QAPolicy, _QAPolicyPromptSpec] = {
             "scanner clearance, and any test attribution."
         ),
         prohibited_conclusions=(
-            "Do not exonerate a group from a remaining target scanner identifier or from a "
-            "test failure without the required structured evidence."
+            "Do not assign blame because a group was updated in the same batch, and do not "
+            "exonerate a group without naming the exact failed tests and evidence that points "
+            "to another known group or establishes that the failure is unrelated."
         ),
     ),
     QAPolicy.INITIAL_CODE_WORKAROUND: _QAPolicyPromptSpec(
@@ -3517,14 +3519,14 @@ they are not available to you.
 ## Questions to Answer
 1. Package/Domain Purpose: What does this package/component do? What domain does it serve?
 2. Relevant Global Failures: Which (if any) of the install/scan/test failures are relevant to this group's domain?
-3. Plausible Causation: Did this group's remediation plausibly cause the observed install or test failures? Reason deductively.
+3. Plausible Causation: Did this group's remediation cause any observed failure? Require positive stack, changed-behavior, or direct test-domain evidence; do not infer causation from batch membership or domain similarity alone.
 4. Scanner Findings: Do the deterministic remaining scanner identifiers above indicate this group still has unresolved vulnerabilities?
 5. Global New Findings: Note any newly introduced identifiers, but do not assign ownership to this group without evidence.
 6. Workaround Path Review (if CODE_WORKAROUND): Does the changed code plausibly block the vulnerable execution path? Inspect the diff or relevant files.
-7. Exoneration or Uncertainty: Explicitly state whether this group is exonerated from failures attributed to other groups, or whether there is genuine uncertainty.
+7. Exoneration or Uncertainty: Mark this group EXONERATED only when no failure evidence points to it and the relevant failure is attributed to another exact group or is clearly unrelated. Otherwise state INCONCLUSIVE.
 
 ## Output Format
-Write a free-form Markdown investigation report answering the 6 questions above.
+Write a free-form Markdown investigation report answering the 7 questions above.
 Be specific. Reference exact test names, file names, or scanner identifiers where possible.
 End with a one-sentence summary verdict for this group.
 
@@ -3736,6 +3738,7 @@ def _build_single_group_judge_prompt(
     new_identifiers: list[str],
     tests_ok: bool,
     tests_summary: str,
+    failure_evidence: QAFailureEvidence | None = None,
 ) -> str:
     """Build a focused judge prompt for a batch containing one group.
 
@@ -3784,6 +3787,13 @@ rewrite them based on the investigation narrative.
 - Success: {tests_ok}
 - Summary: {tests_summary[:3000]}
 
+## Deterministic Failure Ledger
+{_format_deterministic_test_failure_ledger(_QAExecutionResults(tests=(tests_ok, tests_summary)), failure_evidence)}
+
+The ledger is evidence only. Do not treat a global failure as proof that this
+single group is responsible. Attribute only a failure with positive causal
+linkage to this group; otherwise use INCONCLUSIVE.
+
 ## Group Under Review
 
 {group_section}
@@ -3802,10 +3812,12 @@ rewrite them based on the investigation narrative.
    policy-specific scanner rule says they are expected and non-blocking.
 6. Do not pass using execution logs alone when the policy requires source or
    diff evidence.
-7. If tests fail, never emit `exonerated` with an empty
-   `responsible_group_ids` list. This batch has one group, so use
-   `inconclusive` when no exact responsible group can be named; the Python
-   policy evaluator will fail the group closed.
+7. If tests fail, emit structured `test_attribution`. Use RESPONSIBLE only
+   when the failure ledger contains positive evidence tied to this group. With
+   one group there is no other group available for EXONERATED attribution, so
+   use INCONCLUSIVE when the failure is shared, cancelled, unowned, or cannot
+   be causally tied to this group's remediation. Never infer responsibility
+   from batch membership, package-domain similarity, or a global test failure.
 
 ## Output Requirements
 
@@ -3822,6 +3834,55 @@ the Python policy evaluator will apply the policy's deterministic test rule.
 You MUST emit exactly one evaluation for group {group.group_id}."""
 
 
+def _format_deterministic_test_failure_ledger(
+    results: _QAExecutionResults,
+    failure_evidence: QAFailureEvidence | None = None,
+) -> str:
+    """Format bounded, Python-owned test evidence for attribution prompts.
+
+    The judge needs concrete failure records rather than only a global test
+    summary. This helper deliberately presents evidence without assigning an
+    owner; ownership remains an evidence-based judge decision and is validated
+    by Python afterwards.
+
+    Args:
+        results: Deterministic QA execution results.
+        failure_evidence: Optional normalized failure evidence extracted while
+            the QA sandbox was active.
+
+    Returns:
+        A bounded prompt block containing failed tests, diagnostics, source
+        locations, and affected files, or an explicit no-failure marker.
+    """
+    if results.tests is None:
+        return "- Test execution did not produce a result; attribution is unavailable."
+    if results.tests[0]:
+        return "- No failed tests were reported by deterministic execution."
+
+    if failure_evidence is None:
+        return (
+            "- Deterministic test execution failed, but no normalized failure records were "
+            "available. Use INCONCLUSIVE rather than inferring an owner from the global summary.\n"
+            f"- Bounded test summary: {results.tests[1][:3000]}"
+        )
+
+    lines: list[str] = []
+    failed_tests = failure_evidence.failed_tests or ["(test name unavailable)"]
+    diagnostics = failure_evidence.exact_diagnostics or ["(diagnostic unavailable)"]
+    source_locations = failure_evidence.source_locations or ["(source location unavailable)"]
+    affected_files = failure_evidence.affected_files or ["(affected file unavailable)"]
+    lines.append("- Failure records are evidence only; no owner has been assigned by Python.")
+    lines.append("- Failed tests:")
+    lines.extend(f"  - {value}" for value in failed_tests[:10])
+    lines.append("- Exact diagnostics:")
+    lines.extend(f"  - {value}" for value in diagnostics[:10])
+    lines.append("- Source locations observed in deterministic output:")
+    lines.extend(f"  - {value}" for value in source_locations[:10])
+    lines.append("- Affected files observed in deterministic output:")
+    lines.extend(f"  - {value}" for value in affected_files[:10])
+    return "\n".join(lines)
+
+
 def _build_batch_judge_prompt(
     valid_groups: list[VulnerabilityGroup],
     group_strategies: dict[str, str],
@@ -3829,6 +3890,7 @@ def _build_batch_judge_prompt(
     results: _QAExecutionResults,
     investigations_by_group: dict[str, GroupInvestigation],
     group_policies: dict[str, QAPolicy | None] | None = None,
+    failure_evidence: QAFailureEvidence | None = None,
 ) -> str:
     """Build the single comprehensive prompt for the batch judge."""
     known_group_ids = {group.group_id for group in valid_groups}
@@ -3925,6 +3987,7 @@ def _build_batch_judge_prompt(
             new_identifiers=new_identifiers,
             tests_ok=tests_ok,
             tests_summary=tests_summary,
+            failure_evidence=failure_evidence,
         )
 
     return f"""You are the Batch Judge in a map-reduce QA evaluation pipeline.
@@ -3950,6 +4013,13 @@ Your job is to emit exactly one structured QAEvaluation per group. The Python QA
 - Success: {tests_ok}
 - Summary: {tests_summary[:3000]}
 
+## Deterministic Failure Ledger
+{_format_deterministic_test_failure_ledger(results, failure_evidence)}
+
+Each ledger entry is evidence only. Do not copy every global failure into every
+assessment; attribute only the entries that have a positive causal link to the
+evaluated group, or use EXONERATED/INCONCLUSIVE as required below.
+
 ## Individual Group Investigations
 
 {all_group_sections}
@@ -3961,10 +4031,15 @@ scanner execution, group-specific remaining identifiers, package state, or
 hard-test results. The Python policy evaluator overwrites any LLM-provided
 deterministic fields.
 
-For VERSION_BUMP, request structured test attribution only when tests fail. A
-group may be exonerated only when the attribution names responsible group IDs,
-failed tests, and evidence-based reasoning. Do not use attribution for any other
-policy. For required semantic-review policies, emit a structured semantic review
+For VERSION_BUMP, request structured test attribution whenever tests fail,
+including when the group appears unrelated to the failure. A group may be
+exonerated only when the attribution names the exact failed-test records,
+one or more other known responsible group IDs (or clear unrelated evidence),
+and evidence-based reasoning. A group may be marked passed with tests failed
+only when that EXONERATED attribution is complete. Use INCONCLUSIVE when the
+ledger contains an unowned, ambiguous, cancelled, or shared failure. Do not use
+attribution to override scanner or install gates, and do not use attribution for
+other policies. For required semantic-review policies, emit a structured semantic review
 with PASS, FAIL, or INCONCLUSIVE, concise reasoning, and file/symbol/diff/advisory
 evidence references. Missing or fallback investigation evidence is INCONCLUSIVE.
 
@@ -3986,17 +4061,23 @@ and must not be assigned automatically.
    non-blocking. Apply the policy block under each group as the authoritative
    interpretation of residual identifiers.
 
-7. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
+7. Treat each deterministic failure-ledger entry independently. A global test
+   failure is not evidence that every group in the batch is responsible.
 
-8. For every evaluation whose `test_attribution.verdict` is `exonerated`,
+8. Do not double-attribute the same failure-ledger entry to multiple groups
+   unless the evidence explicitly supports multiple causes. Do not infer blame
+   from batch membership, package co-occurrence, or domain similarity alone.
+
+9. For every evaluation whose `test_attribution.verdict` is `exonerated`,
    populate `responsible_group_ids` with one or more exact IDs from the
-   assigned group list. Also populate `failed_tests` and evidence-based
-   `reasoning`. An exoneration with `responsible_group_ids: []` is invalid;
-   use `inconclusive` instead when no exact responsible group can be named.
+   assigned group list, excluding the evaluated group. Also populate only the
+   relevant `failed_tests` and evidence-based `reasoning`. An exoneration with
+   an empty owner list, copied global failure list, or unsupported reasoning is
+   invalid; use `inconclusive` instead.
 
-9. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
-10. Keep newly introduced identifiers out of per-group pass/fail decisions; the Python QA critic records them in the rendered holistic report.
-11. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
+10. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
+11. Keep newly introduced identifiers out of per-group pass/fail decisions; the Python QA critic records them in the rendered holistic report.
+12. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
     - Exact error messages from test execution, runtime logs, or compilation output.
     - Specific failing test names and test files.
     - File and line locations of the failure if available.
@@ -4008,10 +4089,13 @@ Return a BatchQAResult with:
 - evaluations: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group. Do not return a holistic report or Markdown narrative; the Python QA critic renders that report from validated evaluations and deterministic evidence.
   - Each evaluation must have: group_id (exact), passed (bool), failure_category (null if passed), retry_feedback (null if passed, specific actionable guidance if failed).
   - If tests fail and the evaluation's policy is VERSION_BUMP, its
-    test_attribution MUST be present. A responsible attribution must identify
-    the owning group; an exonerated attribution must identify one or more other
-    groups. Both require non-empty failed_tests and evidence-based
-    reasoning. Use inconclusive when the evidence cannot establish ownership.
+    test_attribution MUST be present. `failed_tests` must contain exact entries
+    from the deterministic failure ledger, not an unscoped copy of the global
+    test summary. Use RESPONSIBLE only for positive causal evidence naming the
+    evaluated group; use EXONERATED only when the relevant failures are owned by
+    other exact group IDs or are clearly unrelated; use INCONCLUSIVE when
+    ownership cannot be established. RESPONSIBLE and EXONERATED both require
+    non-empty failed_tests, responsible_group_ids, and evidence-based reasoning.
 
 You MUST emit exactly {len(valid_groups)} evaluations, one for each group ID listed above.
 """
@@ -4024,6 +4108,7 @@ def _run_batch_judge(
     results: _QAExecutionResults,
     investigations_by_group: dict[str, GroupInvestigation],
     group_policies: dict[str, QAPolicy | None] | None = None,
+    failure_evidence: QAFailureEvidence | None = None,
 ) -> BatchQAResult:
     """
     Reduce phase: one primary structured LLM call across all group investigations.
@@ -4045,6 +4130,7 @@ def _run_batch_judge(
         results=results,
         investigations_by_group=investigations_by_group,
         group_policies=group_policies,
+        failure_evidence=failure_evidence,
     )
 
     logger.info("qa_critic: [Reduce] invoking batch judge for %d groups.", len(valid_groups))
@@ -4071,6 +4157,8 @@ def _run_batch_judge(
                 valid_groups=valid_groups,
                 batch_result=batch_result,
                 target_group_ids=reconciliation_targets,
+                results=results,
+                failure_evidence=failure_evidence,
             )
         return batch_result
     except Exception as exc:  # noqa: BLE001
@@ -4674,11 +4762,11 @@ When finished, you MUST output a final markdown report in this exact overall sha
 
 # INVESTIGATIVE REPORT
 
-## 0. Holistic Batch Analysis (Chain of Thought)
-Step 1 - Failure Identification: (List the exact test names or install errors that failed. If none, state 'None').
-Step 2 - Package Domain Mapping: (Briefly state the core functionality or domain of EVERY package evaluated in this batch).
-Step 3 - Causal Linkage: (Logically connect the failures from Step 1 to the specific package domains from Step 2. e.g., 'Test X is a cryptography test, so it was broken by package Y').
-Step 4 - Exoneration: (Explicitly list the packages whose domains have no logical connection to the failures).
+## 0. Evidence Ledger
+Step 1 - Failure Identification: List each exact failed test, suite, diagnostic, and source location. If none, state 'None'.
+Step 2 - Package Domain Mapping: Briefly state the core functionality or domain of each package evaluated in this batch.
+Step 3 - Causal Linkage: For each failure, assign responsibility only when stack, changed behavior, or direct test-domain evidence supports it. Otherwise state INCONCLUSIVE.
+Step 4 - Exoneration: Explicitly list only groups with no evidence linking them to a failed test, and cite the failure owner or unrelated evidence.
 
 ## 1. Install Analysis
 
@@ -4703,8 +4791,8 @@ Step 4 - Exoneration: (Explicitly list the packages whose domains have no logica
 
 - Test Status: passed | failed | not_run
 - Attributed Test Failures: ...
-- Causal Reasoning: ... (If tests failed, you MUST deduce which package update likely caused it. Use deductive reasoning based on the package's domain. Do not state that failures were not attributed.)
-- Exonerated Groups: ... (Explicitly list the group_ids that are unrelated to the test failure, so they are not unfairly penalized.)
+- Causal Reasoning: ... (For each failed test, cite positive evidence for responsibility. Domain similarity alone is insufficient; use INCONCLUSIVE when ownership cannot be established.)
+- Exonerated Groups: ... (List exact group_ids only when the failure evidence points elsewhere or clearly does not involve that group.)
 
 - Group Summary: ...
 
@@ -5262,6 +5350,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         results=results,
         investigations_by_group=investigations_by_group,
         group_policies=group_policies,
+        failure_evidence=deterministic_test_evidence,
     )
 
     # ------------------------------------------------------------------
@@ -5358,6 +5447,8 @@ def _reconcile_batch_judge_result(
     valid_groups: list[VulnerabilityGroup],
     batch_result: BatchQAResult,
     target_group_ids: list[str],
+    results: _QAExecutionResults,
+    failure_evidence: QAFailureEvidence | None = None,
 ) -> BatchQAResult:
     """Repair missing or invalid structured test attribution.
 
@@ -5388,6 +5479,12 @@ def _reconcile_batch_judge_result(
         )
         + "\n\nGroups:\n"
         + "\n".join(f"- {group.group_id}: {group.vulnerable_component}" for group in valid_groups)
+        + "\n\nDeterministic failure ledger:\n"
+        + _format_deterministic_test_failure_ledger(results, failure_evidence)
+        + "\n\nUse the ledger to make direct, evidence-based attribution decisions. "
+        "Do not leave a group without attribution when the ledger clearly identifies "
+        "another known group; use INCONCLUSIVE only when the evidence is genuinely "
+        "ambiguous or unowned."
     )
 
     def mark_contract_error(evaluation: QAEvaluation, reason: str) -> QAEvaluation:
