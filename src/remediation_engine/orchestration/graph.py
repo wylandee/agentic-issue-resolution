@@ -270,7 +270,8 @@ def _reconcile_triaged_groups(
         ]
         if any(
             task_id in active_task_ids
-            or task.status not in {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+            or task.status
+            not in {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE}
             for task_id, task in matching_tasks
         ):
             result.append(previous)

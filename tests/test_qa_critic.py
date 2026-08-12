@@ -36,6 +36,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
     BatchQAResult,
@@ -48,12 +49,16 @@ from remediation_engine.contracts.schemas import (
     NoFixMitigationStage,
     QAEvaluation,
     QAPolicy,
+    QATestAttribution,
     RemediationTask,
     RoutingStrategy,
     Severity,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
+)
+from remediation_engine.contracts.schemas import (
+    TestAttributionVerdict as AttributionVerdict,
 )
 from remediation_engine.orchestration.qa_critic import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
@@ -64,6 +69,7 @@ from remediation_engine.orchestration.qa_critic import (
     _ODC_TIMEOUT_SECONDS,
     GroupInvestigation,
     _apply_guardrails,
+    _batch_judge_reconciliation_targets,
     _build_batch_judge_prompt,
     _build_fallback_investigation_report,
     _build_individual_investigator_prompt,
@@ -80,6 +86,7 @@ from remediation_engine.orchestration.qa_critic import (
     _parse_report_identifiers,
     _QAExecutionResults,
     _read_report_from_workspace,
+    _render_holistic_qa_report,
     _run_batch_judge,
     _run_global_execution,
     _run_individual_investigations,
@@ -1576,7 +1583,6 @@ class TestRunQACriticNode:
             results = _make_fully_populated_results(ok=True)
         if batch_result is None:
             batch_result = BatchQAResult(
-                holistic_report="All groups passed.",
                 evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
             )
 
@@ -1616,7 +1622,6 @@ class TestRunQACriticNode:
         group = _make_group()
         state = _make_minimal_state(groups=[group])
         batch_result = BatchQAResult(
-            holistic_report="All groups passed.",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         patches = self._patch_node(group=group, batch_result=batch_result)
@@ -1628,7 +1633,9 @@ class TestRunQACriticNode:
         assert result["status"] == "qa_completed"
         assert group.group_id in result["qa_evaluations"]
         assert result["qa_evaluations"][group.group_id].passed is True
-        assert result["qa_investigation_report"] == "All groups passed."
+        assert result["qa_investigation_report"].startswith("# QA Evaluation")
+        assert "All groups passed." not in result["qa_investigation_report"]
+        assert group.group_id in result["qa_investigation_report"]
 
     def test_new_identifiers_are_reported_without_task_failure(self):
         group = _make_group(cve_ids=["CVE-2021-23337"], ghsa_ids=[])
@@ -1643,7 +1650,6 @@ class TestRunQACriticNode:
             new_identifiers={"CVE-2025-10001"},
         )
         batch_result = BatchQAResult(
-            holistic_report="All current remediation groups passed.",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         patches = self._patch_node(
@@ -1666,7 +1672,6 @@ class TestRunQACriticNode:
         group = _make_group()
         state = _make_minimal_state(groups=[group])
         batch_result = BatchQAResult(
-            holistic_report="Group failed.",
             evaluations=[
                 QAEvaluation(
                     task_id=group.group_id,
@@ -1727,7 +1732,6 @@ class TestRunQACriticNode:
             changed_files=["package.json", "src/app.ts"],
         )
         batch_result = BatchQAResult(
-            holistic_report="ok",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         patches = self._patch_node(group=group, batch_result=batch_result)
@@ -1750,7 +1754,6 @@ class TestRunQACriticNode:
             )
         }
         batch_result = BatchQAResult(
-            holistic_report="ok",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         mock_sandbox = MagicMock()
@@ -1807,7 +1810,6 @@ class TestQAMissingExecutionTools:
             )
         }
         batch_result = BatchQAResult(
-            holistic_report="ok",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
 
@@ -2117,7 +2119,7 @@ class TestGroupScanAttribution:
         assert "QA Policy: no_fix_code_removal" in prompt
         assert "residual target identifiers remain" in prompt
         assert "Do not add cross-group" in prompt
-        assert "Exactly one `QAEvaluation`" in prompt
+        assert "Exactly one QAEvaluation" in prompt
         assert "### Responsible" not in prompt
 
     def test_multi_group_batch_judge_keeps_policy_specific_scanner_precedence(self):
@@ -2249,32 +2251,24 @@ class TestQAToolsNotInSubagentToolbelts:
 
 
 class TestBatchQAResultSchema:
-    def test_valid_batch_result_accepted(self):
+    def test_structured_batch_result_accepted(self):
         result = BatchQAResult(
-            holistic_report="All groups passed.",
             evaluations=[QAEvaluation(task_id="g1", passed=True)],
         )
-        assert result.holistic_report == "All groups passed."
         assert len(result.evaluations) == 1
 
     def test_empty_evaluations_list_is_allowed(self):
-        result = BatchQAResult(holistic_report="No groups.", evaluations=[])
+        result = BatchQAResult(evaluations=[])
         assert result.evaluations == []
 
-    def test_holistic_report_must_be_nonempty(self):
-        try:
-            BatchQAResult(holistic_report="", evaluations=[])
-            raise AssertionError("should have raised")
-        except Exception:
-            pass
+    def test_narrative_field_is_rejected(self):
+        with pytest.raises(ValidationError):
+            BatchQAResult(holistic_report="not part of the contract", evaluations=[])
 
     def test_batch_result_is_frozen(self):
-        result = BatchQAResult(holistic_report="ok", evaluations=[])
-        try:
-            result.holistic_report = "changed"
-            raise AssertionError("should have raised")
-        except Exception:
-            pass
+        result = BatchQAResult(evaluations=[])
+        with pytest.raises(ValidationError):
+            result.evaluations = []
 
 
 # ---------------------------------------------------------------------------
@@ -2650,7 +2644,6 @@ class TestRunBatchJudge:
         results = _make_fully_populated_results(ok=True)
         invs = {group.group_id: GroupInvestigation(group.group_id, "ok", "")}
         expected = BatchQAResult(
-            holistic_report="All passed.",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
         with patch("langchain_openai.ChatOpenAI") as MockLLM:
@@ -2668,7 +2661,191 @@ class TestRunBatchJudge:
             )
         mi.with_structured_output.assert_called_once_with(BatchQAResult)
         ms.invoke.assert_called_once()
-        assert result.holistic_report == "All passed."
+        assert result == expected
+
+    def test_reconciles_missing_structured_attribution(self):
+        first = _make_group(group_id="g1")
+        second = _make_group(group_id="g2")
+        results = _make_fully_populated_results(ok=False)
+        invs = {
+            first.group_id: GroupInvestigation(first.group_id, "failed", ""),
+            second.group_id: GroupInvestigation(second.group_id, "failed", ""),
+        }
+        initial = BatchQAResult(
+            evaluations=[
+                QAEvaluation(
+                    task_id=first.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="test failure",
+                ),
+                QAEvaluation(
+                    task_id=second.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="test failure",
+                ),
+            ],
+        )
+        repaired = BatchQAResult(
+            evaluations=[
+                QAEvaluation(
+                    task_id=first.group_id,
+                    passed=True,
+                    test_attribution=QATestAttribution(
+                        verdict=AttributionVerdict.EXONERATED,
+                        responsible_group_ids=[second.group_id],
+                        failed_tests=["test/api/chat.test.ts"],
+                        reasoning="The failed test exercises the second package's API domain.",
+                    ),
+                ),
+                QAEvaluation(
+                    task_id=second.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the failing API behavior.",
+                    test_attribution=QATestAttribution(
+                        verdict=AttributionVerdict.RESPONSIBLE,
+                        responsible_group_ids=[second.group_id],
+                        failed_tests=["test/api/chat.test.ts"],
+                        reasoning="The failure is in this package's API domain.",
+                    ),
+                ),
+            ],
+        )
+        with patch("langchain_openai.ChatOpenAI") as MockLLM:
+            mi = MagicMock()
+            ms = MagicMock()
+            ms.invoke.side_effect = [initial, repaired]
+            mi.with_structured_output.return_value = ms
+            MockLLM.return_value = mi
+            result = _run_batch_judge(
+                valid_groups=[first, second],
+                group_strategies={first.group_id: "version_bump", second.group_id: "version_bump"},
+                action_summaries=[],
+                results=results,
+                investigations_by_group=invs,
+            )
+
+        assert ms.invoke.call_count == 2
+        assert result.evaluations[0].passed is True
+        assert result.evaluations[0].test_attribution is not None
+        assert result.evaluations[0].test_attribution.responsible_group_ids == [second.group_id]
+        assert result.evaluations[1].contract_error is False
+
+    def test_missing_version_bump_attribution_requests_repair(self):
+        group = _make_group(group_id="g1")
+        results = _make_fully_populated_results(ok=False)
+        batch = BatchQAResult(
+            evaluations=[
+                QAEvaluation(
+                    task_id=group.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="tests failed",
+                )
+            ],
+        )
+
+        targets = _batch_judge_reconciliation_targets(
+            valid_groups=[group],
+            group_strategies={group.group_id: "version_bump"},
+            group_policies={group.group_id: QAPolicy.VERSION_BUMP},
+            results=results,
+            batch_result=batch,
+        )
+
+        assert targets == [group.group_id]
+
+    def test_missing_version_bump_evaluation_requests_repair(self):
+        group = _make_group(group_id="g1")
+        batch = BatchQAResult(evaluations=[])
+        targets = _batch_judge_reconciliation_targets(
+            valid_groups=[group],
+            group_strategies={group.group_id: "version_bump"},
+            group_policies={group.group_id: QAPolicy.VERSION_BUMP},
+            results=_make_fully_populated_results(ok=False),
+            batch_result=batch,
+        )
+        assert targets == [group.group_id]
+
+    def test_valid_structured_attribution_does_not_need_report_text(self):
+        first = _make_group(group_id="g1")
+        second = _make_group(group_id="g2")
+        failed_test = "test/api/chat.test.ts"
+        batch = BatchQAResult(
+            evaluations=[
+                QAEvaluation(
+                    task_id=first.group_id,
+                    passed=True,
+                    test_attribution=QATestAttribution(
+                        verdict=AttributionVerdict.EXONERATED,
+                        responsible_group_ids=[second.group_id],
+                        failed_tests=[failed_test],
+                        reasoning="The failing API test exercises the second package.",
+                    ),
+                ),
+                QAEvaluation(
+                    task_id=second.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the second package.",
+                    test_attribution=QATestAttribution(
+                        verdict=AttributionVerdict.RESPONSIBLE,
+                        responsible_group_ids=[second.group_id],
+                        failed_tests=[failed_test],
+                        reasoning="The failing API test exercises this package.",
+                    ),
+                ),
+            ],
+        )
+        targets = _batch_judge_reconciliation_targets(
+            valid_groups=[first, second],
+            group_strategies={first.group_id: "version_bump", second.group_id: "version_bump"},
+            group_policies={
+                first.group_id: QAPolicy.VERSION_BUMP,
+                second.group_id: QAPolicy.VERSION_BUMP,
+            },
+            results=_make_fully_populated_results(ok=False),
+            batch_result=batch,
+        )
+        assert targets == []
+
+    def test_canonical_report_is_rendered_from_structured_evaluations(self):
+        first = _make_group(group_id="g1")
+        second = _make_group(group_id="g2")
+        evaluations = {
+            first.group_id: QAEvaluation(
+                task_id=first.group_id,
+                passed=True,
+                test_attribution=QATestAttribution(
+                    verdict=AttributionVerdict.EXONERATED,
+                    responsible_group_ids=[second.group_id],
+                    failed_tests=["tests/api.test.ts::fails"],
+                    reasoning="The failure is owned by the second group.",
+                ),
+            ),
+            second.group_id: QAEvaluation(
+                task_id=second.group_id,
+                passed=False,
+                failure_category=FailureCategory.BREAKING_CHANGE,
+                retry_feedback="Repair the second group.",
+                test_attribution=QATestAttribution(
+                    verdict=AttributionVerdict.RESPONSIBLE,
+                    responsible_group_ids=[second.group_id],
+                    failed_tests=["tests/api.test.ts::fails"],
+                    reasoning="The failure exercises the second package.",
+                ),
+            ),
+        }
+
+        report = _render_holistic_qa_report([first, second], evaluations, {})
+
+        assert "This report is rendered from the validated per-group QA evaluations." in report
+        assert "### g1" in report and "- Verdict: EXONERATED" in report
+        assert "### g2" in report and "- Verdict: RESPONSIBLE" in report
+        assert "Responsible groups: g2" in report
+        assert "No explicit attribution." not in report
 
     def test_llm_failure_returns_fallback(self):
         group = _make_group()
@@ -2687,7 +2864,7 @@ class TestRunBatchJudge:
                 results=results,
                 investigations_by_group=invs,
             )
-        assert "Failure" in result.holistic_report
+        assert result.evaluations[0].contract_error is False
         assert result.evaluations[0].passed is False
         assert result.evaluations[0].failure_category == FailureCategory.SECURITY_FLAG
 
@@ -2707,9 +2884,7 @@ class TestApplyGuardrails:
 
     def test_valid_passes_through(self):
         g = _make_group()
-        batch = BatchQAResult(
-            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
-        )
+        batch = BatchQAResult(evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, errors = _apply_guardrails(
             valid_groups=[g],
             batch_result=batch,
@@ -2757,7 +2932,6 @@ class TestApplyGuardrails:
             status=TaskStatus.OPTIMISTICALLY_FIXED,
         )
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
         )
 
@@ -2776,7 +2950,6 @@ class TestApplyGuardrails:
     def test_unknown_group_id_dropped(self):
         g = _make_group(group_id="real")
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(task_id="real", passed=True),
                 QAEvaluation(
@@ -2795,7 +2968,6 @@ class TestApplyGuardrails:
     def test_duplicate_keeps_first(self):
         g = _make_group()
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(task_id=g.group_id, passed=True),
                 QAEvaluation(
@@ -2813,9 +2985,7 @@ class TestApplyGuardrails:
 
     def test_missing_group_synthesized(self):
         g1, g2 = _make_group(group_id="g1"), _make_group(group_id="g2")
-        batch = BatchQAResult(
-            holistic_report="ok", evaluations=[QAEvaluation(task_id="g1", passed=True)]
-        )
+        batch = BatchQAResult(evaluations=[QAEvaluation(task_id="g1", passed=True)])
         evals, errors = _apply_guardrails(
             valid_groups=[g1, g2], batch_result=batch, results=self._res(), group_strategies={}
         )
@@ -2826,9 +2996,7 @@ class TestApplyGuardrails:
 
     def test_version_bump_remaining_forces_fail(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
-        batch = BatchQAResult(
-            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
-        )
+        batch = BatchQAResult(evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, _ = _apply_guardrails(
             valid_groups=[g],
             batch_result=batch,
@@ -2840,9 +3008,7 @@ class TestApplyGuardrails:
 
     def test_code_workaround_remaining_allowed_pass(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
-        batch = BatchQAResult(
-            holistic_report="ok", evaluations=[QAEvaluation(task_id=g.group_id, passed=True)]
-        )
+        batch = BatchQAResult(evaluations=[QAEvaluation(task_id=g.group_id, passed=True)])
         evals, _ = _apply_guardrails(
             valid_groups=[g],
             batch_result=batch,
@@ -2855,7 +3021,6 @@ class TestApplyGuardrails:
     def test_eresolve_remaps_breaking_to_peer_conflict(self):
         g = _make_group()
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(
                     task_id=g.group_id,
@@ -2876,7 +3041,6 @@ class TestApplyGuardrails:
     def test_eresolve_exempt_for_code_workaround(self):
         g = _make_group()
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(
                     task_id=g.group_id,
@@ -2897,7 +3061,6 @@ class TestApplyGuardrails:
     def test_remaining_scanner_reclassifies_breaking_change_to_security_flag(self):
         g = _make_group(cve_ids=["CVE-2021-0001"], ghsa_ids=[])
         batch = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(
                     task_id=g.group_id,
@@ -2931,7 +3094,6 @@ class TestRunQACriticNodeMapReduce:
             investigations = {g.group_id: GroupInvestigation(g.group_id, "ok", "") for g in groups}
         if batch_result is None:
             batch_result = BatchQAResult(
-                holistic_report="All passed.",
                 evaluations=[QAEvaluation(task_id=g.group_id, passed=True) for g in groups],
             )
         mock_sb = MagicMock()
@@ -2964,7 +3126,6 @@ class TestRunQACriticNodeMapReduce:
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
         br = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(task_id="g1", passed=True),
                 QAEvaluation(task_id="g2", passed=True),
@@ -2980,17 +3141,17 @@ class TestRunQACriticNodeMapReduce:
     def test_holistic_report_in_output(self):
         g = _make_group()
         br = BatchQAResult(
-            holistic_report="## Holistic.",
             evaluations=[QAEvaluation(task_id=g.group_id, passed=True)],
         )
         result, _, _, _ = self._run([g], batch_result=br)
-        assert result["qa_investigation_report"] == "## Holistic."
+        assert result["qa_investigation_report"].startswith("# QA Evaluation")
+        assert "## Holistic." not in result["qa_investigation_report"]
+        assert g.group_id in result["qa_investigation_report"]
 
     def test_all_passed_status(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
         br = BatchQAResult(
-            holistic_report="ok",
             evaluations=[
                 QAEvaluation(task_id="g1", passed=True),
                 QAEvaluation(task_id="g2", passed=True),
@@ -3002,9 +3163,7 @@ class TestRunQACriticNodeMapReduce:
     def test_guardrails_fill_missing_eval(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {"g1": GroupInvestigation("g1", "ok", ""), "g2": GroupInvestigation("g2", "ok", "")}
-        br = BatchQAResult(
-            holistic_report="ok", evaluations=[QAEvaluation(task_id="g1", passed=True)]
-        )  # g2 missing
+        br = BatchQAResult(evaluations=[QAEvaluation(task_id="g1", passed=True)])  # g2 missing
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert "g2" in result["qa_evaluations"] and result["qa_evaluations"]["g2"].passed is False
 

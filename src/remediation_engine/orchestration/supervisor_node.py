@@ -121,6 +121,7 @@ _TERMINAL_STATUSES = frozenset(
     {
         TaskStatus.QA_PASSED,
         TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
     }
 )
 _WORKABLE_STATUSES = frozenset(
@@ -1516,6 +1517,8 @@ def _normalize_qa_evaluations_for_tasks(
             deterministic_gates=evaluation.deterministic_gates,
             semantic_security_review=evaluation.semantic_security_review,
             test_attribution=evaluation.test_attribution,
+            contract_error=evaluation.contract_error,
+            contract_error_reason=evaluation.contract_error_reason,
         )
     return normalized
 
@@ -3304,7 +3307,19 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # identity cannot mutate an attempted task.
                 continue
             task = task_queue[resolved_t_id]
-            if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
+            if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED, TaskStatus.INCONCLUSIVE):
+                continue
+            if evaluation.contract_error:
+                _commit_task_transition(
+                    task_queue,
+                    resolved_t_id,
+                    updates={"status": TaskStatus.INCONCLUSIVE},
+                )
+                logger.warning(
+                    "supervisor: task '%s' marked INCONCLUSIVE after a QA contract mismatch; "
+                    "retry budget unchanged.",
+                    resolved_t_id,
+                )
                 continue
             if evaluation.passed:
                 _commit_task_transition(

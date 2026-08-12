@@ -122,7 +122,7 @@ def _evaluate(
     gates, _ = _evaluate_policy_gates(groups, results, policies)
     evaluations, _ = _apply_policy_decision(
         groups,
-        BatchQAResult(holistic_report="test", evaluations=[evaluation]),
+        BatchQAResult(evaluations=[evaluation]),
         gates,
         policies,
         {group.group_id: investigation} if investigation is not None else None,
@@ -140,7 +140,6 @@ def test_version_bump_scanner_is_group_scoped():
     evaluations, _ = _apply_policy_decision(
         [g1, g2],
         BatchQAResult(
-            holistic_report="test",
             evaluations=[
                 QAEvaluation(task_id="g1", passed=True),
                 QAEvaluation(task_id="g2", passed=True),
@@ -333,7 +332,6 @@ def test_shared_install_failure_fails_every_group():
     evaluations, _ = _apply_policy_decision(
         groups,
         BatchQAResult(
-            holistic_report="test",
             evaluations=[QAEvaluation(task_id=group.group_id, passed=True) for group in groups],
         ),
         gates,

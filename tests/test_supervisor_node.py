@@ -704,6 +704,30 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-1"].retry_count == 1
 
+    def test_qa_contract_error_is_inconclusive_without_consuming_retry(self):
+        g1 = _sca_group("g1")
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="Judge output requires reconciliation.",
+                    contract_error=True,
+                    contract_error_reason="Holistic and structured QA outputs disagree.",
+                )
+            },
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.INCONCLUSIVE
+        assert result["task_queue"]["task-1"].retry_count == 0
+
     def test_not_qa_completed_does_not_update_statuses_from_qa_evals(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)

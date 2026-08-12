@@ -42,6 +42,117 @@ if [ ! -e "$WORKTREE_ROOT/.env" ] && [ ! -L "$WORKTREE_ROOT/.env" ] && [ -f "$MA
   ln -s "$MAIN_ROOT/.env" "$WORKTREE_ROOT/.env"
 fi'''
 
+[setup.win32]
+script = '''
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+$MainRoot = "D:\agentic-issue-resolution"
+
+$GitRoot = ((git rev-parse --show-toplevel) | Select-Object -First 1).Trim()
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($GitRoot)) {
+    throw "Run this block from inside a Git worktree."
+}
+
+$WorktreeRoot = (Resolve-Path -LiteralPath $GitRoot).Path
+$MainRoot = (Resolve-Path -LiteralPath $MainRoot).Path
+
+$Venv = Join-Path $WorktreeRoot ".venv"
+$VenvPython = Join-Path $Venv "Scripts\python.exe"
+$ActivateScript = Join-Path $Venv "Scripts\Activate.ps1"
+
+$SourceRepo = Join-Path $MainRoot "data\clones\juice-shop"
+$TargetRepo = Join-Path $WorktreeRoot "data\clones\juice-shop"
+
+$SourceEnv = Join-Path $MainRoot ".env"
+$TargetEnv = Join-Path $WorktreeRoot ".env"
+
+Set-Location -LiteralPath $WorktreeRoot
+
+New-Item -ItemType Directory -Force -Path `
+    (Join-Path $WorktreeRoot "data\clones"), `
+    (Join-Path $WorktreeRoot "data\cache"), `
+    (Join-Path $WorktreeRoot "data\trajectories") | Out-Null
+
+if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3.11 -m venv $Venv
+    }
+    elseif (Get-Command python -ErrorAction SilentlyContinue) {
+        & python -m venv $Venv
+    }
+    else {
+        throw "Python 3.11 was not found."
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create the virtual environment."
+    }
+}
+
+& $VenvPython -m pip install -e ".[dev]"
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install Python dependencies."
+}
+
+if (-not (Test-Path -LiteralPath $SourceRepo -PathType Container)) {
+    throw "Source Juice Shop clone not found: $SourceRepo"
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $SourceRepo ".git"))) {
+    throw "Source Juice Shop directory is not a Git repository: $SourceRepo"
+}
+
+if (Test-Path -LiteralPath $TargetRepo) {
+    if (-not (Test-Path -LiteralPath (Join-Path $TargetRepo ".git"))) {
+        throw "Target exists but is not a Git repository: $TargetRepo"
+    }
+}
+else {
+    Copy-Item `
+        -LiteralPath $SourceRepo `
+        -Destination $TargetRepo `
+        -Recurse `
+        -Force
+}
+
+if (-not (Test-Path -LiteralPath $TargetEnv)) {
+    if (Test-Path -LiteralPath $SourceEnv -PathType Leaf) {
+        try {
+            New-Item `
+                -ItemType SymbolicLink `
+                -Path $TargetEnv `
+                -Target $SourceEnv | Out-Null
+
+            Write-Host "Created .env symbolic link."
+        }
+        catch {
+            Copy-Item `
+                -LiteralPath $SourceEnv `
+                -Destination $TargetEnv `
+                -Force
+
+            Write-Host "Symbolic link unavailable; copied .env instead."
+        }
+    }
+}
+
+. $ActivateScript
+
+$env:REMEDIATION_TRAJECTORY_DIR = Join-Path `
+    $WorktreeRoot "data\trajectories"
+
+Write-Host ""
+Write-Host "Setup completed successfully."
+Write-Host "Worktree: $WorktreeRoot"
+Write-Host "Virtual environment: $env:VIRTUAL_ENV"
+Write-Host "Python: $((Get-Command python).Source)"
+Write-Host "Juice Shop clone: $TargetRepo"
+Write-Host "Trajectory directory: $env:REMEDIATION_TRAJECTORY_DIR"'''
+
 [cleanup]
 script = ""
 
@@ -64,3 +175,72 @@ fi
 if [ -d "$JUICE_REPO" ]; then
   rm -rf "$JUICE_REPO"
 fi'''
+
+[cleanup.win32]
+script = '''
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+$GitRoot = ((git rev-parse --show-toplevel) | Select-Object -First 1).Trim()
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($GitRoot)) {
+    throw "Run this block from inside a Git worktree."
+}
+
+$WorktreeRoot = (Resolve-Path -LiteralPath $GitRoot).Path
+
+$Venv = Join-Path $WorktreeRoot ".venv"
+$JuiceRepo = Join-Path $WorktreeRoot "data\clones\juice-shop"
+$EnvPath = Join-Path $WorktreeRoot ".env"
+
+$RootPrefix = $WorktreeRoot.TrimEnd("\") + "\"
+
+foreach ($Target in @($Venv, $JuiceRepo, $EnvPath)) {
+    $TargetFull = [System.IO.Path]::GetFullPath($Target)
+
+    if (-not $TargetFull.StartsWith(
+        $RootPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to remove a path outside the worktree: $TargetFull"
+    }
+}
+
+Set-Location -LiteralPath $WorktreeRoot
+
+if (Get-Command deactivate -ErrorAction SilentlyContinue) {
+    deactivate
+}
+
+$EnvItem = Get-Item `
+    -LiteralPath $EnvPath `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+if ($null -ne $EnvItem) {
+    $IsLink = (
+        ($EnvItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    )
+
+    if ($IsLink) {
+        Remove-Item `
+            -LiteralPath $EnvPath `
+            -Force
+    }
+}
+
+if (Test-Path -LiteralPath $Venv -PathType Container) {
+    Remove-Item `
+        -LiteralPath $Venv `
+        -Recurse `
+        -Force
+}
+
+if (Test-Path -LiteralPath $JuiceRepo -PathType Container) {
+    Remove-Item `
+        -LiteralPath $JuiceRepo `
+        -Recurse `
+        -Force
+}
+
+Write-Host "Teardown completed successfully."'''

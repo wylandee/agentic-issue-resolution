@@ -14,8 +14,11 @@ The QA Critic now follows a map-reduce architecture:
 
   Reduce â€” Batch Judge:
     One ChatOpenAI.with_structured_output(BatchQAResult) call across all
-    group investigation texts, producing a holistic_report and exactly one
-    QAEvaluation per group.
+    group investigation texts, producing exactly one typed QAEvaluation per group.
+
+  Report Rendering:
+    The persisted holistic QA report is rendered deterministically from validated
+    evaluations and deterministic execution evidence.
 
   Python Guardrails:
     Normalize, validate, and fill missing/duplicate/unknown evaluations
@@ -2309,6 +2312,148 @@ def _augment_qa_report_with_scan_findings(
     return f"{report.rstrip()}\n\n{section}".strip()
 
 
+def _render_holistic_qa_report(
+    valid_groups: list[VulnerabilityGroup],
+    evaluations: dict[str, QAEvaluation],
+    scan_projection: dict[str, Any],
+) -> str:
+    """Render the canonical QA report from validated structured evaluations.
+
+    The report persisted to orchestrator state is rendered here after
+    deterministic policy guardrails have normalized the per-group evaluations.
+    No LLM narrative is consulted, so the report and typed decisions cannot
+    diverge.
+    """
+    group_by_id = {group.group_id: group for group in valid_groups}
+    responsible_ids: set[str] = set()
+    exonerated_ids: list[str] = []
+    inconclusive_ids: list[str] = []
+    failed_ids: list[str] = []
+
+    lines = [
+        "# QA Evaluation",
+        "",
+        "This report is rendered from the validated per-group QA evaluations.",
+        "",
+        "## Per-group outcomes",
+        "",
+    ]
+
+    for group in valid_groups:
+        evaluation = evaluations.get(group.group_id)
+        if evaluation is None:
+            lines.extend(
+                [
+                    f"### {group.group_id}",
+                    "- Verdict: INCONCLUSIVE",
+                    "- Reason: No validated structured evaluation was available.",
+                    "",
+                ]
+            )
+            inconclusive_ids.append(group.group_id)
+            continue
+
+        attribution = evaluation.test_attribution
+        attribution_verdict = (
+            attribution.verdict.value
+            if attribution is not None and hasattr(attribution.verdict, "value")
+            else str(attribution.verdict)
+            if attribution is not None
+            else ""
+        )
+        if attribution is not None and attribution_verdict in {
+            TestAttributionVerdict.RESPONSIBLE.value,
+            TestAttributionVerdict.EXONERATED.value,
+        }:
+            responsible_ids.update(attribution.responsible_group_ids)
+
+        if evaluation.contract_error:
+            verdict = "INCONCLUSIVE"
+            inconclusive_ids.append(group.group_id)
+        elif evaluation.passed and attribution_verdict == TestAttributionVerdict.EXONERATED.value:
+            verdict = "EXONERATED"
+            exonerated_ids.append(group.group_id)
+        elif (
+            not evaluation.passed
+            and attribution_verdict == TestAttributionVerdict.RESPONSIBLE.value
+        ):
+            verdict = "RESPONSIBLE"
+            responsible_ids.update(attribution.responsible_group_ids)
+            failed_ids.append(group.group_id)
+        elif (
+            not evaluation.passed
+            and attribution_verdict == TestAttributionVerdict.INCONCLUSIVE.value
+        ):
+            verdict = "INCONCLUSIVE"
+            inconclusive_ids.append(group.group_id)
+            failed_ids.append(group.group_id)
+        elif evaluation.passed:
+            verdict = "PASSED"
+        else:
+            verdict = "FAILED"
+            failed_ids.append(group.group_id)
+
+        lines.extend(
+            [
+                f"### {group.group_id}",
+                f"- Component: {group.vulnerable_component or '(unknown)'}",
+                f"- Verdict: {verdict}",
+            ]
+        )
+        if evaluation.failure_category is not None:
+            category = (
+                evaluation.failure_category.value
+                if hasattr(evaluation.failure_category, "value")
+                else str(evaluation.failure_category)
+            )
+            lines.append(f"- Failure category: {category}")
+        if evaluation.deterministic_gates is not None:
+            gates = evaluation.deterministic_gates
+            lines.append(f"- Deterministic gates: {gates.status}")
+            if gates.tests_passed is not None:
+                lines.append(f"- Tests passed: {gates.tests_passed}")
+            if gates.target_remaining_identifiers:
+                lines.append(
+                    "- Remaining target identifiers: "
+                    + ", ".join(gates.target_remaining_identifiers)
+                )
+        if attribution is not None:
+            owners = ", ".join(attribution.responsible_group_ids) or "(none)"
+            lines.append(f"- Test attribution: {attribution_verdict}; responsible groups: {owners}")
+            if attribution.failed_tests:
+                lines.append("- Failed tests: " + "; ".join(attribution.failed_tests))
+            if attribution.reasoning.strip():
+                lines.append("- Attribution reasoning: " + attribution.reasoning.strip())
+        if evaluation.semantic_security_review is not None:
+            review = evaluation.semantic_security_review
+            review_verdict = (
+                review.verdict.value if hasattr(review.verdict, "value") else str(review.verdict)
+            )
+            lines.append(f"- Semantic security review: {review_verdict}")
+            if review.reasoning.strip():
+                lines.append("- Semantic review reasoning: " + review.reasoning.strip())
+        if evaluation.retry_feedback and not evaluation.passed:
+            lines.append("- QA feedback: " + evaluation.retry_feedback.strip())
+        lines.append("")
+
+    known_ids = set(group_by_id)
+    responsible_ids.intersection_update(known_ids)
+    lines.extend(
+        [
+            "## Attribution summary",
+            "",
+            "- Responsible groups: " + (", ".join(sorted(responsible_ids)) or "(none identified)"),
+            "- Exonerated groups: " + (", ".join(exonerated_ids) or "(none)"),
+            "- Inconclusive groups: " + (", ".join(inconclusive_ids) or "(none)"),
+            "- Failed groups: " + (", ".join(failed_ids) or "(none)"),
+        ]
+    )
+    return _augment_qa_report_with_scan_findings(
+        "\n".join(lines).strip(),
+        scan_projection,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Map phase dataclasses
 # ---------------------------------------------------------------------------
@@ -3664,16 +3809,17 @@ rewrite them based on the investigation narrative.
 
 ## Output Requirements
 
-Return a `BatchQAResult` containing:
-- `holistic_report`: A concise report scoped to `{group.group_id}`.
-- `evaluations`: Exactly one `QAEvaluation` whose `task_id` is `{group.group_id}`.
+Return a BatchQAResult with:
+- evaluations: Exactly one QAEvaluation whose task_id is {group.group_id}. Do not return a holistic report or Markdown narrative; the Python QA critic renders that report from validated evaluations and deterministic evidence.
+  - The evaluation must have passed (bool), failure_category (null if passed), and retry_feedback (null if passed, specific actionable guidance if failed).
+  - If tests fail and this policy is VERSION_BUMP, test_attribution MUST be present. Use RESPONSIBLE only for this group, EXONERATED only with exact responsible group IDs from the assigned group list, and INCONCLUSIVE with failed tests and reasoning when ownership cannot be established.
 
 Do not add cross-group responsible/possibly-responsible/exonerated sections,
 and do not perform cross-group test attribution. If the global test failure
-cannot be causally attributed to this group's remediation, state that clearly
-in the evaluation and retry feedback; the Python policy evaluator will apply
-the policy's deterministic test rule.
-"""
+cannot be causally attributed to this group's remediation, use INCONCLUSIVE;
+the Python policy evaluator will apply the policy's deterministic test rule.
+
+You MUST emit exactly one evaluation for group {group.group_id}."""
 
 
 def _build_batch_judge_prompt(
@@ -3784,7 +3930,7 @@ def _build_batch_judge_prompt(
     return f"""You are the Batch Judge in a map-reduce QA evaluation pipeline.
 
 You have received individual investigation reports for {len(valid_groups)} vulnerability group(s).
-Your job is to synthesize these into a holistic report and emit exactly one QAEvaluation per group.
+Your job is to emit exactly one structured QAEvaluation per group. The Python QA critic renders the holistic report from these validated evaluations and deterministic evidence.
 
 ## Global Execution Results
 
@@ -3849,7 +3995,7 @@ and must not be assigned automatically.
    use `inconclusive` instead when no exact responsible group can be named.
 
 9. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
-10. Report newly introduced identifiers explicitly in the holistic report, but leave the per-group evaluations scoped to the assigned remediation groups.
+10. Keep newly introduced identifiers out of per-group pass/fail decisions; the Python QA critic records them in the rendered holistic report.
 11. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
     - Exact error messages from test execution, runtime logs, or compilation output.
     - Specific failing test names and test files.
@@ -3859,13 +4005,13 @@ and must not be assigned automatically.
 ## Output Requirements
 
 Return a BatchQAResult with:
-- `holistic_report`: A markdown narrative listing: (a) responsible groups, (b) possibly responsible groups, (c) exonerated groups, and (d) any newly introduced global scanner identifiers. Reference specific test names, scanner IDs, or diff evidence.
-- `evaluations`: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group.
+- evaluations: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group. Do not return a holistic report or Markdown narrative; the Python QA critic renders that report from validated evaluations and deterministic evidence.
   - Each evaluation must have: group_id (exact), passed (bool), failure_category (null if passed), retry_feedback (null if passed, specific actionable guidance if failed).
-  - If tests fail and an evaluation is `exonerated`, its `test_attribution` MUST include:
-    `verdict="exonerated"`, non-empty `responsible_group_ids` containing exact
-    IDs from the groups above, non-empty `failed_tests`, and non-empty
-    evidence-based `reasoning`. Do not emit an empty responsible-ID list.
+  - If tests fail and the evaluation's policy is VERSION_BUMP, its
+    test_attribution MUST be present. A responsible attribution must identify
+    the owning group; an exonerated attribution must identify one or more other
+    groups. Both require non-empty failed_tests and evidence-based
+    reasoning. Use inconclusive when the evidence cannot establish ownership.
 
 You MUST emit exactly {len(valid_groups)} evaluations, one for each group ID listed above.
 """
@@ -3880,9 +4026,11 @@ def _run_batch_judge(
     group_policies: dict[str, QAPolicy | None] | None = None,
 ) -> BatchQAResult:
     """
-    Reduce phase: one structured LLM call across all group investigations.
+    Reduce phase: one primary structured LLM call across all group investigations.
 
-    Uses ChatOpenAI.with_structured_output(BatchQAResult) exactly once.
+    Uses ChatOpenAI.with_structured_output(BatchQAResult) for the primary
+    judge call. A second structured call repairs missing or contradictory
+    VERSION_BUMP test attribution before policy guardrails run.
     On LLM failure, synthesizes a failed BatchQAResult for all groups.
     """
     from langchain_openai import ChatOpenAI
@@ -3910,6 +4058,20 @@ def _run_batch_judge(
             "qa_critic: [Reduce] batch judge returned %d evaluations.",
             len(batch_result.evaluations),
         )
+        reconciliation_targets = _batch_judge_reconciliation_targets(
+            valid_groups=valid_groups,
+            group_strategies=group_strategies,
+            group_policies=group_policies,
+            results=results,
+            batch_result=batch_result,
+        )
+        if reconciliation_targets:
+            batch_result = _reconcile_batch_judge_result(
+                llm=llm,
+                valid_groups=valid_groups,
+                batch_result=batch_result,
+                target_group_ids=reconciliation_targets,
+            )
         return batch_result
     except Exception as exc:  # noqa: BLE001
         logger.error("qa_critic: batch judge LLM failed â€” %s", exc)
@@ -3925,18 +4087,43 @@ def _run_batch_judge(
             )
             for group in valid_groups
         ]
-        return BatchQAResult(
-            holistic_report=(
-                f"## Batch Judge Failure\n\nThe batch judge LLM call failed: {exc}\n\n"
-                "All groups marked as failed with SECURITY_FLAG pending retry."
-            ),
-            evaluations=fallback_evals,
-        )
+        return BatchQAResult(evaluations=fallback_evals)
 
 
 # ---------------------------------------------------------------------------
 # Python guardrails
-# ---------------------------------------------------------------------------
+
+
+def _valid_test_attribution(
+    evaluation: QAEvaluation,
+    group_id: str,
+    known_group_ids: set[str],
+) -> bool:
+    """Return whether a failed-test evaluation has usable causal evidence.
+
+    INCONCLUSIVE may omit an owner, but it still needs the failed test
+    names and reasoning that explain why ownership could not be established.
+    RESPONSIBLE and EXONERATED must identify valid group IDs with the
+    expected relationship to the evaluated group. This validation is used only
+    for the batch judge's conditional VERSION_BUMP repair request; the final
+    pass/fail decision remains deterministic.
+    """
+    attribution = evaluation.test_attribution
+    if attribution is None:
+        return False
+    if not attribution.failed_tests or not attribution.reasoning.strip():
+        return False
+    if any(identifier not in known_group_ids for identifier in attribution.responsible_group_ids):
+        return False
+    if attribution.verdict == TestAttributionVerdict.INCONCLUSIVE:
+        return True
+    if not attribution.responsible_group_ids:
+        return False
+    if attribution.verdict == TestAttributionVerdict.RESPONSIBLE:
+        return group_id in attribution.responsible_group_ids
+    if attribution.verdict == TestAttributionVerdict.EXONERATED:
+        return group_id not in attribution.responsible_group_ids
+    return False
 
 
 def _evaluate_policy_gates(
@@ -4100,6 +4287,25 @@ def _apply_policy_decision(
         policy = group_policies.get(group_id)
         current = normalized[group_id]
         gates = gates_by_group[group_id]
+        if current.contract_error:
+            reason = current.contract_error_reason.strip() or (
+                "The structured QA result could not be validated."
+            )
+            errors.append(f"qa_critic contract error for '{group_id}': {reason}")
+            final[group_id] = current.model_copy(
+                update={
+                    "task_id": group_id,
+                    "passed": False,
+                    "deterministic_gates": gates,
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": (
+                        "QA result is inconclusive because the structured QA result "
+                        "could not be validated. No remediation retry "
+                        "was consumed. Re-run QA after correcting the judge contract."
+                    ),
+                }
+            )
+            continue
         failures: list[tuple[FailureCategory, str]] = []
         if group_id in missing_evaluation_ids:
             failures.append((FailureCategory.SECURITY_FLAG, "Batch QA Judge omitted this group."))
@@ -5087,9 +5293,10 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         len(qa_evaluations),
     )
 
-    qa_investigation_report = _augment_qa_report_with_scan_findings(
-        batch_result.holistic_report,
-        scan_projection,
+    qa_investigation_report = _render_holistic_qa_report(
+        valid_groups=valid_groups,
+        evaluations=qa_evaluations,
+        scan_projection=scan_projection,
     )
 
     return {
@@ -5102,3 +5309,149 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         "consistency_events": policy_consistency_events,
         **scan_projection,
     }
+
+
+def _batch_judge_reconciliation_targets(
+    *,
+    valid_groups: list[VulnerabilityGroup],
+    group_strategies: dict[str, str],
+    group_policies: dict[str, QAPolicy | None] | None,
+    results: _QAExecutionResults,
+    batch_result: BatchQAResult,
+) -> list[str]:
+    """Return VERSION_BUMP groups needing typed attribution repair.
+
+    The target decision is based only on structured fields and deterministic
+    test failure evidence. Narrative report text is intentionally excluded so
+    wording ambiguity cannot create or clear a contract error.
+    """
+    if results.tests is None or results.tests[0] is not False:
+        return []
+    known_ids = {group.group_id for group in valid_groups}
+    policies = group_policies or {
+        group.group_id: (
+            QAPolicy.INITIAL_CODE_WORKAROUND
+            if group_strategies.get(group.group_id) == "code_workaround"
+            else QAPolicy.VERSION_BUMP
+        )
+        for group in valid_groups
+    }
+    evaluations = {evaluation.task_id: evaluation for evaluation in batch_result.evaluations}
+    targets: list[str] = []
+    for group in valid_groups:
+        if policies.get(group.group_id) != QAPolicy.VERSION_BUMP:
+            continue
+        evaluation = evaluations.get(group.group_id)
+        if evaluation is None or not _valid_test_attribution(
+            evaluation,
+            group.group_id,
+            known_ids,
+        ):
+            targets.append(group.group_id)
+
+    return targets
+
+
+def _reconcile_batch_judge_result(
+    *,
+    llm: Any,
+    valid_groups: list[VulnerabilityGroup],
+    batch_result: BatchQAResult,
+    target_group_ids: list[str],
+) -> BatchQAResult:
+    """Repair missing or invalid structured test attribution.
+
+    The repair call receives only typed evaluations and group identity context.
+    It never receives or edits a narrative report. Any unresolved contract
+    issue becomes an explicit per-task contract error for deterministic QA
+    policy handling.
+    """
+    if not target_group_ids:
+        return batch_result
+
+    known_ids = {group.group_id for group in valid_groups}
+    prompt = (
+        "The previous BatchQAResult is missing valid structured test attribution "
+        "for these VERSION_BUMP groups: "
+        + ", ".join(target_group_ids)
+        + ". Return a corrected BatchQAResult with exactly one evaluation per group. "
+        "Do not return a holistic report or Markdown narrative. For every failed "
+        "VERSION_BUMP evaluation, provide test_attribution. Use RESPONSIBLE only "
+        "when the evaluated group is in responsible_group_ids; use EXONERATED only "
+        "when one or more other known group IDs are responsible. Both require "
+        "failed_tests and evidence-based reasoning. Use INCONCLUSIVE with failed "
+        "tests and reasoning when ownership cannot be established.\n\n"
+        "Previous typed evaluations:\n"
+        + json.dumps(
+            [evaluation.model_dump(mode="json") for evaluation in batch_result.evaluations],
+            indent=2,
+        )
+        + "\n\nGroups:\n"
+        + "\n".join(f"- {group.group_id}: {group.vulnerable_component}" for group in valid_groups)
+    )
+
+    def mark_contract_error(evaluation: QAEvaluation, reason: str) -> QAEvaluation:
+        """Convert an unreconciled judge result into an inconclusive evaluation."""
+        return evaluation.model_copy(
+            update={
+                "passed": False,
+                "failure_category": FailureCategory.SECURITY_FLAG,
+                "retry_feedback": (
+                    "QA result is inconclusive because the batch judge did not "
+                    "provide valid structured test attribution. No remediation retry "
+                    "was consumed; correct the judge contract and rerun QA."
+                ),
+                "contract_error": True,
+                "contract_error_reason": reason,
+            }
+        )
+
+    def mark_targets(evaluations: list[QAEvaluation], reason: str) -> list[QAEvaluation]:
+        """Mark only the affected target evaluations as contract errors."""
+        return [
+            mark_contract_error(evaluation, reason)
+            if evaluation.task_id in target_group_ids
+            else evaluation
+            for evaluation in evaluations
+        ]
+
+    try:
+        repaired: BatchQAResult = invoke_with_trajectory(
+            "qa_critic.batch_judge.reconcile",
+            lambda: llm.invoke(prompt),
+            prompt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: batch judge reconciliation failed: %s", exc)
+        return batch_result.model_copy(
+            update={
+                "evaluations": mark_targets(
+                    batch_result.evaluations,
+                    "Structured attribution repair failed: " + str(exc),
+                )
+            }
+        )
+
+    repaired_ids = [evaluation.task_id for evaluation in repaired.evaluations]
+    if len(repaired_ids) != len(known_ids) or set(repaired_ids) != known_ids:
+        logger.warning("qa_critic: reconciliation returned an incomplete evaluation set")
+        return batch_result.model_copy(
+            update={
+                "evaluations": mark_targets(
+                    batch_result.evaluations,
+                    "Reconciled BatchQAResult did not contain exactly one evaluation per group.",
+                )
+            }
+        )
+
+    repaired_evaluations = [
+        mark_contract_error(
+            evaluation,
+            "Reconciled evaluation still lacks valid structured test attribution.",
+        )
+        if evaluation.task_id in target_group_ids
+        and not _valid_test_attribution(evaluation, evaluation.task_id, known_ids)
+        else evaluation
+        for evaluation in repaired.evaluations
+    ]
+    return repaired.model_copy(update={"evaluations": repaired_evaluations})

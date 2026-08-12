@@ -208,6 +208,26 @@ class TestQAEvaluation:
         attribution = QATestAttribution(verdict=AttributionVerdict.INCONCLUSIVE)
         assert attribution.responsible_group_ids == []
 
+    def test_contract_error_is_inconclusive_and_requires_reason(self):
+        evaluation = QAEvaluation(
+            task_id="group-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Judge output requires reconciliation.",
+            contract_error=True,
+            contract_error_reason="Holistic report and typed evaluation disagree.",
+        )
+        assert evaluation.contract_error is True
+
+        with pytest.raises(ValidationError, match="contract_error_reason"):
+            QAEvaluation(
+                task_id="group-1",
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Judge output requires reconciliation.",
+                contract_error=True,
+            )
+
     def test_passed_evaluation_rejects_failure_metadata(self):
         with pytest.raises(ValidationError, match="passed=True"):
             QAEvaluation(

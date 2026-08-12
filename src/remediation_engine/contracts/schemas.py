@@ -212,6 +212,8 @@ class GroupRemediationStatus(str, Enum):
     NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
 
+    INCONCLUSIVE = "inconclusive"  # QA contract could not be reconciled
+
 
 class TaskStatus(str, Enum):
     """Lifecycle status for one RemediationTask in the task queue."""
@@ -221,6 +223,7 @@ class TaskStatus(str, Enum):
     QA_PASSED = "qa_passed"  # QA explicitly passed; terminal success
     NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed by supervisor
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
+    INCONCLUSIVE = "inconclusive"  # QA contract could not be reconciled
 
 
 # ---------------------------------------------------------------------------
@@ -1342,8 +1345,33 @@ class QAEvaluation(BaseModel):
         description="Structured failure evidence when passed=False.",
     )
     deterministic_gates: QADeterministicGates | None = Field(default=None)
+    contract_error: bool = Field(
+        default=False,
+        description=(
+            "True when the structured QA result could not be validated. This is "
+            "an inconclusive QA outcome, not a remediation failure, and must not "
+            "consume the task retry budget."
+        ),
+    )
     semantic_security_review: QASemanticSecurityReview | None = Field(default=None)
-    test_attribution: QATestAttribution | None = Field(default=None)
+    test_attribution: QATestAttribution | None = Field(
+        default=None,
+        description=(
+            "Optional when test attribution is not applicable. For a failed "
+            "VERSION_BUMP batch, the QA policy evaluator requires explicit "
+            "responsible, exonerated, or inconclusive attribution."
+        ),
+    )
+    contract_error_reason: str = Field(default="")
+
+    @model_validator(mode="after")
+    def _check_contract_error(self) -> QAEvaluation:
+        if self.contract_error:
+            if self.passed:
+                raise ValueError("contract_error=True cannot accompany passed=True.")
+            if not self.contract_error_reason.strip():
+                raise ValueError("contract_error=True requires a non-empty contract_error_reason.")
+        return self
 
     @model_validator(mode="after")
     def _check_pass_fail_payload(self) -> QAEvaluation:
@@ -1366,19 +1394,15 @@ class QAEvaluation(BaseModel):
 
 
 class BatchQAResult(BaseModel):
-    """Structured output from the map-reduce batch judge phase."""
+    """Structured per-task output from the map-reduce batch judge phase.
 
-    model_config = ConfigDict(frozen=True)
+    The batch judge returns only typed evaluations. The QA critic owns the
+    holistic report and renders it deterministically from the validated
+    evaluations and deterministic execution evidence.
+    """
 
-    holistic_report: str = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Free-form markdown holistic report synthesizing all individual "
-            "investigations into a unified narrative, listing responsible, "
-            "possibly responsible, and exonerated groups."
-        ),
-    )
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     evaluations: list[QAEvaluation] = Field(
         default_factory=list,
         description="Exactly one QAEvaluation per vulnerability group in the batch.",

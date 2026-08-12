@@ -179,7 +179,7 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         if task is not None:
             if task.status == TaskStatus.QA_PASSED:
                 passed_files.update(files)
-            elif task.status == TaskStatus.UNFIXABLE:
+            elif task.status in {TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE}:
                 unfixable_files.update(files)
                 if getattr(g, "vulnerable_component", None):
                     unfixable_packages.add(g.vulnerable_component)
@@ -190,7 +190,7 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         if task is not None and attempt_res.changed_files:
             if task.status == TaskStatus.QA_PASSED:
                 passed_files.update(attempt_res.changed_files)
-            elif task.status == TaskStatus.UNFIXABLE:
+            elif task.status in {TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE}:
                 unfixable_files.update(attempt_res.changed_files)
 
     files_to_exclude = unfixable_files - passed_files
