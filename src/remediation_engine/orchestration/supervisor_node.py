@@ -80,7 +80,7 @@ from remediation_engine.tools.registry_tools import plan_npm_version
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 1
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: set[str] = {

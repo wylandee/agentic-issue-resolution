@@ -1844,8 +1844,9 @@ def _format_normalized_test_summary(suites: list[_NormalizedSuiteResult]) -> str
     exit_code = failed_suites[-1].exit_code if failed_suites else 0
     failed_tests = [failure for suite in suites for failure in suite.failed_tests]
     diagnostics = [diagnostic for suite in suites for diagnostic in suite.diagnostics]
+    status_line = f"npm test FAILED (exit {exit_code})." if failed_suites else "npm test passed."
     lines = [
-        f"npm test FAILED (exit {exit_code}).",
+        status_line,
         f"Failed Tests: {len(failed_tests)}",
         f"Runner Diagnostics: {len(diagnostics)}",
         "",
@@ -1896,16 +1897,16 @@ def _run_detected_test_suites(
     sandbox: DockerSandbox,
     plans: list[_TestSuitePlan],
 ) -> tuple[bool, str]:
-    """Run detected child suites sequentially, preserving npm ``&&`` short-circuiting."""
+    """Run every detected child suite independently and aggregate the results."""
     suite_results: list[_NormalizedSuiteResult] = []
     for plan in plans:
         command = _structured_command_for_plan(plan)
         result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
         suite_result = _normalize_suite_result(plan, result, command=command)
         suite_results.append(suite_result)
-        if suite_result.exit_code != 0:
-            return False, _format_normalized_test_summary(suite_results)
-    return True, "npm test passed."
+    if any(suite.exit_code != 0 for suite in suite_results):
+        return False, _format_normalized_test_summary(suite_results)
+    return True, _format_normalized_test_summary(suite_results)
 
 
 def _run_unit_tests(sandbox: DockerSandbox) -> tuple[bool, str]:
@@ -3656,6 +3657,10 @@ rewrite them based on the investigation narrative.
    policy-specific scanner rule says they are expected and non-blocking.
 6. Do not pass using execution logs alone when the policy requires source or
    diff evidence.
+7. If tests fail, never emit `exonerated` with an empty
+   `responsible_group_ids` list. This batch has one group, so use
+   `inconclusive` when no exact responsible group can be named; the Python
+   policy evaluator will fail the group closed.
 
 ## Output Requirements
 
@@ -3837,9 +3842,15 @@ and must not be assigned automatically.
 
 7. **Do not double-attribute** the same test failure to multiple groups unless evidence explicitly supports multiple causes.
 
-8. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
-9. Report newly introduced identifiers explicitly in the holistic report, but leave the per-group evaluations scoped to the assigned remediation groups.
-10. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
+8. For every evaluation whose `test_attribution.verdict` is `exonerated`,
+   populate `responsible_group_ids` with one or more exact IDs from the
+   assigned group list. Also populate `failed_tests` and evidence-based
+   `reasoning`. An exoneration with `responsible_group_ids: []` is invalid;
+   use `inconclusive` instead when no exact responsible group can be named.
+
+9. Resolve contradictions between individual investigations using the deterministic scanner results as the ground truth.
+10. Report newly introduced identifiers explicitly in the holistic report, but leave the per-group evaluations scoped to the assigned remediation groups.
+11. For failed CODE_WORKAROUND groups, `retry_feedback` MUST include detailed diagnostic feedback:
     - Exact error messages from test execution, runtime logs, or compilation output.
     - Specific failing test names and test files.
     - File and line locations of the failure if available.
@@ -3851,6 +3862,10 @@ Return a BatchQAResult with:
 - `holistic_report`: A markdown narrative listing: (a) responsible groups, (b) possibly responsible groups, (c) exonerated groups, and (d) any newly introduced global scanner identifiers. Reference specific test names, scanner IDs, or diff evidence.
 - `evaluations`: A list of exactly {len(valid_groups)} QAEvaluation objects, one per group.
   - Each evaluation must have: group_id (exact), passed (bool), failure_category (null if passed), retry_feedback (null if passed, specific actionable guidance if failed).
+  - If tests fail and an evaluation is `exonerated`, its `test_attribution` MUST include:
+    `verdict="exonerated"`, non-empty `responsible_group_ids` containing exact
+    IDs from the groups above, non-empty `failed_tests`, and non-empty
+    evidence-based `reasoning`. Do not emit an empty responsible-ID list.
 
 You MUST emit exactly {len(valid_groups)} evaluations, one for each group ID listed above.
 """

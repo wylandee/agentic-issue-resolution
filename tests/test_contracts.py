@@ -36,6 +36,7 @@ from remediation_engine.contracts import (
     LocalizedIssue,
     PatchAttempt,
     QAEvaluation,
+    QATestAttribution,
     RoutingStrategy,
     Severity,
     TrajectoryEvent,
@@ -48,6 +49,9 @@ from remediation_engine.contracts.schemas import (
     CWEEntry,
     FailingTest,
     LineRange,
+)
+from remediation_engine.contracts.schemas import (
+    TestAttributionVerdict as AttributionVerdict,
 )
 
 # ===========================================================================
@@ -195,6 +199,14 @@ class TestQAEvaluation:
         evaluation = QAEvaluation(task_id="group-1", passed=True)
         assert evaluation.failure_category is None
         assert evaluation.retry_feedback is None
+
+    def test_exonerated_attribution_requires_structured_evidence(self):
+        with pytest.raises(ValidationError, match="responsible_group_ids"):
+            QATestAttribution(verdict=AttributionVerdict.EXONERATED)
+
+    def test_inconclusive_attribution_may_omit_owner(self):
+        attribution = QATestAttribution(verdict=AttributionVerdict.INCONCLUSIVE)
+        assert attribution.responsible_group_ids == []
 
     def test_passed_evaluation_rejects_failure_metadata(self):
         with pytest.raises(ValidationError, match="passed=True"):

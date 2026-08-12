@@ -250,7 +250,7 @@ class TestRunUnitTests:
         _, kwargs = sandbox.run.call_args
         assert kwargs.get("timeout") == _NPM_TEST_TIMEOUT_SECONDS
 
-    def test_composite_suite_stops_after_first_failed_child(self):
+    def test_composite_suite_runs_all_children_after_failure(self):
         root_package = {
             "scripts": {
                 "test": "npm run test:server && npm run test:api",
@@ -277,7 +277,8 @@ class TestRunUnitTests:
                     ),
                     stderr="",
                     duration_seconds=1.0,
-                )
+                ),
+                CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0),
             ]
         )
         sandbox.read_file.side_effect = lambda path: (
@@ -289,11 +290,12 @@ class TestRunUnitTests:
         assert ok is False
         assert "Failed Tests: 1" in summary
         assert "server rejects bad token" in summary
-        assert sandbox.run.call_count == 1
-        sandbox.run.assert_called_once_with(
+        assert "api: passed" in summary
+        assert sandbox.run.call_count == 2
+        assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "npm run test:server -- --reporter json",
-            timeout=_NPM_TEST_TIMEOUT_SECONDS,
-        )
+            "npm run test:api",
+        ]
 
     def test_composite_suite_all_children_passing_returns_passed(self):
         root_package = {
@@ -316,7 +318,9 @@ class TestRunUnitTests:
         ok, summary = _run_unit_tests(sandbox)
 
         assert ok is True
-        assert summary == "npm test passed."
+        assert summary.startswith("npm test passed.")
+        assert "server: passed" in summary
+        assert "api: passed" in summary
         assert sandbox.run.call_count == 2
 
     def test_unknown_project_uses_legacy_npm_test_text_parser(self):

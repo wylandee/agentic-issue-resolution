@@ -1260,6 +1260,32 @@ class QATestAttribution(BaseModel):
     failed_tests: list[str] = Field(default_factory=list)
     reasoning: str = ""
 
+    @model_validator(mode="after")
+    def _check_attribution_evidence(self) -> QATestAttribution:
+        """Require complete evidence for responsible or exonerated verdicts.
+
+        ``INCONCLUSIVE`` may carry no attribution because it means the judge
+        could not establish causation. A ``RESPONSIBLE`` or ``EXONERATED``
+        verdict must identify the group(s), failed tests, and reasoning that
+        support the claim. Exact group membership is validated later by the
+        QA policy evaluator because this model does not know the batch IDs.
+        """
+        if self.verdict == TestAttributionVerdict.INCONCLUSIVE:
+            return self
+
+        if not self.responsible_group_ids or any(
+            not identifier.strip() for identifier in self.responsible_group_ids
+        ):
+            raise ValueError(
+                "responsible or exonerated test attribution requires non-empty "
+                "responsible_group_ids."
+            )
+        if not self.failed_tests or any(not test.strip() for test in self.failed_tests):
+            raise ValueError("responsible or exonerated test attribution requires failed_tests.")
+        if not self.reasoning.strip():
+            raise ValueError("responsible or exonerated test attribution requires reasoning.")
+        return self
+
 
 class QADeterministicGates(BaseModel):
     """Raw Python-owned QA evidence before policy-specific decision rules."""
