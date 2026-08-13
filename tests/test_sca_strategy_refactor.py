@@ -336,7 +336,7 @@ def test_supervisor_stage_progression_and_retry_cap():
     assert _next_sca_stage(SCARemediationStage.OSV_MINIMUM) == SCARemediationStage.NPM_SAME_MAJOR
     assert _next_sca_stage(SCARemediationStage.NPM_SAME_MAJOR) == SCARemediationStage.NPM_LATEST
     assert _next_sca_stage(SCARemediationStage.NPM_LATEST) == SCARemediationStage.CODE_WORKAROUND
-    assert MAX_RETRIES == 3
+    assert MAX_RETRIES == 2
 
 
 def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():

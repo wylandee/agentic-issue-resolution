@@ -568,11 +568,13 @@ def _ensure_worker_attempt_results(
 
 def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
-    Bridge OrchestratorState â†’ SubagentState for the batch dependency update subagent.
+    Bridge OrchestratorState â†’ SubagentState for the dependency update subagent.
 
-    Reads ``active_target_task_ids`` from state to select the target tasks,
-    resolves the associated VulnerabilityGroups, calls ``run_update_subagent_node``,
-    then merges results back into the orchestrator state via task_queue.
+    Normal Supervisor dispatches contain one active task. The bridge retains
+    generic target-list handling for direct and future batch callers, resolves
+    the associated VulnerabilityGroups, calls ``run_update_subagent_node``, and
+    merges results back into the orchestrator state via ``task_queue`` while
+    preserving attempt snapshots, task revisions, and typed result correlation.
     """
     task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
     active_task_ids = list(state.get("active_target_task_ids", []))

@@ -191,6 +191,15 @@ class TestSupervisorDecisionSchema:
                 decision_reason="test",
             )
 
+    def test_update_subagent_retains_reusable_batch_shape(self):
+        decision = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=["t1", "t2"],
+            instructions="test",
+            decision_reason="direct batch compatibility",
+        )
+        assert decision.target_task_ids == ["t1", "t2"]
+
     def test_update_subagent_rejects_more_than_ten_targets(self):
         with pytest.raises(ValidationError):
             SupervisorDecision(
@@ -310,7 +319,7 @@ class TestRunSupervisorNodeNormalization:
 
 class TestRunSupervisorNodeVersionBump:
     @patch("langchain_openai.ChatOpenAI")
-    def test_version_bump_tasks_batch_to_update_subagent(self, mock_chat):
+    def test_version_bump_tasks_dispatch_one_at_a_time(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
         state = _base_state([g1, g2])
@@ -323,16 +332,52 @@ class TestRunSupervisorNodeVersionBump:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "update_subagent"
-        assert len(result["active_target_task_ids"]) == 2
+        assert result["active_target_task_ids"] == ["task-1"]
 
-    def test_deterministic_routing_caps_update_batch_at_ten(self):
+    def test_deterministic_routing_caps_update_dispatch_at_one(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
         state = _base_state(groups)
 
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "update_subagent"
-        assert len(result["active_target_task_ids"]) == 10
+        assert result["active_target_task_ids"] == ["task-1"]
+
+    def test_deterministic_retry_routing_dispatches_one_task(self):
+        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
+        tasks = {
+            f"task-{i + 1}": _make_task(
+                f"task-{i + 1}",
+                f"g{i}",
+                status=TaskStatus.NEEDS_RETRY,
+                retry_count=1,
+            )
+            for i in range(3)
+        }
+        decision = _deterministic_routing(
+            {task.task_id: task for task in tasks.values()},
+            {group.group_id: group for group in groups},
+            {},
+            {},
+        )
+
+        assert decision.next_node == "update_subagent"
+        assert decision.target_task_ids == ["task-1"]
+
+    def test_repeated_routing_advances_to_the_next_task_after_completion(self):
+        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
+        tasks = {f"task-{i + 1}": _make_task(f"task-{i + 1}", f"g{i}") for i in range(3)}
+        task_queue = {task.task_id: task for task in tasks.values()}
+        groups_by_id = {group.group_id: group for group in groups}
+
+        first = _deterministic_routing(task_queue, groups_by_id, {}, {})
+        assert first.target_task_ids == ["task-1"]
+
+        task_queue["task-1"] = task_queue["task-1"].model_copy(
+            update={"status": TaskStatus.QA_PASSED}
+        )
+        second = _deterministic_routing(task_queue, groups_by_id, {}, {})
+        assert second.target_task_ids == ["task-2"]
 
     @patch("langchain_openai.ChatOpenAI")
     def test_version_bump_routes_to_update_subagent_via_llm(self, mock_chat):
@@ -357,6 +402,7 @@ class TestRunSupervisorNodeVersionBump:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
 
 
 class TestRunSupervisorNodeWorkaround:
@@ -384,7 +430,7 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert "task-1" in result["active_target_task_ids"]
 
-    def test_all_optimistically_fixed_tasks_route_to_qa(self):
+    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
         g1 = _sca_group("g1")
         g2 = _sca_group("g2")
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -398,10 +444,10 @@ class TestRunSupervisorNodeToQA:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
-        assert set(result["active_target_task_ids"]) == {"task-1", "task-2"}
+        assert result["active_target_task_ids"] == ["task-1"]
 
-    def test_current_batch_routes_to_qa_before_more_updates(self):
-        # 12 groups: first 10 are optimistically fixed (active batch), 2 are pending
+    def test_current_task_routes_to_qa_before_more_updates(self):
+        # 12 groups: first 10 are optimistically fixed, 2 are pending.
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
         tasks = {
             f"task-{i + 1}": _make_task(
@@ -420,17 +466,17 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert set(result["active_target_task_ids"]) == {f"task-{i + 1}" for i in range(10)}
+        assert result["active_target_task_ids"] == ["task-1"]
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_mixed_update_batch_routes_successful_subset_to_qa(self, mock_chat):
+    def test_mixed_update_results_route_successful_subset_to_qa(self, mock_chat):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
         tasks = {
             f"task-{i + 1}": _make_task(
                 f"task-{i + 1}",
                 f"g{i}",
                 status=TaskStatus.NEEDS_RETRY,
-                retry_count=1,
+                retry_count=0,
             )
             for i in range(5)
         }
@@ -467,7 +513,7 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1", "task-2", "task-3"]
+        assert result["active_target_task_ids"] == ["task-1"]
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-2"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-3"].status == TaskStatus.OPTIMISTICALLY_FIXED
@@ -2155,7 +2201,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_multi_spawn_materializes_all_children_but_routes_first_child(self, mock_chat):
+    def test_deterministic_routing_ignores_multi_spawn_advisory(self, mock_chat):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
         tasks = {
             f"task-{i + 1}": _make_task(
@@ -2206,7 +2252,7 @@ class TestRunSupervisorNodePeerConflict:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1", "task-2", "task-3"]
+        assert result["active_target_task_ids"] == ["task-1"]
         assert all(
             result["task_queue"][task_id].status == TaskStatus.NEEDS_RETRY
             for task_id in ("task-1", "task-2", "task-3")
@@ -2268,12 +2314,14 @@ class TestSupervisorLLMStructuredOutput:
 
 
 class TestSupervisorPrompt:
-    def test_prompt_instructs_llm_to_cap_update_batches_at_ten(self):
+    def test_prompt_instructs_llm_to_route_one_update_and_qa_task(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
         prompt = build_supervisor_prompt(_base_state(groups))
 
-        assert "batches of at most 10" in prompt
-        assert "update_subagent MUST have between 1 and 10 target_task_ids" in prompt
+        assert "Send exactly one pending VERSION_BUMP task to update_subagent." in prompt
+        assert "Send exactly one retry VERSION_BUMP task to update_subagent." in prompt
+        assert "update_subagent MUST have exactly one target_task_id." in prompt
+        assert "qa_critic MUST have exactly one target_task_id." in prompt
 
     def test_prompt_includes_task_ids(self):
         g1 = _sca_group("g1")

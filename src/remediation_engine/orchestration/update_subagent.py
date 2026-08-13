@@ -1,5 +1,7 @@
-"""
-Batch Update Subagent for Phase 5 dependency resolution.
+"""Dependency Update Subagent for Phase 5 dependency resolution.
+
+The Supervisor normally dispatches one task per invocation, while this module
+retains batch-capable helpers for direct callers and future explicit batch mode.
 """
 
 from __future__ import annotations
@@ -1122,7 +1124,12 @@ def _build_retry_diagnostics(
 
 @traceable(name="Update_Subagent_Test_Run")  # for langsmith testing
 def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
-    """Run the batch dependency update subagent on ``SubagentState``."""
+    """Run the dependency update subagent for one or more committed tasks.
+
+    The Supervisor currently supplies one task per invocation. Direct callers
+    may still provide multiple compatible tasks, subject to the existing
+    first-pass/retry batch safeguards and per-package rollback behavior.
+    """
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
     target_tasks = list(state.get("target_tasks", []))

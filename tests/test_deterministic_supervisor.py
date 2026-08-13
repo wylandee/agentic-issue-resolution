@@ -160,7 +160,7 @@ def test_stable_sort_uses_severity_then_task_id():
         "task-a": _task("task-a", "critical"),
     }
     decision = _route(tasks, groups)
-    assert decision.target_task_ids == ["task-a", "task-b"]
+    assert decision.target_task_ids == ["task-a"]
     assert _task_sort_key(tasks["task-a"], {g.group_id: g for g in groups}) < _task_sort_key(
         tasks["task-b"], {g.group_id: g for g in groups}
     )
