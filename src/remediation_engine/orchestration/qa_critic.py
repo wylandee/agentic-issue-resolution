@@ -13,9 +13,9 @@ The QA Critic now follows a map-reduce architecture:
     assigned group.
 
   Reduce â€” Batch Judge:
-    One ChatOpenAI.with_structured_output(BatchQAResult) call across all
-    group investigation texts, producing a holistic_report and exactly one
-    QAEvaluation per group.
+    One ChatOpenAI.with_structured_output(BatchQAResult) call across the
+    current group scope, normally one group because Supervisor dispatch is
+    per-task, while direct batch callers remain supported.
 
   Python Guardrails:
     Normalize, validate, and fill missing/duplicate/unknown evaluations
@@ -3263,7 +3263,7 @@ def _run_batch_judge(
         investigations_by_group=investigations_by_group,
     )
 
-    logger.info("qa_critic: [Reduce] invoking batch judge for %d groups.", len(valid_groups))
+    logger.info("qa_critic: [Reduce] invoking batch judge for %d group(s).", len(valid_groups))
     try:
         batch_result: BatchQAResult = invoke_with_trajectory(
             "qa_critic.batch_judge",
@@ -3271,7 +3271,7 @@ def _run_batch_judge(
             prompt,
         )
         logger.info(
-            "qa_critic: [Reduce] batch judge returned %d evaluations.",
+            "qa_critic: [Reduce] batch judge returned %d evaluation(s).",
             len(batch_result.evaluations),
         )
         return batch_result
@@ -3980,7 +3980,10 @@ def _extract_group_evaluations(
 @traceable(name="qa_critic")
 def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     """
-    LangGraph node: run the map-reduce QA pipeline and evaluate each group.
+    LangGraph node: run the map-reduce QA pipeline for the supplied group scope.
+
+    Normal Supervisor dispatches supply one task and therefore one parent group;
+    direct callers may still provide multiple groups for batch QA.
 
     Pipeline:
       Step 0 â€” Global Execution (deterministic Python, no LLM tools)
@@ -4153,7 +4156,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         errors.extend(investigation.errors)
 
     # ------------------------------------------------------------------
-    # Reduce: Batch Judge (one LLM call for all groups)
+    # Reduce: Batch Judge (one LLM call for the current group scope)
     # ------------------------------------------------------------------
     batch_result = _run_batch_judge(
         valid_groups=valid_groups,

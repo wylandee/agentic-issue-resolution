@@ -79,8 +79,11 @@ from remediation_engine.tools.registry_tools import plan_npm_version
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
-UPDATE_BATCH_SIZE: int = 10
+MAX_RETRIES: int = 1
+# Supervisor dispatch is intentionally per-task.  The worker and QA helpers
+# remain batch-capable for direct callers and a future explicit batch mode.
+UPDATE_DISPATCH_LIMIT: int = 1
+QA_DISPATCH_LIMIT: int = 1
 
 _VALID_NEXT_NODES: set[str] = {
     "update_subagent",
@@ -165,11 +168,13 @@ def _dispatchable_task_ids_for_status(
 def _qa_ready_task_ids(
     task_queue: dict[str, RemediationTask],
     preferred_ids: list[str] | None = None,
+    limit: int | None = None,
 ) -> list[str]:
     return _dispatchable_task_ids_for_status(
         task_queue,
         {TaskStatus.OPTIMISTICALLY_FIXED},
         preferred_ids=preferred_ids,
+        limit=limit,
     )
 
 
@@ -1389,7 +1394,7 @@ def _update_worker_task_ids(
     task_queue: dict[str, RemediationTask],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     preferred_ids: list[str] | None = None,
-    limit: int | None = UPDATE_BATCH_SIZE,
+    limit: int | None = UPDATE_DISPATCH_LIMIT,
 ) -> list[str]:
     task_ids = _dispatchable_task_ids_for_status(
         task_queue,
@@ -1419,13 +1424,17 @@ def _normalize_target_task_ids_for_node(
     """Clamp returned active targets to the lifecycle state accepted by next_node."""
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
     if next_node == "qa_critic":
-        return _qa_ready_task_ids(task_queue, preferred_ids=target_task_ids)
+        return _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=target_task_ids,
+            limit=QA_DISPATCH_LIMIT,
+        )
     if next_node == "update_subagent":
         return _update_worker_task_ids(
             task_queue,
             retry_diagnostics_by_task,
             preferred_ids=target_task_ids,
-            limit=UPDATE_BATCH_SIZE,
+            limit=UPDATE_DISPATCH_LIMIT,
         )
     if next_node == "workaround_subagent":
         return _dispatchable_task_ids_for_status(
@@ -1874,28 +1883,29 @@ def _deterministic_routing(
             decision_reason="No actionable tasks remain.",
         )
 
-    # If active batch is all optimistically_fixed â†’ route to qa_critic
-    current_batch_qa_ready = _qa_ready_task_ids(
+    # If an active task is optimistically_fixed â†’ route it to qa_critic.
+    current_task_qa_ready = _qa_ready_task_ids(
         task_queue,
         preferred_ids=list(active_target_task_ids or []),
+        limit=QA_DISPATCH_LIMIT,
     )
-    if current_status != "qa_completed" and current_batch_qa_ready:
+    if current_status != "qa_completed" and current_task_qa_ready:
         return SupervisorDecision(
             next_node="qa_critic",
-            target_task_ids=current_batch_qa_ready,
-            instructions="Run QA on the current remediated batch before starting more remediation.",
+            target_task_ids=current_task_qa_ready,
+            instructions="Run QA on the current remediated task before starting more remediation.",
             decision_reason=(
-                f"Routing {len(current_batch_qa_ready)} optimistically fixed task(s) from the current batch to QA."
+                f"Routing task '{current_task_qa_ready[0]}' to QA after a successful worker attempt."
             ),
         )
 
-    all_qa_ready = _qa_ready_task_ids(task_queue)
+    all_qa_ready = _qa_ready_task_ids(task_queue, limit=QA_DISPATCH_LIMIT)
     if all_qa_ready:
         return SupervisorDecision(
             next_node="qa_critic",
             target_task_ids=all_qa_ready,
-            instructions="Run QA on the remaining optimistically fixed tasks.",
-            decision_reason="Routing all remaining optimistically fixed tasks to QA.",
+            instructions="Run QA on the next remaining optimistically fixed task.",
+            decision_reason=f"Routing task '{all_qa_ready[0]}' to QA.",
         )
 
     # Collect tasks that still need work
@@ -2001,7 +2011,7 @@ def _deterministic_routing(
         if t.strategy == RoutingStrategy.VERSION_BUMP and t.status == TaskStatus.NEEDS_RETRY
     ]
     if retry_version_bump:
-        batch = retry_version_bump[:UPDATE_BATCH_SIZE]
+        batch = retry_version_bump[:UPDATE_DISPATCH_LIMIT]
         feedback_by_task: dict[str, str] = {}
         revised_instructions: dict[str, str] = {}
         for task in batch:
@@ -2021,20 +2031,20 @@ def _deterministic_routing(
             target_task_ids=[t.task_id for t in batch],
             feedback_by_task=feedback_by_task,
             revised_instructions=revised_instructions,
-            instructions="Route retry-bound dependency tasks back to the update worker with high-level retry goals.",
+            instructions="Route the retry-bound dependency task back to the update worker with its high-level retry goal.",
             decision_reason=(
-                f"Routing {len(batch)} retry VERSION_BUMP task(s) to update_subagent for registry-guided evidence gathering."
+                f"Routing retry VERSION_BUMP task '{batch[0].task_id}' to update_subagent for registry-guided evidence gathering."
             ),
         )
 
-    # VERSION_BUMP tasks batch to update_subagent only for non-retry work.
+    # VERSION_BUMP tasks route to update_subagent one at a time for non-retry work.
     version_bump = [
         t
         for t in workable
         if t.strategy == RoutingStrategy.VERSION_BUMP and t.status != TaskStatus.NEEDS_RETRY
     ]
     if version_bump:
-        batch = version_bump[:UPDATE_BATCH_SIZE]
+        batch = version_bump[:UPDATE_DISPATCH_LIMIT]
         feedback_by_task: dict[str, str] = {}
         for t in batch:
             eval_ = qa_evaluations.get(t.task_id) or qa_evaluations.get(t.parent_group_id)
@@ -2044,10 +2054,8 @@ def _deterministic_routing(
             next_node="update_subagent",
             target_task_ids=[t.task_id for t in batch],
             feedback_by_task=feedback_by_task,
-            instructions="Apply the required version bump(s) in the package manifest(s) for this batch only.",
-            decision_reason=(
-                f"Routing {len(batch)} VERSION_BUMP task(s) to update_subagent (batch size cap {UPDATE_BATCH_SIZE})."
-            ),
+            instructions="Apply the required version bump in the package manifest for this task only.",
+            decision_reason=(f"Routing VERSION_BUMP task '{batch[0].task_id}' to update_subagent."),
         )
 
     # CODE_WORKAROUND tasks: send exactly one at a time to workaround_subagent
@@ -2531,8 +2539,8 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "## Router Rules (follow strictly)",
         "0. QA-ready tasks have priority: route optimistically_fixed tasks to qa_critic before planning retries or dispatching workers.",
         "1. When Post-QA triage required is yes after QA results are ingested, route to triage before any worker or teardown decision.",
-        f"2. Send pending VERSION_BUMP tasks to update_subagent in batches of at most {UPDATE_BATCH_SIZE}.",
-        f"3. Send retry VERSION_BUMP tasks to update_subagent in retry-only batches of at most {UPDATE_BATCH_SIZE}.",
+        "2. Send exactly one pending VERSION_BUMP task to update_subagent.",
+        "3. Send exactly one retry VERSION_BUMP task to update_subagent.",
         "4. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry containing the exact planned version.",
         "5. Retry revised_instructions are authoritative exact execution instructions.",
         "6. Same-strategy retries reuse the same task.",
@@ -2542,20 +2550,21 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "8a. CODE_WORKAROUND tasks that fail QA are retried; they do not advance version stages. You MUST copy the task's Last QA feedback into feedback_by_task for the retry.",
         "9. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task.",
         "10. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
-        "11. After a worker succeeds for the current active batch, route that batch to qa_critic.",
+        "11. After a worker succeeds for the current task, route that task to qa_critic.",
         "12. When no actionable non-terminal tasks remain, route to teardown.",
         f"13. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
         "14. unfixable and qa_passed tasks must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
         "15. task_status_updates may only set QA_PASSED or UNFIXABLE.",
-        f"16. update_subagent MUST have between 1 and {UPDATE_BATCH_SIZE} target_task_ids.",
+        "16. Under the current routing policy, update_subagent MUST have exactly one target_task_id.",
         "17. workaround_subagent MUST have exactly one target_task_id.",
-        "18. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
-        f"19. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
-        "20. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
-        "21. Mixed worker batches must be split by task status before routing the next node.",
-        "22. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
-        "23. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
-        "24. When routing or spawning CODE_WORKAROUND tasks, you MUST provide a search_hint in the task `instruction` or `revised_instructions`:",
+        "18. Under the current routing policy, qa_critic MUST have exactly one target_task_id.",
+        "19. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
+        f"20. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
+        "21. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
+        "22. If multi-task worker mode is re-enabled, mixed first-pass and retry tasks must be split before routing.",
+        "23. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
+        "24. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
+        "25. When routing or spawning CODE_WORKAROUND tasks, you MUST provide a search_hint in the task `instruction` or `revised_instructions`:",
         '    - Scenario: QA failed on unit tests -> "Hint: Unit tests failed, prioritize searching the error string / stack trace without quotation marks."',
         '    - Scenario: QA failed on scanner/CVE unresolved, or no version bumps available -> "Hint: Prioritize searching the CVE and mitigation strategies without quotation marks."',
         '    - Scenario: Workaround validation gate failed (retry) -> "Hint: Validation gate failed, prioritize searching the error string without quotation marks."',
@@ -2709,7 +2718,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     2. Ingest subagent action summaries for current active_target_task_ids only.
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
     4. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
-    5. Short-circuit: if active batch is all optimistically_fixed â†’ qa_critic.
+    5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic.
     6. If QA produced a parseable scan and set ``triage_required``, route to
        the post-QA triage node before any worker or teardown decision.
     7. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
@@ -3354,21 +3363,22 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             )
 
     # ------------------------------------------------------------------
-    # 5. Short-circuit: if active batch is all optimistically_fixed â†’ qa_critic
+    # 5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic
     # ------------------------------------------------------------------
     decision: SupervisorDecision | None = None
     if state.get("status") != "qa_completed" and active_target_task_ids:
         active_qa_ready = _qa_ready_task_ids(
             task_queue,
             preferred_ids=active_target_task_ids,
+            limit=QA_DISPATCH_LIMIT,
         )
         if active_qa_ready:
             decision = SupervisorDecision(
                 next_node="qa_critic",
                 target_task_ids=active_qa_ready,
-                instructions="Run QA on the current remediated batch before starting more remediation.",
+                instructions="Run QA on the current remediated task before starting more remediation.",
                 decision_reason=(
-                    f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
+                    f"Routing task '{active_qa_ready[0]}' to QA after a successful worker attempt."
                 ),
             )
 
@@ -3399,13 +3409,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 decision_reason="No actionable tasks remain.",
             )
         else:
-            qa_ready = _qa_ready_task_ids(task_queue)
+            qa_ready = _qa_ready_task_ids(task_queue, limit=QA_DISPATCH_LIMIT)
             if qa_ready:
                 decision = SupervisorDecision(
                     next_node="qa_critic",
                     target_task_ids=qa_ready,
-                    instructions="Run QA on the remaining optimistically fixed tasks.",
-                    decision_reason="Routing remaining optimistically fixed tasks to QA.",
+                    instructions="Run QA on the next remaining optimistically fixed task.",
+                    decision_reason=f"Routing task '{qa_ready[0]}' to QA.",
                 )
 
     # ------------------------------------------------------------------
@@ -3689,14 +3699,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         active_qa_ready = _qa_ready_task_ids(
             task_queue,
             preferred_ids=active_target_task_ids,
+            limit=QA_DISPATCH_LIMIT,
         )
         if active_qa_ready:
             decision = SupervisorDecision(
                 next_node="qa_critic",
                 target_task_ids=active_qa_ready,
-                instructions="Run QA on the current remediated batch before starting more remediation.",
+                instructions="Run QA on the current remediated task before starting more remediation.",
                 decision_reason=(
-                    f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
+                    f"Routing task '{active_qa_ready[0]}' to QA after a successful worker attempt."
                 ),
             )
 
@@ -3767,13 +3778,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             valid_target_ids = _qa_ready_task_ids(
                 task_queue,
                 preferred_ids=list(decision.target_task_ids),
+                limit=QA_DISPATCH_LIMIT,
             )
         elif decision.next_node == "update_subagent":
             valid_target_ids = _update_worker_task_ids(
                 task_queue,
                 retry_diagnostics_by_task,
                 preferred_ids=list(decision.target_task_ids),
-                limit=UPDATE_BATCH_SIZE,
+                limit=UPDATE_DISPATCH_LIMIT,
             )
         elif decision.next_node == "workaround_subagent":
             valid_target_ids = []
@@ -3799,6 +3811,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 
         # Enforce cardinality constraints
         needs_fallback = False
+        requested_target_count = len(decision.target_task_ids)
         if decision.next_node == "workaround_subagent" and len(valid_target_ids) != 1:
             logger.warning(
                 "supervisor: workaround_subagent needs 1 target, got %d â€” falling back.",
@@ -3812,12 +3825,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if (
             not needs_fallback
             and decision.next_node == "update_subagent"
-            and len(valid_target_ids) > UPDATE_BATCH_SIZE
+            and requested_target_count > UPDATE_DISPATCH_LIMIT
         ):
             logger.warning(
-                "supervisor: update_subagent supports at most %d targets, got %d â€” falling back.",
-                UPDATE_BATCH_SIZE,
-                len(valid_target_ids),
+                "supervisor: update_subagent current policy allows exactly 1 target, got %d â€” falling back.",
+                requested_target_count,
+            )
+            needs_fallback = True
+        if (
+            not needs_fallback
+            and decision.next_node == "qa_critic"
+            and requested_target_count > QA_DISPATCH_LIMIT
+        ):
+            logger.warning(
+                "supervisor: qa_critic current policy allows exactly 1 target, got %d â€” falling back.",
+                requested_target_count,
             )
             needs_fallback = True
         if not needs_fallback and decision.next_node == "update_subagent" and valid_target_ids:
@@ -3833,7 +3855,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             )
             if has_retry_targets and has_first_pass_targets:
                 logger.warning(
-                    "supervisor: update_subagent batch mixed first-pass and retry tasks â€” falling back."
+                    "supervisor: update_subagent request mixed first-pass and retry tasks â€” falling back."
                 )
                 needs_fallback = True
         if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
