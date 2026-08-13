@@ -26,6 +26,7 @@ from typing import Annotated, Any, TypeVar
 from langgraph.graph.message import AnyMessage, add_messages
 from typing_extensions import TypedDict
 
+from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FixPlanStatus,
@@ -47,6 +48,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.supervisor_phases import AuditRecord
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -343,6 +345,8 @@ class OrchestratorState(TypedDict, total=False):
 
     # Supervisor routing fields
     next_routing_step: str
+    decision_code: DecisionCode | None
+    supervisor_audit: AuditRecord | None
     active_target_group_ids: list[str]
     feedback_by_group: Annotated[dict[str, str], replace_dict_reducer]
     feedback_by_task: Annotated[dict[str, str], replace_dict_reducer]

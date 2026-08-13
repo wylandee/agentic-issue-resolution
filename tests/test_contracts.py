@@ -25,6 +25,7 @@ from remediation_engine.contracts import (
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
+    DecisionCode,
     EditRequest,
     EditResult,
     EditStatus,
@@ -48,6 +49,7 @@ from remediation_engine.contracts.schemas import (
     CWEEntry,
     FailingTest,
     LineRange,
+    SupervisorDecision,
 )
 
 # ===========================================================================
@@ -178,6 +180,16 @@ class TestSeverityCoercion:
 class TestPhase5RefactorEnums:
     def test_failure_category_values(self):
         assert FailureCategory.SECURITY_FLAG.value == "security_flag"
+
+    def test_supervisor_decision_accepts_optional_decision_code(self):
+        decision = SupervisorDecision(
+            next_node="teardown",
+            instructions="done",
+            decision_reason="all tasks terminal",
+        )
+        assert decision.decision_code is None
+        coded = decision.model_copy(update={"decision_code": DecisionCode.NO_ACTIONABLE_TASKS})
+        assert coded.decision_code == DecisionCode.NO_ACTIONABLE_TASKS
         assert FailureCategory.PEER_CONFLICT.value == "peer_conflict"
         assert FailureCategory.BREAKING_CHANGE.value == "breaking_change"
 

@@ -28,12 +28,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
 import requests
 from langchain_core.tools import tool
+
+from remediation_engine.contracts.version_policy import RegistryCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,63 @@ def _fetch_package_data(package_name: str) -> dict[str, Any]:
     return response.json()
 
 
+def fetch_registry_candidates(
+    package_name: str,
+    security_floor: str,
+    attempted_versions: set[str] | None = None,
+) -> list[RegistryCandidate]:
+    """Fetch stable npm versions as typed deterministic policy inputs.
+
+    Args:
+        package_name: Package name accepted by the npm registry.
+        security_floor: Lowest stable version that addresses the finding.
+        attempted_versions: Versions already tried by prior worker attempts.
+
+    Returns:
+        Candidates sorted by ascending semantic-version key.
+
+    Raises:
+        ValueError: If ``security_floor`` is not stable semver or the package
+            is not present in the registry.
+        requests.RequestException: If the registry request fails.
+    """
+    package_name = (package_name or "").strip()
+    floor = (security_floor or "").strip().lstrip("vV")
+    if not package_name:
+        raise ValueError("package_name must not be empty")
+    floor_key = _stable_version_key(floor)
+    if floor_key is None:
+        raise ValueError(f"Invalid security floor: {security_floor}")
+
+    attempted = {
+        str(version).strip().lstrip("vV")
+        for version in (attempted_versions or set())
+        if str(version).strip()
+    }
+    try:
+        data = _fetch_package_data(package_name)
+    except requests.RequestException as exc:
+        raise ValueError(f"Could not fetch registry data for {package_name}: {exc}") from exc
+    candidates: list[RegistryCandidate] = []
+    for raw_version in data.get("versions") or {}:
+        version = str(raw_version).strip().lstrip("vV")
+        key = _stable_version_key(version)
+        if key is None:
+            continue
+        candidates.append(
+            RegistryCandidate(
+                version=version,
+                semver_key=key,
+                security_floor_met=key >= floor_key,
+                is_stable=True,
+                same_major=key[0] == floor_key[0],
+                already_attempted=version in attempted,
+            )
+        )
+    candidates.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+    return candidates
+
+
 def _build_version_entries(
     data: dict[str, Any],
     time_map: dict[str, str],
@@ -105,10 +165,8 @@ def _build_version_entries(
         publish_time = time_map.get(version)
         ts_key: datetime | None = None
         if publish_time:
-            try:
+            with suppress(Exception):
                 ts_key = datetime.fromisoformat(publish_time.replace("Z", "+00:00"))
-            except Exception:  # noqa: BLE001
-                pass
 
         entries.append(
             {
@@ -288,7 +346,7 @@ def plan_npm_version(
         return f"ERROR: Could not query '{package_name}': {exc}"
 
     stable_versions: list[tuple[tuple[int, int, int], str]] = []
-    for raw_version in (data.get("versions") or {}).keys():
+    for raw_version in data.get("versions") or {}:
         version = str(raw_version).strip().lstrip("vV")
         key = _stable_version_key(version)
         if key is not None and key >= floor_key:

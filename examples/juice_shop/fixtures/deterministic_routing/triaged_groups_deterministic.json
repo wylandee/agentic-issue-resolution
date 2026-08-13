@@ -1,0 +1,334 @@
+[
+  {
+    "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "@tootallnate/once",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2026-3449"
+    ],
+    "ghsa_ids": [
+      "GHSA-VPQ2-C234-7XJ6"
+    ],
+    "versions": [
+      "1.1.2"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "5c280aa5-a3d6-43f3-85fa-9de7e5459809",
+    "issues": [
+      {
+        "id": "5c280aa5-a3d6-43f3-85fa-9de7e5459809",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2026-3449",
+        "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+        "cwe": [
+          {
+            "id": "CWE-705",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "LOW",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/@tootallnate/once:1.1.2",
+        "line_range": null,
+        "package_name": "@tootallnate/once",
+        "package_version": "1.1.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+        "ecosystem": "npm",
+        "message": "Versions of the package @tootallnate/once before 3.0.1 are vulnerable to Incorrect Control Flow Scoping in promise resolving when AbortSignal option is used. The Promise remains in a permanently pending state after the signal is aborted, causing any await or .then() usage to hang indefinitely. This can cause a control-flow leak that can lead to stalled requests, blocked workers, or degraded application availability.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "ingested_at": "2026-08-03T16:41:00.813971+00:00"
+      }
+    ],
+    "localized_issues": [],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "2.0.1",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"@tootallnate/once\": \"2.0.1\"} in package.json to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": null,
+    "is_reachable": null,
+    "grouped_at": "2026-08-13T00:00:00Z"
+  },
+  {
+    "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "express-jwt",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2020-15084"
+    ],
+    "ghsa_ids": [
+      "GHSA-6G6M-M6H5-W9GF"
+    ],
+    "versions": [
+      "0.1.3"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+    "issues": [
+      {
+        "id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2020-15084",
+        "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+        "cwe": [
+          {
+            "id": "CWE-863",
+            "name": null
+          },
+          {
+            "id": "CWE-285",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "CRITICAL",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+        "line_range": null,
+        "package_name": "express-jwt",
+        "package_version": "0.1.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/express-jwt@0.1.3",
+        "ecosystem": "npm",
+        "message": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "ingested_at": "2026-08-03T16:41:00.815136+00:00"
+      }
+    ],
+    "localized_issues": [],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "6.0.0",
+      "workaround_snippets": null,
+      "instruction": "Update \"express-jwt\" in package.json to version \"6.0.0\".",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": null,
+    "is_reachable": true,
+    "grouped_at": "2026-08-13T00:00:00Z"
+  },
+  {
+    "group_id": "sca:package.json:got:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "got",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2022-33987"
+    ],
+    "ghsa_ids": [
+      "GHSA-PFRX-2Q88-QQ97"
+    ],
+    "versions": [
+      "8.3.2"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "1fb9e267-0256-4ba2-a883-7b3459729634",
+    "issues": [
+      {
+        "id": "1fb9e267-0256-4ba2-a883-7b3459729634",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-33987",
+        "ghsa_id": "GHSA-PFRX-2Q88-QQ97",
+        "cwe": [],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/got:8.3.2",
+        "line_range": null,
+        "package_name": "got",
+        "package_version": "8.3.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/got@8.3.2",
+        "ecosystem": "npm",
+        "message": "The got package before 11.8.5 and 12.1.0 for Node.js allows a redirect to a UNIX socket.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "ingested_at": "2026-08-03T16:41:00.815534+00:00"
+      }
+    ],
+    "localized_issues": [],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "11.8.5",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"got\": \"11.8.5\"} in package.json to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": null,
+    "is_reachable": true,
+    "grouped_at": "2026-08-13T00:00:00Z"
+  },
+  {
+    "group_id": "sca:package.json:notevil:NO_FIX",
+    "issue_type": "sca",
+    "vulnerable_component": "notevil",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2021-23771"
+    ],
+    "ghsa_ids": [],
+    "versions": [
+      "1.3.3"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "eb127601-b1cf-448e-b2ba-0da785662dbc",
+    "issues": [
+      {
+        "id": "eb127601-b1cf-448e-b2ba-0da785662dbc",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2021-23771",
+        "ghsa_id": null,
+        "cwe": [
+          {
+            "id": "CWE-1321",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/notevil:1.3.3",
+        "line_range": null,
+        "package_name": "notevil",
+        "package_version": "1.3.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/notevil@1.3.3",
+        "ecosystem": "npm",
+        "message": "This affects all versions of package notevil; all versions of package argencoders-notevil. It is vulnerable to Sandbox Escape leading to Prototype pollution. The package fails to restrict access to the main context, allowing an attacker to add or modify an object's prototype. **Note:** This vulnerability derives from an incomplete fix in [SNYK-JS-NOTEVIL-608878](https://security.snyk.io/vuln/SNYK-JS-NOTEVIL-608878).",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "ingested_at": "2026-08-03T16:41:00.817244+00:00"
+      }
+    ],
+    "localized_issues": [],
+    "fix_plan": {
+      "status": "no_fix",
+      "fixed_version": null,
+      "workaround_snippets": null,
+      "instruction": "No upstream patch or workaround was found. Inform the user.",
+      "strategy_used": "NO_FIX"
+    },
+    "enrichment": null,
+    "is_reachable": true,
+    "grouped_at": "2026-08-13T00:00:00Z"
+  },
+  {
+    "group_id": "sca:package.json:sanitize-html:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "sanitize-html",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2022-25887"
+    ],
+    "ghsa_ids": [
+      "GHSA-CGFM-XWP7-2CVR"
+    ],
+    "versions": [
+      "1.4.2"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "debe21f0-2374-47a9-95dd-7a22592ff580",
+    "issues": [
+      {
+        "id": "debe21f0-2374-47a9-95dd-7a22592ff580",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-25887",
+        "ghsa_id": "GHSA-CGFM-XWP7-2CVR",
+        "cwe": [
+          {
+            "id": "CWE-1333",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "HIGH",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/sanitize-html:1.4.2",
+        "line_range": null,
+        "package_name": "sanitize-html",
+        "package_version": "1.4.2",
+        "fixed_version": null,
+        "purl": "pkg:npm/sanitize-html@1.4.2",
+        "ecosystem": "npm",
+        "message": "The package sanitize-html before 2.7.1 are vulnerable to Regular Expression Denial of Service (ReDoS) due to insecure global regular expression replacement logic of HTML comment removal.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "ingested_at": "2026-08-03T16:41:00.817501+00:00"
+      }
+    ],
+    "localized_issues": [],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "2.12.1",
+      "workaround_snippets": null,
+      "instruction": "Update \"sanitize-html\" in package.json to version \"2.12.1\".",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": null,
+    "is_reachable": true,
+    "grouped_at": "2026-08-13T00:00:00Z"
+  }
+]

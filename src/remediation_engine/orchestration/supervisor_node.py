@@ -34,10 +34,17 @@ import logging
 import re
 import uuid
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from remediation_engine.contracts.decision_codes import (
+    DecisionCode,
+    validate_transition,
+)
+from remediation_engine.contracts.llm_advisory import LLMAdvisory
+from remediation_engine.contracts.planner_advice import PlannerAdvice, PlannerBatchAdvice
 from remediation_engine.contracts.schemas import (
     MAX_ANCESTRY_DEPTH,
     MAX_TASK_QUEUE_SIZE,
@@ -64,6 +71,12 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.supervisor_phases import (
+    AuditRecord,
+    EligibleActions,
+    ReconciliationResult,
+)
+from remediation_engine.contracts.version_policy import select_version
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
 from remediation_engine.orchestration.task_utils import (
@@ -75,11 +88,11 @@ from remediation_engine.orchestration.task_utils import (
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
-from remediation_engine.tools.registry_tools import plan_npm_version
+from remediation_engine.tools.registry_tools import fetch_registry_candidates, plan_npm_version
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 2
 UPDATE_BATCH_SIZE: int = 10
 
 _VALID_NEXT_NODES: set[str] = {
@@ -120,6 +133,7 @@ _TERMINAL_STATUSES = frozenset(
     {
         TaskStatus.QA_PASSED,
         TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
     }
 )
 _WORKABLE_STATUSES = frozenset(
@@ -129,6 +143,47 @@ _WORKABLE_STATUSES = frozenset(
     }
 )
 
+_SEVERITY_RANK: dict[str, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+}
+
+
+def _task_sort_key(
+    task: RemediationTask,
+    group_by_id: dict[str, VulnerabilityGroup],
+) -> tuple[int, int, int, int, str, str]:
+    """Return the stable priority key used for deterministic task selection.
+
+    Severity is read from an optional group-level attribute when present and
+    otherwise from the most severe member finding.  This supports current
+    ``VulnerabilityGroup`` records, which store severity on their issues, and
+    legacy/fixture records that expose ``group.severity`` directly.
+    """
+    group = group_by_id.get(task.parent_group_id)
+    raw_severities: list[Any] = []
+    if group is not None:
+        raw_severities.append(getattr(group, "severity", None))
+        raw_severities.extend(getattr(issue, "severity", None) for issue in group.issues or [])
+    ranks = [
+        _SEVERITY_RANK.get(str(getattr(value, "value", value)).lower(), 4)
+        for value in raw_severities
+        if value is not None
+    ]
+    severity_rank = min(ranks, default=4)
+    strategy_rank = 0 if task.strategy == RoutingStrategy.VERSION_BUMP else 1
+    status_rank = {TaskStatus.NEEDS_RETRY: 0, TaskStatus.PENDING: 1}.get(task.status, 2)
+    return (
+        severity_rank,
+        strategy_rank,
+        status_rank,
+        task.retry_count,
+        task.parent_group_id,
+        task.task_id,
+    )
+
 
 def _dispatchable_task_ids_for_status(
     task_queue: dict[str, RemediationTask],
@@ -136,28 +191,30 @@ def _dispatchable_task_ids_for_status(
     preferred_ids: list[str] | None = None,
     strategy: RoutingStrategy | None = None,
     limit: int | None = None,
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
     """Return non-terminal task IDs matching status and optional strategy filters."""
-    ordered_ids = list(preferred_ids) if preferred_ids is not None else list(task_queue.keys())
-    dispatchable: list[str] = []
+    candidate_ids = list(preferred_ids) if preferred_ids is not None else list(task_queue)
+    tasks: list[RemediationTask] = []
     seen: set[str] = set()
-
-    for task_id in ordered_ids:
+    for task_id in candidate_ids:
         if task_id in seen:
             continue
         seen.add(task_id)
         task = task_queue.get(task_id)
-        if task is None:
-            continue
-        if task.status in _TERMINAL_STATUSES:
+        if task is None or task.status in _TERMINAL_STATUSES:
             continue
         if task.status not in statuses:
             continue
         if strategy is not None and task.strategy != strategy:
             continue
-        dispatchable.append(task_id)
-        if limit is not None and len(dispatchable) >= limit:
-            break
+        tasks.append(task)
+
+    if group_by_id is not None:
+        tasks.sort(key=lambda task: _task_sort_key(task, group_by_id))
+    dispatchable = [task.task_id for task in tasks]
+    if limit is not None:
+        dispatchable = dispatchable[:limit]
 
     return dispatchable
 
@@ -165,11 +222,13 @@ def _dispatchable_task_ids_for_status(
 def _qa_ready_task_ids(
     task_queue: dict[str, RemediationTask],
     preferred_ids: list[str] | None = None,
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
     return _dispatchable_task_ids_for_status(
         task_queue,
         {TaskStatus.OPTIMISTICALLY_FIXED},
         preferred_ids=preferred_ids,
+        group_by_id=group_by_id,
     )
 
 
@@ -308,8 +367,17 @@ def _create_attempt_snapshot(
     workaround_context: WorkaroundContext | None = None,
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
     """Commit the exact worker input and return the revised task projection."""
-    attempt_id = str(uuid.uuid4())
     task_revision = task.task_revision + 1
+    # Attempt identity is derived from committed state rather than wall-clock
+    # randomness.  This makes replaying an identical OrchestratorState produce
+    # the same dispatch projection while still changing identity whenever the
+    # task revision or supervisor state revision changes.
+    attempt_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"remediation-attempt:{task.task_id}:{task_revision}:{state_revision}:{dispatch_node}",
+        )
+    )
     snapshot = TaskAttemptSnapshot(
         attempt_id=attempt_id,
         task_id=task.task_id,
@@ -323,6 +391,7 @@ def _create_attempt_snapshot(
         instruction_digest=_instruction_digest(task.instruction),
         dispatch_node=dispatch_node,  # type: ignore[arg-type]
         plan_id=plan_id,
+        created_at=datetime.fromtimestamp(state_revision, tz=UTC),
         workaround_context=workaround_context,
     )
     snapshots_by_id[attempt_id] = snapshot
@@ -477,6 +546,7 @@ def _commit_task_transition(
     updates: dict[str, Any],
     close_attempt: bool = False,
     clear_selected_version: bool = False,
+    consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     """Commit one coherent supervisor transition for a task.
 
@@ -490,6 +560,41 @@ def _commit_task_transition(
     task = task_queue.get(task_id)
     if task is None:
         return None
+
+    if "status" in updates:
+        current_status = task.status
+        try:
+            new_status = (
+                updates["status"]
+                if isinstance(updates["status"], TaskStatus)
+                else TaskStatus(updates["status"])
+            )
+        except (TypeError, ValueError):
+            new_status = None
+        if new_status is None or (
+            new_status != current_status and not validate_transition(current_status, new_status)
+        ):
+            event = _build_consistency_event(
+                error_code="INVALID_TRANSITION",
+                task_id=task_id,
+                expected_attempt_id=task.current_attempt_id,
+                received_attempt_id=None,
+                action="rejected",
+                details=(
+                    f"Rejected transition {current_status.value} -> "
+                    f"{updates['status']!s}; it is not in VALID_TRANSITIONS."
+                ),
+            )
+            if consistency_events is not None:
+                consistency_events.append(event)
+            logger.error(
+                "supervisor: rejected invalid transition %s -> %s for task '%s'.",
+                current_status.value,
+                updates["status"],
+                task_id,
+            )
+            return task
+        updates = {**updates, "status": new_status}
 
     committed_updates = dict(updates)
     input_changed = any(
@@ -1390,12 +1495,14 @@ def _update_worker_task_ids(
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     preferred_ids: list[str] | None = None,
     limit: int | None = UPDATE_BATCH_SIZE,
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
     task_ids = _dispatchable_task_ids_for_status(
         task_queue,
         set(_WORKABLE_STATUSES),
         preferred_ids=preferred_ids,
         strategy=RoutingStrategy.VERSION_BUMP,
+        group_by_id=group_by_id,
     )
     dispatchable = [
         task_id
@@ -1415,17 +1522,23 @@ def _normalize_target_task_ids_for_node(
     target_task_ids: list[str],
     task_queue: dict[str, RemediationTask],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
     """Clamp returned active targets to the lifecycle state accepted by next_node."""
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
     if next_node == "qa_critic":
-        return _qa_ready_task_ids(task_queue, preferred_ids=target_task_ids)
+        return _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=target_task_ids,
+            group_by_id=group_by_id,
+        )
     if next_node == "update_subagent":
         return _update_worker_task_ids(
             task_queue,
             retry_diagnostics_by_task,
             preferred_ids=target_task_ids,
             limit=UPDATE_BATCH_SIZE,
+            group_by_id=group_by_id,
         )
     if next_node == "workaround_subagent":
         return _dispatchable_task_ids_for_status(
@@ -1434,6 +1547,7 @@ def _normalize_target_task_ids_for_node(
             preferred_ids=target_task_ids,
             strategy=RoutingStrategy.CODE_WORKAROUND,
             limit=1,
+            group_by_id=group_by_id,
         )
     return []
 
@@ -1852,22 +1966,33 @@ def _deterministic_routing(
 
     Implements the same priority rules described in the supervisor prompt.
     """
-    tasks = list(task_queue.values())
+    tasks = sorted(task_queue.values(), key=lambda task: _task_sort_key(task, group_by_id))
     non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
     # Post-QA triage is a Supervisor-owned handoff.  It must run before
     # teardown even when the current task queue is already terminal, because
     # the global scan may have discovered a new package vulnerability.
     if triage_required and current_status in {"qa_completed", "qa_failed"}:
         return SupervisorDecision(
+            decision_code=DecisionCode.TRIAGE_REQUIRED,
             next_node="triage",
             target_task_ids=[],
             instructions="Re-triage the complete parseable post-remediation scan before the next remediation decision.",
             decision_reason="QA produced a parseable scan and marked post-QA triage as required.",
         )
 
+    if not group_by_id and not task_queue:
+        return SupervisorDecision(
+            decision_code=DecisionCode.NO_VALID_GROUPS,
+            next_node="teardown",
+            target_task_ids=[],
+            instructions="No valid vulnerability groups are available for remediation.",
+            decision_reason="Deterministic routing found no valid groups.",
+        )
+
     # All tasks are terminal â†’ teardown
     if not non_terminal:
         return SupervisorDecision(
+            decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
             next_node="teardown",
             target_task_ids=[],
             instructions="All tasks are terminal. Proceeding to teardown.",
@@ -1878,9 +2003,11 @@ def _deterministic_routing(
     current_batch_qa_ready = _qa_ready_task_ids(
         task_queue,
         preferred_ids=list(active_target_task_ids or []),
+        group_by_id=group_by_id,
     )
     if current_status != "qa_completed" and current_batch_qa_ready:
         return SupervisorDecision(
+            decision_code=DecisionCode.QA_READY,
             next_node="qa_critic",
             target_task_ids=current_batch_qa_ready,
             instructions="Run QA on the current remediated batch before starting more remediation.",
@@ -1889,9 +2016,10 @@ def _deterministic_routing(
             ),
         )
 
-    all_qa_ready = _qa_ready_task_ids(task_queue)
+    all_qa_ready = _qa_ready_task_ids(task_queue, group_by_id=group_by_id)
     if all_qa_ready:
         return SupervisorDecision(
+            decision_code=DecisionCode.QA_READY_BATCH,
             next_node="qa_critic",
             target_task_ids=all_qa_ready,
             instructions="Run QA on the remaining optimistically fixed tasks.",
@@ -1904,21 +2032,24 @@ def _deterministic_routing(
     # NO_FIX is a deterministic same-task state machine.  Keep it ahead of
     # generic workaround routing so the LLM cannot skip a mitigation stage or
     # let MAX_RETRIES terminate the lifecycle early.
-    no_fix_workable = [
-        task
-        for task in workable
-        if task.strategy == RoutingStrategy.CODE_WORKAROUND
-        and (
-            (
-                task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
-                and task.status == TaskStatus.PENDING
+    no_fix_workable = sorted(
+        [
+            task
+            for task in workable
+            if task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and (
+                (
+                    task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
+                    and task.status == TaskStatus.PENDING
+                )
+                or (
+                    task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
+                    and task.status == TaskStatus.NEEDS_RETRY
+                )
             )
-            or (
-                task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
-                and task.status == TaskStatus.NEEDS_RETRY
-            )
-        )
-    ]
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
     if no_fix_workable:
         target = no_fix_workable[0]
         evaluation = qa_evaluations.get(target.task_id) or qa_evaluations.get(
@@ -1935,6 +2066,7 @@ def _deterministic_routing(
         if evaluation and evaluation.retry_feedback:
             feedback_by_task[target.task_id] = evaluation.retry_feedback
         return SupervisorDecision(
+            decision_code=DecisionCode.NO_FIX_LIFECYCLE,
             next_node="workaround_subagent",
             target_task_ids=[target.task_id],
             feedback_by_task=feedback_by_task,
@@ -1949,14 +2081,17 @@ def _deterministic_routing(
     # All VERSION_BUMP QA failures follow the ordered version stages. A
     # BREAKING_CHANGE is evidence for the next stage, not an immediate pivot.
 
-    exhausted_retries = [
-        task
-        for task in workable
-        if _is_exhausted_update_pivot_candidate(
-            task,
-            retry_diagnostics_by_task.get(task.task_id),
-        )
-    ]
+    exhausted_retries = sorted(
+        [
+            task
+            for task in workable
+            if _is_exhausted_update_pivot_candidate(
+                task,
+                retry_diagnostics_by_task.get(task.task_id),
+            )
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
     if exhausted_retries:
         spawn_requests: list[TaskSpawnRequest] = []
         feedback_by_task: dict[str, str] = {}
@@ -1985,6 +2120,7 @@ def _deterministic_routing(
                 )
             )
         return SupervisorDecision(
+            decision_code=DecisionCode.EXHAUSTED_UPDATE_PIVOT,
             next_node="workaround_subagent",
             target_task_ids=[exhausted_retries[0].task_id],
             spawn_requests=spawn_requests,
@@ -1995,11 +2131,14 @@ def _deterministic_routing(
             ),
         )
 
-    retry_version_bump = [
-        t
-        for t in workable
-        if t.strategy == RoutingStrategy.VERSION_BUMP and t.status == TaskStatus.NEEDS_RETRY
-    ]
+    retry_version_bump = sorted(
+        [
+            t
+            for t in workable
+            if t.strategy == RoutingStrategy.VERSION_BUMP and t.status == TaskStatus.NEEDS_RETRY
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
     if retry_version_bump:
         batch = retry_version_bump[:UPDATE_BATCH_SIZE]
         feedback_by_task: dict[str, str] = {}
@@ -2017,6 +2156,7 @@ def _deterministic_routing(
                 retry_diagnostics_by_task.get(task.task_id),
             )
         return SupervisorDecision(
+            decision_code=DecisionCode.RETRY_VERSION_BUMP,
             next_node="update_subagent",
             target_task_ids=[t.task_id for t in batch],
             feedback_by_task=feedback_by_task,
@@ -2028,11 +2168,14 @@ def _deterministic_routing(
         )
 
     # VERSION_BUMP tasks batch to update_subagent only for non-retry work.
-    version_bump = [
-        t
-        for t in workable
-        if t.strategy == RoutingStrategy.VERSION_BUMP and t.status != TaskStatus.NEEDS_RETRY
-    ]
+    version_bump = sorted(
+        [
+            t
+            for t in workable
+            if t.strategy == RoutingStrategy.VERSION_BUMP and t.status != TaskStatus.NEEDS_RETRY
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
     if version_bump:
         batch = version_bump[:UPDATE_BATCH_SIZE]
         feedback_by_task: dict[str, str] = {}
@@ -2041,6 +2184,7 @@ def _deterministic_routing(
             if eval_ and eval_.retry_feedback:
                 feedback_by_task[t.task_id] = eval_.retry_feedback
         return SupervisorDecision(
+            decision_code=DecisionCode.NEW_VERSION_BUMP,
             next_node="update_subagent",
             target_task_ids=[t.task_id for t in batch],
             feedback_by_task=feedback_by_task,
@@ -2051,13 +2195,16 @@ def _deterministic_routing(
         )
 
     # CODE_WORKAROUND tasks: send exactly one at a time to workaround_subagent
-    workaround = [
-        t
-        for t in workable
-        if t.strategy == RoutingStrategy.CODE_WORKAROUND
-        and t.no_fix_stage is None
-        and t.retry_count < MAX_RETRIES
-    ]
+    workaround = sorted(
+        [
+            t
+            for t in workable
+            if t.strategy == RoutingStrategy.CODE_WORKAROUND
+            and t.no_fix_stage is None
+            and t.retry_count < MAX_RETRIES
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
     if workaround:
         target = workaround[0]
         eval_ = qa_evaluations.get(target.task_id) or qa_evaluations.get(target.parent_group_id)
@@ -2072,6 +2219,7 @@ def _deterministic_routing(
                 group_by_id.get(target.parent_group_id),
             )
         return SupervisorDecision(
+            decision_code=DecisionCode.WORKAROUND_DISPATCH,
             next_node="workaround_subagent",
             target_task_ids=[target.task_id],
             feedback_by_task=feedback,
@@ -2082,10 +2230,239 @@ def _deterministic_routing(
 
     # Unexpected: no workable tasks found â†’ teardown as safe default
     return SupervisorDecision(
+        decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
         next_node="teardown",
         target_task_ids=[],
         instructions="No actionable tasks remain.",
         decision_reason=("Deterministic fallback: no workable tasks found, routing to teardown."),
+    )
+
+
+def _reconcile_results(
+    state: OrchestratorState,
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    *,
+    qa_evaluations: dict[str, QAEvaluation] | None = None,
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    consistency_events: list[StateConsistencyEvent] | None = None,
+    auto_constraints: list[str] | None = None,
+    errors: list[str] | None = None,
+) -> ReconciliationResult:
+    """Project worker/QA outcomes into a detached reconciliation result.
+
+    This phase deliberately does not select a route.  It is small enough to
+    run in replay tests without constructing an LLM or touching the graph.
+    The production node retains its richer attempt-correlation reducer; this
+    helper exposes the same state-machine boundary for focused callers.
+    """
+
+    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    projected_evaluations = dict(qa_evaluations or state.get("qa_evaluations", {}) or {})
+    projected_diagnostics = dict(
+        retry_diagnostics_by_task or state.get("retry_diagnostics_by_task", {}) or {}
+    )
+    projected_events = list(consistency_events or [])
+    projected_constraints = list(auto_constraints or [])
+    projected_errors = list(errors or [])
+
+    if state.get("status") == "qa_completed":
+        for task_id in sorted(projected_evaluations):
+            evaluation = projected_evaluations[task_id]
+            task = projected_tasks.get(task_id)
+            if task is None or task.status != TaskStatus.OPTIMISTICALLY_FIXED:
+                continue
+            if evaluation.passed:
+                if validate_transition(task.status, TaskStatus.QA_PASSED):
+                    projected_tasks[task_id] = task.model_copy(
+                        update={"status": TaskStatus.QA_PASSED}
+                    )
+            elif validate_transition(task.status, TaskStatus.NEEDS_RETRY):
+                projected_tasks[task_id] = task.model_copy(
+                    update={
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    }
+                )
+
+    return ReconciliationResult(
+        task_queue=projected_tasks,
+        qa_evaluations=projected_evaluations,
+        retry_diagnostics_by_task=projected_diagnostics,
+        consistency_events=projected_events,
+        auto_constraints=projected_constraints,
+        errors=projected_errors,
+    )
+
+
+def _validate_invariants(
+    task_queue: dict[str, RemediationTask],
+    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    target_task_ids: list[str],
+    next_node: str,
+) -> tuple[list[StateConsistencyEvent], list[str]]:
+    """Validate committed state without mutating the caller's task queue."""
+
+    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    return _validate_committed_state(
+        projected_tasks,
+        dict(attempt_snapshots_by_id),
+        dict(retry_plans_by_task),
+        dict(retry_diagnostics_by_task),
+        list(target_task_ids),
+        next_node,
+    )
+
+
+def _calculate_eligible_actions(
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    *,
+    active_target_task_ids: list[str] | None = None,
+    current_status: str = "",
+    triage_required: bool = False,
+) -> EligibleActions:
+    """Return the pure eligibility projection consumed by routing."""
+
+    ordered = sorted(task_queue.values(), key=lambda task: _task_sort_key(task, group_by_id))
+    non_terminal = [task for task in ordered if task.status not in _TERMINAL_STATUSES]
+    workable = [task for task in non_terminal if task.status in _WORKABLE_STATUSES]
+    current_qa = _qa_ready_task_ids(
+        task_queue,
+        preferred_ids=active_target_task_ids or [],
+        group_by_id=group_by_id,
+    )
+    all_qa = _qa_ready_task_ids(task_queue, group_by_id=group_by_id)
+    no_fix = [
+        task
+        for task in workable
+        if task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and task.no_fix_stage
+        in {
+            NoFixMitigationStage.PACKAGE_REMOVAL,
+            NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+        }
+    ]
+    exhausted = [
+        task
+        for task in workable
+        if _is_exhausted_update_pivot_candidate(task, retry_diagnostics_by_task.get(task.task_id))
+    ]
+    retries = [
+        task
+        for task in workable
+        if task.strategy == RoutingStrategy.VERSION_BUMP
+        and task.status == TaskStatus.NEEDS_RETRY
+        and task not in exhausted
+    ]
+    pending_updates = [
+        task
+        for task in workable
+        if task.strategy == RoutingStrategy.VERSION_BUMP and task.status == TaskStatus.PENDING
+    ]
+    workarounds = [
+        task
+        for task in workable
+        if task.strategy == RoutingStrategy.CODE_WORKAROUND and task.no_fix_stage is None
+    ]
+    return EligibleActions(
+        non_terminal_tasks=[task.task_id for task in non_terminal],
+        qa_ready_task_ids=(
+            current_qa if current_status != "qa_completed" and current_qa else all_qa
+        ),
+        workable_tasks=[task.task_id for task in workable],
+        no_fix_workable=[task.task_id for task in no_fix],
+        exhausted_pivots=[task.task_id for task in exhausted],
+        retry_version_bumps=[task.task_id for task in retries],
+        new_version_bumps=[task.task_id for task in pending_updates],
+        workaround_tasks=[task.task_id for task in workarounds],
+        triage_required=triage_required and current_status in {"qa_completed", "qa_failed"},
+    )
+
+
+def _select_deterministic_action(
+    eligible: EligibleActions,
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+) -> SupervisorDecision:
+    """Select the same fixed-priority action as the authoritative router."""
+
+    return _deterministic_routing(
+        task_queue,
+        group_by_id,
+        qa_evaluations,
+        retry_diagnostics_by_task,
+        active_target_task_ids=eligible.qa_ready_task_ids,
+        current_status="",
+        triage_required=eligible.triage_required,
+    )
+
+
+def _apply_transition(
+    decision: SupervisorDecision,
+    task_queue: dict[str, RemediationTask],
+    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    group_by_id: dict[str, VulnerabilityGroup],
+    state_revision: int,
+) -> dict[str, Any]:
+    """Apply a dispatch projection without performing another route decision."""
+
+    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    projected_snapshots = dict(attempt_snapshots_by_id)
+    target_ids = _normalize_target_task_ids_for_node(
+        decision.next_node,
+        list(decision.target_task_ids),
+        projected_tasks,
+        retry_diagnostics_by_task,
+        group_by_id,
+    )
+    if decision.next_node in {"update_subagent", "workaround_subagent"}:
+        for task_id in target_ids:
+            task = projected_tasks[task_id]
+            if task.current_attempt_id is None and task.instruction:
+                committed, _snapshot = _create_attempt_snapshot(
+                    task,
+                    dispatch_node=decision.next_node,
+                    snapshots_by_id=projected_snapshots,
+                    state_revision=state_revision,
+                    plan_id=(
+                        retry_plans_by_task[task_id].plan_id
+                        if task_id in retry_plans_by_task
+                        else None
+                    ),
+                )
+                projected_tasks[task_id] = committed
+    return {
+        "task_queue": projected_tasks,
+        "attempt_snapshots_by_id": projected_snapshots,
+        "next_routing_step": decision.next_node,
+        "active_target_task_ids": target_ids,
+        "decision_code": decision.decision_code,
+    }
+
+
+def _emit_audit(
+    decision: SupervisorDecision,
+    consistency_events: list[StateConsistencyEvent],
+    state_revision: int,
+) -> AuditRecord:
+    """Build the typed audit record for a deterministic decision."""
+
+    return AuditRecord(
+        decision_code=decision.decision_code or DecisionCode.INVALID_LLM_DECISION,
+        next_node=decision.next_node,
+        target_task_ids=list(decision.target_task_ids),
+        reasoning=decision.decision_reason,
+        state_revision=state_revision,
+        consistency_events=list(consistency_events),
     )
 
 
@@ -2134,9 +2511,198 @@ def _no_fix_decision_requires_fallback(
     return any(request.parent_task_id == expected_task_id for request in decision.spawn_requests)
 
 
+def _should_invoke_llm(decision: SupervisorDecision) -> bool:
+    """Return whether advisory enrichment is useful for ``decision``."""
+
+    return decision.decision_code not in {
+        DecisionCode.NO_ACTIONABLE_TASKS,
+        DecisionCode.NO_VALID_GROUPS,
+    }
+
+
+def _build_advisory_prompt(
+    state: OrchestratorState,
+    deterministic_decision: SupervisorDecision,
+) -> str:
+    """Build a prompt that requests explanation and feedback only."""
+
+    targets = ", ".join(deterministic_decision.target_task_ids) or "none"
+    return "\n".join(
+        [
+            "You are an advisory reviewer for an AppSec remediation supervisor.",
+            "Python has already selected the route and task targets below.",
+            "Do not propose routing, status, version, or spawn mutations.",
+            "Return only human-readable reasoning, per-task feedback, and new constraints.",
+            f"Decision code: {deterministic_decision.decision_code or 'unknown'}",
+            f"Next node (read-only): {deterministic_decision.next_node}",
+            f"Target task IDs (read-only): {targets}",
+            f"Supervisor state status: {state.get('status', '')}",
+        ]
+    )
+
+
+def _invoke_llm_advisory(
+    state: OrchestratorState,
+    deterministic_decision: SupervisorDecision,
+    *,
+    model: str = _DEFAULT_MODEL,
+) -> LLMAdvisory | None:
+    """Optionally obtain advisory text without affecting deterministic state."""
+
+    if not _should_invoke_llm(deterministic_decision):
+        return None
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore[import]
+
+        advisory_llm = ChatOpenAI(model=model, temperature=0.0)
+        structured = advisory_llm.with_structured_output(
+            LLMAdvisory,
+            method="function_calling",
+        )
+        prompt = _build_advisory_prompt(state, deterministic_decision)
+        result = invoke_with_trajectory(
+            "supervisor.advisory",
+            lambda: structured.invoke(prompt),
+            prompt,
+        )
+        if isinstance(result, LLMAdvisory):
+            return result
+        return LLMAdvisory.model_validate(result)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("supervisor: advisory call failed (%s); continuing deterministically.", exc)
+        return None
+
+
+def _merge_advisory(
+    deterministic_decision: SupervisorDecision,
+    advisory: LLMAdvisory | SupervisorDecision | None,
+    *,
+    existing_constraints: list[str] | None = None,
+) -> SupervisorDecision:
+    """Merge advisory prose while preserving every Python-owned field.
+
+    ``SupervisorDecision`` is accepted for Phase 1 compatibility with older
+    structured router responses.  Its routing and mutation fields are ignored.
+    """
+
+    if advisory is None:
+        return deterministic_decision
+
+    if isinstance(advisory, LLMAdvisory):
+        reasoning = advisory.reasoning
+        feedback = advisory.feedback_by_task
+        constraints = advisory.new_constraints
+    else:
+        reasoning = advisory.decision_reason
+        feedback = advisory.feedback_by_task
+        constraints = advisory.new_constraints
+
+    target_ids = set(deterministic_decision.target_task_ids)
+    merged_feedback = {
+        task_id: text.strip()
+        for task_id, text in deterministic_decision.feedback_by_task.items()
+        if task_id in target_ids and isinstance(text, str) and text.strip()
+    }
+    for task_id, text in feedback.items():
+        if task_id in target_ids and isinstance(text, str) and text.strip():
+            merged_feedback[task_id] = text.strip()
+    existing = set(existing_constraints or [])
+    merged_constraints = list(deterministic_decision.new_constraints)
+    for constraint in constraints:
+        if not isinstance(constraint, str):
+            continue
+        cleaned = constraint.strip()
+        if cleaned and cleaned not in existing and cleaned not in merged_constraints:
+            merged_constraints.append(cleaned)
+
+    return deterministic_decision.model_copy(
+        update={
+            "decision_reason": reasoning.strip() or deterministic_decision.decision_reason,
+            "instructions": (
+                (
+                    advisory.instructions.strip()
+                    if isinstance(advisory, SupervisorDecision)
+                    else reasoning.strip()
+                )
+                or deterministic_decision.instructions
+            ),
+            "feedback_by_task": merged_feedback,
+            "new_constraints": merged_constraints,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Planner phase helpers
 # ---------------------------------------------------------------------------
+
+
+def _convert_planner_advice_to_retry_plan(
+    advice: PlannerAdvice,
+    task: RemediationTask,
+    diagnostics: UpdateRetryDiagnostics,
+    group: VulnerabilityGroup | None,
+) -> SupervisorRetryPlan:
+    """Convert advisory stage selection into a Python-owned retry plan.
+
+    Stage progression, registry lookup, version choice, exhaustion detection,
+    and worker instructions all remain deterministic.  Planner reasoning is
+    intentionally not embedded into the worker instruction.
+    """
+
+    requested_order = _SCA_STAGE_ORDER.get(advice.requested_stage, 99)
+    current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
+    effective_stage = (
+        advice.requested_stage if requested_order >= current_order else task.strategy_stage
+    )
+    attempted = set(diagnostics.attempted_versions)
+    security_floor = group.fix_plan.fixed_version if group and group.fix_plan else None
+    candidates = []
+    selected_version: str | None = None
+    if security_floor and effective_stage != SCARemediationStage.CODE_WORKAROUND:
+        candidates = fetch_registry_candidates(
+            group.vulnerable_component or "",
+            security_floor,
+            attempted,
+        )
+        selected_version = select_version(candidates, effective_stage, attempted)
+
+    exhausted = effective_stage != SCARemediationStage.CODE_WORKAROUND and selected_version is None
+    effective_task = task.model_copy(update={"strategy_stage": effective_stage})
+    effective_diagnostics = diagnostics.model_copy(
+        update={
+            "strategy_stage": effective_stage,
+            "selected_version": selected_version,
+            "candidate_versions_considered": [candidate.version for candidate in candidates[:30]],
+            "latest_version_seen": candidates[-1].version if candidates else None,
+            "exhausted_update_path": exhausted,
+        }
+    )
+    if exhausted:
+        component = group.vulnerable_component if group else task.parent_group_id
+        instruction = (
+            f"Implement a code workaround or isolation strategy for {component} "
+            "because the deterministic registry policy found no remaining eligible update version."
+        )
+    else:
+        instruction = _build_high_level_retry_instruction(
+            effective_task,
+            group,
+            None,
+            effective_diagnostics,
+        )
+    return SupervisorRetryPlan(
+        task_id=advice.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=effective_stage,
+        selected_version=selected_version,
+        attempted_versions=list(diagnostics.attempted_versions),
+        candidate_versions_considered=[candidate.version for candidate in candidates[:30]],
+        latest_version_seen=candidates[-1].version if candidates else None,
+        exhausted_update_path=exhausted,
+        action="pivot_workaround" if exhausted else "retry_update",
+        exact_instruction=instruction,
+    )
 
 
 def _needs_planner(
@@ -2238,10 +2804,14 @@ def _build_planner_prompt(
     if not actionable_retry_tasks:
         lines.append("- (none)")
 
-    terminal_tasks = [task for task in active_tasks.values() if task.status in _TERMINAL_STATUSES]
-    qa_ready_tasks = [
-        task for task in active_tasks.values() if task.status == TaskStatus.OPTIMISTICALLY_FIXED
-    ]
+    terminal_tasks = sorted(
+        [task for task in active_tasks.values() if task.status in _TERMINAL_STATUSES],
+        key=lambda item: _task_sort_key(item, group_by_id),
+    )
+    qa_ready_tasks = sorted(
+        [task for task in active_tasks.values() if task.status == TaskStatus.OPTIMISTICALLY_FIXED],
+        key=lambda item: _task_sort_key(item, group_by_id),
+    )
 
     lines += [
         "",
@@ -2326,6 +2896,105 @@ def _build_planner_prompt(
     return "\n".join(lines)
 
 
+def _run_structured_planner_phase(
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    *,
+    model: str = _DEFAULT_MODEL,
+) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
+    """Run the typed planner and convert advice into deterministic plans.
+
+    Registry candidates are fetched before the model call and shown as facts
+    in the prompt.  The model can recommend only a stage; version selection is
+    performed by :func:`_convert_planner_advice_to_retry_plan`.
+    """
+    from langchain_openai import ChatOpenAI  # type: ignore[import]
+
+    retry_tasks = sorted(
+        (
+            task
+            for task in task_queue.values()
+            if task.status == TaskStatus.NEEDS_RETRY
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+        ),
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
+    lines = [
+        "You are the typed planner for dependency remediation retries.",
+        "Return PlannerBatchAdvice. Recommend requested_stage and explain reasoning.",
+        "Python owns exact versions, retry counts, transitions, and workaround pivots.",
+    ]
+    registry_facts: dict[str, list[str]] = {}
+    for task in retry_tasks:
+        group = group_by_id.get(task.parent_group_id)
+        floor = group.fix_plan.fixed_version if group and group.fix_plan else None
+        candidates = []
+        if floor and group and group.vulnerable_component:
+            try:
+                candidates = fetch_registry_candidates(
+                    group.vulnerable_component,
+                    floor,
+                    set(
+                        diagnostics_by_task.get(
+                            task.task_id, UpdateRetryDiagnostics(task_id=task.task_id)
+                        ).attempted_versions
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "supervisor planner: registry facts unavailable for %s: %s", task.task_id, exc
+                )
+        registry_facts[task.task_id] = [candidate.version for candidate in candidates[:30]]
+        evaluation = qa_evaluations.get(task.task_id)
+        lines.extend(
+            [
+                f"Task {task.task_id}: current_stage={task.strategy_stage.value};",
+                f"  QA feedback: {evaluation.retry_feedback if evaluation else 'none'}",
+                f"  Registry candidates: {', '.join(registry_facts[task.task_id]) or 'none'}",
+            ]
+        )
+
+    prompt = "\n".join(lines)
+    planner_llm = ChatOpenAI(model=model, temperature=0.0)
+    structured = planner_llm.with_structured_output(
+        PlannerBatchAdvice,
+        method="function_calling",
+    )
+    batch = invoke_with_trajectory(
+        "supervisor.planner",
+        lambda: structured.invoke(prompt),
+        prompt,
+    )
+    if not isinstance(batch, PlannerBatchAdvice):
+        batch = PlannerBatchAdvice.model_validate(batch)
+
+    updated_diagnostics = dict(diagnostics_by_task)
+    plans: dict[str, SupervisorRetryPlan] = {}
+    for advice in sorted(batch.advice, key=lambda item: item.task_id):
+        task = task_queue.get(advice.task_id)
+        if task is None:
+            continue
+        diagnostics = updated_diagnostics.get(
+            advice.task_id,
+            UpdateRetryDiagnostics(task_id=advice.task_id),
+        )
+        group = group_by_id.get(task.parent_group_id)
+        plan = _convert_planner_advice_to_retry_plan(advice, task, diagnostics, group)
+        plans[advice.task_id] = plan
+        updated_diagnostics[advice.task_id] = diagnostics.model_copy(
+            update={
+                "strategy_stage": plan.strategy_stage,
+                "selected_version": plan.selected_version,
+                "candidate_versions_considered": plan.candidate_versions_considered,
+                "latest_version_seen": plan.latest_version_seen,
+                "exhausted_update_path": plan.exhausted_update_path,
+            }
+        )
+    return updated_diagnostics, plans
+
+
 def _run_planner_phase(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
@@ -2337,7 +3006,32 @@ def _run_planner_phase(
     correction: str = "",
     return_tool_events: bool = False,
 ) -> Any:
-    """Run the bounded planner ReAct loop. Returns the scratchpad text."""
+    """Run the typed planner with a legacy scratchpad fallback.
+
+    The structured path is the normal Phase 2 path.  The scratchpad loop is
+    retained only for integrations that provide an older test double or model
+    adapter which cannot produce ``PlannerBatchAdvice`` yet.
+    """
+    try:
+        if not correction:
+            planner_model = getattr(llm, "model_name", _DEFAULT_MODEL)
+            if not isinstance(planner_model, str) or not planner_model.strip():
+                planner_model = _DEFAULT_MODEL
+            diagnostics, plans = _run_structured_planner_phase(
+                task_queue,
+                group_by_id,
+                qa_evaluations,
+                retry_diagnostics_by_task,
+                model=planner_model,
+            )
+            if return_tool_events:
+                return diagnostics, plans, []
+            return diagnostics, plans
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "supervisor planner: typed path unavailable (%s); using compatibility path.", exc
+        )
+
     planner_prompt = _build_planner_prompt(
         task_queue,
         group_by_id,
@@ -2427,7 +3121,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         if t.status in [TaskStatus.PENDING, TaskStatus.NEEDS_RETRY, TaskStatus.OPTIMISTICALLY_FIXED]
     }
 
-    for task in active_tasks.values():
+    for task in sorted(active_tasks.values(), key=lambda item: _task_sort_key(item, group_by_id)):
         group = group_by_id.get(task.parent_group_id)
         fix_plan = group.fix_plan if group else None
         cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
@@ -2586,7 +3280,11 @@ def _materialize_spawn_requests(
     child_ids_by_parent: dict[str, list[str]] = {}
     current_queue_size = len(task_queue)
 
-    for req in spawn_requests:
+    ordered_spawn_requests = sorted(
+        spawn_requests,
+        key=lambda request: (request.parent_task_id, request.strategy.value),
+    )
+    for req in ordered_spawn_requests:
         # Guard: unknown parent task
         if req.parent_task_id not in task_queue:
             errors.append(
@@ -2725,17 +3423,37 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             "qa_completed",
             "qa_failed",
         }:
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.TRIAGE_REQUIRED,
+                next_node="triage",
+                target_task_ids=[],
+                instructions="Route the parseable post-remediation scan to triage.",
+                decision_reason="Post-QA triage is required.",
+            )
             return {
                 "status": "supervisor_routed",
                 "next_routing_step": "triage",
                 "active_target_task_ids": [],
+                "decision_code": decision.decision_code,
+                "supervisor_audit": _emit_audit(
+                    decision, [], int(state.get("state_revision", 0)) + 1
+                ),
                 "supervisor_instructions": "Route the parseable post-remediation scan to triage.",
             }
         logger.info("supervisor: no valid groups â€” routing to teardown.")
+        decision = SupervisorDecision(
+            decision_code=DecisionCode.NO_VALID_GROUPS,
+            next_node="teardown",
+            target_task_ids=[],
+            instructions="No groups to process.",
+            decision_reason="No valid vulnerability groups are available.",
+        )
         return {
             "status": "supervisor_routed",
             "next_routing_step": "teardown",
             "active_target_task_ids": [],
+            "decision_code": decision.decision_code,
+            "supervisor_audit": _emit_audit(decision, [], int(state.get("state_revision", 0)) + 1),
             "supervisor_instructions": "No groups to process.",
         }
 
@@ -3412,6 +4130,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # 6. Router phase (structured LLM call)
     # ------------------------------------------------------------------
     planner_scratchpad = ""
+    llm_advisory: SupervisorDecision | LLMAdvisory | None = None
     if decision is None:
         try:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -3447,26 +4166,38 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         correction=planner_correction,
                         return_tool_events=True,
                     )
-                    if isinstance(planner_result, tuple):
+                    typed_planner_result = (
+                        isinstance(planner_result, tuple)
+                        and len(planner_result) == 3
+                        and isinstance(planner_result[0], dict)
+                        and isinstance(planner_result[1], dict)
+                    )
+                    if typed_planner_result:
+                        parsed_diagnostics = dict(planner_result[0])
+                        parsed_plans = dict(planner_result[1])
+                        planner_tool_events.extend(list(planner_result[2]))
+                        planner_scratchpad = ""
+                    elif isinstance(planner_result, tuple):
                         planner_scratchpad, attempt_tool_events = planner_result
                         planner_tool_events.extend(attempt_tool_events)
                     else:
                         # Preserve compatibility with tests/integrations that
                         # replace the planner helper with a text-only stub.
                         planner_scratchpad = str(planner_result)
-                    parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
-                        planner_scratchpad,
-                        task_queue,
-                        planner_base_diagnostics,
-                        group_by_id,
-                    )
-                    parsed_diagnostics, parsed_plans = _reconcile_registry_plan_evidence(
-                        parsed_plans,
-                        parsed_diagnostics,
-                        task_queue,
-                        group_by_id,
-                        planner_tool_events,
-                    )
+                    if not typed_planner_result:
+                        parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
+                            planner_scratchpad,
+                            task_queue,
+                            planner_base_diagnostics,
+                            group_by_id,
+                        )
+                        parsed_diagnostics, parsed_plans = _reconcile_registry_plan_evidence(
+                            parsed_plans,
+                            parsed_diagnostics,
+                            task_queue,
+                            group_by_id,
+                            planner_tool_events,
+                        )
                     planner_violations = _planner_plan_violations(
                         parsed_plans,
                         task_queue,
@@ -3652,33 +4383,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         active_target_task_ids=active_target_task_ids,
                         current_status=str(state.get("status") or ""),
                     )
-            structured_llm = router_llm.with_structured_output(
-                SupervisorDecision, method="function_calling"
-            )
-            if decision is None:
-                prompt_state: OrchestratorState = {  # type: ignore[typeddict-item]
-                    **state,
-                    "task_queue": task_queue,
-                    "qa_evaluations": qa_evaluations,
-                    "retry_diagnostics_by_task": retry_diagnostics_by_task,
-                    "retry_plans_by_task": retry_plans_by_task,
-                }
-                prompt_text = build_supervisor_prompt(
-                    prompt_state,
-                    scratchpad=planner_scratchpad,
-                )
-                logger.info("supervisor: invoking structured router LLM.")
-                decision = invoke_with_trajectory(
-                    "supervisor.router",
-                    lambda: structured_llm.invoke(prompt_text),
-                    prompt_text,
-                )
-                logger.info(
-                    "supervisor: router decision â†’ next_node=%s targets=%s reason=%s",
-                    decision.next_node,
-                    decision.target_task_ids,
-                    decision.decision_reason,
-                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "supervisor: LLM call failed (%s) â€” using deterministic fallback.", exc
@@ -3699,6 +4403,33 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     f"Routing {len(active_qa_ready)} optimistically fixed task(s) from the current batch to QA."
                 ),
             )
+
+    # ------------------------------------------------------------------
+    # 6b. Deterministic authority boundary
+    # ------------------------------------------------------------------
+    deterministic_decision = _deterministic_routing(
+        task_queue,
+        group_by_id,
+        qa_evaluations,
+        retry_diagnostics_by_task,
+        action_summaries=action_summaries,
+        active_target_task_ids=active_target_task_ids,
+        current_status=str(state.get("status") or ""),
+        triage_required=bool(state.get("triage_required")),
+    )
+    if llm_advisory is not None:
+        decision = _merge_advisory(
+            deterministic_decision,
+            llm_advisory,
+            existing_constraints=existing_constraints,
+        )
+    else:
+        llm_advisory = _invoke_llm_advisory(state, deterministic_decision)
+        decision = _merge_advisory(
+            deterministic_decision,
+            llm_advisory,
+            existing_constraints=existing_constraints,
+        )
 
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
@@ -4069,6 +4800,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 
             try:
                 decision = SupervisorDecision(
+                    decision_code=decision.decision_code,
                     next_node=decision.next_node,
                     updated_task_strategies={},
                     target_task_ids=valid_target_ids,
@@ -4224,6 +4956,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         resolved_target_task_ids,
         task_queue,
         retry_diagnostics_by_task,
+        group_by_id,
     )
     # Status overrides and parent terminalization above are also untrusted
     # router requests. Re-clamp after those mutations so a task that became
@@ -4233,6 +4966,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         resolved_target_task_ids,
         task_queue,
         retry_diagnostics_by_task,
+        group_by_id,
     )
     remapped_feedback_by_task = {
         task_id: feedback
@@ -4401,6 +5135,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     return {
         "status": "supervisor_routed",
         "next_routing_step": resolved_next_node,
+        "decision_code": decision.decision_code,
+        "supervisor_audit": _emit_audit(decision, consistency_events, state_revision),
         "active_target_task_ids": resolved_target_task_ids,
         # Keep active_target_group_ids populated for bridge nodes that still use it
         "active_target_group_ids": [
@@ -4437,17 +5173,27 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 
 
 def supervisor_router(state: OrchestratorState) -> str:
-    """
-    Conditional-edge callable for the supervisor node.
-
-    Reads ``state["next_routing_step"]`` and returns the target node name.
-    Defaults to ``"teardown"`` for any unknown or missing value.
-    """
+    """Return the committed route, recomputing it when state is invalid."""
     step = state.get("next_routing_step", "")
     if step in _VALID_NEXT_NODES:
         return step
-    logger.warning(
-        "supervisor_router: unknown next_routing_step '%s' â€” defaulting to teardown.",
-        step,
+    logger.error("supervisor_router: invalid next_routing_step '%s' - recomputing.", step)
+
+    valid_groups = list(state.get("valid_groups", []) or [])
+    group_by_id = {group.group_id: group for group in valid_groups}
+    decision = _deterministic_routing(
+        dict(state.get("task_queue", {}) or {}),
+        group_by_id,
+        dict(state.get("qa_evaluations", {}) or {}),
+        dict(state.get("retry_diagnostics_by_task", {}) or {}),
+        active_target_task_ids=list(state.get("active_target_task_ids", []) or []),
+        current_status=str(state.get("status") or ""),
+        triage_required=bool(state.get("triage_required")),
     )
-    return "teardown"
+    if decision.next_node not in _VALID_NEXT_NODES:
+        logger.critical(
+            "supervisor_router: deterministic recomputation produced invalid node '%s'.",
+            decision.next_node,
+        )
+        return "teardown"
+    return decision.next_node
