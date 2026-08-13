@@ -176,49 +176,13 @@ def parse_lockfile_path(file_path: str) -> tuple[str | None, str | None, str | N
     ``/src/node_modules/express-jwt/node_modules/moment/moment.js``
         â†’ (None, ``express-jwt``, ``moment``)
     """
-    m = _LOCKFILE_PATH_RE.match(file_path)
-    if m:
-        lockfile = m.group("lockfile")
-        ancestry = m.group("ancestry").lstrip("/")
-
-        # Split ancestry into package segments.
-        # A segment is either:
-        #   - a plain token like "cookie:0.4.2"
-        #   - a scoped token like "@tootallnate/once:1.1.2"  (starts with @)
-        # We must NOT split scoped tokens on the '/' inside them.
-        segments: list[str] = []
-        remaining = ancestry
-        while remaining:
-            if remaining.startswith("@"):
-                # consume up to next '/' that is NOT part of the scope
-                # e.g. "@tootallnate/once:1.1.2/next-pkg:2.0"
-                # The scope+name is everything up to ':version' then optional '/'
-                # We find the end of this token by locating the first '/' that comes
-                # AFTER the mandatory scope separator.
-                slash_scope = remaining.index("/")  # separator between @scope and name
-                rest_after_scope = remaining[slash_scope + 1 :]  # "once:1.1.2/next..."
-                next_slash = rest_after_scope.find("/")
-                if next_slash == -1:
-                    segments.append(remaining)
-                    break
-                token = remaining[: slash_scope + 1 + next_slash]
-                segments.append(token)
-                remaining = rest_after_scope[next_slash + 1 :]
-            else:
-                slash_idx = remaining.find("/")
-                if slash_idx == -1:
-                    segments.append(remaining)
-                    break
-                segments.append(remaining[:slash_idx])
-                remaining = remaining[slash_idx + 1 :]
-
+    parsed = _parse_dependency_segments(file_path)
+    if parsed is not None:
+        lockfile, segments = parsed
         if not segments:
             return lockfile, None, None
-
-        leaf = normalize_package_name(segments[-1])
-        parent_raw = segments[-2] if len(segments) >= 2 else None
-        parent = normalize_package_name(parent_raw) if parent_raw else None
-
+        leaf = segments[-1][0]
+        parent = segments[-2][0] if len(segments) >= 2 else None
         return lockfile, parent, leaf
 
     # Not a lockfile path â€” may be a node_modules file path.
@@ -226,13 +190,111 @@ def parse_lockfile_path(file_path: str) -> tuple[str | None, str | None, str | N
     # Each node_modules entry is the directory immediately after 'node_modules/'.
     # e.g. /src/node_modules/express-jwt/node_modules/moment/moment.js
     #       â†’ packages: ['express-jwt', 'moment'], leaf='moment', parent='express-jwt'
-    nm_match = re.findall(r"node_modules/([^/]+)", file_path)
-    if nm_match:
-        leaf = nm_match[-1]
-        parent = nm_match[-2] if len(nm_match) >= 2 else None
+    segments = _node_modules_dependency_segments(file_path)
+    if segments:
+        leaf = segments[-1][0]
+        parent = segments[-2][0] if len(segments) >= 2 else None
         return None, parent, leaf
 
     return None, None, None
+
+
+def _split_lockfile_ancestry(ancestry: str) -> list[str]:
+    """Split lockfile ancestry tokens without breaking scoped package names."""
+    segments: list[str] = []
+    remaining = ancestry.lstrip("/")
+    while remaining:
+        if remaining.startswith("@"):
+            scope_separator = remaining.find("/")
+            if scope_separator < 0:
+                segments.append(remaining)
+                break
+            after_scope = remaining[scope_separator + 1 :]
+            next_separator = after_scope.find("/")
+            if next_separator < 0:
+                segments.append(remaining)
+                break
+            segments.append(remaining[: scope_separator + 1 + next_separator])
+            remaining = after_scope[next_separator + 1 :]
+            continue
+
+        separator = remaining.find("/")
+        if separator < 0:
+            segments.append(remaining)
+            break
+        segments.append(remaining[:separator])
+        remaining = remaining[separator + 1 :]
+    return segments
+
+
+def _package_token(token: str) -> tuple[str, str | None]:
+    """Return ``(package_name, resolved_version)`` from a scanner ancestry token."""
+    raw = token.strip()
+    version: str | None = None
+    if raw.startswith("@"):
+        colon = raw.rfind(":")
+        slash = raw.find("/")
+        if colon > slash:
+            version = raw[colon + 1 :].strip() or None
+    elif ":" in raw:
+        raw, version = raw.split(":", 1)
+        version = version.strip() or None
+    return normalize_package_name(raw), version
+
+
+def _node_modules_dependency_segments(file_path: str) -> list[tuple[str, str | None]]:
+    """Extract nested ``node_modules`` package names from a filesystem path."""
+    parts = [part for part in file_path.replace("\\", "/").split("/") if part]
+    segments: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(parts):
+        if parts[index] != "node_modules" or index + 1 >= len(parts):
+            index += 1
+            continue
+        package = parts[index + 1]
+        consumed = 1
+        if package.startswith("@") and index + 2 < len(parts):
+            package = f"{package}/{parts[index + 2]}"
+            consumed = 2
+        # A package directory may legitimately end in .js (for example
+        # fast.js); unlike a file identifier, it must not be normalized as an
+        # archive/source filename.
+        segments.append((package.strip(), None))
+        index += consumed + 1
+    return [(name, version) for name, version in segments if name]
+
+
+def _parse_dependency_segments(
+    file_path: str,
+) -> tuple[str, list[tuple[str, str | None]]] | None:
+    """Parse a lockfile path into its lockfile and ordered dependency chain."""
+    match = _LOCKFILE_PATH_RE.match(file_path or "")
+    if not match:
+        return None
+    lockfile = match.group("lockfile")
+    tokens = _split_lockfile_ancestry(match.group("ancestry"))
+    segments: list[tuple[str, str | None]] = []
+    for token in tokens:
+        parsed = _package_token(token)
+        if parsed[0]:
+            segments.append(parsed)
+    return lockfile, segments
+
+
+def parse_dependency_ancestry(file_path: str) -> list[tuple[str, str | None]]:
+    """Return the ordered dependency ancestry encoded in a scanner path.
+
+    Args:
+        file_path: ODC lockfile ancestry or a nested ``node_modules`` path.
+
+    Returns:
+        A list of ``(package_name, resolved_version)`` pairs ordered from the
+        outermost package to the vulnerable leaf. Unknown versions are ``None``.
+    """
+    parsed = _parse_dependency_segments(file_path)
+    if parsed is not None:
+        return parsed[1]
+    return _node_modules_dependency_segments(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +481,18 @@ def _locate_in_manifest(
     dependencies = package_json.get("dependencies") or {}
     dev_dependencies = package_json.get("devDependencies") or {}
     peer_dependencies = package_json.get("peerDependencies") or {}
-    all_direct = {**dependencies, **dev_dependencies, **peer_dependencies}
+    optional_dependencies = package_json.get("optionalDependencies") or {}
+    declaration_maps = (
+        ("dependencies", dependencies),
+        ("devDependencies", dev_dependencies),
+        ("peerDependencies", peer_dependencies),
+        ("optionalDependencies", optional_dependencies),
+    )
+    all_direct = {
+        package: (declaration_type, str(spec))
+        for declaration_type, declarations in declaration_maps
+        for package, spec in declarations.items()
+    }
 
     is_direct = package_name in all_direct
 
@@ -427,9 +500,12 @@ def _locate_in_manifest(
         "manifest_file": str(manifest_path),
         "package_name": package_name,
         "is_direct": is_direct,
+        "declaration_type": all_direct.get(package_name, (None, None))[0],
+        "declared_version": all_direct.get(package_name, (None, None))[1],
         "line_number": None,
         "snippet": None,
         "package_manager": pkg_manager,
+        "direct_declarations": all_direct,
     }
 
     if is_direct:
@@ -479,6 +555,7 @@ def locate_dependency(
 
     # 1. Parse lockfile ancestry from ODC path
     lockfile_rel, ancestor_pkg, leaf_pkg = parse_lockfile_path(odc_file_path)
+    dependency_ancestry = parse_dependency_ancestry(odc_file_path)
     effective_name = leaf_pkg or package_name
 
     # 2. Resolve nearest manifest
@@ -500,6 +577,29 @@ def locate_dependency(
 
     # 4. Locate in manifest (pure localization â€” no fix planning)
     location = _locate_in_manifest(manifest_path, effective_name, pkg_manager)
+    direct_declarations = location.pop("direct_declarations", {})
+    ancestry_names = [name for name, _ in dependency_ancestry]
+    dependency_versions = {name: version for name, version in dependency_ancestry if version}
+    parent_name: str | None = None
+    parent_version: str | None = None
+    parent_declaration_type: str | None = None
+    parent_manifest_line: int | None = None
+    parent_manifest_snippet: str | None = None
+    # Walk outward from the vulnerable leaf and select the nearest package that
+    # is actually declared in the editable manifest. This is the only parent
+    # target that the update worker is allowed to change.
+    for candidate_name, candidate_version in reversed(dependency_ancestry[:-1]):
+        declaration = direct_declarations.get(candidate_name)
+        if declaration is None:
+            continue
+        parent_name = candidate_name
+        parent_version = candidate_version or dependency_versions.get(candidate_name)
+        parent_declaration_type = declaration[0]
+        lines = manifest_path.read_text(encoding="utf-8").splitlines()
+        parent_manifest_line = _find_dependency_line(lines, candidate_name)
+        if parent_manifest_line is not None:
+            parent_manifest_snippet = _build_snippet(lines, parent_manifest_line)
+        break
 
     return {
         "status": "success",
@@ -509,6 +609,13 @@ def locate_dependency(
             "ancestor_pkg": ancestor_pkg,
             "leaf_pkg": leaf_pkg,
         },
+        "dependency_ancestry": ancestry_names,
+        "dependency_versions": dependency_versions,
+        "parent_package_name": parent_name,
+        "parent_package_version": parent_version,
+        "parent_declaration_type": parent_declaration_type,
+        "parent_manifest_line": parent_manifest_line,
+        "parent_manifest_snippet": parent_manifest_snippet,
     }
 
 
@@ -565,5 +672,13 @@ def locate_from_issue(
         manifest_line=result.get("line_number"),
         manifest_snippet=result.get("snippet"),
         package_manager=result.get("package_manager"),
+        dependency_ancestry=result.get("dependency_ancestry", []),
+        dependency_versions=result.get("dependency_versions", {}),
+        declaration_type=result.get("declaration_type"),
+        parent_package_name=result.get("parent_package_name"),
+        parent_package_version=result.get("parent_package_version"),
+        parent_declaration_type=result.get("parent_declaration_type"),
+        parent_manifest_line=result.get("parent_manifest_line"),
+        parent_manifest_snippet=result.get("parent_manifest_snippet"),
         localization_confidence=confidence,
     )

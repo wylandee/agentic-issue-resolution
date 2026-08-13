@@ -163,8 +163,8 @@ def _build_package_manifest_map(
 ) -> dict[str, list[str]]:
     """Build a per-package allowlist of manifest paths for tool enforcement."""
     package_manifest_map: dict[str, list[str]] = {}
-    for _, group, manifest_paths in resolved_tasks:
-        package_name = (group.vulnerable_component or "").strip()
+    for task, group, manifest_paths in resolved_tasks:
+        package_name = _target_package_name(task, group)
         if not package_name:
             continue
         existing = package_manifest_map.setdefault(package_name, [])
@@ -180,38 +180,44 @@ def _requires_override_remediation(
     feedback: str = "",
     previous_outcome: str = "",
 ) -> bool:
-    """Return whether this package must be edited through npm overrides."""
-    if diagnostics and diagnostics.used_overrides:
-        return True
-
-    text_parts = [
-        task.instruction or "",
-        feedback or "",
-        previous_outcome or "",
-    ]
-    if diagnostics:
-        text_parts.extend(
-            [
-                diagnostics.failure_reason,
-                diagnostics.reasoning_summary,
-            ]
-        )
-    lowered = " ".join(part.lower() for part in text_parts if part)
-    return any(
-        marker in lowered
-        for marker in (
-            '"overrides"',
-            "'overrides'",
-            "npm override",
-            "npm overrides",
-            "use overrides",
-            "using overrides",
-            "via overrides",
-            "with overrides",
-            "transitive dependency",
-            "transitive-only",
-        )
+    """Return whether the committed stage requires a native package override."""
+    del feedback, previous_outcome
+    if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        # Preserve explicit legacy/direct override evidence, but never let it
+        # override a transitive task that is still editing its parent.
+        return bool(diagnostics and diagnostics.used_overrides and not task.parent_package_name)
+    return bool(
+        diagnostics is None
+        or diagnostics.used_overrides
+        or task.target_dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
+        or diagnostics.target_dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
     )
+
+
+def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> str:
+    """Return the Supervisor-owned package target for this task stage."""
+    if isinstance(task.target_package_name, str) and task.target_package_name.strip():
+        return task.target_package_name.strip()
+    if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        if group.parent_package_name:
+            return group.parent_package_name.strip()
+        for localized in group.localized_issues:
+            if localized.parent_package_name:
+                return localized.parent_package_name.strip()
+    return (group.vulnerable_component or "").strip()
+
+
+def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
+    """Return the Supervisor-owned manifest declaration type for this task."""
+    if isinstance(task.target_dependency_type, str) and task.target_dependency_type:
+        return task.target_dependency_type
+    if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        if group.parent_declaration_type:
+            return group.parent_declaration_type
+        for localized in group.localized_issues:
+            if localized.parent_declaration_type:
+                return localized.parent_declaration_type
+    return "overrides" if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE else None
 
 
 def _is_retry_task(task: RemediationTask) -> bool:
@@ -428,12 +434,13 @@ def _legacy_build_update_prompt(
 
 
 def _was_package_reverted(
+    task: RemediationTask,
     group: VulnerabilityGroup,
     tool_events: Sequence[Any] | None,
 ) -> bool:
     if not tool_events:
         return False
-    pkg = (group.vulnerable_component or "").strip()
+    pkg = _target_package_name(task, group)
     reverted = False
     for event in tool_events:
         name = getattr(event, "name", "")
@@ -450,12 +457,13 @@ def _was_package_reverted(
 
 
 def _was_package_modified(
+    task: RemediationTask,
     group: VulnerabilityGroup,
     tool_events: Sequence[Any] | None,
 ) -> bool:
     if not tool_events:
         return False
-    pkg = (group.vulnerable_component or "").strip()
+    pkg = _target_package_name(task, group)
     modified = False
     for event in tool_events:
         name = getattr(event, "name", "")
@@ -476,6 +484,7 @@ def _was_package_modified(
 
 
 def _has_successful_validation_for_package(
+    task: RemediationTask,
     group: VulnerabilityGroup,
     tool_events: Sequence[Any] | None,
 ) -> bool:
@@ -483,7 +492,7 @@ def _has_successful_validation_for_package(
     if not tool_events:
         return False
 
-    pkg = (group.vulnerable_component or "").strip()
+    pkg = _target_package_name(task, group)
     last_successful_edit_index = -1
 
     for index, event in enumerate(tool_events):
@@ -515,6 +524,7 @@ def _has_successful_validation_for_package(
 
 
 def _had_registry_lookup_before_package_edit(
+    task: RemediationTask,
     group: VulnerabilityGroup,
     tool_events: Sequence[Any] | None,
 ) -> bool:
@@ -522,7 +532,7 @@ def _had_registry_lookup_before_package_edit(
     if not tool_events:
         return False
 
-    pkg = (group.vulnerable_component or "").strip()
+    pkg = _target_package_name(task, group)
     first_successful_edit_index = -1
 
     for index, event in enumerate(tool_events):
@@ -568,14 +578,14 @@ def _legacy_build_action_summaries(
         relevant_changed_files = [
             path for path in manifest_paths if path.replace("\\", "/") in normalized_changed_files
         ]
-        pkg_reverted = _was_package_reverted(group, tool_events)
+        pkg_reverted = _was_package_reverted(task, group, tool_events)
         pkg_modified = (
-            _was_package_modified(group, tool_events)
+            _was_package_modified(task, group, tool_events)
             if tool_events is not None
             else (bool(relevant_changed_files) and not pkg_reverted)
         )
         pkg_validated = (
-            _has_successful_validation_for_package(group, tool_events)
+            _has_successful_validation_for_package(task, group, tool_events)
             if tool_events is not None
             else succeeded
         )
@@ -683,7 +693,7 @@ def _attempted_versions_for_current_run(
     """
     package_to_task_ids: dict[str, list[str]] = {}
     for task, group, _manifest_paths in resolved_tasks:
-        package = (group.vulnerable_component or "").strip()
+        package = _target_package_name(task, group)
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
 
@@ -710,7 +720,7 @@ def _executed_versions_for_current_run(
     result: dict[str, list[str]] = {task.task_id: [] for task, _group, _paths in resolved_tasks}
     package_to_task_ids: dict[str, list[str]] = {}
     for task, group, _manifest_paths in resolved_tasks:
-        package = (group.vulnerable_component or "").strip()
+        package = _target_package_name(task, group)
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
     for event in tool_events:
@@ -847,9 +857,6 @@ def _legacy_build_retry_diagnostics(
             selected_version = prior.selected_version
 
         attempted_set = set(attempted_versions)
-        untried_candidates = [
-            version for version in candidate_versions if version not in attempted_set
-        ]
         is_peer_conflict = "peer" in (joined_errors + " " + lowered_final_text) or "eresolve" in (
             joined_errors + " " + lowered_final_text
         )
@@ -872,7 +879,7 @@ def _legacy_build_retry_diagnostics(
                 "latest version was already attempted",
             ]
         )
-        reverted_on_retry = _is_retry_task(task) and _was_package_reverted(group, tool_events)
+        reverted_on_retry = _is_retry_task(task) and _was_package_reverted(task, group, tool_events)
         latest_attempted_on_retry = (
             _is_retry_task(task)
             and latest_version_seen is not None
@@ -891,48 +898,6 @@ def _legacy_build_retry_diagnostics(
             failure_reason = joined_errors or final_text.strip()
         elif prior and prior.failure_reason and not selected_version:
             failure_reason = prior.failure_reason
-
-        candidate_choices = [
-            version for version in candidate_versions if version not in attempted_set
-        ]
-        planning_answers = {
-            "1_last_fix_attempt": selected_version
-            or (prior.selected_version if prior else None)
-            or (attempted_versions[-1] if attempted_versions else "none"),
-            "2_attempted_versions": ", ".join(attempted_versions) or "none",
-            "3_latest_version_available": latest_version_seen or "unknown",
-            "4_untried_candidates": ", ".join(candidate_choices) or "none",
-            "5_remediation_type": "npm overrides"
-            if used_overrides
-            else "direct dependency version bump",
-            "6_context": (
-                "package abandoned"
-                if package_abandoned
-                else (
-                    "peer conflict"
-                    if "peer" in (joined_errors + " " + lowered_final_text)
-                    else ("stale version or prior failure")
-                )
-            ),
-            "7_constraints": (
-                "constraints ledger contains entries"
-                if constraints_ledger
-                else "no blocking constraints recorded"
-            ),
-            "8_next_candidate": (
-                latest_version_seen
-                if (latest_version_seen and latest_version_seen not in attempted_set)
-                else (
-                    candidate_choices[0]
-                    if candidate_choices
-                    else (
-                        f"NONE (latest version '{latest_version_seen}' already attempted)"
-                        if latest_version_seen in attempted_set
-                        else "none"
-                    )
-                )
-            ),
-        }
 
         diagnostics_by_task[task.task_id] = UpdateRetryDiagnostics(
             task_id=task.task_id,
@@ -974,6 +939,8 @@ def _build_update_prompt(
         "The validator rolls back only the current package to its pre-update checkpoint when synchronization fails; preserve earlier packages whose validations succeeded.",
         "If a package validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
         "Never edit source-code files in this worker.",
+        "During parent stages (OSV_MINIMUM, NPM_SAME_MAJOR, NPM_LATEST), edit only the committed parent target and never add an override.",
+        "During PACKAGE_OVERRIDE, edit only the committed vulnerable child through the package manager's native override mechanism.",
         "",
         "Constraints ledger:",
     ]
@@ -986,6 +953,10 @@ def _build_update_prompt(
                 "",
                 f"## Task {task.task_id}",
                 f"- Component: {group.vulnerable_component or 'unknown'}",
+                f"- Edit target: {_target_package_name(task, group)}",
+                f"- Declaration type: {_target_dependency_type(task, group) or 'package dependency'}",
+                f"- Strategy stage: {task.strategy_stage.value}",
+                f"- Parent package: {task.parent_package_name or group.parent_package_name or 'none'}",
                 f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
                 f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
                 f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
@@ -1015,8 +986,8 @@ def _build_action_summaries(
     final_note = (final_text or "").strip()
     summaries: list[AgentActionSummary] = []
     for task, group, manifest_paths in resolved_tasks:
-        package_modified = _was_package_modified(group, tool_events)
-        package_validated = _has_successful_validation_for_package(group, tool_events)
+        package_modified = _was_package_modified(task, group, tool_events)
+        package_validated = _has_successful_validation_for_package(task, group, tool_events)
         task_succeeded = package_modified and package_validated
         if tool_events is None:
             task_succeeded = succeeded and bool(normalized_changed_files)
@@ -1051,21 +1022,27 @@ def _build_retry_diagnostics(
     joined_errors = " | ".join(error.strip() for error in errors if error.strip())
     lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
     for task, group, _ in resolved_tasks:
+        target_package = _target_package_name(task, group)
+        target_dependency_type = _target_dependency_type(task, group)
         prior = prior_diagnostics_by_task.get(task.task_id)
-        attempted = list(prior.attempted_versions) if prior else []
+        prior_attempts_by_target = dict(prior.attempted_versions_by_target) if prior else {}
+        attempted = list(
+            prior_attempts_by_target.get(target_package, prior.attempted_versions if prior else [])
+        )
         used_overrides = bool(prior.used_overrides) if prior else False
         for event in tool_events:
             if event.name != "modify_npm_dependency":
                 continue
-            if (
-                str(event.args.get("package_name", "")).strip()
-                != (group.vulnerable_component or "").strip()
-            ):
+            if str(event.args.get("package_name", "")).strip() != target_package:
                 continue
             target = str(event.args.get("target_version", "")).strip().lstrip("vV")
             if target and target not in attempted:
                 attempted.append(target)
-            used_overrides = used_overrides or event.args.get("dependency_type") == "overrides"
+            used_overrides = used_overrides or event.args.get("dependency_type") in {
+                "overrides",
+                "resolutions",
+                "pnpm_overrides",
+            }
         package_abandoned = bool(prior.package_abandoned) if prior else False
         if "package abandoned" in lowered_outcome or "package not found" in lowered_outcome:
             package_abandoned = True
@@ -1083,7 +1060,7 @@ def _build_retry_diagnostics(
             exhausted_update_path = True
         if (
             _is_retry_task(task)
-            and _was_package_reverted(group, tool_events)
+            and _was_package_reverted(task, group, tool_events)
             and "peer" not in lowered_outcome
             and "eresolve" not in lowered_outcome
         ):
@@ -1116,6 +1093,29 @@ def _build_retry_diagnostics(
             else (prior.failure_reason if prior else ""),
             reasoning_summary=(final_text or "").strip(),
             instruction_digest=prior.instruction_digest if prior else None,
+            target_package_name=target_package,
+            target_dependency_type=target_dependency_type,
+            parent_package_name=(
+                task.parent_package_name
+                or group.parent_package_name
+                or next(
+                    (
+                        localized.parent_package_name
+                        for localized in group.localized_issues
+                        if localized.parent_package_name
+                    ),
+                    None,
+                )
+            ),
+            parent_minimum_version=(
+                task.parent_minimum_version
+                if task.parent_minimum_version
+                else (prior.parent_minimum_version if prior else None)
+            ),
+            attempted_versions_by_target={
+                **prior_attempts_by_target,
+                target_package: attempted,
+            },
         )
     return result
 
@@ -1161,13 +1161,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     resolved_tasks: list[tuple[RemediationTask, VulnerabilityGroup, list[str]]] = []
     resolution_errors: list[str] = []
     target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
-    for task, group in zip(target_tasks, target_groups):
+    for task, group in zip(target_tasks, target_groups, strict=False):
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is not None:
             if (
                 task.current_attempt_id != snapshot.attempt_id
                 or task.task_revision != snapshot.task_revision
                 or task.instruction != snapshot.instruction
+                or task.target_package_name != snapshot.target_package_name
+                or task.target_dependency_type != snapshot.target_dependency_type
             ):
                 resolution_errors.append(
                     f"Update Subagent: committed attempt snapshot does not match task {task.task_id}."
@@ -1177,6 +1179,9 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 update={
                     "strategy_stage": snapshot.strategy_stage,
                     "selected_version": snapshot.selected_version,
+                    "target_package_name": snapshot.target_package_name,
+                    "target_dependency_type": snapshot.target_dependency_type,
+                    "parent_minimum_version": snapshot.parent_minimum_version,
                     "instruction": snapshot.instruction,
                 }
             )
@@ -1273,8 +1278,12 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     ]
 
     override_required_packages: set[str] = set()
+    allowed_dependency_types_by_package: dict[str, set[str]] = {}
     for task, group, _ in skinny_resolved_tasks:
-        pkg_name = (group.vulnerable_component or "").strip()
+        pkg_name = _target_package_name(task, group)
+        target_type = _target_dependency_type(task, group)
+        if pkg_name and target_type:
+            allowed_dependency_types_by_package.setdefault(pkg_name, set()).add(target_type)
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
         if pkg_name and _requires_override_remediation(
             task,
@@ -1298,6 +1307,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 ],
                 package_manifest_paths=package_manifest_map,
                 override_required_packages=override_required_packages,
+                allowed_dependency_types_by_package=allowed_dependency_types_by_package,
                 execution_state=execution_state,
                 package_checkpoints=package_checkpoints,
             )
@@ -1333,19 +1343,19 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         event for event in runtime.tool_events if event.name == "validate_manifest_sync"
     ]
     package_names = {
-        (group.vulnerable_component or "").strip()
-        for _, group, _ in resolved_tasks
-        if (group.vulnerable_component or "").strip()
+        _target_package_name(task, group)
+        for task, group, _ in resolved_tasks
+        if _target_package_name(task, group)
     }
     successful_packages = {
-        (group.vulnerable_component or "").strip()
-        for _, group, _ in resolved_tasks
-        if _has_successful_validation_for_package(group, runtime.tool_events)
+        _target_package_name(task, group)
+        for task, group, _ in resolved_tasks
+        if _has_successful_validation_for_package(task, group, runtime.tool_events)
     }
     unvalidated_manifest_paths = {
         path.replace("\\", "/")
-        for _, group, manifest_paths in resolved_tasks
-        if (group.vulnerable_component or "").strip() not in successful_packages
+        for task, group, manifest_paths in resolved_tasks
+        if _target_package_name(task, group) not in successful_packages
         for path in manifest_paths
     }
     committed_changed_files = sorted(touched_files)
@@ -1361,7 +1371,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         and len(validation_events) == len(package_names)
         and int(execution_state.get("validation_calls", 0)) == len(package_names)
         and all(
-            _has_successful_validation_for_package(group, runtime.tool_events)
+            _has_successful_validation_for_package(task, group, runtime.tool_events)
             for _, group, _ in resolved_tasks
         )
     )

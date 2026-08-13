@@ -78,12 +78,18 @@ def _localized(
     manifest_file: str | None = None,
     is_direct_dependency: bool | None = True,
     package_manager: str | None = "npm",
+    parent_package_name: str | None = None,
+    parent_package_version: str | None = None,
+    parent_declaration_type: str | None = None,
 ) -> LocalizedIssue:
     return LocalizedIssue(
         issue=issue,
         manifest_file=manifest_file or issue.file_path,
         is_direct_dependency=is_direct_dependency,
         package_manager=package_manager,
+        parent_package_name=parent_package_name,
+        parent_package_version=parent_package_version,
+        parent_declaration_type=parent_declaration_type,
         localization_confidence=0.95,
     )
 
@@ -110,6 +116,40 @@ def _plan(
 
 
 class TestSCAGrouping:
+    def test_transitive_same_child_with_different_parents_stays_separate(self):
+        issues = [
+            _sca(cve_id="CVE-2026-1001"),
+            _sca(cve_id="CVE-2026-1002"),
+        ]
+        groups = group_issues(
+            issues,
+            sca_issue_plans=[
+                (
+                    _localized(
+                        issues[0],
+                        is_direct_dependency=False,
+                        parent_package_name="parent-a",
+                        parent_package_version="1.0.0",
+                        parent_declaration_type="dependencies",
+                    ),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.0.1"),
+                ),
+                (
+                    _localized(
+                        issues[1],
+                        is_direct_dependency=False,
+                        parent_package_name="parent-b",
+                        parent_package_version="2.0.0",
+                        parent_declaration_type="dependencies",
+                    ),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.0.1"),
+                ),
+            ],
+        )
+
+        assert len(groups) == 2
+        assert {group.parent_package_name for group in groups} == {"parent-a", "parent-b"}
+
     def test_same_package_multiple_cves_become_one_group(self):
         issues = [
             _sca(cve_id="CVE-2021-23337"),

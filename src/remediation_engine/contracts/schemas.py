@@ -134,6 +134,7 @@ class SCARemediationStage(str, Enum):
     OSV_MINIMUM = "osv_minimum"
     NPM_SAME_MAJOR = "npm_same_major"
     NPM_LATEST = "npm_latest"
+    PACKAGE_OVERRIDE = "package_override"
     CODE_WORKAROUND = "code_workaround"
 
 
@@ -548,6 +549,50 @@ class LocalizedIssue(BaseModel):
         description="Detected package manager (npm / yarn / pnpm) for the manifest.",
     )
 
+    # Dependency ancestry / parent-first transitive remediation context
+    dependency_ancestry: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Package names in the resolved dependency chain, ordered from the "
+            "outermost package toward the vulnerable leaf."
+        ),
+    )
+    dependency_versions: dict[str, str] = Field(
+        default_factory=dict,
+        description="Resolved versions keyed by package name when the scanner supplied them.",
+    )
+    declaration_type: str | None = Field(
+        None,
+        description=(
+            "Manifest declaration section for the localized leaf dependency "
+            "(dependencies, devDependencies, peerDependencies, or optionalDependencies)."
+        ),
+    )
+    parent_package_name: str | None = Field(
+        None,
+        description=(
+            "Nearest ancestor in dependency_ancestry that is directly declared "
+            "in the editable manifest."
+        ),
+    )
+    parent_package_version: str | None = Field(
+        None,
+        description="Resolved version of parent_package_name, when available.",
+    )
+    parent_declaration_type: str | None = Field(
+        None,
+        description="Manifest declaration section containing parent_package_name.",
+    )
+    parent_manifest_line: int | None = Field(
+        None,
+        ge=1,
+        description="1-indexed manifest line for the directly declared parent dependency.",
+    )
+    parent_manifest_snippet: str | None = Field(
+        None,
+        description="Manifest snippet centred on the directly declared parent dependency.",
+    )
+
     # Confidence
     localization_confidence: float = Field(
         default=0.0,
@@ -567,6 +612,34 @@ class LocalizedIssue(BaseModel):
             return None
         s = str(v).strip().replace("\\", "/").lstrip("/")
         return s if s else None
+
+    @field_validator("dependency_ancestry", mode="before")
+    @classmethod
+    def _normalise_dependency_ancestry(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list) else [value]
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            normalized = str(item).strip()
+            if normalized and normalized not in seen:
+                result.append(normalized)
+                seen.add(normalized)
+        return result
+
+    @field_validator("dependency_versions", mode="before")
+    @classmethod
+    def _normalise_dependency_versions(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("dependency_versions must be a mapping of package names to versions.")
+        return {
+            str(package).strip(): str(version).strip()
+            for package, version in value.items()
+            if str(package).strip() and str(version).strip()
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +1022,26 @@ class VulnerabilityGroup(BaseModel):
         default_factory=list,
         description="Deduplicated installed versions of the vulnerable package.",
     )
+    dependency_ancestry: list[str] = Field(
+        default_factory=list,
+        description="Resolved dependency chain for the grouped SCA finding.",
+    )
+    dependency_versions: dict[str, str] = Field(
+        default_factory=dict,
+        description="Resolved dependency versions from the grouped SCA finding.",
+    )
+    parent_package_name: str | None = Field(
+        None,
+        description="Nearest directly declared parent package for a transitive finding.",
+    )
+    parent_package_version: str | None = Field(
+        None,
+        description="Installed/resolved version of the directly declared parent package.",
+    )
+    parent_declaration_type: str | None = Field(
+        None,
+        description="Manifest declaration section for the directly declared parent package.",
+    )
 
     # Scanner provenance
     sources: list[IssueSource] = Field(
@@ -1316,6 +1409,9 @@ class TaskAttemptSnapshot(BaseModel):
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
+    target_package_name: str | None = None
+    target_dependency_type: str | None = None
+    parent_minimum_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
     dispatch_node: Literal["update_subagent", "workaround_subagent", "qa_critic"]
@@ -1333,9 +1429,14 @@ class UpdateRetryDiagnostics(BaseModel):
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     committed_attempt_id: str | None = None
     security_floor: str | None = None
+    target_package_name: str | None = None
+    target_dependency_type: str | None = None
+    parent_package_name: str | None = None
+    parent_minimum_version: str | None = None
     registry_query_performed: bool = False
     attempted_versions: list[str] = Field(default_factory=list)
     executed_versions: list[str] = Field(default_factory=list)
+    attempted_versions_by_target: dict[str, list[str]] = Field(default_factory=dict)
     candidate_versions_considered: list[str] = Field(default_factory=list)
     selected_version: str | None = None
     latest_version_seen: str | None = None
@@ -1369,6 +1470,32 @@ class UpdateRetryDiagnostics(BaseModel):
             seen.add(normalized)
             cleaned.append(normalized)
         return cleaned
+
+    @field_validator("attempted_versions_by_target", mode="before")
+    @classmethod
+    def _normalize_attempted_versions_by_target(cls, value: Any) -> dict[str, list[str]]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("attempted_versions_by_target must be a mapping.")
+        normalized: dict[str, list[str]] = {}
+        for package, versions in value.items():
+            package_name = str(package).strip()
+            if not package_name:
+                continue
+            if not isinstance(versions, list):
+                raise ValueError("attempted_versions_by_target values must be lists.")
+            seen: set[str] = set()
+            cleaned: list[str] = []
+            for version in versions:
+                if not isinstance(version, str):
+                    raise ValueError("attempted target versions must be strings.")
+                item = version.strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    cleaned.append(item)
+            normalized[package_name] = cleaned
+        return normalized
 
     @field_validator("selected_version", "latest_version_seen", mode="before")
     @classmethod
@@ -1586,6 +1713,9 @@ class SupervisorRetryPlan(BaseModel):
     source_task_revision: int = Field(default=0, ge=0)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     selected_version: str | None = None
+    target_package_name: str | None = None
+    target_dependency_type: str | None = None
+    parent_minimum_version: str | None = None
     attempted_versions: list[str] = Field(default_factory=list)
     candidate_versions_considered: list[str] = Field(default_factory=list)
     latest_version_seen: str | None = None
@@ -1853,6 +1983,32 @@ class RemediationTask(BaseModel):
     strategy_stage: SCARemediationStage = Field(
         default=SCARemediationStage.OSV_MINIMUM,
         description="Current ordered SCA remediation stage for this task.",
+    )
+    target_package_name: str | None = Field(
+        default=None,
+        description=(
+            "Package the current stage is allowed to edit. For transitive tasks this "
+            "is the direct parent until PACKAGE_OVERRIDE, then the vulnerable child."
+        ),
+    )
+    target_dependency_type: str | None = Field(
+        default=None,
+        description=(
+            "Manifest dependency section or package-manager override mechanism for "
+            "the current target package."
+        ),
+    )
+    parent_package_name: str | None = Field(
+        default=None,
+        description="Direct parent package for a transitive vulnerability, if known.",
+    )
+    parent_package_version: str | None = Field(
+        default=None,
+        description="Installed/resolved direct parent version for a transitive vulnerability.",
+    )
+    parent_minimum_version: str | None = Field(
+        default=None,
+        description="Lowest compatible parent version selected by the parent planner.",
     )
     no_fix_stage: NoFixMitigationStage | None = Field(
         default=None,

@@ -41,6 +41,7 @@ from remediation_engine.tools.manifest_locator import (
     locate_dependency,
     locate_from_issue,
     normalize_package_name,
+    parse_dependency_ancestry,
     parse_lockfile_path,
 )
 from remediation_engine.tools.odc_parser import (
@@ -514,6 +515,16 @@ class TestNormalizePackageName:
 
 
 class TestParseLockfilePath:
+    def test_dependency_ancestry_preserves_scoped_names_and_versions(self):
+        ancestry = parse_dependency_ancestry(
+            "/src/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/@tootallnate/once:1.1.2"
+        )
+        assert ancestry == [
+            ("sqlite3", "5.1.7"),
+            ("http-proxy-agent", "4.0.1"),
+            ("@tootallnate/once", "1.1.2"),
+        ]
+
     def test_root_npm_entry(self):
         lockfile, parent, leaf = parse_lockfile_path("/src/package-lock.json?/lodash:2.4.2")
         assert lockfile == "/src/package-lock.json"
@@ -727,6 +738,28 @@ class TestLocateDependency:
         ancestry = result["lockfile_ancestry"]
         assert ancestry["ancestor_pkg"] == "jws"
         assert ancestry["leaf_pkg"] == "base64url"
+
+    def test_transitive_parent_is_nearest_direct_manifest_dependency(self, tmp_repo):
+        package_json = json.loads((tmp_repo / "package.json").read_text())
+        package_json["dependencies"]["sqlite3"] = "^5.1.7"
+        (tmp_repo / "package.json").write_text(json.dumps(package_json, indent=2))
+
+        result = locate_dependency(
+            repo_path=tmp_repo,
+            raw_dependency_name="@tootallnate/once:1.1.2",
+            odc_file_path=(
+                "/src/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/"
+                "@tootallnate/once:1.1.2"
+            ),
+        )
+
+        assert result["status"] == "success"
+        assert result["dependency_versions"]["sqlite3"] == "5.1.7"
+        assert result["parent_package_name"] == "sqlite3"
+        assert result["parent_package_version"] == "5.1.7"
+        assert result["parent_declaration_type"] == "dependencies"
+        assert result["parent_manifest_line"] is not None
+        assert '"sqlite3": "^5.1.7"' in result["parent_manifest_snippet"]
 
     def test_package_manager_detected(self, tmp_repo_yarn):
         result = locate_dependency(

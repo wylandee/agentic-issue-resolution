@@ -163,12 +163,15 @@ def _build_instruction(
     package_manager: str | None,
     is_direct: bool | None,
     manifest_file: str | None,
+    parent_package_name: str | None = None,
+    parent_declaration_type: str | None = None,
 ) -> str:
     """
     Generate a terse, actionable instruction for the Remedy agent.
 
-    Direct dependencies: pin in place.
-    Transitive dependencies: use the package-manager override mechanism.
+    Direct dependencies: pin in place. Transitive dependencies with a known
+    directly declared parent are explicitly parent-first; the Supervisor will
+    choose the parent version before an override is considered.
     """
     manifest_name = os.path.basename(manifest_file) if manifest_file else "package.json"
     pm = (package_manager or "npm").lower()
@@ -178,6 +181,15 @@ def _build_instruction(
             package=package_name,
             manifest=manifest_name,
             version=fixed_version,
+        )
+
+    if parent_package_name:
+        declaration = parent_declaration_type or "dependencies"
+        return (
+            f'Update the directly declared parent "{parent_package_name}" in {manifest_name} '
+            f"({declaration}) to the minimum compatible released version that resolves "
+            f'transitive package "{package_name}" to at least "{fixed_version}". '
+            "Do not use a package override unless the parent update stages are exhausted."
         )
 
     if pm == "yarn":
@@ -799,6 +811,8 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             is_direct,
             manifest_file,
             strategy="osv_api",
+            parent_package_name=localized_issue.parent_package_name,
+            parent_declaration_type=localized_issue.parent_declaration_type,
         )
     if snippets:
         return {
@@ -821,6 +835,8 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
                 is_direct,
                 manifest_file,
                 strategy="serper_llm",
+                parent_package_name=localized_issue.parent_package_name,
+                parent_declaration_type=localized_issue.parent_declaration_type,
             )
         if strategy == "CODE_WORKAROUND" and serper_llm_result.get("workaround_snippets"):
             return {
@@ -853,6 +869,8 @@ def _version_plan(
     is_direct: bool | None,
     manifest_file: str | None,
     strategy: str,
+    parent_package_name: str | None = None,
+    parent_declaration_type: str | None = None,
 ) -> dict:
     """Return a ``version_found`` plan dict."""
     instruction = _build_instruction(
@@ -861,6 +879,8 @@ def _version_plan(
         package_manager=package_manager,
         is_direct=is_direct,
         manifest_file=manifest_file,
+        parent_package_name=parent_package_name,
+        parent_declaration_type=parent_declaration_type,
     )
     return {
         "status": FixPlanStatus.VERSION_FOUND.value,

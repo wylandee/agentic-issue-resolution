@@ -27,6 +27,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _next_sca_stage,
     run_supervisor_node,
 )
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.orchestration.update_subagent import (
     _build_retry_diagnostics,
     _build_update_prompt,
@@ -36,7 +37,11 @@ from remediation_engine.tools.fix_planner import (
     _query_osv_fixed_version,
     plan_fix,
 )
-from remediation_engine.tools.registry_tools import plan_npm_version
+from remediation_engine.tools.registry_tools import (
+    plan_npm_parent_version,
+    plan_npm_version,
+    select_npm_parent_version,
+)
 from remediation_engine.triage.grouper import group_issues
 
 
@@ -259,6 +264,175 @@ def test_supervisor_npm_tool_skips_same_major_when_it_equals_latest(monkeypatch)
     assert "Selected Version: 4.18.0" in same_major
     assert "Same-Major Stage: SKIPPED" in same_major
     assert "Selected Version: 4.18.0" in latest
+
+
+def test_parent_selector_orders_stable_compatible_releases_by_stage():
+    data = {
+        "versions": {
+            "1.0.1": {"dependencies": {"transitive-child": "^2.0.0"}},
+            "1.1.0": {"dependencies": {"transitive-child": "^2.0.0"}},
+            "2.0.0": {"dependencies": {"transitive-child": "^2.0.0"}},
+            "2.1.0-beta.1": {"dependencies": {"transitive-child": "^2.0.0"}},
+            "2.2.0": {"dependencies": {"transitive-child": "^1.0.0"}},
+        }
+    }
+
+    minimum = select_npm_parent_version(
+        data,
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="minimum",
+    )
+    same_major = select_npm_parent_version(
+        data,
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="same_major",
+    )
+    latest = select_npm_parent_version(
+        data,
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="latest",
+    )
+
+    assert minimum["selected"] == "1.0.1"
+    assert same_major["selected"] == "1.1.0"
+    assert latest["selected"] == "2.0.0"
+    assert "2.1.0-beta.1" not in latest["compatible"]
+
+
+def test_parent_selector_resolves_multi_hop_dependency_ancestry():
+    parent_data = {
+        "versions": {
+            "1.0.1": {"dependencies": {"intermediate": "~1.0.0"}},
+            "1.1.0": {"dependencies": {"intermediate": "^1.1.0"}},
+            "2.0.0": {"dependencies": {"intermediate": "^1.1.0"}},
+            "2.1.0-beta.1": {"dependencies": {"intermediate": "^1.1.0"}},
+        }
+    }
+    intermediate_data = {
+        "versions": {
+            "1.0.0": {"dependencies": {"transitive-child": "^1.0.0"}},
+            "1.1.0": {"dependencies": {"transitive-child": "^2.0.0"}},
+            "1.2.0": {"dependencies": {"transitive-child": "^3.0.0"}},
+        }
+    }
+
+    minimum = select_npm_parent_version(
+        parent_data,
+        parent_package_name="direct-parent",
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="minimum",
+        dependency_ancestry=["direct-parent", "intermediate", "transitive-child"],
+        registry_data_by_package={"intermediate": intermediate_data},
+    )
+    same_major = select_npm_parent_version(
+        parent_data,
+        parent_package_name="direct-parent",
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="same_major",
+        dependency_ancestry=["direct-parent", "intermediate", "transitive-child"],
+        registry_data_by_package={"intermediate": intermediate_data},
+    )
+    latest = select_npm_parent_version(
+        parent_data,
+        parent_package_name="direct-parent",
+        child_package_name="transitive-child",
+        child_fixed_version="2.0.1",
+        installed_parent_version="1.0.0",
+        selection="latest",
+        dependency_ancestry=["direct-parent", "intermediate", "transitive-child"],
+        registry_data_by_package={"intermediate": intermediate_data},
+    )
+
+    assert minimum["selected"] == "1.1.0"
+    assert same_major["selected"] == "1.1.0"
+    assert latest["selected"] == "2.0.0"
+    assert latest["compatible"] == ["1.1.0", "2.0.0"]
+    assert "2.1.0-beta.1" not in latest["compatible"]
+
+
+def test_parent_planner_fetches_intermediate_registry_metadata(monkeypatch):
+    registry_data = {
+        "direct-parent": {
+            "versions": {
+                "1.0.1": {"dependencies": {"intermediate": "^1.1.0"}},
+            }
+        },
+        "intermediate": {
+            "versions": {
+                "1.1.0": {"dependencies": {"@tootallnate/once": "^2.0.0"}},
+            }
+        },
+    }
+    fetched: list[str] = []
+
+    def fetch(package_name: str):
+        fetched.append(package_name)
+        return registry_data[package_name]
+
+    monkeypatch.setattr("remediation_engine.tools.registry_tools._fetch_package_data", fetch)
+
+    report = plan_npm_parent_version.invoke(
+        {
+            "parent_package_name": "direct-parent",
+            "child_package_name": "@tootallnate/once",
+            "child_fixed_version": "2.0.1",
+            "installed_parent_version": "1.0.0",
+            "selection": "minimum",
+            "dependency_ancestry": "direct-parent -> intermediate -> @tootallnate/once",
+        }
+    )
+
+    assert fetched == ["direct-parent", "intermediate"]
+    assert "Selected Version: 1.0.1" in report
+    assert "Dependency Ancestry: direct-parent -> intermediate -> @tootallnate/once" in report
+
+
+def test_transitive_initial_task_targets_parent_before_override():
+    issue = _issue("CVE-2026-0002", package="transitive-child")
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        is_direct_dependency=False,
+        dependency_ancestry=["direct-parent", "transitive-child"],
+        dependency_versions={"direct-parent": "1.0.0", "transitive-child": "1.0.0"},
+        parent_package_name="direct-parent",
+        parent_package_version="1.0.0",
+        parent_declaration_type="dependencies",
+        localization_confidence=1.0,
+    )
+    group = group_issues(
+        [issue],
+        sca_issue_plans=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
+    )[0]
+
+    task = build_initial_remediation_task(group, "task-1")
+
+    assert task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+    assert task.target_package_name == "direct-parent"
+    assert task.target_dependency_type == "dependencies"
+    assert task.selected_version is None
+    assert "direct-parent" in task.instruction
+    assert "overrides" not in task.instruction
+
+
+def test_transitive_stage_progression_reaches_override_before_workaround():
+    assert _next_sca_stage(SCARemediationStage.NPM_LATEST, transitive=True) == (
+        SCARemediationStage.PACKAGE_OVERRIDE
+    )
+    assert _next_sca_stage(SCARemediationStage.PACKAGE_OVERRIDE, transitive=True) == (
+        SCARemediationStage.CODE_WORKAROUND
+    )
 
 
 def test_update_worker_prompt_contains_no_planning_or_registry_phase():

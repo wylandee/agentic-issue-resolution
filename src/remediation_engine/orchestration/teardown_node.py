@@ -88,21 +88,21 @@ def _revert_unfixable_packages_in_json(
                 "pnpm" in upd_obj
                 and isinstance(upd_obj["pnpm"], dict)
                 and "overrides" in upd_obj["pnpm"]
+                and pkg in upd_obj["pnpm"]["overrides"]
             ):
-                if pkg in upd_obj["pnpm"]["overrides"]:
-                    if (
-                        "pnpm" in orig_obj
-                        and isinstance(orig_obj.get("pnpm"), dict)
-                        and "overrides" in orig_obj["pnpm"]
-                        and pkg in orig_obj["pnpm"]["overrides"]
-                    ):
-                        upd_obj["pnpm"]["overrides"][pkg] = orig_obj["pnpm"]["overrides"][pkg]
-                    else:
-                        del upd_obj["pnpm"]["overrides"][pkg]
-                    if not upd_obj["pnpm"]["overrides"] and (
-                        "pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})
-                    ):
-                        del upd_obj["pnpm"]["overrides"]
+                if (
+                    "pnpm" in orig_obj
+                    and isinstance(orig_obj.get("pnpm"), dict)
+                    and "overrides" in orig_obj["pnpm"]
+                    and pkg in orig_obj["pnpm"]["overrides"]
+                ):
+                    upd_obj["pnpm"]["overrides"][pkg] = orig_obj["pnpm"]["overrides"][pkg]
+                else:
+                    del upd_obj["pnpm"]["overrides"][pkg]
+                if not upd_obj["pnpm"]["overrides"] and (
+                    "pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})
+                ):
+                    del upd_obj["pnpm"]["overrides"]
 
         return json.dumps(upd_obj, indent=indent) + "\n"
     except Exception:
@@ -114,7 +114,7 @@ def _revert_unfixable_packages_in_json(
             if len(orig_matches) == 1 and len(upd_matches) == 1:
                 updated_text = updated_text.replace(upd_matches[0], orig_matches[0])
             elif len(orig_matches) > 1 and len(orig_matches) == len(upd_matches):
-                for orig_m, upd_m in zip(orig_matches, upd_matches):
+                for orig_m, upd_m in zip(orig_matches, upd_matches, strict=True):
                     updated_text = updated_text.replace(upd_m, orig_m, 1)
         return updated_text
 
@@ -181,8 +181,11 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
                 passed_files.update(files)
             elif task.status == TaskStatus.UNFIXABLE:
                 unfixable_files.update(files)
-                if getattr(g, "vulnerable_component", None):
-                    unfixable_packages.add(g.vulnerable_component)
+                target_package = getattr(task, "target_package_name", None) or getattr(
+                    g, "vulnerable_component", None
+                )
+                if target_package:
+                    unfixable_packages.add(target_package)
 
     worker_results_by_attempt = state.get("worker_results_by_attempt", {})
     for attempt_res in worker_results_by_attempt.values():

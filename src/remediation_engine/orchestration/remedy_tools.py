@@ -750,7 +750,14 @@ def _make_revert_workspace_file_tool(
                 return "ERROR: package.json is not a valid JSON object."
 
             reverted_any = False
-            for dep_type in ("dependencies", "devDependencies", "overrides"):
+            for dep_type in (
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+                "overrides",
+                "resolutions",
+            ):
                 baseline_deps = baseline_data.get(dep_type)
                 sandbox_deps = sandbox_data.get(dep_type)
 
@@ -764,6 +771,24 @@ def _make_revert_workspace_file_tool(
                     if isinstance(sandbox_deps, dict) and package_name in sandbox_deps:
                         del sandbox_deps[package_name]
                         reverted_any = True
+
+            baseline_pnpm = baseline_data.get("pnpm")
+            sandbox_pnpm = sandbox_data.get("pnpm")
+            baseline_pnpm_overrides = (
+                baseline_pnpm.get("overrides") if isinstance(baseline_pnpm, dict) else None
+            )
+            sandbox_pnpm_overrides = (
+                sandbox_pnpm.get("overrides") if isinstance(sandbox_pnpm, dict) else None
+            )
+            if isinstance(sandbox_pnpm_overrides, dict) and package_name in sandbox_pnpm_overrides:
+                if (
+                    isinstance(baseline_pnpm_overrides, dict)
+                    and package_name in baseline_pnpm_overrides
+                ):
+                    sandbox_pnpm_overrides[package_name] = baseline_pnpm_overrides[package_name]
+                else:
+                    del sandbox_pnpm_overrides[package_name]
+                reverted_any = True
 
             if not reverted_any:
                 return f"NOTE: Package '{package_name}' was not found/modified in '{rel_path}'."
@@ -796,6 +821,7 @@ def _make_modify_npm_dependency_tool(
     package_manifest_paths: Mapping[str, Iterable[str]],
     attempted_versions_by_package: Mapping[str, set[str]] | None = None,
     override_required_packages: Iterable[str] | None = None,
+    allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
     require_planning_answers: bool = False,
     planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
@@ -812,6 +838,11 @@ def _make_modify_npm_dependency_tool(
         for package_name in (override_required_packages or [])
         if package_name and package_name.strip()
     }
+    allowed_dependency_types = {
+        package_name.strip(): {value.strip() for value in dependency_types if value.strip()}
+        for package_name, dependency_types in (allowed_dependency_types_by_package or {}).items()
+        if package_name.strip()
+    }
 
     @tool
     def modify_npm_dependency(
@@ -821,7 +852,8 @@ def _make_modify_npm_dependency_tool(
         manifest_path: str = "package.json",
     ) -> str:
         """
-        Modify dependencies, devDependencies, or overrides in a package.json.
+        Modify a package.json dependency declaration or native package-manager
+        override field.
         """
         import re
 
@@ -837,16 +869,39 @@ def _make_modify_npm_dependency_tool(
                 "alphanumeric characters, dots, hyphens, slashes, @, ~, ^, and * "
                 "are allowed."
             )
-        if dependency_type not in ("dependencies", "devDependencies", "overrides"):
+        supported_dependency_types = (
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+            "overrides",
+            "resolutions",
+            "pnpm_overrides",
+        )
+        if dependency_type not in supported_dependency_types:
             return (
                 "ERROR: dependency_type must be strictly one of: "
-                "'dependencies', 'devDependencies', or 'overrides'."
+                + ", ".join(repr(value) for value in supported_dependency_types)
+                + "."
             )
-        if package_name in override_required_package_names and dependency_type != "overrides":
+        override_types = {"overrides", "resolutions", "pnpm_overrides"}
+        if (
+            package_name in override_required_package_names
+            and dependency_type not in override_types
+        ):
             return (
-                f"ERROR: Package '{package_name}' is constrained to npm overrides for "
-                "this task. Retry modify_npm_dependency with dependency_type='overrides'. "
+                f"ERROR: Package '{package_name}' is constrained to npm overrides/native "
+                "package-manager overrides for this task. Retry modify_npm_dependency with "
+                "dependency_type='overrides' (or use 'resolutions'/'pnpm_overrides'). "
                 "No manifest changes were made."
+            )
+        package_allowed_types = allowed_dependency_types.get(package_name)
+        if package_allowed_types and dependency_type not in package_allowed_types:
+            allowed = ", ".join(sorted(package_allowed_types))
+            return (
+                f"ERROR: Package '{package_name}' is committed to declaration type "
+                f"{allowed} for this strategy stage; dependency_type='{dependency_type}' "
+                "would violate target ownership. No manifest changes were made."
             )
 
         try:
@@ -885,7 +940,8 @@ def _make_modify_npm_dependency_tool(
                 touched_files,
             )
 
-        package_expr = f"{dependency_type}[{package_name}]={target_version}"
+        package_path = "pnpm.overrides" if dependency_type == "pnpm_overrides" else dependency_type
+        package_expr = f"{package_path}[{package_name}]={target_version}"
         npm_cmd = shlex.join(["npm", "pkg", "set", package_expr])
         workspace_dir = _workspace_dir_for_manifest(rel_manifest)
         if workspace_dir == "/workspace":
@@ -3056,6 +3112,7 @@ def build_update_toolbelt(
     enable_registry_lookup: bool = False,
     attempted_versions_by_package: Mapping[str, set[str]] | None = None,
     override_required_packages: Iterable[str] | None = None,
+    allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
     require_planning_answers: bool = False,
     planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
@@ -3074,6 +3131,7 @@ def build_update_toolbelt(
             normalized_package_manifest_paths,
             attempted_versions_by_package=attempted_versions_by_package,
             override_required_packages=override_required_packages,
+            allowed_dependency_types_by_package=allowed_dependency_types_by_package,
             require_planning_answers=require_planning_answers,
             planning_state=planning_state,
             execution_state=execution_state,

@@ -33,6 +33,30 @@ def is_no_fix_group(group: VulnerabilityGroup) -> bool:
     return group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
 
 
+def is_transitive_group(group: VulnerabilityGroup) -> bool:
+    """Return whether an SCA group represents a transitive dependency."""
+    if group.parent_package_name:
+        return True
+    return any(localized.is_direct_dependency is False for localized in group.localized_issues)
+
+
+def group_parent_context(group: VulnerabilityGroup) -> tuple[str | None, str | None, str | None]:
+    """Return the direct parent name, version, and declaration type for a group."""
+    parent_name = group.parent_package_name
+    parent_version = group.parent_package_version
+    parent_type = group.parent_declaration_type
+    if parent_name:
+        return parent_name, parent_version, parent_type
+    for localized in group.localized_issues:
+        if localized.parent_package_name:
+            return (
+                localized.parent_package_name,
+                localized.parent_package_version,
+                localized.parent_declaration_type,
+            )
+    return None, None, None
+
+
 def _group_manifest_paths(group: VulnerabilityGroup) -> list[str]:
     """Return stable, deduplicated manifest paths declared by a group."""
     paths: list[str] = []
@@ -61,6 +85,16 @@ def _group_package_managers(group: VulnerabilityGroup) -> list[str]:
             seen.add(manager)
             managers.append(manager)
     return managers
+
+
+def _group_override_dependency_type(group: VulnerabilityGroup) -> str:
+    """Return the native override field for the group's package manager."""
+    managers = set(_group_package_managers(group))
+    if "yarn" in managers:
+        return "resolutions"
+    if "pnpm" in managers:
+        return "pnpm_overrides"
+    return "overrides"
 
 
 def build_no_fix_package_removal_instruction(group: VulnerabilityGroup) -> str:
@@ -230,19 +264,63 @@ def build_initial_remediation_task(
         if group.fix_plan is not None and group.fix_plan.instruction:
             instruction = group.fix_plan.instruction
 
+    transitive = is_transitive_group(group)
+    parent_name, parent_version, parent_type = group_parent_context(group)
+    has_parent_target = (
+        strategy == RoutingStrategy.VERSION_BUMP and transitive and bool(parent_name)
+    )
+    target_package_name = (
+        parent_name
+        if has_parent_target
+        else (
+            group.vulnerable_component
+            if transitive and strategy == RoutingStrategy.VERSION_BUMP
+            else None
+        )
+    )
+    target_dependency_type = (
+        parent_type
+        if has_parent_target
+        else (
+            _group_override_dependency_type(group)
+            if transitive and strategy == RoutingStrategy.VERSION_BUMP
+            else None
+        )
+    )
+    if has_parent_target:
+        child_version = group.fix_plan.fixed_version if group.fix_plan else None
+        declaration = parent_type or "dependencies"
+        instruction = (
+            f'Update directly declared parent "{parent_name}" in {declaration} '
+            f"to the minimum compatible released version that resolves transitive "
+            f'package "{group.vulnerable_component}" to at least '
+            f'"{child_version or "the OSV-fixed version"}". '
+            "Do not use a package override unless the parent update stages are exhausted."
+        )
+    initial_stage = (
+        SCARemediationStage.OSV_MINIMUM
+        if strategy == RoutingStrategy.VERSION_BUMP and has_parent_target
+        else SCARemediationStage.PACKAGE_OVERRIDE
+        if strategy == RoutingStrategy.VERSION_BUMP and transitive
+        else SCARemediationStage.CODE_WORKAROUND
+        if strategy == RoutingStrategy.CODE_WORKAROUND
+        else SCARemediationStage.OSV_MINIMUM
+    )
+
     return RemediationTask(
         task_id=task_id,
         parent_group_id=group.group_id,
         strategy=strategy,
-        strategy_stage=(
-            SCARemediationStage.OSV_MINIMUM
-            if strategy == RoutingStrategy.VERSION_BUMP
-            else SCARemediationStage.CODE_WORKAROUND
-        ),
+        strategy_stage=initial_stage,
+        target_package_name=target_package_name,
+        target_dependency_type=target_dependency_type,
+        parent_package_name=parent_name,
+        parent_package_version=parent_version,
+        parent_minimum_version=None,
         no_fix_stage=no_fix_stage,
         selected_version=(
             None
-            if no_fix_stage is not None
+            if no_fix_stage is not None or has_parent_target
             else (group.fix_plan.fixed_version if group.fix_plan is not None else None)
         ),
         instruction=instruction,

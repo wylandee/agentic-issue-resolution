@@ -71,11 +71,13 @@ from remediation_engine.orchestration.task_utils import (
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
+    group_parent_context,
     is_no_fix_group,
+    is_transitive_group,
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
-from remediation_engine.tools.registry_tools import plan_npm_version
+from remediation_engine.tools.registry_tools import plan_npm_parent_version, plan_npm_version
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +105,16 @@ _PLANNER_STAGE_ALIASES: dict[str, SCARemediationStage] = {
     "npm_same_major": SCARemediationStage.NPM_SAME_MAJOR,
     "latest": SCARemediationStage.NPM_LATEST,
     "npm_latest": SCARemediationStage.NPM_LATEST,
+    "package_override": SCARemediationStage.PACKAGE_OVERRIDE,
+    "override": SCARemediationStage.PACKAGE_OVERRIDE,
     "code_workaround": SCARemediationStage.CODE_WORKAROUND,
 }
 _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
     SCARemediationStage.NPM_LATEST: 2,
-    SCARemediationStage.CODE_WORKAROUND: 3,
+    SCARemediationStage.PACKAGE_OVERRIDE: 3,
+    SCARemediationStage.CODE_WORKAROUND: 4,
 }
 
 # ---------------------------------------------------------------------------
@@ -178,6 +183,10 @@ def _is_exhausted_update_pivot_candidate(
     diagnostics: UpdateRetryDiagnostics | None,
 ) -> bool:
     """Return True when a retry update task must pivot instead of retrying update."""
+    if task.parent_package_name and task.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
+        # A transitive task may only pivot after its explicit child-override
+        # stage has also failed.  Parent registry exhaustion is not terminal.
+        return False
     return (
         task.strategy == RoutingStrategy.VERSION_BUMP
         and task.status == TaskStatus.NEEDS_RETRY
@@ -191,12 +200,19 @@ def _is_exhausted_update_pivot_candidate(
     )
 
 
-def _next_sca_stage(stage: SCARemediationStage) -> SCARemediationStage:
+def _next_sca_stage(
+    stage: SCARemediationStage,
+    transitive: bool = False,
+) -> SCARemediationStage:
     """Advance one ordered SCA version strategy stage."""
     if stage == SCARemediationStage.OSV_MINIMUM:
         return SCARemediationStage.NPM_SAME_MAJOR
     if stage == SCARemediationStage.NPM_SAME_MAJOR:
         return SCARemediationStage.NPM_LATEST
+    if stage == SCARemediationStage.NPM_LATEST and transitive:
+        return SCARemediationStage.PACKAGE_OVERRIDE
+    if stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        return SCARemediationStage.CODE_WORKAROUND
     return SCARemediationStage.CODE_WORKAROUND
 
 
@@ -319,6 +335,9 @@ def _create_attempt_snapshot(
         strategy_stage=task.strategy_stage,
         no_fix_stage=task.no_fix_stage,
         selected_version=task.selected_version,
+        target_package_name=task.target_package_name,
+        target_dependency_type=task.target_dependency_type,
+        parent_minimum_version=task.parent_minimum_version,
         instruction=task.instruction,
         instruction_digest=_instruction_digest(task.instruction),
         dispatch_node=dispatch_node,  # type: ignore[arg-type]
@@ -466,6 +485,9 @@ _ATTEMPT_INPUT_FIELDS = frozenset(
         "instruction",
         "strategy",
         "no_fix_stage",
+        "target_package_name",
+        "target_dependency_type",
+        "parent_minimum_version",
     }
 )
 
@@ -573,6 +595,9 @@ def _validate_committed_state(
             and snapshot.strategy_stage == task.strategy_stage
             and snapshot.no_fix_stage == task.no_fix_stage
             and snapshot.selected_version == task.selected_version
+            and snapshot.target_package_name == task.target_package_name
+            and snapshot.target_dependency_type == task.target_dependency_type
+            and snapshot.parent_minimum_version == task.parent_minimum_version
             and snapshot.instruction == task.instruction
             and snapshot.instruction_digest == _instruction_digest(task.instruction)
             and (
@@ -597,6 +622,9 @@ def _validate_committed_state(
                 "strategy_stage": snapshot.strategy_stage,
                 "no_fix_stage": snapshot.no_fix_stage,
                 "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "target_dependency_type": snapshot.target_dependency_type,
+                "parent_minimum_version": snapshot.parent_minimum_version,
                 "instruction": snapshot.instruction,
             }
         )
@@ -946,10 +974,33 @@ def _parse_planner_retry_plans(
             effective_stage = SCARemediationStage.NPM_LATEST
 
         # A planner's free-form pivot language cannot bypass the ordered
-        # version stages. Only an exhausted NPM_LATEST task may pivot; earlier
-        # stages must remain retryable update tasks.
+        # version stages. Direct tasks pivot only after NPM_LATEST. A
+        # transitive task converts parent exhaustion into PACKAGE_OVERRIDE.
+        group = (group_by_id or {}).get(task.parent_group_id)
+        transitive = bool(group and is_transitive_group(group))
         if effective_stage != SCARemediationStage.NPM_LATEST:
             exhausted = bool(prior.package_abandoned)
+
+        if (
+            transitive
+            and effective_stage == SCARemediationStage.NPM_LATEST
+            and selected is None
+            and exhausted
+        ):
+            selected = group.fix_plan.fixed_version if group and group.fix_plan else None
+            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
+            exhausted = False
+
+        target_package = task.target_package_name
+        target_type = task.target_dependency_type
+        if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+            target_package = group.vulnerable_component if group else task.parent_group_id
+            target_type = _override_dependency_type(group)
+        elif not target_package:
+            target_package, _, parent_type = (
+                group_parent_context(group) if group is not None else (None, None, None)
+            )
+            target_type = target_type or parent_type
 
         action = (
             "pivot_workaround"
@@ -967,13 +1018,26 @@ def _parse_planner_retry_plans(
                 "latest_version_seen": latest_seen,
                 "registry_query_performed": True,
                 "exhausted_update_path": exhausted,
+                "target_package_name": target_package,
+                "target_dependency_type": target_type,
+                "parent_package_name": (
+                    group.parent_package_name if group is not None else task.parent_package_name
+                ),
+                "parent_minimum_version": task.parent_minimum_version,
             }
         )
         updated[task_id] = diagnostics
         group = (group_by_id or {}).get(task.parent_group_id)
         if action == "retry_update":
             instruction = _build_high_level_retry_instruction(
-                task.model_copy(update={"strategy_stage": effective_stage}),
+                task.model_copy(
+                    update={
+                        "strategy_stage": effective_stage,
+                        "target_package_name": target_package,
+                        "target_dependency_type": target_type,
+                        "selected_version": selected,
+                    }
+                ),
                 group,
                 None,
                 diagnostics,
@@ -994,6 +1058,9 @@ def _parse_planner_retry_plans(
             latest_version_seen=latest_seen,
             exhausted_update_path=exhausted,
             package_abandoned=prior.package_abandoned,
+            target_package_name=target_package,
+            target_dependency_type=target_type,
+            parent_minimum_version=task.parent_minimum_version,
             action=action,
             exact_instruction=instruction,
         )
@@ -1108,17 +1175,33 @@ def _reconcile_registry_plan_evidence(
     for task_id, plan in plans.items():
         task = task_queue.get(task_id)
         group = group_by_id.get(task.parent_group_id) if task else None
-        package_name = group.vulnerable_component if group else None
+        transitive = bool(group and is_transitive_group(group))
+        parent_name, _, _ = group_parent_context(group) if group is not None else (None, None, None)
+        package_name = (
+            parent_name
+            if transitive
+            and parent_name
+            and plan.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE
+            else (task.target_package_name if task else None)
+            or (group.vulnerable_component if group else None)
+        )
         if not package_name:
             reconciled[task_id] = plan
             continue
 
+        expected_tool = "plan_npm_parent_version" if transitive else "plan_npm_version"
         matching_events = [
             event
             for event in tool_events
-            if event.name == "plan_npm_version"
-            and str(event.args.get("package_name", "")).strip() == package_name
-            and event.content.startswith("# NPM Version Plan:")
+            if event.name == expected_tool
+            and (
+                str(event.args.get("parent_package_name", "")).strip() == package_name
+                if transitive
+                else str(event.args.get("package_name", "")).strip() == package_name
+            )
+            and event.content.startswith(
+                "# NPM Parent Version Plan:" if transitive else "# NPM Version Plan:"
+            )
         ]
         if not matching_events:
             reconciled[task_id] = plan
@@ -1134,17 +1217,27 @@ def _reconcile_registry_plan_evidence(
             for event in matching_events
             if str(event.args.get("selection", "")).strip().lower() == "latest"
         ]
+        minimum_events = [
+            event
+            for event in matching_events
+            if str(event.args.get("selection", "")).strip().lower() == "minimum"
+        ]
         selected_event = (
             latest_events[-1]
             if plan.strategy_stage == SCARemediationStage.NPM_LATEST and latest_events
+            else minimum_events[-1]
+            if plan.strategy_stage == SCARemediationStage.OSV_MINIMUM and minimum_events
             else same_major_events[-1]
             if same_major_events
             else matching_events[-1]
         )
         if (
             selected_event in same_major_events
-            and "same-major stage: skipped" in selected_event.content.lower()
             and latest_events
+            and (
+                "same-major stage: skipped" in selected_event.content.lower()
+                or _registry_selected_version(selected_event.content) is None
+            )
         ):
             selected_event = latest_events[-1]
 
@@ -1153,7 +1246,9 @@ def _reconcile_registry_plan_evidence(
             r"^-\s*Selected Version:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE
         )
         latest_match = re.search(
-            r"^-\s*Latest Stable:\s*(\S+)", content, re.IGNORECASE | re.MULTILINE
+            r"^-\s*(?:Latest Stable|Latest Compatible):\s*(\S+)",
+            content,
+            re.IGNORECASE | re.MULTILINE,
         )
         eligible_match = re.search(
             r"^-\s*Eligible Candidates:\s*(.*)$", content, re.IGNORECASE | re.MULTILINE
@@ -1184,7 +1279,14 @@ def _reconcile_registry_plan_evidence(
             candidates.append(latest_seen)
 
         effective_stage = plan.strategy_stage
-        if (
+        selected_selection = str(selected_event.args.get("selection", "")).strip().lower()
+        if selected_selection == "minimum":
+            effective_stage = SCARemediationStage.OSV_MINIMUM
+        elif selected_selection == "same_major":
+            effective_stage = SCARemediationStage.NPM_SAME_MAJOR
+        elif selected_selection == "latest":
+            effective_stage = SCARemediationStage.NPM_LATEST
+        if selected_selection != "minimum" and (
             selected_event in latest_events
             or "same-major stage: skipped" in content.lower()
             or (
@@ -1206,6 +1308,17 @@ def _reconcile_registry_plan_evidence(
             and selected is None
             and not unattempted
         )
+        target_package = task.target_package_name if task else package_name
+        target_type = task.target_dependency_type if task else None
+        if transitive and effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+            target_package = group.vulnerable_component if group else package_name
+            target_type = _override_dependency_type(group)
+        if transitive and effective_stage == SCARemediationStage.NPM_LATEST and exhausted:
+            selected = group.fix_plan.fixed_version if group and group.fix_plan else None
+            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
+            target_package = group.vulnerable_component if group else package_name
+            target_type = _override_dependency_type(group)
+            exhausted = False
         action = "pivot_workaround" if exhausted else "retry_update"
         diagnostics = prior.model_copy(
             update={
@@ -1215,12 +1328,22 @@ def _reconcile_registry_plan_evidence(
                 "latest_version_seen": latest_seen,
                 "registry_query_performed": True,
                 "exhausted_update_path": exhausted,
+                "target_package_name": target_package,
+                "target_dependency_type": target_type,
+                "parent_package_name": parent_name if transitive else prior.parent_package_name,
             }
         )
         updated[task_id] = diagnostics
         if action == "retry_update":
             instruction = _build_high_level_retry_instruction(
-                task.model_copy(update={"strategy_stage": effective_stage}),
+                task.model_copy(
+                    update={
+                        "strategy_stage": effective_stage,
+                        "target_package_name": target_package,
+                        "target_dependency_type": target_type,
+                        "selected_version": selected,
+                    }
+                ),
                 group,
                 None,
                 diagnostics,
@@ -1240,6 +1363,8 @@ def _reconcile_registry_plan_evidence(
                 "exhausted_update_path": exhausted,
                 "action": action,
                 "exact_instruction": instruction,
+                "target_package_name": target_package,
+                "target_dependency_type": target_type,
             }
         )
     return updated, reconciled
@@ -1308,6 +1433,11 @@ def _repair_invalid_planner_plans(
                 effective_stage = SCARemediationStage.NPM_LATEST
             if diagnostics is None:
                 diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+            group = group_by_id.get(task_queue[task_id].parent_group_id)
+            target_package = task_queue[task_id].target_package_name or (
+                group_parent_context(group)[0] if group is not None else None
+            )
+            target_type = task_queue[task_id].target_dependency_type
             diagnostics = diagnostics.model_copy(
                 update={
                     "strategy_stage": effective_stage,
@@ -1317,10 +1447,11 @@ def _repair_invalid_planner_plans(
                     ),
                     "registry_query_performed": True,
                     "exhausted_update_path": False,
+                    "target_package_name": target_package,
+                    "target_dependency_type": target_type,
                 }
             )
             repaired_diagnostics[task_id] = diagnostics
-            group = group_by_id.get(task_queue[task_id].parent_group_id)
             instruction = _build_high_level_retry_instruction(
                 task_queue[task_id].model_copy(update={"strategy_stage": effective_stage}),
                 group,
@@ -1335,13 +1466,60 @@ def _repair_invalid_planner_plans(
                     "action": "retry_update",
                     "exact_instruction": instruction,
                     "exhausted_update_path": False,
+                    "target_package_name": target_package,
+                    "target_dependency_type": target_type,
                 }
             )
             continue
 
-        # No unattempted candidate can be proven.  Clear stale selection and
-        # pivot at the terminal update stage so no guessed/old version is sent
-        # to the dumb update worker.
+        group = group_by_id.get(task_queue[task_id].parent_group_id)
+        if group is not None and is_transitive_group(group) and group.fix_plan:
+            # Parent registry exhaustion is the deterministic handoff to the
+            # native child override stage, not yet a code-workaround pivot.
+            child_version = group.fix_plan.fixed_version
+            target_type = _override_dependency_type(group)
+            if diagnostics is None:
+                diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+            diagnostics = diagnostics.model_copy(
+                update={
+                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                    "selected_version": child_version,
+                    "target_package_name": group.vulnerable_component,
+                    "target_dependency_type": target_type,
+                    "exhausted_update_path": False,
+                }
+            )
+            repaired_diagnostics[task_id] = diagnostics
+            override_task = task_queue[task_id].model_copy(
+                update={
+                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                    "selected_version": child_version,
+                    "target_package_name": group.vulnerable_component,
+                    "target_dependency_type": target_type,
+                }
+            )
+            instruction = _build_high_level_retry_instruction(
+                override_task,
+                group,
+                None,
+                diagnostics,
+            )
+            repaired_plans[task_id] = plan.model_copy(
+                update={
+                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                    "selected_version": child_version,
+                    "exhausted_update_path": False,
+                    "action": "retry_update",
+                    "exact_instruction": instruction,
+                    "target_package_name": group.vulnerable_component,
+                    "target_dependency_type": target_type,
+                }
+            )
+            continue
+
+        # No direct unattempted candidate can be proven. Clear stale selection
+        # and pivot at the terminal update stage so no guessed/old version is
+        # sent to the dumb update worker.
         effective_stage = SCARemediationStage.NPM_LATEST
         if diagnostics is None:
             diagnostics = UpdateRetryDiagnostics(task_id=task_id)
@@ -1350,6 +1528,8 @@ def _repair_invalid_planner_plans(
                 "strategy_stage": effective_stage,
                 "selected_version": None,
                 "exhausted_update_path": True,
+                "target_package_name": task_queue[task_id].target_package_name,
+                "target_dependency_type": task_queue[task_id].target_dependency_type,
             }
         )
         repaired_diagnostics[task_id] = diagnostics
@@ -1366,6 +1546,8 @@ def _repair_invalid_planner_plans(
                 "exhausted_update_path": True,
                 "action": "pivot_workaround",
                 "exact_instruction": instruction,
+                "target_package_name": task_queue[task_id].target_package_name,
+                "target_dependency_type": task_queue[task_id].target_dependency_type,
             }
         )
     return repaired_diagnostics, repaired_plans
@@ -1653,22 +1835,52 @@ def _build_high_level_retry_instruction(
 ) -> str:
     """Synthesize a high-level retry instruction for the update worker."""
     component = group.vulnerable_component if group else task.parent_group_id
+    parent_name, _, parent_type = (
+        group_parent_context(group) if group is not None else (None, None, None)
+    )
+    target = task.target_package_name
+    if not target and task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        target = parent_name
+    target = target or component
+    dependency_type = task.target_dependency_type or parent_type
+    if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        dependency_type = dependency_type or "overrides"
     category = evaluation.failure_category if evaluation else None
     if diagnostics and diagnostics.selected_version:
         manifest = group.file_paths[0] if group and group.file_paths else "package.json"
-        dependency_action = "dependency version"
-        if diagnostics.used_overrides:
-            dependency_action = "npm override"
+        is_override = (
+            task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+            or diagnostics.used_overrides
+            or dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
+        )
+        dependency_action = (
+            f"package-manager override for {component}"
+            if is_override
+            else f"{target} dependency version"
+        )
+        target_clause = (
+            f"edit only the {target} declaration" if target != component else f"update {target}"
+        )
+        if dependency_type:
+            target_clause += f" in {dependency_type}"
         return (
-            f"Apply the supervisor-selected {dependency_action} for {component} "
+            f"Apply the supervisor-selected {dependency_action} for {component}; "
             f"during strategy stage {task.strategy_stage.value}: "
-            f"update {manifest} to exact version {diagnostics.selected_version}; "
+            f"{target_clause} in {manifest} to exact version {diagnostics.selected_version}; "
+            "do not edit any other dependency target; "
             "after all requested manifest edits, run the single final manifest synchronization validation."
         )
     if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
         floor = group.fix_plan.fixed_version
         if floor:
             manifest = group.file_paths[0] if group.file_paths else "package.json"
+            if parent_name and target == parent_name:
+                return (
+                    f"Apply strategy stage {task.strategy_stage.value} for transitive package {component}: "
+                    f"update only directly declared parent {parent_name} in {manifest} to the "
+                    "supervisor-selected compatible parent version; do not use a child override; "
+                    "after all requested manifest edits, run the single final manifest synchronization validation."
+                )
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update {manifest} to exact OSV minimum fixed version {floor}; "
@@ -1693,7 +1905,7 @@ def _build_high_level_retry_instruction(
             manifest = group.file_paths[0] if group and group.file_paths else "package.json"
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
-                f"update {manifest} to exact version {candidate}; "
+                f"update only {target} in {manifest} to exact version {candidate}; "
                 "after all requested manifest edits, run the single final manifest synchronization validation."
             )
     if diagnostics and diagnostics.package_abandoned:
@@ -1720,6 +1932,151 @@ def _build_high_level_retry_instruction(
     return (
         f"Investigate remaining safe manifest remediation paths for {component}. "
         "Use registry evidence and prior validation failures to choose the next bounded retry."
+    )
+
+
+def _registry_selected_version(report: str) -> str | None:
+    """Extract a planner-selected stable version from a registry report."""
+    match = re.search(
+        r"^-\s*Selected Version:\s*(\S+)",
+        report or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if not match or match.group(1).upper() == "NONE":
+        return None
+    return match.group(1).strip().lstrip("vV")
+
+
+def _override_dependency_type(group: VulnerabilityGroup | None) -> str:
+    """Return the package-manager-native override field for an SCA group."""
+    managers = {
+        (issue.package_manager or "").strip().lower()
+        for issue in (group.localized_issues if group else [])
+    }
+    if "yarn" in managers:
+        return "resolutions"
+    if "pnpm" in managers:
+        return "pnpm_overrides"
+    return "overrides"
+
+
+def _plan_initial_transitive_task(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+) -> RemediationTask:
+    """Select the first parent-first candidate before worker dispatch.
+
+    The worker receives only the committed result of this function. Registry
+    failures or an empty candidate set advance deterministically to the next
+    parent stage, and only a fully exhausted parent path commits a child
+    package-manager override.
+    """
+    if (
+        task.strategy != RoutingStrategy.VERSION_BUMP
+        or task.status != TaskStatus.PENDING
+        or task.parent_package_name is None
+        or task.strategy_stage != SCARemediationStage.OSV_MINIMUM
+    ):
+        return task
+    child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
+    installed_parent_version = task.parent_package_version
+    parent_name, _, parent_type = group_parent_context(group)
+    if not child_fixed_version or not installed_parent_version or not parent_name:
+        stage = SCARemediationStage.PACKAGE_OVERRIDE
+        target_type = _override_dependency_type(group)
+        override_task = task.model_copy(
+            update={
+                "strategy_stage": stage,
+                "target_package_name": group.vulnerable_component,
+                "target_dependency_type": target_type,
+                "selected_version": child_fixed_version,
+                "instruction": (
+                    f"Apply package-manager override stage for {group.vulnerable_component}: "
+                    f"pin the vulnerable child to exact version {child_fixed_version or 'the OSV-fixed version'} "
+                    f"using {target_type}; do not edit the parent declaration."
+                ),
+            }
+        )
+        return override_task
+
+    attempted: set[str] = set()
+    for selection, stage in (
+        ("minimum", SCARemediationStage.OSV_MINIMUM),
+        ("same_major", SCARemediationStage.NPM_SAME_MAJOR),
+        ("latest", SCARemediationStage.NPM_LATEST),
+    ):
+        try:
+            report = plan_npm_parent_version.invoke(
+                {
+                    "parent_package_name": parent_name,
+                    "child_package_name": group.vulnerable_component,
+                    "child_fixed_version": child_fixed_version,
+                    "installed_parent_version": installed_parent_version,
+                    "selection": selection,
+                    "attempted_versions": ",".join(sorted(attempted)),
+                    "dependency_ancestry": ",".join(group.dependency_ancestry),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "supervisor: initial parent registry planning failed for %s (%s)",
+                parent_name,
+                exc,
+            )
+            report = ""
+        selected = _registry_selected_version(report)
+        if not selected:
+            continue
+        attempted.add(selected)
+        target_task = task.model_copy(
+            update={
+                "strategy_stage": stage,
+                "target_package_name": parent_name,
+                "target_dependency_type": task.target_dependency_type or parent_type,
+                "selected_version": selected,
+                "parent_minimum_version": (
+                    selected
+                    if stage == SCARemediationStage.OSV_MINIMUM
+                    else task.parent_minimum_version
+                ),
+            }
+        )
+        diagnostics = UpdateRetryDiagnostics(
+            task_id=task.task_id,
+            strategy_stage=stage,
+            security_floor=child_fixed_version,
+            selected_version=selected,
+            target_package_name=parent_name,
+            target_dependency_type=target_task.target_dependency_type,
+            parent_package_name=parent_name,
+            parent_minimum_version=target_task.parent_minimum_version,
+            registry_query_performed=True,
+            candidate_versions_considered=[selected],
+        )
+        return target_task.model_copy(
+            update={
+                "instruction": _build_high_level_retry_instruction(
+                    target_task,
+                    group,
+                    None,
+                    diagnostics,
+                )
+            }
+        )
+
+    target_type = _override_dependency_type(group)
+    return task.model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "target_package_name": group.vulnerable_component,
+            "target_dependency_type": target_type,
+            "selected_version": child_fixed_version,
+            "instruction": (
+                f"Apply package-manager override stage for {group.vulnerable_component}: "
+                f"pin the vulnerable child to exact version {child_fixed_version} using {target_type}; "
+                "do not edit the parent declaration."
+            ),
+        }
     )
 
 
@@ -2153,7 +2510,28 @@ def _needs_planner(
     version_bump_retries = [
         t
         for t in task_queue.values()
-        if t.status == TaskStatus.NEEDS_RETRY and t.strategy == RoutingStrategy.VERSION_BUMP
+        if (
+            t.status == TaskStatus.NEEDS_RETRY
+            and t.strategy == RoutingStrategy.VERSION_BUMP
+            and (
+                t.strategy_stage
+                in {
+                    SCARemediationStage.OSV_MINIMUM,
+                    SCARemediationStage.NPM_SAME_MAJOR,
+                    SCARemediationStage.NPM_LATEST,
+                }
+                or (
+                    t.strategy_stage == SCARemediationStage.CODE_WORKAROUND
+                    and not t.parent_package_name
+                    and t.target_dependency_type
+                    not in {
+                        "overrides",
+                        "resolutions",
+                        "pnpm_overrides",
+                    }
+                )
+            )
+        )
     ]
     if not version_bump_retries:
         return False
@@ -2175,10 +2553,11 @@ def _build_planner_prompt(
     lines = [
         "You are the Planner phase of an AppSec remediation Supervisor.",
         "You own exact version planning for retry tasks.",
-        "The ordered strategy is OSV minimum, highest stable same-major release, highest stable released version, then code workaround.",
+        "For direct dependencies the ordered strategy is OSV minimum, highest stable same-major release, highest stable released version, then code workaround.",
+        "For transitive dependencies, plan the nearest directly declared parent first: parent OSV-compatible minimum, parent same-major latest, parent latest compatible stable, then package-manager override, then code workaround.",
         "The Update Subagent is a dumb worker and must receive an exact version instruction from you.",
         "",
-        "Call plan_npm_version for NPM retry stages. Never delegate registry lookup or version choice to the worker.",
+        "Call plan_npm_version for direct NPM retry stages. For transitive parent stages call plan_npm_parent_version with the parent, child, complete dependency ancestry, child OSV-fixed version, installed parent version, and selection. Never delegate registry lookup or version choice to the worker.",
         "Respect the OSV security floor and exclude already attempted versions, even when an attempted version is the security floor.",
         "",
         "## Actionable Retry Tasks",
@@ -2200,6 +2579,9 @@ def _build_planner_prompt(
         cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
         ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
         component = group.vulnerable_component if group else task.parent_group_id
+        parent_name, parent_version, _ = (
+            group_parent_context(group) if group is not None else (None, None, None)
+        )
         eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
 
@@ -2207,6 +2589,10 @@ def _build_planner_prompt(
             "",
             f"### Task: {task.task_id}",
             f"- Component     : {component}",
+            f"- Edit Target   : {task.target_package_name or component}",
+            f"- Parent Target : {parent_name or 'none'}",
+            f"- Installed Parent: {parent_version or task.parent_package_version or 'unknown'}",
+            f"- Dependency Ancestry: {' -> '.join(group.dependency_ancestry) if group and group.dependency_ancestry else 'unknown'}",
             f"- CVEs          : {cves}",
             f"- GHSAs         : {ghsas}",
             f"- Strategy      : {task.strategy.value}",
@@ -2291,9 +2677,9 @@ def _build_planner_prompt(
         "",
         "## Planner Playbooks",
         "- SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance exactly one ordered version stage (VERSION_BUMP tasks only; CODE_WORKAROUND tasks simply retry).",
-        "- package_abandoned=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
-        "- exhausted_update_path=True: pivot from VERSION_BUMP to a CODE_WORKAROUND child task.",
-        "- VERSION_BUMP + NEEDS_RETRY + exhausted_update_path=True must not be routed back to update_subagent.",
+        "- package_abandoned=True: direct tasks pivot from VERSION_BUMP to a CODE_WORKAROUND child task; transitive tasks first enter PACKAGE_OVERRIDE.",
+        "- exhausted_update_path=True: direct tasks pivot from VERSION_BUMP to a CODE_WORKAROUND child task; transitive parent exhaustion first enters PACKAGE_OVERRIDE.",
+        "- VERSION_BUMP + NEEDS_RETRY + exhausted_update_path=True must not be routed back to update_subagent unless the committed stage is PACKAGE_OVERRIDE.",
         "- A strategy pivot must be expressed as a child-task recommendation, not as an in-place worker retry.",
         "",
         "## Queue Caps",
@@ -2319,8 +2705,8 @@ def _build_planner_prompt(
             "## Previous Planner Output Rejected",
             "The following deterministic planner invariants were violated:",
             *[f"- {violation}" for violation in correction.splitlines() if violation.strip()],
-            "Correct only the affected task sections. Re-call plan_npm_version with the complete attempted-version list.",
-            "Never select an attempted version. A retry_update must contain one unattempted exact version. A latest-stage task with no unattempted candidate must use ACTION: pivot_workaround.",
+            "Correct only the affected task sections. Re-call the appropriate registry planner with the complete attempted-version list.",
+            "Never select an attempted version. A retry_update must contain one unattempted exact version. A latest-stage direct task with no unattempted candidate must use ACTION: pivot_workaround; a transitive task must use PACKAGE_OVERRIDE first.",
         ]
 
     return "\n".join(lines)
@@ -2347,13 +2733,14 @@ def _run_planner_phase(
         constraints_ledger,
         correction=correction,
     )
-    tools = [plan_npm_version]
+    tools = [plan_npm_version, plan_npm_parent_version]
     initial_messages = [
         SystemMessage(content=planner_prompt),
         HumanMessage(
             content=(
-                "Plan every retry task. For NPM stages call plan_npm_version with the package, "
-                "OSV security floor, stage selection, and attempted versions. Emit TASK and "
+                "Plan every retry task. For direct NPM stages call plan_npm_version; for transitive "
+                "parent stages call plan_npm_parent_version. Include the package/parent, complete dependency "
+                "ancestry, child OSV-fixed version or security floor, stage selection, and attempted versions. Emit TASK and "
                 "SELECTED_VERSION lines before the Strategy Scratchpad."
                 + (" Apply the previous-output correction rules exactly." if correction else "")
             )
@@ -2451,6 +2838,10 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
             f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
             f"- Strategy      : {task.strategy.value}",
             f"- Strategy Stage: {task.strategy_stage.value}",
+            f"- Edit Target   : {task.target_package_name or (group.vulnerable_component if group else 'unknown')}",
+            f"- Target Type   : {task.target_dependency_type or 'package dependency'}",
+            f"- Parent Target : {task.parent_package_name or 'none'}",
+            f"- Parent Minimum: {task.parent_minimum_version or 'none'}",
             f"- NO_FIX Stage  : {task.no_fix_stage.value if task.no_fix_stage else 'none'}",
             f"- Task Revision : {task.task_revision}",
             f"- Current Attempt: {task.current_attempt_id or 'none'}",
@@ -2539,8 +2930,10 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "7. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
         "8. SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance VERSION_BUMP tasks by exactly one version stage.",
         "SECURITY_FLAG and PEER_CONFLICT remain update remediation first; BREAKING_CHANGE also advances through the ordered update stages.",
+        "8b. For transitive VERSION_BUMP tasks, update the committed parent target through OSV_MINIMUM, NPM_SAME_MAJOR, and NPM_LATEST before PACKAGE_OVERRIDE; never target the vulnerable child during parent stages.",
+        "8c. PACKAGE_OVERRIDE may target only the vulnerable child through overrides, resolutions, or pnpm overrides. Prose mentioning transitive dependencies does not change the committed target.",
         "8a. CODE_WORKAROUND tasks that fail QA are retried; they do not advance version stages. You MUST copy the task's Last QA feedback into feedback_by_task for the retry.",
-        "9. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task.",
+        "9. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task; transitive tasks use PACKAGE_OVERRIDE before that pivot.",
         "10. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
         "11. After a worker succeeds for the current active batch, route that batch to qa_critic.",
         "12. When no actionable non-terminal tasks remain, route to teardown.",
@@ -2820,13 +3213,44 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and task.status == TaskStatus.PENDING
             and task.selected_version is None
             and task.strategy == RoutingStrategy.VERSION_BUMP
+            and not task.parent_package_name
             and group is not None
             and group.fix_plan is not None
             and group.fix_plan.fixed_version
         ):
             task_updates["selected_version"] = group.fix_plan.fixed_version
+        if (
+            task.task_revision == 0
+            and task.current_attempt_id is None
+            and group is not None
+            and is_transitive_group(group)
+        ):
+            parent_name, parent_version, parent_type = group_parent_context(group)
+            if parent_name and task.parent_package_name != parent_name:
+                task_updates["parent_package_name"] = parent_name
+            if parent_version and task.parent_package_version != parent_version:
+                task_updates["parent_package_version"] = parent_version
+            if parent_name and task.target_package_name is None:
+                task_updates["target_package_name"] = parent_name
+                task_updates["target_dependency_type"] = task.target_dependency_type or parent_type
         if task_updates:
             task_queue[task_id] = task.model_copy(update=task_updates)
+
+    # A transitive VERSION_BUMP task is planned against its nearest directly
+    # declared parent before the first update worker is dispatched. This keeps
+    # child pins/overrides out of the initial instruction.
+    for task_id, task in list(task_queue.items()):
+        group = group_by_id.get(task.parent_group_id)
+        if (
+            group is not None
+            and is_transitive_group(group)
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.status == TaskStatus.PENDING
+            and task.current_attempt_id is None
+            and task.parent_package_name
+            and task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+        ):
+            task_queue[task_id] = _plan_initial_transitive_task(task, group)
 
     # ------------------------------------------------------------------
     # 2. Ingest attempt-tagged worker results (active targets only)
@@ -3050,15 +3474,58 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # supervisor pass. Detach the consumed attempt first so the
                 # planner cannot observe a new stage paired with an old
                 # immutable snapshot.
+                failed_group = group_by_id.get(task.parent_group_id)
+                transitive_failure = bool(failed_group and is_transitive_group(failed_group))
+                next_failure_stage = (
+                    _next_sca_stage(task.strategy_stage, transitive=True)
+                    if transitive_failure
+                    else task.strategy_stage
+                )
+                failure_updates: dict[str, Any] = {
+                    "status": TaskStatus.NEEDS_RETRY,
+                    "retry_count": task.retry_count + 1,
+                }
+                if transitive_failure and next_failure_stage != task.strategy_stage:
+                    failure_updates["strategy_stage"] = next_failure_stage
+                    if next_failure_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+                        failure_updates.update(
+                            {
+                                "target_package_name": failed_group.vulnerable_component,
+                                "target_dependency_type": _override_dependency_type(failed_group),
+                                "selected_version": (
+                                    failed_group.fix_plan.fixed_version
+                                    if failed_group.fix_plan
+                                    else None
+                                ),
+                            }
+                        )
+                    elif next_failure_stage == SCARemediationStage.CODE_WORKAROUND:
+                        failure_updates.update(
+                            {
+                                "selected_version": None,
+                                "exhausted_update_path": True,
+                            }
+                        )
                 _commit_task_transition(
                     task_queue,
                     task_id,
-                    updates={
-                        "status": TaskStatus.NEEDS_RETRY,
-                        "retry_count": task.retry_count + 1,
-                    },
+                    updates=failure_updates,
                     close_attempt=True,
+                    clear_selected_version=(
+                        next_failure_stage == SCARemediationStage.CODE_WORKAROUND
+                    ),
                 )
+                if transitive_failure:
+                    committed_failure_task = task_queue[task_id]
+                    retry_diagnostics_by_task[task_id] = prior.model_copy(
+                        update={
+                            "strategy_stage": committed_failure_task.strategy_stage,
+                            "selected_version": committed_failure_task.selected_version,
+                            "target_package_name": committed_failure_task.target_package_name,
+                            "target_dependency_type": committed_failure_task.target_dependency_type,
+                            "exhausted_update_path": committed_failure_task.exhausted_update_path,
+                        }
+                    )
             processed_worker_attempt_ids.add(current_attempt_id)
             new_worker_attempt_ids.append(current_attempt_id)
             continue
@@ -3267,13 +3734,31 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             workaround_replay_plans_by_task[resolved_t_id] = reset_plan
                     continue
 
-                next_stage = _next_sca_stage(task.strategy_stage)
+                group = group_by_id.get(task.parent_group_id)
+                next_stage = _next_sca_stage(
+                    task.strategy_stage,
+                    transitive=bool(group and is_transitive_group(group)),
+                )
                 task_updates = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
                 if task.strategy == RoutingStrategy.VERSION_BUMP:
                     task_updates["strategy_stage"] = next_stage
+                    if next_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+                        task_updates.update(
+                            {
+                                "target_package_name": (
+                                    group.vulnerable_component if group else task.parent_group_id
+                                ),
+                                "target_dependency_type": _override_dependency_type(group),
+                                "selected_version": (
+                                    group.fix_plan.fixed_version
+                                    if group and group.fix_plan
+                                    else task.selected_version
+                                ),
+                            }
+                        )
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
@@ -3282,7 +3767,19 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task = task_queue[resolved_t_id]
                 if task.strategy == RoutingStrategy.VERSION_BUMP:
                     prior_diag = retry_diagnostics_by_task.get(resolved_t_id)
-                    group = group_by_id.get(task.parent_group_id)
+                    parent_name, _, parent_type = (
+                        group_parent_context(group) if group is not None else (None, None, None)
+                    )
+                    next_target = (
+                        group.vulnerable_component
+                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
+                        else task.target_package_name or parent_name
+                    )
+                    next_target_type = (
+                        _override_dependency_type(group)
+                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
+                        else task.target_dependency_type or parent_type
+                    )
                     if prior_diag is None:
                         retry_diagnostics_by_task[resolved_t_id] = UpdateRetryDiagnostics(
                             task_id=resolved_t_id,
@@ -3293,6 +3790,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             exhausted_update_path=(
                                 next_stage == SCARemediationStage.CODE_WORKAROUND
                             ),
+                            target_package_name=next_target,
+                            target_dependency_type=next_target_type,
+                            parent_package_name=parent_name,
+                            parent_minimum_version=task.parent_minimum_version,
+                            selected_version=task.selected_version,
                         )
                     else:
                         retry_diagnostics_by_task[resolved_t_id] = prior_diag.model_copy(
@@ -3306,6 +3808,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                 ),
                                 "exhausted_update_path": next_stage
                                 == SCARemediationStage.CODE_WORKAROUND,
+                                "target_package_name": next_target,
+                                "target_dependency_type": next_target_type,
+                                "parent_package_name": parent_name,
+                                "parent_minimum_version": task.parent_minimum_version,
+                                "selected_version": task.selected_version,
                             }
                         )
 
@@ -3530,6 +4037,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                 "instruction": plan.exact_instruction,
                                 "selected_version": plan.selected_version,
                                 "exhausted_update_path": plan.exhausted_update_path,
+                                "target_package_name": plan.target_package_name
+                                or task_queue[task_id].target_package_name,
+                                "target_dependency_type": plan.target_dependency_type
+                                or task_queue[task_id].target_dependency_type,
+                                "parent_minimum_version": plan.parent_minimum_version
+                                or task_queue[task_id].parent_minimum_version,
                             },
                             # A planner result supersedes any previous worker
                             # input. Closing here makes the planner commit
@@ -3547,6 +4060,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                     "strategy_stage": committed_task.strategy_stage,
                                     "selected_version": committed_task.selected_version,
                                     "exhausted_update_path": committed_task.exhausted_update_path,
+                                    "target_package_name": committed_task.target_package_name,
+                                    "target_dependency_type": committed_task.target_dependency_type,
+                                    "parent_minimum_version": committed_task.parent_minimum_version,
                                     "instruction_digest": _instruction_digest(
                                         committed_task.instruction
                                     ),
@@ -3587,6 +4103,63 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     for task_id in affected_ids:
                         task = task_queue[task_id]
                         group = group_by_id.get(task.parent_group_id)
+                        if (
+                            group is not None
+                            and is_transitive_group(group)
+                            and group.fix_plan is not None
+                            and group.fix_plan.fixed_version
+                        ):
+                            child_version = group.fix_plan.fixed_version
+                            target_type = _override_dependency_type(group)
+                            override_instruction = (
+                                f"Apply package-manager override stage for {group.vulnerable_component}: "
+                                f"pin the vulnerable child to exact version {child_version} "
+                                f"using {target_type}; do not edit the parent declaration."
+                            )
+                            committed_task = _commit_task_transition(
+                                task_queue,
+                                task_id,
+                                updates={
+                                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                                    "target_package_name": group.vulnerable_component,
+                                    "target_dependency_type": target_type,
+                                    "selected_version": child_version,
+                                    "exhausted_update_path": False,
+                                    "instruction": override_instruction,
+                                },
+                                close_attempt=True,
+                            )
+                            retry_diagnostics_by_task[task_id] = UpdateRetryDiagnostics(
+                                task_id=task_id,
+                                committed_attempt_id=(
+                                    committed_task.current_attempt_id
+                                    if committed_task is not None
+                                    else None
+                                ),
+                                strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+                                security_floor=child_version,
+                                selected_version=child_version,
+                                target_package_name=group.vulnerable_component,
+                                target_dependency_type=target_type,
+                                parent_package_name=group.parent_package_name,
+                                exhausted_update_path=False,
+                            )
+                            retry_plans_by_task[task_id] = SupervisorRetryPlan(
+                                task_id=task_id,
+                                source_task_revision=(
+                                    committed_task.task_revision
+                                    if committed_task is not None
+                                    else task.task_revision
+                                ),
+                                strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+                                selected_version=child_version,
+                                exhausted_update_path=False,
+                                target_package_name=group.vulnerable_component,
+                                target_dependency_type=target_type,
+                                action="retry_update",
+                                exact_instruction=override_instruction,
+                            )
+                            continue
                         component = group.vulnerable_component if group else task.parent_group_id
                         pivot_instruction = (
                             f"Implement a code workaround or isolation strategy for {component} "

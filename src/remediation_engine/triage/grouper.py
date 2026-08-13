@@ -93,6 +93,12 @@ def _sca_key(localized_issue: LocalizedIssue, fix_plan: FixPlan) -> str:
     component = _component_from_issue(issue)
     file_part = localized_issue.manifest_file or issue.file_path or ""
     strategy_part = _fix_strategy_bucket(fix_plan)
+    if localized_issue.parent_package_name:
+        parent_type = localized_issue.parent_declaration_type or "unknown"
+        return (
+            f"sca:{file_part}:{component}:parent={localized_issue.parent_package_name}"
+            f":type={parent_type}:{strategy_part}"
+        )
     return f"sca:{file_part}:{component}:{strategy_part}"
 
 
@@ -100,10 +106,7 @@ def _sast_key(issue: VulnerabilityIssue) -> str:
     """Return the normalised grouping key for a SAST issue."""
     file_part = issue.file_path or ""
     rule_part = issue.rule_id or "unknown_rule"
-    if issue.line_range:
-        line_part = f"{issue.line_range.start}-{issue.line_range.end}"
-    else:
-        line_part = "0-0"
+    line_part = f"{issue.line_range.start}-{issue.line_range.end}" if issue.line_range else "0-0"
     return f"sast:{file_part}:{rule_part}:{line_part}"
 
 
@@ -306,6 +309,7 @@ def _group_sca(
             if group_file_paths
             else (localized_members[0].manifest_file or rep.file_path)
         )
+        exemplar_localized = localized_members[0] if localized_members else None
 
         groups[key] = VulnerabilityGroup(
             group_id=key,
@@ -316,6 +320,21 @@ def _group_sca(
             cve_ids=seen_cves,
             ghsa_ids=seen_ghsas,
             versions=seen_versions,
+            dependency_ancestry=(
+                list(exemplar_localized.dependency_ancestry) if exemplar_localized else []
+            ),
+            dependency_versions=(
+                dict(exemplar_localized.dependency_versions) if exemplar_localized else {}
+            ),
+            parent_package_name=(
+                exemplar_localized.parent_package_name if exemplar_localized else None
+            ),
+            parent_package_version=(
+                exemplar_localized.parent_package_version if exemplar_localized else None
+            ),
+            parent_declaration_type=(
+                exemplar_localized.parent_declaration_type if exemplar_localized else None
+            ),
             sources=list(sources_set),
             representative_issue_id=rep.id,
             issues=member_issues,
