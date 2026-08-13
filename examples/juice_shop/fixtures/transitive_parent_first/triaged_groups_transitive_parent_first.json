@@ -1,0 +1,222 @@
+[
+  {
+    "group_id": "sca:package.json:@tootallnate/once:parent=sqlite3:type=dependencies:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "@tootallnate/once",
+    "file_path": "package.json",
+    "file_paths": ["package.json"],
+    "cve_ids": ["CVE-2026-3449"],
+    "ghsa_ids": ["GHSA-VPQ2-C234-7XJ6"],
+    "versions": ["1.1.2"],
+    "dependency_ancestry": ["sqlite3", "http-proxy-agent", "@tootallnate/once"],
+    "dependency_versions": {
+      "sqlite3": "5.1.7",
+      "http-proxy-agent": "4.0.1",
+      "@tootallnate/once": "1.1.2"
+    },
+    "parent_package_name": "sqlite3",
+    "parent_package_version": "5.1.7",
+    "parent_declaration_type": "dependencies",
+    "sources": ["odc"],
+    "representative_issue_id": "00000000-0000-4000-8000-000000000101",
+    "issues": [
+      {
+        "id": "00000000-0000-4000-8000-000000000101",
+        "source": "odc",
+        "issue_type": "sca",
+        "cve_id": "CVE-2026-3449",
+        "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+        "severity": "LOW",
+        "file_path": "scan/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/@tootallnate/once:1.1.2",
+        "package_name": "@tootallnate/once",
+        "package_version": "1.1.2",
+        "purl": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+        "ecosystem": "npm",
+        "message": "Versions before 2.0.1 are vulnerable to incorrect control flow scoping in promise resolving.",
+        "finding_url": "https://github.com/advisories/GHSA-vpq2-c234-7xj6"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "00000000-0000-4000-8000-000000000101",
+          "source": "odc",
+          "issue_type": "sca",
+          "cve_id": "CVE-2026-3449",
+          "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+          "severity": "LOW",
+          "file_path": "scan/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/@tootallnate/once:1.1.2",
+          "package_name": "@tootallnate/once",
+          "package_version": "1.1.2",
+          "purl": "pkg:npm/%40tootallnate%2Fonce@1.1.2",
+          "ecosystem": "npm"
+        },
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": "npm",
+        "dependency_ancestry": ["sqlite3", "http-proxy-agent", "@tootallnate/once"],
+        "dependency_versions": {
+          "sqlite3": "5.1.7",
+          "http-proxy-agent": "4.0.1",
+          "@tootallnate/once": "1.1.2"
+        },
+        "declaration_type": null,
+        "parent_package_name": "sqlite3",
+        "parent_package_version": "5.1.7",
+        "parent_declaration_type": "dependencies",
+        "parent_manifest_line": 154,
+        "parent_manifest_snippet": "    \"sqlite3\": \"^5.1.7\",",
+        "localization_confidence": 0.6
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "2.0.1",
+      "workaround_snippets": null,
+      "instruction": "Update directly declared parent \"sqlite3\" before using an override for @tootallnate/once.",
+      "strategy_used": "osv_api"
+    }
+  },
+  {
+    "group_id": "sca:package.json:got:parent=download:type=dependencies:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "got",
+    "file_path": "package.json",
+    "file_paths": ["package.json"],
+    "cve_ids": ["CVE-2022-33987"],
+    "ghsa_ids": ["GHSA-PFRX-2Q88-QQ97"],
+    "versions": ["8.3.2"],
+    "dependency_ancestry": ["download", "got"],
+    "dependency_versions": {"download": "8.0.0", "got": "8.3.2"},
+    "parent_package_name": "download",
+    "parent_package_version": "8.0.0",
+    "parent_declaration_type": "dependencies",
+    "sources": ["odc"],
+    "representative_issue_id": "00000000-0000-4000-8000-000000000102",
+    "issues": [
+      {
+        "id": "00000000-0000-4000-8000-000000000102",
+        "source": "odc",
+        "issue_type": "sca",
+        "cve_id": "CVE-2022-33987",
+        "ghsa_id": "GHSA-PFRX-2Q88-QQ97",
+        "severity": "MEDIUM",
+        "file_path": "scan/package-lock.json?download:8.0.0/got:8.3.2",
+        "package_name": "got",
+        "package_version": "8.3.2",
+        "purl": "pkg:npm/got@8.3.2",
+        "ecosystem": "npm",
+        "message": "The got package before 11.8.5 allows a redirect to a UNIX socket.",
+        "finding_url": "https://github.com/advisories/GHSA-pfrx-2q88-qq97"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "00000000-0000-4000-8000-000000000102",
+          "source": "odc",
+          "issue_type": "sca",
+          "cve_id": "CVE-2022-33987",
+          "ghsa_id": "GHSA-PFRX-2Q88-QQ97",
+          "severity": "MEDIUM",
+          "file_path": "scan/package-lock.json?download:8.0.0/got:8.3.2",
+          "package_name": "got",
+          "package_version": "8.3.2",
+          "purl": "pkg:npm/got@8.3.2",
+          "ecosystem": "npm"
+        },
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "package_manager": "npm",
+        "dependency_ancestry": ["download", "got"],
+        "dependency_versions": {"download": "8.0.0", "got": "8.3.2"},
+        "declaration_type": null,
+        "parent_package_name": "download",
+        "parent_package_version": "8.0.0",
+        "parent_declaration_type": "dependencies",
+        "parent_manifest_line": 107,
+        "parent_manifest_snippet": "    \"download\": \"^8.0.0\",",
+        "localization_confidence": 0.6
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "11.8.5",
+      "workaround_snippets": null,
+      "instruction": "Update directly declared parent \"download\" before using an override for got.",
+      "strategy_used": "osv_api"
+    }
+  },
+  {
+    "group_id": "sca:package.json:crypto-js:parent=pdfkit:type=dependencies:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "crypto-js",
+    "file_path": "package.json",
+    "file_paths": ["package.json"],
+    "cve_ids": ["CVE-2023-46233"],
+    "ghsa_ids": ["GHSA-XWCQ-PM8M-C4VF"],
+    "versions": ["3.3.0"],
+    "dependency_ancestry": ["pdfkit", "crypto-js"],
+    "dependency_versions": {"pdfkit": "0.11.0", "crypto-js": "3.3.0"},
+    "parent_package_name": "pdfkit",
+    "parent_package_version": "0.11.0",
+    "parent_declaration_type": "dependencies",
+    "sources": ["odc"],
+    "representative_issue_id": "00000000-0000-4000-8000-000000000103",
+    "issues": [
+      {
+        "id": "00000000-0000-4000-8000-000000000103",
+        "source": "odc",
+        "issue_type": "sca",
+        "cve_id": "CVE-2023-46233",
+        "ghsa_id": "GHSA-XWCQ-PM8M-C4VF",
+        "severity": "CRITICAL",
+        "file_path": "scan/package-lock.json?pdfkit:0.11.0/crypto-js:3.3.0",
+        "package_name": "crypto-js",
+        "package_version": "3.3.0",
+        "purl": "pkg:npm/crypto-js@3.3.0",
+        "ecosystem": "npm",
+        "message": "crypto-js before 4.2.0 uses weak PBKDF2 defaults.",
+        "finding_url": "https://github.com/advisories/GHSA-xwcq-pm8m-c4vf"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "00000000-0000-4000-8000-000000000103",
+          "source": "odc",
+          "issue_type": "sca",
+          "cve_id": "CVE-2023-46233",
+          "ghsa_id": "GHSA-XWCQ-PM8M-C4VF",
+          "severity": "CRITICAL",
+          "file_path": "scan/package-lock.json?pdfkit:0.11.0/crypto-js:3.3.0",
+          "package_name": "crypto-js",
+          "package_version": "3.3.0",
+          "purl": "pkg:npm/crypto-js@3.3.0",
+          "ecosystem": "npm"
+        },
+        "manifest_file": "package.json",
+        "is_direct_dependency": false,
+        "package_manager": "npm",
+        "dependency_ancestry": ["pdfkit", "crypto-js"],
+        "dependency_versions": {"pdfkit": "0.11.0", "crypto-js": "3.3.0"},
+        "declaration_type": null,
+        "parent_package_name": "pdfkit",
+        "parent_package_version": "0.11.0",
+        "parent_declaration_type": "dependencies",
+        "parent_manifest_line": 143,
+        "parent_manifest_snippet": "    \"pdfkit\": \"^0.11.0\",",
+        "localization_confidence": 0.6
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "4.2.0",
+      "workaround_snippets": null,
+      "instruction": "Update directly declared parent \"pdfkit\" before using an override for crypto-js.",
+      "strategy_used": "osv_api"
+    }
+  }
+]

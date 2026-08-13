@@ -1,0 +1,115 @@
+"""Run the parent-first transitive dependency fixture against Juice Shop.
+
+This manual scenario loads three pre-triaged transitive SCA groups and runs the
+normal post-triage workflow. Each group names a directly declared parent, so
+the Supervisor should try parent OSV-minimum, same-major, and latest releases
+before it can commit a package-manager override for the vulnerable child.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from remediation_engine import RemediationRequest, run_remediation
+from remediation_engine.contracts.schemas import VulnerabilityGroup
+
+logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_DEFAULT_GROUPS = Path(__file__).resolve().parent / "triaged_groups_transitive_parent_first.json"
+
+
+def load_parent_first_groups(path: Path = _DEFAULT_GROUPS) -> list[VulnerabilityGroup]:
+    """Load and validate the three transitive parent-first groups.
+
+    Args:
+        path: JSON fixture containing the pre-triaged SCA groups.
+
+    Returns:
+        Exactly three validated transitive vulnerability groups.
+
+    Raises:
+        FileNotFoundError: If the fixture path does not exist.
+        ValueError: If the fixture does not contain the expected packages or
+            parent metadata.
+        json.JSONDecodeError: If the fixture is not valid JSON.
+    """
+    raw_groups = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_groups, list) or len(raw_groups) != 3:
+        raise ValueError("Parent-first fixture must contain exactly three groups.")
+
+    groups = [VulnerabilityGroup.model_validate(item) for item in raw_groups]
+    expected = {"@tootallnate/once", "got", "crypto-js"}
+    actual = {group.vulnerable_component for group in groups}
+    if actual != expected:
+        raise ValueError(f"Expected transitive packages {sorted(expected)}, got {sorted(actual)}.")
+    if any(not group.parent_package_name for group in groups):
+        raise ValueError("Every parent-first fixture group must name a direct parent.")
+    if any(group.parent_declaration_type != "dependencies" for group in groups):
+        raise ValueError("Every parent-first fixture group must target dependencies.")
+    if any(
+        not any(not issue.is_direct_dependency for issue in group.localized_issues)
+        for group in groups
+    ):
+        raise ValueError("Every parent-first fixture group must be localized as transitive.")
+    return groups
+
+
+def main() -> int:
+    """Execute the parent-first fixture with standard logging and output persistence."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path(
+            os.environ.get("TEST_REPO_ROOT", _PROJECT_ROOT / "data" / "clones" / "juice-shop")
+        ),
+    )
+    parser.add_argument("--groups", type=Path, default=_DEFAULT_GROUPS)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/trajectories/juice-shop-transitive-parent-first-result.json"),
+    )
+    parser.add_argument(
+        "--patch-out",
+        type=Path,
+        default=Path("data/trajectories/juice-shop-transitive-parent-first.patch"),
+    )
+    args = parser.parse_args()
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if not args.repo.is_dir():
+        logger.error("Repository does not exist: %s", args.repo)
+        return 2
+    if not args.groups.is_file():
+        logger.error("Parent-first groups fixture does not exist: %s", args.groups)
+        return 2
+
+    groups = load_parent_first_groups(args.groups)
+    logger.info(
+        "Starting parent-first remediation with packages: %s",
+        ", ".join(sorted(group.vulnerable_component or "unknown" for group in groups)),
+    )
+    result = run_remediation(RemediationRequest(repo_root=args.repo, valid_groups=groups))
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(result.model_dump(exclude={"raw_state"}), indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    args.patch_out.write_text(result.diff, encoding="utf-8")
+    logger.info("status=%s changed_files=%s", result.status, result.changed_files)
+    return 0 if result.status == "completed" and not result.errors else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

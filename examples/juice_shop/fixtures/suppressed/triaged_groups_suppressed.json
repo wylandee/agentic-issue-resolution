@@ -1,6 +1,6 @@
 [
   {
-    "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    "group_id": "sca:package.json:@tootallnate/once:parent=sqlite3:type=dependencies:UPDATE_VERSION",
     "issue_type": "sca",
     "vulnerable_component": "@tootallnate/once",
     "file_path": "package.json",
@@ -16,6 +16,19 @@
     "versions": [
       "1.1.2"
     ],
+    "dependency_ancestry": [
+      "sqlite3",
+      "http-proxy-agent",
+      "@tootallnate/once"
+    ],
+    "dependency_versions": {
+      "sqlite3": "5.1.7",
+      "http-proxy-agent": "4.0.1",
+      "@tootallnate/once": "1.1.2"
+    },
+    "parent_package_name": "sqlite3",
+    "parent_package_version": "5.1.7",
+    "parent_declaration_type": "dependencies",
     "sources": [
       "odc"
     ],
@@ -247,6 +260,22 @@
         "manifest_line": null,
         "manifest_snippet": null,
         "package_manager": "npm",
+        "dependency_ancestry": [
+          "sqlite3",
+          "http-proxy-agent",
+          "@tootallnate/once"
+        ],
+        "dependency_versions": {
+          "sqlite3": "5.1.7",
+          "http-proxy-agent": "4.0.1",
+          "@tootallnate/once": "1.1.2"
+        },
+        "declaration_type": null,
+        "parent_package_name": "sqlite3",
+        "parent_package_version": "5.1.7",
+        "parent_declaration_type": "dependencies",
+        "parent_manifest_line": 154,
+        "parent_manifest_snippet": "    \"sqlite3\": \"^5.1.7\",",
         "localization_confidence": 0.6,
         "localized_at": "2026-08-06T02:16:33.892696Z"
       }
@@ -255,7 +284,7 @@
       "status": "version_found",
       "fixed_version": "2.0.1",
       "workaround_snippets": null,
-      "instruction": "Add or update \"overrides\": {\"@tootallnate/once\": \"2.0.1\"} in package.json to pin the transitive dependency via npm overrides.",
+      "instruction": "Update directly declared parent \"sqlite3\" in dependencies to the minimum compatible released version that resolves transitive package \"@tootallnate/once\" to at least \"2.0.1\". Do not use a package override unless the parent update stages are exhausted.",
       "strategy_used": "UPDATE_VERSION"
     },
     "enrichment": {

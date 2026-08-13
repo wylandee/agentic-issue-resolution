@@ -54,6 +54,16 @@ Runs the `notevil` vulnerable-code-removal retry fixture through the Supervisor 
 python examples/juice_shop/fixtures/workaround_nofix/run_workaround_nofix.py
 ```
 
+### 5. Parent-first transitive dependency remediation
+
+Runs three pre-triaged transitive findings—`@tootallnate/once`, `got`, and
+`crypto-js`—whose direct parents are `sqlite3`, `download`, and `pdfkit`.
+The fixture exercises parent updates before child overrides:
+
+```bash
+python examples/juice_shop/fixtures/transitive_parent_first/run_parent_first.py
+```
+
 ---
 
 ## Fixture layout
@@ -81,6 +91,8 @@ The workaround scenarios are self-contained under `fixtures/`:
 * **`fixtures/workaround_replay/express_jwt_workaround_replay.json`**: Express-JWT replay state, task, and QA evidence.
 * **`fixtures/workaround_nofix/run_workaround_nofix.py`**: `notevil` NO_FIX retry runner.
 * **`fixtures/workaround_nofix/notevil_workaround_nofix.json`**: `notevil` Stage 2 retry state, task, and prior QA evidence.
+* **`fixtures/transitive_parent_first/run_parent_first.py`**: Parent-first runner for three transitive SCA findings.
+* **`fixtures/transitive_parent_first/triaged_groups_transitive_parent_first.json`**: Pre-triaged groups with dependency ancestry and direct-parent targets.
 
 Both workaround runners use the Workspace Builder for initial npm dependency installation. The Express-JWT replay additionally applies the target dependency update inside the isolated volume so it can reproduce the failed update state; the NO_FIX retry starts from the unchanged baseline workspace.
 
