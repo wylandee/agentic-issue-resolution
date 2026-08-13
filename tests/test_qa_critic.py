@@ -2484,6 +2484,7 @@ class TestRunBatchJudge:
         mi.with_structured_output.assert_called_once_with(BatchQAResult)
         ms.invoke.assert_called_once()
         assert result.holistic_report == "All passed."
+        assert len(result.evaluations) == 1
 
     def test_llm_failure_returns_fallback(self):
         group = _make_group()
@@ -2812,6 +2813,7 @@ class TestRunQACriticNodeMapReduce:
         )
         result, _, _, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         assert result["eval_status"] == "all_passed" and result["status"] == "qa_completed"
+        assert len(result["qa_evaluations"]) == 2
 
     def test_guardrails_fill_missing_eval(self):
         g1, g2 = _make_group("g1"), _make_group("g2")

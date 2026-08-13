@@ -1772,8 +1772,10 @@ class SupervisorDecision(BaseModel):
     Controls hub-and-spoke routing in the Phase 5 orchestrator graph.
     Pydantic validators enforce routing invariants:
     - ``workaround_subagent`` requires exactly one ``target_task_id``.
-    - ``update_subagent`` requires 1-10 ``target_task_ids``.
-    - ``qa_critic`` requires one or more ``target_task_ids`` for batch QA.
+    - ``update_subagent`` accepts 1-10 ``target_task_ids`` for reusable batch callers;
+      the current Supervisor dispatch policy narrows this to one target.
+    - ``qa_critic`` accepts one or more ``target_task_ids`` for reusable batch QA;
+      the current Supervisor dispatch policy narrows this to one target.
     - ``triage`` is a graph-level handoff and does not target a task.
     - ``teardown`` requires empty ``target_task_ids``.
     - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
@@ -1798,10 +1800,10 @@ class SupervisorDecision(BaseModel):
         default_factory=list,
         description=(
             "Task IDs to send to the next worker node. "
-            "One or more for qa_critic. "
+            "One or more for direct/batch qa_critic callers. "
             "Empty for teardown. "
             "Exactly one entry for workaround_subagent. "
-            "One to ten entries for update_subagent."
+            "One to ten entries for direct/batch update_subagent callers; Supervisor routing currently sends one."
         ),
     )
     unfixable_task_ids: list[str] = Field(

@@ -19,6 +19,7 @@ from remediation_engine.contracts.schemas import (
     SCARemediationStage,
     Severity,
     TaskAttemptSnapshot,
+    TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -657,6 +658,35 @@ class TestPhase5GraphIntegration:
                 "qa_evaluations": {},
                 "eval_status": "all_passed",
                 "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+
+        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+            result = run_qa_critic_from_orchestrator(state)
+
+        scoped_state = qa_critic.call_args[0][0]
+        assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
+        assert result["status"] == "qa_completed"
+
+    def test_qa_wrapper_scopes_one_active_task_to_one_parent_group(self, tmp_path):
+        groups = [
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        ]
+        task = build_initial_remediation_task(groups[1], "task-2").model_copy(
+            update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
+        )
+        state = _initial_state(tmp_path, groups)
+        state["task_queue"] = {"task-2": task}
+        state["active_target_task_ids"] = ["task-2"]
+
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {},
+                "eval_status": "all_passed",
+                "qa_investigation_report": "# INVESTIGATIVE REPORT",
                 "status": "qa_completed",
                 "errors": [],
             }

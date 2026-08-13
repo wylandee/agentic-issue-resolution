@@ -17,6 +17,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     Severity,
+    TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -147,6 +148,31 @@ class TestUpdateSubagentWrapper:
         assert "First-pass planning questions:" not in prompt
         assert "Planning Answers" not in prompt
         assert "Reasoning Summary" not in prompt
+
+    def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
+        group_a = _sca_group("sca:package.json:lodash", "package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [group_a, group_b],
+            [],
+        )
+        state["target_tasks"][0] = state["target_tasks"][0].model_copy(
+            update={"retry_count": 1, "status": TaskStatus.NEEDS_RETRY}
+        )
+
+        with (
+            patch(
+                "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
+                return_value=(["package.json"], []),
+            ),
+            patch("remediation_engine.orchestration.update_subagent.ChatOpenAI") as mock_chat,
+        ):
+            result = run_update_subagent_node(state)
+
+        assert "mixed first-pass and retry" in result["errors"][-1]
+        assert mock_chat.call_count == 0
 
     def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
         group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")
