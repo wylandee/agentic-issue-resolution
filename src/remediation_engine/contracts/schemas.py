@@ -123,6 +123,25 @@ class FailureCategory(str, Enum):
     BREAKING_CHANGE = "breaking_change"
 
 
+class ScanScope(str, Enum):  # noqa: UP042
+    """Requested or effective scope of an OWASP Dependency-Check run."""
+
+    TARGETED = "targeted"
+    FULL = "full"
+
+
+class ScanFallbackReason(str, Enum):  # noqa: UP042
+    """Reason a requested targeted scan used the full-scan fallback."""
+
+    UNSUPPORTED_PACKAGE_MANAGER = "unsupported_package_manager"
+    MISSING_LOCKFILE = "missing_lockfile"
+    INVALID_LOCKFILE = "invalid_lockfile"
+    AMBIGUOUS_TARGET = "ambiguous_target"
+    INCOMPLETE_CLOSURE = "incomplete_closure"
+    TARGETED_SCAN_FAILED = "targeted_scan_failed"
+    TARGETED_REPORT_UNPARSEABLE = "targeted_report_unparseable"
+
+
 class RoutingStrategy(str, Enum):
     """Strict supervisor routing strategies for vulnerability groups."""
 
@@ -1299,6 +1318,39 @@ class QAFailureEvidence(BaseModel):
     task_revision: int = Field(default=0, ge=0)
 
 
+class ODCScanEvidence(BaseModel):
+    """Typed evidence describing one ODC scan and its authority boundary."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    requested_scope: ScanScope
+    effective_scope: ScanScope
+    authoritative: bool = False
+    covered_task_ids: list[str] = Field(default_factory=list)
+    closure_package_names: list[str] = Field(default_factory=list)
+    closure_lockfile_keys: list[str] = Field(default_factory=list)
+    found_identifiers: list[str] = Field(default_factory=list)
+    remaining_target_identifiers: list[str] = Field(default_factory=list)
+    complete: bool = False
+    fallback_reason: ScanFallbackReason | None = None
+
+
+class FinalFullScanResult(BaseModel):
+    """Authoritative full-workspace ODC result used before teardown."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    completed: bool = False
+    authoritative: bool = True
+    found_identifiers: list[str] = Field(default_factory=list)
+    remaining_target_identifiers: list[str] = Field(default_factory=list)
+    new_identifiers: list[str] = Field(default_factory=list)
+    found_issues: list[VulnerabilityIssue] = Field(default_factory=list)
+    status: str = "not_scanned"
+    triage_required: bool = False
+    error: str | None = None
+
+
 class WorkaroundContext(BaseModel):
     """Supervisor-provided phase and evidence context for workaround attempts."""
 
@@ -1336,6 +1388,13 @@ class QAEvaluation(BaseModel):
     failure_evidence: QAFailureEvidence | None = Field(
         None,
         description="Structured failure evidence when passed=False.",
+    )
+    scan_evidence: ODCScanEvidence | None = Field(
+        None,
+        description=(
+            "Attempt-local ODC evidence. Only the final full scan is authoritative "
+            "for repo-wide status."
+        ),
     )
 
     @model_validator(mode="after")
@@ -1780,6 +1839,7 @@ class SupervisorDecision(BaseModel):
     - ``qa_critic`` accepts one or more ``target_task_ids`` for reusable batch QA;
       the current Supervisor dispatch policy narrows this to one target.
     - ``triage`` is a graph-level handoff and does not target a task.
+    - ``final_full_scan`` is a graph-level handoff and does not target a task.
     - ``teardown`` requires empty ``target_task_ids``.
     - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
     """
@@ -1796,7 +1856,12 @@ class SupervisorDecision(BaseModel):
     )
 
     next_node: Literal[
-        "update_subagent", "workaround_subagent", "qa_critic", "triage", "teardown"
+        "update_subagent",
+        "workaround_subagent",
+        "qa_critic",
+        "triage",
+        "final_full_scan",
+        "teardown",
     ] = Field(
         ...,
         description="The next node to route to in the orchestrator graph.",
@@ -1885,7 +1950,7 @@ class SupervisorDecision(BaseModel):
             )
         if node == "qa_critic" and len(targets) < 1:
             raise ValueError("qa_critic requires at least 1 target_task_id.")
-        if node == "teardown" and targets:
+        if node in {"final_full_scan", "teardown"} and targets:
             raise ValueError(f"{node} must have empty target_task_ids, got {targets}.")
         overlap = set(unfixable) & set(targets)
         if overlap:

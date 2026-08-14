@@ -35,9 +35,11 @@ from remediation_engine.contracts import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    ODCScanEvidence,
     PatchAttempt,
     QAEvaluation,
     RoutingStrategy,
+    ScanScope,
     Severity,
     TrajectoryEvent,
     TrajectoryEventKind,
@@ -256,6 +258,23 @@ class TestQAEvaluation:
         )
         reloaded = QAEvaluation.model_validate_json(evaluation.model_dump_json())
         assert reloaded == evaluation
+
+    def test_optional_scan_evidence_round_trips_for_passed_evaluation(self):
+        evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-1"],
+            closure_package_names=["express"],
+            complete=True,
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=True,
+            scan_evidence=evidence,
+        )
+
+        reloaded = QAEvaluation.model_validate_json(evaluation.model_dump_json())
+        assert reloaded.scan_evidence == evidence
 
 
 class TestAgentActionSummary:

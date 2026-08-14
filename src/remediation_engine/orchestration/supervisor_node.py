@@ -109,6 +109,7 @@ _VALID_NEXT_NODES: set[str] = {
     "workaround_subagent",
     "qa_critic",
     "triage",
+    "final_full_scan",
     "teardown",
 }
 _DEFAULT_MODEL = "gpt-4o-mini"
@@ -2335,6 +2336,8 @@ def _deterministic_routing(
     active_target_task_ids: list[str] | None = None,
     current_status: str = "",
     triage_required: bool = False,
+    workspace_volume: str | None = None,
+    final_full_scan_completed: bool = False,
 ) -> SupervisorDecision:
     """
     Pure-Python fallback routing used when the LLM call fails.
@@ -2346,7 +2349,7 @@ def _deterministic_routing(
     # Post-QA triage is a Supervisor-owned handoff.  It must run before
     # teardown even when the current task queue is already terminal, because
     # the global scan may have discovered a new package vulnerability.
-    if triage_required and current_status in {"qa_completed", "qa_failed"}:
+    if triage_required and current_status in {"qa_completed", "qa_failed", "final_scan_completed"}:
         return SupervisorDecision(
             decision_code=DecisionCode.TRIAGE_REQUIRED,
             next_node="triage",
@@ -2364,8 +2367,16 @@ def _deterministic_routing(
             decision_reason="Deterministic routing found no valid groups.",
         )
 
-    # All tasks are terminal â†’ teardown
+    # All tasks are terminal â†’ authoritative full scan, then teardown.
     if not non_terminal:
+        if workspace_volume and task_queue and not final_full_scan_completed:
+            return SupervisorDecision(
+                decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
+                next_node="final_full_scan",
+                target_task_ids=[],
+                instructions="Run the authoritative full Dependency-Check scan before teardown.",
+                decision_reason="All remediation tasks are terminal and the final full scan is not complete.",
+            )
         return SupervisorDecision(
             decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
             next_node="teardown",
@@ -2758,7 +2769,8 @@ def _calculate_eligible_actions(
         retry_version_bumps=[task.task_id for task in retries],
         new_version_bumps=[task.task_id for task in pending_updates],
         workaround_tasks=[task.task_id for task in workarounds],
-        triage_required=triage_required and current_status in {"qa_completed", "qa_failed"},
+        triage_required=triage_required
+        and current_status in {"qa_completed", "qa_failed", "final_scan_completed"},
     )
 
 
@@ -3837,6 +3849,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if state.get("triage_required") and state.get("status") in {
             "qa_completed",
             "qa_failed",
+            "final_scan_completed",
         }:
             decision = SupervisorDecision(
                 decision_code=DecisionCode.TRIAGE_REQUIRED,
@@ -4687,6 +4700,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     if state.get("triage_required") and state.get("status") in {
         "qa_completed",
         "qa_failed",
+        "final_scan_completed",
     }:
         decision = SupervisorDecision(
             next_node="triage",
@@ -5619,6 +5633,45 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             remapped_feedback_by_task[task_id] = decision.feedback_by_task[task_id]
 
     resolved_next_node = decision.next_node
+    all_tasks_terminal = bool(task_queue) and all(
+        task.status in _TERMINAL_STATUSES for task in task_queue.values()
+    )
+    if (
+        all_tasks_terminal
+        and state.get("workspace_volume")
+        and not state.get("final_full_scan_completed", False)
+    ):
+        decision = decision.model_copy(
+            update={
+                "decision_code": DecisionCode.FINAL_FULL_SCAN_REQUIRED,
+                "next_node": "final_full_scan",
+                "target_task_ids": [],
+                "instructions": "Run the authoritative full Dependency-Check scan before teardown.",
+                "decision_reason": (
+                    "Supervisor routing barrier required the final full scan before teardown."
+                ),
+            }
+        )
+        resolved_next_node = "final_full_scan"
+        resolved_target_task_ids = []
+    elif resolved_next_node == "final_full_scan":
+        errors.append(
+            "supervisor: rejected final_full_scan because the terminal workspace gate is not satisfied."
+        )
+        decision = _deterministic_routing(
+            task_queue,
+            group_by_id,
+            qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
+            active_target_task_ids=active_target_task_ids,
+            current_status=str(state.get("status") or ""),
+            triage_required=bool(state.get("triage_required")),
+            workspace_volume=state.get("workspace_volume"),
+            final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+        )
+        resolved_next_node = decision.next_node
+        resolved_target_task_ids = list(decision.target_task_ids)
     resolved_target_task_ids = _normalize_target_task_ids_for_node(
         resolved_next_node,
         resolved_target_task_ids,
@@ -5843,6 +5896,26 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 def supervisor_router(state: OrchestratorState) -> str:
     """Return the committed route, recomputing it when state is invalid."""
     step = state.get("next_routing_step", "")
+    task_queue = dict(state.get("task_queue", {}) or {})
+    if (
+        step == "teardown"
+        and state.get("workspace_volume")
+        and task_queue
+        and not state.get("final_full_scan_completed", False)
+        and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
+    ):
+        logger.warning("supervisor_router: enforcing final_full_scan before teardown.")
+        return "final_full_scan"
+    if step == "final_full_scan":
+        terminal_workspace = (
+            bool(task_queue)
+            and bool(state.get("workspace_volume"))
+            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
+            and not state.get("final_full_scan_completed", False)
+        )
+        if not terminal_workspace:
+            logger.warning("supervisor_router: rejecting premature final_full_scan route.")
+            step = ""
     if step in _VALID_NEXT_NODES:
         return step
     logger.error("supervisor_router: invalid next_routing_step '%s' - recomputing.", step)
@@ -5857,6 +5930,8 @@ def supervisor_router(state: OrchestratorState) -> str:
         active_target_task_ids=list(state.get("active_target_task_ids", []) or []),
         current_status=str(state.get("status") or ""),
         triage_required=bool(state.get("triage_required")),
+        workspace_volume=state.get("workspace_volume"),
+        final_full_scan_completed=bool(state.get("final_full_scan_completed")),
     )
     if decision.next_node not in _VALID_NEXT_NODES:
         logger.critical(

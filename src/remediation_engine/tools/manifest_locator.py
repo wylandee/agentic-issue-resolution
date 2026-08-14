@@ -461,6 +461,23 @@ def _run_package_lock_generation(repo_path: Path) -> None:
         log.error("npm not found on PATH")
 
 
+def _lockfile_dependency_edges(metadata: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Return dependency edges declared by one npm lockfile package entry.
+
+    The category is retained so closure consumers can distinguish required,
+    optional, and peer edges without duplicating lockfile field semantics.
+    """
+    edges: list[tuple[str, str, str]] = []
+    for category in ("dependencies", "optionalDependencies", "peerDependencies"):
+        values = metadata.get(category)
+        if not isinstance(values, dict):
+            continue
+        for package_name, requirement in values.items():
+            if isinstance(package_name, str) and isinstance(requirement, str):
+                edges.append((package_name, requirement, category))
+    return edges
+
+
 def _lockfile_dependency_requirements(metadata: dict[str, Any]) -> dict[str, str]:
     """Return dependency ranges declared by one npm lockfile package entry.
 
@@ -470,15 +487,10 @@ def _lockfile_dependency_requirements(metadata: dict[str, Any]) -> dict[str, str
     Returns:
         Dependency names mapped to their declared npm ranges.
     """
-    requirements: dict[str, str] = {}
-    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
-        values = metadata.get(field)
-        if not isinstance(values, dict):
-            continue
-        for package_name, requirement in values.items():
-            if isinstance(package_name, str) and isinstance(requirement, str):
-                requirements[package_name] = requirement
-    return requirements
+    return {
+        package_name: requirement
+        for package_name, requirement, _category in _lockfile_dependency_edges(metadata)
+    }
 
 
 def _lockfile_package_candidates(

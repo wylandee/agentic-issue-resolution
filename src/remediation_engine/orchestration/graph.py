@@ -21,6 +21,8 @@ Phase 5 graph topology (hub-and-spoke)
       +-> qa_critic ------------------------------>+
       |                                            |
       +-> triage (post-QA reconciliation) -------->+
+      |                                            |
+      +-> final_full_scan ------------------------>+
       |
       +-> teardown
            |
@@ -65,7 +67,11 @@ from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
 )
-from remediation_engine.orchestration.qa_critic import run_qa_critic_node
+from remediation_engine.orchestration.qa_critic import (
+    _group_target_identifiers,
+    run_final_full_scan_node,
+    run_qa_critic_node,
+)
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_orchestrator_state,
@@ -337,11 +343,32 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         changed_group_ids = set(reconciliation["changed_group_ids"])
         changed_group_ids.update(reconciliation["reappeared_group_ids"])
         changed_group_ids.update(reconciliation["new_group_ids"])
+        final_scan = state.get("final_full_scan_result")
+        final_scan_identifiers = set(
+            (
+                final_scan.get("remaining_target_identifiers", [])
+                if isinstance(final_scan, dict)
+                else getattr(final_scan, "remaining_target_identifiers", [])
+            )
+            or []
+        )
+        final_scan_reopened_group_ids = sorted(
+            group.group_id
+            for group in state.get("valid_groups", []) or []
+            if _group_target_identifiers(group) & final_scan_identifiers
+        )
+        changed_group_ids.update(final_scan_reopened_group_ids)
+        if final_scan_reopened_group_ids:
+            reconciliation["final_scan_reopened_group_ids"] = final_scan_reopened_group_ids
         groups_by_id = {group.group_id: group for group in valid_groups}
         reopened_task_ids: set[str] = set()
+        preserved_unfixable_task_ids: set[str] = set()
         prior_qa_evaluations = dict(state.get("qa_evaluations", {}) or {})
         for task_id, task in list(task_queue.items()):
             if task.parent_group_id not in changed_group_ids:
+                continue
+            if task.status == TaskStatus.UNFIXABLE:
+                preserved_unfixable_task_ids.add(task_id)
                 continue
             group = groups_by_id.get(task.parent_group_id)
             if group is None:
@@ -381,6 +408,13 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             len(reconciliation["new_group_ids"]),
             len(reconciliation["changed_group_ids"]),
         )
+        work_reopened = bool(
+            reopened_task_ids
+            or reconciliation["new_group_ids"]
+            or reconciliation["reappeared_group_ids"]
+        )
+        if preserved_unfixable_task_ids:
+            reconciliation["preserved_unfixable_task_ids"] = sorted(preserved_unfixable_task_ids)
         return {
             "valid_groups": valid_groups,
             "status": "triage_completed" if valid_groups else "triage_completed_no_work",
@@ -390,6 +424,12 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "qa_evaluations": qa_evaluations,
             "active_target_task_ids": [],
             "active_target_group_ids": [],
+            "final_full_scan_completed": False
+            if work_reopened
+            else state.get("final_full_scan_completed", False),
+            "final_full_scan_result": None
+            if work_reopened
+            else state.get("final_full_scan_result"),
         }
     except Exception as exc:  # noqa: BLE001
         log.exception("post_qa_triage_node: triage pipeline raised")
@@ -813,11 +853,16 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             }
 
     result = run_qa_critic_node(scoped_state)
-    scan_status = result.get(
-        "new_vulnerability_status",
-        state.get("new_vulnerability_status", "not_scanned"),
+    scan_evidence = result.get("scan_evidence")
+    attempt_scan_is_authoritative = scan_evidence is None or bool(
+        getattr(scan_evidence, "authoritative", False)
     )
-    scan_snapshot_available = (
+    scan_status = (
+        result.get("new_vulnerability_status", state.get("new_vulnerability_status", "not_scanned"))
+        if attempt_scan_is_authoritative
+        else state.get("new_vulnerability_status", "not_scanned")
+    )
+    scan_snapshot_available = attempt_scan_is_authoritative and (
         "post_remediation_scan_issues" in result or "post_remediation_scan_issues" in state
     )
     disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in (
@@ -827,6 +872,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     ) or os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
     triage_required = (
         not disable_retriage
+        and attempt_scan_is_authoritative
         and result.get("status") in {"qa_completed", "qa_failed"}
         and scan_status in {"none", "detected"}
         and scan_snapshot_available
@@ -839,21 +885,34 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             "baseline_scan_identifiers",
             state.get("baseline_scan_identifiers", []),
         ),
-        "post_remediation_scan_identifiers": result.get(
-            "post_remediation_scan_identifiers",
-            state.get("post_remediation_scan_identifiers", []),
+        "post_remediation_scan_identifiers": (
+            result.get(
+                "post_remediation_scan_identifiers",
+                state.get("post_remediation_scan_identifiers", []),
+            )
+            if attempt_scan_is_authoritative
+            else state.get("post_remediation_scan_identifiers", [])
         ),
-        "post_remediation_scan_issues": result.get(
-            "post_remediation_scan_issues",
-            state.get("post_remediation_scan_issues", []),
+        "post_remediation_scan_issues": (
+            result.get(
+                "post_remediation_scan_issues", state.get("post_remediation_scan_issues", [])
+            )
+            if attempt_scan_is_authoritative
+            else state.get("post_remediation_scan_issues", [])
         ),
-        "new_vulnerability_identifiers": result.get(
-            "new_vulnerability_identifiers",
-            state.get("new_vulnerability_identifiers", []),
+        "new_vulnerability_identifiers": (
+            result.get(
+                "new_vulnerability_identifiers", state.get("new_vulnerability_identifiers", [])
+            )
+            if attempt_scan_is_authoritative
+            else state.get("new_vulnerability_identifiers", [])
         ),
-        "new_vulnerability_status": result.get(
-            "new_vulnerability_status",
-            state.get("new_vulnerability_status", "not_scanned"),
+        "new_vulnerability_status": (
+            result.get(
+                "new_vulnerability_status", state.get("new_vulnerability_status", "not_scanned")
+            )
+            if attempt_scan_is_authoritative
+            else state.get("new_vulnerability_status", "not_scanned")
         ),
         "triage_required": triage_required,
         "status": result.get("status", "qa_completed"),
@@ -884,6 +943,8 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         )
     if qa_results_by_attempt:
         out["qa_results_by_attempt"] = qa_results_by_attempt
+    if scan_evidence is not None:
+        out["scan_evidence_by_task"] = {task_id: scan_evidence for task_id in active_task_ids}
     return out
 
 
@@ -917,6 +978,7 @@ def build_orchestrator_graph():
     workflow.add_node("update_subagent", run_update_subagent_from_orchestrator)
     workflow.add_node("workaround_subagent", run_workaround_subagent_from_orchestrator)
     workflow.add_node("qa_critic", run_qa_critic_from_orchestrator)
+    workflow.add_node("final_full_scan", run_final_full_scan_node)
     workflow.add_node("teardown", run_teardown_node)
 
     workflow.add_edge(START, "initial_triage")
@@ -927,6 +989,7 @@ def build_orchestrator_graph():
     workflow.add_edge("workaround_subagent", "supervisor")
     workflow.add_edge("qa_critic", "supervisor")
     workflow.add_edge("triage", "supervisor")
+    workflow.add_edge("final_full_scan", "supervisor")
     workflow.add_edge("teardown", END)
 
     return workflow.compile()

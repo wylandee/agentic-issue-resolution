@@ -110,6 +110,14 @@ def test_decision_codes_cover_fixed_priority_routes():
     )
     assert (
         _route(
+            {"t": _task("t", "g", status=TaskStatus.QA_PASSED)},
+            [_group("g")],
+            workspace_volume="workspace-volume",
+        ).decision_code
+        == DecisionCode.FINAL_FULL_SCAN_REQUIRED
+    )
+    assert (
+        _route(
             {"t": _task("t", "g", status=TaskStatus.OPTIMISTICALLY_FIXED)}, [_group("g")]
         ).decision_code
         == DecisionCode.QA_READY_BATCH

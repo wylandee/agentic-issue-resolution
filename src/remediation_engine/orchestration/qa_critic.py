@@ -39,6 +39,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,10 +52,15 @@ from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     BatchQAResult,
     FailureCategory,
+    FinalFullScanResult,
     FixPlanStatus,
     NoFixMitigationStage,
+    ODCScanEvidence,
     QAEvaluation,
     QAFailureEvidence,
+    RemediationTask,
+    ScanFallbackReason,
+    ScanScope,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -63,6 +69,12 @@ from remediation_engine.orchestration.subagent_runtime import run_bounded_subage
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.settings import AppSettings
+from remediation_engine.tools.lockfile_closure import (
+    ClosureResolutionError,
+    DependencyClosure,
+    build_sliced_lockfile_artifacts,
+    resolve_dependency_closure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +138,15 @@ _STACK_NOISE_RE = re.compile(r"^\s*(at\s+.+|\^\s*|[-]{3,}|\s*operator:\s+.+)$")
 # ---------------------------------------------------------------------------
 
 
-def _read_report_from_workspace(sandbox: DockerSandbox) -> str | None:
-    """Read the ODC JSON report from the sandbox workspace."""
+def _read_report_from_workspace(
+    sandbox: DockerSandbox,
+    relative_dir: str = "",
+) -> str | None:
+    """Read an ODC JSON report from a workspace-relative report directory."""
     try:
-        return sandbox.read_file(_ODC_REPORT_NAME)
+        clean_dir = relative_dir.strip("/\\")
+        report_path = f"{clean_dir}/{_ODC_REPORT_NAME}".lstrip("/")
+        return sandbox.read_file(report_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("qa_critic: failed to read ODC report from workspace â€” %s", exc)
         return None
@@ -207,8 +224,12 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
         return None
 
 
-def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
-    """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
+def _odc_command(workspace_volume: str, scan_subdir: str | None = None) -> list[str]:
+    """Build a safe ODC Docker command for the full or targeted workspace."""
+    scan_path = "/scan"
+    if scan_subdir:
+        scan_subdir = _validate_qa_path(scan_subdir)
+        scan_path = f"/scan/{scan_subdir}"
     cmd = [
         "docker",
         "run",
@@ -223,13 +244,13 @@ def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
         "--project",
         "sandbox_scan",
         "--scan",
-        "/scan",
+        scan_path,
         "--format",
         "JSON",
         "--format",
         "HTML",
         "--out",
-        "/scan",
+        scan_path,
         "--noupdate",
     ]
 
@@ -237,7 +258,28 @@ def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
+    return cmd
+
+
+def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
+    """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
+    cmd = _odc_command(workspace_volume)
     logger.info("qa_critic: running ODC in Docker: %s", " ".join(cmd))
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=_ODC_TIMEOUT_SECONDS,
+    )
+
+
+def _run_targeted_odc(
+    workspace_volume: str,
+    targeted_subdir: str,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ODC against a validated workspace-relative targeted directory."""
+    cmd = _odc_command(workspace_volume, targeted_subdir)
+    logger.info("qa_critic: running targeted ODC in Docker: %s", " ".join(cmd))
     return subprocess.run(
         cmd,
         capture_output=True,
@@ -438,6 +480,139 @@ def _run_security_scan(
         summary,
         set(),
         found_identifiers,
+        new_identifiers,
+        found_issues,
+    )
+
+
+def _targeted_report_host_path(targeted_subdir: str, suffix: str) -> Path:
+    """Return an ignored, unique host path for a targeted ODC report."""
+    stamp = f"{time.time_ns()}-{abs(hash(targeted_subdir))}"
+    return _ODC_DEBUG_DIR / "targeted" / f"{stamp}-{suffix}"
+
+
+def _run_targeted_security_scan(
+    sandbox: DockerSandbox,
+    workspace_volume: str,
+    target_identifiers: set[str],
+    baseline_identifiers: set[str],
+    targeted_subdir: str,
+) -> _SecurityScanResult:
+    """Run and classify ODC against a synthetic targeted workspace."""
+    baseline = {
+        identifier.upper().strip()
+        for identifier in baseline_identifiers
+        if identifier and identifier.strip()
+    }
+    if shutil.which("docker") is None:
+        return _SecurityScanResult(
+            False,
+            "FAILURE: docker is not available on PATH; Dependency-Check cannot run.",
+            set(),
+            set(),
+            set(),
+        )
+
+    try:
+        proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
+    except FileNotFoundError:
+        return _SecurityScanResult(
+            False,
+            "FAILURE: docker is not available on PATH; Dependency-Check cannot run.",
+            set(),
+            set(),
+            set(),
+        )
+    except subprocess.TimeoutExpired:
+        return _SecurityScanResult(
+            False,
+            f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s.",
+            set(),
+            set(),
+            set(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _SecurityScanResult(
+            False,
+            f"FAILURE: Dependency-Check subprocess error — {exc}",
+            set(),
+            set(),
+            set(),
+        )
+
+    report_dir = _validate_qa_path(targeted_subdir)
+    report_json = f"{report_dir}/{_ODC_REPORT_NAME}"
+    report_html = f"{report_dir}/{_ODC_HTML_REPORT_NAME}"
+    saved_html = _persist_workspace_report_to_host(
+        sandbox,
+        report_html,
+        _targeted_report_host_path(report_dir, _ODC_HTML_REPORT_NAME),
+    )
+    saved_json = _persist_workspace_report_to_host(
+        sandbox,
+        report_json,
+        _targeted_report_host_path(report_dir, _ODC_REPORT_NAME),
+    )
+    report_location_note = ""
+    if saved_html is not None:
+        report_location_note = f"\nHTML report saved to: {saved_html}"
+        if saved_json is not None:
+            report_location_note += f"\nJSON report saved to: {saved_json}"
+
+    report_text = _read_report_from_workspace(sandbox, report_dir)
+    found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
+    found_issues = _parse_report_issues(report_text) if report_text is not None else None
+    if found_issues is None and found_identifiers is not None:
+        found_issues = []
+    if proc.returncode != 0 and (found_identifiers is None or found_issues is None):
+        summary = (
+            f"FAILURE: Dependency-Check exited {proc.returncode} and produced no parseable report.\n"
+            f"stdout:\n{proc.stdout[:2000]}\n"
+            f"stderr:\n{proc.stderr[:2000]}"
+        )
+        return _SecurityScanResult(False, summary + report_location_note, set(), set(), set())
+    if found_identifiers is None or found_issues is None:
+        summary = (
+            f"FAILURE: Dependency-Check report was not parseable (exit {proc.returncode}).\n"
+            f"stderr:\n{proc.stderr[:2000]}"
+        )
+        return _SecurityScanResult(False, summary + report_location_note, set(), set(), set())
+    if proc.returncode != 0:
+        summary = (
+            f"FAILURE: targeted Dependency-Check exited {proc.returncode}.\n"
+            f"stderr:\n{proc.stderr[:2000]}"
+        )
+        return _SecurityScanResult(False, summary + report_location_note, set(), set(), set())
+
+    found = {identifier.upper().strip() for identifier in found_identifiers if identifier}
+    remaining = {
+        identifier.upper().strip() for identifier in target_identifiers if identifier
+    } & found
+    new_identifiers = found - baseline
+    if remaining:
+        summary = (
+            "FAILURE: Dependency-Check found unresolved target vulnerabilities. "
+            f"Remaining identifiers: {', '.join(sorted(remaining))}"
+        )
+        if new_identifiers:
+            summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
+        return _SecurityScanResult(
+            False,
+            summary + report_location_note,
+            remaining,
+            found,
+            new_identifiers,
+            found_issues,
+        )
+
+    summary = "Dependency-Check found no remaining target vulnerability identifiers."
+    if new_identifiers:
+        summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
+    return _SecurityScanResult(
+        True,
+        summary + report_location_note,
+        set(),
+        found,
         new_identifiers,
         found_issues,
     )
@@ -1849,6 +2024,82 @@ def _collect_baseline_identifiers(
     return _collect_target_identifiers(groups)
 
 
+def _lockfile_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
+    """Return normalized npm lockfile paths associated with an SCA group."""
+    candidates: list[str] = []
+    candidates.extend(group.file_paths or [])
+    if group.file_path:
+        candidates.append(group.file_path)
+    for issue in group.localized_issues or []:
+        if issue.manifest_file:
+            candidates.append(issue.manifest_file)
+
+    lockfiles: list[str] = []
+    for raw_path in candidates:
+        path = str(raw_path or "").strip().split("?", 1)[0].replace("\\", "/")
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            continue
+        path = path.lstrip("./")
+        name = Path(path).name.lower()
+        if name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}:
+            lockfile = path
+        elif name == "package.json":
+            lockfile = str(Path(path).with_name("package-lock.json"))
+        else:
+            continue
+        if lockfile not in lockfiles:
+            lockfiles.append(lockfile)
+    return tuple(sorted(lockfiles))
+
+
+def _build_qa_scan_targets(
+    state: OrchestratorState,
+    groups: list[VulnerabilityGroup],
+) -> list[QAScanTarget] | None:
+    """Build task-owned scan targets, or ``None`` for legacy direct QA calls."""
+    active_ids = list(state.get("active_target_task_ids") or [])
+    if not active_ids:
+        # A group-id fallback is retained for older orchestrator callers that
+        # predate task-keyed dispatch, but a completely unscoped direct call
+        # must keep its historical full-scan behavior.
+        active_ids = list(state.get("active_target_group_ids") or [])
+    if not active_ids:
+        return None
+
+    task_queue: dict[str, RemediationTask] = dict(state.get("task_queue") or {})
+    groups_by_id = {group.group_id: group for group in groups}
+    targets: list[QAScanTarget] = []
+    for active_id in active_ids:
+        task = task_queue.get(active_id)
+        group_id = task.parent_group_id if task is not None else active_id
+        group = groups_by_id.get(group_id)
+        if group is None:
+            continue
+        target_package = (
+            task.target_package_name
+            if task is not None and task.target_package_name
+            else group.vulnerable_component or ""
+        ).strip()
+        expected_version = task.selected_version if task is not None else None
+        if not expected_version and target_package:
+            expected_version = (group.dependency_versions or {}).get(target_package)
+        if not expected_version and target_package == group.vulnerable_component:
+            expected_version = (group.versions or [None])[0]
+        ancestry = tuple(name for name in (group.dependency_ancestry or []) if name)
+        targets.append(
+            QAScanTarget(
+                task_id=task.task_id if task is not None else active_id,
+                group_id=group.group_id,
+                target_package=target_package,
+                expected_version=expected_version,
+                manifest_paths=_lockfile_paths_for_group(group),
+                dependency_ancestry=ancestry,
+                target_identifiers=frozenset(_group_target_identifiers(group)),
+            )
+        )
+    return targets
+
+
 # ---------------------------------------------------------------------------
 # Path safety helper (used by review tools)
 # ---------------------------------------------------------------------------
@@ -1878,6 +2129,20 @@ class _QAExecutionResults:
     install: tuple[bool, str] | None = None  # (ok, summary)
     scan: Any | None = None  # _SecurityScanResult or legacy tuple
     tests: tuple[bool, str] | None = None  # (ok, summary)
+    scan_evidence: ODCScanEvidence | None = None
+
+
+@dataclass(frozen=True)
+class QAScanTarget:
+    """Task-owned package target and live lockfile context for QA scanning."""
+
+    task_id: str
+    group_id: str
+    target_package: str
+    expected_version: str | None
+    manifest_paths: tuple[str, ...]
+    dependency_ancestry: tuple[str, ...]
+    target_identifiers: frozenset[str]
 
 
 def _scan_result_value(scan_result: Any, field: str, default: Any) -> Any:
@@ -1902,8 +2167,19 @@ def _scan_result_value(scan_result: Any, field: str, default: Any) -> Any:
 def _scan_state_projection(
     results: _QAExecutionResults,
     baseline_identifiers: set[str],
+    *,
+    authoritative: bool = True,
 ) -> dict[str, Any]:
     """Project the scan cache into serializable graph-state fields."""
+    if not authoritative:
+        return {
+            "baseline_scan_identifiers": sorted(baseline_identifiers),
+            "post_remediation_scan_identifiers": [],
+            "post_remediation_scan_issues": [],
+            "new_vulnerability_identifiers": [],
+            "new_vulnerability_status": "not_scanned",
+        }
+
     scan_result = results.scan
     if scan_result is None:
         return {
@@ -2457,11 +2733,191 @@ def _parse_investigation_report(
 # ---------------------------------------------------------------------------
 
 
+def _targeted_extra_args_conflict() -> bool:
+    """Return whether configured ODC arguments override required target paths."""
+    extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
+    if not extra_args:
+        return False
+    try:
+        tokens = shlex.split(extra_args)
+    except ValueError:
+        return True
+    return any(
+        token in {"--scan", "--out"} or token.startswith("--scan=") or token.startswith("--out=")
+        for token in tokens
+    )
+
+
+def _closure_fallback_reason(reason: str | None) -> ScanFallbackReason:
+    """Map pure resolver diagnostics to the typed QA fallback vocabulary."""
+    return {
+        "ambiguous_target": ScanFallbackReason.AMBIGUOUS_TARGET,
+        "incomplete_closure": ScanFallbackReason.INCOMPLETE_CLOSURE,
+        "invalid_lockfile": ScanFallbackReason.INVALID_LOCKFILE,
+    }.get(reason or "", ScanFallbackReason.INCOMPLETE_CLOSURE)
+
+
+def _merge_dependency_closures(
+    source_lockfile: str,
+    closures: Sequence[DependencyClosure],
+) -> DependencyClosure:
+    """Union complete closures from one lockfile without losing physical keys."""
+    node_map = {node.lockfile_key: node for closure in closures for node in closure.nodes}
+    return DependencyClosure(
+        source_lockfile=source_lockfile,
+        root_keys=tuple(sorted({key for closure in closures for key in closure.root_keys})),
+        nodes=tuple(node_map[key] for key in sorted(node_map)),
+        includes_optional=any(closure.includes_optional for closure in closures),
+        includes_peer=any(closure.includes_peer for closure in closures),
+        complete=all(closure.complete for closure in closures),
+        lockfile_version=closures[0].lockfile_version,
+    )
+
+
+def _resolve_targeted_closures(
+    sandbox: DockerSandbox,
+    targets: Sequence[QAScanTarget],
+) -> tuple[list[DependencyClosure], ScanFallbackReason | None, str | None]:
+    """Read live npm lockfiles and resolve the union needed by active tasks."""
+    if not targets:
+        return [], ScanFallbackReason.MISSING_LOCKFILE, "No active task scan targets were supplied."
+
+    by_source: dict[str, list[QAScanTarget]] = {}
+    for target in targets:
+        if not target.manifest_paths:
+            return (
+                [],
+                ScanFallbackReason.MISSING_LOCKFILE,
+                (f"Task {target.task_id} has no supported lockfile path."),
+            )
+        for source_lockfile in target.manifest_paths:
+            source_lockfile = _validate_qa_path(source_lockfile)
+            if Path(source_lockfile).name.lower() != "package-lock.json":
+                return (
+                    [],
+                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                    (f"Task {target.task_id} uses unsupported lockfile {source_lockfile}."),
+                )
+            by_source.setdefault(source_lockfile, []).append(target)
+
+    merged: list[DependencyClosure] = []
+    for source_lockfile, source_targets in sorted(by_source.items()):
+        raw_lockfile = sandbox.read_file(source_lockfile)
+        if raw_lockfile is None:
+            return (
+                [],
+                ScanFallbackReason.MISSING_LOCKFILE,
+                (f"Live workspace lockfile {source_lockfile} could not be read."),
+            )
+        try:
+            lockfile = json.loads(raw_lockfile)
+        except (TypeError, json.JSONDecodeError) as exc:
+            return (
+                [],
+                ScanFallbackReason.INVALID_LOCKFILE,
+                (f"Live workspace lockfile {source_lockfile} is not valid JSON: {exc}"),
+            )
+        packages = lockfile.get("packages") if isinstance(lockfile, Mapping) else None
+        lockfile_version = (
+            lockfile.get("lockfileVersion") if isinstance(lockfile, Mapping) else None
+        )
+        if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
+            return (
+                [],
+                ScanFallbackReason.INVALID_LOCKFILE,
+                (f"Live workspace lockfile {source_lockfile} lacks a supported packages map."),
+            )
+
+        closures: list[DependencyClosure] = []
+        for target in source_targets:
+            closure = resolve_dependency_closure(
+                packages,
+                source_lockfile=source_lockfile,
+                target_package=target.target_package,
+                target_version=target.expected_version,
+                dependency_ancestry=target.dependency_ancestry,
+                include_optional=True,
+                include_peer=True,
+                lockfile_version=lockfile_version,
+            )
+            if not closure.complete:
+                return (
+                    [],
+                    _closure_fallback_reason(closure.fallback_reason),
+                    (
+                        f"Task {target.task_id} closure failed for {source_lockfile}: "
+                        f"{closure.fallback_reason or 'unknown reason'}"
+                    ),
+                )
+            closures.append(closure)
+        merged.append(_merge_dependency_closures(source_lockfile, closures))
+    return merged, None, None
+
+
+def _write_targeted_artifacts(
+    sandbox: DockerSandbox,
+    closures: Sequence[DependencyClosure],
+) -> tuple[str, list[str], list[str]]:
+    """Write synthetic package roots and return scan path plus closure metadata."""
+    targeted_subdir = ".odc-targeted"
+    package_names: set[str] = set()
+    lockfile_keys: set[str] = set()
+    for index, closure in enumerate(closures):
+        artifacts = build_sliced_lockfile_artifacts(closure)
+        subdir = f"{targeted_subdir}/{index:03d}"
+        for filename, content in artifacts.items():
+            sandbox.write_file(_validate_qa_path(f"{subdir}/{filename}"), content)
+        package_names.update(node.package_name for node in closure.nodes)
+        lockfile_keys.update(node.lockfile_key for node in closure.nodes)
+    return targeted_subdir, sorted(package_names), sorted(lockfile_keys)
+
+
+def _cleanup_targeted_artifacts(sandbox: DockerSandbox) -> None:
+    """Remove the fixed temporary targeted-scan directory from the workspace."""
+    try:
+        sandbox.run("rm -rf -- .odc-targeted", timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: targeted artifact cleanup failed — %s", exc)
+
+
+def _scan_evidence(
+    *,
+    targets: Sequence[QAScanTarget],
+    scan_result: Any,
+    effective_scope: ScanScope,
+    complete: bool,
+    fallback_reason: ScanFallbackReason | None = None,
+    closures: Sequence[DependencyClosure] = (),
+) -> ODCScanEvidence:
+    """Build typed, attempt-local ODC evidence from a scan result."""
+    return ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=effective_scope,
+        authoritative=False,
+        covered_task_ids=sorted({target.task_id for target in targets}),
+        closure_package_names=sorted(
+            {node.package_name for closure in closures for node in closure.nodes}
+        ),
+        closure_lockfile_keys=sorted(
+            {node.lockfile_key for closure in closures for node in closure.nodes}
+        ),
+        found_identifiers=sorted(
+            _scan_result_value(scan_result, "found_identifiers", set()) or set()
+        ),
+        remaining_target_identifiers=sorted(
+            _scan_result_value(scan_result, "remaining_identifiers", set()) or set()
+        ),
+        complete=complete,
+        fallback_reason=fallback_reason,
+    )
+
+
 def _run_global_execution(
     sandbox: DockerSandbox,
     workspace_volume: str,
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
+    scan_targets: Sequence[QAScanTarget] | None = None,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -2476,16 +2932,107 @@ def _run_global_execution(
     install_ok, _ = results.install
 
     logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
-    if baseline_identifiers is None:
-        # Preserve the legacy helper call shape for direct callers that do not
-        # provide a pre-remediation baseline.
-        results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+    scan_started = time.monotonic()
+    if scan_targets is None:
+        if baseline_identifiers is None:
+            # Preserve the legacy helper call shape for direct callers that do not
+            # provide a pre-remediation baseline.
+            results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+        else:
+            results.scan = _run_security_scan(
+                sandbox,
+                workspace_volume,
+                target_identifiers,
+                baseline_identifiers,
+            )
     else:
-        results.scan = _run_security_scan(
-            sandbox,
-            workspace_volume,
-            target_identifiers,
-            baseline_identifiers,
+        baseline = baseline_identifiers or target_identifiers
+        closures: list[DependencyClosure] = []
+        targeted_subdir: str | None = None
+        fallback_reason: ScanFallbackReason | None = None
+        try:
+            if _targeted_extra_args_conflict():
+                fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+            else:
+                closures, fallback_reason, resolution_detail = _resolve_targeted_closures(
+                    sandbox,
+                    scan_targets,
+                )
+                if resolution_detail:
+                    logger.info("qa_critic: targeted scan fallback: %s", resolution_detail)
+            if fallback_reason is None:
+                targeted_subdir = ".odc-targeted"
+                _write_targeted_artifacts(sandbox, closures)
+                targeted_result = _run_targeted_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline,
+                    targeted_subdir,
+                )
+                if (
+                    not targeted_result.ok
+                    and not targeted_result.found_identifiers
+                    and not targeted_result.remaining_identifiers
+                ):
+                    fallback_reason = (
+                        ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
+                        if "report" in targeted_result.summary.lower()
+                        else ScanFallbackReason.TARGETED_SCAN_FAILED
+                    )
+                else:
+                    results.scan = targeted_result
+                    results.scan_evidence = _scan_evidence(
+                        targets=scan_targets,
+                        scan_result=targeted_result,
+                        effective_scope=ScanScope.TARGETED,
+                        complete=True,
+                        closures=closures,
+                    )
+        except (ClosureResolutionError, OSError, RuntimeError, ValueError) as exc:
+            logger.warning("qa_critic: targeted scan setup failed — %s", exc)
+            fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+        finally:
+            if targeted_subdir is not None:
+                _cleanup_targeted_artifacts(sandbox)
+
+        if fallback_reason is not None:
+            if baseline_identifiers is None:
+                results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+            else:
+                results.scan = _run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline,
+                )
+            results.scan_evidence = _scan_evidence(
+                targets=scan_targets,
+                scan_result=results.scan,
+                effective_scope=ScanScope.FULL,
+                complete=False,
+                fallback_reason=fallback_reason,
+                closures=closures,
+            )
+
+    if results.scan_evidence is not None:
+        logger.info(
+            "qa_critic: scan requested_scope=%s effective_scope=%s tasks=%d closure_packages=%d "
+            "fallback_reason=%s duration_seconds=%.3f",
+            results.scan_evidence.requested_scope.value,
+            results.scan_evidence.effective_scope.value,
+            len(results.scan_evidence.covered_task_ids),
+            len(results.scan_evidence.closure_package_names),
+            results.scan_evidence.fallback_reason.value
+            if results.scan_evidence.fallback_reason
+            else None,
+            time.monotonic() - scan_started,
+        )
+    else:
+        logger.info(
+            "qa_critic: scan requested_scope=full effective_scope=full tasks=0 "
+            "closure_packages=0 fallback_reason=None duration_seconds=%.3f",
+            time.monotonic() - scan_started,
         )
 
     logger.info("qa_critic: [Step 0] running unit tests.")
@@ -3536,6 +4083,19 @@ def _attach_failure_evidence_to_evaluations(
     return enriched
 
 
+def _attach_scan_evidence_to_evaluations(
+    evaluations: dict[str, QAEvaluation],
+    evidence: ODCScanEvidence | None,
+) -> dict[str, QAEvaluation]:
+    """Attach the same attempt-local scan evidence to each QA evaluation."""
+    if evidence is None:
+        return evaluations
+    return {
+        group_id: evaluation.model_copy(update={"scan_evidence": evidence})
+        for group_id, evaluation in evaluations.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # QA agent system prompt (backcompat â€” used by legacy _run_investigator_phase)
 # ---------------------------------------------------------------------------
@@ -4011,7 +4571,13 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     )
     candidate_changed_files: list[str] = state.get("changed_files") or []
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
-    unscanned_projection = _scan_state_projection(_QAExecutionResults(), baseline_identifiers)
+    scan_targets = _build_qa_scan_targets(state, valid_groups)
+    scan_is_authoritative = scan_targets is None
+    unscanned_projection = _scan_state_projection(
+        _QAExecutionResults(),
+        baseline_identifiers,
+        authoritative=scan_is_authoritative,
+    )
 
     if not valid_groups and not state.get("force_qa"):
         logger.info("qa_critic: no valid groups - skipping QA.")
@@ -4068,8 +4634,13 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 workspace_volume=workspace_volume,
                 target_identifiers=target_identifiers,
                 baseline_identifiers=baseline_identifiers,
+                scan_targets=scan_targets,
             )
-            scan_projection = _scan_state_projection(results, baseline_identifiers)
+            scan_projection = _scan_state_projection(
+                results,
+                baseline_identifiers,
+                authoritative=scan_is_authoritative,
+            )
 
             # ------------------------------------------------------------------
             # Pipeline completeness guard
@@ -4105,6 +4676,10 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     )
                     for group in valid_groups
                 }
+                failed_evals = _attach_scan_evidence_to_evaluations(
+                    failed_evals,
+                    results.scan_evidence,
+                )
                 return {
                     "qa_evaluations": failed_evals,
                     "eval_status": "failures_detected",
@@ -4112,6 +4687,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     "errors": errors,
                     "changed_files": [],
                     "qa_investigation_report": "",
+                    "scan_evidence": results.scan_evidence,
                     **scan_projection,
                 }
 
@@ -4190,6 +4766,10 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         state,
         deterministic_evidence=deterministic_test_evidence,
     )
+    qa_evaluations = _attach_scan_evidence_to_evaluations(
+        qa_evaluations,
+        results.scan_evidence,
+    )
 
     all_passed = all(evaluation.passed for evaluation in qa_evaluations.values())
     eval_status = "all_passed" if all_passed else "failures_detected"
@@ -4213,5 +4793,107 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         "changed_files": candidate_changed_files,
         "errors": errors,
         "qa_investigation_report": qa_investigation_report,
+        "scan_evidence": results.scan_evidence,
         **scan_projection,
+    }
+
+
+@traceable(name="final_full_scan")
+def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
+    """Run the authoritative full ODC scan immediately before teardown."""
+    workspace_volume = state.get("workspace_volume")
+    groups: list[VulnerabilityGroup] = list(state.get("valid_groups") or [])
+    baseline = _collect_baseline_identifiers(state, groups)
+    target_identifiers = _collect_target_identifiers(groups)
+    if not workspace_volume:
+        error = "final_full_scan: workspace_volume is missing."
+        result = FinalFullScanResult(
+            completed=False,
+            found_identifiers=[],
+            remaining_target_identifiers=[],
+            new_identifiers=[],
+            status="scan_failed",
+            triage_required=False,
+            error=error,
+        )
+        return {
+            "final_full_scan_result": result,
+            "final_full_scan_completed": True,
+            "new_vulnerability_status": "scan_failed",
+            "triage_required": False,
+            "status": "final_scan_failed",
+            "errors": [error],
+        }
+
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            scan = _run_security_scan(
+                sandbox,
+                workspace_volume,
+                target_identifiers,
+                baseline,
+            )
+    except RuntimeError as exc:
+        error = f"final_full_scan: Docker sandbox unavailable - {exc}"
+        result = FinalFullScanResult(
+            completed=False,
+            found_identifiers=[],
+            remaining_target_identifiers=[],
+            new_identifiers=[],
+            status="scan_failed",
+            triage_required=False,
+            error=error,
+        )
+        return {
+            "final_full_scan_result": result,
+            "final_full_scan_completed": True,
+            "new_vulnerability_status": "scan_failed",
+            "triage_required": False,
+            "status": "final_scan_failed",
+            "errors": [error],
+        }
+
+    found = sorted(scan.found_identifiers)
+    remaining = sorted(scan.remaining_identifiers)
+    new_identifiers = sorted(scan.new_identifiers)
+    hard_failure = not scan.ok and not scan.found_identifiers and not scan.remaining_identifiers
+    status = (
+        "scan_failed"
+        if hard_failure
+        else "detected"
+        if new_identifiers
+        else "unresolved"
+        if remaining
+        else "none"
+    )
+    triage_required = bool(new_identifiers or remaining)
+    result = FinalFullScanResult(
+        completed=not hard_failure,
+        found_identifiers=found,
+        remaining_target_identifiers=remaining,
+        new_identifiers=new_identifiers,
+        found_issues=list(scan.found_issues),
+        status=status,
+        triage_required=triage_required,
+        error=scan.summary if hard_failure else None,
+    )
+    logger.info(
+        "final_full_scan: completed=%s found=%d remaining=%d new=%d triage_required=%s",
+        result.completed,
+        len(found),
+        len(remaining),
+        len(new_identifiers),
+        triage_required,
+    )
+    return {
+        "final_full_scan_result": result,
+        "final_full_scan_completed": True,
+        "baseline_scan_identifiers": sorted(baseline),
+        "post_remediation_scan_identifiers": found,
+        "post_remediation_scan_issues": list(scan.found_issues),
+        "new_vulnerability_identifiers": new_identifiers,
+        "new_vulnerability_status": status,
+        "triage_required": triage_required,
+        "status": "final_scan_completed" if not hard_failure else "final_scan_failed",
+        "errors": [scan.summary] if hard_failure else [],
     }

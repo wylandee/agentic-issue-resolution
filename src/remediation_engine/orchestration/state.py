@@ -29,9 +29,11 @@ from typing_extensions import TypedDict
 from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
+    FinalFullScanResult,
     FixPlanStatus,
     GroupRemediationStatus,
     NoFixMitigationStage,
+    ODCScanEvidence,
     QAAttemptResult,
     QAEvaluation,
     RemediationTask,
@@ -359,6 +361,7 @@ class OrchestratorState(TypedDict, total=False):
     attempt_snapshots_by_id: Annotated[dict[str, TaskAttemptSnapshot], merge_dict_reducer]
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
+    scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
     consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
@@ -386,6 +389,8 @@ class OrchestratorState(TypedDict, total=False):
     post_remediation_scan_issues: list[VulnerabilityIssue]
     new_vulnerability_identifiers: list[str]
     new_vulnerability_status: str
+    final_full_scan_result: FinalFullScanResult | None
+    final_full_scan_completed: bool
     triage_required: bool
     initial_triage_status: str
     initial_triage_executed: bool
@@ -459,6 +464,7 @@ def initial_orchestrator_state(
         "attempt_snapshots_by_id": {},
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
+        "scan_evidence_by_task": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],
         "consistency_events": [],
@@ -480,6 +486,8 @@ def initial_orchestrator_state(
         "post_remediation_scan_issues": [],
         "new_vulnerability_identifiers": [],
         "new_vulnerability_status": "not_scanned",
+        "final_full_scan_result": None,
+        "final_full_scan_completed": False,
         "triage_required": False,
         "initial_triage_status": "pending",
         "initial_triage_executed": False,

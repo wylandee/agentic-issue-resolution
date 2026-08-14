@@ -10,6 +10,7 @@ scanner report -> ingest -> triage/group/enrich -> supervisor
                                              |        +--> update worker
                                              |        +--> workaround worker
                                              |        +--> QA critic
+                                             |        +--> final full ODC scan
                                              v
                                         teardown -> patch result
 ```
@@ -24,6 +25,32 @@ The host repository is never edited by the public API or CLI. Results contain a
 unified diff and changed-file list so a caller can review and apply the patch
 through its own workflow. Trajectory files are written only when configured by
 `REMEDIATION_TRAJECTORY_DIR`.
+
+## QA scan authority
+
+QA keeps install and full test execution per task. For supported npm
+`package-lock.json` workspaces, it may resolve the active task's target from
+the live Docker workspace after install, build a temporary exact-key closure,
+and run a targeted ODC scan. Nested package keys, optional/peer edges, and
+dependency ancestry are preserved by the pure resolver in
+`tools/lockfile_closure.py`. Unsupported package managers, missing or
+ambiguous lockfiles, incomplete closures, and targeted scan/report failures
+fall back to the existing full ODC scan.
+
+Per-task scan evidence is attempt-local and non-authoritative. It is attached
+to `QAEvaluation` and stored by task, but it cannot update repo-wide scan
+projections or trigger post-QA triage. Before teardown, the Supervisor must
+route a terminal workspace through one authoritative full ODC scan:
+
+```text
+supervisor -> final_full_scan -> supervisor -> teardown
+```
+
+If that scan finds unresolved target identifiers or newly introduced
+vulnerabilities, the existing triage node reopens only retryable work. A new
+terminal cycle resets the final-scan gate. Docker volumes and temporary
+targeted artifacts remain owned by the runtime/QA lifecycle and are removed
+on teardown or the targeted-scan cleanup path.
 
 ## Package boundaries
 

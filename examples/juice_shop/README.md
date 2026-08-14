@@ -12,6 +12,21 @@ This directory contains the maintained end-to-end examples for remediating OWASP
 
 Note: All execution scripts run against isolated Docker volumes. The host clone is never edited.
 
+### QA scan behavior
+
+During normal task QA, the engine keeps `npm install` and the full test phase
+unchanged. Supported npm lockfiles may use a temporary task-targeted ODC
+closure read from the live Docker workspace after install. Yarn, pnpm,
+ambiguous or incomplete npm closures, and targeted ODC/report failures use the
+existing full-scan fallback. Targeted evidence is attempt-local; it does not
+represent the repository-wide security state.
+
+Every terminal remediation cycle with a workspace then runs one authoritative
+full ODC scan before teardown. Findings from that scan can route the workflow
+back through Supervisor-owned post-QA triage. Temporary targeted files are
+removed before tests/final scanning, and Docker volume cleanup remains part of
+teardown.
+
 ---
 
 ## Example Scenarios
