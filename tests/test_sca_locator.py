@@ -761,6 +761,63 @@ class TestLocateDependency:
         assert result["parent_manifest_line"] is not None
         assert '"sqlite3": "^5.1.7"' in result["parent_manifest_snippet"]
 
+    def test_expands_compressed_odc_ancestry_from_npm_lockfile(self, tmp_repo):
+        package_json = json.loads((tmp_repo / "package.json").read_text())
+        package_json["dependencies"]["sqlite3"] = "^5.1.7"
+        (tmp_repo / "package.json").write_text(json.dumps(package_json, indent=2))
+        (tmp_repo / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"dependencies": {"sqlite3": "^5.1.7"}},
+                        "node_modules/sqlite3": {
+                            "version": "5.1.7",
+                            "optionalDependencies": {"node-gyp": "8.x"},
+                        },
+                        "node_modules/sqlite3/node_modules/node-gyp": {
+                            "version": "8.4.1",
+                            "dependencies": {"make-fetch-happen": "^9.1.0"},
+                        },
+                        "node_modules/sqlite3/node_modules/make-fetch-happen": {
+                            "version": "9.1.0",
+                            "dependencies": {"http-proxy-agent": "^4.0.1"},
+                        },
+                        "node_modules/sqlite3/node_modules/http-proxy-agent": {
+                            "version": "4.0.1",
+                            "dependencies": {"@tootallnate/once": "1"},
+                        },
+                        "node_modules/@tootallnate/once": {"version": "1.1.2"},
+                    },
+                }
+            )
+        )
+
+        result = locate_dependency(
+            repo_path=tmp_repo,
+            raw_dependency_name="@tootallnate/once:1.1.2",
+            odc_file_path=(
+                "/src/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/"
+                "@tootallnate/once:1.1.2"
+            ),
+        )
+
+        assert result["dependency_ancestry"] == [
+            "sqlite3",
+            "node-gyp",
+            "make-fetch-happen",
+            "http-proxy-agent",
+            "@tootallnate/once",
+        ]
+        assert result["dependency_versions"] == {
+            "sqlite3": "5.1.7",
+            "node-gyp": "8.4.1",
+            "make-fetch-happen": "9.1.0",
+            "http-proxy-agent": "4.0.1",
+            "@tootallnate/once": "1.1.2",
+        }
+        assert result["parent_package_name"] == "sqlite3"
+
     def test_package_manager_detected(self, tmp_repo_yarn):
         result = locate_dependency(
             repo_path=tmp_repo_yarn,

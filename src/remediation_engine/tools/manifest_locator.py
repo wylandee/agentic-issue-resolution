@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote  # noqa: F401 â€” kept for callers that may use it
 
+from semantic_version import NpmSpec, Version
+
 from remediation_engine.contracts import (
     LocalizedIssue,
     VulnerabilityIssue,
@@ -459,6 +461,214 @@ def _run_package_lock_generation(repo_path: Path) -> None:
         log.error("npm not found on PATH")
 
 
+def _lockfile_dependency_requirements(metadata: dict[str, Any]) -> dict[str, str]:
+    """Return dependency ranges declared by one npm lockfile package entry.
+
+    Args:
+        metadata: One entry from the npm lockfile ``packages`` mapping.
+
+    Returns:
+        Dependency names mapped to their declared npm ranges.
+    """
+    requirements: dict[str, str] = {}
+    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
+        values = metadata.get(field)
+        if not isinstance(values, dict):
+            continue
+        for package_name, requirement in values.items():
+            if isinstance(package_name, str) and isinstance(requirement, str):
+                requirements[package_name] = requirement
+    return requirements
+
+
+def _lockfile_package_candidates(
+    packages: dict[str, Any],
+    parent_key: str,
+    package_name: str,
+    requirement: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Resolve one dependency from an npm lockfile ``packages`` graph.
+
+    npm checks a package-local ``node_modules`` directory and then walks
+    outward toward the repository root. Reproducing that lookup lets the
+    locator recover logical dependency edges even when the scanner path only
+    reflects physical package nesting.
+
+    Args:
+        packages: npm lockfile ``packages`` mapping.
+        parent_key: Lockfile key for the package declaring the dependency.
+        package_name: Dependency name to resolve.
+        requirement: npm range declared by the parent.
+
+    Returns:
+        Matching ``(package_key, metadata)`` pairs in npm resolution order.
+    """
+    parent_parts = [part for part in parent_key.split("/") if part]
+    scopes: list[list[str]] = [parent_parts + ["node_modules"]]
+    for index in range(len(parent_parts) - 1, -1, -1):
+        if parent_parts[index] == "node_modules":
+            scopes.append(parent_parts[: index + 1])
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    seen_keys: set[str] = set()
+    for scope in scopes:
+        key = "/".join([*scope, package_name])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        metadata = packages.get(key)
+        if not isinstance(metadata, dict):
+            continue
+        version_text = str(metadata.get("version") or "").strip()
+        if not version_text:
+            continue
+        try:
+            if not NpmSpec(requirement).match(Version(version_text)):
+                continue
+        except (TypeError, ValueError):
+            # Non-semver specs such as aliases and workspace ranges cannot be
+            # evaluated safely here. Keep an exact resolved-version match but
+            # otherwise leave the scanner path unchanged.
+            if requirement.strip() != version_text:
+                continue
+        candidates.append((key, metadata))
+    return candidates
+
+
+def _expand_npm_lockfile_ancestry(
+    lockfile_path: Path,
+    ancestry: list[tuple[str, str | None]],
+) -> list[tuple[str, str | None]]:
+    """Expand compressed ODC ancestry using npm lockfile dependency edges.
+
+    Dependency-Check paths can omit logical package edges when npm hoists or
+    nests the resolved package. The registry parent planner needs the logical
+    chain because it evaluates each published dependency range in sequence.
+
+    Args:
+        lockfile_path: Path to the npm ``package-lock.json``.
+        ancestry: Scanner-supplied path from the direct parent to the leaf.
+
+    Returns:
+        The reconstructed logical ancestry, or the original path when the
+        lockfile cannot provide a deterministic expansion.
+    """
+    if len(ancestry) < 2 or not lockfile_path.is_file():
+        return ancestry
+
+    lockfile = _read_json_file(lockfile_path)
+    packages = lockfile.get("packages")
+    if not isinstance(packages, dict):
+        return ancestry
+
+    parent_name, parent_version = ancestry[0]
+    leaf_name, leaf_version = ancestry[-1]
+    parent_key = f"node_modules/{parent_name}"
+    parent_metadata = packages.get(parent_key)
+    if not isinstance(parent_metadata, dict):
+        return ancestry
+    if parent_version and str(parent_metadata.get("version")) != parent_version:
+        return ancestry
+
+    hint_names = [name for name, _ in ancestry]
+    hint_versions = {name: version for name, version in ancestry if version}
+    queue: list[tuple[str, list[tuple[str, str | None]], int]] = [
+        (parent_key, [(parent_name, parent_version)], 1)
+    ]
+    visited: set[tuple[str, int]] = set()
+
+    while queue:
+        current_key, current_path, hint_index = queue.pop(0)
+        visit_key = (current_key, hint_index)
+        if visit_key in visited:
+            continue
+        visited.add(visit_key)
+
+        current_metadata = packages.get(current_key)
+        if not isinstance(current_metadata, dict):
+            continue
+        requirements = _lockfile_dependency_requirements(current_metadata)
+        for dependency_name in sorted(requirements):
+            requirement = requirements[dependency_name]
+            for child_key, child_metadata in _lockfile_package_candidates(
+                packages,
+                current_key,
+                dependency_name,
+                requirement,
+            ):
+                child_version = str(child_metadata.get("version") or "") or None
+                next_hint_index = hint_index
+                if (
+                    next_hint_index < len(hint_names)
+                    and dependency_name == hint_names[next_hint_index]
+                    and (
+                        not hint_versions.get(dependency_name)
+                        or hint_versions[dependency_name] == child_version
+                    )
+                ):
+                    next_hint_index += 1
+
+                child_path = [*current_path, (dependency_name, child_version)]
+                if (
+                    dependency_name == leaf_name
+                    and (not leaf_version or child_version == leaf_version)
+                    and next_hint_index == len(hint_names)
+                ):
+                    return child_path
+
+                queue.append((child_key, child_path, next_hint_index))
+
+    return ancestry
+
+
+def expand_dependency_ancestry_from_repository(
+    repo_root: Path,
+    manifest_file: str | None,
+    odc_file_path: str,
+    dependency_ancestry: list[str],
+    dependency_versions: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    """Expand a localized dependency ancestry using a repository lockfile.
+
+    This boundary helper also supports pre-triaged groups, whose localized
+    records may bypass :func:`locate_from_issue` before entering Phase 5.
+
+    Args:
+        repo_root: Absolute repository root containing the manifest.
+        manifest_file: Repository-relative or absolute manifest path.
+        odc_file_path: Scanner file path containing lockfile ancestry notation.
+        dependency_ancestry: Package names supplied by localization or a
+            preprocessed group.
+        dependency_versions: Resolved versions keyed by package name.
+
+    Returns:
+        A possibly expanded ``(ancestry, versions)`` pair. If the lockfile is
+        unavailable or cannot provide a deterministic path, the supplied data
+        is returned unchanged.
+    """
+    lockfile_rel, _, _ = parse_lockfile_path(odc_file_path)
+    lockfile_name = Path(lockfile_rel).name if lockfile_rel else ""
+    if lockfile_name.lower() != "package-lock.json":
+        return list(dependency_ancestry), dict(dependency_versions)
+
+    manifest_path = Path(manifest_file) if manifest_file else repo_root / "package.json"
+    if not manifest_path.is_absolute():
+        manifest_path = repo_root / manifest_path
+    supplied_pairs = [(name, dependency_versions.get(name)) for name in dependency_ancestry if name]
+    parsed_pairs = parse_dependency_ancestry(odc_file_path)
+    if parsed_pairs and [name for name, _ in parsed_pairs] == dependency_ancestry:
+        supplied_pairs = parsed_pairs
+
+    expanded = _expand_npm_lockfile_ancestry(
+        manifest_path.parent / lockfile_name,
+        supplied_pairs,
+    )
+    return (
+        [name for name, _ in expanded],
+        {name: version for name, version in expanded if version},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core locator logic
 # ---------------------------------------------------------------------------
@@ -572,14 +782,24 @@ def locate_dependency(
             "package_name": effective_name,
         }
 
+    # ODC may report the physical lockfile nesting rather than every logical
+    # dependency edge. Expand npm paths from the lockfile when possible so the
+    # parent-version planner receives a complete chain. The raw scanner path
+    # remains available through ``lockfile_ancestry`` for diagnostics.
+    ancestry_names, dependency_versions = expand_dependency_ancestry_from_repository(
+        repo_path,
+        str(manifest_path),
+        odc_file_path,
+        [name for name, _ in dependency_ancestry],
+        {name: version for name, version in dependency_ancestry if version},
+    )
+
     # 3. Detect package manager
     pkg_manager = detect_package_manager(manifest_path.parent)
 
     # 4. Locate in manifest (pure localization â€” no fix planning)
     location = _locate_in_manifest(manifest_path, effective_name, pkg_manager)
     direct_declarations = location.pop("direct_declarations", {})
-    ancestry_names = [name for name, _ in dependency_ancestry]
-    dependency_versions = {name: version for name, version in dependency_ancestry if version}
     parent_name: str | None = None
     parent_version: str | None = None
     parent_declaration_type: str | None = None

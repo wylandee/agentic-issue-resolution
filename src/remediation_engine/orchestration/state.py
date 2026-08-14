@@ -49,6 +49,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
+from remediation_engine.tools.manifest_locator import expand_dependency_ancestry_from_repository
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -175,12 +176,35 @@ def normalize_group_paths(
     for group in groups:
         replacements: dict[str, str] = {}
         localized_issues = []
+        expanded_group_ancestry = list(group.dependency_ancestry)
+        expanded_group_versions = dict(group.dependency_versions)
         for localized in group.localized_issues or []:
             old = localized.manifest_file
             new = _repo_relative_path(old, repo_root)
             if old and old != new:
                 replacements[str(old)] = new or "unknown-manifest"
-            localized_issues.append(localized.model_copy(update={"manifest_file": new}))
+            odc_file_path = localized.issue.file_path or (localized.issue.raw_payload or {}).get(
+                "filePath", ""
+            )
+            ancestry, versions = expand_dependency_ancestry_from_repository(
+                Path(repo_root),
+                new or old,
+                odc_file_path,
+                localized.dependency_ancestry,
+                localized.dependency_versions,
+            )
+            localized_updates: dict[str, Any] = {"manifest_file": new}
+            if ancestry != localized.dependency_ancestry:
+                localized_updates.update(
+                    {
+                        "dependency_ancestry": ancestry,
+                        "dependency_versions": versions,
+                    }
+                )
+                if expanded_group_ancestry == list(group.dependency_ancestry):
+                    expanded_group_ancestry = ancestry
+                    expanded_group_versions = versions
+            localized_issues.append(localized.model_copy(update=localized_updates))
 
         file_paths: list[str] = []
         for path in group.file_paths or []:
@@ -211,6 +235,8 @@ def normalize_group_paths(
             and file_path == group.file_path
             and file_paths == list(group.file_paths or [])
             and localized_issues == list(group.localized_issues or [])
+            and expanded_group_ancestry == list(group.dependency_ancestry)
+            and expanded_group_versions == dict(group.dependency_versions)
             and fix_plan is group.fix_plan
         ):
             # Keep object identity for already-canonical groups.  Some graph
@@ -224,6 +250,8 @@ def normalize_group_paths(
                     "file_path": file_path,
                     "file_paths": file_paths,
                     "localized_issues": localized_issues,
+                    "dependency_ancestry": expanded_group_ancestry,
+                    "dependency_versions": expanded_group_versions,
                     "fix_plan": fix_plan,
                 }
             )

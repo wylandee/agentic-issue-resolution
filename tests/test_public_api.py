@@ -158,6 +158,94 @@ def test_graph_group_paths_are_repo_relative(tmp_path: Path) -> None:
     assert str(tmp_path).replace("\\", "/") not in normalized.group_id
 
 
+def test_preprocessed_groups_expand_compressed_npm_ancestry(tmp_path: Path) -> None:
+    """Cached groups receive complete ancestry before Supervisor planning."""
+    package_json = {
+        "name": "fixture-app",
+        "version": "1.0.0",
+        "dependencies": {"sqlite3": "^5.1.7"},
+    }
+    (tmp_path / "package.json").write_text(json.dumps(package_json), encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {"sqlite3": "^5.1.7"}},
+                    "node_modules/sqlite3": {
+                        "version": "5.1.7",
+                        "optionalDependencies": {"node-gyp": "8.x"},
+                    },
+                    "node_modules/sqlite3/node_modules/node-gyp": {
+                        "version": "8.4.1",
+                        "dependencies": {"make-fetch-happen": "^9.1.0"},
+                    },
+                    "node_modules/sqlite3/node_modules/make-fetch-happen": {
+                        "version": "9.1.0",
+                        "dependencies": {"http-proxy-agent": "^4.0.1"},
+                    },
+                    "node_modules/sqlite3/node_modules/http-proxy-agent": {
+                        "version": "4.0.1",
+                        "dependencies": {"@tootallnate/once": "1"},
+                    },
+                    "node_modules/@tootallnate/once": {"version": "1.1.2"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        package_name="@tootallnate/once",
+        package_version="1.1.2",
+        file_path="/src/package-lock.json?sqlite3:5.1.7/http-proxy-agent:4.0.1/@tootallnate/once:1.1.2",
+    )
+    compressed_ancestry = ["sqlite3", "http-proxy-agent", "@tootallnate/once"]
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        is_direct_dependency=False,
+        dependency_ancestry=compressed_ancestry,
+        dependency_versions={
+            "sqlite3": "5.1.7",
+            "http-proxy-agent": "4.0.1",
+            "@tootallnate/once": "1.1.2",
+        },
+        parent_package_name="sqlite3",
+        parent_package_version="5.1.7",
+        parent_declaration_type="dependencies",
+    )
+    group = VulnerabilityGroup(
+        group_id="sca:package.json:@tootallnate/once:UPDATE_VERSION",
+        issue_type=IssueType.SCA,
+        vulnerable_component="@tootallnate/once",
+        file_path="package.json",
+        dependency_ancestry=compressed_ancestry,
+        dependency_versions=localized.dependency_versions,
+        parent_package_name="sqlite3",
+        parent_package_version="5.1.7",
+        parent_declaration_type="dependencies",
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[localized],
+    )
+
+    normalized = normalize_group_paths([group], str(tmp_path))[0]
+
+    expected_ancestry = [
+        "sqlite3",
+        "node-gyp",
+        "make-fetch-happen",
+        "http-proxy-agent",
+        "@tootallnate/once",
+    ]
+    assert normalized.dependency_ancestry == expected_ancestry
+    assert normalized.localized_issues[0].dependency_ancestry == expected_ancestry
+    assert normalized.parent_package_name == "sqlite3"
+
+
 def test_cli_exposes_ingest_triage_and_run_commands() -> None:
     """The CLI parser keeps the three supported operational commands."""
     parser = build_parser()
