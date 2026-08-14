@@ -2682,12 +2682,16 @@ def build_qa_toolbelt(
         return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
 
     @tool
-    def search_codebase_pattern(root_dir: str = ".", pattern: str = "") -> str:
+    def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
         """Search the workspace after the fixed QA pipeline has completed."""
         review_error = _review_ready_error(results)
         if review_error:
             return review_error
-        return str(search_tool.invoke({"root_dir": root_dir, "pattern": pattern}))
+        return str(
+            search_tool.invoke(
+                {"search_pattern": search_pattern, "target_directory": target_directory}
+            )
+        )
 
     @tool
     def inspect_ast_symbol(file_path: str, symbol_name: str) -> str:
@@ -2810,12 +2814,16 @@ def build_qa_review_toolbelt(
         return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
 
     @tool
-    def search_codebase_pattern(root_dir: str = ".", pattern: str = "") -> str:
+    def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
         """Search the workspace for a regex pattern in source files."""
         review_error = _review_ready_error(results)
         if review_error:
             return review_error
-        return str(search_tool.invoke({"root_dir": root_dir, "pattern": pattern}))
+        return str(
+            search_tool.invoke(
+                {"search_pattern": search_pattern, "target_directory": target_directory}
+            )
+        )
 
     @tool
     def inspect_ast_symbol(file_path: str, symbol_name: str) -> str:

@@ -643,6 +643,76 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
 
+    def test_qa_terminalization_clears_attempt_projection_without_repair_events(self):
+        g1 = _sca_group("g1")
+        instruction = "Pin test-pkg through the package manager override."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa-pass",
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            target_dependency_type="overrides",
+            instruction=instruction,
+            instruction_digest=_instruction_digest(instruction),
+            dispatch_node="update_subagent",
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "target_dependency_type": snapshot.target_dependency_type,
+                "instruction": instruction,
+            }
+        )
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            qa_results_by_attempt={
+                snapshot.attempt_id: QAAttemptResult(
+                    attempt_id=snapshot.attempt_id,
+                    task_id="task-1",
+                    task_revision=1,
+                    evaluation=QAEvaluation(task_id="task-1", passed=True),
+                )
+            },
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+                    selected_version="1.2.3",
+                    target_package_name="test-pkg",
+                    target_dependency_type="overrides",
+                    attempted_versions=["1.2.3"],
+                    attempted_versions_by_target={"test-pkg": ["1.2.3"]},
+                    used_overrides=True,
+                )
+            },
+        )
+
+        result = run_supervisor_node(state)
+
+        committed = result["task_queue"]["task-1"]
+        assert committed.status == TaskStatus.QA_PASSED
+        assert committed.current_attempt_id is None
+        assert committed.selected_version is None
+        diagnostics = result["retry_diagnostics_by_task"]["task-1"]
+        assert diagnostics.selected_version is None
+        assert diagnostics.attempted_versions_by_target == {"test-pkg": ["1.2.3"]}
+        assert diagnostics.used_overrides is True
+        assert not any(
+            event.error_code
+            in {"TERMINAL_TASK_FIELDS_NORMALIZED", "DIAGNOSTICS_PROJECTION_REPAIRED"}
+            for event in result["consistency_events"]
+        )
+
     def test_qa_completed_passed_adds_constraint(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -1277,6 +1347,65 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
     assert committed.selected_version == "2.0.0"
     assert committed.status == TaskStatus.OPTIMISTICALLY_FIXED
     assert any(event.error_code == "STALE_WORKER_RESULT" for event in result["consistency_events"])
+
+
+def test_worker_result_persists_attempts_by_target_and_override_usage():
+    group = _sca_group("g1")
+    instruction = "Pin test-pkg to 1.2.3 through the package manager override."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-override",
+        task_id="task-1",
+        task_revision=1,
+        strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+        selected_version="1.2.3",
+        target_package_name="test-pkg",
+        target_dependency_type="overrides",
+        instruction=instruction,
+        instruction_digest=_instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "target_dependency_type": snapshot.target_dependency_type,
+            "instruction": instruction,
+        }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id="task-1",
+        task_revision=1,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["1.2.3"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["1.2.3"],
+            executed_versions=["1.2.3"],
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            worker_results_by_attempt={snapshot.attempt_id: worker_result},
+        )
+    )
+
+    diagnostics = result["retry_diagnostics_by_task"]["task-1"]
+    assert diagnostics.attempted_versions == ["1.2.3"]
+    assert diagnostics.executed_versions == ["1.2.3"]
+    assert diagnostics.attempted_versions_by_target == {"test-pkg": ["1.2.3"]}
+    assert diagnostics.target_package_name == "test-pkg"
+    assert diagnostics.target_dependency_type == "overrides"
+    assert diagnostics.used_overrides is True
+    assert result["next_routing_step"] == "qa_critic"
 
 
 def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch):

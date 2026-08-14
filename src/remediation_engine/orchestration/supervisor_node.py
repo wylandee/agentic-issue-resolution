@@ -136,6 +136,7 @@ _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.PACKAGE_OVERRIDE: 3,
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
+_OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
 
 # ---------------------------------------------------------------------------
 # Task status helpers
@@ -628,6 +629,13 @@ def _commit_task_transition(
         updates = {**updates, "status": new_status}
 
     committed_updates = dict(updates)
+    # Terminal status is a complete transition, not just a status projection.
+    # Clear all future worker input here so callers cannot leave a selected
+    # version or live attempt for the validator to repair later.
+    committed_status = committed_updates.get("status")
+    if isinstance(committed_status, TaskStatus) and committed_status in _TERMINAL_STATUSES:
+        close_attempt = True
+        clear_selected_version = True
     input_changed = any(
         field in committed_updates and committed_updates[field] != getattr(task, field)
         for field in _ATTEMPT_INPUT_FIELDS
@@ -4125,6 +4133,48 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             prior = retry_diagnostics_by_task.get(task_id)
             if prior is None:
                 prior = UpdateRetryDiagnostics(task_id=task_id)
+            group = group_by_id.get(task.parent_group_id)
+            parent_name, _, parent_type = (
+                group_parent_context(group) if group is not None else (None, None, None)
+            )
+            if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+                target_package_name = (
+                    snapshot.target_package_name
+                    or task.target_package_name
+                    or (group.vulnerable_component if group is not None else None)
+                )
+                target_dependency_type = (
+                    snapshot.target_dependency_type
+                    or task.target_dependency_type
+                    or (_override_dependency_type(group) if group is not None else None)
+                )
+            else:
+                target_package_name = (
+                    snapshot.target_package_name
+                    or task.target_package_name
+                    or (parent_name if group is not None and is_transitive_group(group) else None)
+                    or (group.vulnerable_component if group is not None else None)
+                )
+                target_dependency_type = (
+                    snapshot.target_dependency_type
+                    or task.target_dependency_type
+                    or (parent_type if group is not None and is_transitive_group(group) else None)
+                )
+            attempted_versions_by_target = dict(prior.attempted_versions_by_target)
+            if target_package_name and attempted_versions:
+                attempted_versions_by_target[target_package_name] = list(
+                    dict.fromkeys(
+                        [
+                            *attempted_versions_by_target.get(target_package_name, []),
+                            *attempted_versions,
+                        ]
+                    )
+                )
+            used_overrides = (
+                prior.used_overrides
+                or task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+                or target_dependency_type in _OVERRIDE_DEPENDENCY_TYPES
+            )
             retry_diagnostics_by_task[task_id] = prior.model_copy(
                 update={
                     "committed_attempt_id": current_attempt_id,
@@ -4137,6 +4187,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     "selected_version": task.selected_version,
                     "strategy_stage": task.strategy_stage,
                     "exhausted_update_path": task.exhausted_update_path,
+                    "target_package_name": target_package_name or prior.target_package_name,
+                    "target_dependency_type": target_dependency_type
+                    or prior.target_dependency_type,
+                    "attempted_versions_by_target": attempted_versions_by_target,
+                    "used_overrides": used_overrides,
                     "instruction_digest": snapshot.instruction_digest,
                     "failure_reason": (
                         " | ".join(result.errors)
@@ -4409,6 +4464,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_id,
                 updates={},
                 close_attempt=True,
+                clear_selected_version=True,
             )
         processed_qa_attempt_ids.add(task.current_attempt_id)
         new_qa_attempt_ids.append(task.current_attempt_id)
@@ -4590,6 +4646,18 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 "supervisor: task '%s' marked UNFIXABLE after %d retries.",
                 task_id,
                 task.retry_count,
+            )
+
+    # Keep diagnostics aligned with terminal task state without emitting a
+    # projection-repair event. The selected version is no longer dispatchable,
+    # while target and attempt evidence remains useful in the final report.
+    for task_id, task in task_queue.items():
+        if task.status not in _TERMINAL_STATUSES:
+            continue
+        diagnostics = retry_diagnostics_by_task.get(task_id)
+        if diagnostics is not None and diagnostics.selected_version is not None:
+            retry_diagnostics_by_task[task_id] = diagnostics.model_copy(
+                update={"selected_version": None}
             )
 
     # ------------------------------------------------------------------

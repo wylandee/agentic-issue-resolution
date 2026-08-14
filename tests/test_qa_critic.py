@@ -1266,7 +1266,39 @@ class TestQAExecutionToolGuards:
         changed_tool = self._get_tool(tools, "list_changed_files")
         search_tool = self._get_tool(tools, "search_codebase_pattern")
         assert "Review tools are locked" in changed_tool.invoke({})
-        assert "Review tools are locked" in search_tool.invoke({"root_dir": ".", "pattern": "foo"})
+        assert "Review tools are locked" in search_tool.invoke(
+            {"search_pattern": "foo", "target_directory": "."}
+        )
+
+    def test_search_codebase_pattern_forwards_shared_argument_contract(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="src/app.ts:1:foo\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="test-vol",
+            target_identifiers=set(),
+            candidate_changed_files=["src/app.ts"],
+            host_repo_root="/tmp/repo",
+        )
+        results.install = (True, "install ok")
+        results.scan = (True, "scan ok", set())
+        results.tests = (True, "tests ok")
+
+        search_tool = self._get_tool(tools, "search_codebase_pattern")
+
+        assert (
+            search_tool.invoke({"search_pattern": "foo", "target_directory": "src"})
+            == "src/app.ts:1:foo"
+        )
+        command = sandbox.run.call_args.args[0]
+        assert "'foo'" in command
+        assert "'src'" in command
+        assert set(search_tool.args) == {"search_pattern", "target_directory"}
 
 
 # ---------------------------------------------------------------------------
@@ -2323,6 +2355,36 @@ class TestBuildQaReviewToolbelt:
         result = tool.invoke({"log_type": "tests"})
         assert "Detected Failures: 1" in result
         assert "jwt challenge" in result
+
+    def test_search_codebase_pattern_forwards_shared_argument_contract(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="src/app.ts:1:foo\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        results = _QAExecutionResults(
+            install=(True, "install ok"),
+            scan=(True, "scan ok", set()),
+            tests=(True, "tests ok"),
+        )
+        tools = build_qa_review_toolbelt(
+            sandbox=sandbox,
+            candidate_changed_files=["src/app.ts"],
+            host_repo_root="/tmp/repo",
+            results=results,
+        )
+        search_tool = next(t for t in tools if t.name == "search_codebase_pattern")
+
+        assert (
+            search_tool.invoke({"search_pattern": "foo", "target_directory": "src"})
+            == "src/app.ts:1:foo"
+        )
+        command = sandbox.run.call_args.args[0]
+        assert "'foo'" in command
+        assert "'src'" in command
+        assert set(search_tool.args) == {"search_pattern", "target_directory"}
 
 
 # ---------------------------------------------------------------------------
