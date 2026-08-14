@@ -64,6 +64,16 @@ The fixture exercises parent updates before child overrides:
 python examples/juice_shop/fixtures/transitive_parent_first/run_parent_first.py
 ```
 
+### 6. Deterministic Supervisor routing
+
+Runs a five-finding pre-triaged fixture containing one NO_FIX group and four
+version-bump groups. The runner persists the final decision code, route, audit
+record, task statuses, trajectory, and patch for routing-focused review:
+
+```bash
+python examples/juice_shop/fixtures/deterministic_routing/run_deterministic_routing.py
+```
+
 ---
 
 ## Fixture layout
@@ -95,6 +105,12 @@ The workaround scenarios are self-contained under `fixtures/`:
 * **`fixtures/transitive_parent_first/triaged_groups_transitive_parent_first.json`**: Pre-triaged groups with dependency ancestry and direct-parent targets.
 
 Both workaround runners use the Workspace Builder for initial npm dependency installation. The Express-JWT replay additionally applies the target dependency update inside the isolated volume so it can reproduce the failed update state; the NO_FIX retry starts from the unchanged baseline workspace.
+
+The `fixtures/deterministic_routing/` scenario contains:
+
+* **`triaged_groups_deterministic.json`**: Exactly five findings across five pre-triaged groups.
+* **`run_deterministic_routing.py`**: Runner that validates the issue limit and persists routing evidence.
+* **`README.md`**: Expected deterministic decision checkpoints and coverage notes.
 
 ### Refreshing derived fixtures manually
 

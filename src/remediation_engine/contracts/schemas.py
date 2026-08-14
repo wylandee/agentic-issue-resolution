@@ -28,6 +28,8 @@ from pydantic import (
     model_validator,
 )
 
+from remediation_engine.contracts.decision_codes import DecisionCode
+
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
@@ -185,6 +187,7 @@ class TaskStatus(str, Enum):
     QA_PASSED = "qa_passed"  # QA explicitly passed; terminal success
     NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed by supervisor
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
+    INCONCLUSIVE = "inconclusive"  # Evidence was invalid or could not be classified
 
 
 # ---------------------------------------------------------------------------
@@ -1698,7 +1701,7 @@ class StateConsistencyEvent(BaseModel):
     task_id: str | None = None
     expected_attempt_id: str | None = None
     received_attempt_id: str | None = None
-    action: Literal["ignored", "repaired", "replanned"]
+    action: Literal["ignored", "repaired", "replanned", "rejected"]
     details: str = ""
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -1783,6 +1786,15 @@ class SupervisorDecision(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    decision_code: DecisionCode | None = Field(
+        default=None,
+        description=(
+            "Machine-readable deterministic rule that produced this decision. "
+            "Python owns this field; it is advisory metadata and does not affect "
+            "routing validation."
+        ),
+    )
+
     next_node: Literal[
         "update_subagent", "workaround_subagent", "qa_critic", "triage", "teardown"
     ] = Field(
@@ -1851,7 +1863,7 @@ class SupervisorDecision(BaseModel):
         default_factory=dict,
         description=(
             "Manual status overrides keyed by task_id. "
-            "Only QA_PASSED and UNFIXABLE are permitted; all other values are rejected."
+            "Python-owned status transitions. LLM advisory output cannot set this field."
         ),
     )
 

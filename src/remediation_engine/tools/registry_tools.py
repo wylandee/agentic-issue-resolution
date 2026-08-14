@@ -42,6 +42,8 @@ import requests
 from langchain_core.tools import tool
 from semantic_version import NpmSpec, Version
 
+from remediation_engine.contracts.version_policy import RegistryCandidate
+
 logger = logging.getLogger(__name__)
 
 _NPM_REGISTRY_URL = "https://registry.npmjs.org"
@@ -304,6 +306,63 @@ def _fetch_package_data(package_name: str) -> dict[str, Any]:
         raise ValueError("404")
     response.raise_for_status()
     return response.json()
+
+
+def fetch_registry_candidates(
+    package_name: str,
+    security_floor: str,
+    attempted_versions: set[str] | None = None,
+) -> list[RegistryCandidate]:
+    """Fetch stable npm versions as typed deterministic policy inputs.
+
+    Args:
+        package_name: Package name accepted by the npm registry.
+        security_floor: Lowest stable version that addresses the finding.
+        attempted_versions: Versions already tried by prior worker attempts.
+
+    Returns:
+        Candidates sorted by ascending semantic-version key.
+
+    Raises:
+        ValueError: If ``security_floor`` is not stable semver or the package
+            is not present in the registry.
+        requests.RequestException: If the registry request fails.
+    """
+    package_name = (package_name or "").strip()
+    floor = (security_floor or "").strip().lstrip("vV")
+    if not package_name:
+        raise ValueError("package_name must not be empty")
+    floor_key = _stable_version_key(floor)
+    if floor_key is None:
+        raise ValueError(f"Invalid security floor: {security_floor}")
+
+    attempted = {
+        str(version).strip().lstrip("vV")
+        for version in (attempted_versions or set())
+        if str(version).strip()
+    }
+    try:
+        data = _fetch_package_data(package_name)
+    except requests.RequestException as exc:
+        raise ValueError(f"Could not fetch registry data for {package_name}: {exc}") from exc
+    candidates: list[RegistryCandidate] = []
+    for raw_version in data.get("versions") or {}:
+        version = str(raw_version).strip().lstrip("vV")
+        key = _stable_version_key(version)
+        if key is None:
+            continue
+        candidates.append(
+            RegistryCandidate(
+                version=version,
+                semver_key=key,
+                security_floor_met=key >= floor_key,
+                is_stable=True,
+                same_major=key[0] == floor_key[0],
+                already_attempted=version in attempted,
+            )
+        )
+    candidates.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+    return candidates
 
 
 def _build_version_entries(

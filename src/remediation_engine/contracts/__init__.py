@@ -5,6 +5,9 @@ All data that flows between agents, tools, and storage layers is typed
 through these models. Agents NEVER pass raw dicts across module boundaries.
 """
 
+from .decision_codes import VALID_TRANSITIONS, DecisionCode, validate_transition
+from .llm_advisory import LLMAdvisory
+from .planner_advice import PlannerAdvice, PlannerBatchAdvice
 from .schemas import (
     # Constants
     MAX_ANCESTRY_DEPTH,
@@ -66,6 +69,8 @@ from .schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from .supervisor_phases import AuditRecord, EligibleActions, ReconciliationResult
+from .version_policy import RegistryCandidate, is_version_space_exhausted, select_version
 
 __all__ = [
     "Severity",
@@ -83,6 +88,9 @@ __all__ = [
     "AgentActionStatus",
     "GroupRemediationStatus",
     "TaskStatus",
+    "DecisionCode",
+    "VALID_TRANSITIONS",
+    "validate_transition",
     # Constants
     "MAX_ANCESTRY_DEPTH",
     "MAX_TASK_QUEUE_SIZE",
@@ -124,4 +132,13 @@ __all__ = [
     # Task queue
     "TaskSpawnRequest",
     "RemediationTask",
+    "PlannerAdvice",
+    "PlannerBatchAdvice",
+    "RegistryCandidate",
+    "select_version",
+    "is_version_space_exhausted",
+    "LLMAdvisory",
+    "ReconciliationResult",
+    "EligibleActions",
+    "AuditRecord",
 ]
