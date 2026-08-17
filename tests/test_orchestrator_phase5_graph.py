@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     QAEvaluation,
+    RoutingStrategy,
     SCARemediationStage,
     Severity,
     TaskAttemptSnapshot,
@@ -819,7 +820,7 @@ class TestPhase5GraphIntegration:
         assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
         assert result["status"] == "qa_completed"
 
-    def test_failed_qa_restores_and_removes_attempt_workspace_snapshot(self, tmp_path):
+    def test_breaking_change_qa_retains_pre_update_snapshot_for_workaround(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-qa"}
@@ -870,9 +871,136 @@ class TestPhase5GraphIntegration:
         ):
             result = run_qa_critic_from_orchestrator(state)
 
-        sandbox.restore_workspace_snapshot.assert_called_once_with("attempt-attempt-qa")
-        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-qa")
+        sandbox.restore_workspace_snapshot.assert_not_called()
+        sandbox.remove_workspace_snapshot.assert_not_called()
+        assert result["workspace_rollback_anchors_by_task"] == {"task-1": "attempt-attempt-qa"}
         assert result["qa_results_by_attempt"]["attempt-qa"].evaluation.passed is False
+
+    def test_security_failure_restores_and_removes_attempt_workspace_snapshot(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"task_revision": 1, "current_attempt_id": "attempt-security"}
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-security",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            instruction=task.instruction,
+            instruction_digest=_instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id=groups[0].group_id,
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="The candidate still contains the target vulnerability.",
+        )
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {groups[0].group_id: evaluation},
+                "eval_status": "some_failed",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+
+        with (
+            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch(
+                "remediation_engine.orchestration.graph.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_qa_critic_from_orchestrator(state)
+
+        sandbox.restore_workspace_snapshot.assert_called_once_with("attempt-attempt-security")
+        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-security")
+        assert result["qa_results_by_attempt"]["attempt-security"].evaluation.passed is False
+
+    def test_workaround_regression_restores_to_original_pre_update_workspace(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-workaround",
+                "parent_task_id": "task-parent",
+                "strategy": RoutingStrategy.CODE_WORKAROUND,
+                "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+                "selected_version": None,
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-workaround",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            selected_version=None,
+            instruction=task.instruction,
+            instruction_digest=_instruction_digest(task.instruction),
+            dispatch_node="workaround_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+                "workspace_rollback_anchors_by_task": {
+                    "task-parent": "attempt-parent",
+                },
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id=groups[0].group_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="The workaround still breaks a regression test.",
+        )
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {groups[0].group_id: evaluation},
+                "eval_status": "some_failed",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+
+        with (
+            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch(
+                "remediation_engine.orchestration.graph.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_qa_critic_from_orchestrator(state)
+
+        assert [call.args for call in sandbox.restore_workspace_snapshot.call_args_list] == [
+            ("attempt-attempt-workaround",),
+            ("attempt-parent",),
+        ]
+        assert [call.args for call in sandbox.remove_workspace_snapshot.call_args_list] == [
+            ("attempt-attempt-workaround",),
+            ("attempt-parent",),
+        ]
+        assert result["qa_results_by_attempt"]["attempt-workaround"].evaluation.passed is False
 
     def test_passed_qa_keeps_candidate_and_only_removes_attempt_snapshot(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

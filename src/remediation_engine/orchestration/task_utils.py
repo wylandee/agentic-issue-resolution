@@ -27,6 +27,21 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
 )
 
+TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.QA_PASSED,
+        TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
+        TaskStatus.MITIGATED,
+        TaskStatus.PIVOTED,
+    }
+)
+
+
+def is_no_fix_package_removal_task(task: RemediationTask) -> bool:
+    """Return whether ``task`` is the deterministic NO_FIX removal stage."""
+    return task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
+
 
 def is_no_fix_group(group: VulnerabilityGroup) -> bool:
     """Return whether ``group`` has an explicit ``NO_FIX`` plan."""

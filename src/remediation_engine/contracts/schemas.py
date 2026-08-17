@@ -207,6 +207,8 @@ class TaskStatus(str, Enum):
     NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed by supervisor
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
     INCONCLUSIVE = "inconclusive"  # Evidence was invalid or could not be classified
+    MITIGATED = "mitigated"  # Legacy terminal status; new package removals still run QA
+    PIVOTED = "pivoted"  # Parent attempt was superseded by a spawned child task
 
 
 # ---------------------------------------------------------------------------

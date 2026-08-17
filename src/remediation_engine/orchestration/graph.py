@@ -52,6 +52,7 @@ from langgraph.graph import END, START, StateGraph
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    FailureCategory,
     IssueSource,
     QAAttemptResult,
     RemediationTask,
@@ -85,7 +86,10 @@ from remediation_engine.orchestration.supervisor_node import (
     run_supervisor_node,
     supervisor_router,
 )
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.orchestration.task_utils import (
+    TERMINAL_TASK_STATUSES,
+    build_initial_remediation_task,
+)
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
@@ -277,8 +281,7 @@ def _reconcile_triaged_groups(
             if task.parent_group_id == previous.group_id
         ]
         if any(
-            task_id in active_task_ids
-            or task.status not in {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+            task_id in active_task_ids or task.status not in TERMINAL_TASK_STATUSES
             for task_id, task in matching_tasks
         ):
             result.append(previous)
@@ -365,12 +368,18 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         groups_by_id = {group.group_id: group for group in valid_groups}
         reopened_task_ids: set[str] = set()
         preserved_unfixable_task_ids: set[str] = set()
+        preserved_pivoted_task_ids: set[str] = set()
         prior_qa_evaluations = dict(state.get("qa_evaluations", {}) or {})
         for task_id, task in list(task_queue.items()):
             if task.parent_group_id not in changed_group_ids:
                 continue
             if task.status == TaskStatus.UNFIXABLE:
                 preserved_unfixable_task_ids.add(task_id)
+                continue
+            if task.status == TaskStatus.PIVOTED:
+                # This parent is an audit record for work delegated to its
+                # child. Re-triage must not resurrect it as a fresh task.
+                preserved_pivoted_task_ids.add(task_id)
                 continue
             group = groups_by_id.get(task.parent_group_id)
             if group is None:
@@ -417,6 +426,8 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         )
         if preserved_unfixable_task_ids:
             reconciliation["preserved_unfixable_task_ids"] = sorted(preserved_unfixable_task_ids)
+        if preserved_pivoted_task_ids:
+            reconciliation["preserved_pivoted_task_ids"] = sorted(preserved_pivoted_task_ids)
         return {
             "valid_groups": valid_groups,
             "status": "triage_completed" if valid_groups else "triage_completed_no_work",
@@ -653,6 +664,36 @@ def _finish_workspace_attempt_snapshot(
     return errors
 
 
+def _parent_workspace_rollback_anchors(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> list[str]:
+    """Return retained pre-update snapshots for workaround child tasks."""
+    anchors = state.get("workspace_rollback_anchors_by_task", {}) or {}
+    return list(
+        dict.fromkeys(
+            anchor_id
+            for task in target_tasks
+            if task.parent_task_id
+            for anchor_id in [anchors.get(task.parent_task_id)]
+            if anchor_id
+        )
+    )
+
+
+def _finish_parent_workspace_rollback_anchors(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    *,
+    restore: bool,
+) -> list[str]:
+    """Restore or discard parent-attempt snapshots associated with a child."""
+    errors: list[str] = []
+    for anchor_id in _parent_workspace_rollback_anchors(state, target_tasks):
+        errors.extend(_finish_workspace_attempt_snapshot(state, anchor_id, restore=restore))
+    return errors
+
+
 def _worker_attempts_succeeded(
     result: dict[str, Any],
     target_tasks: list[RemediationTask],
@@ -694,11 +735,13 @@ def _finalize_worker_workspace_snapshot(
         # QA owns the next decision.  It must still be able to restore this
         # exact candidate if install, scanning, or tests reject it.
         return []
-    return _finish_workspace_attempt_snapshot(
+    errors = _finish_workspace_attempt_snapshot(
         state,
         snapshot_id,
         restore=True,
     )
+    errors.extend(_finish_parent_workspace_rollback_anchors(state, target_tasks, restore=True))
+    return errors
 
 
 def _finalize_qa_workspace_snapshot(
@@ -707,18 +750,131 @@ def _finalize_qa_workspace_snapshot(
     snapshot_id: str | None,
     result: dict[str, Any],
 ) -> list[str]:
-    """Keep a candidate only when all scoped QA evaluations pass."""
+    """Finalize the candidate workspace after scoped QA.
+
+    A validated dependency update that fails only because it introduced a
+    runtime or test regression is still the correct base for a workaround
+    child.  Preserve that candidate while handing control back to the
+    Supervisor.  Other QA failures, and every failed workaround attempt,
+    restore the attempt-local checkpoint so failed source edits do not leak
+    into the next retry.
+    """
     if snapshot_id is None:
         return []
-    if result.get("status") != "qa_completed":
-        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+    attempt_snapshots = state.get("attempt_snapshots_by_id", {})
+    candidate_snapshots = [
+        attempt_snapshots.get(task.current_attempt_id)
+        for task in target_tasks
+        if task.current_attempt_id
+    ]
+    workaround_attempt = (
+        bool(target_tasks)
+        and len(candidate_snapshots) == len(target_tasks)
+        and all(
+            snapshot is not None and snapshot.dispatch_node == "workaround_subagent"
+            for snapshot in candidate_snapshots
+        )
+    )
 
+    def restore_failed_workaround() -> list[str]:
+        errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+        if workaround_attempt:
+            errors.extend(
+                _finish_parent_workspace_rollback_anchors(
+                    state,
+                    target_tasks,
+                    restore=True,
+                )
+            )
+        return errors
+
+    def discard_successful_workaround_anchors() -> list[str]:
+        if not workaround_attempt:
+            return []
+        return _finish_parent_workspace_rollback_anchors(
+            state,
+            target_tasks,
+            restore=False,
+        )
+
+    if result.get("status") != "qa_completed":
+        return restore_failed_workaround()
+
+    evaluations = result.get("qa_evaluations") or {}
+    update_candidate = (
+        bool(target_tasks)
+        and len(candidate_snapshots) == len(target_tasks)
+        and all(
+            snapshot is not None and snapshot.dispatch_node == "update_subagent"
+            for snapshot in candidate_snapshots
+        )
+    )
+    has_regression = False
+    for task in target_tasks:
+        evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task.task_id)
+        if evaluation is None:
+            return restore_failed_workaround()
+        if not evaluation.passed:
+            if workaround_attempt:
+                return restore_failed_workaround()
+            evidence = evaluation.failure_evidence
+            is_regression = evaluation.failure_category == FailureCategory.BREAKING_CHANGE or bool(
+                evidence and evidence.failed_tests
+            )
+            if not is_regression:
+                return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+            has_regression = True
+
+    if update_candidate and has_regression:
+        # The next Supervisor decision may dispatch a workaround child.  The
+        # child will create its own attempt snapshot from this retained
+        # dependency candidate, so its failures can restore to the candidate
+        # rather than to the original vulnerable baseline.
+        return []
+    if has_regression:
+        # A workaround attempt owns source edits, so even a breaking-change
+        # evaluation must roll back to the candidate that preceded it.
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+    errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+    errors.extend(discard_successful_workaround_anchors())
+    return errors
+
+
+def _qa_workspace_rollback_anchor_updates(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    snapshot_id: str | None,
+    result: dict[str, Any],
+) -> dict[str, str]:
+    """Record pre-update snapshots while a regression workaround may follow."""
+    if snapshot_id is None or result.get("status") != "qa_completed":
+        return {}
+    attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    snapshots = [
+        attempt_snapshots.get(task.current_attempt_id)
+        for task in target_tasks
+        if task.current_attempt_id
+    ]
+    if (
+        not target_tasks
+        or len(snapshots) != len(target_tasks)
+        or not all(
+            snapshot is not None and snapshot.dispatch_node == "update_subagent"
+            for snapshot in snapshots
+        )
+    ):
+        return {}
     evaluations = result.get("qa_evaluations") or {}
     for task in target_tasks:
         evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task.task_id)
-        if evaluation is None or not evaluation.passed:
-            return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
-    return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+        if evaluation is None or evaluation.passed:
+            continue
+        evidence = evaluation.failure_evidence
+        if evaluation.failure_category == FailureCategory.BREAKING_CHANGE or bool(
+            evidence and evidence.failed_tests
+        ):
+            return {task.task_id: snapshot_id for task in target_tasks}
+    return {}
 
 
 def _ensure_worker_attempt_results(
@@ -959,6 +1115,7 @@ def run_workaround_subagent_from_orchestrator(
             workspace_snapshot_id,
             restore=True,
         )
+        _finish_parent_workspace_rollback_anchors(state, [task], restore=True)
         raise
 
     out: dict[str, Any] = {
@@ -1059,6 +1216,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             workspace_snapshot_id,
             restore=True,
         )
+        _finish_parent_workspace_rollback_anchors(state, target_tasks, restore=True)
         raise
     snapshot_cleanup_errors = _finalize_qa_workspace_snapshot(
         state,
@@ -1066,9 +1224,16 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         workspace_snapshot_id,
         result,
     )
+    rollback_anchor_updates = _qa_workspace_rollback_anchor_updates(
+        state,
+        target_tasks,
+        workspace_snapshot_id,
+        result,
+    )
     scan_evidence = result.get("scan_evidence")
-    attempt_scan_is_authoritative = scan_evidence is None or bool(
-        getattr(scan_evidence, "authoritative", False)
+    scan_was_skipped = bool(result.get("scan_skipped"))
+    attempt_scan_is_authoritative = not scan_was_skipped and (
+        scan_evidence is None or bool(getattr(scan_evidence, "authoritative", False))
     )
     scan_status = (
         result.get("new_vulnerability_status", state.get("new_vulnerability_status", "not_scanned"))
@@ -1158,6 +1323,8 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         out["qa_results_by_attempt"] = qa_results_by_attempt
     if scan_evidence is not None:
         out["scan_evidence_by_task"] = {task_id: scan_evidence for task_id in active_task_ids}
+    if rollback_anchor_updates:
+        out["workspace_rollback_anchors_by_task"] = rollback_anchor_updates
     return out
 
 

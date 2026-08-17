@@ -37,12 +37,16 @@ class DecisionCode(str, Enum):  # noqa: UP042
 VALID_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("pending", "optimistically_fixed"),
+        ("pending", "mitigated"),
+        ("pending", "pivoted"),
         ("pending", "needs_retry"),
         ("pending", "unfixable"),
         ("optimistically_fixed", "qa_passed"),
+        ("optimistically_fixed", "mitigated"),
         ("optimistically_fixed", "needs_retry"),
         ("optimistically_fixed", "inconclusive"),
         ("needs_retry", "optimistically_fixed"),
+        ("needs_retry", "pivoted"),
         ("needs_retry", "unfixable"),
         ("needs_retry", "inconclusive"),
     }

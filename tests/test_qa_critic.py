@@ -1638,6 +1638,43 @@ class TestRunQACriticNode:
         assert result["qa_evaluations"][group.group_id].passed is True
         assert result["qa_investigation_report"] == "All groups passed."
 
+    def test_package_removal_node_skips_only_security_scan(self):
+        group = _make_group(fix_plan_status=FixPlanStatus.NO_FIX)
+        task = RemediationTask(
+            task_id="task-1",
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+            instruction="Remove the vulnerable package.",
+        )
+        state = _make_minimal_state(groups=[group])
+        state.update(
+            {
+                "task_queue": {task.task_id: task},
+                "active_target_task_ids": [task.task_id],
+            }
+        )
+        results = _make_fully_populated_results(ok=True)
+        results.scan = None
+        results.scan_skipped = True
+        results.scan_skip_reason = "no_fix_package_removal"
+        patches = self._patch_node(group=group, results=results)
+
+        with (
+            patches["sandbox"],
+            patches["global_exec"] as global_exec,
+            patches["investigators"],
+            patches["judge"],
+        ):
+            result = run_qa_critic_node(state)
+
+        call = global_exec.call_args.kwargs
+        assert call["skip_scan"] is True
+        assert call["scan_skip_reason"] == "no_fix_package_removal"
+        assert result["new_vulnerability_status"] == "not_scanned"
+        assert result["qa_evaluations"][group.group_id].passed is True
+
     def test_new_identifiers_are_reported_without_task_failure(self):
         group = _make_group(cve_ids=["CVE-2021-23337"], ghsa_ids=[])
         state = _make_minimal_state(groups=[group])
@@ -2318,6 +2355,66 @@ class TestRunGlobalExecution:
             results = _run_global_execution(sandbox, "vol", set())
         mt.assert_called_once()
         assert results.tests == (True, "passed.")
+
+    def test_skip_scan_still_runs_install_and_tests(self):
+        """NO_FIX package removal skips only ODC, not the rest of QA."""
+        sandbox = MagicMock()
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_install",
+                return_value=(True, "install ok"),
+            ) as install,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_security_scan",
+            ) as scan,
+            patch(
+                "remediation_engine.orchestration.qa_critic._run_unit_tests",
+                return_value=(True, "tests ok"),
+            ) as tests,
+        ):
+            results = _run_global_execution(
+                sandbox,
+                "vol",
+                {"CVE-2021-0001"},
+                skip_scan=True,
+                scan_skip_reason="no_fix_package_removal",
+            )
+
+        install.assert_called_once_with(sandbox)
+        scan.assert_not_called()
+        tests.assert_called_once_with(sandbox)
+        assert results.scan is None
+        assert results.scan_skipped is True
+        assert results.scan_skip_reason == "no_fix_package_removal"
+        assert results.tests == (True, "tests ok")
+
+    def test_skip_scan_allows_review_tools_after_install_and_tests(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools, results = build_qa_toolbelt(
+            sandbox=sandbox,
+            workspace_volume="vol",
+            target_identifiers=set(),
+            candidate_changed_files=[],
+            host_repo_root=None,
+            skip_scan=True,
+            scan_skip_reason="no_fix_package_removal",
+        )
+        by_name = {tool.name: tool for tool in tools}
+
+        by_name["run_dependency_install"].invoke({})
+        assert "SKIPPED" in by_name["run_security_scan"].invoke({})
+        assert "passed" in by_name["run_unit_tests"].invoke({})
+        assert results.scan_skipped is True
+        assert results.tests is not None
+
+        changed_files = by_name["list_changed_files"].invoke({})
+        assert "no changed files" in changed_files
 
 
 # ---------------------------------------------------------------------------

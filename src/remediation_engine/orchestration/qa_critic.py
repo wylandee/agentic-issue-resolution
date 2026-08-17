@@ -67,6 +67,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
+from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.settings import AppSettings
@@ -2149,6 +2150,8 @@ class _QAExecutionResults:
     scan: Any | None = None  # _SecurityScanResult or legacy tuple
     tests: tuple[bool, str] | None = None  # (ok, summary)
     scan_evidence: ODCScanEvidence | None = None
+    scan_skipped: bool = False
+    scan_skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2348,8 +2351,9 @@ _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 
 
 def _pipeline_complete(results: _QAExecutionResults) -> bool:
-    """Return whether install, scan, and tests have all run at least once."""
-    return results.install is not None and results.scan is not None and results.tests is not None
+    """Return whether install, scan-or-skip, and tests have run at least once."""
+    scan_complete = results.scan is not None or results.scan_skipped
+    return results.install is not None and scan_complete and results.tests is not None
 
 
 def _review_ready_error(results: _QAExecutionResults) -> str | None:
@@ -2358,7 +2362,8 @@ def _review_ready_error(results: _QAExecutionResults) -> str | None:
         return None
     return (
         "ERROR: Review tools are locked until run_dependency_install, "
-        "run_security_scan, and run_unit_tests have all been called in order."
+        "run_security_scan (or an explicit scan skip), and run_unit_tests have all "
+        "been called in order."
     )
 
 
@@ -2581,8 +2586,12 @@ def _derive_qa_group_strategies(
 def _group_scan_status(
     scan_result: tuple[bool, str, set[str]] | None,
     group: VulnerabilityGroup,
+    *,
+    scan_skipped: bool = False,
 ) -> str:
     """Classify the scanner outcome for one group from deterministic results."""
+    if scan_skipped:
+        return "skipped"
     if scan_result is None:
         return "scan_failed"
 
@@ -2629,6 +2638,11 @@ def _build_fallback_investigation_report(
         f"- Evidence: {install_summary}",
         f"- Post-remediation Scanner Identifiers: {', '.join(post_scan_identifiers) if post_scan_identifiers else 'none'}",
         f"- Newly Introduced Scanner Identifiers: {', '.join(new_identifiers) if new_identifiers else 'none'}",
+        (
+            f"- Scanner Phase: skipped ({results.scan_skip_reason or 'explicit policy'})"
+            if results.scan_skipped
+            else "- Scanner Phase: executed"
+        ),
         "",
     ]
 
@@ -2638,7 +2652,11 @@ def _build_fallback_investigation_report(
         group_remaining = (
             _group_remaining_identifiers(group, scan_result[2]) if scan_result is not None else []
         )
-        scan_status = _group_scan_status(scan_result, group)
+        scan_status = _group_scan_status(
+            scan_result,
+            group,
+            scan_skipped=results.scan_skipped,
+        )
         blocks.extend(
             [
                 f"### GROUP: {group.group_id}",
@@ -2937,6 +2955,8 @@ def _run_global_execution(
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
     scan_targets: Sequence[QAScanTarget] | None = None,
+    skip_scan: bool = False,
+    scan_skip_reason: str | None = None,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -2950,9 +2970,18 @@ def _run_global_execution(
     results.install = _run_install(sandbox)
     install_ok, _ = results.install
 
-    logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
+    if skip_scan:
+        results.scan_skipped = True
+        results.scan_skip_reason = scan_skip_reason or "explicitly skipped by QA policy"
+        logger.info(
+            "qa_critic: [Step 0] skipping security scan (%s); install_ok=%s.",
+            results.scan_skip_reason,
+            install_ok,
+        )
+    else:
+        logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
     scan_started = time.monotonic()
-    if scan_targets is None:
+    if not skip_scan and scan_targets is None:
         if baseline_identifiers is None:
             # Preserve the legacy helper call shape for direct callers that do not
             # provide a pre-remediation baseline.
@@ -2964,7 +2993,7 @@ def _run_global_execution(
                 target_identifiers,
                 baseline_identifiers,
             )
-    else:
+    elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
         closures: list[DependencyClosure] = []
         targeted_subdir: str | None = None
@@ -3034,7 +3063,14 @@ def _run_global_execution(
                 closures=closures,
             )
 
-    if results.scan_evidence is not None:
+    if results.scan_skipped:
+        logger.info(
+            "qa_critic: scan requested_scope=skipped effective_scope=skipped "
+            "reason=%s duration_seconds=%.3f",
+            results.scan_skip_reason,
+            time.monotonic() - scan_started,
+        )
+    elif results.scan_evidence is not None:
         logger.info(
             "qa_critic: scan requested_scope=%s effective_scope=%s tasks=%d closure_packages=%d "
             "fallback_reason=%s duration_seconds=%.3f",
@@ -3072,6 +3108,8 @@ def build_qa_toolbelt(
     candidate_changed_files: list[str],
     host_repo_root: str | None,
     baseline_identifiers: set[str] | None = None,
+    skip_scan: bool = False,
+    scan_skip_reason: str | None = None,
 ) -> tuple[list, _QAExecutionResults]:
     """
     Build the QA-only toolbelt with one-shot execution tools and read-only review tools.
@@ -3129,10 +3167,14 @@ def build_qa_toolbelt(
         Repeated calls return the cached result immediately.
         """
         if results.scan is not None:
-            _, summary, _ = results.scan
+            summary = _scan_result_value(results.scan, "summary", "scan completed")
             return f"[CACHED â€” already run] {summary}"
         if results.install is None:
             return "ERROR: run_security_scan must be called after run_dependency_install."
+        if skip_scan:
+            results.scan_skipped = True
+            results.scan_skip_reason = scan_skip_reason or "explicitly skipped by QA policy"
+            return f"[SKIPPED] {results.scan_skip_reason}"
         if baseline_identifiers is None:
             scan_result = _run_security_scan(
                 sandbox,
@@ -3153,13 +3195,14 @@ def build_qa_toolbelt(
     def run_unit_tests() -> str:
         """
         Run 'npm test' inside the workspace.
-        Must be called after run_security_scan.
+        Must be called after run_dependency_install. If the QA policy explicitly
+        skips scanning, tests run after install without a scanner result.
         Repeated calls return the cached result immediately.
         """
         if results.tests is not None:
             _, summary = results.tests
             return f"[CACHED â€” already run] {summary}"
-        if results.scan is None:
+        if results.scan is None and not results.scan_skipped:
             return "ERROR: run_unit_tests must be called after run_security_scan."
         ok, summary = _run_unit_tests(sandbox)
         results.tests = (ok, summary)
@@ -3236,9 +3279,11 @@ def build_qa_toolbelt(
             _, summary = results.install
             return summary[:_LOG_QUERY_MAX_CHARS]
         if log_type == "scan":
+            if results.scan_skipped:
+                return f"[SKIPPED] {results.scan_skip_reason or 'scan skipped'}"
             if results.scan is None:
                 return "ERROR: run_security_scan has not been called yet."
-            _, summary, _ = results.scan
+            summary = _scan_result_value(results.scan, "summary", "scan completed")
             return summary[:_LOG_QUERY_MAX_CHARS]
         if log_type == "tests":
             if results.tests is None:
@@ -3368,9 +3413,11 @@ def build_qa_review_toolbelt(
             _, summary = results.install
             return summary[:_LOG_QUERY_MAX_CHARS]
         if log_type == "scan":
+            if results.scan_skipped:
+                return f"[SKIPPED] {results.scan_skip_reason or 'scan skipped'}"
             if results.scan is None:
                 return "ERROR: run_security_scan has not been called yet."
-            _, summary, _ = results.scan
+            summary = _scan_result_value(results.scan, "summary", "scan completed")
             return summary[:_LOG_QUERY_MAX_CHARS]
         if log_type == "tests":
             if results.tests is None:
@@ -3430,7 +3477,11 @@ def _build_individual_investigator_prompt(
     ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
 
     install_ok, install_summary = results.install or (False, "not run")
-    scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
+    if results.scan_skipped:
+        scan_ok = True
+        scan_summary = f"scan skipped: {results.scan_skip_reason or 'policy'}"
+    else:
+        scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
     tests_ok, tests_summary = results.tests or (False, "not run")
     post_scan_identifiers = sorted(
         _scan_result_value(results.scan, "found_identifiers", set()) or set()
@@ -3643,12 +3694,14 @@ def _build_fallback_investigation_for_group(
     """Synthesize a minimal investigation for a single group when the investigator fails."""
     install_ok, _ = results.install or (False, "not run")
     tests_ok, _ = results.tests or (False, "not run")
-    scan_ok = results.scan[0] if results.scan else False
+    scan_ok = results.scan[0] if results.scan else results.scan_skipped
     new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
 
     remaining_text = ", ".join(group_remaining_ids) if group_remaining_ids else "none"
     scan_status = (
-        "still_flagged" if group_remaining_ids else ("cleared" if scan_ok else "scan_failed")
+        "still_flagged"
+        if group_remaining_ids
+        else ("skipped" if results.scan_skipped else ("cleared" if scan_ok else "scan_failed"))
     )
 
     return (
@@ -3659,7 +3712,7 @@ def _build_fallback_investigation_for_group(
         f"**Target Identifiers:** {', '.join(sorted(_group_target_identifiers(group))) or 'none'}\n\n"
         f"**Deterministic Results:**\n"
         f"- Install: {'SUCCESS' if install_ok else 'FAILED'}\n"
-        f"- Security Scan: {'SUCCESS' if scan_ok else 'FAILED'}\n"
+        f"- Security Scan: {'SKIPPED' if results.scan_skipped else ('SUCCESS' if scan_ok else 'FAILED')}\n"
         f"- Scan Status for this group: {scan_status}\n"
         f"- Remaining Scanner Identifiers: {remaining_text}\n"
         f"- Global Newly Introduced Scanner Identifiers: {', '.join(new_identifiers) if new_identifiers else 'none'}\n"
@@ -3685,7 +3738,12 @@ def _build_batch_judge_prompt(
     known_group_ids = {group.group_id for group in valid_groups}
 
     install_ok, install_summary = results.install or (False, "not run")
-    scan_ok, scan_summary, remaining_global = results.scan or (False, "not run", set())
+    if results.scan_skipped:
+        scan_ok = True
+        scan_summary = f"SKIPPED: {results.scan_skip_reason or 'explicit policy'}"
+        remaining_global: set[str] = set()
+    else:
+        scan_ok, scan_summary, remaining_global = results.scan or (False, "not run", set())
     tests_ok, tests_summary = results.tests or (False, "not run")
     post_scan_identifiers = sorted(
         _scan_result_value(results.scan, "found_identifiers", set()) or set()
@@ -3934,7 +3992,11 @@ def _apply_guardrails(
             )
 
     # Phase 3: deterministic scanner guardrail
-    remaining_global: set[str] = results.scan[2] if results.scan else set()
+    remaining_global: set[str] = (
+        set(_scan_result_value(results.scan, "remaining_identifiers", set()) or set())
+        if results.scan is not None
+        else set()
+    )
     for group in valid_groups:
         strategy = group_strategies.get(group.group_id, "version_bump")
         group_remaining = _group_remaining_identifiers(group, remaining_global)
@@ -4267,7 +4329,13 @@ def _build_group_evidence_packet(
         False,
         "run_dependency_install was not called.",
     )
-    if results.scan is None:
+    if results.scan_skipped:
+        scan_ok, scan_summary, remaining_identifiers = (
+            True,
+            f"scan skipped: {results.scan_skip_reason or 'explicit policy'}",
+            set(),
+        )
+    elif results.scan is None:
         scan_ok, scan_summary, remaining_identifiers = (
             False,
             "run_security_scan was not called.",
@@ -4591,7 +4659,16 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     candidate_changed_files: list[str] = state.get("changed_files") or []
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
     scan_targets = _build_qa_scan_targets(state, valid_groups)
-    scan_is_authoritative = scan_targets is None
+    task_queue = state.get("task_queue") or {}
+    active_task_ids = list(state.get("active_target_task_ids") or [])
+    active_tasks = [task_queue.get(task_id) for task_id in active_task_ids]
+    active_tasks = [task for task in active_tasks if task is not None]
+    skip_scan = (
+        bool(active_tasks)
+        and len(active_tasks) == len(active_task_ids)
+        and all(is_no_fix_package_removal_task(task) for task in active_tasks)
+    )
+    scan_is_authoritative = scan_targets is None and not skip_scan
     unscanned_projection = _scan_state_projection(
         _QAExecutionResults(),
         baseline_identifiers,
@@ -4654,6 +4731,8 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 target_identifiers=target_identifiers,
                 baseline_identifiers=baseline_identifiers,
                 scan_targets=scan_targets,
+                skip_scan=skip_scan,
+                scan_skip_reason="no_fix_package_removal" if skip_scan else None,
             )
             scan_projection = _scan_state_projection(
                 results,
@@ -4667,7 +4746,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
             missing_tools: list[str] = []
             if results.install is None:
                 missing_tools.append("run_dependency_install")
-            if results.scan is None:
+            if results.scan is None and not results.scan_skipped:
                 missing_tools.append("run_security_scan")
             if results.tests is None:
                 missing_tools.append("run_unit_tests")
@@ -4703,6 +4782,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     "qa_evaluations": failed_evals,
                     "eval_status": "failures_detected",
                     "status": "qa_failed",
+                    "scan_skipped": results.scan_skipped,
                     "errors": errors,
                     "changed_files": [],
                     "qa_investigation_report": "",
@@ -4809,6 +4889,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         "qa_evaluations": qa_evaluations,
         "eval_status": eval_status,
         "status": "qa_completed",
+        "scan_skipped": results.scan_skipped,
         "changed_files": candidate_changed_files,
         "errors": errors,
         "qa_investigation_report": qa_investigation_report,

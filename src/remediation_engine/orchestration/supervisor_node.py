@@ -80,6 +80,7 @@ from remediation_engine.contracts.version_policy import select_version
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
 from remediation_engine.orchestration.task_utils import (
+    TERMINAL_TASK_STATUSES,
     advance_no_fix_stage,
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
@@ -143,13 +144,7 @@ _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overri
 # Task status helpers
 # ---------------------------------------------------------------------------
 
-_TERMINAL_STATUSES = frozenset(
-    {
-        TaskStatus.QA_PASSED,
-        TaskStatus.UNFIXABLE,
-        TaskStatus.INCONCLUSIVE,
-    }
-)
+_TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
 _WORKABLE_STATUSES = frozenset(
     {
         TaskStatus.PENDING,
@@ -590,9 +585,9 @@ def _commit_task_transition(
     Worker successes that are waiting for QA intentionally do not use this
     helper for a status-only update: their current snapshot remains valid QA
     input.  Every replan, surrender, terminalization, and pivot does use it.
-    ``allow_breaking_change_pivot`` is reserved for the Supervisor-owned case
-    where a breaking-change update is retained as a passed parent attempt and
-    a workaround child owns the regression repair.
+    ``allow_breaking_change_pivot`` is retained for the Supervisor-owned
+    breaking-change pivot path; the normal ``NEEDS_RETRY -> PIVOTED`` transition
+    is now explicit in the shared transition table.
     """
     task = task_queue.get(task_id)
     if task is None:
@@ -2239,9 +2234,10 @@ def _parent_status_for_strategy_pivot(
     """
     Choose the terminal parent status when a strategy pivot spawns a child task.
 
-    BREAKING_CHANGE means the version bump itself succeeded but caused regressions,
-    so the parent attempt should become QA_PASSED and the child handles follow-on
-    workaround work. Other pivots represent an exhausted parent strategy attempt.
+    BREAKING_CHANGE means the version bump itself produced a candidate but caused
+    regressions, so the parent attempt is superseded by the child that owns the
+    follow-on workaround. Other pivots represent an exhausted parent strategy
+    attempt and remain ``UNFIXABLE``.
     """
     evaluation = qa_evaluations.get(parent_task.task_id) or qa_evaluations.get(
         parent_task.parent_group_id
@@ -2252,7 +2248,7 @@ def _parent_status_for_strategy_pivot(
         and evaluation is not None
         and evaluation.failure_category == FailureCategory.BREAKING_CHANGE
     ):
-        return TaskStatus.QA_PASSED
+        return TaskStatus.PIVOTED
     return TaskStatus.UNFIXABLE
 
 
@@ -2315,7 +2311,7 @@ def _terminalize_pivot_parents(
             updates=updates,
             close_attempt=(parent_task.current_attempt_id is not None),
             clear_selected_version=(parent_task.selected_version is not None),
-            allow_breaking_change_pivot=(terminal_status == TaskStatus.QA_PASSED),
+            allow_breaking_change_pivot=(terminal_status == TaskStatus.PIVOTED),
         )
         if retry_plans_by_task is not None:
             retry_plans_by_task.pop(parent_id, None)
@@ -3677,7 +3673,7 @@ def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> s
         "11. After a worker succeeds for the current task, route that task to qa_critic.",
         "12. When no actionable non-terminal tasks remain, route to teardown.",
         f"13. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
-        "14. unfixable and qa_passed tasks must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
+        "14. Terminal tasks (including unfixable, mitigated, and pivoted tasks) must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
         "15. task_status_updates may only set QA_PASSED or UNFIXABLE.",
         "16. Under the current routing policy, update_subagent MUST have exactly one target_task_id.",
         "17. workaround_subagent MUST have exactly one target_task_id.",
@@ -4262,8 +4258,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             if result.replay_plan is not None:
                 workaround_replay_plans_by_task[task_id] = result.replay_plan
             if result_status == AgentActionStatus.SUCCESS:
-                # Keep a successful attempt open because QA must evaluate the
-                # exact snapshot that produced the changes.
+                # Package removal still needs the normal QA install/test
+                # checks. QA deliberately skips only ODC for this stage;
+                # keep every successful attempt open so the snapshot is
+                # consumed by QA before the task becomes terminal.
                 _commit_task_transition(
                     task_queue,
                     task_id,

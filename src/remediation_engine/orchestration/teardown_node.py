@@ -177,7 +177,7 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
 
         task = task_by_group.get(g.group_id)
         if task is not None:
-            if task.status == TaskStatus.QA_PASSED:
+            if task.status in {TaskStatus.QA_PASSED, TaskStatus.MITIGATED, TaskStatus.PIVOTED}:
                 passed_files.update(files)
             elif task.status == TaskStatus.UNFIXABLE:
                 unfixable_files.update(files)
@@ -191,7 +191,7 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
     for attempt_res in worker_results_by_attempt.values():
         task = task_queue.get(attempt_res.task_id)
         if task is not None and attempt_res.changed_files:
-            if task.status == TaskStatus.QA_PASSED:
+            if task.status in {TaskStatus.QA_PASSED, TaskStatus.MITIGATED, TaskStatus.PIVOTED}:
                 passed_files.update(attempt_res.changed_files)
             elif task.status == TaskStatus.UNFIXABLE:
                 unfixable_files.update(attempt_res.changed_files)

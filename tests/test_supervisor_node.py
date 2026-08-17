@@ -1408,6 +1408,66 @@ def test_worker_result_persists_attempts_by_target_and_override_usage():
     assert result["next_routing_step"] == "qa_critic"
 
 
+@patch("langchain_openai.ChatOpenAI")
+def test_successful_no_fix_package_removal_routes_to_qa_without_odc(mock_chat):
+    """A removed NO_FIX package still runs QA install/tests; only ODC is skipped."""
+    group = _sca_group("g1", FixPlanStatus.NO_FIX)
+    instruction = "Remove test-pkg from the dependency manifests."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-no-fix-removal",
+        task_id="task-1",
+        task_revision=1,
+        strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+        no_fix_stage="package_removal",
+        instruction=instruction,
+        instruction_digest=_instruction_digest(instruction),
+        dispatch_node="workaround_subagent",
+    )
+    task = _make_task(
+        "task-1",
+        "g1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+    ).model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "no_fix_stage": snapshot.no_fix_stage,
+            "instruction": instruction,
+        }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            validation_calls=1,
+            validation_passed=True,
+            per_gate_results={"overall_status": "PASS"},
+            validated_files=[],
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+    mock_chat.side_effect = ImportError("No LLM needed for deterministic routing")
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            worker_results_by_attempt={snapshot.attempt_id: worker_result},
+        )
+    )
+
+    committed = result["task_queue"][task.task_id]
+    assert committed.status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert committed.current_attempt_id == snapshot.attempt_id
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == [task.task_id]
+
+
 def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch):
     group = _sca_group("g1")
     old_instruction = "Update test-pkg to 1.0.0."
@@ -2118,7 +2178,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_breaking_change_pivot_marks_parent_passed_and_routes_child(self, mock_chat):
+    def test_breaking_change_pivot_marks_parent_pivoted_and_routes_child(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task(
             "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
@@ -2212,7 +2272,7 @@ class TestRunSupervisorNodePeerConflict:
 
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
-        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
         assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
 
@@ -2664,7 +2724,7 @@ class TestBugFixes:
 
         result = run_supervisor_node(state)
 
-        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
         assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
         assert result["next_routing_step"] == "final_full_scan"
         assert result["active_target_task_ids"] == []
