@@ -59,6 +59,7 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     QAFailureEvidence,
     RemediationTask,
+    RoutingStrategy,
     ScanFallbackReason,
     ScanScope,
     VulnerabilityGroup,
@@ -2081,9 +2082,27 @@ def _build_qa_scan_targets(
             else group.vulnerable_component or ""
         ).strip()
         expected_version = task.selected_version if task is not None else None
-        if not expected_version and target_package:
+        # A workaround task deliberately has no supervisor-selected package
+        # version.  Its worker may leave the installed dependency at whatever
+        # version the live workspace resolves after install.  Falling back to
+        # the group's baseline version here can therefore point the closure
+        # resolver at a package instance that no longer exists (for example,
+        # an express-jwt workaround task with a live 8.x installation and a
+        # baseline group version from the original 0.x finding).  Leaving the
+        # version unconstrained lets the resolver select the live instance or
+        # fail closed when the live lockfile is genuinely ambiguous.
+        is_unversioned_workaround = (
+            task is not None
+            and task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and not task.selected_version
+        )
+        if not expected_version and target_package and not is_unversioned_workaround:
             expected_version = (group.dependency_versions or {}).get(target_package)
-        if not expected_version and target_package == group.vulnerable_component:
+        if (
+            not expected_version
+            and target_package == group.vulnerable_component
+            and not is_unversioned_workaround
+        ):
             expected_version = (group.versions or [None])[0]
         ancestry = tuple(name for name in (group.dependency_ancestry or []) if name)
         targets.append(

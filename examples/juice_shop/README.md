@@ -89,6 +89,17 @@ record, task statuses, trajectory, and patch for routing-focused review:
 python examples/juice_shop/fixtures/deterministic_routing/run_deterministic_routing.py
 ```
 
+### 7. Shared dependency closures
+
+Runs two pre-triaged update tasks for `express-jwt` and its nested
+`jsonwebtoken` dependency. Their lockfile closures overlap, so the fixture is
+useful for validating targeted closure union and duplicate-safe lockfile-key
+provenance:
+
+```bash
+python examples/juice_shop/fixtures/shared_dependencies/run_shared_dependencies.py
+```
+
 ---
 
 ## Fixture layout
@@ -126,6 +137,13 @@ The `fixtures/deterministic_routing/` scenario contains:
 * **`triaged_groups_deterministic.json`**: Exactly five findings across five pre-triaged groups.
 * **`run_deterministic_routing.py`**: Runner that validates the issue limit and persists routing evidence.
 * **`README.md`**: Expected deterministic decision checkpoints and coverage notes.
+
+The `fixtures/shared_dependencies/` scenario contains:
+
+* **`triaged_groups_shared_dependencies.json`**: Two extracted pre-triaged groups with overlapping npm closures.
+* **`baseline_issues_shared_dependencies.jsonl`**: The five matching canonical baseline issue records.
+* **`run_shared_dependencies.py`**: Runner that validates the group/issue correspondence and executes the post-triage workflow.
+* **`README.md`**: Shared-closure coverage and expected usage.
 
 ### Refreshing derived fixtures manually
 

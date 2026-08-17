@@ -66,6 +66,7 @@ from remediation_engine.orchestration.qa_critic import (
     _build_batch_judge_prompt,
     _build_fallback_investigation_report,
     _build_individual_investigator_prompt,
+    _build_qa_scan_targets,
     _collect_baseline_identifiers,
     _collect_target_identifiers,
     _derive_qa_group_strategies,
@@ -169,6 +170,38 @@ def _make_workspace_tmpdir() -> Path:
 # ---------------------------------------------------------------------------
 # _run_install
 # ---------------------------------------------------------------------------
+
+
+def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
+    """Workaround QA must not inherit a stale baseline group version."""
+    group = _make_group(
+        group_id="sca:package.json:express-jwt:code_workaround",
+    ).model_copy(
+        update={
+            "vulnerable_component": "express-jwt",
+            "versions": ["0.1.3"],
+            "dependency_versions": {"express-jwt": "0.1.3"},
+        }
+    )
+    task = RemediationTask(
+        task_id="task-workaround",
+        parent_group_id=group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Apply the workaround.",
+    )
+
+    targets = _build_qa_scan_targets(
+        {
+            "active_target_task_ids": [task.task_id],
+            "task_queue": {task.task_id: task},
+        },
+        [group],
+    )
+
+    assert targets is not None
+    assert len(targets) == 1
+    assert targets[0].target_package == "express-jwt"
+    assert targets[0].expected_version is None
 
 
 class TestRunInstall:

@@ -98,7 +98,7 @@ from remediation_engine.tools.registry_tools import (
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 2
+MAX_RETRIES: int = 3
 # Supervisor dispatch is intentionally per-task.  The worker and QA helpers
 # remain batch-capable for direct callers and a future explicit batch mode.
 UPDATE_DISPATCH_LIMIT: int = 1
@@ -579,6 +579,7 @@ def _commit_task_transition(
     updates: dict[str, Any],
     close_attempt: bool = False,
     clear_selected_version: bool = False,
+    allow_breaking_change_pivot: bool = False,
     consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     """Commit one coherent supervisor transition for a task.
@@ -589,6 +590,9 @@ def _commit_task_transition(
     Worker successes that are waiting for QA intentionally do not use this
     helper for a status-only update: their current snapshot remains valid QA
     input.  Every replan, surrender, terminalization, and pivot does use it.
+    ``allow_breaking_change_pivot`` is reserved for the Supervisor-owned case
+    where a breaking-change update is retained as a passed parent attempt and
+    a workaround child owns the regression repair.
     """
     task = task_queue.get(task_id)
     if task is None:
@@ -604,8 +608,15 @@ def _commit_task_transition(
             )
         except (TypeError, ValueError):
             new_status = None
+        pivot_transition_allowed = (
+            allow_breaking_change_pivot
+            and current_status == TaskStatus.NEEDS_RETRY
+            and new_status == TaskStatus.QA_PASSED
+        )
         if new_status is None or (
-            new_status != current_status and not validate_transition(current_status, new_status)
+            new_status != current_status
+            and not validate_transition(current_status, new_status)
+            and not pivot_transition_allowed
         ):
             event = _build_consistency_event(
                 error_code="INVALID_TRANSITION",
@@ -2304,6 +2315,7 @@ def _terminalize_pivot_parents(
             updates=updates,
             close_attempt=(parent_task.current_attempt_id is not None),
             clear_selected_version=(parent_task.selected_version is not None),
+            allow_breaking_change_pivot=(terminal_status == TaskStatus.QA_PASSED),
         )
         if retry_plans_by_task is not None:
             retry_plans_by_task.pop(parent_id, None)
@@ -3700,7 +3712,8 @@ def _materialize_spawn_requests(
     """Validate and materialize spawn requests into new RemediationTask objects.
 
     Returns a dict of new task_id â†’ RemediationTask to be merged into task_queue.
-    Rejected requests are logged to errors.
+    Rejected requests are logged to errors.  A repeated parent/strategy pivot
+    reuses its existing child and is not treated as an error.
     """
     next_index = len(task_queue) + 1
     new_tasks: dict[str, RemediationTask] = {}
@@ -3732,6 +3745,34 @@ def _materialize_spawn_requests(
                 f"supervisor: spawn rejected â€” CODE_WORKAROUND parent '{req.parent_task_id}' "
                 f"cannot spawn another CODE_WORKAROUND child. Workaround tasks are terminal "
                 f"remediation strategies."
+            )
+            continue
+
+        # Spawn requests can be replayed when the supervisor revisits the same
+        # exhausted parent, and an LLM decision can also contain duplicate
+        # requests in one envelope.  A workaround pivot is idempotent: one
+        # parent remediation task may own at most one child for a given
+        # strategy.  Check both the committed queue and children materialized
+        # earlier in this call so neither replay can create sibling tasks.
+        existing_child = next(
+            (
+                candidate
+                for candidate in (*task_queue.values(), *new_tasks.values())
+                if candidate.parent_task_id == req.parent_task_id
+                and candidate.strategy == req.strategy
+            ),
+            None,
+        )
+        if existing_child is not None:
+            existing_child_ids = child_ids_by_parent.setdefault(req.parent_task_id, [])
+            if existing_child.task_id not in existing_child_ids:
+                existing_child_ids.append(existing_child.task_id)
+            logger.info(
+                "supervisor: skipped duplicate child spawn for parent '%s'; "
+                "reusing existing child '%s' (strategy=%s).",
+                req.parent_task_id,
+                existing_child.task_id,
+                req.strategy.value,
             )
             continue
 
@@ -5619,9 +5660,29 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             child_ids = child_ids_by_parent.get(task_id, [])
             if child_ids:
                 child_task_id = child_ids[0]
-                resolved_target_task_ids.append(child_task_id)
-                if task_id in decision.feedback_by_task:
-                    remapped_feedback_by_task[child_task_id] = decision.feedback_by_task[task_id]
+                child_task = task_queue.get(child_task_id)
+                if (
+                    child_task is not None
+                    and child_task.strategy == RoutingStrategy.CODE_WORKAROUND
+                    and child_task.status in _WORKABLE_STATUSES
+                ):
+                    resolved_target_task_ids.append(child_task_id)
+                    if task_id in decision.feedback_by_task:
+                        remapped_feedback_by_task[child_task_id] = decision.feedback_by_task[
+                            task_id
+                        ]
+                else:
+                    # A replayed pivot may find a child that is already
+                    # optimistic/terminal.  It is valid evidence that the
+                    # pivot exists, but it is not a worker target.  Let the
+                    # deterministic reroute below choose QA, final scanning,
+                    # teardown, or another actionable task.
+                    logger.info(
+                        "supervisor: pivot child '%s' is not dispatchable "
+                        "(status=%s); recomputing the next route.",
+                        child_task_id,
+                        child_task.status.value if child_task is not None else "missing",
+                    )
             else:
                 errors.append(
                     "supervisor: dropped strategy-pivot target because child task could not "
@@ -5709,11 +5770,37 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         and not resolved_target_task_ids
     ):
         errors.append(
-            "supervisor: routing fell back to teardown because no dispatchable target tasks remained."
+            "supervisor: recomputing routing because no dispatchable target tasks remained."
         )
-        resolved_next_node = "teardown"
-        resolved_target_task_ids = []
-        remapped_feedback_by_task = {}
+        # This can happen when a replayed pivot reuses a child that has
+        # already reached a terminal state.  Teardown would incorrectly skip
+        # other non-terminal tasks, so ask the deterministic router for the
+        # next eligible action after the parent/child transition is committed.
+        decision = _deterministic_routing(
+            task_queue,
+            group_by_id,
+            qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
+            active_target_task_ids=active_target_task_ids,
+            current_status=str(state.get("status") or ""),
+            triage_required=bool(state.get("triage_required")),
+            workspace_volume=state.get("workspace_volume"),
+            final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+        )
+        resolved_next_node = decision.next_node
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            list(decision.target_task_ids),
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+        )
+        remapped_feedback_by_task = {
+            task_id: feedback
+            for task_id, feedback in decision.feedback_by_task.items()
+            if task_id in set(resolved_target_task_ids)
+        }
 
     # Commit the exact input snapshot before exposing worker targets to the
     # graph. QA reuses the current worker attempt; update/workaround dispatches

@@ -55,6 +55,12 @@ class _FakeResult:
             "load_fixture",
         ),
         (
+            "shared_dependencies",
+            "examples/juice_shop/fixtures/shared_dependencies/run_shared_dependencies.py",
+            "examples/juice_shop/fixtures/shared_dependencies/triaged_groups_shared_dependencies.json",
+            "load_shared_dependency_groups",
+        ),
+        (
             "suppressed",
             "examples/juice_shop/fixtures/suppressed/run_post_triage.py",
             "examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json",

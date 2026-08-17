@@ -203,6 +203,22 @@ def test_commit_rejects_invalid_transition_without_mutation():
     assert events[0].action == "rejected"
 
 
+def test_commit_rejects_unscoped_retry_to_pass_transition():
+    task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY)
+    queue = {task.task_id: task}
+    events = []
+
+    _commit_task_transition(
+        queue,
+        task.task_id,
+        updates={"status": TaskStatus.QA_PASSED},
+        consistency_events=events,
+    )
+
+    assert queue[task.task_id] == task
+    assert events and events[0].error_code == "INVALID_TRANSITION"
+
+
 def test_supervisor_router_recomputes_invalid_route():
     group = _group("g")
     state = {

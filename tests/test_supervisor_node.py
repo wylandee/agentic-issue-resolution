@@ -2559,6 +2559,120 @@ class TestBugFixes:
         assert child_task.strategy == RoutingStrategy.CODE_WORKAROUND
         assert len(errors) == 0
 
+    def test_materialize_spawn_requests_reuses_existing_child_for_parent(self):
+        """A replayed pivot must not create a second workaround sibling."""
+        parent_task = RemediationTask(
+            task_id="task-1",
+            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+            instruction="Bump express",
+        )
+        existing_child = RemediationTask(
+            task_id="task-2",
+            parent_group_id="sca:package.json:express:CODE_WORKAROUND",
+            parent_task_id="task-1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.PENDING,
+            instruction="Apply workaround",
+        )
+        task_queue = {parent_task.task_id: parent_task, existing_child.task_id: existing_child}
+        spawn_req = TaskSpawnRequest(
+            parent_task_id="task-1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            instruction="Pivot to workaround",
+            reason="Exhausted version bump",
+        )
+        errors: list[str] = []
+
+        new_tasks, child_ids_by_parent = _materialize_spawn_requests(
+            spawn_requests=[spawn_req],
+            task_queue=task_queue,
+            group_by_id={},
+            errors=errors,
+        )
+
+        assert new_tasks == {}
+        assert child_ids_by_parent == {"task-1": ["task-2"]}
+        assert errors == []
+
+    def test_materialize_spawn_requests_deduplicates_requests_in_one_decision(self):
+        parent_task = RemediationTask(
+            task_id="task-1",
+            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+            instruction="Bump express",
+        )
+        task_queue = {parent_task.task_id: parent_task}
+        spawn_req = TaskSpawnRequest(
+            parent_task_id="task-1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            instruction="Pivot to workaround",
+            reason="Exhausted version bump",
+        )
+        errors: list[str] = []
+
+        new_tasks, child_ids_by_parent = _materialize_spawn_requests(
+            spawn_requests=[spawn_req, spawn_req],
+            task_queue=task_queue,
+            group_by_id={},
+            errors=errors,
+        )
+
+        assert len(new_tasks) == 1
+        assert len(child_ids_by_parent["task-1"]) == 1
+        assert errors == []
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
+        """A completed workaround child must not produce an empty worker route."""
+        group = _sca_group("g1")
+        parent_task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        existing_child = _make_task(
+            "task-2",
+            "g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.UNFIXABLE,
+        ).model_copy(update={"parent_task_id": "task-1"})
+        state = _base_state(
+            [group],
+            task_queue={"task-1": parent_task, "task-2": existing_child},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The update introduced a breaking runtime regression.",
+                )
+            },
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    exhausted_update_path=True,
+                )
+            },
+            workspace_volume="workspace-volume",
+            final_full_scan_completed=False,
+        )
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
+        assert result["next_routing_step"] == "final_full_scan"
+        assert result["active_target_task_ids"] == []
+        assert not any(
+            error.startswith("supervisor: routing fell back to teardown")
+            for error in result.get("errors", [])
+        )
+
     def test_bug3_reject_workaround_to_workaround_spawn(self):
         parent_task = RemediationTask(
             task_id="task-1",
