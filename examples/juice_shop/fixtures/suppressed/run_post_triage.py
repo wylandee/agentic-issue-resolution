@@ -11,7 +11,30 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from remediation_engine import RemediationRequest, run_remediation
-from remediation_engine.contracts.schemas import VulnerabilityGroup
+from remediation_engine.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
+
+
+def _baseline_issues_from_groups(
+    groups: list[VulnerabilityGroup],
+) -> list[VulnerabilityIssue]:
+    """Return the de-duplicated issue baseline represented by pre-triaged groups.
+
+    Args:
+        groups: Pre-triaged groups that will be supplied to remediation.
+
+    Returns:
+        The issue objects represented by ``groups``, preserving fixture order.
+
+    Raises:
+        ValueError: If a group has no issue payload to establish its baseline.
+    """
+    issues_by_id: dict[str, VulnerabilityIssue] = {}
+    for group in groups:
+        if not group.issues:
+            raise ValueError(f"Pre-triaged group {group.group_id} has no baseline issues.")
+        for issue in group.issues:
+            issues_by_id.setdefault(str(issue.id), issue)
+    return list(issues_by_id.values())
 
 
 def main() -> int:
@@ -52,16 +75,19 @@ def main() -> int:
 
     raw_groups = json.loads(args.groups.read_text(encoding="utf-8"))
     groups = [VulnerabilityGroup.model_validate(item) for item in raw_groups]
+    baseline_issues = _baseline_issues_from_groups(groups)
 
     logging.info(
-        "Starting remediation with %d pre-processed vulnerability group(s)...",
+        "Starting remediation with %d pre-processed vulnerability group(s) and %d baseline issue(s)...",
         len(groups),
+        len(baseline_issues),
     )
 
     result = run_remediation(
         RemediationRequest(
             repo_root=args.repo,
             valid_groups=groups,
+            issues=baseline_issues,
         )
     )
 

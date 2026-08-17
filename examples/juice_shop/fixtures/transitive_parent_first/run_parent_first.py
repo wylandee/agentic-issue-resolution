@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from remediation_engine import RemediationRequest, run_remediation
-from remediation_engine.contracts.schemas import VulnerabilityGroup
+from remediation_engine.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,29 @@ def load_parent_first_groups(path: Path = _DEFAULT_GROUPS) -> list[Vulnerability
     return groups
 
 
+def _baseline_issues_from_groups(
+    groups: list[VulnerabilityGroup],
+) -> list[VulnerabilityIssue]:
+    """Return the de-duplicated issue baseline represented by pre-triaged groups.
+
+    Args:
+        groups: Pre-triaged groups that will be supplied to remediation.
+
+    Returns:
+        The issue objects represented by ``groups``, preserving fixture order.
+
+    Raises:
+        ValueError: If a group has no issue payload to establish its baseline.
+    """
+    issues_by_id: dict[str, VulnerabilityIssue] = {}
+    for group in groups:
+        if not group.issues:
+            raise ValueError(f"Pre-triaged group {group.group_id} has no baseline issues.")
+        for issue in group.issues:
+            issues_by_id.setdefault(str(issue.id), issue)
+    return list(issues_by_id.values())
+
+
 def main() -> int:
     """Execute the parent-first fixture with standard logging and output persistence."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -95,11 +118,19 @@ def main() -> int:
         return 2
 
     groups = load_parent_first_groups(args.groups)
+    baseline_issues = _baseline_issues_from_groups(groups)
     logger.info(
-        "Starting parent-first remediation with packages: %s",
+        "Starting parent-first remediation with packages: %s and %d baseline issue(s)",
         ", ".join(sorted(group.vulnerable_component or "unknown" for group in groups)),
+        len(baseline_issues),
     )
-    result = run_remediation(RemediationRequest(repo_root=args.repo, valid_groups=groups))
+    result = run_remediation(
+        RemediationRequest(
+            repo_root=args.repo,
+            valid_groups=groups,
+            issues=baseline_issues,
+        )
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

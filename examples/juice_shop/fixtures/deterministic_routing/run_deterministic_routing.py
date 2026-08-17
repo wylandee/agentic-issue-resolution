@@ -19,7 +19,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from remediation_engine import RemediationRequest, run_remediation
-from remediation_engine.contracts.schemas import VulnerabilityGroup
+from remediation_engine.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
 
 _MAX_ISSUES = 5
 _EXPECTED_COMPONENTS = {
@@ -80,6 +80,29 @@ def load_fixture(path: Path = _DEFAULT_FIXTURE) -> list[VulnerabilityGroup]:
     return groups
 
 
+def _baseline_issues_from_groups(
+    groups: list[VulnerabilityGroup],
+) -> list[VulnerabilityIssue]:
+    """Return the de-duplicated issue baseline represented by the fixture groups.
+
+    Args:
+        groups: Pre-triaged groups that will be supplied to remediation.
+
+    Returns:
+        The issue objects represented by ``groups``, preserving fixture order.
+
+    Raises:
+        ValueError: If a group has no issue payload to establish its baseline.
+    """
+    issues_by_id: dict[str, VulnerabilityIssue] = {}
+    for group in groups:
+        if not group.issues:
+            raise ValueError(f"Pre-triaged group {group.group_id} has no baseline issues.")
+        for issue in group.issues:
+            issues_by_id.setdefault(str(issue.id), issue)
+    return list(issues_by_id.values())
+
+
 def _routing_summary(result: Any) -> dict[str, Any]:
     """Project deterministic-routing evidence from a remediation result."""
     state = result.raw_state or {}
@@ -121,16 +144,18 @@ def main() -> int:
         return 2
 
     groups = load_fixture(args.fixture.resolve())
+    baseline_issues = _baseline_issues_from_groups(groups)
     logging.info(
         "Starting deterministic-routing fixture with %d groups and %d issues.",
         len(groups),
-        sum(len(group.issues) for group in groups),
+        len(baseline_issues),
     )
 
     result = run_remediation(
         RemediationRequest(
             repo_root=args.repo.resolve(),
             valid_groups=groups,
+            issues=baseline_issues,
         )
     )
 
