@@ -1,0 +1,1289 @@
+[
+  {
+    "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "express-jwt",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2020-15084"
+    ],
+    "ghsa_ids": [
+      "GHSA-6G6M-M6H5-W9GF"
+    ],
+    "versions": [
+      "0.1.3"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+    "issues": [
+      {
+        "id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2020-15084",
+        "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+        "cwe": [
+          {
+            "id": "CWE-863",
+            "name": null
+          },
+          {
+            "id": "CWE-285",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "CRITICAL",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+        "line_range": null,
+        "package_name": "express-jwt",
+        "package_version": "0.1.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/express-jwt@0.1.3",
+        "ecosystem": "npm",
+        "message": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "express-jwt:0.1.3",
+          "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2020-15084",
+            "severity": "CRITICAL",
+            "cvssv2": {
+              "score": 4.3,
+              "accessVector": "NETWORK",
+              "accessComplexity": "MEDIUM",
+              "authenticationr": "NONE",
+              "confidentialityImpact": "NONE",
+              "integrityImpact": "PARTIAL",
+              "availabilityImpact": "NONE",
+              "severity": "MEDIUM",
+              "version": "2.0",
+              "exploitabilityScore": "8.6",
+              "impactScore": "2.9"
+            },
+            "cvssv3": {
+              "baseScore": 9.1,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "NONE",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "CRITICAL",
+              "exploitabilityScore": "3.9",
+              "impactScore": "5.2",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-863",
+              "CWE-285"
+            ],
+            "description": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+            "notes": "",
+            "references": [
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:auth0:express-jwt:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "5.3.3"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/express-jwt@0.1.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815136+00:00"
+      },
+      {
+        "id": "e94f2e28-2a06-4533-8d1b-afc309579eae",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2020-15084",
+        "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+        "cwe": [
+          {
+            "id": "CWE-863",
+            "name": null
+          },
+          {
+            "id": "CWE-285",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "HIGH",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+        "line_range": null,
+        "package_name": "express-jwt",
+        "package_version": "0.1.3",
+        "fixed_version": null,
+        "purl": "pkg:npm/express-jwt@0.1.3",
+        "ecosystem": "npm",
+        "message": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "express-jwt:0.1.3",
+          "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+          "vulnerability": {
+            "source": "NPM",
+            "name": "GHSA-6g6m-m6h5-w9gf",
+            "unscored": "true",
+            "severity": "high",
+            "cvssv3": {
+              "baseScore": 7.699999809265137,
+              "attackVector": "NETWORK",
+              "attackComplexity": "HIGH",
+              "privilegesRequired": "LOW",
+              "userInteraction": "REQUIRED",
+              "scope": "CHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "HIGH",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-863",
+              "CWE-285"
+            ],
+            "description": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+            "notes": "",
+            "references": [
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084",
+                "name": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                "name": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf"
+              },
+              {
+                "source": "NPM Advisory reference: ",
+                "url": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf",
+                "name": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:*:express-jwt:\\<\\=5.3.3:*:*:*:*:*:*:*"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/express-jwt@0.1.3",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.815145+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "98e1c80e-d8b4-446e-b480-deb8b809c4f4",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2020-15084",
+          "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+          "cwe": [
+            {
+              "id": "CWE-863",
+              "name": null
+            },
+            {
+              "id": "CWE-285",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "CRITICAL",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+          "line_range": null,
+          "package_name": "express-jwt",
+          "package_version": "0.1.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/express-jwt@0.1.3",
+          "ecosystem": "npm",
+          "message": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "express-jwt:0.1.3",
+            "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2020-15084",
+              "severity": "CRITICAL",
+              "cvssv2": {
+                "score": 4.3,
+                "accessVector": "NETWORK",
+                "accessComplexity": "MEDIUM",
+                "authenticationr": "NONE",
+                "confidentialityImpact": "NONE",
+                "integrityImpact": "PARTIAL",
+                "availabilityImpact": "NONE",
+                "severity": "MEDIUM",
+                "version": "2.0",
+                "exploitabilityScore": "8.6",
+                "impactScore": "2.9"
+              },
+              "cvssv3": {
+                "baseScore": 9.1,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "NONE",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "HIGH",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "CRITICAL",
+                "exploitabilityScore": "3.9",
+                "impactScore": "5.2",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-863",
+                "CWE-285"
+              ],
+              "description": "In express-jwt (NPM package) up and including version 5.3.3, the algorithms entry to be specified in the configuration is not being enforced. When algorithms is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. You are affected by this vulnerability if all of the following conditions apply: - You are using express-jwt - You do not have **algorithms** configured in your express-jwt configuration. - You are using libraries such as jwks-rsa as the **secret**. You can fix this by specifying **algorithms** in the express-jwt configuration. See linked GHSA for example. This is also fixed in version 6.0.0.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:auth0:express-jwt:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "5.3.3"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/express-jwt@0.1.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815136+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": null,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": null,
+        "localization_confidence": 0.0,
+        "localized_at": "2026-08-03T16:49:39.231704Z"
+      },
+      {
+        "issue": {
+          "id": "e94f2e28-2a06-4533-8d1b-afc309579eae",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2020-15084",
+          "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+          "cwe": [
+            {
+              "id": "CWE-863",
+              "name": null
+            },
+            {
+              "id": "CWE-285",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "HIGH",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
+          "line_range": null,
+          "package_name": "express-jwt",
+          "package_version": "0.1.3",
+          "fixed_version": null,
+          "purl": "pkg:npm/express-jwt@0.1.3",
+          "ecosystem": "npm",
+          "message": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "express-jwt:0.1.3",
+            "filePath": "/scan/package-lock.json?/express-jwt:0.1.3",
+            "vulnerability": {
+              "source": "NPM",
+              "name": "GHSA-6g6m-m6h5-w9gf",
+              "unscored": "true",
+              "severity": "high",
+              "cvssv3": {
+                "baseScore": 7.699999809265137,
+                "attackVector": "NETWORK",
+                "attackComplexity": "HIGH",
+                "privilegesRequired": "LOW",
+                "userInteraction": "REQUIRED",
+                "scope": "CHANGED",
+                "confidentialityImpact": "HIGH",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "HIGH",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-863",
+                "CWE-285"
+              ],
+              "description": "### Overview\nVersions before and including 5.3.3, we are not enforcing the **algorithms** entry to be specified in the configuration.\nWhen **algorithms** is not specified in the configuration, with the combination of jwks-rsa, it may lead to authorization bypass. \n\n### Am I affected?\nYou are affected by this vulnerability if all of the following conditions apply:\n\nYou are using express-jwt\nAND \nYou do not have **algorithms**  configured in your express-jwt configuration.\nAND\nYou are using libraries such as jwks-rsa as the **secret**. \n\n### How to fix that?\nSpecify **algorithms** in the express-jwt configuration. The following is an example of a proper configuration\n\n``` \nconst checkJwt = jwt({\n  secret: jwksRsa.expressJwtSecret({\n    rateLimit: true,\n    jwksRequestsPerMinute: 5,\n    jwksUri: `https://${DOMAIN}/.well-known/jwks.json`\n  }),\n  // Validate the audience and the issuer.\n  audience: process.env.AUDIENCE,\n  issuer: `https://${DOMAIN}/`,\n  // restrict allowed algorithms\n  algorithms: ['RS256']\n}); \n```\n\n### Will this update impact my users?\nThe fix provided in patch will not affect your users if you specified the algorithms allowed. The patch now makes **algorithms** a required configuration. \n\n\n### Credit\nIST Group",
+              "notes": "",
+              "references": [
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084",
+                  "name": "https://nvd.nist.gov/vuln/detail/CVE-2020-15084"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef",
+                  "name": "https://github.com/auth0/express-jwt/commit/7ecab5f8f0cab5297c2b863596566eb0c019cdef"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "https://github.com/auth0/express-jwt/security/advisories/GHSA-6g6m-m6h5-w9gf"
+                },
+                {
+                  "source": "NPM Advisory reference: ",
+                  "url": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf",
+                  "name": "https://github.com/advisories/GHSA-6g6m-m6h5-w9gf"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:*:express-jwt:\\<\\=5.3.3:*:*:*:*:*:*:*"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/express-jwt@0.1.3",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.815145+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": null,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": null,
+        "localization_confidence": 0.0,
+        "localized_at": "2026-08-03T16:49:40.159242Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "6.0.0",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"express-jwt\": \"6.0.0\"} in express-jwt:0.1.3 to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2020-15084",
+      "epss": 0.01054,
+      "epss_percentile": 0.61052,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-03T16:51:23.121235Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": null,
+    "grouped_at": "2026-08-03T16:51:22.088625Z"
+  },
+  {
+    "group_id": "sca:package.json:jsonwebtoken:UPDATE_VERSION",
+    "issue_type": "sca",
+    "vulnerable_component": "jsonwebtoken",
+    "file_path": "package.json",
+    "file_paths": [
+      "package.json"
+    ],
+    "cve_ids": [
+      "CVE-2022-23539",
+      "CVE-2022-23540",
+      "CVE-2022-23541"
+    ],
+    "ghsa_ids": [
+      "GHSA-8CF7-32GW-WR33",
+      "GHSA-QWPH-4952-7XR6",
+      "GHSA-HJRF-2M68-5959"
+    ],
+    "versions": [
+      "0.1.0"
+    ],
+    "sources": [
+      "odc"
+    ],
+    "representative_issue_id": "a1b52fda-9b0f-4f9f-83a8-a2aac86b9a57",
+    "issues": [
+      {
+        "id": "a1b52fda-9b0f-4f9f-83a8-a2aac86b9a57",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-23539",
+        "ghsa_id": "GHSA-8CF7-32GW-WR33",
+        "cwe": [
+          {
+            "id": "CWE-327",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "HIGH",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+        "line_range": null,
+        "package_name": "jsonwebtoken",
+        "package_version": "0.1.0",
+        "fixed_version": null,
+        "purl": "pkg:npm/jsonwebtoken@0.1.0",
+        "ecosystem": "npm",
+        "message": "Versions `<=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you’ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "jsonwebtoken:0.1.0",
+          "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2022-23539",
+            "severity": "HIGH",
+            "cvssv3": {
+              "baseScore": 8.1,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "HIGH",
+              "exploitabilityScore": "2.8",
+              "impactScore": "5.2",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-327"
+            ],
+            "description": "Versions `<=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you’ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions.",
+            "notes": "",
+            "references": [
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-8cf7-32gw-wr33",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-8cf7-32gw-wr33",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH,THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "8.5.1"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/jsonwebtoken@0.1.0",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.816173+00:00"
+      },
+      {
+        "id": "3152ef0a-99c4-4f4c-bc69-6968894a2183",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-23540",
+        "ghsa_id": "GHSA-QWPH-4952-7XR6",
+        "cwe": [
+          {
+            "id": "CWE-347",
+            "name": null
+          },
+          {
+            "id": "CWE-287",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "HIGH",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+        "line_range": null,
+        "package_name": "jsonwebtoken",
+        "package_version": "0.1.0",
+        "fixed_version": null,
+        "purl": "pkg:npm/jsonwebtoken@0.1.0",
+        "ecosystem": "npm",
+        "message": "In versions `<=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don’t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "jsonwebtoken:0.1.0",
+          "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2022-23540",
+            "severity": "HIGH",
+            "cvssv3": {
+              "baseScore": 7.6,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "LOW",
+              "integrityImpact": "HIGH",
+              "availabilityImpact": "LOW",
+              "baseSeverity": "HIGH",
+              "exploitabilityScore": "2.8",
+              "impactScore": "4.7",
+              "version": "3.1"
+            },
+            "cwes": [
+              "CWE-347",
+              "CWE-287"
+            ],
+            "description": "In versions `<=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don’t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options.",
+            "notes": "",
+            "references": [
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-qwph-4952-7xr6",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-qwph-4952-7xr6",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "8.5.1"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/jsonwebtoken@0.1.0",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.816182+00:00"
+      },
+      {
+        "id": "d0143079-0ad8-43d7-ab70-62f83759af0e",
+        "finding_id": null,
+        "source": "odc",
+        "issue_type": "sca",
+        "repo_url": null,
+        "base_ref": null,
+        "rule_id": null,
+        "cve_id": "CVE-2022-23541",
+        "ghsa_id": "GHSA-HJRF-2M68-5959",
+        "cwe": [
+          {
+            "id": "CWE-287",
+            "name": null
+          },
+          {
+            "id": "CWE-1259",
+            "name": null
+          }
+        ],
+        "owasp": [],
+        "severity": "MEDIUM",
+        "confidence": null,
+        "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+        "line_range": null,
+        "package_name": "jsonwebtoken",
+        "package_version": "0.1.0",
+        "fixed_version": null,
+        "purl": "pkg:npm/jsonwebtoken@0.1.0",
+        "ecosystem": "npm",
+        "message": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `<= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0.",
+        "finding_url": null,
+        "dataflow_trace": null,
+        "validation_profile": null,
+        "raw_payload": {
+          "fileName": "jsonwebtoken:0.1.0",
+          "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "vulnerability": {
+            "source": "NVD",
+            "name": "CVE-2022-23541",
+            "severity": "MEDIUM",
+            "cvssv3": {
+              "baseScore": 6.3,
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "NONE",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "LOW",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "LOW",
+              "baseSeverity": "MEDIUM",
+              "exploitabilityScore": "2.8",
+              "impactScore": "3.4",
+              "version": "3.1"
+            },
+            "cwes": [
+              "NVD-CWE-Other",
+              "CWE-287",
+              "CWE-1259"
+            ],
+            "description": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `<= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0.",
+            "notes": "",
+            "references": [
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/releases/tag/v9.0.0",
+                "name": "RELEASE_NOTES"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-hjrf-2m68-5959",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-hjrf-2m68-5959",
+                "name": "THIRD_PARTY_ADVISORY"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/releases/tag/v9.0.0",
+                "name": "RELEASE_NOTES"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+              },
+              {
+                "source": "security-advisories@github.com",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH"
+              },
+              {
+                "source": "af854a3a-2127-422b-91ae-364da2661108",
+                "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                "name": "PATCH"
+              }
+            ],
+            "vulnerableSoftware": [
+              {
+                "software": {
+                  "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                  "vulnerabilityIdMatched": "true",
+                  "versionEndIncluding": "8.5.1"
+                }
+              }
+            ]
+          },
+          "packages": [
+            {
+              "id": "pkg:npm/jsonwebtoken@0.1.0",
+              "confidence": "HIGHEST"
+            }
+          ],
+          "includedBy": []
+        },
+        "ingested_at": "2026-08-03T16:41:00.816192+00:00"
+      }
+    ],
+    "localized_issues": [
+      {
+        "issue": {
+          "id": "a1b52fda-9b0f-4f9f-83a8-a2aac86b9a57",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2022-23539",
+          "ghsa_id": "GHSA-8CF7-32GW-WR33",
+          "cwe": [
+            {
+              "id": "CWE-327",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "HIGH",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "line_range": null,
+          "package_name": "jsonwebtoken",
+          "package_version": "0.1.0",
+          "fixed_version": null,
+          "purl": "pkg:npm/jsonwebtoken@0.1.0",
+          "ecosystem": "npm",
+          "message": "Versions `<=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you’ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "jsonwebtoken:0.1.0",
+            "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2022-23539",
+              "severity": "HIGH",
+              "cvssv3": {
+                "baseScore": 8.1,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "LOW",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "HIGH",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "NONE",
+                "baseSeverity": "HIGH",
+                "exploitabilityScore": "2.8",
+                "impactScore": "5.2",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-327"
+              ],
+              "description": "Versions `<=8.5.1` of `jsonwebtoken` library could be misconfigured so that legacy, insecure key types are used for signature verification. For example, DSA keys could be used with the RS256 algorithm. You are affected if you are using an algorithm and a key type other than a combination listed in the GitHub Security Advisory as unaffected. This issue has been fixed, please update to version 9.0.0. This version validates for asymmetric key type and algorithm combinations. Please refer to the above mentioned algorithm / key type combinations for the valid secure configuration. After updating to version 9.0.0, if you still intend to continue with signing or verifying tokens using invalid key type/algorithm value combinations, you’ll need to set the `allowInvalidAsymmetricKeyTypes` option  to `true` in the `sign()` and/or `verify()` functions.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-8cf7-32gw-wr33",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-8cf7-32gw-wr33",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH,THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "8.5.1"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/jsonwebtoken@0.1.0",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.816173+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": null,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": null,
+        "localization_confidence": 0.0,
+        "localized_at": "2026-08-03T16:49:58.788277Z"
+      },
+      {
+        "issue": {
+          "id": "3152ef0a-99c4-4f4c-bc69-6968894a2183",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2022-23540",
+          "ghsa_id": "GHSA-QWPH-4952-7XR6",
+          "cwe": [
+            {
+              "id": "CWE-347",
+              "name": null
+            },
+            {
+              "id": "CWE-287",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "HIGH",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "line_range": null,
+          "package_name": "jsonwebtoken",
+          "package_version": "0.1.0",
+          "fixed_version": null,
+          "purl": "pkg:npm/jsonwebtoken@0.1.0",
+          "ecosystem": "npm",
+          "message": "In versions `<=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don’t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "jsonwebtoken:0.1.0",
+            "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2022-23540",
+              "severity": "HIGH",
+              "cvssv3": {
+                "baseScore": 7.6,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "LOW",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "LOW",
+                "integrityImpact": "HIGH",
+                "availabilityImpact": "LOW",
+                "baseSeverity": "HIGH",
+                "exploitabilityScore": "2.8",
+                "impactScore": "4.7",
+                "version": "3.1"
+              },
+              "cwes": [
+                "CWE-347",
+                "CWE-287"
+              ],
+              "description": "In versions `<=8.5.1` of `jsonwebtoken` library, lack of algorithm definition in the `jwt.verify()` function can lead to signature validation bypass due to defaulting to the `none` algorithm for signature verification. Users are affected if you do not specify algorithms in the `jwt.verify()` function. This issue has been fixed, please update to version 9.0.0 which removes the default support for the none algorithm in the `jwt.verify()` method. There will be no impact, if you update to version 9.0.0 and you don’t need to allow for the `none` algorithm. If you need 'none' algorithm, you have to explicitly specify that in `jwt.verify()` options.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-qwph-4952-7xr6",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-qwph-4952-7xr6",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "8.5.1"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/jsonwebtoken@0.1.0",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.816182+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": null,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": null,
+        "localization_confidence": 0.0,
+        "localized_at": "2026-08-03T16:49:59.709678Z"
+      },
+      {
+        "issue": {
+          "id": "d0143079-0ad8-43d7-ab70-62f83759af0e",
+          "finding_id": null,
+          "source": "odc",
+          "issue_type": "sca",
+          "repo_url": null,
+          "base_ref": null,
+          "rule_id": null,
+          "cve_id": "CVE-2022-23541",
+          "ghsa_id": "GHSA-HJRF-2M68-5959",
+          "cwe": [
+            {
+              "id": "CWE-287",
+              "name": null
+            },
+            {
+              "id": "CWE-1259",
+              "name": null
+            }
+          ],
+          "owasp": [],
+          "severity": "MEDIUM",
+          "confidence": null,
+          "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
+          "line_range": null,
+          "package_name": "jsonwebtoken",
+          "package_version": "0.1.0",
+          "fixed_version": null,
+          "purl": "pkg:npm/jsonwebtoken@0.1.0",
+          "ecosystem": "npm",
+          "message": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `<= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0.",
+          "finding_url": null,
+          "dataflow_trace": null,
+          "validation_profile": null,
+          "raw_payload": {
+            "fileName": "jsonwebtoken:0.1.0",
+            "filePath": "/scan/package-lock.json?/jsonwebtoken:0.1.0",
+            "vulnerability": {
+              "source": "NVD",
+              "name": "CVE-2022-23541",
+              "severity": "MEDIUM",
+              "cvssv3": {
+                "baseScore": 6.3,
+                "attackVector": "NETWORK",
+                "attackComplexity": "LOW",
+                "privilegesRequired": "LOW",
+                "userInteraction": "NONE",
+                "scope": "UNCHANGED",
+                "confidentialityImpact": "LOW",
+                "integrityImpact": "LOW",
+                "availabilityImpact": "LOW",
+                "baseSeverity": "MEDIUM",
+                "exploitabilityScore": "2.8",
+                "impactScore": "3.4",
+                "version": "3.1"
+              },
+              "cwes": [
+                "NVD-CWE-Other",
+                "CWE-287",
+                "CWE-1259"
+              ],
+              "description": "jsonwebtoken is an implementation of JSON Web Tokens. Versions `<= 8.5.1` of `jsonwebtoken` library can be misconfigured so that passing a poorly implemented key retrieval function referring to the `secretOrPublicKey` argument from the readme link will result in incorrect verification of tokens. There is a possibility of using a different algorithm and key combination in verification, other than the one that was used to sign the tokens. Specifically, tokens signed with an asymmetric public key could be verified with a symmetric HS256 algorithm. This can lead to successful validation of  forged tokens. If your application is supporting usage of both symmetric key and asymmetric key in jwt.verify() implementation with the same key retrieval function. This issue has been patched, please update to version 9.0.0.",
+              "notes": "",
+              "references": [
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/releases/tag/v9.0.0",
+                  "name": "RELEASE_NOTES"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-hjrf-2m68-5959",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/security/advisories/GHSA-hjrf-2m68-5959",
+                  "name": "THIRD_PARTY_ADVISORY"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/releases/tag/v9.0.0",
+                  "name": "RELEASE_NOTES"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://security.netapp.com/advisory/ntap-20240621-0007/"
+                },
+                {
+                  "source": "security-advisories@github.com",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH"
+                },
+                {
+                  "source": "af854a3a-2127-422b-91ae-364da2661108",
+                  "url": "https://github.com/auth0/node-jsonwebtoken/commit/e1fa9dcc12054a8681db4e6373da1b30cf7016e3",
+                  "name": "PATCH"
+                }
+              ],
+              "vulnerableSoftware": [
+                {
+                  "software": {
+                    "id": "cpe:2.3:a:auth0:jsonwebtoken:*:*:*:*:*:node.js:*:*",
+                    "vulnerabilityIdMatched": "true",
+                    "versionEndIncluding": "8.5.1"
+                  }
+                }
+              ]
+            },
+            "packages": [
+              {
+                "id": "pkg:npm/jsonwebtoken@0.1.0",
+                "confidence": "HIGHEST"
+              }
+            ],
+            "includedBy": []
+          },
+          "ingested_at": "2026-08-03T16:41:00.816192+00:00"
+        },
+        "enclosing_symbol": null,
+        "enclosing_node_type": "unknown",
+        "sink_expression": null,
+        "imports": [],
+        "data_flow_hints": [],
+        "snippet": null,
+        "manifest_file": "package.json",
+        "is_direct_dependency": null,
+        "manifest_line": null,
+        "manifest_snippet": null,
+        "package_manager": null,
+        "localization_confidence": 0.0,
+        "localized_at": "2026-08-03T16:50:00.531785Z"
+      }
+    ],
+    "fix_plan": {
+      "status": "version_found",
+      "fixed_version": "9.0.0",
+      "workaround_snippets": null,
+      "instruction": "Add or update \"overrides\": {\"jsonwebtoken\": \"9.0.0\"} in jsonwebtoken:0.1.0 to pin the transitive dependency via npm overrides.",
+      "strategy_used": "UPDATE_VERSION"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2022-23541",
+      "epss": 0.00753,
+      "epss_percentile": 0.51498,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enriched_at": "2026-08-03T16:51:23.121235Z",
+      "enrichment_source": "epss"
+    },
+    "is_reachable": null,
+    "grouped_at": "2026-08-03T16:51:22.089271Z"
+  }
+]
