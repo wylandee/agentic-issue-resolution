@@ -234,6 +234,45 @@ class TestSandboxRun:
             sandbox.write_file("package.json", "{}")
 
 
+class TestSandboxWorkspaceSnapshots:
+    def _started_sandbox(self, tmp_path, client, container):
+        sandbox = DockerSandbox(tmp_path, workspace_volume="agent_workspace_deadbeef")
+        sandbox._client = client
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_snapshot_restore_and_cleanup_use_private_volume_paths(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        sandbox.create_workspace_snapshot("attempt-123")
+        sandbox.restore_workspace_snapshot("attempt-123")
+        sandbox.remove_workspace_snapshot("attempt-123")
+        sandbox.cleanup_workspace_snapshots()
+
+        commands = [call.args[0][2] for call in container.exec_run.call_args_list]
+        assert (
+            "tar -czf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[0])
+        )
+        assert (
+            "tar -xzf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[1])
+        )
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots/attempt-123" in commands[2]
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots" in commands[3]
+
+    def test_snapshot_ids_are_path_safe(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(ValueError, match="snapshot IDs"):
+            sandbox.create_workspace_snapshot("../escape")
+
+        container.exec_run.assert_not_called()
+
+
 def _tar_chunks(filename: str, content: str) -> list[bytes]:
     buf = io.BytesIO()
     encoded = content.encode("utf-8")

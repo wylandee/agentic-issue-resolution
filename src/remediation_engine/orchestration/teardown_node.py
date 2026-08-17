@@ -211,6 +211,9 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
                         repo_root=None,
                         workspace_volume=workspace_volume,
                     ) as sandbox:
+                        # Attempt archives are internal transaction state and
+                        # must never survive into the final volume lifecycle.
+                        sandbox.cleanup_workspace_snapshots()
                         for rel_path in changed_files:
                             if rel_path in files_to_exclude:
                                 continue

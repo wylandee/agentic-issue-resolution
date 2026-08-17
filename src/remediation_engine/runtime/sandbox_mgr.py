@@ -17,6 +17,8 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
+import shlex
 import tarfile
 import time
 import uuid
@@ -31,6 +33,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_IMAGE = "node:22"
 _DEFAULT_TIMEOUT_SECONDS = 300
 _SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
+_WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
+_WORKSPACE_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS = 900
+
+
+def _workspace_snapshot_archive(snapshot_id: str) -> str:
+    """Return the validated archive path for a workspace snapshot."""
+    if not _WORKSPACE_SNAPSHOT_ID_RE.fullmatch(snapshot_id):
+        raise ValueError(
+            "workspace snapshot IDs must contain only letters, numbers, '.', '_' or '-'."
+        )
+    return f"/workspace/{_WORKSPACE_SNAPSHOT_DIR}/{snapshot_id}/workspace.tar.gz"
 
 
 def _make_tar_archive(repo_root: Path) -> bytes:
@@ -371,3 +385,119 @@ class DockerSandbox:
         except Exception as exc:  # noqa: BLE001
             logger.warning("DockerSandbox.read_file: failed to extract %s â€” %s", abs_path, exc)
             return None
+
+    @traceable(run_type="tool", name="docker_sandbox.create_workspace_snapshot")
+    def create_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Create an attempt-local archive of the mounted workspace.
+
+        The archive lives inside the named Docker volume so it follows the
+        workspace across the short-lived containers used by worker and QA
+        nodes.  The snapshot directory is excluded from its own archive.
+
+        Parameters
+        ----------
+        snapshot_id:
+            Opaque, shell-safe identifier for the attempt or batch.
+
+        Raises
+        ------
+        RuntimeError
+            If the sandbox is not running or the archive command fails.
+        ValueError
+            If ``snapshot_id`` contains unsafe path characters.
+        """
+        archive_path = _workspace_snapshot_archive(snapshot_id)
+        snapshot_dir = archive_path.rsplit("/", 1)[0]
+        if not self._alive:
+            raise RuntimeError("Sandbox is not running.")
+
+        quoted_dir = shlex.quote(snapshot_dir)
+        quoted_archive = shlex.quote(archive_path)
+        command = (
+            f"rm -rf -- {quoted_dir} && "
+            f"mkdir -p -- {quoted_dir} && "
+            f"tar -czf {quoted_archive} "
+            f"--exclude=./{_WORKSPACE_SNAPSHOT_DIR} -C /workspace ."
+        )
+        result = self.run(command, timeout=_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot creation failed for {snapshot_id}: "
+                f"{result.stderr or result.stdout or 'unknown error'}"
+            )
+        logger.info("DockerSandbox: created workspace snapshot %s.", snapshot_id)
+
+    @traceable(run_type="tool", name="docker_sandbox.restore_workspace_snapshot")
+    def restore_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Restore the mounted workspace to a prior attempt snapshot.
+
+        Restoration removes every current workspace entry except the private
+        snapshot store, then extracts the archived candidate.  Dependencies
+        and generated files are included in the archive, so the next worker
+        sees the exact pre-attempt workspace rather than a stale install.
+
+        Parameters
+        ----------
+        snapshot_id:
+            Identifier previously passed to :meth:`create_workspace_snapshot`.
+
+        Raises
+        ------
+        RuntimeError
+            If the sandbox is not running or the archive cannot be restored.
+        ValueError
+            If ``snapshot_id`` contains unsafe path characters.
+        """
+        archive_path = _workspace_snapshot_archive(snapshot_id)
+        if not self._alive:
+            raise RuntimeError("Sandbox is not running.")
+
+        quoted_archive = shlex.quote(archive_path)
+        command = (
+            f"test -f {quoted_archive} && "
+            "find /workspace -mindepth 1 -maxdepth 1 "
+            f"! -name {shlex.quote(_WORKSPACE_SNAPSHOT_DIR)} "
+            "-exec rm -rf -- {} + && "
+            f"tar -xzf {quoted_archive} -C /workspace"
+        )
+        result = self.run(command, timeout=_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot restore failed for {snapshot_id}: "
+                f"{result.stderr or result.stdout or 'unknown error'}"
+            )
+        logger.info("DockerSandbox: restored workspace snapshot %s.", snapshot_id)
+
+    @traceable(run_type="tool", name="docker_sandbox.remove_workspace_snapshot")
+    def remove_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Delete one attempt snapshot from the mounted workspace.
+
+        Missing snapshots are treated as success, making cleanup safe in
+        worker error, QA error, and teardown ``finally`` paths.
+        """
+        archive_path = _workspace_snapshot_archive(snapshot_id)
+        if not self._alive:
+            raise RuntimeError("Sandbox is not running.")
+
+        snapshot_dir = archive_path.rsplit("/", 1)[0]
+        result = self.run(f"rm -rf -- {shlex.quote(snapshot_dir)}")
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot cleanup failed for {snapshot_id}: "
+                f"{result.stderr or result.stdout or 'unknown error'}"
+            )
+        logger.debug("DockerSandbox: removed workspace snapshot %s.", snapshot_id)
+
+    @traceable(run_type="tool", name="docker_sandbox.cleanup_workspace_snapshots")
+    def cleanup_workspace_snapshots(self) -> None:
+        """Remove all private attempt snapshots from the mounted workspace."""
+        if not self._alive:
+            raise RuntimeError("Sandbox is not running.")
+
+        result = self.run(f"rm -rf -- {shlex.quote('/workspace/' + _WORKSPACE_SNAPSHOT_DIR)}")
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Workspace snapshot directory cleanup failed: "
+                f"{result.stderr or result.stdout or 'unknown error'}"
+            )
+        logger.debug("DockerSandbox: removed all workspace attempt snapshots.")

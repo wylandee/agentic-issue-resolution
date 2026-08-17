@@ -39,6 +39,7 @@ callers do not need to construct LangGraph state directly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -95,6 +96,7 @@ from remediation_engine.orchestration.trajectory_exporter import (
 from remediation_engine.orchestration.update_subagent import run_update_subagent_node
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
+from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
@@ -567,6 +569,158 @@ def _dispatch_boundary_rejection(
     }
 
 
+def _workspace_snapshot_id(target_tasks: list[RemediationTask]) -> str | None:
+    """Return the stable workspace snapshot ID for one worker dispatch.
+
+    Supervisor dispatch normally contains one task, so its committed attempt
+    ID is enough.  Direct batch callers are treated as one workspace
+    transaction: a QA failure restores the complete batch snapshot instead of
+    restoring one task over another task's changes.
+    """
+    attempt_ids = sorted(
+        {
+            task.current_attempt_id
+            for task in target_tasks
+            if task.current_attempt_id and task.current_attempt_id.strip()
+        }
+    )
+    if not attempt_ids or len(attempt_ids) != len(target_tasks):
+        return None
+    if len(attempt_ids) == 1:
+        return f"attempt-{attempt_ids[0]}"
+    digest = hashlib.sha256("\n".join(attempt_ids).encode("utf-8")).hexdigest()[:24]
+    return f"batch-{digest}"
+
+
+def _create_workspace_attempt_snapshot(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> tuple[str | None, list[str]]:
+    """Snapshot a committed worker target before it mutates the shared volume.
+
+    Legacy bridge callers without committed attempts, and calls without a
+    workspace volume, retain their pre-transaction behavior.  A real Phase 5
+    dispatch with a workspace is fail-closed if snapshot creation fails.
+    """
+    workspace_volume = state.get("workspace_volume")
+    if "attempt_snapshots_by_id" not in state:
+        return None, []
+    snapshot_id = _workspace_snapshot_id(target_tasks)
+    if not workspace_volume or snapshot_id is None:
+        return None, []
+
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            sandbox.create_workspace_snapshot(snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - boundary must prevent unsafe execution
+        message = f"graph: could not snapshot workspace before attempt {snapshot_id}: {exc}"
+        log.exception("Workspace snapshot creation failed for %s.", snapshot_id)
+        cleanup_errors = _finish_workspace_attempt_snapshot(
+            state,
+            snapshot_id,
+            restore=False,
+        )
+        return None, [message, *cleanup_errors]
+    return snapshot_id, []
+
+
+def _finish_workspace_attempt_snapshot(
+    state: OrchestratorState,
+    snapshot_id: str | None,
+    *,
+    restore: bool,
+) -> list[str]:
+    """Restore or delete a worker snapshot and always attempt cleanup."""
+    workspace_volume = state.get("workspace_volume")
+    if not workspace_volume or snapshot_id is None:
+        return []
+
+    errors: list[str] = []
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            try:
+                if restore:
+                    sandbox.restore_workspace_snapshot(snapshot_id)
+            finally:
+                # Do not leave a failed restore archive in the shared volume;
+                # teardown also performs a final best-effort sweep.
+                sandbox.remove_workspace_snapshot(snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - preserve the original attempt outcome
+        action = "restore" if restore else "remove"
+        message = f"graph: could not {action} workspace snapshot {snapshot_id}: {exc}"
+        log.exception("Workspace snapshot %s failed for %s.", action, snapshot_id)
+        errors.append(message)
+    return errors
+
+
+def _worker_attempts_succeeded(
+    result: dict[str, Any],
+    target_tasks: list[RemediationTask],
+) -> bool:
+    """Return whether every committed target produced a validated worker result."""
+    if result.get("errors"):
+        return False
+
+    worker_results = result.get("worker_results_by_attempt") or {}
+    if worker_results:
+        by_task = {item.task_id: item for item in worker_results.values()}
+        return all(
+            (worker_result := by_task.get(task.task_id)) is not None
+            and worker_result.status == AgentActionStatus.SUCCESS
+            and worker_result.execution_diagnostics.validation_passed
+            for task in target_tasks
+        )
+
+    summaries = {summary.task_id: summary for summary in result.get("action_summaries", []) or []}
+    if not summaries:
+        return False
+    return all(
+        (summary := summaries.get(task.task_id)) is not None
+        and summary.status == AgentActionStatus.SUCCESS
+        for task in target_tasks
+    )
+
+
+def _finalize_worker_workspace_snapshot(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    snapshot_id: str | None,
+    result: dict[str, Any],
+) -> list[str]:
+    """Keep successful worker archives until QA; restore failed workers."""
+    if snapshot_id is None:
+        return []
+    if _worker_attempts_succeeded(result, target_tasks):
+        # QA owns the next decision.  It must still be able to restore this
+        # exact candidate if install, scanning, or tests reject it.
+        return []
+    return _finish_workspace_attempt_snapshot(
+        state,
+        snapshot_id,
+        restore=True,
+    )
+
+
+def _finalize_qa_workspace_snapshot(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    snapshot_id: str | None,
+    result: dict[str, Any],
+) -> list[str]:
+    """Keep a candidate only when all scoped QA evaluations pass."""
+    if snapshot_id is None:
+        return []
+    if result.get("status") != "qa_completed":
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+
+    evaluations = result.get("qa_evaluations") or {}
+    for task in target_tasks:
+        evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task.task_id)
+        if evaluation is None or not evaluation.passed:
+            return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+    return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+
+
 def _ensure_worker_attempt_results(
     result: dict[str, Any],
     target_tasks: list[RemediationTask],
@@ -675,7 +829,22 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         target_attempt_snapshots=target_attempt_snapshots,
     )
 
-    result = run_update_subagent_node(subagent_state)
+    workspace_snapshot_id, snapshot_errors = _create_workspace_attempt_snapshot(
+        state,
+        target_tasks,
+    )
+    if snapshot_errors:
+        return {"errors": snapshot_errors}
+
+    try:
+        result = run_update_subagent_node(subagent_state)
+    except Exception:
+        _finish_workspace_attempt_snapshot(
+            state,
+            workspace_snapshot_id,
+            restore=True,
+        )
+        raise
 
     out: dict[str, Any] = {
         "errors": result.get("errors", []),
@@ -704,6 +873,12 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         # Compatibility for legacy direct bridge callers that do not provide
         # attempt envelopes. Real Phase 5 dispatches always use envelopes.
         out["retry_diagnostics_by_task"] = result["retry_diagnostics_by_task"]
+    out["errors"] = list(out.get("errors", [])) + _finalize_worker_workspace_snapshot(
+        state,
+        target_tasks,
+        workspace_snapshot_id,
+        result,
+    )
     return out
 
 
@@ -769,7 +944,22 @@ def run_workaround_subagent_from_orchestrator(
         current_replay_plan=current_replay_plan,
     )
 
-    result = run_workaround_subagent_node(subagent_state)
+    workspace_snapshot_id, snapshot_errors = _create_workspace_attempt_snapshot(
+        state,
+        [task],
+    )
+    if snapshot_errors:
+        return {"errors": snapshot_errors}
+
+    try:
+        result = run_workaround_subagent_node(subagent_state)
+    except Exception:
+        _finish_workspace_attempt_snapshot(
+            state,
+            workspace_snapshot_id,
+            restore=True,
+        )
+        raise
 
     out: dict[str, Any] = {
         "errors": result.get("errors", []),
@@ -799,6 +989,12 @@ def run_workaround_subagent_from_orchestrator(
     )
     if worker_results:
         out["worker_results_by_attempt"] = worker_results
+    out["errors"] = list(out.get("errors", [])) + _finalize_worker_workspace_snapshot(
+        state,
+        [task],
+        workspace_snapshot_id,
+        result,
+    )
     return out
 
 
@@ -852,7 +1048,24 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
                 "valid_groups": scoped_groups,
             }
 
-    result = run_qa_critic_node(scoped_state)
+    workspace_snapshot_id = (
+        _workspace_snapshot_id(target_tasks) if "attempt_snapshots_by_id" in state else None
+    )
+    try:
+        result = run_qa_critic_node(scoped_state)
+    except Exception:
+        _finish_workspace_attempt_snapshot(
+            state,
+            workspace_snapshot_id,
+            restore=True,
+        )
+        raise
+    snapshot_cleanup_errors = _finalize_qa_workspace_snapshot(
+        state,
+        target_tasks,
+        workspace_snapshot_id,
+        result,
+    )
     scan_evidence = result.get("scan_evidence")
     attempt_scan_is_authoritative = scan_evidence is None or bool(
         getattr(scan_evidence, "authoritative", False)
@@ -916,7 +1129,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         ),
         "triage_required": triage_required,
         "status": result.get("status", "qa_completed"),
-        "errors": result.get("errors", []),
+        "errors": list(result.get("errors", []) or []) + snapshot_cleanup_errors,
     }
     qa_results_by_attempt: dict[str, QAAttemptResult] = {}
     task_queue = state.get("task_queue", {})
