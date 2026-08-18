@@ -35,6 +35,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundPhase,
 )
 from remediation_engine.orchestration.graph import (
+    post_qa_triage_node,
     run_qa_critic_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
@@ -42,6 +43,7 @@ from remediation_engine.orchestration.langsmith_config import (
     is_phase5_tracing_enabled,
     resolve_phase5_trace_url,
 )
+from remediation_engine.orchestration.qa_critic import run_final_full_scan_node
 from remediation_engine.orchestration.state import initial_orchestrator_state
 from remediation_engine.orchestration.supervisor_node import run_supervisor_node
 from remediation_engine.orchestration.task_utils import (
@@ -307,6 +309,20 @@ def _merge_supervisor_result(state: dict[str, Any], result: dict[str, Any]) -> N
     state["errors"] = list(dict.fromkeys([*prior_errors, *(result.get("errors", []) or [])]))
 
 
+def _merge_final_full_scan_result(state: dict[str, Any], result: dict[str, Any]) -> None:
+    """Apply the production final-scan patch while preserving prior errors."""
+    prior_errors = list(state.get("errors", []) or [])
+    state.update({key: value for key, value in result.items() if key != "errors"})
+    state["errors"] = list(dict.fromkeys([*prior_errors, *(result.get("errors", []) or [])]))
+
+
+def _merge_triage_result(state: dict[str, Any], result: dict[str, Any]) -> None:
+    """Apply the production post-QA triage patch while preserving prior errors."""
+    prior_errors = list(state.get("errors", []) or [])
+    state.update({key: value for key, value in result.items() if key != "errors"})
+    state["errors"] = list(dict.fromkeys([*prior_errors, *(result.get("errors", []) or [])]))
+
+
 def _jsonable(value: Any) -> Any:
     """Convert contracts, enums, and paths to JSON-serializable values."""
     if hasattr(value, "model_dump"):
@@ -415,6 +431,16 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
                 _merge_qa_result(state, qa_result)
                 continue
 
+            if next_step == "triage":
+                triage_result = post_qa_triage_node(state)
+                _merge_triage_result(state, triage_result)
+                continue
+
+            if next_step == "final_full_scan":
+                final_scan_result = run_final_full_scan_node(state)
+                _merge_final_full_scan_result(state, final_scan_result)
+                continue
+
             if next_step == "teardown":
                 break
 
@@ -466,6 +492,7 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
             },
             "workspace_install": install_diagnostics,
             "supervisor_events": supervisor_events,
+            "triage_reconciliation": _jsonable(state.get("triage_reconciliation", {})),
             "worker": {
                 "status": worker_status,
                 "action_summaries": action_summaries,
@@ -478,6 +505,7 @@ def _execute_nofix(repo_root: str, fixture: dict[str, Any]) -> dict[str, Any]:
                 "status": qa_status,
                 "eval_status": qa_eval_status,
             },
+            "final_full_scan": _jsonable(state.get("final_full_scan_result")),
             "teardown": {
                 "status": teardown_result.get("status"),
                 "workspace_volume": teardown_result.get("workspace_volume"),
