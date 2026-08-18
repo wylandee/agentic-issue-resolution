@@ -34,6 +34,9 @@ class AppSettings:
     langsmith_project: str = "AppSec-Remediation-Engine"
     langsmith_endpoint: str = ""
     remediation_trajectory_dir: Path | None = None
+    remediation_report_dir: Path | None = None
+    report_llm_enabled: bool = False
+    report_llm_model: str = "gpt-4o-mini"
     remedy_bypass_workaround_subagent: bool = False
     remedy_disable_post_qa_triage: bool = False
     remedy_disable_retriage: bool = False
@@ -42,6 +45,7 @@ class AppSettings:
     def from_env(cls) -> AppSettings:
         """Build settings from the process environment without side effects."""
         trajectory = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
+        report_dir = os.environ.get("REMEDIATION_REPORT_DIR", "").strip()
         default_model = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini").strip()
         if not default_model:
             default_model = "gpt-4o-mini"
@@ -68,6 +72,9 @@ class AppSettings:
             ).strip(),
             langsmith_endpoint=os.environ.get("LANGSMITH_ENDPOINT", "").strip(),
             remediation_trajectory_dir=Path(trajectory) if trajectory else None,
+            remediation_report_dir=Path(report_dir) if report_dir else None,
+            report_llm_enabled=_env_bool("REPORT_LLM_ENABLED"),
+            report_llm_model=model_override("REPORT_LLM_MODEL"),
             remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),
             remedy_disable_post_qa_triage=_env_bool("REMEDY_DISABLE_POST_QA_TRIAGE"),
             remedy_disable_retriage=_env_bool("REMEDY_DISABLE_RETRIAGE"),

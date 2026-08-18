@@ -32,6 +32,7 @@ class RemediationResult(BaseModel):
     diff: str = ""
     errors: list[str] = Field(default_factory=list)
     trajectory_path: str | None = None
+    report_path: str | None = None
     raw_state: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
@@ -63,18 +64,20 @@ def run_remediation(
     The host repository is not edited. ``settings`` is accepted as an explicit
     dependency-injection boundary for CLI and embedding applications.
     """
-    del settings  # Graph nodes currently resolve settings from the environment.
     # Initial triage belongs to the graph's ``initial_triage`` node.  Passing
     # an empty group list is intentional: it tells the graph to triage the
     # supplied issue set exactly once instead of performing a hidden
     # preprocessing pass here and then reporting ``triage_skipped``.
     groups = list(request.valid_groups)
-    state = run_orchestrator(
-        repo_root=str(request.repo_root),
-        valid_groups=groups,
-        issues=request.issues,
-        system_context=request.system_context,
-    )
+    orchestrator_kwargs: dict[str, Any] = {
+        "repo_root": str(request.repo_root),
+        "valid_groups": groups,
+        "issues": request.issues,
+        "system_context": request.system_context,
+    }
+    if settings is not None:
+        orchestrator_kwargs["settings"] = settings
+    state = run_orchestrator(**orchestrator_kwargs)
     errors = list(state.get("errors", []) or [])
     status = state.get("status", "failed")
     if errors and status == "completed":
@@ -85,5 +88,6 @@ def run_remediation(
         diff=state.get("diff", ""),
         errors=errors,
         trajectory_path=state.get("trajectory_path"),
+        report_path=state.get("report_path"),
         raw_state=dict(state),
     )

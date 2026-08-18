@@ -150,6 +150,50 @@ def _span_name(serialized: Any, fallback: str) -> str:
     return fallback
 
 
+def _token_usage_from_response(response: Any) -> tuple[int, int, bool]:
+    """Extract prompt/completion token usage from a LangChain LLM response."""
+    candidates: list[Any] = []
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, Mapping):
+        candidates.append(usage_metadata)
+    llm_output = getattr(response, "llm_output", None)
+    if isinstance(llm_output, Mapping):
+        candidates.extend([llm_output.get("token_usage"), llm_output.get("usage"), llm_output])
+    metadata = getattr(response, "response_metadata", None)
+    if isinstance(metadata, Mapping):
+        candidates.extend([metadata.get("token_usage"), metadata.get("usage"), metadata])
+    for generation_group in getattr(response, "generations", []) or []:
+        for generation in generation_group or []:
+            message = getattr(generation, "message", None)
+            message_usage = getattr(message, "usage_metadata", None)
+            if isinstance(message_usage, Mapping):
+                candidates.append(message_usage)
+            generation_metadata = getattr(message, "response_metadata", None)
+            if isinstance(generation_metadata, Mapping):
+                candidates.extend(
+                    [
+                        generation_metadata.get("token_usage"),
+                        generation_metadata.get("usage"),
+                        generation_metadata,
+                    ]
+                )
+
+    for usage in candidates:
+        if not isinstance(usage, Mapping):
+            continue
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion = usage.get("completion_tokens", usage.get("output_tokens"))
+        try:
+            prompt_value = max(0, int(prompt)) if prompt is not None else 0
+            completion_value = max(0, int(completion)) if completion is not None else 0
+        except (TypeError, ValueError):
+            continue
+        available = prompt is not None or completion is not None
+        if available:
+            return prompt_value, completion_value, True
+    return 0, 0, False
+
+
 class TrajectoryRecorder(BaseCallbackHandler):
     """Capture callback spans for a single Phase 5 invocation.
 
@@ -160,11 +204,15 @@ class TrajectoryRecorder(BaseCallbackHandler):
     raise_error = False
 
     def __init__(self) -> None:
+        """Initialize an empty span and token-usage recorder."""
         super().__init__()
         self._lock = RLock()
         self._spans: dict[str, _LocalSpan] = {}
         self._order: list[str] = []
         self._sequence = 0
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+        self._token_data_available = False
 
     def _start(
         self,
@@ -344,6 +392,39 @@ class TrajectoryRecorder(BaseCallbackHandler):
     def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
         """Record successful completion of an LLM callback."""
         self._end(run_id, outputs=response)
+        try:
+            prompt_tokens, completion_tokens, available = _token_usage_from_response(response)
+            if available:
+                with self._lock:
+                    self._total_prompt_tokens += prompt_tokens
+                    self._total_completion_tokens += completion_tokens
+                    self._token_data_available = True
+        except Exception:  # pragma: no cover - telemetry must not interrupt a run
+            logger.debug("trajectory recorder failed to extract token usage", exc_info=True)
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        """Return accumulated prompt tokens from LLM callbacks."""
+        with self._lock:
+            return self._total_prompt_tokens
+
+    @property
+    def total_completion_tokens(self) -> int:
+        """Return accumulated completion tokens from LLM callbacks."""
+        with self._lock:
+            return self._total_completion_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Return accumulated prompt and completion tokens."""
+        with self._lock:
+            return self._total_prompt_tokens + self._total_completion_tokens
+
+    @property
+    def token_data_available(self) -> bool:
+        """Return whether at least one LLM callback supplied token usage."""
+        with self._lock:
+            return self._token_data_available
 
     def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
         """Record a failed LLM callback."""

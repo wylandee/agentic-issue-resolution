@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
@@ -342,7 +343,10 @@ class OrchestratorState(TypedDict, total=False):
     """
 
     repo_root: str
+    run_id: str
     valid_groups: list[VulnerabilityGroup]
+    initial_valid_groups: list[VulnerabilityGroup]
+    run_started_at: str
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
@@ -402,6 +406,7 @@ class OrchestratorState(TypedDict, total=False):
     langsmith_run_id: str
     langsmith_trace_url: str
     trajectory_path: str
+    report_markdown: str
     errors: Annotated[list[str], operator.add]
 
 
@@ -453,7 +458,10 @@ def initial_orchestrator_state(
     )
     state: dict[str, Any] = {
         "repo_root": repo_root,
+        "run_id": "",
         "valid_groups": valid_groups,
+        "initial_valid_groups": list(valid_groups),
+        "run_started_at": datetime.now(UTC).isoformat(),
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
@@ -496,6 +504,7 @@ def initial_orchestrator_state(
         "triage_reconciliation": {},
         "diff": "",
         "trajectory_path": "",
+        "report_markdown": "",
         "errors": [],
     }
     if issues is not None:

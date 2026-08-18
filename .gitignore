@@ -5,6 +5,7 @@
 # Ignore all data files, vector embeddings, and target code clones
 /data/clones/*
 /data/trajectories/*
+/data/reports/*
 /data/*.csv
 /data/*.json
 /data/*.jsonl
@@ -13,6 +14,7 @@
 # Keep the directory structure intact in git
 !/data/clones/.gitkeep
 !/data/trajectories/.gitkeep
+!/data/reports/.gitkeep
 
 # Triage enrichment cache (KEV JSON, future EPSS cache)
 /data/cache/*

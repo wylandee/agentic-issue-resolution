@@ -43,6 +43,7 @@ def test_request_result_models_are_stable(tmp_path: Path) -> None:
         "diff": "",
         "errors": [],
         "trajectory_path": None,
+        "report_path": None,
     }
 
 

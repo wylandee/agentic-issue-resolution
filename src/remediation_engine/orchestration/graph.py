@@ -24,9 +24,7 @@ Phase 5 graph topology (hub-and-spoke)
       |                                            |
       +-> final_full_scan ------------------------>+
       |
-      +-> teardown
-           |
-          END
+      +-> teardown -> report -> END
 
 Public API:
 ``build_orchestrator_graph()``
@@ -74,6 +72,7 @@ from remediation_engine.orchestration.qa_critic import (
     run_final_full_scan_node,
     run_qa_critic_node,
 )
+from remediation_engine.orchestration.report_node import finalize_report, run_report_node
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_orchestrator_state,
@@ -101,6 +100,7 @@ from remediation_engine.orchestration.update_subagent import run_update_subagent
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.settings import AppSettings
 from remediation_engine.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ def triage_node(state: OrchestratorState) -> dict[str, Any]:
         if not valid_groups:
             return {
                 "valid_groups": [],
+                "initial_valid_groups": [],
                 "status": "triage_completed_no_work",
                 "initial_triage_status": "completed_no_work",
                 "initial_triage_executed": True,
@@ -163,6 +164,7 @@ def triage_node(state: OrchestratorState) -> dict[str, Any]:
 
         return {
             "valid_groups": valid_groups,
+            "initial_valid_groups": valid_groups,
             "status": "triage_completed",
             "initial_triage_status": "completed",
             "initial_triage_executed": True,
@@ -1360,6 +1362,7 @@ def build_orchestrator_graph():
     workflow.add_node("qa_critic", run_qa_critic_from_orchestrator)
     workflow.add_node("final_full_scan", run_final_full_scan_node)
     workflow.add_node("teardown", run_teardown_node)
+    workflow.add_node("report", run_report_node)
 
     workflow.add_edge(START, "initial_triage")
     workflow.add_conditional_edges("initial_triage", route_after_triage)
@@ -1370,7 +1373,8 @@ def build_orchestrator_graph():
     workflow.add_edge("qa_critic", "supervisor")
     workflow.add_edge("triage", "supervisor")
     workflow.add_edge("final_full_scan", "supervisor")
-    workflow.add_edge("teardown", END)
+    workflow.add_edge("teardown", "report")
+    workflow.add_edge("report", END)
 
     return workflow.compile()
 
@@ -1383,8 +1387,26 @@ def run_orchestrator(
     valid_groups: list[VulnerabilityGroup],
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
+    settings: AppSettings | None = None,
 ) -> OrchestratorState:
-    """Convenience entry point for the Phase 5 orchestrator graph."""
+    """Run the Phase 5 graph and return its final state.
+
+    Args:
+        repo_root: Absolute path to the repository workspace.
+        valid_groups: Initial caller-selected actionable groups.
+        issues: Optional canonical scanner findings used by initial triage.
+        system_context: Optional deployment context for triage and QA.
+        settings: Optional validated application settings used by report
+            finalization; environment settings are used when omitted.
+
+    Returns:
+        The final graph state, including trajectory and report metadata when
+        those artifacts were successfully produced.
+
+    Raises:
+        BaseException: Re-raises an orchestration failure after best-effort
+            trajectory export, preserving the existing public behavior.
+    """
     initial_state = initial_orchestrator_state(
         repo_root=repo_root,
         valid_groups=valid_groups,
@@ -1395,6 +1417,7 @@ def run_orchestrator(
     recorder = TrajectoryRecorder()
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
+    initial_state["run_id"] = str(trace_id)
     if config is None:
         runnable_config: dict[str, Any] = {
             "run_id": trace_id,
@@ -1459,6 +1482,24 @@ def run_orchestrator(
             log.warning("run_orchestrator: trajectory export failed: %s", export_error)
             if result is not None:
                 result.setdefault("errors", []).append(f"trajectory export failed: {export_error}")
+
+        if result is not None:
+            try:
+                report_markdown, report_path = finalize_report(
+                    result,
+                    recorder=recorder,
+                    trajectory_path=result.get("trajectory_path"),
+                    trace_url=trace_url or result.get("langsmith_trace_url"),
+                    settings=settings,
+                )
+                result["report_markdown"] = report_markdown
+                if report_path is not None:
+                    result["report_path"] = str(report_path)
+            except Exception as report_error:  # noqa: BLE001 - report must not mask remediation
+                log.exception("run_orchestrator: report finalization failed")
+                result.setdefault("errors", []).append(
+                    f"report finalization failed: {report_error}"
+                )
 
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",

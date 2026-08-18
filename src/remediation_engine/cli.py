@@ -79,6 +79,18 @@ def _write_jsonl(path: Path | None, values: list[object]) -> None:
         path.write_text(payload, encoding="utf-8")
 
 
+def _copy_report(source: Path, destination: Path) -> None:
+    """Copy a canonical Markdown report to a caller-selected path atomically."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        temporary.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser without reading environment state."""
     parser = argparse.ArgumentParser(prog="remedy", description=__doc__)
@@ -104,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--output", type=Path)
     run.add_argument("--patch-out", type=Path)
+    run.add_argument("--report-out", type=Path)
     return parser
 
 
@@ -138,6 +151,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.patch_out:
             args.patch_out.parent.mkdir(parents=True, exist_ok=True)
             args.patch_out.write_text(result.diff, encoding="utf-8")
+        if args.report_out:
+            if not result.report_path:
+                raise ValueError("The run did not produce a canonical report to copy.")
+            _copy_report(Path(result.report_path), args.report_out)
         _write_json(args.output, result.model_dump(exclude={"raw_state"}))
         return 0 if result.status == "completed" and not result.errors else 1
     except (OSError, ValueError) as exc:
