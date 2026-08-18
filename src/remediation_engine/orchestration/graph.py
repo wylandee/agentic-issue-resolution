@@ -535,6 +535,7 @@ def _dispatch_boundary_rejection(
             or snapshot.task_revision != task.task_revision
             or snapshot.strategy_stage != task.strategy_stage
             or snapshot.no_fix_stage != task.no_fix_stage
+            or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)

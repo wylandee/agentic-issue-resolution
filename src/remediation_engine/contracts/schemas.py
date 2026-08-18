@@ -149,6 +149,43 @@ class RoutingStrategy(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class QAPolicy(str, Enum):
+    """Supervisor-owned policy that defines the QA gates for an attempt."""
+
+    VERSION_BUMP = "version_bump"
+    INITIAL_CODE_WORKAROUND = "initial_code_workaround"
+    MIGRATION_CODE_WORKAROUND = "migration_code_workaround"
+    MITIGATION_CODE_WORKAROUND = "mitigation_code_workaround"
+    NO_FIX_PACKAGE_REMOVAL = "no_fix_package_removal"
+    NO_FIX_CODE_REMOVAL = "no_fix_code_removal"
+
+
+class ScannerExecutionStatus(str, Enum):
+    """Trust status of the deterministic Dependency-Check execution."""
+
+    SUCCESS = "success"
+    DOCKER_UNAVAILABLE = "docker_unavailable"
+    TIMEOUT = "timeout"
+    UNPARSEABLE = "unparseable"
+    NOT_RUN = "not_run"
+
+
+class SecurityReviewVerdict(str, Enum):
+    """Verdict emitted by the semantic security review."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    INCONCLUSIVE = "inconclusive"
+
+
+class TestAttributionVerdict(str, Enum):
+    """LLM attribution of a shared test-suite failure."""
+
+    RESPONSIBLE = "responsible"
+    EXONERATED = "exonerated"
+    INCONCLUSIVE = "inconclusive"
+
+
 class SCARemediationStage(str, Enum):
     """Ordered remediation stages for an SCA version-bump task."""
 
@@ -1320,6 +1357,61 @@ class QAFailureEvidence(BaseModel):
     task_revision: int = Field(default=0, ge=0)
 
 
+class QASemanticSecurityReview(BaseModel):
+    """Evidence-backed semantic review for a code-remediation policy."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verdict: SecurityReviewVerdict
+    reasoning: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class QATestAttribution(BaseModel):
+    """Structured attribution of failed tests to remediation groups."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verdict: TestAttributionVerdict
+    responsible_group_ids: list[str] = Field(default_factory=list)
+    failed_tests: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+
+    @model_validator(mode="after")
+    def _check_attribution_evidence(self) -> QATestAttribution:
+        """Require evidence for responsible and exonerated attribution."""
+        if self.verdict == TestAttributionVerdict.INCONCLUSIVE:
+            return self
+        if not self.responsible_group_ids or any(
+            not identifier.strip() for identifier in self.responsible_group_ids
+        ):
+            raise ValueError(
+                "responsible or exonerated test attribution requires non-empty "
+                "responsible_group_ids."
+            )
+        if not self.failed_tests or any(not test.strip() for test in self.failed_tests):
+            raise ValueError("responsible or exonerated test attribution requires failed_tests.")
+        if not self.reasoning.strip():
+            raise ValueError("responsible or exonerated test attribution requires reasoning.")
+        return self
+
+
+class QADeterministicGates(BaseModel):
+    """Raw Python-owned QA evidence before policy-specific decision rules."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: Literal["pass", "fail"]
+    install_passed: bool
+    scanner_execution_status: ScannerExecutionStatus
+    target_remaining_identifiers: list[str] = Field(default_factory=list)
+    target_scanner_cleared: bool | None = None
+    tests_passed: bool | None = None
+    package_manifest_state: str | None = None
+    package_graph_state: str | None = None
+    diagnostics: list[str] = Field(default_factory=list)
+
+
 class ODCScanEvidence(BaseModel):
     """Typed evidence describing one ODC scan and its authority boundary."""
 
@@ -1391,6 +1483,26 @@ class QAEvaluation(BaseModel):
         None,
         description="Structured failure evidence when passed=False.",
     )
+    deterministic_gates: QADeterministicGates | None = Field(default=None)
+    semantic_security_review: QASemanticSecurityReview | None = Field(default=None)
+    test_attribution: QATestAttribution | None = Field(default=None)
+    contract_error: bool = Field(
+        default=False,
+        description=(
+            "True when the structured QA result could not be validated. This is "
+            "an inconclusive QA outcome and must not consume the task retry budget."
+        ),
+    )
+    contract_error_reason: str = Field(default="")
+
+    @model_validator(mode="after")
+    def _check_contract_error(self) -> QAEvaluation:
+        if self.contract_error:
+            if self.passed:
+                raise ValueError("contract_error=True cannot accompany passed=True.")
+            if not self.contract_error_reason.strip():
+                raise ValueError("contract_error=True requires a non-empty contract_error_reason.")
+        return self
     scan_evidence: ODCScanEvidence | None = Field(
         None,
         description=(
@@ -1410,6 +1522,9 @@ class QAEvaluation(BaseModel):
                 raise ValueError(
                     "passed=True requires failure_category=None, retry_feedback=None, and failure_evidence=None."
                 )
+            return self
+
+        if self.contract_error:
             return self
 
         if self.failure_category is None:
@@ -1470,6 +1585,7 @@ class TaskAttemptSnapshot(BaseModel):
     state_revision: int = Field(default=0, ge=0)
     task_revision: int = Field(default=0, ge=0)
     attempt_number: int = Field(default=1, ge=1)
+    qa_policy: QAPolicy | None = Field(default=None)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
@@ -2055,6 +2171,13 @@ class RemediationTask(BaseModel):
         description=(
             "The task_id of the parent task that spawned this task. "
             "None for initial (depth-0) tasks."
+        ),
+    )
+    qa_policy: QAPolicy | None = Field(
+        default=None,
+        description=(
+            "Supervisor-owned QA gate policy. None is retained only for legacy "
+            "state so missing provenance can fail closed."
         ),
     )
     strategy: RoutingStrategy = Field(
