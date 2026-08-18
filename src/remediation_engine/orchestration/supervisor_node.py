@@ -954,6 +954,7 @@ def reconcile_phase5_state_before_teardown(
         "task_queue": task_queue,
         "retry_plans_by_task": retry_plans_by_task,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
+        "workspace_rollback_anchors_by_task": {},
         "active_target_task_ids": [],
         "active_target_group_ids": [],
         "next_routing_step": "teardown",

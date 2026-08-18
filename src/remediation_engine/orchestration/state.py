@@ -359,7 +359,9 @@ class OrchestratorState(TypedDict, total=False):
         dict[str, WorkaroundReplayPlan], replace_dict_reducer
     ]
     attempt_snapshots_by_id: Annotated[dict[str, TaskAttemptSnapshot], merge_dict_reducer]
-    workspace_rollback_anchors_by_task: Annotated[dict[str, str], merge_dict_reducer]
+    # This is an authoritative projection of immutable task baselines. A
+    # merge reducer would leave removed snapshot IDs stale in state.
+    workspace_rollback_anchors_by_task: Annotated[dict[str, str], replace_dict_reducer]
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
     scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
