@@ -19,8 +19,8 @@ from typing import Any
 from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     NoFixMitigationStage,
-    QAPolicy,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -261,6 +261,42 @@ def derive_initial_qa_policy(group: VulnerabilityGroup) -> QAPolicy:
     if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.VERSION_FOUND:
         return QAPolicy.VERSION_BUMP
     return QAPolicy.INITIAL_CODE_WORKAROUND
+
+
+def derive_missing_task_qa_policy(
+    task: RemediationTask,
+    group: VulnerabilityGroup | None,
+) -> QAPolicy | None:
+    """Derive a safe QA policy for an uncommitted legacy task.
+
+    This helper is intentionally narrower than the initial-task factory.  It
+    repairs state created before ``qa_policy`` became mandatory while refusing
+    to guess the policy for a pivoted child task whose policy provenance has
+    been lost.
+
+    Args:
+        task: Existing task whose policy may be missing.
+        group: Current vulnerability group, when still available.
+
+    Returns:
+        A deterministically recoverable policy, or ``None`` when provenance is
+        ambiguous and the caller must fail closed.
+    """
+    if task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        return QAPolicy.NO_FIX_CODE_REMOVAL
+    if group is not None and is_no_fix_group(group):
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if task.strategy == RoutingStrategy.VERSION_BUMP:
+        return QAPolicy.VERSION_BUMP
+    if (
+        task.parent_task_id is None
+        and task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and (group is None or not is_no_fix_group(group))
+    ):
+        return QAPolicy.INITIAL_CODE_WORKAROUND
+    return None
 
 
 def build_initial_remediation_task(

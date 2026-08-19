@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+from pydantic import ValidationError
+
 from remediation_engine.contracts.schemas import (
     BatchQAResult,
     FailureCategory,
@@ -12,10 +15,13 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    QAAttemptResult,
     QAEvaluation,
     QAPolicy,
     QASemanticSecurityReview,
     QATestAttribution,
+    RemediationTask,
+    RoutingStrategy,
     ScannerExecutionStatus,
     SecurityReviewVerdict,
     Severity,
@@ -27,10 +33,15 @@ from remediation_engine.orchestration.qa_critic import (
     GroupInvestigation,
     _apply_policy_decision,
     _collect_group_package_state,
+    _derive_qa_group_policies,
     _evaluate_policy_gates,
     _QAExecutionResults,
     _QAPackageState,
     _SecurityScanResult,
+)
+from remediation_engine.orchestration.task_utils import (
+    build_initial_remediation_task,
+    derive_missing_task_qa_policy,
 )
 
 
@@ -114,7 +125,7 @@ def _evaluate(
     gates, _ = _evaluate_policy_gates([group], results, {group.group_id: policy})
     evaluations, _ = _apply_policy_decision(
         [group],
-        BatchQAResult(evaluations=[evaluation]),
+        BatchQAResult(holistic_report="test", evaluations=[evaluation]),
         gates,
         {group.group_id: policy},
         {group.group_id: investigation} if investigation is not None else None,
@@ -132,6 +143,7 @@ def test_version_bump_scanner_is_group_scoped() -> None:
     evaluations, _ = _apply_policy_decision(
         [g1, g2],
         BatchQAResult(
+            holistic_report="test",
             evaluations=[
                 QAEvaluation(task_id="g1", passed=True),
                 QAEvaluation(task_id="g2", passed=True),
@@ -146,23 +158,43 @@ def test_version_bump_scanner_is_group_scoped() -> None:
 
 def test_version_bump_may_exonerate_unrelated_test_failure() -> None:
     group = _group("g1")
-    result = _evaluate(
-        group,
-        QAPolicy.VERSION_BUMP,
-        _results(tests=(False, "test failed")),
-        QAEvaluation(
-            task_id="g1",
-            passed=False,
-            failure_category=FailureCategory.BREAKING_CHANGE,
-            retry_feedback="The other group owns the failure.",
-            test_attribution=QATestAttribution(
-                verdict=TestAttributionVerdict.EXONERATED,
-                responsible_group_ids=["g2"],
-                failed_tests=["tests/other.test.js::fails"],
-                reasoning="The failure does not touch this diff.",
-            ),
-        ),
+    unrelated_group = _group("g2", "CVE-2025-0002")
+    results = _results(tests=(False, "test failed"))
+    gates, _ = _evaluate_policy_gates(
+        [group, unrelated_group],
+        results,
+        {
+            group.group_id: QAPolicy.VERSION_BUMP,
+            unrelated_group.group_id: QAPolicy.VERSION_BUMP,
+        },
     )
+    evaluations, _ = _apply_policy_decision(
+        [group, unrelated_group],
+        BatchQAResult(
+            holistic_report="test",
+            evaluations=[
+                QAEvaluation(
+                    task_id="g1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The other group owns the failure.",
+                    test_attribution=QATestAttribution(
+                        verdict=TestAttributionVerdict.EXONERATED,
+                        responsible_group_ids=["g2"],
+                        failed_tests=["tests/other.test.js::fails"],
+                        reasoning="The failure does not touch this diff.",
+                    ),
+                ),
+                QAEvaluation(task_id="g2", passed=True),
+            ],
+        ),
+        gates,
+        {
+            group.group_id: QAPolicy.VERSION_BUMP,
+            unrelated_group.group_id: QAPolicy.VERSION_BUMP,
+        },
+    )
+    result = evaluations[group.group_id]
     assert result.passed is True
 
 
@@ -261,7 +293,10 @@ def test_shared_install_failure_fails_every_group() -> None:
     )
     evaluations, _ = _apply_policy_decision(
         groups,
-        BatchQAResult(evaluations=[QAEvaluation(task_id=group.group_id, passed=True) for group in groups]),
+        BatchQAResult(
+            holistic_report="test",
+            evaluations=[QAEvaluation(task_id=group.group_id, passed=True) for group in groups],
+        ),
         gates,
         {group.group_id: QAPolicy.VERSION_BUMP for group in groups},
     )
@@ -270,3 +305,85 @@ def test_shared_install_failure_fails_every_group() -> None:
         evaluation.failure_category == FailureCategory.PEER_CONFLICT
         for evaluation in evaluations.values()
     )
+
+
+def test_missing_initial_task_policy_is_recoverable_deterministically() -> None:
+    group = _group("g1")
+    task = build_initial_remediation_task(group, "task-1").model_copy(
+        update={"qa_policy": None}
+    )
+
+    assert derive_missing_task_qa_policy(task, group) == QAPolicy.VERSION_BUMP
+
+
+def test_missing_no_fix_policy_recovers_package_removal_stage() -> None:
+    group = _group("g1").model_copy(
+        update={
+            "fix_plan": FixPlan(
+                status=FixPlanStatus.NO_FIX,
+                instruction="Remove the vulnerable package.",
+                strategy_used="test",
+            )
+        }
+    )
+    task = RemediationTask(
+        task_id="task-1",
+        parent_group_id=group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Remove the vulnerable package.",
+    )
+
+    assert derive_missing_task_qa_policy(task, group) == QAPolicy.NO_FIX_PACKAGE_REMOVAL
+
+
+def test_missing_pivot_policy_is_not_guessed() -> None:
+    group = _group("g1")
+    task = RemediationTask(
+        task_id="task-child",
+        parent_group_id=group.group_id,
+        parent_task_id="task-parent",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Apply workaround.",
+    )
+
+    assert derive_missing_task_qa_policy(task, group) is None
+
+
+def test_active_qa_policy_must_match_attempt_snapshot() -> None:
+    group = _group("g1")
+    task = build_initial_remediation_task(group, "task-1").model_copy(
+        update={"task_revision": 1, "current_attempt_id": "attempt-1"}
+    )
+
+    policies = _derive_qa_group_policies(
+        [group],
+        {task.task_id: task},
+        [task.task_id],
+        {
+            "attempt-1": task.model_copy(
+                update={"current_attempt_id": None, "qa_policy": None}
+            )
+        },
+    )
+
+    assert policies[group.group_id] is None
+
+
+def test_qa_attempt_result_requires_consistent_policy_provenance() -> None:
+    evaluation = QAEvaluation(task_id="g1", passed=True)
+
+    with pytest.raises(ValidationError, match="qa_policy_source"):
+        QAAttemptResult(
+            attempt_id="attempt-1",
+            task_id="task-1",
+            qa_policy=QAPolicy.VERSION_BUMP,
+            evaluation=evaluation,
+        )
+
+    with pytest.raises(ValidationError, match="qa_policy_source"):
+        QAAttemptResult(
+            attempt_id="attempt-1",
+            task_id="task-1",
+            qa_policy_source="task_queue",
+            evaluation=evaluation,
+        )

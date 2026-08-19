@@ -1863,9 +1863,45 @@ class QAAttemptResult(BaseModel):
     attempt_id: str = Field(..., min_length=1)
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
+    qa_policy: QAPolicy | None = Field(
+        default=None,
+        description=(
+            "Supervisor-owned policy copied from the committed attempt. None is "
+            "retained only for legacy results and must not be produced by the "
+            "current graph dispatch path."
+        ),
+    )
+    qa_policy_source: Literal["attempt_snapshot", "task_queue", "missing"] = Field(
+        default="missing",
+        description="Provenance source for qa_policy in this attempt result.",
+    )
     evaluation: QAEvaluation
     investigation_report: str = ""
     errors: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_qa_policy_provenance(self) -> QAAttemptResult:
+        """Keep the optional legacy policy state internally consistent.
+
+        The current graph must populate both fields. Legacy direct callers
+        may still omit the policy, but a present policy must identify its
+        source and a non-missing source must carry a policy value.
+
+        Returns:
+            This validated QA attempt result.
+
+        Raises:
+            ValueError: If the policy and provenance fields disagree.
+        """
+        if self.qa_policy is None and self.qa_policy_source != "missing":
+            raise ValueError(
+                "qa_policy_source must be 'missing' when qa_policy is absent."
+            )
+        if self.qa_policy is not None and self.qa_policy_source == "missing":
+            raise ValueError(
+                "qa_policy_source must identify the source when qa_policy is present."
+            )
+        return self
 
 
 class StateConsistencyEvent(BaseModel):

@@ -617,6 +617,38 @@ class TestRunOdc:
             joined = " ".join(args)
             assert _ODC_CACHE_VOLUME in joined
 
+    def test_assigns_unique_named_container_for_cleanup(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _run_odc("test-vol")
+            args = mock_run.call_args[0][0]
+
+        assert "--name" in args
+        container_name = args[args.index("--name") + 1]
+        assert container_name.startswith("remedy-odc-")
+
+    def test_completed_scan_persists_diagnostic_output(self, tmp_path):
+        process = subprocess.CompletedProcess(
+            ["docker", "run"],
+            2,
+            stdout="scan warning",
+            stderr="scan error",
+        )
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._ODC_LOG_DIR",
+                tmp_path,
+            ),
+            patch("subprocess.run", return_value=process),
+        ):
+            result = _run_odc("test-vol")
+
+        payload = json.loads(Path(result.odc_log_path).read_text(encoding="utf-8"))
+        assert payload["status"] == "completed"
+        assert payload["exit_code"] == 2
+        assert payload["stdout"] == "scan warning"
+        assert payload["stderr"] == "scan error"
+
     def test_respects_odc_extra_args(self, monkeypatch):
         monkeypatch.setenv("ODC_EXTRA_ARGS", "--disableNodeAudit --disableRetireJS")
         with patch("subprocess.run") as mock_run:
@@ -647,6 +679,70 @@ class TestRunOdc:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd=["docker"], timeout=300)
             with pytest.raises(subprocess.TimeoutExpired):
                 _run_odc("test-vol")
+
+    def test_timeout_persists_output_and_forces_container_cleanup(self, tmp_path):
+        timeout = subprocess.TimeoutExpired(
+            cmd=["docker", "run"],
+            timeout=_ODC_TIMEOUT_SECONDS,
+            output="partial stdout",
+            stderr="partial stderr",
+        )
+        cleanup = subprocess.CompletedProcess(
+            ["docker", "rm", "-f"],
+            0,
+            stdout="removed",
+            stderr="",
+        )
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._ODC_LOG_DIR",
+                tmp_path,
+            ),
+            patch("subprocess.run", side_effect=[timeout, cleanup]) as mock_run,
+            pytest.raises(subprocess.TimeoutExpired) as raised,
+        ):
+            _run_odc("test-vol")
+
+        run_command = mock_run.call_args_list[0].args[0]
+        container_name = run_command[run_command.index("--name") + 1]
+        cleanup_command = mock_run.call_args_list[1].args[0]
+        assert cleanup_command == ["docker", "rm", "-f", container_name]
+
+        log_path = raised.value.log_path
+        assert log_path is not None
+        payload = json.loads(Path(log_path).read_text(encoding="utf-8"))
+        assert payload["status"] == "timeout"
+        assert payload["container_name"] == container_name
+        assert payload["stdout"] == "partial stdout"
+        assert payload["stderr"] == "partial stderr"
+        assert payload["cleanup"]["succeeded"] is True
+
+    def test_timeout_preserves_cleanup_failure_in_exception_and_log(self, tmp_path):
+        timeout = subprocess.TimeoutExpired(
+            cmd=["docker", "run"],
+            timeout=_ODC_TIMEOUT_SECONDS,
+        )
+        cleanup = subprocess.CompletedProcess(
+            ["docker", "rm", "-f"],
+            1,
+            stdout="",
+            stderr="permission denied",
+        )
+        with (
+            patch(
+                "remediation_engine.orchestration.qa_critic._ODC_LOG_DIR",
+                tmp_path,
+            ),
+            patch("subprocess.run", side_effect=[timeout, cleanup]),
+            pytest.raises(subprocess.TimeoutExpired) as raised,
+        ):
+            _run_odc("test-vol")
+
+        assert raised.value.cleanup.succeeded is False
+        assert "permission denied" in raised.value.cleanup.error
+        payload = json.loads(Path(raised.value.log_path).read_text(encoding="utf-8"))
+        assert payload["cleanup"]["succeeded"] is False
+        assert payload["cleanup"]["error"] == "permission denied"
 
 
 class TestRunSecurityScan:
@@ -824,6 +920,32 @@ class TestRunSecurityScan:
 
         assert ok is False
         assert "timed out" in summary.lower()
+
+    def test_timeout_summary_includes_log_and_cleanup_evidence(self, tmp_path):
+        sandbox = MagicMock()
+        timeout = subprocess.TimeoutExpired(
+            cmd=["docker", "run"],
+            timeout=_ODC_TIMEOUT_SECONDS,
+        )
+        cleanup = subprocess.CompletedProcess(
+            ["docker", "rm", "-f"],
+            0,
+            stdout="removed",
+            stderr="",
+        )
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch(
+                "remediation_engine.orchestration.qa_critic._ODC_LOG_DIR",
+                tmp_path,
+            ),
+            patch("subprocess.run", side_effect=[timeout, cleanup]),
+        ):
+            result = _run_security_scan(sandbox, "vol", {"CVE-2021-23337"})
+
+        assert result.ok is False
+        assert "ODC diagnostic log saved to:" in result.summary
+        assert "ODC container cleanup completed" in result.summary
 
     def test_failure_when_target_still_found(self):
         sandbox = MagicMock()

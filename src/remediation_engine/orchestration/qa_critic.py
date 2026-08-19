@@ -41,8 +41,10 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -65,8 +67,8 @@ from remediation_engine.contracts.schemas import (
     RemediationTask,
     RoutingStrategy,
     ScanFallbackReason,
-    ScanScope,
     ScannerExecutionStatus,
+    ScanScope,
     SecurityReviewVerdict,
     TestAttributionVerdict,
     VulnerabilityGroup,
@@ -98,6 +100,8 @@ _ODC_REPORT_NAME = "dependency-check-report.json"
 _ODC_HTML_REPORT_NAME = "dependency-check-report.html"
 _ODC_CACHE_VOLUME = "odc-cache"
 _ODC_DEBUG_DIR = Path("data/cache/qa_reports")
+_ODC_LOG_DIR = _ODC_DEBUG_DIR / "odc_logs"
+_ODC_CLEANUP_TIMEOUT_SECONDS = 30
 
 # LLM context budget limits
 _DIFF_CHAR_BUDGET = 8_000
@@ -235,6 +239,337 @@ _STACK_NOISE_RE = re.compile(r"^\s*(at\s+.+|\^\s*|[-]{3,}|\s*operator:\s+.+)$")
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _ODCExecution:
+    """Host-side identity and diagnostics location for one ODC invocation."""
+
+    run_id: str
+    scope: str
+    container_name: str
+    log_path: Path
+    started_at_utc: str
+
+
+@dataclass(frozen=True)
+class _ODCCleanupResult:
+    """Outcome of the best-effort forced removal of an ODC container."""
+
+    container_name: str
+    succeeded: bool
+    already_absent: bool
+    returncode: int | None
+    stdout: str
+    stderr: str
+    error: str | None = None
+
+
+class _ODCScanTimeout(subprocess.TimeoutExpired):
+    """Timeout carrying ODC diagnostics and container-cleanup evidence."""
+
+    def __init__(
+        self,
+        original: subprocess.TimeoutExpired,
+        execution: _ODCExecution,
+        cleanup: _ODCCleanupResult,
+        log_path: Path | None,
+    ) -> None:
+        super().__init__(
+            original.cmd,
+            original.timeout,
+            output=getattr(original, "output", None),
+            stderr=getattr(original, "stderr", None),
+        )
+        self.run_id = execution.run_id
+        self.scope = execution.scope
+        self.container_name = execution.container_name
+        self.cleanup = cleanup
+        self.log_path = log_path
+
+
+def _new_odc_execution(scope: str) -> _ODCExecution:
+    """Allocate a unique Docker container name and host diagnostic path."""
+    run_id = uuid4().hex
+    return _ODCExecution(
+        run_id=run_id,
+        scope=scope,
+        container_name=f"remedy-odc-{run_id}",
+        log_path=_ODC_LOG_DIR / f"{run_id}-{scope}.json",
+        started_at_utc=datetime.now(UTC).isoformat(),
+    )
+
+
+def _subprocess_text(value: Any) -> str:
+    """Convert subprocess output, including timeout byte output, to text."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _redact_odc_command(command: Sequence[str]) -> list[str]:
+    """Redact values for the small set of secret-bearing ODC options."""
+    sensitive_options = {
+        "--apikey",
+        "--nvdapikey",
+        "--proxypass",
+        "--password",
+    }
+    redacted: list[str] = []
+    redact_next = False
+    for argument in command:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        redacted.append(argument)
+        if argument.lower() in sensitive_options:
+            redact_next = True
+    return redacted
+
+
+def _cleanup_odc_container(container_name: str) -> _ODCCleanupResult:
+    """Force-remove one named ODC container after a scan timeout.
+
+    ``docker rm -f`` both stops a running container and removes it.  A
+    ``No such container`` response is treated as success because ``--rm`` may
+    have won a cleanup race.  All other failures are returned to the caller so
+    the timeout remains a hard QA failure while preserving the cleanup issue.
+    """
+    command = ["docker", "rm", "-f", container_name]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_ODC_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _ODCCleanupResult(
+            container_name=container_name,
+            succeeded=False,
+            already_absent=False,
+            returncode=None,
+            stdout=_subprocess_text(getattr(exc, "stdout", None)),
+            stderr=_subprocess_text(getattr(exc, "stderr", None)),
+            error=(f"docker rm -f timed out after {_ODC_CLEANUP_TIMEOUT_SECONDS}s"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _ODCCleanupResult(
+            container_name=container_name,
+            succeeded=False,
+            already_absent=False,
+            returncode=None,
+            stdout="",
+            stderr="",
+            error=f"docker rm -f failed to start: {exc}",
+        )
+
+    stdout = _subprocess_text(getattr(result, "stdout", None))
+    stderr = _subprocess_text(getattr(result, "stderr", None))
+    returncode = getattr(result, "returncode", None)
+    detail = f"{stdout}\n{stderr}".strip()
+    if returncode == 0:
+        return _ODCCleanupResult(
+            container_name=container_name,
+            succeeded=True,
+            already_absent=False,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if "no such container" in detail.lower():
+        return _ODCCleanupResult(
+            container_name=container_name,
+            succeeded=True,
+            already_absent=True,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return _ODCCleanupResult(
+        container_name=container_name,
+        succeeded=False,
+        already_absent=False,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        error=detail or f"docker rm -f exited {returncode}",
+    )
+
+
+def _write_odc_diagnostic_log(
+    execution: _ODCExecution,
+    command: Sequence[str],
+    *,
+    status: str,
+    process: subprocess.CompletedProcess[str] | None = None,
+    error: BaseException | None = None,
+    cleanup: _ODCCleanupResult | None = None,
+) -> Path | None:
+    """Persist one ODC invocation's command, output, and lifecycle evidence."""
+    stdout = _subprocess_text(
+        getattr(process, "stdout", None) if process is not None else getattr(error, "stdout", None)
+    )
+    stderr = _subprocess_text(
+        getattr(process, "stderr", None) if process is not None else getattr(error, "stderr", None)
+    )
+    exit_code = getattr(process, "returncode", None) if process is not None else None
+    cleanup_payload: dict[str, Any] | None = None
+    if cleanup is not None:
+        cleanup_payload = {
+            "container_name": cleanup.container_name,
+            "succeeded": cleanup.succeeded,
+            "already_absent": cleanup.already_absent,
+            "returncode": cleanup.returncode,
+            "stdout": cleanup.stdout,
+            "stderr": cleanup.stderr,
+            "error": cleanup.error,
+        }
+    payload = {
+        "run_id": execution.run_id,
+        "scope": execution.scope,
+        "container_name": execution.container_name,
+        "started_at_utc": execution.started_at_utc,
+        "finished_at_utc": datetime.now(UTC).isoformat(),
+        "status": status,
+        "exit_code": exit_code,
+        "timeout_seconds": _ODC_TIMEOUT_SECONDS,
+        "command": _redact_odc_command(command),
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": str(error) if error is not None else None,
+        "cleanup": cleanup_payload,
+    }
+    try:
+        execution.log_path.parent.mkdir(parents=True, exist_ok=True)
+        execution.log_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        resolved_path = execution.log_path.resolve()
+        logger.info("qa_critic: ODC diagnostic log saved to %s", resolved_path)
+        return resolved_path
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "qa_critic: failed to persist ODC diagnostic log to %s - %s",
+            execution.log_path,
+            exc,
+        )
+        return None
+
+
+def _odc_process_metadata(process: Any, key: str) -> Any:
+    """Read metadata attached by the ODC execution helper without MagicMock leakage."""
+    metadata = getattr(process, "__dict__", {})
+    return metadata.get(key) if isinstance(metadata, dict) else None
+
+
+def _odc_log_note(process: Any) -> str:
+    """Return a user-facing note for a persisted ODC diagnostic log."""
+    log_path = _odc_process_metadata(process, "odc_log_path")
+    return f"\nODC diagnostic log saved to: {log_path}" if log_path else ""
+
+
+def _odc_exception_log_note(error: BaseException) -> str:
+    """Return a user-facing diagnostic-log note attached to a scan exception."""
+    log_path = getattr(error, "odc_log_path", None)
+    return f"\nODC diagnostic log saved to: {log_path}" if log_path else ""
+
+
+def _odc_timeout_summary(exc: subprocess.TimeoutExpired) -> str:
+    """Build a timeout summary that preserves log and cleanup diagnostics."""
+    summary = f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s."
+    log_path = getattr(exc, "log_path", None)
+    if log_path:
+        summary += f"\nODC diagnostic log saved to: {log_path}"
+    cleanup = getattr(exc, "cleanup", None)
+    if isinstance(cleanup, _ODCCleanupResult):
+        if cleanup.succeeded:
+            cleanup_state = "already absent" if cleanup.already_absent else "removed"
+            summary += f"\nODC container cleanup completed ({cleanup_state}): {cleanup.container_name}"
+        else:
+            summary += (
+                f"\nODC container cleanup FAILED for {cleanup.container_name}: "
+                f"{cleanup.error or 'unknown cleanup error'}"
+            )
+    return summary
+
+
+def _run_odc_process(
+    workspace_volume: str,
+    scan_subdir: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ODC with a unique container identity and durable diagnostics."""
+    scope = "targeted" if scan_subdir else "full"
+    execution = _new_odc_execution(scope)
+    cmd = _odc_command(workspace_volume, scan_subdir, execution.container_name)
+    logger.info("qa_critic: running %s ODC in Docker: %s", scope, " ".join(cmd))
+    try:
+        process = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_ODC_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cleanup = _cleanup_odc_container(execution.container_name)
+        log_path = _write_odc_diagnostic_log(
+            execution,
+            cmd,
+            status="timeout",
+            error=exc,
+            cleanup=cleanup,
+        )
+        if not cleanup.succeeded:
+            logger.error(
+                "qa_critic: failed to remove timed-out ODC container %s: %s",
+                execution.container_name,
+                cleanup.error,
+            )
+        raise _ODCScanTimeout(exc, execution, cleanup, log_path) from exc
+    except Exception as exc:  # noqa: BLE001
+        log_path = _write_odc_diagnostic_log(
+            execution,
+            cmd,
+            status="subprocess_error",
+            error=exc,
+        )
+        try:
+            exc.__dict__.update(
+                {
+                    "odc_run_id": execution.run_id,
+                    "odc_container_name": execution.container_name,
+                    "odc_log_path": log_path,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "qa_critic: unable to attach ODC error metadata",
+                exc_info=True,
+            )
+        raise
+
+    log_path = _write_odc_diagnostic_log(
+        execution,
+        cmd,
+        status="completed",
+        process=process,
+    )
+    try:
+        process.__dict__.update(
+            {
+                "odc_run_id": execution.run_id,
+                "odc_container_name": execution.container_name,
+                "odc_log_path": log_path,
+            }
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("qa_critic: unable to attach ODC diagnostic metadata", exc_info=True)
+    return process
+
+
 def _read_report_from_workspace(
     sandbox: DockerSandbox,
     relative_dir: str = "",
@@ -321,16 +656,24 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
         return None
 
 
-def _odc_command(workspace_volume: str, scan_subdir: str | None = None) -> list[str]:
+def _odc_command(
+    workspace_volume: str,
+    scan_subdir: str | None = None,
+    container_name: str | None = None,
+) -> list[str]:
     """Build a safe ODC Docker command for the full or targeted workspace."""
     scan_path = "/scan"
     if scan_subdir:
         scan_subdir = _validate_qa_path(scan_subdir)
         scan_path = f"/scan/{scan_subdir}"
+    if container_name is None:
+        container_name = _new_odc_execution("targeted" if scan_subdir else "full").container_name
     cmd = [
         "docker",
         "run",
         "--rm",
+        "--name",
+        container_name,
         "-u",
         "root",
         "-v",
@@ -360,14 +703,7 @@ def _odc_command(workspace_volume: str, scan_subdir: str | None = None) -> list[
 
 def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
     """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
-    cmd = _odc_command(workspace_volume)
-    logger.info("qa_critic: running ODC in Docker: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=_ODC_TIMEOUT_SECONDS,
-    )
+    return _run_odc_process(workspace_volume)
 
 
 def _run_targeted_odc(
@@ -375,14 +711,7 @@ def _run_targeted_odc(
     targeted_subdir: str,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ODC against a validated workspace-relative targeted directory."""
-    cmd = _odc_command(workspace_volume, targeted_subdir)
-    logger.info("qa_critic: running targeted ODC in Docker: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=_ODC_TIMEOUT_SECONDS,
-    )
+    return _run_odc_process(workspace_volume, targeted_subdir)
 
 
 # ---------------------------------------------------------------------------
@@ -493,13 +822,16 @@ def _run_security_scan(
 
     try:
         proc = _run_odc(workspace_volume)
-    except FileNotFoundError:
-        msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
+    except FileNotFoundError as exc:
+        msg = (
+            "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
+            + _odc_exception_log_note(exc)
+        )
         return _SecurityScanResult(
             False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE
         )
-    except subprocess.TimeoutExpired:
-        msg = f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s."
+    except subprocess.TimeoutExpired as exc:
+        msg = _odc_timeout_summary(exc)
         return _SecurityScanResult(
             False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.TIMEOUT
         )
@@ -519,9 +851,9 @@ def _run_security_scan(
         _ODC_REPORT_NAME,
         _ODC_DEBUG_DIR / _ODC_REPORT_NAME,
     )
-    report_location_note = ""
+    report_location_note = _odc_log_note(proc)
     if saved_html_report is not None:
-        report_location_note = f"\nHTML report saved to: {saved_html_report}"
+        report_location_note += f"\nHTML report saved to: {saved_html_report}"
         if saved_json_report is not None:
             report_location_note += f"\nJSON report saved to: {saved_json_report}"
 
@@ -629,19 +961,20 @@ def _run_targeted_security_scan(
 
     try:
         proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         return _SecurityScanResult(
             False,
-            "FAILURE: docker is not available on PATH; Dependency-Check cannot run.",
+            "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
+            + _odc_exception_log_note(exc),
             set(),
             set(),
             set(),
             execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return _SecurityScanResult(
             False,
-            f"FAILURE: Dependency-Check timed out after {_ODC_TIMEOUT_SECONDS}s.",
+            _odc_timeout_summary(exc),
             set(),
             set(),
             set(),
@@ -670,9 +1003,9 @@ def _run_targeted_security_scan(
         report_json,
         _targeted_report_host_path(report_dir, _ODC_REPORT_NAME),
     )
-    report_location_note = ""
+    report_location_note = _odc_log_note(proc)
     if saved_html is not None:
-        report_location_note = f"\nHTML report saved to: {saved_html}"
+        report_location_note += f"\nHTML report saved to: {saved_html}"
         if saved_json is not None:
             report_location_note += f"\nJSON report saved to: {saved_json}"
 
@@ -2884,8 +3217,14 @@ def _derive_qa_group_policies(
     valid_groups: list[VulnerabilityGroup],
     task_queue: dict[str, Any] | None,
     active_target_task_ids: list[str] | None = None,
+    attempt_snapshots_by_id: dict[str, Any] | None = None,
 ) -> dict[str, QAPolicy | None]:
-    """Resolve the supervisor-committed QA policy for each evaluated group."""
+    """Resolve the supervisor-committed QA policy for each evaluated group.
+
+    Active graph dispatches must agree with their immutable attempt snapshot.
+    Legacy direct callers may omit snapshots and use the task queue alone; the
+    real graph always supplies the snapshot map.
+    """
     queue = dict(task_queue or {})
     active_ids = list(active_target_task_ids or [])
     policies: dict[str, QAPolicy | None] = {}
@@ -2899,10 +3238,36 @@ def _derive_qa_group_policies(
             task = queue.get(task_id)
             if task is not None and getattr(task, "parent_group_id", None) == group.group_id:
                 candidates.append(task)
-        raw_policy = next(
-            (getattr(task, "qa_policy", None) for task in candidates if getattr(task, "qa_policy", None)),
-            None,
-        )
+        raw_policy = None
+        active_candidates = [task for task in candidates if task.task_id in active_ids]
+        if active_candidates and attempt_snapshots_by_id is not None:
+            active_task = active_candidates[0]
+            snapshot = attempt_snapshots_by_id.get(getattr(active_task, "current_attempt_id", None))
+            snapshot_policy = (
+                snapshot.get("qa_policy")
+                if isinstance(snapshot, Mapping)
+                else getattr(snapshot, "qa_policy", None)
+                if snapshot is not None
+                else None
+            )
+            task_policy = getattr(active_task, "qa_policy", None)
+            if snapshot_policy is None or task_policy != snapshot_policy:
+                logger.error(
+                    "qa_critic: missing or contradictory QA policy provenance for task %s.",
+                    getattr(active_task, "task_id", "unknown"),
+                )
+                policies[group.group_id] = None
+                continue
+            raw_policy = snapshot_policy
+        else:
+            raw_policy = next(
+                (
+                    getattr(task, "qa_policy", None)
+                    for task in candidates
+                    if getattr(task, "qa_policy", None)
+                ),
+                None,
+            )
         if raw_policy is None:
             policies[group.group_id] = None
             continue
@@ -5378,6 +5743,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         valid_groups,
         state.get("task_queue") or {},
         state.get("active_target_task_ids") or [],
+        state.get("attempt_snapshots_by_id"),
     )
     candidate_changed_files: list[str] = state.get("changed_files") or []
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)

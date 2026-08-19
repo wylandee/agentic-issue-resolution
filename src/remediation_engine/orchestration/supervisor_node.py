@@ -86,6 +86,7 @@ from remediation_engine.orchestration.task_utils import (
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
+    derive_missing_task_qa_policy,
     group_parent_context,
     is_no_fix_group,
     is_transitive_group,
@@ -861,6 +862,22 @@ def _validate_committed_state(
         snapshot = snapshots_by_id.get(task.current_attempt_id)
         if snapshot is None:
             errors.append(f"supervisor: active task {task_id} references missing attempt.")
+            continue
+        if task.qa_policy is None or snapshot.qa_policy is None:
+            errors.append(f"supervisor: active task {task_id} has missing QA policy provenance.")
+            events.append(
+                _build_consistency_event(
+                    error_code="MISSING_QA_POLICY_PROVENANCE",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=task.current_attempt_id,
+                    action="replanned",
+                    details=(
+                        "Active task and committed attempt must both carry a "
+                        "supervisor-owned QA policy."
+                    ),
+                )
+            )
             continue
         if (
             snapshot.task_revision != task.task_revision
@@ -4043,6 +4060,26 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     for task_id, task in list(task_queue.items()):
         group = group_by_id.get(task.parent_group_id)
         task_updates: dict[str, Any] = {}
+        if task.qa_policy is None and task.current_attempt_id is None:
+            recovered_policy = derive_missing_task_qa_policy(task, group)
+            if recovered_policy is not None:
+                task_updates["qa_policy"] = recovered_policy
+            elif task.status not in _TERMINAL_STATUSES:
+                details = (
+                    "Task has no recoverable QA policy provenance before dispatch; "
+                    "the Supervisor will fail closed."
+                )
+                errors.append(f"supervisor: task {task_id} has missing QA policy provenance.")
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="MISSING_QA_POLICY_PROVENANCE",
+                        task_id=task_id,
+                        expected_attempt_id=None,
+                        received_attempt_id=None,
+                        action="rejected",
+                        details=details,
+                    )
+                )
         if (
             task.status not in _TERMINAL_STATUSES
             and task.current_attempt_id is None
@@ -4094,6 +4131,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_updates["target_package_name"] = parent_name
                 task_updates["target_dependency_type"] = task.target_dependency_type or parent_type
         if task_updates:
+            if "qa_policy" in task_updates:
+                task_updates["task_revision"] = task.task_revision + 1
             task_queue[task_id] = task.model_copy(update=task_updates)
 
     # A transitive VERSION_BUMP task is planned against its nearest directly
