@@ -344,3 +344,127 @@ def test_successful_workaround_edit_injects_immediate_validation_instruction() -
         and "next action must be validate_workaround" in message.content
         for message in second_turn
     )
+
+
+def test_manifest_tool_calls_are_serialized_and_deferred_within_one_turn() -> None:
+    """Only the first manifest operation in a model turn is executed."""
+    modify_tool = MagicMock()
+    modify_tool.name = "modify_npm_dependency"
+    modify_tool.invoke.side_effect = [
+        "SUCCESS: updated lodash",
+        "SUCCESS: updated axios",
+    ]
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_manifest_sync"
+    validate_tool.invoke.side_effect = ["SUCCESS: validated lodash", "SUCCESS: validated axios"]
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": modify_tool.name, "args": {"package_name": "lodash"}, "id": "modify-1"},
+                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-2"},
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": validate_tool.name, "args": {"package_name": "lodash"}, "id": "validate-1"}
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-3"}
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": validate_tool.name, "args": {"package_name": "axios"}, "id": "validate-2"}
+            ],
+        ),
+        AIMessage(content="complete"),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [modify_tool, validate_tool],
+        [HumanMessage(content="Update the dependencies.")],
+        set(),
+    )
+
+    assert result.errors == []
+    assert [event.name for event in result.tool_events] == [
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+    ]
+    llm.bind_tools.assert_called_once_with(
+        [modify_tool, validate_tool], parallel_tool_calls=False
+    )
+    assert any(
+        isinstance(message, HumanMessage)
+        and "Manifest operation sequencing barrier" in message.content
+        for message in bound_llm.invoke.call_args_list[1].args[0]
+    )
+
+
+def test_manifest_validation_failure_does_not_stop_later_batch_items() -> None:
+    """A failed package validation still allows later packages to run."""
+    modify_tool = MagicMock()
+    modify_tool.name = "modify_npm_dependency"
+    modify_tool.invoke.side_effect = ["SUCCESS: updated lodash", "SUCCESS: updated axios"]
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_manifest_sync"
+    validate_tool.invoke.side_effect = [
+        "FAILURE: rolled back lodash",
+        "SUCCESS: validated axios",
+    ]
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": modify_tool.name, "args": {"package_name": "lodash"}, "id": "modify-1"}
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": validate_tool.name, "args": {"package_name": "lodash"}, "id": "validate-1"}
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-2"}
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": validate_tool.name, "args": {"package_name": "axios"}, "id": "validate-2"}
+            ],
+        ),
+        AIMessage(content="lodash surrendered; axios completed"),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [modify_tool, validate_tool],
+        [HumanMessage(content="Update the dependencies.")],
+        set(),
+    )
+
+    assert result.errors == []
+    assert modify_tool.invoke.call_count == 2
+    assert validate_tool.invoke.call_count == 2
+    assert "rolled back lodash" in result.tool_events[1].content

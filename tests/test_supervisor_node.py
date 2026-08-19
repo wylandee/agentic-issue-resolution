@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -310,6 +311,26 @@ class TestRunSupervisorNodeNormalization:
         result = run_supervisor_node(state)
         # Should still have exactly 1 task
         assert len(result["task_queue"]) == 1
+
+    def test_backfills_missing_policy_on_uncommitted_existing_task(self):
+        g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
+        existing_task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP)
+        state = _base_state([g1], task_queue={"task-1": existing_task})
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].qa_policy == QAPolicy.VERSION_BUMP
+
+    def test_initial_dispatch_commits_policy_to_task_and_attempt_snapshot(self):
+        g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
+        result = run_supervisor_node(_base_state([g1]))
+
+        task = result["task_queue"]["task-1"]
+        assert task.qa_policy == QAPolicy.VERSION_BUMP
+        assert task.current_attempt_id is not None
+
+        snapshot = result["attempt_snapshots_by_id"][task.current_attempt_id]
+        assert snapshot.qa_policy == QAPolicy.VERSION_BUMP
 
 
 # ===========================================================================
@@ -2593,6 +2614,7 @@ class TestBugFixes:
         parent_task = RemediationTask(
             task_id="task-1",
             parent_group_id=group_id,
+            qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Bump express",
@@ -2611,6 +2633,14 @@ class TestBugFixes:
             task_queue=task_queue,
             group_by_id={},
             errors=errors,
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The update attempt broke the test suite.",
+                )
+            },
         )
 
         assert len(new_tasks) == 1
@@ -2624,6 +2654,7 @@ class TestBugFixes:
         parent_task = RemediationTask(
             task_id="task-1",
             parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Bump express",
@@ -2660,6 +2691,7 @@ class TestBugFixes:
         parent_task = RemediationTask(
             task_id="task-1",
             parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Bump express",
@@ -2678,6 +2710,14 @@ class TestBugFixes:
             task_queue=task_queue,
             group_by_id={},
             errors=errors,
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The update attempt broke the test suite.",
+                )
+            },
         )
 
         assert len(new_tasks) == 1
