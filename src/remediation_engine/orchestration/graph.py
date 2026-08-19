@@ -681,26 +681,118 @@ def _finish_workspace_attempt_snapshot(
     *,
     restore: bool,
 ) -> list[str]:
-    """Restore or delete a worker snapshot and always attempt cleanup."""
+    """Restore or delete a worker snapshot while preserving failed restores.
+
+    A successful restore is followed by snapshot deletion. If restoration
+    fails, the archive is retained for teardown diagnostics and recovery
+    instead of being deleted by the cleanup path that reports the failure.
+    """
     workspace_volume = state.get("workspace_volume")
     if not workspace_volume or snapshot_id is None:
         return []
 
     errors: list[str] = []
+    restore_succeeded = not restore
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            try:
-                if restore:
-                    sandbox.restore_workspace_snapshot(snapshot_id)
-            finally:
-                # Do not leave a failed restore archive in the shared volume;
-                # teardown also performs a final best-effort sweep.
+            if restore:
+                sandbox.restore_workspace_snapshot(snapshot_id)
+                restore_succeeded = True
+            if restore_succeeded:
                 sandbox.remove_workspace_snapshot(snapshot_id)
     except Exception as exc:  # noqa: BLE001 - preserve the original attempt outcome
-        action = "restore" if restore else "remove"
+        action = "remove" if restore_succeeded else "restore"
         message = f"graph: could not {action} workspace snapshot {snapshot_id}: {exc}"
         log.exception("Workspace snapshot %s failed for %s.", action, snapshot_id)
+        if restore and not restore_succeeded:
+            log.warning(
+                "Workspace snapshot %s retained after failed restore for teardown cleanup.",
+                snapshot_id,
+            )
         errors.append(message)
+    return errors
+
+
+def _restore_workspace_snapshot(
+    state: OrchestratorState,
+    snapshot_id: str,
+) -> list[str]:
+    """Restore a retained snapshot without deleting its archive.
+
+    Baseline snapshots remain available across update retries. This helper
+    separates restoration from cleanup so a worker failure can return to the
+    task baseline while preserving it for the next retry.
+    """
+    workspace_volume = state.get("workspace_volume")
+    if not workspace_volume or not snapshot_id:
+        return []
+
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            sandbox.restore_workspace_snapshot(snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - preserve the original attempt outcome
+        message = f"graph: could not restore retained workspace snapshot {snapshot_id}: {exc}"
+        log.exception("Retained workspace snapshot restore failed for %s.", snapshot_id)
+        return [message]
+    return []
+
+
+def _workspace_rollback_anchor_ids(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> list[str]:
+    """Return immutable baselines for targets and their workaround parents."""
+    anchors = state.get("workspace_rollback_anchors_by_task", {}) or {}
+    task_ids: list[str] = []
+    for task in target_tasks:
+        for task_id in (task.task_id, task.parent_task_id):
+            if task_id and task_id not in task_ids:
+                task_ids.append(task_id)
+    return list(dict.fromkeys(anchors[task_id] for task_id in task_ids if anchors.get(task_id)))
+
+
+def _finish_workspace_rollback_anchors(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    *,
+    restore: bool,
+) -> list[str]:
+    """Restore or discard immutable task baselines associated with targets."""
+    errors: list[str] = []
+    for anchor_id in _workspace_rollback_anchor_ids(state, target_tasks):
+        errors.extend(_finish_workspace_attempt_snapshot(state, anchor_id, restore=restore))
+    return errors
+
+
+def _finish_all_workspace_rollback_anchors(
+    state: OrchestratorState,
+    *,
+    restore: bool,
+) -> list[str]:
+    """Restore or discard every retained workspace baseline.
+
+    A successful workaround validates the complete live workspace, including
+    the dependency candidate that caused the regression. Any rollback anchor
+    retained from before that validation is therefore stale: restoring it
+    later would split the validated code edit from its dependency state. The
+    caller is responsible for emitting the corresponding empty anchor map
+    after this cleanup completes.
+    """
+    anchors = state.get("workspace_rollback_anchors_by_task", {}) or {}
+    errors: list[str] = []
+    for anchor_id in dict.fromkeys(anchors.values()):
+        errors.extend(_finish_workspace_attempt_snapshot(state, anchor_id, restore=restore))
+    return errors
+
+
+def _restore_retained_workspace_anchors(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> list[str]:
+    """Restore immutable task baselines while retaining them for another retry."""
+    errors: list[str] = []
+    for anchor_id in _workspace_rollback_anchor_ids(state, target_tasks):
+        errors.extend(_restore_workspace_snapshot(state, anchor_id))
     return errors
 
 
@@ -772,9 +864,16 @@ def _finalize_worker_workspace_snapshot(
     if snapshot_id is None:
         return []
     if _worker_attempts_succeeded(result, target_tasks):
-        # QA owns the next decision.  It must still be able to restore this
+        # QA owns the next decision. It must still be able to restore this
         # exact candidate if install, scanning, or tests reject it.
         return []
+    if _workspace_rollback_anchor_ids(state, target_tasks):
+        # A retry may have started from a previously rejected candidate. A
+        # failed worker must not preserve that candidate for the next task;
+        # restore the immutable task baseline and delete this checkpoint.
+        errors = _restore_retained_workspace_anchors(state, target_tasks)
+        errors.extend(_finish_workspace_attempt_snapshot(state, snapshot_id, restore=False))
+        return errors
     errors = _finish_workspace_attempt_snapshot(
         state,
         snapshot_id,
@@ -791,13 +890,11 @@ def _finalize_qa_workspace_snapshot(
     result: dict[str, Any],
 ) -> list[str]:
     """Finalize the candidate workspace after scoped QA.
-
     A validated dependency update that fails only because it introduced a
     runtime or test regression is still the correct base for a workaround
-    child.  Preserve that candidate while handing control back to the
-    Supervisor.  Other QA failures, and every failed workaround attempt,
-    restore the attempt-local checkpoint so failed source edits do not leak
-    into the next retry.
+    child. Preserve that candidate while handing control back to the
+    Supervisor. Other QA failures restore the immutable task baseline when one
+    exists, so a rejected retry cannot leak into the next task.
     """
     if snapshot_id is None:
         return []
@@ -818,28 +915,21 @@ def _finalize_qa_workspace_snapshot(
 
     def restore_failed_workaround() -> list[str]:
         errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
-        if workaround_attempt:
-            errors.extend(
-                _finish_parent_workspace_rollback_anchors(
-                    state,
-                    target_tasks,
-                    restore=True,
-                )
-            )
+        errors.extend(_finish_workspace_rollback_anchors(state, target_tasks, restore=True))
         return errors
 
-    def discard_successful_workaround_anchors() -> list[str]:
-        if not workaround_attempt:
-            return []
-        return _finish_parent_workspace_rollback_anchors(
-            state,
-            target_tasks,
-            restore=False,
-        )
+    def restore_failed_update() -> list[str]:
+        if _workspace_rollback_anchor_ids(state, target_tasks):
+            errors = _restore_retained_workspace_anchors(state, target_tasks)
+            errors.extend(_finish_workspace_attempt_snapshot(state, snapshot_id, restore=False))
+            return errors
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+
+    def discard_task_rollback_anchors() -> list[str]:
+        return _finish_workspace_rollback_anchors(state, target_tasks, restore=False)
 
     if result.get("status") != "qa_completed":
-        return restore_failed_workaround()
-
+        return restore_failed_workaround() if workaround_attempt else restore_failed_update()
     evaluations = result.get("qa_evaluations") or {}
     update_candidate = (
         bool(target_tasks)
@@ -853,7 +943,7 @@ def _finalize_qa_workspace_snapshot(
     for task in target_tasks:
         evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task.task_id)
         if evaluation is None:
-            return restore_failed_workaround()
+            return restore_failed_workaround() if workaround_attempt else restore_failed_update()
         if not evaluation.passed:
             if workaround_attempt:
                 return restore_failed_workaround()
@@ -862,21 +952,28 @@ def _finalize_qa_workspace_snapshot(
                 evidence and evidence.failed_tests
             )
             if not is_regression:
-                return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+                return restore_failed_update()
             has_regression = True
-
     if update_candidate and has_regression:
-        # The next Supervisor decision may dispatch a workaround child.  The
-        # child will create its own attempt snapshot from this retained
-        # dependency candidate, so its failures can restore to the candidate
-        # rather than to the original vulnerable baseline.
+        # The next Supervisor decision may dispatch a workaround child. The
+        # child creates its own checkpoint from this retained candidate, while
+        # the anchor map continues to point to the first pre-task baseline.
         return []
     if has_regression:
-        # A workaround attempt owns source edits, so even a breaking-change
-        # evaluation must roll back to the candidate that preceded it.
-        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
+        return restore_failed_workaround()
+
+    if workaround_attempt:
+        # The workaround was validated against the live candidate workspace.
+        # Promote that exact cumulative state: the parent dependency update and
+        # the child source edit must remain together for all later tasks. Any
+        # anchor retained before this QA run points at an older workspace and
+        # must not be allowed to restore over the promoted candidate.
+        errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+        errors.extend(_finish_all_workspace_rollback_anchors(state, restore=False))
+        return errors
+
     errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
-    errors.extend(discard_successful_workaround_anchors())
+    errors.extend(discard_task_rollback_anchors())
     return errors
 
 
@@ -886,9 +983,15 @@ def _qa_workspace_rollback_anchor_updates(
     snapshot_id: str | None,
     result: dict[str, Any],
 ) -> dict[str, str]:
-    """Record pre-update snapshots while a regression workaround may follow."""
-    if snapshot_id is None or result.get("status") != "qa_completed":
-        return {}
+    """Project immutable task baselines and remove resolved snapshot IDs.
+    The first regression snapshot becomes the task baseline. Later update
+    retries retain that original ID instead of replacing it with the
+    pre-retry candidate, which previously allowed a failed dependency change
+    to leak into subsequent tasks.
+    """
+    anchors = dict(state.get("workspace_rollback_anchors_by_task", {}) or {})
+    if snapshot_id is None:
+        return anchors
     attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
     snapshots = [
         attempt_snapshots.get(task.current_attempt_id)
@@ -899,22 +1002,52 @@ def _qa_workspace_rollback_anchor_updates(
         not target_tasks
         or len(snapshots) != len(target_tasks)
         or not all(
-            snapshot is not None and snapshot.dispatch_node == "update_subagent"
+            snapshot is not None
+            and snapshot.dispatch_node in {"update_subagent", "workaround_subagent"}
             for snapshot in snapshots
         )
     ):
-        return {}
+        return anchors
+    workaround_attempt = all(
+        snapshot is not None and snapshot.dispatch_node == "workaround_subagent"
+        for snapshot in snapshots
+    )
+    if result.get("status") != "qa_completed":
+        if workaround_attempt:
+            for task in target_tasks:
+                if task.parent_task_id:
+                    anchors.pop(task.parent_task_id, None)
+        return anchors
     evaluations = result.get("qa_evaluations") or {}
+    workaround_passed = workaround_attempt
     for task in target_tasks:
         evaluation = evaluations.get(task.parent_group_id) or evaluations.get(task.task_id)
-        if evaluation is None or evaluation.passed:
+        if evaluation is None:
+            workaround_passed = False
+            continue
+        if workaround_attempt:
+            if not evaluation.passed:
+                workaround_passed = False
+            if task.parent_task_id:
+                anchors.pop(task.parent_task_id, None)
+            continue
+        if evaluation.passed:
+            anchors.pop(task.task_id, None)
             continue
         evidence = evaluation.failure_evidence
         if evaluation.failure_category == FailureCategory.BREAKING_CHANGE or bool(
             evidence and evidence.failed_tests
         ):
-            return {task.task_id: snapshot_id for task in target_tasks}
-    return {}
+            # setdefault makes this an immutable task baseline. The current
+            # failed candidate remains available to a workaround child, but
+            # it is never promoted to the rollback anchor for later retries.
+            anchors.setdefault(task.task_id, snapshot_id)
+    if workaround_passed:
+        # The current workspace is now the authoritative cumulative patch.
+        # Clear the complete projection so an unrelated later failure cannot
+        # restore a stale pre-workaround dependency state.
+        return {}
+    return anchors
 
 
 def _ensure_worker_attempt_results(
@@ -1035,13 +1168,16 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
     try:
         result = run_update_subagent_node(subagent_state)
     except Exception:
-        _finish_workspace_attempt_snapshot(
-            state,
-            workspace_snapshot_id,
-            restore=True,
-        )
+        if _workspace_rollback_anchor_ids(state, target_tasks):
+            _restore_retained_workspace_anchors(state, target_tasks)
+            _finish_workspace_attempt_snapshot(state, workspace_snapshot_id, restore=False)
+        else:
+            _finish_workspace_attempt_snapshot(
+                state,
+                workspace_snapshot_id,
+                restore=True,
+            )
         raise
-
     out: dict[str, Any] = {
         "errors": result.get("errors", []),
     }
@@ -1251,12 +1387,24 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     try:
         result = run_qa_critic_node(scoped_state)
     except Exception:
-        _finish_workspace_attempt_snapshot(
-            state,
-            workspace_snapshot_id,
-            restore=True,
+        snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+        workaround_attempt = bool(target_tasks) and all(
+            (snapshot := snapshots.get(task.current_attempt_id)) is not None
+            and snapshot.dispatch_node == "workaround_subagent"
+            for task in target_tasks
         )
-        _finish_parent_workspace_rollback_anchors(state, target_tasks, restore=True)
+        if workaround_attempt:
+            _finish_workspace_attempt_snapshot(state, workspace_snapshot_id, restore=True)
+            _finish_workspace_rollback_anchors(state, target_tasks, restore=True)
+        elif _workspace_rollback_anchor_ids(state, target_tasks):
+            _restore_retained_workspace_anchors(state, target_tasks)
+            _finish_workspace_attempt_snapshot(state, workspace_snapshot_id, restore=False)
+        else:
+            _finish_workspace_attempt_snapshot(
+                state,
+                workspace_snapshot_id,
+                restore=True,
+            )
         raise
     snapshot_cleanup_errors = _finalize_qa_workspace_snapshot(
         state,
@@ -1379,8 +1527,9 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         out["qa_results_by_attempt"] = qa_results_by_attempt
     if scan_evidence is not None:
         out["scan_evidence_by_task"] = {task_id: scan_evidence for task_id in active_task_ids}
-    if rollback_anchor_updates:
-        out["workspace_rollback_anchors_by_task"] = rollback_anchor_updates
+    # Emit the complete projection so the replace reducer can clear anchors
+    # after a successful update or an abandoned workaround.
+    out["workspace_rollback_anchors_by_task"] = rollback_anchor_updates
     return out
 
 

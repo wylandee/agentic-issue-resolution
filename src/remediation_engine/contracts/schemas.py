@@ -1464,6 +1464,44 @@ class WorkaroundContext(BaseModel):
     )
 
 
+class QACriticLLMOutput(BaseModel):
+    """LLM-owned fields returned by one task-scoped QA evaluator.
+
+    Deterministic gates, scan evidence, failure excerpts, and attempt
+    provenance are attached by Python after this model is validated.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(..., min_length=1)
+    passed: bool
+    failure_category: FailureCategory | None = Field(
+        None,
+        description="Required when passed=False.",
+    )
+    retry_feedback: str | None = Field(
+        None,
+        description="Required retry guidance when passed=False.",
+    )
+    semantic_security_review: QASemanticSecurityReview | None = Field(default=None)
+    test_attribution: QATestAttribution | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _check_pass_fail_payload(self) -> QACriticLLMOutput:
+        """Require the minimum structured decision fields from the evaluator."""
+        if self.passed:
+            if self.failure_category is not None or self.retry_feedback is not None:
+                raise ValueError(
+                    "passed=True requires failure_category=None and retry_feedback=None."
+                )
+            return self
+        if self.failure_category is None:
+            raise ValueError("passed=False requires a non-null failure_category.")
+        if not self.retry_feedback or not self.retry_feedback.strip():
+            raise ValueError("passed=False requires a non-empty retry_feedback.")
+        return self
+
+
 class QAEvaluation(BaseModel):
     """Structured QA Critic verdict for a single remediation task."""
 

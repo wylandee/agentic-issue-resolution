@@ -6,12 +6,99 @@ from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from remediation_engine.contracts.schemas import QACriticLLMOutput
 from remediation_engine.orchestration.subagent_runtime import (
     ToolEvent,
     _validation_gate_recovery_instruction,
     has_successful_validation_gate,
     run_bounded_subagent_loop,
 )
+
+
+def test_structured_terminal_output_is_returned_without_free_text() -> None:
+    """The QA evaluator returns only validated structured data."""
+    terminal_tool = MagicMock()
+    terminal_tool.name = "emit_qa_evaluation"
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.return_value = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": terminal_tool.name,
+                "args": {"task_id": "g1", "passed": True},
+                "id": "final-1",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [terminal_tool],
+        [HumanMessage(content="Review the task.")],
+        set(),
+        structured_output_model=QACriticLLMOutput,
+        structured_output_tool_name=terminal_tool.name,
+    )
+
+    assert isinstance(result.structured_output, QACriticLLMOutput)
+    assert result.structured_output.task_id == "g1"
+    assert result.final_text == ""
+    terminal_tool.invoke.assert_not_called()
+
+
+def test_invalid_structured_terminal_output_is_rejected_and_retried() -> None:
+    """Malformed terminal fields never become a QA verdict."""
+    terminal_tool = MagicMock()
+    terminal_tool.name = "emit_qa_evaluation"
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": terminal_tool.name,
+                    "args": {"task_id": "g1", "passed": False},
+                    "id": "invalid-1",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": terminal_tool.name,
+                    "args": {
+                        "task_id": "g1",
+                        "passed": False,
+                        "failure_category": "breaking_change",
+                        "retry_feedback": "Fix the failing test.",
+                    },
+                    "id": "final-1",
+                }
+            ],
+        ),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [terminal_tool],
+        [HumanMessage(content="Review the task.")],
+        set(),
+        structured_output_model=QACriticLLMOutput,
+        structured_output_tool_name=terminal_tool.name,
+    )
+
+    assert isinstance(result.structured_output, QACriticLLMOutput)
+    assert result.structured_output.failure_category.value == "breaking_change"
+    assert any("validation failed" in error for error in result.errors)
+    assert bound_llm.invoke.call_count == 2
+    terminal_tool.invoke.assert_not_called()
 
 
 def test_repeated_failed_ast_call_injects_recovery_without_terminating() -> None:

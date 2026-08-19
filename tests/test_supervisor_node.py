@@ -275,12 +275,34 @@ class TestDeriveInitialStrategy:
 
 class TestSupervisorRouterFunction:
     def test_valid_next_routing_steps_route_correctly(self):
-        assert supervisor_router({"next_routing_step": "update_subagent"}) == "update_subagent"
+        active_targets = {"active_target_task_ids": ["task-1"]}
         assert (
-            supervisor_router({"next_routing_step": "workaround_subagent"}) == "workaround_subagent"
+            supervisor_router({"next_routing_step": "update_subagent", **active_targets})
+            == "update_subagent"
         )
-        assert supervisor_router({"next_routing_step": "qa_critic"}) == "qa_critic"
+        assert (
+            supervisor_router({"next_routing_step": "workaround_subagent", **active_targets})
+            == "workaround_subagent"
+        )
+        assert (
+            supervisor_router({"next_routing_step": "qa_critic", **active_targets}) == "qa_critic"
+        )
         assert supervisor_router({"next_routing_step": "teardown"}) == "teardown"
+
+    @pytest.mark.parametrize(
+        "step",
+        ["update_subagent", "workaround_subagent", "qa_critic"],
+    )
+    def test_worker_routes_without_active_targets_fail_closed(self, step):
+        assert (
+            supervisor_router(
+                {
+                    "next_routing_step": step,
+                    "task_queue": {"task-1": _make_task("task-1", "g1")},
+                }
+            )
+            == "teardown"
+        )
 
     def test_missing_or_unknown_step_defaults_to_teardown(self):
         assert supervisor_router({}) == "teardown"
@@ -2772,6 +2794,51 @@ class TestBugFixes:
             error.startswith("supervisor: routing fell back to teardown")
             for error in result.get("errors", [])
         )
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_terminal_pivot_child_releases_other_pending_tasks(self, mock_chat):
+        """A terminal pivot child must not starve unrelated pending tasks."""
+        groups = [_sca_group("g1"), _sca_group("g2")]
+        parent_task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        existing_child = _make_task(
+            "task-2",
+            "g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.UNFIXABLE,
+        ).model_copy(update={"parent_task_id": "task-1"})
+        pending_task = _make_task(
+            "task-3",
+            "g2",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.PENDING,
+        )
+        state = _base_state(
+            groups,
+            task_queue={
+                "task-1": parent_task,
+                "task-2": existing_child,
+                "task-3": pending_task,
+            },
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    exhausted_update_path=True,
+                )
+            },
+        )
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-3"]
 
     def test_bug3_reject_workaround_to_workaround_spawn(self):
         parent_task = RemediationTask(
