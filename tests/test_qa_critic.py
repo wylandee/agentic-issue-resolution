@@ -46,6 +46,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     NoFixMitigationStage,
+    QACriticLLMOutput,
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
@@ -1660,11 +1661,12 @@ def _make_minimal_state(
 
 
 def _make_loop_result(
-    final_text="# INVESTIGATIVE REPORT\n## Install Analysis\n- Install Status: succeeded",
+    final_text="",
     tool_events=None,
     errors=None,
+    structured_output=None,
 ):
-    """Build a mock SubagentRuntimeResult."""
+    """Build a mocked SubagentRuntimeResult."""
     from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
 
     return SubagentRuntimeResult(
@@ -1672,8 +1674,8 @@ def _make_loop_result(
         tool_events=tool_events or [],
         changed_files=[],
         errors=errors or [],
+        structured_output=structured_output,
     )
-
 
 def _make_fully_populated_results(ok=True):
     """Build a _QAExecutionResults with all three phases filled in."""
@@ -1710,12 +1712,16 @@ class TestRunQACriticNode:
                 evaluations=[QAEvaluation(task_id=group.group_id, passed=True)],
             )
 
+        evaluations_by_group = {
+            evaluation.task_id: evaluation for evaluation in batch_result.evaluations
+        }
         investigations = {
             group.group_id: GroupInvestigation(
                 group_id=group.group_id,
-                investigation_text="Investigation complete.",
+                investigation_text="",
                 tool_transcript="",
                 errors=[],
+                evaluation=evaluations_by_group.get(group.group_id),
             )
         }
 
@@ -1758,7 +1764,8 @@ class TestRunQACriticNode:
         assert result["status"] == "qa_completed"
         assert group.group_id in result["qa_evaluations"]
         assert result["qa_evaluations"][group.group_id].passed is True
-        assert result["qa_investigation_report"] == "All groups passed."
+        report = json.loads(result["qa_investigation_report"])
+        assert report["evaluations"][group.group_id]["passed"] is True
 
     def test_package_removal_node_skips_only_security_scan(self):
         group = _make_group(fix_plan_status=FixPlanStatus.NO_FIX)
@@ -2671,6 +2678,8 @@ class TestBuildIndividualInvestigatorPrompt:
     def test_instructs_not_to_call_execution_tools(self):
         lower = self._prompt().lower()
         assert "not available to you" in lower or "do not attempt" in lower
+        assert "free-form" in lower
+        assert "emit_qa_evaluation" in lower
 
 
 # ---------------------------------------------------------------------------
@@ -2679,7 +2688,7 @@ class TestBuildIndividualInvestigatorPrompt:
 
 
 class TestRunIndividualInvestigations:
-    def _lr(self, text="investigation complete", errors=None):
+    def _lr(self, text="", errors=None, evaluation=None):
         from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
 
         return SubagentRuntimeResult(
@@ -2687,6 +2696,7 @@ class TestRunIndividualInvestigations:
             tool_events=[],
             changed_files=[],
             errors=errors or [],
+            structured_output=evaluation,
         )
 
     def test_one_investigator_per_group(self):
@@ -2696,7 +2706,10 @@ class TestRunIndividualInvestigations:
             patch("langchain_openai.ChatOpenAI"),
             patch(
                 "remediation_engine.orchestration.qa_critic.run_bounded_subagent_loop",
-                return_value=self._lr(),
+                side_effect=[
+                    self._lr(evaluation=QACriticLLMOutput(task_id="g1", passed=True)),
+                    self._lr(evaluation=QACriticLLMOutput(task_id="g2", passed=True)),
+                ],
             ) as ml,
             patch(
                 "remediation_engine.orchestration.qa_critic.build_qa_review_toolbelt",
@@ -2713,7 +2726,13 @@ class TestRunIndividualInvestigations:
                 results=results,
             )
         assert ml.call_count == 2
+        assert all(
+            call.kwargs["structured_output_model"] is QACriticLLMOutput
+            for call in ml.call_args_list
+        )
         assert "g1" in invs and "g2" in invs
+        assert invs["g1"].evaluation is not None and invs["g1"].evaluation.passed is True
+        assert invs["g2"].evaluation is not None and invs["g2"].evaluation.passed is True
 
     def test_crash_produces_fallback(self):
         group = _make_group(group_id="g1")
@@ -2765,7 +2784,9 @@ class TestRunIndividualInvestigations:
                 results=results,
             )
         assert invs["g1"].errors
-        assert "Fallback" in invs["g1"].investigation_text
+        assert invs["g1"].investigation_text == ""
+        assert invs["g1"].fallback is True
+        assert invs["g1"].evaluation is not None
 
 
 # ---------------------------------------------------------------------------
@@ -3056,13 +3077,29 @@ class TestRunQACriticNodeMapReduce:
     def _run(self, groups, global_results=None, investigations=None, batch_result=None):
         if global_results is None:
             global_results = _make_fully_populated_results(ok=True)
-        if investigations is None:
-            investigations = {g.group_id: GroupInvestigation(g.group_id, "ok", "") for g in groups}
         if batch_result is None:
             batch_result = BatchQAResult(
                 holistic_report="All passed.",
                 evaluations=[QAEvaluation(task_id=g.group_id, passed=True) for g in groups],
             )
+        evaluations_by_group = {
+            evaluation.task_id: evaluation for evaluation in batch_result.evaluations
+        }
+        if investigations is None:
+            investigations = {
+                g.group_id: GroupInvestigation(
+                    g.group_id,
+                    "",
+                    "",
+                    evaluation=evaluations_by_group.get(g.group_id),
+                )
+                for g in groups
+            }
+        else:
+            for group_id, investigation in investigations.items():
+                if investigation.evaluation is None:
+                    investigation.evaluation = evaluations_by_group.get(group_id)
+
         mock_sb = MagicMock()
         mock_sb.__enter__ = MagicMock(return_value=mock_sb)
         mock_sb.__exit__ = MagicMock(return_value=None)
@@ -3102,9 +3139,9 @@ class TestRunQACriticNodeMapReduce:
         _, _, mm, _ = self._run([g1, g2], investigations=invs, batch_result=br)
         mm.assert_called_once()
 
-    def test_batch_judge_called_once(self):
+    def test_batch_judge_is_not_called_for_individual_dispatch(self):
         _, _, _, mr = self._run([_make_group()])
-        mr.assert_called_once()
+        mr.assert_not_called()
 
     def test_holistic_report_in_output(self):
         g = _make_group()
@@ -3113,7 +3150,8 @@ class TestRunQACriticNodeMapReduce:
             evaluations=[QAEvaluation(task_id=g.group_id, passed=True)],
         )
         result, _, _, _ = self._run([g], batch_result=br)
-        assert result["qa_investigation_report"] == "## Holistic."
+        report = json.loads(result["qa_investigation_report"])
+        assert report["evaluations"][g.group_id]["passed"] is True
 
     def test_all_passed_status(self):
         g1, g2 = _make_group("g1"), _make_group("g2")

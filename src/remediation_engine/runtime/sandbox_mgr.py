@@ -36,6 +36,7 @@ _SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
 _WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
 _WORKSPACE_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS = 900
+_WORKSPACE_SNAPSHOT_VALIDATION_TIMEOUT_SECONDS = 60
 
 
 def _workspace_snapshot_archive(snapshot_id: str) -> str:
@@ -425,6 +426,15 @@ class DockerSandbox:
                 f"Workspace snapshot creation failed for {snapshot_id}: "
                 f"{result.stderr or result.stdout or 'unknown error'}"
             )
+        validation = self.run(
+            f"test -s {quoted_archive} && tar -tzf {quoted_archive} >/dev/null",
+            timeout=_WORKSPACE_SNAPSHOT_VALIDATION_TIMEOUT_SECONDS,
+        )
+        if validation.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot creation produced an invalid archive for {snapshot_id}: "
+                f"{validation.stderr or validation.stdout or 'archive is missing or unreadable'}"
+            )
         logger.info("DockerSandbox: created workspace snapshot %s.", snapshot_id)
 
     @traceable(run_type="tool", name="docker_sandbox.restore_workspace_snapshot")
@@ -453,18 +463,36 @@ class DockerSandbox:
             raise RuntimeError("Sandbox is not running.")
 
         quoted_archive = shlex.quote(archive_path)
-        command = (
-            f"test -f {quoted_archive} && "
+        validation = self.run(
+            f"test -s {quoted_archive} && tar -tzf {quoted_archive} >/dev/null",
+            timeout=_WORKSPACE_SNAPSHOT_VALIDATION_TIMEOUT_SECONDS,
+        )
+        if validation.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot restore failed for {snapshot_id} before workspace cleanup: "
+                f"{validation.stderr or validation.stdout or 'snapshot archive is missing or unreadable'}"
+            )
+
+        cleanup = self.run(
             "find /workspace -mindepth 1 -maxdepth 1 "
             f"! -name {shlex.quote(_WORKSPACE_SNAPSHOT_DIR)} "
-            "-exec rm -rf -- {} + && "
-            f"tar -xzf {quoted_archive} -C /workspace"
+            "-exec rm -rf -- {} +",
+            timeout=_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS,
         )
-        result = self.run(command, timeout=_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS)
-        if result.exit_code != 0:
+        if cleanup.exit_code != 0:
             raise RuntimeError(
-                f"Workspace snapshot restore failed for {snapshot_id}: "
-                f"{result.stderr or result.stdout or 'unknown error'}"
+                f"Workspace snapshot restore failed for {snapshot_id} while clearing the workspace: "
+                f"{cleanup.stderr or cleanup.stdout or 'unknown error'}"
+            )
+
+        extraction = self.run(
+            f"tar -xzf {quoted_archive} -C /workspace",
+            timeout=_WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS,
+        )
+        if extraction.exit_code != 0:
+            raise RuntimeError(
+                f"Workspace snapshot restore failed for {snapshot_id} while extracting the archive: "
+                f"{extraction.stderr or extraction.stdout or 'unknown error'}"
             )
         logger.info("DockerSandbox: restored workspace snapshot %s.", snapshot_id)
 

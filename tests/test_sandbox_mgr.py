@@ -257,11 +257,59 @@ class TestSandboxWorkspaceSnapshots:
             in (commands[0])
         )
         assert (
-            "tar -xzf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            "test -s /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
             in (commands[1])
         )
-        assert "rm -rf -- /workspace/.remedy-attempt-snapshots/attempt-123" in commands[2]
-        assert "rm -rf -- /workspace/.remedy-attempt-snapshots" in commands[3]
+        assert (
+            "test -s /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[2])
+        )
+        assert "find /workspace -mindepth 1 -maxdepth 1" in commands[3]
+        assert (
+            "tar -xzf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[4])
+        )
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots/attempt-123" in commands[5]
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots" in commands[6]
+
+    def test_snapshot_creation_rejects_invalid_archive(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (1, (b"", b"archive missing")),
+        ]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="invalid archive"):
+            sandbox.create_workspace_snapshot("attempt-invalid")
+
+        assert container.exec_run.call_count == 2
+
+    def test_snapshot_restore_rejects_missing_archive_before_cleanup(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [(1, (b"", b""))]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="before workspace cleanup"):
+            sandbox.restore_workspace_snapshot("attempt-missing")
+
+        assert container.exec_run.call_count == 1
+        command = container.exec_run.call_args.args[0][2]
+        assert "test -s /workspace/.remedy-attempt-snapshots/attempt-missing" in command
+
+    def test_snapshot_restore_reports_extraction_failure(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (0, (b"", b"")),
+            (2, (b"", b"tar: invalid archive")),
+        ]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="while extracting the archive"):
+            sandbox.restore_workspace_snapshot("attempt-corrupt")
+
+        assert container.exec_run.call_count == 3
 
     def test_snapshot_ids_are_path_safe(self, tmp_path):
         _docker_mod, _docker_errors, client, container = _docker_modules()

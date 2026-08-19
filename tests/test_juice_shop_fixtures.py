@@ -66,6 +66,12 @@ class _FakeResult:
             "examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json",
             None,
         ),
+        (
+            "retriage",
+            "examples/juice_shop/fixtures/retriage/run_retriage.py",
+            "examples/juice_shop/fixtures/retriage/triaged_groups_retriage.json",
+            "load_retriage_groups",
+        ),
     ],
 )
 def test_pretriaged_runner_passes_group_issues_as_baseline(

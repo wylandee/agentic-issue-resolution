@@ -115,6 +115,7 @@ _VALID_NEXT_NODES: set[str] = {
     "final_full_scan",
     "teardown",
 }
+_WORKER_NODES = frozenset({"update_subagent", "workaround_subagent", "qa_critic"})
 _DEFAULT_MODEL = "gpt-4o-mini"
 
 # Keep planner stage parsing and validation centralized.  The router prompt
@@ -264,6 +265,30 @@ def _is_exhausted_update_pivot_candidate(
                 and (diagnostics.package_abandoned or diagnostics.exhausted_update_path)
             )
         )
+    )
+
+
+def _has_existing_workaround_child(
+    task: RemediationTask,
+    task_queue: dict[str, RemediationTask],
+) -> bool:
+    """Return whether a task already owns a code-workaround child.
+
+    A replayed strategy-pivot request must not be treated as a fresh update
+    pivot. The existing child is either the next dispatchable workaround or
+    terminal evidence that the parent lifecycle has already ended.
+
+    Args:
+        task: Candidate parent task.
+        task_queue: Current copy-on-write task queue.
+
+    Returns:
+        True when a code-workaround child references task.
+    """
+    return any(
+        candidate.parent_task_id == task.task_id
+        and candidate.strategy == RoutingStrategy.CODE_WORKAROUND
+        for candidate in task_queue.values()
     )
 
 
@@ -2369,6 +2394,63 @@ def _terminalize_pivot_parents(
                 )
 
 
+def _reconcile_terminal_pivot_parents(
+    task_queue: dict[str, RemediationTask],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    group_by_id: dict[str, VulnerabilityGroup],
+) -> list[str]:
+    """Terminalize non-terminal update parents whose workaround child is terminal.
+
+    Args:
+        task_queue: Copy-on-write task queue to mutate.
+        qa_evaluations: QA evidence used to classify the parent transition.
+        retry_diagnostics_by_task: Retry diagnostics to keep aligned with the
+            parent transition.
+        retry_plans_by_task: Retry plans to clear for terminalized parents.
+        group_by_id: Vulnerability groups used to rebuild parent instructions.
+
+    Returns:
+        Task IDs of parents terminalized during this reconciliation.
+
+    Mutations:
+        Closes any live parent attempt, clears dispatch-only fields, and
+        removes retry plans through _terminalize_pivot_parents.
+    """
+    parent_ids: list[str] = []
+    for child in task_queue.values():
+        if (
+            child.parent_task_id is None
+            or child.strategy != RoutingStrategy.CODE_WORKAROUND
+            or child.status not in _TERMINAL_STATUSES
+        ):
+            continue
+        parent = task_queue.get(child.parent_task_id)
+        if (
+            parent is None
+            or parent.status in _TERMINAL_STATUSES
+            or parent.strategy != RoutingStrategy.VERSION_BUMP
+        ):
+            continue
+        parent_ids.append(parent.task_id)
+
+    parent_ids = sorted(set(parent_ids))
+    if not parent_ids:
+        return []
+
+    _terminalize_pivot_parents(
+        task_queue,
+        parent_ids,
+        {parent_id: RoutingStrategy.CODE_WORKAROUND for parent_id in parent_ids},
+        qa_evaluations,
+        retry_diagnostics_by_task=retry_diagnostics_by_task,
+        retry_plans_by_task=retry_plans_by_task,
+        group_by_id=group_by_id,
+    )
+    return parent_ids
+
+
 # ---------------------------------------------------------------------------
 # Deterministic fallback router
 # ---------------------------------------------------------------------------
@@ -2527,6 +2609,7 @@ def _deterministic_routing(
                 task,
                 retry_diagnostics_by_task.get(task.task_id),
             )
+            and not _has_existing_workaround_child(task, task_queue)
         ],
         key=lambda task: _task_sort_key(task, group_by_id),
     )
@@ -2573,7 +2656,9 @@ def _deterministic_routing(
         [
             t
             for t in workable
-            if t.strategy == RoutingStrategy.VERSION_BUMP and t.status == TaskStatus.NEEDS_RETRY
+            if t.strategy == RoutingStrategy.VERSION_BUMP
+            and t.status == TaskStatus.NEEDS_RETRY
+            and not _has_existing_workaround_child(t, task_queue)
         ],
         key=lambda task: _task_sort_key(task, group_by_id),
     )
@@ -2610,7 +2695,9 @@ def _deterministic_routing(
         [
             t
             for t in workable
-            if t.strategy == RoutingStrategy.VERSION_BUMP and t.status != TaskStatus.NEEDS_RETRY
+            if t.strategy == RoutingStrategy.VERSION_BUMP
+            and t.status != TaskStatus.NEEDS_RETRY
+            and not _has_existing_workaround_child(t, task_queue)
         ],
         key=lambda task: _task_sort_key(task, group_by_id),
     )
@@ -2787,6 +2874,7 @@ def _calculate_eligible_actions(
         task
         for task in workable
         if _is_exhausted_update_pivot_candidate(task, retry_diagnostics_by_task.get(task.task_id))
+        and not _has_existing_workaround_child(task, task_queue)
     ]
     retries = [
         task
@@ -2794,11 +2882,14 @@ def _calculate_eligible_actions(
         if task.strategy == RoutingStrategy.VERSION_BUMP
         and task.status == TaskStatus.NEEDS_RETRY
         and task not in exhausted
+        and not _has_existing_workaround_child(task, task_queue)
     ]
     pending_updates = [
         task
         for task in workable
-        if task.strategy == RoutingStrategy.VERSION_BUMP and task.status == TaskStatus.PENDING
+        if task.strategy == RoutingStrategy.VERSION_BUMP
+        and task.status == TaskStatus.PENDING
+        and not _has_existing_workaround_child(task, task_queue)
     ]
     workarounds = [
         task
@@ -3868,9 +3959,7 @@ def _materialize_spawn_requests(
                 continue
             gates = parent_eval.deterministic_gates if parent_eval is not None else None
             scanner_cleared = bool(gates and gates.target_scanner_cleared is True)
-            hard_test_failure = bool(
-                gates and gates.tests_passed is False
-            ) or bool(
+            hard_test_failure = bool(gates and gates.tests_passed is False) or bool(
                 parent_eval and parent_eval.failure_category == FailureCategory.BREAKING_CHANGE
             )
             child_policy = (
@@ -4837,6 +4926,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             )
 
     # ------------------------------------------------------------------
+    # 4.5. Reconcile terminal workaround children before routing.
+    # ------------------------------------------------------------------
+    stale_pivot_parent_ids = _reconcile_terminal_pivot_parents(
+        task_queue,
+        qa_evaluations,
+        retry_diagnostics_by_task,
+        retry_plans_by_task,
+        group_by_id,
+    )
+    if stale_pivot_parent_ids:
+        errors.append(
+            "supervisor: terminalized stale pivot parent task(s) after their "
+            "workaround child reached a terminal state: "
+            f"{stale_pivot_parent_ids}."
+        )
     # 5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic
     # ------------------------------------------------------------------
     decision: SupervisorDecision | None = None
@@ -5927,6 +6031,56 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             if task_id in set(resolved_target_task_ids)
         }
 
+    if resolved_next_node in _WORKER_NODES and not resolved_target_task_ids:
+        stalled_task_ids = [
+            task_id for task_id, task in task_queue.items() if task.status not in _TERMINAL_STATUSES
+        ]
+        for task_id in stalled_task_ids:
+            task = task_queue[task_id]
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={"status": TaskStatus.UNFIXABLE},
+                close_attempt=task.current_attempt_id is not None,
+                clear_selected_version=task.selected_version is not None,
+            )
+        errors.append(
+            "supervisor: fail-closed an empty worker route; no dispatchable "
+            f"target remained. Marked unresolved tasks unfixable: {stalled_task_ids}."
+        )
+
+        terminal_workspace = (
+            bool(task_queue)
+            and bool(state.get("workspace_volume"))
+            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
+            and not state.get("final_full_scan_completed", False)
+        )
+        if terminal_workspace:
+            resolved_next_node = "final_full_scan"
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
+                next_node=resolved_next_node,
+                target_task_ids=[],
+                instructions="Run the authoritative full Dependency-Check scan before teardown.",
+                decision_reason=(
+                    "All tasks were terminalized after the Supervisor found no "
+                    "dispatchable worker target."
+                ),
+            )
+        else:
+            resolved_next_node = "teardown"
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
+                next_node=resolved_next_node,
+                target_task_ids=[],
+                instructions="No dispatchable tasks remain; proceed to teardown.",
+                decision_reason=(
+                    "The Supervisor fail-closed after a worker route had no dispatchable target."
+                ),
+            )
+        resolved_target_task_ids = []
+        remapped_feedback_by_task = {}
+
     # Commit the exact input snapshot before exposing worker targets to the
     # graph. QA reuses the current worker attempt; update/workaround dispatches
     # always receive a new attempt identity.
@@ -6128,6 +6282,19 @@ def supervisor_router(state: OrchestratorState) -> str:
         if not terminal_workspace:
             logger.warning("supervisor_router: rejecting premature final_full_scan route.")
             step = ""
+    if step in _WORKER_NODES and task_queue and not state.get("active_target_task_ids"):
+        logger.error(
+            "supervisor_router: refusing worker route '%s' without active targets; "
+            "failing closed to teardown.",
+            step,
+        )
+        terminal_workspace = (
+            bool(task_queue)
+            and bool(state.get("workspace_volume"))
+            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
+            and not state.get("final_full_scan_completed", False)
+        )
+        return "final_full_scan" if terminal_workspace else "teardown"
     if step in _VALID_NEXT_NODES:
         return step
     logger.error("supervisor_router: invalid next_routing_step '%s' - recomputing.", step)

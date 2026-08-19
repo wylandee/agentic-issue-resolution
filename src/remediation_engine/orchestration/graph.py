@@ -678,25 +678,34 @@ def _finish_workspace_attempt_snapshot(
     *,
     restore: bool,
 ) -> list[str]:
-    """Restore or delete a worker snapshot and always attempt cleanup."""
+    """Restore or delete a worker snapshot while preserving failed restores.
+
+    A successful restore is followed by snapshot deletion. If restoration
+    fails, the archive is retained for teardown diagnostics and recovery
+    instead of being deleted by the cleanup path that reports the failure.
+    """
     workspace_volume = state.get("workspace_volume")
     if not workspace_volume or snapshot_id is None:
         return []
 
     errors: list[str] = []
+    restore_succeeded = not restore
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            try:
-                if restore:
-                    sandbox.restore_workspace_snapshot(snapshot_id)
-            finally:
-                # Do not leave a failed restore archive in the shared volume;
-                # teardown also performs a final best-effort sweep.
+            if restore:
+                sandbox.restore_workspace_snapshot(snapshot_id)
+                restore_succeeded = True
+            if restore_succeeded:
                 sandbox.remove_workspace_snapshot(snapshot_id)
     except Exception as exc:  # noqa: BLE001 - preserve the original attempt outcome
-        action = "restore" if restore else "remove"
+        action = "remove" if restore_succeeded else "restore"
         message = f"graph: could not {action} workspace snapshot {snapshot_id}: {exc}"
         log.exception("Workspace snapshot %s failed for %s.", action, snapshot_id)
+        if restore and not restore_succeeded:
+            log.warning(
+                "Workspace snapshot %s retained after failed restore for teardown cleanup.",
+                snapshot_id,
+            )
         errors.append(message)
     return errors
 

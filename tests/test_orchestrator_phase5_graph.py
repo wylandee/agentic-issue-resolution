@@ -34,6 +34,7 @@ from remediation_engine.orchestration import (
     run_orchestrator,
 )
 from remediation_engine.orchestration.graph import (
+    _finish_workspace_attempt_snapshot,
     route_after_workspace_builder,
     run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
@@ -530,6 +531,28 @@ class TestPhase5GraphIntegration:
         sandbox.restore_workspace_snapshot.assert_called_once_with("attempt-attempt-update")
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-update")
         assert "validation failed" in result["errors"]
+
+    def test_failed_restore_retains_attempt_snapshot_for_teardown(self, tmp_path):
+        state = _initial_state(tmp_path, [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+        sandbox.restore_workspace_snapshot.side_effect = RuntimeError("archive missing")
+
+        with patch(
+            "remediation_engine.orchestration.graph.DockerSandbox",
+            return_value=sandbox,
+        ):
+            errors = _finish_workspace_attempt_snapshot(
+                state,
+                "attempt-missing",
+                restore=True,
+            )
+
+        sandbox.remove_workspace_snapshot.assert_not_called()
+        assert errors == [
+            "graph: could not restore workspace snapshot attempt-missing: archive missing"
+        ]
 
     def test_successful_worker_keeps_snapshot_until_qa_accepts_candidate(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
