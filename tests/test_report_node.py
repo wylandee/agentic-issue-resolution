@@ -172,3 +172,104 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
     assert result["report_status"] == "rendered"
     assert result["report_path"] is None
     assert result["report_error"] is None
+
+
+def test_report_separates_targeted_success_from_new_scan_findings_and_qa_records():
+    """The overview distinguishes target QA coverage from post-scan security status."""
+    state = _state()
+    state["initial_valid_groups"] = [
+        state["initial_valid_groups"][0],
+        {
+            "group_id": "group-2",
+            "vulnerable_component": "got",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "medium", "source": "odc"}],
+            "fix_plan": {"status": "version_found"},
+        },
+    ]
+    state["task_queue"]["task-2"] = {
+        "task_id": "task-2",
+        "parent_group_id": "group-2",
+        "parent_task_id": None,
+        "strategy": "VERSION_BUMP",
+        "instruction": "Update got.",
+        "status": "qa_passed",
+    }
+    state["qa_evaluations"] = {"task-1": {"task_id": "task-1", "passed": True}}
+    state["post_remediation_scan_issues"] = [
+        {
+            "cve_id": "CVE-2026-0001",
+            "ghsa_id": "GHSA-AAAA-BBBB-CCCC",
+            "package_name": "new-package",
+            "source": "odc",
+            "file_path": "package-lock.json",
+            "severity": "high",
+        },
+        {
+            "cve_id": "CVE-2026-0002",
+            "package_name": "another-package",
+            "source": "odc",
+            "file_path": "package-lock.json",
+            "severity": "low",
+        },
+    ]
+    state["post_remediation_scan_identifiers"] = [
+        "CVE-2026-0001",
+        "GHSA-AAAA-BBBB-CCCC",
+        "CVE-2026-0002",
+    ]
+    state["new_vulnerability_identifiers"] = list(state["post_remediation_scan_identifiers"])
+    state["new_vulnerability_status"] = "detected"
+
+    report = generate_report(state)
+
+    assert "Completed with new findings (completed)" in report
+    assert "Overall outcome: **Completed with new findings**" in report
+    assert "2 passed / 2 targeted groups" in report
+    assert "1 records retained" in report
+    assert "2 findings" in report
+    assert "3 unique identifiers" in report
+    assert "### Newly Detected Findings" in report
+    assert "CVE-2026-0001, GHSA-AAAA-BBBB-CCCC" in report
+    assert "Overall outcome: **Successful**" not in report
+
+
+def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
+    """Package output lists direct changes and summarizes transitive lockfile churn."""
+    state = _state()
+    state["diff"] = (
+        "--- a/package.json\n"
+        "+++ b/package.json\n"
+        "@@\n"
+        '  "dependencies": {\n'
+        '-    "lodash": "4.17.15"\n'
+        '+    "lodash": "4.17.21"\n'
+        "  },\n"
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@\n"
+        '  "node_modules/lodash": {\n'
+        '-    "version": "4.17.15",\n'
+        '+    "version": "4.17.21",\n'
+        '     "engines": {\n'
+        '-      "node": ">=4"\n'
+        '+      "node": ">=10"\n'
+        "     },\n"
+        '  "node_modules/transitive-package": {\n'
+        '-    "version": "1.0.0",\n'
+        '+    "version": "2.0.0",\n'
+        '     "deprecated": "old package"\n'
+    )
+
+    report = generate_report(state)
+
+    assert "#### Direct Manifest Changes" in report
+    assert "lodash" in report
+    assert "4.17.15" in report
+    assert "4.17.21" in report
+    assert "1 transitive lockfile package entries changed" in report
+    assert "engines" not in report
+    assert "deprecated" not in report
+    assert "transitive-package" not in report

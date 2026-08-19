@@ -31,14 +31,43 @@ _PACKAGE_FILE_RE = re.compile(
     r"(?:^|/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml)$",
     re.IGNORECASE,
 )
-_PACKAGE_LINE_RE = re.compile(
-    r'^\s*[+-]\s*"(?P<name>(?:@[^" ]+/)?[^" ]+)"\s*:\s*"(?P<version>[^"\n]+)"'
-)
-_LOCKFILE_PACKAGE_RE = re.compile(
-    r'^\s*[ +-]*"(?:node_modules/)?(?P<name>(?:@[^" ]+/)?[^" ]+)"\s*:\s*\{'
+_PACKAGE_LINE_RE = re.compile(r'^\s*"(?P<name>(?:@[^" ]+/)?[^" ]+)"\s*:\s*"(?P<version>[^"\n]+)"')
+_LOCKFILE_PACKAGE_RE = re.compile(r'^\s*"(?P<name>(?:node_modules/)?(?:@[^" ]+/)?[^" ]+)"\s*:\s*\{')
+_MANIFEST_SECTION_RE = re.compile(
+    r'^\s*"(?P<section>dependencies|devDependencies|optionalDependencies|'
+    r'peerDependencies|overrides|resolutions)"\s*:\s*\{'
 )
 _NON_PACKAGE_KEYS = {
+    "author",
+    "bin",
+    "browser",
+    "bundleDependencies",
+    "bundled",
+    "contributors",
+    "cpu",
+    "description",
     "name",
+    "deprecated",
+    "directories",
+    "engines",
+    "engineStrict",
+    "files",
+    "funding",
+    "hasInstallScript",
+    "homepage",
+    "keywords",
+    "license",
+    "main",
+    "man",
+    "module",
+    "node",
+    "optional",
+    "os",
+    "peer",
+    "peerDependenciesMeta",
+    "publishConfig",
+    "readme",
+    "repository",
     "version",
     "lockfileVersion",
     "requires",
@@ -48,6 +77,13 @@ _NON_PACKAGE_KEYS = {
     "devDependencies",
     "peerDependencies",
     "optionalDependencies",
+    "packages",
+    "snapshots",
+    "scripts",
+    "sideEffects",
+    "type",
+    "types",
+    "workspaces",
 }
 
 
@@ -65,6 +101,9 @@ class _ReportContext:
     total_tokens: int | None
     status: str
     overall_label: str
+    targeted_qa_total: int
+    targeted_qa_passed: int
+    recorded_qa_total: int
     has_patch: bool
     original_scanner_findings: int
     actionable_groups: int
@@ -91,12 +130,25 @@ class _ReportContext:
     retry_diagnostics: dict[str, Any]
     final_full_scan_result: Any
     post_remediation_scan_issues: list[Any]
+    post_remediation_scan_identifiers: list[str]
     new_vulnerability_identifiers: list[str]
+    new_vulnerability_status: str
     diff: str
     changed_files: list[str]
     trajectory_path: str | None
     langsmith_trace_url: str | None
     executive_narrative: str | None = None
+
+
+@dataclass(frozen=True)
+class _PackageChange:
+    """One direct or lockfile package version change extracted from a diff."""
+
+    name: str
+    old: str
+    new: str
+    file: str
+    scope: str
 
 
 def _value(item: Any, key: str, default: Any = None) -> Any:
@@ -210,19 +262,32 @@ def _group_status(task_queue: Mapping[str, Any], group_id: str) -> str:
     return "pending"
 
 
-def _overall_label(status: str, counts: Mapping[str, int]) -> str:
-    """Map machine status and group counts to a reader-facing outcome label."""
+def _overall_label(
+    status: str,
+    counts: Mapping[str, int],
+    new_vulnerability_status: str,
+    new_identifier_count: int,
+) -> str:
+    """Map run state and post-scan evidence to a reader-facing outcome label."""
     if status in {"failed", "error"}:
-        return "Failed"
-    if status == "completed_with_errors":
-        return "Completed with errors"
-    if counts.get("unresolved", 0):
-        return "Partial"
-    if counts.get("inconclusive", 0):
-        return "Inconclusive"
-    if status in {"completed", "triage_completed_no_work"}:
-        return "Successful"
-    return "Inconclusive"
+        base = "Failed"
+    elif status == "completed_with_errors":
+        base = "Completed with errors"
+    elif counts.get("unresolved", 0):
+        base = "Partial"
+    elif counts.get("inconclusive", 0):
+        base = "Inconclusive"
+    elif status in {"completed", "triage_completed_no_work"}:
+        base = "Successful"
+    else:
+        base = "Inconclusive"
+
+    if new_vulnerability_status == "detected" or new_identifier_count:
+        if base == "Successful":
+            return "Completed with new findings"
+        if base not in {"Failed", "Completed with errors"}:
+            return f"{base}; new findings detected"
+    return base
 
 
 def _extract_token_summary(recorder: TrajectoryRecorder | None) -> dict[str, Any]:
@@ -261,6 +326,53 @@ def _error_strings(state: Mapping[str, Any]) -> list[str]:
     return result
 
 
+def _unique_texts(values: Sequence[Any]) -> list[str]:
+    """Return non-empty text values once, preserving their first-seen order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _text(value).strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def _qa_record_summary(
+    qa_evaluations: Mapping[str, Any],
+    qa_results_by_attempt: Mapping[str, Any],
+) -> int:
+    """Count distinct recorded QA verdicts.
+
+    Attempt envelopes are preferred because they are task-keyed and preserve
+    provenance. The legacy evaluation map is used as a fallback for callers
+    that construct state without attempt envelopes.
+    """
+    records: dict[str, Any] = {}
+    for result in qa_results_by_attempt.values():
+        evaluation = _value(result, "evaluation")
+        identifier = _text(_value(result, "task_id")) or _text(_value(evaluation, "task_id"))
+        if identifier and evaluation is not None:
+            records[identifier] = evaluation
+    for key, evaluation in qa_evaluations.items():
+        identifier = _text(_value(evaluation, "task_id"), str(key))
+        if identifier and evaluation is not None:
+            records.setdefault(identifier, evaluation)
+    return len(records)
+
+
+def _issue_identifiers(issue: Any) -> list[str]:
+    """Return scanner-facing identifiers for one typed vulnerability issue."""
+    return _unique_texts(
+        [
+            _value(issue, "cve_id"),
+            _value(issue, "ghsa_id"),
+            _value(issue, "rule_id"),
+            _value(issue, "finding_id"),
+        ]
+    )
+
+
 def _build_context(
     state: Mapping[str, Any],
     *,
@@ -296,15 +408,19 @@ def _build_context(
         "pending": status_counts.get("pending", 0) + status_counts.get("optimistically_fixed", 0),
     }
     reconciliation = _mapping(state.get("triage_reconciliation"))
-    added_ids = _items(
-        reconciliation.get("added")
-        if "added" in reconciliation
-        else reconciliation.get("new_group_ids")
+    added_ids = _unique_texts(
+        _items(
+            reconciliation.get("added")
+            if "added" in reconciliation
+            else reconciliation.get("new_group_ids")
+        )
     )
-    reappeared_ids = _items(
-        reconciliation.get("reappeared")
-        if "reappeared" in reconciliation
-        else reconciliation.get("reappeared_group_ids")
+    reappeared_ids = _unique_texts(
+        _items(
+            reconciliation.get("reappeared")
+            if "reappeared" in reconciliation
+            else reconciliation.get("reappeared_group_ids")
+        )
     )
     ended = _iso(run_ended_at)
     started = _iso(state.get("run_started_at"))
@@ -313,6 +429,26 @@ def _build_context(
     issues = _items(state.get("issues"))
     if not issues:
         issues = [issue for group in initial_groups for issue in _items(_value(group, "issues"))]
+    final_scan = state.get("final_full_scan_result")
+    post_scan_issues = _items(state.get("post_remediation_scan_issues"))
+    if not post_scan_issues:
+        post_scan_issues = _items(_value(final_scan, "found_issues"))
+    post_scan_identifiers = _unique_texts(
+        _items(state.get("post_remediation_scan_identifiers"))
+        or _items(_value(final_scan, "found_identifiers"))
+        or [identifier for issue in post_scan_issues for identifier in _issue_identifiers(issue)]
+    )
+    new_identifiers = _unique_texts(
+        _items(state.get("new_vulnerability_identifiers"))
+        or _items(_value(final_scan, "new_identifiers"))
+    )
+    new_status = _text(
+        state.get("new_vulnerability_status") or _value(final_scan, "status"),
+        "not_scanned",
+    )
+    qa_evaluations = _mapping(state.get("qa_evaluations"))
+    qa_results = _mapping(state.get("qa_results_by_attempt"))
+    recorded_qa_total = _qa_record_summary(qa_evaluations, qa_results)
     return _ReportContext(
         run_id=_text(state.get("run_id") or state.get("langsmith_run_id"), "local-run"),
         repo_root=_text(state.get("repo_root")),
@@ -323,7 +459,13 @@ def _build_context(
         total_output_tokens=tokens.get("output_tokens"),
         total_tokens=tokens.get("total_tokens"),
         status=status,
-        overall_label=_overall_label(status, counts),
+        overall_label=_overall_label(status, counts, new_status, len(new_identifiers)),
+        targeted_qa_total=len(initial_groups),
+        targeted_qa_passed=sum(
+            statuses.get(_text(_value(group, "group_id")), "pending") == "qa_passed"
+            for group in initial_groups
+        ),
+        recorded_qa_total=recorded_qa_total,
         has_patch=bool(_text(state.get("diff"))),
         original_scanner_findings=len(issues),
         actionable_groups=len(initial_groups),
@@ -342,17 +484,17 @@ def _build_context(
         triage_reconciliation=reconciliation,
         group_strategies=_mapping(state.get("group_strategies")),
         retry_plans=_mapping(state.get("retry_plans_by_task")),
-        qa_evaluations=_mapping(state.get("qa_evaluations")),
+        qa_evaluations=qa_evaluations,
         group_statuses=statuses,
         worker_results=_mapping(state.get("worker_results_by_attempt")),
-        qa_results=_mapping(state.get("qa_results_by_attempt")),
+        qa_results=qa_results,
         attempt_snapshots=_mapping(state.get("attempt_snapshots_by_id")),
         retry_diagnostics=_mapping(state.get("retry_diagnostics_by_task")),
-        final_full_scan_result=state.get("final_full_scan_result"),
-        post_remediation_scan_issues=_items(state.get("post_remediation_scan_issues")),
-        new_vulnerability_identifiers=[
-            _text(item) for item in _items(state.get("new_vulnerability_identifiers"))
-        ],
+        final_full_scan_result=final_scan,
+        post_remediation_scan_issues=post_scan_issues,
+        post_remediation_scan_identifiers=post_scan_identifiers,
+        new_vulnerability_identifiers=new_identifiers,
+        new_vulnerability_status=new_status,
         diff=_text(state.get("diff")),
         changed_files=[_text(item) for item in _items(state.get("changed_files"))],
         trajectory_path=trajectory_path or _text(state.get("trajectory_path")) or None,
@@ -458,51 +600,189 @@ def _validation_for_group(context: _ReportContext, group_id: str) -> str:
     }.get(status, "Not evaluated")
 
 
-def _package_changes(diff: str) -> list[tuple[str, str, str, str]]:
-    """Extract manifest/lockfile package version changes from a unified diff."""
-    changes: dict[str, dict[str, str]] = {}
+def _diff_content(line: str) -> str:
+    """Remove the unified-diff prefix from one line."""
+    return line[1:] if line[:1] in {"+", "-", " "} else line
+
+
+def _line_indent(line: str) -> int:
+    """Return the leading-space count for diff content."""
+    return len(line) - len(line.lstrip())
+
+
+def _record_package_change(
+    records: dict[str, dict[str, str]],
+    name: str,
+    version: str,
+    prefix: str,
+    file_path: str,
+) -> None:
+    """Record one added or removed package version from a diff line."""
+    if name in _NON_PACKAGE_KEYS:
+        return
+    record = records.setdefault(name, {"old": "", "new": "", "file": file_path})
+    if prefix == "+":
+        record["new"] = version
+    elif prefix == "-":
+        record["old"] = version
+
+
+def _package_change_kind(change: _PackageChange) -> str:
+    """Classify a package change for compact report summaries."""
+    if change.old and change.new and change.old != change.new:
+        return "changed"
+    if change.new and not change.old:
+        return "added"
+    if change.old and not change.new:
+        return "removed"
+    return "unchanged"
+
+
+def _package_changes(diff: str) -> list[_PackageChange]:
+    """Extract direct manifest changes and classified lockfile changes.
+
+    Only dependency-section entries from ``package.json`` are considered
+    direct changes. Lockfiles contribute only package ``version`` fields under
+    package entries; metadata such as ``engines.node`` or ``deprecated`` is
+    deliberately excluded.
+    """
+    manifest_records: dict[str, dict[str, str]] = {}
+    lockfile_records: dict[str, dict[str, str]] = {}
     current_file = ""
-    lockfile_package = ""
+    manifest_section_indent: int | None = None
+    lockfile_package: tuple[str, int] | None = None
+
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current_file = line[6:].strip()
-            lockfile_package = ""
+            manifest_section_indent = None
+            lockfile_package = None
             continue
-        if line.startswith("--- a/"):
+        if line.startswith("--- a/") or not _PACKAGE_FILE_RE.search(current_file):
             continue
-        if not _PACKAGE_FILE_RE.search(current_file):
-            continue
-        package_match = _LOCKFILE_PACKAGE_RE.match(line)
-        if package_match and "lock" in current_file.lower():
-            lockfile_package = package_match.group("name")
-        match = _PACKAGE_LINE_RE.match(line)
-        if not match or line.startswith("+++") or line.startswith("---"):
-            continue
-        name = match.group("name")
-        version = match.group("version")
-        if name in _NON_PACKAGE_KEYS:
-            if name != "version" or not lockfile_package:
+        prefix = line[:1]
+        content = _diff_content(line)
+        indent = _line_indent(content)
+
+        if current_file.lower().endswith("package.json") and not current_file.lower().endswith(
+            "package-lock.json"
+        ):
+            section_match = _MANIFEST_SECTION_RE.match(content)
+            if section_match:
+                manifest_section_indent = indent
                 continue
-            name = lockfile_package
-        record = changes.setdefault(name, {"old": "", "new": "", "file": current_file})
-        if line.startswith("+"):
-            record["new"] = version
-        else:
-            record["old"] = version
-    rows: list[tuple[str, str, str, str]] = []
-    for name in sorted(changes):
-        record = changes[name]
-        old, new = record["old"], record["new"]
-        if old and new and old != new:
-            change = "changed"
-        elif new and not old:
-            change = "added"
-        elif old and not new:
-            change = "removed"
-        else:
+            if manifest_section_indent is not None:
+                if content.strip() and indent <= manifest_section_indent:
+                    manifest_section_indent = None
+                elif prefix in {"+", "-"}:
+                    package_match = _PACKAGE_LINE_RE.match(content)
+                    if package_match:
+                        _record_package_change(
+                            manifest_records,
+                            package_match.group("name"),
+                            package_match.group("version"),
+                            prefix,
+                            current_file,
+                        )
+            elif prefix in {"+", "-"}:
+                # Sparse diffs may omit the surrounding dependency-section
+                # context. The metadata deny-list keeps this fallback bounded.
+                package_match = _PACKAGE_LINE_RE.match(content)
+                if package_match:
+                    _record_package_change(
+                        manifest_records,
+                        package_match.group("name"),
+                        package_match.group("version"),
+                        prefix,
+                        current_file,
+                    )
             continue
-        rows.append((name, old or "—", new or "—", f"{change} ({record['file']})"))
-    return rows
+
+        if "lock" in current_file.lower():
+            package_match = _LOCKFILE_PACKAGE_RE.match(content)
+            if package_match:
+                raw_name = package_match.group("name")
+                name = raw_name.removeprefix("node_modules/")
+                if name and name not in _NON_PACKAGE_KEYS:
+                    lockfile_package = (name, indent)
+                elif lockfile_package and indent <= lockfile_package[1]:
+                    lockfile_package = None
+            elif (
+                lockfile_package
+                and content.strip().startswith("}")
+                and indent <= lockfile_package[1]
+            ):
+                lockfile_package = None
+
+            if prefix in {"+", "-"} and lockfile_package:
+                version_match = _PACKAGE_LINE_RE.match(content)
+                if (
+                    version_match
+                    and version_match.group("name") == "version"
+                    and indent > lockfile_package[1]
+                ):
+                    _record_package_change(
+                        lockfile_records,
+                        lockfile_package[0],
+                        version_match.group("version"),
+                        prefix,
+                        current_file,
+                    )
+
+    direct_names = set(manifest_records)
+    changes: list[_PackageChange] = []
+    for name in sorted(manifest_records):
+        record = manifest_records[name]
+        if record["old"] or record["new"]:
+            evidence_file = record["file"]
+            if name in lockfile_records:
+                evidence_file += "; lockfile synchronized"
+            changes.append(
+                _PackageChange(name, record["old"], record["new"], evidence_file, "direct")
+            )
+    for name in sorted(lockfile_records):
+        if name in direct_names:
+            continue
+        record = lockfile_records[name]
+        if record["old"] or record["new"]:
+            changes.append(
+                _PackageChange(
+                    name,
+                    record["old"],
+                    record["new"],
+                    record["file"],
+                    "transitive",
+                )
+            )
+    return sorted(changes, key=lambda change: (change.scope != "direct", change.name))
+
+
+def _targeted_remediation_summary(context: _ReportContext) -> str:
+    """Summarize the outcome for the original actionable groups."""
+    return (
+        f"{context.groups_fixed}/{context.actionable_groups} actionable groups fixed; "
+        f"{context.groups_unresolved} unresolved, "
+        f"{context.groups_inconclusive} inconclusive, "
+        f"{context.groups_pending} pending"
+    )
+
+
+def _post_scan_summary(context: _ReportContext) -> str:
+    """Summarize post-remediation scan evidence without conflating its counts."""
+    status = context.new_vulnerability_status
+    if status == "detected" or context.new_vulnerability_identifiers:
+        return (
+            f"{len(context.post_remediation_scan_issues)} findings / "
+            f"{len(context.post_remediation_scan_identifiers)} unique identifiers; "
+            f"{len(context.new_vulnerability_identifiers)} new identifiers detected"
+        )
+    if status in {"scan_failed", "failed"}:
+        return "Scanner validation failed"
+    if status in {"none", "clear", "not_detected"}:
+        return "No post-remediation findings detected"
+    if status == "not_scanned":
+        return "Not scanned"
+    return status
 
 
 def _render_summary(context: _ReportContext) -> str:
@@ -525,6 +805,8 @@ def _render_summary(context: _ReportContext) -> str:
         ("Run ID", context.run_id),
         ("Repository", context.repo_root),
         ("Status", f"{context.overall_label} ({context.status})"),
+        ("Targeted remediation", _targeted_remediation_summary(context)),
+        ("Post-remediation security status", _post_scan_summary(context)),
         ("Total time taken", duration),
         ("Original scanner findings", context.original_scanner_findings),
         ("Actionable groups", context.actionable_groups),
@@ -532,7 +814,11 @@ def _render_summary(context: _ReportContext) -> str:
         ("Groups unresolved", context.groups_unresolved),
         ("Groups inconclusive", context.groups_inconclusive),
         ("Groups pending", context.groups_pending),
-        ("Re-triage findings", context.groups_retriage_discovered),
+        ("Re-triage groups discovered", context.groups_retriage_discovered),
+        (
+            "Targeted QA coverage",
+            f"{context.targeted_qa_passed} passed / {context.targeted_qa_total} targeted groups",
+        ),
         ("Patch present", "yes" if context.has_patch else "no"),
         *token_rows,
     ]
@@ -597,6 +883,8 @@ def _render_overview(context: _ReportContext) -> str:
                     ("Findings by type", type_text),
                     ("Initial groups by severity", severity_text),
                     ("Task strategies", strategy_text),
+                    ("Targeted remediation", _targeted_remediation_summary(context)),
+                    ("Post-remediation security status", _post_scan_summary(context)),
                     ("Re-triage discovered groups", context.groups_retriage_discovered),
                 ],
             ),
@@ -637,9 +925,13 @@ def _render_key_decisions(context: _ReportContext) -> str:
             )
     if not failed_qa:
         failed_qa = [("None", "—", "No failed QA evaluations recorded")]
+    strategies_by_group = dict(context.group_strategies)
+    for task in context.task_queue.values():
+        group_id = _text(_value(task, "parent_group_id"))
+        if group_id and group_id not in strategies_by_group:
+            strategies_by_group[group_id] = _value(task, "strategy")
     strategy_rows = [
-        (group_id, _text(strategy))
-        for group_id, strategy in sorted(context.group_strategies.items())
+        (group_id, _text(strategy)) for group_id, strategy in sorted(strategies_by_group.items())
     ] or [("None", "No strategy selections recorded")]
     action_rows = [
         (
@@ -719,10 +1011,31 @@ def _render_findings(context: _ReportContext) -> str:
         ),
         rows or [("None",) * 9],
     )
-    package_rows = _package_changes(context.diff)
-    package_table = _table(
+    package_changes = _package_changes(context.diff)
+    direct_package_rows = [
+        (
+            change.name,
+            change.old or "-",
+            change.new or "-",
+            f"{_package_change_kind(change)} ({change.file})",
+        )
+        for change in package_changes
+        if change.scope == "direct"
+    ]
+    direct_package_table = _table(
         ("Package", "Previous", "New", "Evidence"),
-        package_rows or [("None", "—", "—", "No package changes found in the unified diff")],
+        direct_package_rows or [("None", "-", "-", "No direct manifest package changes found")],
+    )
+    transitive_changes = [change for change in package_changes if change.scope == "transitive"]
+    transitive_counts = Counter(_package_change_kind(change) for change in transitive_changes)
+    transitive_summary = (
+        "No transitive lockfile package changes found."
+        if not transitive_changes
+        else (
+            f"{len(transitive_changes)} transitive lockfile package entries changed: "
+            + ", ".join(f"{kind} {count}" for kind, count in sorted(transitive_counts.items()))
+            + "."
+        )
     )
     diagnostic_rows = []
     for attempt_id, worker_result in sorted(context.worker_results.items()):
@@ -792,9 +1105,15 @@ def _render_findings(context: _ReportContext) -> str:
             "",
             "### Packages Added or Changed",
             "",
-            "Package changes below are parsed from the unified diff; worker and QA records provide supporting execution evidence.",
+            "Direct manifest changes are listed individually; transitive lockfile churn is summarized.",
             "",
-            package_table,
+            "#### Direct Manifest Changes",
+            "",
+            direct_package_table,
+            "",
+            "#### Transitive Lockfile Changes",
+            "",
+            transitive_summary,
             "",
             "### Worker Package Execution Evidence",
             "",
@@ -807,17 +1126,44 @@ def _render_findings(context: _ReportContext) -> str:
     )
 
 
+def _new_scan_finding_rows(context: _ReportContext) -> list[tuple[str, str, str, str, str, str]]:
+    """Render post-scan issues once per scanner finding, not once per identifier."""
+    new_ids = set(context.new_vulnerability_identifiers)
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for issue in context.post_remediation_scan_issues:
+        identifiers = _issue_identifiers(issue)
+        if new_ids and identifiers and not new_ids.intersection(identifiers):
+            continue
+        rows.append(
+            (
+                ", ".join(identifiers) or "unidentified finding",
+                _text(
+                    _value(issue, "package_name") or _value(issue, "vulnerable_component"),
+                    "-",
+                ),
+                _text(_value(issue, "source"), "-"),
+                _text(_value(issue, "file_path"), "-"),
+                _text(_value(issue, "severity"), "unknown"),
+                "new vulnerability",
+            )
+        )
+    if not rows and new_ids:
+        rows = [
+            (identifier, "-", "-", "-", "unknown", "new vulnerability")
+            for identifier in sorted(new_ids)
+        ]
+    return rows
+
+
 def _render_validation(context: _ReportContext) -> str:
     """Render deterministic validation gates and remaining work."""
     scan_status = _text(_value(context.final_full_scan_result, "status"), "not recorded")
-    remaining = [
+    remaining_groups = [
         (group_id, status)
         for group_id, status in sorted(context.group_statuses.items())
         if status not in {"qa_passed", "mitigated"}
     ]
-    remaining += [
-        (identifier, "new vulnerability") for identifier in context.new_vulnerability_identifiers
-    ]
+    new_scan_rows = _new_scan_finding_rows(context)
     return "\n".join(
         [
             "## {number}. Validation and Remaining Issues",
@@ -826,16 +1172,24 @@ def _render_validation(context: _ReportContext) -> str:
                 ("Validation area", "Result"),
                 [
                     (
-                        "QA evaluations",
-                        f"{sum(bool(_value(item, 'passed', False)) for item in context.qa_evaluations.values())} passed / {len(context.qa_evaluations)} recorded",
+                        "Targeted QA coverage",
+                        f"{context.targeted_qa_passed} passed / {context.targeted_qa_total} targeted groups",
+                    ),
+                    (
+                        "QA record provenance",
+                        f"{context.recorded_qa_total} records retained",
                     ),
                     (
                         "Post-remediation scanner findings",
-                        len(context.post_remediation_scan_issues),
+                        f"{len(context.post_remediation_scan_issues)} findings",
+                    ),
+                    (
+                        "Post-remediation unique identifiers",
+                        f"{len(context.post_remediation_scan_identifiers)} identifiers",
                     ),
                     (
                         "New vulnerability identifiers",
-                        ", ".join(context.new_vulnerability_identifiers) or "None",
+                        f"{len(context.new_vulnerability_identifiers)} identifiers",
                     ),
                     ("Scanner/QA evidence", scan_status),
                     ("Consistency events", len(context.consistency_events)),
@@ -846,7 +1200,15 @@ def _render_validation(context: _ReportContext) -> str:
             "",
             _table(
                 ("Group/finding", "Status"),
-                remaining or [("None", "All original groups reached a fixed or mitigated status")],
+                remaining_groups
+                or [("None", "All original groups reached a fixed or mitigated status")],
+            ),
+            "",
+            "### Newly Detected Findings",
+            "",
+            _table(
+                ("Identifiers", "Package/component", "Source", "Location", "Severity", "Status"),
+                new_scan_rows or [("None", "-", "-", "-", "-", "No newly detected findings")],
             ),
         ]
     )
