@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, ToolMessage
+from pydantic import BaseModel, ValidationError
 
 from remediation_engine.orchestration.trajectory_exporter import (
     invoke_with_trajectory,
@@ -43,12 +44,17 @@ class ToolEvent:
 
 @dataclass(frozen=True)
 class SubagentRuntimeResult:
-    """Summarize a bounded worker run and its observable side effects."""
+    """Summarize a bounded worker run and its observable side effects.
+
+    structured_output is populated only when a caller configures a typed
+    terminal tool; final_text remains available for legacy free-form workers.
+    """
 
     final_text: str
     tool_events: list[ToolEvent]
     changed_files: list[str]
     errors: list[str]
+    structured_output: BaseModel | None = None
 
 
 def _contains_sandbox_not_running(content: str) -> bool:
@@ -352,11 +358,45 @@ def run_bounded_subagent_loop(
     touched_files: set[str],
     planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
+    structured_output_model: type[BaseModel] | None = None,
+    structured_output_tool_name: str | None = None,
 ) -> SubagentRuntimeResult:
-    """Run a bounded tool-calling loop for one specialized subagent."""
+    """Run a bounded tool-calling loop for one specialized subagent.
+
+    Args:
+        llm: Chat model that supports tool binding and invocation.
+        tools: Tools available to the bounded loop.
+        initial_messages: Initial conversation messages.
+        touched_files: Files already known to be changed by the worker.
+        planning_state: Optional mutable planning-phase state.
+        execution_state: Optional mutable validation/execution state.
+        structured_output_model: Optional Pydantic model for a terminal result.
+        structured_output_tool_name: Tool name whose arguments are validated as
+            structured_output_model. Both structured arguments are required
+            together and the terminal tool body is not executed.
+
+    Returns:
+        The bounded run result, including the validated terminal model when
+        structured output is configured.
+
+    Raises:
+        ValueError: If structured-output configuration is incomplete or names
+            a tool that is not in tools.
+    """
     tool_map = {tool.name: tool for tool in tools}
     # This is only a provider hint; the runtime barrier below remains
     # authoritative for providers that ignore it or still emit multiple calls.
+    if (structured_output_model is None) != (structured_output_tool_name is None):
+        raise ValueError(
+            "structured_output_model and structured_output_tool_name must be provided together."
+        )
+    if (
+        structured_output_tool_name is not None
+        and structured_output_tool_name not in tool_map
+    ):
+        raise ValueError(
+            f"Structured output tool {structured_output_tool_name!r} is not available."
+        )
     llm_with_tools = llm.bind_tools(list(tools), parallel_tool_calls=False)
     conversation = list(initial_messages)
     tool_events: list[ToolEvent] = []
@@ -397,12 +437,59 @@ def run_bounded_subagent_loop(
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
-            return SubagentRuntimeResult(
-                final_text=final_text,
-                tool_events=tool_events,
-                changed_files=sorted(observed_changed_files | set(touched_files)),
-                errors=errors,
+            if structured_output_model is None:
+                return SubagentRuntimeResult(
+                    final_text=final_text,
+                    tool_events=tool_events,
+                    changed_files=sorted(observed_changed_files | set(touched_files)),
+                    errors=errors,
+                )
+            conversation.append(
+                HumanMessage(
+                    content=(
+                        "This evaluator may not emit free-form text. Continue reviewing evidence "
+                        f"and finish by calling {structured_output_tool_name} with the complete "
+                        "structured QA result."
+                    )
+                )
             )
+            continue
+
+        if structured_output_model is not None:
+            terminal_calls = [
+                call
+                for call in tool_calls
+                if str(call.get("name", "")) == structured_output_tool_name
+            ]
+            if terminal_calls:
+                terminal_call = terminal_calls[0]
+                try:
+                    structured_output = structured_output_model.model_validate(
+                        terminal_call.get("args", {}) or {}
+                    )
+                except ValidationError as exc:
+                    terminal_call_id = terminal_call.get("id")
+                    if not isinstance(terminal_call_id, str) or not terminal_call_id.strip():
+                        terminal_call_id = "invalid-structured-output-call-id"
+                    conversation.append(
+                        ToolMessage(
+                            content=(
+                                "ERROR: Structured QA output failed validation. "
+                                f"Correct the fields and call {structured_output_tool_name} again: {exc}"
+                            ),
+                            tool_call_id=terminal_call_id,
+                            name=structured_output_tool_name,
+                        )
+                    )
+                    errors.append("Structured QA output validation failed; evaluator was asked to retry.")
+                    continue
+                return SubagentRuntimeResult(
+                    final_text="",
+                    tool_events=tool_events,
+                    changed_files=sorted(observed_changed_files | set(touched_files)),
+                    errors=list(dict.fromkeys(errors)),
+                    structured_output=structured_output,
+                )
 
         recovery_instruction: str | None = None
         sandbox_stopped = False
