@@ -20,6 +20,7 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     NoFixMitigationStage,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -246,6 +247,58 @@ def derive_initial_strategy(group: VulnerabilityGroup) -> RoutingStrategy:
     return RoutingStrategy.CODE_WORKAROUND
 
 
+def derive_initial_qa_policy(group: VulnerabilityGroup) -> QAPolicy:
+    """Derive the immutable QA policy for a newly created task.
+
+    Args:
+        group: Vulnerability group being scheduled.
+
+    Returns:
+        The supervisor-owned QA policy for the task's initial attempt.
+    """
+    if is_no_fix_group(group):
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.VERSION_FOUND:
+        return QAPolicy.VERSION_BUMP
+    return QAPolicy.INITIAL_CODE_WORKAROUND
+
+
+def derive_missing_task_qa_policy(
+    task: RemediationTask,
+    group: VulnerabilityGroup | None,
+) -> QAPolicy | None:
+    """Derive a safe QA policy for an uncommitted legacy task.
+
+    This helper is intentionally narrower than the initial-task factory.  It
+    repairs state created before ``qa_policy`` became mandatory while refusing
+    to guess the policy for a pivoted child task whose policy provenance has
+    been lost.
+
+    Args:
+        task: Existing task whose policy may be missing.
+        group: Current vulnerability group, when still available.
+
+    Returns:
+        A deterministically recoverable policy, or ``None`` when provenance is
+        ambiguous and the caller must fail closed.
+    """
+    if task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        return QAPolicy.NO_FIX_CODE_REMOVAL
+    if group is not None and is_no_fix_group(group):
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if task.strategy == RoutingStrategy.VERSION_BUMP:
+        return QAPolicy.VERSION_BUMP
+    if (
+        task.parent_task_id is None
+        and task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and (group is None or not is_no_fix_group(group))
+    ):
+        return QAPolicy.INITIAL_CODE_WORKAROUND
+    return None
+
+
 def build_initial_remediation_task(
     group: VulnerabilityGroup,
     task_id: str,
@@ -270,6 +323,7 @@ def build_initial_remediation_task(
         A freshly created task ready to be added to ``task_queue``.
     """
     strategy = derive_initial_strategy(group)
+    qa_policy = derive_initial_qa_policy(group)
     no_fix_stage: NoFixMitigationStage | None = None
     if is_no_fix_group(group):
         no_fix_stage = NoFixMitigationStage.PACKAGE_REMOVAL
@@ -325,6 +379,7 @@ def build_initial_remediation_task(
     return RemediationTask(
         task_id=task_id,
         parent_group_id=group.group_id,
+        qa_policy=qa_policy,
         strategy=strategy,
         strategy_stage=initial_stage,
         target_package_name=target_package_name,

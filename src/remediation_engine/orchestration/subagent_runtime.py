@@ -22,6 +22,15 @@ MAX_VALIDATION_INPUT_ERRORS = 3
 SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
 
+# Manifest mutations and validation form a single ordered transaction. The
+# worker must observe the result of one operation before issuing the next.
+_SERIAL_MANIFEST_TOOL_NAMES = frozenset(
+    {
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ToolEvent:
@@ -315,6 +324,27 @@ def _validation_input_recovery_instruction(tool_content: str) -> str:
     )
 
 
+def _manifest_call_deferred_instruction(deferred_tool_names: Sequence[str]) -> str:
+    """Tell the worker to resume after deferred manifest calls.
+
+    Args:
+        deferred_tool_names: Manifest tools acknowledged but not executed from
+            the current assistant message.
+
+    Returns:
+        A bounded instruction for the next model turn.
+    """
+    names = ", ".join(deferred_tool_names)
+    return (
+        "Manifest operation sequencing barrier: only one modify_npm_dependency "
+        "or validate_manifest_sync call may execute per assistant turn. "
+        f"Deferred call(s): {names}. The prior manifest operation has already "
+        "been executed. On the next turn, inspect its result and continue with "
+        "the required validate_manifest_sync call for that same package before "
+        "moving to the next package. Do not repeat a successful modification."
+    )
+
+
 def run_bounded_subagent_loop(
     llm: Any,
     tools: Sequence[Any],
@@ -325,7 +355,9 @@ def run_bounded_subagent_loop(
 ) -> SubagentRuntimeResult:
     """Run a bounded tool-calling loop for one specialized subagent."""
     tool_map = {tool.name: tool for tool in tools}
-    llm_with_tools = llm.bind_tools(list(tools))
+    # This is only a provider hint; the runtime barrier below remains
+    # authoritative for providers that ignore it or still emit multiple calls.
+    llm_with_tools = llm.bind_tools(list(tools), parallel_tool_calls=False)
     conversation = list(initial_messages)
     tool_events: list[ToolEvent] = []
     final_text = ""
@@ -380,7 +412,10 @@ def run_bounded_subagent_loop(
         validation_limit_error: str | None = None
         validation_input_limit_error: str | None = None
         blocker_errors: list[str] = []
+        manifest_call_seen = False
+        deferred_manifest_calls: list[str] = []
         for tool_call in tool_calls:
+            tool_name = str(tool_call.get("name", ""))
             call_signature = _tool_call_signature(tool_call)
             tool_call_id = tool_call.get("id")
             if not isinstance(tool_call_id, str) or not tool_call_id.strip():
@@ -395,29 +430,47 @@ def run_bounded_subagent_loop(
                         f"recovery instruction. Prior failure: {prior_failure}"
                     ),
                     tool_call_id=tool_call_id,
-                    name=tool_call.get("name", ""),
+                    name=tool_name,
                 )
+                deferred_manifest_call = False
             else:
-                tool_name = str(tool_call.get("name", ""))
-                if (
-                    execution_state is not None
-                    and execution_state.get("phase") == "VALIDATE"
-                    and tool_name
-                    in {"record_plan", "search_web", "read_web_page", "read_repository_map"}
-                ):
+                if tool_name in _SERIAL_MANIFEST_TOOL_NAMES and manifest_call_seen:
+                    deferred_manifest_calls.append(tool_name)
+                    deferred_manifest_call = True
                     tool_message = ToolMessage(
                         content=(
-                            "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
-                            "Call validate_workaround before planning or web research."
+                            "DEFERRED: manifest tools are serialized. This call was not "
+                            "executed; continue it in the next assistant turn after the "
+                            "current package operation has been observed."
                         ),
                         tool_call_id=tool_call_id,
                         name=tool_name,
                     )
                 else:
-                    tool_message = _invoke_bound_tool(tool_map, tool_call)
+                    deferred_manifest_call = False
+                    if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
+                        manifest_call_seen = True
+                    if (
+                        execution_state is not None
+                        and execution_state.get("phase") == "VALIDATE"
+                        and tool_name
+                        in {"record_plan", "search_web", "read_web_page", "read_repository_map"}
+                    ):
+                        tool_message = ToolMessage(
+                            content=(
+                                "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
+                                "Call validate_workaround before planning or web research."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        )
+                    else:
+                        tool_message = _invoke_bound_tool(tool_map, tool_call)
             conversation.append(tool_message)
+            if deferred_manifest_call:
+                continue
             event = ToolEvent(
-                name=tool_call.get("name", ""),
+                name=tool_name,
                 args=tool_call.get("args", {}) or {},
                 content=tool_message.content,
             )
@@ -496,6 +549,7 @@ def run_bounded_subagent_loop(
                                 content=_validation_input_recovery_instruction(event.content)
                             )
                         )
+
                 else:
                     validation_gate_call_count += 1
                     if execution_state is not None:
@@ -550,6 +604,11 @@ def run_bounded_subagent_loop(
                             )
                     else:
                         consecutive_validation_failures = 0
+
+            if deferred_manifest_calls:
+                conversation.append(
+                    HumanMessage(content=_manifest_call_deferred_instruction(deferred_manifest_calls))
+                )
 
             inferred_paths = _infer_changed_files(event)
             if inferred_paths:

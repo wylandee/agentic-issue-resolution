@@ -147,6 +147,7 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     assert reopened.task_revision == 3
     assert reopened.retry_count == 0
     assert reopened.current_attempt_id is None
+    assert reopened.qa_policy == changed_task.qa_policy
     assert changed.group_id not in result["qa_evaluations"]
     assert result["task_queue"]["task-unchanged"] is unchanged_task
     assert result["active_target_task_ids"] == []

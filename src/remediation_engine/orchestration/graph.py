@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -390,6 +391,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
                     "task_revision": task.task_revision + 1,
                     "current_attempt_id": None,
                     "strategy": fresh_task.strategy,
+                    "qa_policy": fresh_task.qa_policy,
                     "strategy_stage": fresh_task.strategy_stage,
                     "selected_version": fresh_task.selected_version,
                     "exhausted_update_path": False,
@@ -513,13 +515,38 @@ def _dispatch_boundary_rejection(
     field, so real graph execution is strict: no worker or QA node may run
     without a matching task revision, instruction, and snapshot.
     """
-    if "attempt_snapshots_by_id" not in state:
+    has_attempt_snapshot_state = "attempt_snapshots_by_id" in state
+    if not has_attempt_snapshot_state and expected_node != "qa_critic":
         return None
 
     snapshots = state.get("attempt_snapshots_by_id") or {}
     errors: list[str] = []
     events: list[StateConsistencyEvent] = []
     for task in target_tasks:
+        if not has_attempt_snapshot_state:
+            # Legacy direct QA callers may omit the snapshot map, but they may
+            # not silently run policy-less QA. The normal graph path always
+            # carries the map and is checked below against the immutable
+            # attempt snapshot.
+            if expected_node == "qa_critic" and task.qa_policy is None:
+                details = (
+                    "QA requires a supervisor-owned policy even for legacy "
+                    "direct callers that omit attempt snapshots."
+                )
+                errors.append(
+                    f"graph: rejected {expected_node} dispatch for {task.task_id}: {details}"
+                )
+                events.append(
+                    StateConsistencyEvent(
+                        error_code="MISSING_QA_POLICY_PROVENANCE",
+                        task_id=task.task_id,
+                        expected_attempt_id=task.current_attempt_id,
+                        received_attempt_id=task.current_attempt_id,
+                        action="ignored",
+                        details=details,
+                    )
+                )
+            continue
         attempt_id = task.current_attempt_id
         snapshot = snapshots.get(attempt_id) if attempt_id else None
         error_code: str | None = None
@@ -530,11 +557,21 @@ def _dispatch_boundary_rejection(
         elif snapshot is None:
             error_code = "DISPATCH_ATTEMPT_MISSING"
             details = "Task references an attempt that is absent from the snapshot map."
+        elif task.qa_policy is None and snapshot.qa_policy is None:
+            error_code = "MISSING_QA_POLICY_PROVENANCE"
+            details = (
+                "Task and committed attempt must carry a supervisor-owned QA policy "
+                "before dispatch."
+            )
+        elif task.qa_policy is None or snapshot.qa_policy is None:
+            error_code = "DISPATCH_SNAPSHOT_CONTRADICTION"
+            details = "Task and committed attempt disagree because QA policy provenance is missing."
         elif (
             snapshot.task_id != task.task_id
             or snapshot.task_revision != task.task_revision
             or snapshot.strategy_stage != task.strategy_stage
             or snapshot.no_fix_stage != task.no_fix_stage
+            or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
@@ -1450,10 +1487,28 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             # The attempt envelope is task-keyed, so normalize the nested
             # evaluation before it enters the authoritative correlation map.
             evaluation = evaluation.model_copy(update={"task_id": task_id})
+        attempt_snapshot = (state.get("attempt_snapshots_by_id") or {}).get(
+            task.current_attempt_id
+        )
+        attempt_policy = (
+            attempt_snapshot.get("qa_policy")
+            if isinstance(attempt_snapshot, Mapping)
+            else getattr(attempt_snapshot, "qa_policy", None)
+        )
+        result_policy = attempt_policy or task.qa_policy
+        policy_source = (
+            "attempt_snapshot"
+            if attempt_snapshot is not None and attempt_policy is not None
+            else "task_queue"
+            if task.qa_policy is not None
+            else "missing"
+        )
         qa_results_by_attempt[task.current_attempt_id] = QAAttemptResult(
             attempt_id=task.current_attempt_id,
             task_id=task_id,
             task_revision=task.task_revision,
+            qa_policy=result_policy,
+            qa_policy_source=policy_source,
             evaluation=evaluation,
             investigation_report=result.get("qa_investigation_report", ""),
             errors=list(result.get("errors", []) or []),

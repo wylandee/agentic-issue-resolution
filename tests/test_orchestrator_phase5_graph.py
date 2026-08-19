@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     QAEvaluation,
+    QAPolicy,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
@@ -357,6 +358,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -412,6 +414,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version="4.17.21",
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -437,6 +440,46 @@ class TestPhase5GraphIntegration:
             for event in result["consistency_events"]
         )
 
+    def test_dispatch_rejects_missing_qa_policy_provenance(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-update",
+                "qa_policy": None,
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-update",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=task.strategy_stage,
+            qa_policy=None,
+            selected_version=task.selected_version,
+            instruction=task.instruction,
+            instruction_digest=_instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        worker = MagicMock()
+        with patch("remediation_engine.orchestration.graph.run_update_subagent_node", worker):
+            result = run_update_subagent_from_orchestrator(state)
+
+        worker.assert_not_called()
+        assert any(
+            event.error_code == "MISSING_QA_POLICY_PROVENANCE"
+            for event in result["consistency_events"]
+        )
+
     def test_failed_worker_restores_attempt_workspace_snapshot(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
@@ -448,6 +491,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -498,6 +542,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -791,6 +836,26 @@ class TestPhase5GraphIntegration:
         assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
         assert result["status"] == "qa_completed"
 
+    def test_qa_wrapper_rejects_policyless_legacy_task(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"qa_policy": None}
+        )
+        state = _initial_state(tmp_path, groups)
+        state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+
+        qa_critic = MagicMock()
+        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+            result = run_qa_critic_from_orchestrator(state)
+
+        qa_critic.assert_not_called()
+        assert result["eval_status"] == "state_inconsistent"
+        assert any(
+            event.error_code == "MISSING_QA_POLICY_PROVENANCE"
+            for event in result["consistency_events"]
+        )
+
     def test_qa_wrapper_scopes_one_active_task_to_one_parent_group(self, tmp_path):
         groups = [
             _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
@@ -831,6 +896,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -887,6 +953,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -939,6 +1006,7 @@ class TestPhase5GraphIntegration:
                 "current_attempt_id": "attempt-workaround",
                 "parent_task_id": "task-parent",
                 "strategy": RoutingStrategy.CODE_WORKAROUND,
+                "qa_policy": QAPolicy.MITIGATION_CODE_WORKAROUND,
                 "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
                 "selected_version": None,
             }
@@ -949,6 +1017,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -1013,6 +1082,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -1046,10 +1116,13 @@ class TestPhase5GraphIntegration:
                 return_value=sandbox,
             ),
         ):
-            run_qa_critic_from_orchestrator(state)
+            result = run_qa_critic_from_orchestrator(state)
 
         sandbox.restore_workspace_snapshot.assert_not_called()
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-pass")
+        qa_result = result["qa_results_by_attempt"]["attempt-pass"]
+        assert qa_result.qa_policy == task.qa_policy
+        assert qa_result.qa_policy_source == "attempt_snapshot"
 
     def test_regression_retries_keep_first_pre_task_baseline(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

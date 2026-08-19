@@ -127,6 +127,7 @@ def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
                     "task_revision": 2,
                     "attempt_number": 2,
                     "strategy_stage": "npm_latest",
+                    "qa_policy": "version_bump",
                     "selected_version": "8.5.1",
                     "dispatch_node": "update_subagent",
                     "instruction": "Update package.json to 8.5.1.",
@@ -141,6 +142,8 @@ def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
             },
             "qa_results_by_attempt": {
                 "attempt-2": {
+                    "qa_policy": "version_bump",
+                    "qa_policy_source": "attempt_snapshot",
                     "evaluation": {"passed": False},
                 }
             },
@@ -157,6 +160,8 @@ def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
     assert "## Attempt Snapshot Summary" in markdown
     assert "attempt-2" in markdown
     assert "8.5.1" in markdown
+    assert "version_bump" in markdown
+    assert "attempt_snapshot" in markdown
     assert "Update package.json to 8.5.1." in markdown
     assert '"passed": false' in markdown
 

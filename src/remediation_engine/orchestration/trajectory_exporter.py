@@ -583,8 +583,8 @@ def _render_markdown(
         "",
         "## Attempt Snapshot Summary",
         "",
-        "| Task | Attempt | Revision | Stage | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
-        "|---|---|---:|---|---|---|---|---|---|---|---|",
+        "| Task | Attempt | Revision | Stage | QA Policy | Policy Source | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
+        "|---|---|---:|---|---|---|---|---|---|---|---|---|---|",
     ]
     if isinstance(final_state, Mapping):
         task_queue = final_state.get("task_queue") or {}
@@ -623,6 +623,8 @@ def _render_markdown(
                         _table_value(attempt_id),
                         _table_value(data.get("task_revision")),
                         _table_value(data.get("strategy_stage")),
+                        _table_value(data.get("qa_policy") or task_data.get("qa_policy") or "missing"),
+                        _table_value(qa_data.get("qa_policy_source", "missing")),
                         _table_value(data.get("selected_version") or "none"),
                         _table_value(data.get("dispatch_node")),
                         _table_value(", ".join(worker_data.get("executed_versions", []) or [])),
@@ -635,9 +637,9 @@ def _render_markdown(
                 + " |"
             )
         if not snapshots:
-            lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+            lines.append("| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
     else:
-        lines.append("| none | none |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+        lines.append("| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
 
     lines.extend(
         [
