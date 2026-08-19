@@ -542,6 +542,28 @@ def default_trajectory_dir() -> Path:
     return Path(configured) if configured else _DEFAULT_TRAJECTORY_DIR
 
 
+def build_phase5_trajectory_path(
+    trace_id: uuid.UUID | str,
+    *,
+    timestamp: datetime | None = None,
+) -> Path:
+    """Build the canonical output path for one Phase 5 trajectory.
+
+    Args:
+        trace_id: Stable run or trace identifier used in the filename.
+        timestamp: Optional UTC timestamp used for deterministic callers and
+            tests. The current UTC time is used when omitted.
+
+    Returns:
+        The configured trajectory path. The parent directory is not created
+        until export is requested.
+    """
+    export_time = timestamp or datetime.now(UTC)
+    return default_trajectory_dir() / (
+        f"phase5_{export_time.strftime('%Y%m%dT%H%M%SZ')}_{trace_id}.md"
+    )
+
+
 def _remote_span(run: Any, sequence: int) -> dict[str, Any]:
     return {
         "run_id": _identifier(getattr(run, "id", "")),
@@ -704,7 +726,9 @@ def _render_markdown(
                         _table_value(attempt_id),
                         _table_value(data.get("task_revision")),
                         _table_value(data.get("strategy_stage")),
-                        _table_value(data.get("qa_policy") or task_data.get("qa_policy") or "missing"),
+                        _table_value(
+                            data.get("qa_policy") or task_data.get("qa_policy") or "missing"
+                        ),
                         _table_value(qa_data.get("qa_policy_source", "missing")),
                         _table_value(data.get("selected_version") or "none"),
                         _table_value(data.get("dispatch_node")),
@@ -718,9 +742,13 @@ def _render_markdown(
                 + " |"
             )
         if not snapshots:
-            lines.append("| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+            lines.append(
+                "| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+            )
     else:
-        lines.append("| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |")
+        lines.append(
+            "| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+        )
 
     lines.extend(
         [
@@ -819,8 +847,13 @@ def export_phase5_trajectory(
     langsmith_enabled: bool,
     langsmith_url: str | None = None,
     run_error: BaseException | None = None,
+    output_path: str | Path | None = None,
 ) -> Path:
-    """Write one Markdown trajectory, preferring LangSmith spans when possible."""
+    """Write one Markdown trajectory, optionally to a reserved output path.
+
+    A caller-supplied ``output_path`` lets a final report reference the exact
+    trajectory file that contains the finalized report fields.
+    """
     warnings: list[str] = []
     spans = recorder.spans()
     source = "local-fallback"
@@ -833,10 +866,10 @@ def export_phase5_trajectory(
             warnings.append(warning)
             logger.warning(warning)
 
-    output_dir = default_trajectory_dir()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    output_path = output_dir / f"phase5_{timestamp}_{trace_id}.md"
+    output_file = (
+        Path(output_path) if output_path is not None else build_phase5_trajectory_path(trace_id)
+    )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     markdown = _render_markdown(
         trace_id=str(trace_id),
         repo_root=repo_root,
@@ -847,9 +880,9 @@ def export_phase5_trajectory(
         langsmith_url=langsmith_url,
         warnings=warnings,
         run_error=str(run_error) if run_error else None,
-        trajectory_path=output_path,
+        trajectory_path=output_file,
     )
-    temporary_path = output_path.with_suffix(".md.tmp")
+    temporary_path = output_file.with_suffix(".md.tmp")
     temporary_path.write_text(markdown, encoding="utf-8")
-    temporary_path.replace(output_path)
-    return output_path
+    temporary_path.replace(output_file)
+    return output_file

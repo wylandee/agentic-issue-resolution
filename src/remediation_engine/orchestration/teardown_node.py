@@ -10,6 +10,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,10 @@ from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 
 logger = logging.getLogger(__name__)
+
+
+_WORKSPACE_VOLUME_CLEANUP_ATTEMPTS = 3
+_WORKSPACE_VOLUME_CLEANUP_RETRY_SECONDS = 0.25
 
 
 def _close_client(client) -> None:
@@ -41,6 +46,119 @@ def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
             tofile=f"b/{rel_path}",
         )
     )
+
+
+def _docker_not_found(exc: BaseException) -> bool:
+    """Return whether the Docker resource is already absent."""
+    error_name = exc.__class__.__name__.lower()
+    detail = str(exc).lower()
+    return error_name == "notfound" or "no such container" in detail or "no such volume" in detail
+
+
+def _docker_volume_in_use(exc: BaseException) -> bool:
+    """Return whether Docker rejected volume removal because it is attached."""
+    detail = str(exc).lower()
+    return "volume is in use" in detail or "409" in detail or "conflict" in detail
+
+
+def _container_label(container: Any) -> str:
+    """Return a stable label for a Docker container in cleanup diagnostics."""
+    return str(
+        getattr(container, "name", None) or getattr(container, "id", None) or "unknown-container"
+    ).lstrip("/")
+
+
+def _force_remove_attached_container(container: Any) -> str | None:
+    """Remove one container attached to the run-owned workspace volume.
+
+    Args:
+        container: Docker SDK container object to remove.
+
+    Returns:
+        None when the container is gone; otherwise a concise cleanup error.
+
+    Side Effects:
+        Stops/kills and force-removes the supplied Docker container.
+    """
+    label = _container_label(container)
+    try:
+        container.remove(force=True)
+        return None
+    except Exception as remove_error:  # noqa: BLE001
+        if _docker_not_found(remove_error):
+            return None
+
+        # A daemon can report a conflict while the container is transitioning
+        # out of the running state. Kill once, then retry removal.
+        try:
+            container.kill()
+        except Exception as kill_error:  # noqa: BLE001
+            if _docker_not_found(kill_error):
+                return None
+
+        try:
+            container.remove(force=True)
+            return None
+        except Exception as retry_error:  # noqa: BLE001
+            if _docker_not_found(retry_error):
+                return None
+            return f"container '{label}' removal failed: {retry_error}"
+
+
+def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool, list[str]]:
+    """Remove attached containers before deleting a workspace volume.
+
+    Args:
+        client: Connected Docker SDK client.
+        workspace_volume: Engine-owned named volume to clean up.
+
+    Returns:
+        A removed flag and cleanup errors for the final report.
+
+    Side Effects:
+        Lists all containers attached to the volume, force-removes them, and
+        retries volume removal when the Docker daemon reports a 409 conflict.
+    """
+    errors: list[str] = []
+    volume_error: BaseException | None = None
+
+    for attempt in range(_WORKSPACE_VOLUME_CLEANUP_ATTEMPTS):
+        try:
+            attached = list(
+                client.containers.list(
+                    all=True,
+                    filters={"volume": workspace_volume},
+                )
+                or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            attached = []
+            errors.append(
+                f"teardown_node: failed to list containers attached to '{workspace_volume}' - {exc}"
+            )
+
+        for container in attached:
+            cleanup_error = _force_remove_attached_container(container)
+            if cleanup_error:
+                errors.append(f"teardown_node: {cleanup_error}")
+
+        try:
+            client.volumes.get(workspace_volume).remove(force=True)
+            return True, errors
+        except Exception as exc:  # noqa: BLE001
+            if _docker_not_found(exc):
+                return True, errors
+            volume_error = exc
+            if not _docker_volume_in_use(exc):
+                break
+            if attempt < _WORKSPACE_VOLUME_CLEANUP_ATTEMPTS - 1:
+                time.sleep(_WORKSPACE_VOLUME_CLEANUP_RETRY_SECONDS)
+
+    if volume_error is not None:
+        errors.append(
+            f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {volume_error}"
+        )
+    return False, errors
 
 
 def _revert_unfixable_packages_in_json(
@@ -120,6 +238,34 @@ def _revert_unfixable_packages_in_json(
 
 
 def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
+    """Run teardown and return a reportable terminal state.
+
+    Args:
+        state: Current Phase 5 orchestration state.
+
+    Returns:
+        A state update containing the diff, cleanup diagnostics, and the
+        workspace volume name when cleanup could not complete.
+
+    Side Effects:
+        Reads changed files from the Docker workspace and attempts to remove
+        attached containers and the run-owned workspace volume.
+    """
+    try:
+        return _run_teardown_node_impl(state)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("teardown_node: unexpected teardown failure.")
+        return {
+            "status": "completed_with_errors",
+            "workspace_volume": state.get("workspace_volume"),
+            "changed_files": sorted(set(state.get("changed_files", []))),
+            "diff": "",
+            "errors": list(state.get("errors", []) or [])
+            + [f"teardown_node: unexpected teardown failure - {exc}"],
+        }
+
+
+def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node - Teardown.
 
@@ -151,6 +297,7 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
     diff_chunks: list[str] = []
     errors: list[str] = []
     client = None
+    volume_removed = not bool(workspace_volume)
 
     task_queue = state.get("task_queue", {})
     valid_groups = state.get("valid_groups", [])
@@ -238,8 +385,15 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         if workspace_volume:
             try:
                 client = get_docker_client()
-                client.volumes.get(workspace_volume).remove(force=True)
-                logger.info("teardown_node: removed workspace volume %s.", workspace_volume)
+                volume_removed, cleanup_errors = _cleanup_workspace_volume(client, workspace_volume)
+                errors.extend(cleanup_errors)
+                if volume_removed:
+                    logger.info("teardown_node: removed workspace volume %s.", workspace_volume)
+                else:
+                    logger.error(
+                        "teardown_node: workspace volume %s remains after cleanup.",
+                        workspace_volume,
+                    )
             except Exception as exc:  # noqa: BLE001
                 msg = (
                     f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {exc}"
@@ -248,13 +402,16 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
                 errors.append(msg)
             finally:
                 if client is not None:
-                    _close_client(client)
+                    try:
+                        _close_client(client)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"teardown_node: Docker client close failed - {exc}")
 
     terminal_has_errors = bool(state.get("errors")) or bool(errors)
     result: dict[str, Any] = {
         **barrier_state,
         "status": "completed_with_errors" if terminal_has_errors else "completed",
-        "workspace_volume": None,
+        "workspace_volume": None if volume_removed else workspace_volume,
         "changed_files": changed_files,
         "diff": "".join(diff_chunks),
     }

@@ -158,10 +158,17 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
         ),
         patch(
             "remediation_engine.orchestration.graph.run_teardown_node",
-            return_value={"status": "completed"},
+            return_value={
+                "status": "completed_with_errors",
+                "errors": ["workspace volume cleanup failed"],
+            },
         ),
     ):
         result = build_orchestrator_graph().invoke(state)
 
     assert "report" in build_orchestrator_graph().get_graph().nodes
+    assert "workspace volume cleanup failed" in result["report_markdown"]
     assert result["report_markdown"].startswith("# Remediation Run Report")
+    assert result["report_status"] == "rendered"
+    assert result["report_path"] is None
+    assert result["report_error"] is None

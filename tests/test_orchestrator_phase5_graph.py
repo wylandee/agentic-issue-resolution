@@ -4,6 +4,7 @@ Tests for the Phase 5 LangGraph orchestrator wiring.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -219,6 +220,8 @@ class TestPhase5RunOrchestrator:
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        report_dir = tmp_path / "reports"
+        monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
 
@@ -235,6 +238,13 @@ class TestPhase5RunOrchestrator:
         assert trajectory_path.startswith(str(trajectory_dir))
         assert trajectory_path.endswith(".md")
         assert trajectory_dir.joinpath(trajectory_path.split("\\")[-1]).exists()
+        assert result["report_status"] == "persisted"
+        assert result["report_path"]
+        assert Path(result["report_path"]).is_file()
+        trajectory_text = Path(trajectory_path).read_text(encoding="utf-8")
+        assert '"report_status": "persisted"' in trajectory_text
+        assert '"report_path":' in trajectory_text
+        assert Path(result["report_path"]).name in trajectory_text
 
     def test_failed_orchestration_still_writes_trajectory_and_preserves_error(
         self, tmp_path, monkeypatch
@@ -242,6 +252,8 @@ class TestPhase5RunOrchestrator:
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        report_dir = tmp_path / "reports"
+        monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
         mock_engine = MagicMock()
         mock_engine.invoke.side_effect = RuntimeError("graph exploded")
 
@@ -258,6 +270,11 @@ class TestPhase5RunOrchestrator:
         files = list(trajectory_dir.glob("*.md"))
         assert len(files) == 1
         assert "graph exploded" in files[0].read_text(encoding="utf-8")
+
+        report_files = list(report_dir.glob("*.md"))
+        assert len(report_files) == 1
+        report_text = report_files[0].read_text(encoding="utf-8")
+        assert "orchestrator failed before report phase" in report_text
 
     def test_trajectory_export_failure_does_not_mask_orchestration_error(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

@@ -95,6 +95,7 @@ from remediation_engine.orchestration.qa_critic import (
     build_qa_review_toolbelt,
     build_qa_toolbelt,
     build_targeted_test_command,
+    run_final_full_scan_node,
     run_qa_critic_node,
 )
 
@@ -165,6 +166,26 @@ def _make_workspace_tmpdir() -> Path:
     base_dir = Path("data/cache")
     base_dir.mkdir(exist_ok=True)
     return Path(tempfile.mkdtemp(dir=base_dir))
+
+
+# ---------------------------------------------------------------------------
+# final full scan failure routing
+# ---------------------------------------------------------------------------
+
+
+def test_final_full_scan_converts_docker_api_error_to_scan_failure() -> None:
+    """A Docker/API teardown error must return typed state instead of raising."""
+    state = {"workspace_volume": "agent_workspace_deadbeef", "valid_groups": []}
+    with patch(
+        "remediation_engine.orchestration.qa_critic.DockerSandbox",
+        side_effect=Exception("409 Client Error: Conflict (volume is in use)"),
+    ):
+        result = run_final_full_scan_node(state)
+
+    assert result["final_full_scan_completed"] is True
+    assert result["status"] == "final_scan_failed"
+    assert result["final_full_scan_result"].status == "scan_failed"
+    assert "409" in result["errors"][0]
 
 
 # ---------------------------------------------------------------------------

@@ -417,6 +417,9 @@ class OrchestratorState(TypedDict, total=False):
     langsmith_trace_url: str
     trajectory_path: str
     report_markdown: str
+    report_path: str | None
+    report_status: str
+    report_error: str | None
     errors: Annotated[list[str], operator.add]
 
 
@@ -515,6 +518,9 @@ def initial_orchestrator_state(
         "diff": "",
         "trajectory_path": "",
         "report_markdown": "",
+        "report_path": None,
+        "report_status": "pending",
+        "report_error": None,
         "errors": [],
     }
     if issues is not None:

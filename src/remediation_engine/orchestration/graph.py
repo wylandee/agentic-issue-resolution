@@ -93,6 +93,7 @@ from remediation_engine.orchestration.task_utils import (
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
+    build_phase5_trajectory_path,
     export_phase5_trajectory,
     invoke_with_trajectory,
     use_trajectory_recorder,
@@ -1350,9 +1351,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             # The attempt envelope is task-keyed, so normalize the nested
             # evaluation before it enters the authoritative correlation map.
             evaluation = evaluation.model_copy(update={"task_id": task_id})
-        attempt_snapshot = (state.get("attempt_snapshots_by_id") or {}).get(
-            task.current_attempt_id
-        )
+        attempt_snapshot = (state.get("attempt_snapshots_by_id") or {}).get(task.current_attempt_id)
         attempt_policy = (
             attempt_snapshot.get("qa_policy")
             if isinstance(attempt_snapshot, Mapping)
@@ -1509,6 +1508,65 @@ def run_orchestrator(
         run_error = exc
         raise
     finally:
+        if result is None:
+            fallback_errors = list(initial_state.get("errors", []) or [])
+            if run_error is not None:
+                fallback_errors.append(f"orchestrator failed before report phase: {run_error}")
+            else:
+                fallback_errors.append("orchestrator produced no final state before report phase")
+            result = {
+                **initial_state,
+                "status": "completed_with_errors",
+                "errors": fallback_errors,
+            }
+            try:
+                with use_trajectory_recorder(recorder):
+                    report_update = run_report_node(result)
+                    report_errors = list(report_update.pop("errors", []) or [])
+                    result.update(report_update)
+                    if report_errors:
+                        result["errors"] = fallback_errors + report_errors
+            except Exception as report_node_error:  # noqa: BLE001
+                log.exception("run_orchestrator: fallback report node failed")
+                result.setdefault("errors", []).append(
+                    f"report_node fallback failed: {report_node_error}"
+                )
+        planned_trajectory_path = build_phase5_trajectory_path(trace_id)
+        if result is not None:
+            result.setdefault("report_markdown", "")
+            result.setdefault("report_path", None)
+            result.setdefault("report_status", "pending")
+            result.setdefault("report_error", None)
+            result["trajectory_path"] = str(planned_trajectory_path)
+            try:
+                report_markdown, report_path = finalize_report(
+                    result,
+                    recorder=recorder,
+                    trajectory_path=str(planned_trajectory_path),
+                    trace_url=trace_url or result.get("langsmith_trace_url"),
+                    settings=settings,
+                )
+                result["report_markdown"] = report_markdown
+                if report_path is not None:
+                    result["report_path"] = str(report_path)
+                    result["report_status"] = "persisted"
+                    result["report_error"] = None
+                else:
+                    result["report_path"] = None
+                    result["report_status"] = "rendered" if report_markdown else "failed"
+                    result["report_error"] = "report persistence failed"
+                    result.setdefault("errors", []).append(
+                        "report persistence failed: no report path was returned"
+                    )
+            except Exception as report_error:  # noqa: BLE001 - report must not mask remediation
+                log.exception("run_orchestrator: report finalization failed")
+                result["report_path"] = None
+                result["report_status"] = "failed"
+                result["report_error"] = str(report_error)
+                result.setdefault("errors", []).append(
+                    f"report finalization failed: {report_error}"
+                )
+
         recorder.record_manual(
             name="phase5.root_output",
             run_type="state",
@@ -1530,6 +1588,7 @@ def run_orchestrator(
                 langsmith_enabled=langsmith_enabled,
                 langsmith_url=trace_url,
                 run_error=run_error,
+                output_path=planned_trajectory_path,
             )
             if result is not None:
                 result["trajectory_path"] = str(trajectory_path)
@@ -1537,24 +1596,6 @@ def run_orchestrator(
             log.warning("run_orchestrator: trajectory export failed: %s", export_error)
             if result is not None:
                 result.setdefault("errors", []).append(f"trajectory export failed: {export_error}")
-
-        if result is not None:
-            try:
-                report_markdown, report_path = finalize_report(
-                    result,
-                    recorder=recorder,
-                    trajectory_path=result.get("trajectory_path"),
-                    trace_url=trace_url or result.get("langsmith_trace_url"),
-                    settings=settings,
-                )
-                result["report_markdown"] = report_markdown
-                if report_path is not None:
-                    result["report_path"] = str(report_path)
-            except Exception as report_error:  # noqa: BLE001 - report must not mask remediation
-                log.exception("run_orchestrator: report finalization failed")
-                result.setdefault("errors", []).append(
-                    f"report finalization failed: {report_error}"
-                )
 
     log.info(
         "run_orchestrator: repo_root=%s groups=%d final_status=%s",

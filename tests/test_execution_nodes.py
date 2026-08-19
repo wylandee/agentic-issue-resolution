@@ -245,6 +245,74 @@ class TestTeardownNode:
         assert result["changed_files"] == []
         assert result["diff"] == ""
 
+    def test_attached_container_is_removed_before_volume(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        client = MagicMock()
+        attached = MagicMock()
+        attached.name = "/adoring_hertz"
+        client.containers.list.return_value = [attached]
+
+        with patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ):
+            result = run_teardown_node(state)
+
+        client.containers.list.assert_called_once_with(
+            all=True,
+            filters={"volume": "agent_workspace_deadbeef"},
+        )
+        attached.remove.assert_called_once_with(force=True)
+        client.volumes.get.return_value.remove.assert_called_once_with(force=True)
+        assert result["workspace_volume"] is None
+
+    def test_volume_conflict_is_retried_after_attached_container_cleanup(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        client.volumes.get.return_value.remove.side_effect = [
+            RuntimeError("409 Client Error: Conflict (volume is in use)"),
+            None,
+        ]
+
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+            patch("remediation_engine.orchestration.teardown_node.time.sleep") as sleep,
+        ):
+            result = run_teardown_node(state)
+
+        assert client.volumes.get.return_value.remove.call_count == 2
+        sleep.assert_called_once()
+        assert result["status"] == "completed"
+        assert result["workspace_volume"] is None
+
+    def test_persistent_volume_conflict_is_reported_without_raising(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        client.volumes.get.return_value.remove.side_effect = RuntimeError(
+            "409 Client Error: Conflict (volume is in use)"
+        )
+
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+            patch("remediation_engine.orchestration.teardown_node.time.sleep"),
+        ):
+            result = run_teardown_node(state)
+
+        assert result["status"] == "completed_with_errors"
+        assert result["workspace_volume"] == "agent_workspace_deadbeef"
+        assert any("failed to remove workspace volume" in error for error in result["errors"])
+
     def test_existing_errors_produce_completed_with_errors_status(self, tmp_path):
         """Teardown preserves a failed worker outcome in its terminal status."""
         state = initial_orchestrator_state(str(tmp_path), [])

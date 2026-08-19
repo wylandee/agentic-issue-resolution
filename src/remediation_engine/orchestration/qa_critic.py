@@ -6040,7 +6040,7 @@ def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
                 target_identifiers,
                 baseline,
             )
-    except RuntimeError as exc:
+    except Exception as exc:  # noqa: BLE001 - scan failures must reach teardown/report
         error = f"final_full_scan: Docker sandbox unavailable - {exc}"
         result = FinalFullScanResult(
             completed=False,

@@ -1,10 +1,10 @@
 """Deterministic human-readable reporting for a Phase 5 remediation run.
 
-The graph node in this module only renders the state that is available before
-the graph exits.  ``finalize_report`` runs after trajectory export so the
-canonical report can include final timing, token usage, trace references, and
-an atomically persisted path.  The optional LLM call is limited to an
-executive narrative and cannot determine any report facts or statuses.
+The graph node renders the state available after teardown and before the graph
+exits.  The orchestrator then finalizes and persists that report before the
+final trajectory export, so both artifacts contain the same report metadata.
+The optional LLM call is limited to an executive narrative and cannot
+determine any report facts or statuses.
 """
 
 from __future__ import annotations
@@ -1000,11 +1000,19 @@ def _write_report_atomic(path: Path, markdown: str) -> None:
 def run_report_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Render the preliminary report as the terminal graph node."""
     try:
-        return {"report_markdown": generate_report(state)}
+        return {
+            "report_markdown": generate_report(state),
+            "report_path": None,
+            "report_status": "rendered",
+            "report_error": None,
+        }
     except Exception as exc:  # noqa: BLE001 - reporting must not mask remediation
         log.exception("report_node: deterministic rendering failed")
         return {
             "report_markdown": "",
+            "report_path": None,
+            "report_status": "failed",
+            "report_error": str(exc),
             "errors": [f"report_node: failed to render report: {exc}"],
         }
 
