@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from remediation_engine.orchestration.graph import build_orchestrator_graph
 from remediation_engine.orchestration.report_node import (
-    _compact_text,
+    _full_text,
     finalize_report,
     generate_report,
     run_report_node,
@@ -203,6 +203,7 @@ def test_report_separates_targeted_success_from_new_scan_findings_and_qa_records
         {
             "cve_id": "CVE-2026-0001",
             "ghsa_id": "GHSA-AAAA-BBBB-CCCC",
+            "finding_id": "ghsa-aaaa-bbbb-cccc",
             "package_name": "new-package",
             "source": "odc",
             "file_path": "package-lock.json",
@@ -234,6 +235,7 @@ def test_report_separates_targeted_success_from_new_scan_findings_and_qa_records
     assert "3 unique identifiers" in report
     assert "### Newly Detected Findings" in report
     assert "CVE-2026-0001, GHSA-AAAA-BBBB-CCCC" in report
+    assert "GHSA-AAAA-BBBB-CCCC, ghsa-aaaa-bbbb-cccc" not in report
     assert "Overall outcome: **Successful**" not in report
 
 
@@ -405,16 +407,69 @@ def test_report_renders_historical_retry_activity_and_latest_action_per_task():
     assert report.count("Earlier attempt summary.") == 0
 
 
-def test_report_text_truncation_is_word_safe_and_uses_ellipsis():
-    """Long report prose ends at a complete word before the ellipsis."""
-    text = "A completed remediation attempt remains unchanged after validation and review."
+def test_report_text_preserves_full_text_without_truncation():
+    """Report prose retains line breaks and the complete source text."""
+    text = "A completed remediation attempt.\nThe full conclusion remains available."
 
-    compact = _compact_text(text, limit=36)
-    visible = compact.removesuffix("…")
-    valid_prefixes = {" ".join(text.split()[:index]) for index in range(1, len(text.split()) + 1)}
+    assert _full_text(text) == text
 
-    assert compact.endswith("…")
-    assert visible in valid_prefixes
+
+def test_report_renders_full_prose_and_failed_qa_attempt_history():
+    """Full retry, QA, action, and repair prose is rendered without ellipses."""
+    state = _state()
+    retry_instruction = "retry instruction " + " ".join(f"detail-{index}" for index in range(120))
+    retry_reason = "retry reason " + " ".join(f"reason-{index}" for index in range(120))
+    qa_feedback = "QA feedback " + " ".join(f"feedback-{index}" for index in range(120))
+    action_summary = "worker summary " + " ".join(f"summary-{index}" for index in range(120))
+    repair_reason = "repair reason " + " ".join(f"repair-{index}" for index in range(120))
+    state["retry_plans_by_task"] = {
+        "task-1": {
+            "action": "retry_update",
+            "instructions": retry_instruction,
+        }
+    }
+    state["retry_diagnostics_by_task"] = {
+        "task-1": {
+            "task_id": "task-1",
+            "strategy_stage": "npm_latest",
+            "reasoning_summary": retry_reason,
+        }
+    }
+    state["qa_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "evaluation": {
+                "task_id": "task-1",
+                "passed": False,
+                "failure_category": "security_flag",
+                "retry_feedback": qa_feedback,
+            },
+        }
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 1,
+            "status": "surrender",
+            "summary": action_summary,
+        }
+    ]
+    state["consistency_events"] = [
+        {"event_type": "repair", "reason": repair_reason},
+    ]
+
+    report = generate_report(state)
+
+    assert retry_instruction in report
+    assert retry_reason in report
+    assert qa_feedback in report
+    assert action_summary in report
+    assert repair_reason in report
+    assert "### Failed QA Gates (Attempt History)" in report
+    assert "| task-1 | attempt-1 | security_flag |" in report
+    assert "…" not in report
 
 
 def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():

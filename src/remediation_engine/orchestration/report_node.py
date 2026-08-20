@@ -210,27 +210,15 @@ def _text(value: Any, default: str = "") -> str:
     return str(enum_value if enum_value is not None else value)
 
 
-def _compact_text(value: Any, limit: int = 240) -> str:
-    """Compact report prose without cutting a word in half.
+def _full_text(value: Any, default: str = "—") -> str:
+    """Return complete report prose without truncating or normalizing it.
 
-    Whitespace is normalized because these values are rendered inside Markdown
-    table cells. When truncation is necessary, the final visible character is
-    an ellipsis and the preceding text ends at a word boundary. A single very
-    long token is retained whole rather than being silently corrupted.
+    Markdown table escaping is applied later by :func:`_escape_cell`, so this
+    helper deliberately preserves internal whitespace and line breaks. Empty
+    values still receive the report's standard placeholder.
     """
-    text = re.sub(r"\s+", " ", _text(value).strip())
-    if not text:
-        return "—"
-    if limit <= 1:
-        return "…"
-    if len(text) <= limit:
-        return text
-
-    budget = max(1, limit - 1)
-    prefix = text[:budget].rstrip()
-    boundary = prefix.rfind(" ")
-    prefix = prefix[:boundary] if boundary > 0 else text.split(" ", 1)[0]
-    return f"{prefix}…"
+    text = _text(value)
+    return text if text.strip() else default
 
 
 def _items(value: Any) -> list[Any]:
@@ -550,14 +538,25 @@ def _qa_record_summary(
 
 def _issue_identifiers(issue: Any) -> list[str]:
     """Return scanner-facing identifiers for one typed vulnerability issue."""
-    return _unique_texts(
-        [
-            _value(issue, "cve_id"),
-            _value(issue, "ghsa_id"),
-            _value(issue, "rule_id"),
-            _value(issue, "finding_id"),
-        ]
-    )
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for value in (
+        _value(issue, "cve_id"),
+        _value(issue, "ghsa_id"),
+        _value(issue, "rule_id"),
+        _value(issue, "finding_id"),
+    ):
+        identifier = _text(value).strip()
+        if not identifier:
+            continue
+        if re.match(r"^(?:CVE|GHSA)-", identifier, flags=re.IGNORECASE):
+            identifier = identifier.upper()
+        key = identifier.casefold()
+        if key in seen:
+            continue
+        identifiers.append(identifier)
+        seen.add(key)
+    return identifiers
 
 
 def _build_context(
@@ -1083,6 +1082,50 @@ def _action_attempt_id(context: _ReportContext, task_id: str, summary: Any) -> s
     return max(candidates)[1] if candidates else "—"
 
 
+def _failed_qa_rows(context: _ReportContext) -> list[tuple[str, str, str, str]]:
+    """Return failed QA evaluations with attempt provenance when available.
+
+    Attempt envelopes are the authoritative historical record and may contain
+    multiple failed evaluations for one task across retries. The final
+    ``qa_evaluations`` map is retained as a fallback for callers that do not
+    provide attempt envelopes, but is not duplicated when an attempt record
+    already covers the same task.
+    """
+    rows: list[tuple[str, str, str, str]] = []
+    attempt_task_ids: set[str] = set()
+    for key, result in sorted(context.qa_results.items()):
+        evaluation = _value(result, "evaluation")
+        if evaluation is None:
+            continue
+        task_id = _text(_value(evaluation, "task_id")) or _text(_value(result, "task_id")) or key
+        attempt_task_ids.add(task_id)
+        if bool(_value(evaluation, "passed", False)):
+            continue
+        attempt_id = _text(_value(result, "attempt_id"), key) or key
+        rows.append(
+            (
+                task_id,
+                attempt_id,
+                _text(_value(evaluation, "failure_category"), "unknown"),
+                _full_text(_value(evaluation, "retry_feedback")),
+            )
+        )
+
+    for key, evaluation in sorted(context.qa_evaluations.items()):
+        task_id = _text(_value(evaluation, "task_id")) or key
+        if task_id in attempt_task_ids or bool(_value(evaluation, "passed", False)):
+            continue
+        rows.append(
+            (
+                task_id,
+                _full_text(_value(evaluation, "attempt_id")),
+                _text(_value(evaluation, "failure_category"), "unknown"),
+                _full_text(_value(evaluation, "retry_feedback")),
+            )
+        )
+    return sorted(rows, key=lambda row: (row[0], row[1]))
+
+
 def _targeted_remediation_summary(context: _ReportContext) -> str:
     """Summarize the outcome for the original actionable groups."""
     return (
@@ -1283,12 +1326,11 @@ def _render_key_decisions(context: _ReportContext) -> str:
                 task_id,
                 _text(_value(plan, "action"), _text(_value(plan, "next_node"), "retry")),
                 _text(_value(plan, "selected_version"), "—"),
-                _compact_text(
+                _full_text(
                     _value(plan, "instructions"),
-                    240,
                 )
                 if _value(plan, "instructions")
-                else _compact_text(_value(plan, "reason"), 240),
+                else _full_text(_value(plan, "reason")),
             )
         )
     if not retry_rows:
@@ -1311,7 +1353,7 @@ def _render_key_decisions(context: _ReportContext) -> str:
                 _diagnostic_versions(diagnostic, "attempted_versions"),
                 _diagnostic_versions(diagnostic, "executed_versions"),
                 _retry_outcome(context, task_id, diagnostic),
-                _compact_text(reason, 240),
+                _full_text(reason),
             )
         )
     if not historical_retry_rows:
@@ -1319,18 +1361,9 @@ def _render_key_decisions(context: _ReportContext) -> str:
             ("None", "—", "—", "—", "—", "—", "—", "No historical retry/pivot activity recorded")
         ]
 
-    failed_qa: list[tuple[Any, ...]] = []
-    for key, evaluation in sorted(context.qa_evaluations.items()):
-        if not bool(_value(evaluation, "passed", False)):
-            failed_qa.append(
-                (
-                    key,
-                    _text(_value(evaluation, "failure_category"), "unknown"),
-                    _compact_text(_value(evaluation, "retry_feedback"), 240),
-                )
-            )
+    failed_qa = _failed_qa_rows(context)
     if not failed_qa:
-        failed_qa = [("None", "—", "No failed QA evaluations recorded")]
+        failed_qa = [("None", "—", "—", "No failed QA evaluations recorded")]
 
     strategies_by_group = dict(context.group_strategies)
     for task in context.task_queue.values():
@@ -1367,7 +1400,7 @@ def _render_key_decisions(context: _ReportContext) -> str:
                 _action_attempt_id(context, task_id, summary),
                 revision if revision is not None else "—",
                 f"{history_count} {'summary' if history_count == 1 else 'summaries'}",
-                _compact_text(action_text, 240),
+                _full_text(action_text),
             )
         )
     if not action_rows:
@@ -1376,7 +1409,7 @@ def _render_key_decisions(context: _ReportContext) -> str:
     event_rows = [
         (
             _text(_value(event, "event_type"), "consistency event"),
-            _compact_text(_value(event, "reason"), 240),
+            _full_text(_value(event, "reason")),
         )
         for event in context.consistency_events
     ] or [("None", "No consistency repairs recorded")]
@@ -1404,9 +1437,9 @@ def _render_key_decisions(context: _ReportContext) -> str:
                 historical_retry_rows,
             ),
             "",
-            "### Failed QA Gates",
+            "### Failed QA Gates (Attempt History)",
             "",
-            _table(("Task/group", "Category", "Feedback"), failed_qa),
+            _table(("Task/group", "Attempt", "Category", "Feedback"), failed_qa),
             "",
             "### Initial Strategy Selections",
             "",
