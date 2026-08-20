@@ -97,6 +97,10 @@ _ODC_CACHE_VOLUME = "odc-cache"
 _ODC_DEBUG_DIR = Path("data/cache/qa_reports")
 _ODC_LOG_DIR = _ODC_DEBUG_DIR / "odc_logs"
 _ODC_CLEANUP_TIMEOUT_SECONDS = 30
+_ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
+    "**/.remedy-attempt-snapshots/**",
+    "**/.odc-targeted/**",
+)
 
 # LLM context budget limits
 _DIFF_CHAR_BUDGET = 8_000
@@ -688,6 +692,10 @@ def _odc_command(
         scan_path,
         "--noupdate",
     ]
+
+    if scan_subdir is None:
+        for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES:
+            cmd.extend(["--exclude", pattern])
 
     extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
     if extra_args:

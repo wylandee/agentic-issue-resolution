@@ -60,6 +60,7 @@ from remediation_engine.orchestration.qa_critic import (
     _NPM_TEST_TIMEOUT_SECONDS,
     _ODC_CACHE_VOLUME,
     _ODC_HTML_REPORT_NAME,
+    _ODC_INTERNAL_FULL_SCAN_EXCLUDES,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
     GroupInvestigation,
@@ -88,6 +89,7 @@ from remediation_engine.orchestration.qa_critic import (
     _run_judge_phase,
     _run_odc,
     _run_security_scan,
+    _run_targeted_odc,
     _run_unit_tests,
     _scan_state_projection,
     _SecurityScanResult,
@@ -638,6 +640,23 @@ class TestRunOdc:
             args = mock_run.call_args[0][0]
             joined = " ".join(args)
             assert _ODC_CACHE_VOLUME in joined
+
+    def test_excludes_engine_state_from_full_scan(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _run_odc("test-vol")
+            args = mock_run.call_args[0][0]
+
+        excludes = {args[index + 1] for index, argument in enumerate(args[:-1]) if argument == "--exclude"}
+        assert set(_ODC_INTERNAL_FULL_SCAN_EXCLUDES).issubset(excludes)
+
+    def test_does_not_exclude_targeted_scan_root(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _run_targeted_odc("test-vol", ".odc-targeted")
+            args = mock_run.call_args[0][0]
+
+        assert not any(pattern in args for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES)
 
     def test_assigns_unique_named_container_for_cleanup(self):
         with patch("subprocess.run") as mock_run:
