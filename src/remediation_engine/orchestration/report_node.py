@@ -85,6 +85,38 @@ _NON_PACKAGE_KEYS = {
     "types",
     "workspaces",
 }
+_KNOWN_ERROR_SOURCES = {
+    "docker",
+    "final_full_scan",
+    "odc",
+    "qa_critic",
+    "report_node",
+    "scan",
+    "supervisor",
+    "teardown",
+    "update_subagent",
+    "workaround_subagent",
+    "workspace_builder",
+}
+_KNOWN_ERROR_CODES = {
+    "INVALID_PLANNER_COMMIT",
+    "ODC_TIMEOUT",
+    "PLANNER_SEMANTIC_VALIDATION",
+    "QA_OUTPUT_VALIDATION",
+    "STALE_ATTEMPT_RESULT",
+    "STALE_PIVOT_REPAIR",
+    "VALIDATION_INPUT_LIMIT_REACHED",
+}
+_SCAN_COMPLETE_STATUSES = {
+    "clear",
+    "completed",
+    "detected",
+    "none",
+    "not_detected",
+    "scan_completed",
+    "success",
+    "unresolved",
+}
 
 
 @dataclass(frozen=True)
@@ -111,9 +143,10 @@ class _ReportContext:
     groups_unresolved: int
     groups_inconclusive: int
     groups_pending: int
-    groups_retriage_discovered: int
+    groups_retriage_discovered: int | None
     consistency_events: list[Any]
     error_strings: list[str]
+    error_records: list[_ErrorRecord]
     initial_valid_groups: list[Any]
     final_valid_groups: list[Any]
     issues: list[Any]
@@ -129,6 +162,7 @@ class _ReportContext:
     attempt_snapshots: dict[str, Any]
     retry_diagnostics: dict[str, Any]
     final_full_scan_result: Any
+    triage_required: bool
     post_remediation_scan_issues: list[Any]
     post_remediation_scan_identifiers: list[str]
     new_vulnerability_identifiers: list[str]
@@ -151,6 +185,16 @@ class _PackageChange:
     scope: str
 
 
+@dataclass(frozen=True)
+class _ErrorRecord:
+    """One deduplicated, source-aware critical error for the report."""
+
+    source: str
+    code: str
+    message: str
+    occurrences: int
+
+
 def _value(item: Any, key: str, default: Any = None) -> Any:
     """Read a field from either a Pydantic object or a mapping."""
     if isinstance(item, Mapping):
@@ -164,6 +208,29 @@ def _text(value: Any, default: str = "") -> str:
         return default
     enum_value = getattr(value, "value", None)
     return str(enum_value if enum_value is not None else value)
+
+
+def _compact_text(value: Any, limit: int = 240) -> str:
+    """Compact report prose without cutting a word in half.
+
+    Whitespace is normalized because these values are rendered inside Markdown
+    table cells. When truncation is necessary, the final visible character is
+    an ellipsis and the preceding text ends at a word boundary. A single very
+    long token is retained whole rather than being silently corrupted.
+    """
+    text = re.sub(r"\s+", " ", _text(value).strip())
+    if not text:
+        return "—"
+    if limit <= 1:
+        return "…"
+    if len(text) <= limit:
+        return text
+
+    budget = max(1, limit - 1)
+    prefix = text[:budget].rstrip()
+    boundary = prefix.rfind(" ")
+    prefix = prefix[:boundary] if boundary > 0 else text.split(" ", 1)[0]
+    return f"{prefix}…"
 
 
 def _items(value: Any) -> list[Any]:
@@ -217,11 +284,23 @@ def _reconciliation_ids(reconciliation: Mapping[str, Any], *names: str) -> list[
 
 
 def _group_tree(task_queue: Mapping[str, Any], group_id: str) -> list[Any]:
-    """Return the root task and all descendants for one original group."""
+    """Return the root task and all descendants for one task group.
+
+    Pivot tasks retain their original task as parent_task_id while moving
+    to a new parent_group_id. A child-group task is therefore a root from
+    that child's perspective even though it is not globally root-like.
+    """
+    group_tasks = [
+        task for task in task_queue.values() if _value(task, "parent_group_id") == group_id
+    ]
+    group_task_ids = {
+        _text(_value(task, "task_id")) for task in group_tasks if _value(task, "task_id")
+    }
     roots = [
         task
-        for task in task_queue.values()
-        if _value(task, "parent_group_id") == group_id and _value(task, "parent_task_id") is None
+        for task in group_tasks
+        if _value(task, "parent_task_id") is None
+        or _text(_value(task, "parent_task_id")) not in group_task_ids
     ]
     result: list[Any] = []
     children: dict[str, list[Any]] = defaultdict(list)
@@ -230,11 +309,16 @@ def _group_tree(task_queue: Mapping[str, Any], group_id: str) -> list[Any]:
         if parent:
             children[str(parent)].append(task)
     stack = sorted(roots, key=lambda task: _text(_value(task, "task_id")))
+    visited: set[str] = set()
     while stack:
         task = stack.pop(0)
+        task_id = _text(_value(task, "task_id"))
+        if task_id in visited:
+            continue
+        visited.add(task_id)
         result.append(task)
         stack[0:0] = sorted(
-            children.get(_text(_value(task, "task_id")), []),
+            children.get(task_id, []),
             key=lambda child: _text(_value(child, "task_id")),
         )
     return result
@@ -259,6 +343,8 @@ def _group_status(task_queue: Mapping[str, Any], group_id: str) -> str:
         return "needs_retry"
     if "optimistically_fixed" in statuses:
         return "optimistically_fixed"
+    if "pivoted" in statuses:
+        return "pivoted"
     return "pending"
 
 
@@ -282,6 +368,8 @@ def _overall_label(
     else:
         base = "Inconclusive"
 
+    if new_vulnerability_status in {"scan_failed", "failed"} and base == "Successful":
+        base = "Completed with errors"
     if new_vulnerability_status == "detected" or new_identifier_count:
         if base == "Successful":
             return "Completed with new findings"
@@ -309,21 +397,120 @@ def _extract_token_summary(recorder: TrajectoryRecorder | None) -> dict[str, Any
     }
 
 
-def _error_strings(state: Mapping[str, Any]) -> list[str]:
-    """Collect critical run errors and final-scan errors in stable order."""
-    result: list[str] = []
-    seen: set[str] = set()
+def _error_source_and_message(candidate: Any) -> tuple[str, str, str | None]:
+    """Extract a source, message, and optional explicit code from an error."""
+    explicit_code = _text(_value(candidate, "error_code")).strip() or None
+    if explicit_code:
+        source = _text(_value(candidate, "source"), "consistency").strip() or "consistency"
+        message = _text(_value(candidate, "details"), explicit_code).strip()
+        return source, message, explicit_code
+
+    source = "run"
+    message = _text(candidate).strip()
+    while message:
+        match = re.match(r"^(?P<source>[A-Za-z][A-Za-z0-9_-]*):\s*(?P<message>.+)$", message)
+        if not match:
+            break
+        prefix = match.group("source")
+        if prefix.upper() in _KNOWN_ERROR_CODES:
+            return source, match.group("message").strip(), prefix.upper()
+        if prefix.lower() not in _KNOWN_ERROR_SOURCES:
+            break
+        source = prefix.lower()
+        message = match.group("message").strip()
+    return source, message, None
+
+
+def _classify_error(source: str, message: str, explicit_code: str | None) -> str:
+    """Map known failure wording to a stable report error code."""
+    if explicit_code:
+        return explicit_code.upper()
+    lowered = message.lower()
+    if ("timeout" in lowered or "timed out" in lowered) and (
+        source in {"final_full_scan", "odc", "qa_critic"}
+        or "odc" in lowered
+        or "dependency-check" in lowered
+        or "dependency check" in lowered
+    ):
+        return "ODC_TIMEOUT"
+    if "invalid planner commit" in lowered:
+        return "INVALID_PLANNER_COMMIT"
+    if "planner" in lowered and "semantic" in lowered and "valid" in lowered:
+        return "PLANNER_SEMANTIC_VALIDATION"
+    if "validation input" in lowered and "limit" in lowered:
+        return "VALIDATION_INPUT_LIMIT_REACHED"
+    if (
+        "stale" in lowered
+        and ("attempt" in lowered or "instruction" in lowered)
+        or "ignored revised instruction" in lowered
+    ):
+        return "STALE_ATTEMPT_RESULT"
+    if "structured" in lowered and "qa" in lowered and "valid" in lowered:
+        return "QA_OUTPUT_VALIDATION"
+    if "terminalized" in lowered and "pivot" in lowered:
+        return "STALE_PIVOT_REPAIR"
+    return "ERROR"
+
+
+def _error_records(state: Mapping[str, Any]) -> list[_ErrorRecord]:
+    """Collect critical errors by normalized message/code with source counts."""
     candidates = _items(state.get("errors"))
     final_scan = state.get("final_full_scan_result")
     scan_error = _value(final_scan, "error")
     if scan_error:
         candidates.append(f"final_full_scan: {scan_error}")
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for candidate in candidates:
-        text = _text(candidate).strip()
-        if text and text not in seen:
-            result.append(text)
-            seen.add(text)
-    return result
+        source, message, explicit_code = _error_source_and_message(candidate)
+        message = re.sub(r"\s+", " ", message).strip()
+        if not message:
+            continue
+        code = _classify_error(source, message, explicit_code)
+        key = (code, message.casefold())
+        record = grouped.setdefault(key, {"source": [], "message": message, "occurrences": 0})
+        record["occurrences"] += 1
+        if source not in record["source"]:
+            record["source"].append(source)
+
+    return [
+        _ErrorRecord(
+            source=", ".join(data["source"]),
+            code=code,
+            message=data["message"],
+            occurrences=int(data["occurrences"]),
+        )
+        for (code, _), data in grouped.items()
+    ]
+
+
+def _error_strings(state: Mapping[str, Any]) -> list[str]:
+    """Return stable error strings for bounded narrative evidence."""
+    return [f"{record.source}/{record.code}: {record.message}" for record in _error_records(state)]
+
+
+def _scan_evidence_state(final_scan: Any, new_status: str = "") -> str:
+    """Classify authoritative post-remediation scan evidence.
+
+    Returns `complete` only when the scan produced a usable result,
+    `failed` when it explicitly failed, and `not_scanned` when no
+    authoritative result is available.
+    """
+    status = _text(_value(final_scan, "status")).strip().lower()
+    normalized_new_status = new_status.strip().lower()
+    if status in {"scan_failed", "failed", "error", "timeout"} or normalized_new_status in {
+        "scan_failed",
+        "failed",
+    }:
+        return "failed"
+    if final_scan is None:
+        return "complete" if normalized_new_status in _SCAN_COMPLETE_STATUSES else "not_scanned"
+    completed = _value(final_scan, "completed")
+    if completed is False:
+        return "not_scanned" if status in {"", "not_scanned"} else "failed"
+    if completed is True or status in _SCAN_COMPLETE_STATUSES:
+        return "complete"
+    return "not_scanned"
 
 
 def _unique_texts(values: Sequence[Any]) -> list[str]:
@@ -446,6 +633,14 @@ def _build_context(
         state.get("new_vulnerability_status") or _value(final_scan, "status"),
         "not_scanned",
     )
+    scan_evidence_state = _scan_evidence_state(final_scan, new_status)
+    triage_required_value = state.get("triage_required")
+    triage_required = bool(
+        _value(final_scan, "triage_required")
+        if triage_required_value is None
+        else triage_required_value
+    )
+    error_records = _error_records(state)
     qa_evaluations = _mapping(state.get("qa_evaluations"))
     qa_results = _mapping(state.get("qa_results_by_attempt"))
     recorded_qa_total = _qa_record_summary(qa_evaluations, qa_results)
@@ -473,9 +668,14 @@ def _build_context(
         groups_unresolved=counts["unresolved"],
         groups_inconclusive=counts["inconclusive"],
         groups_pending=counts["pending"],
-        groups_retriage_discovered=len(added_ids) + len(reappeared_ids),
+        groups_retriage_discovered=(
+            len(added_ids) + len(reappeared_ids) if scan_evidence_state == "complete" else None
+        ),
         consistency_events=_items(state.get("consistency_events")),
-        error_strings=_error_strings(state),
+        error_strings=[
+            f"{record.source}/{record.code}: {record.message}" for record in error_records
+        ],
+        error_records=error_records,
         initial_valid_groups=initial_groups,
         final_valid_groups=final_groups,
         issues=issues,
@@ -491,6 +691,7 @@ def _build_context(
         attempt_snapshots=_mapping(state.get("attempt_snapshots_by_id")),
         retry_diagnostics=_mapping(state.get("retry_diagnostics_by_task")),
         final_full_scan_result=final_scan,
+        triage_required=triage_required,
         post_remediation_scan_issues=post_scan_issues,
         post_remediation_scan_identifiers=post_scan_identifiers,
         new_vulnerability_identifiers=new_identifiers,
@@ -757,6 +958,131 @@ def _package_changes(diff: str) -> list[_PackageChange]:
     return sorted(changes, key=lambda change: (change.scope != "direct", change.name))
 
 
+def _usable_package_name(value: Any) -> str | None:
+    """Return a package label when the value is meaningful trace metadata."""
+    text = _text(value).strip()
+    if not text or text in {"-", "—", "None", "unknown"}:
+        return None
+    return text
+
+
+def _package_for_task(
+    context: _ReportContext,
+    task_id: str,
+    snapshot: Any = None,
+    worker_result: Any = None,
+    diagnostic: Any = None,
+) -> str:
+    """Recover a worker package name from attempt, task, retry, or group metadata."""
+    task = context.task_queue.get(task_id)
+    candidates = [
+        _value(snapshot, "target_package_name"),
+        _value(worker_result, "target_package_name"),
+        _value(task, "target_package_name"),
+        _value(task, "parent_package_name"),
+        _value(diagnostic, "target_package_name"),
+        _value(diagnostic, "parent_package_name"),
+    ]
+    for candidate in candidates:
+        package = _usable_package_name(candidate)
+        if package:
+            return package
+
+    versions_by_target = _mapping(_value(diagnostic, "attempted_versions_by_target"))
+    for package_name in versions_by_target:
+        package = _usable_package_name(package_name)
+        if package:
+            return package
+
+    group_ids = [_text(_value(task, "parent_group_id"))]
+    for group_id in group_ids:
+        for group in [*context.initial_valid_groups, *context.final_valid_groups]:
+            if _text(_value(group, "group_id")) != group_id:
+                continue
+            package = _usable_package_name(_value(group, "vulnerable_component"))
+            if package:
+                return package
+    return "unknown — package missing from trace"
+
+
+def _diagnostic_versions(diagnostic: Any, field_name: str) -> str:
+    """Format version evidence, retaining per-target detail when available."""
+    versions_by_target = _mapping(_value(diagnostic, "attempted_versions_by_target"))
+    if field_name == "executed_versions":
+        versions_by_target = _mapping(_value(diagnostic, "executed_versions_by_target"))
+    if versions_by_target:
+        return (
+            "; ".join(
+                f"{package}: {', '.join(_text(version) for version in _items(versions))}"
+                for package, versions in sorted(versions_by_target.items())
+                if _items(versions)
+            )
+            or "—"
+        )
+    versions = _items(_value(diagnostic, field_name))
+    return ", ".join(_text(version) for version in versions) or "—"
+
+
+def _retry_outcome(context: _ReportContext, task_id: str, diagnostic: Any) -> str:
+    """Summarize the terminal meaning of one historical retry diagnostic."""
+    task_status = _text(_value(context.task_queue.get(task_id), "status")).lower()
+    if task_status == "unfixable" or bool(_value(diagnostic, "package_abandoned")):
+        return "unfixable"
+    if bool(_value(diagnostic, "exhausted_update_path")):
+        return "update path exhausted"
+    if _text(_value(diagnostic, "failure_reason")).strip():
+        return "failed"
+    if _items(_value(diagnostic, "executed_versions")):
+        return "executed"
+    return "recorded"
+
+
+def _latest_action_summaries(
+    summaries: Sequence[Any],
+) -> list[tuple[str, Any, int]]:
+    """Keep the latest action summary and history count for each task."""
+    grouped: dict[str, list[tuple[int, Any]]] = defaultdict(list)
+    for index, summary in enumerate(summaries):
+        task_id = _text(_value(summary, "task_id"), "unknown")
+        grouped[task_id].append((index, summary))
+
+    latest: list[tuple[str, Any, int]] = []
+    for task_id, entries in grouped.items():
+
+        def sort_key(entry: tuple[int, Any]) -> tuple[int, int]:
+            index, summary = entry
+            revision = _value(summary, "task_revision")
+            try:
+                normalized_revision = int(revision) if revision is not None else -1
+            except (TypeError, ValueError):
+                normalized_revision = -1
+            return normalized_revision, index
+
+        _, summary = max(entries, key=sort_key)
+        latest.append((task_id, summary, len(entries)))
+    return sorted(latest, key=lambda item: item[0])
+
+
+def _action_attempt_id(context: _ReportContext, task_id: str, summary: Any) -> str:
+    """Return an action's attempt ID, falling back to a correlated worker result."""
+    attempt_id = _text(_value(summary, "attempt_id")).strip()
+    if attempt_id:
+        return attempt_id
+    task_revision = _value(summary, "task_revision")
+    candidates: list[tuple[int, str]] = []
+    for key, worker_result in context.worker_results.items():
+        if _text(_value(worker_result, "task_id")) != task_id:
+            continue
+        revision = _value(worker_result, "task_revision")
+        try:
+            normalized_revision = int(revision) if revision is not None else -1
+        except (TypeError, ValueError):
+            normalized_revision = -1
+        if task_revision is None or normalized_revision == task_revision:
+            candidates.append((normalized_revision, key))
+    return max(candidates)[1] if candidates else "—"
+
+
 def _targeted_remediation_summary(context: _ReportContext) -> str:
     """Summarize the outcome for the original actionable groups."""
     return (
@@ -769,6 +1095,13 @@ def _targeted_remediation_summary(context: _ReportContext) -> str:
 
 def _post_scan_summary(context: _ReportContext) -> str:
     """Summarize post-remediation scan evidence without conflating its counts."""
+    scan_state = _scan_evidence_state(
+        context.final_full_scan_result, context.new_vulnerability_status
+    )
+    if scan_state == "failed":
+        return "Scanner validation failed"
+    if scan_state != "complete":
+        return "Not scanned"
     status = context.new_vulnerability_status
     if status == "detected" or context.new_vulnerability_identifiers:
         return (
@@ -776,13 +1109,34 @@ def _post_scan_summary(context: _ReportContext) -> str:
             f"{len(context.post_remediation_scan_identifiers)} unique identifiers; "
             f"{len(context.new_vulnerability_identifiers)} new identifiers detected"
         )
-    if status in {"scan_failed", "failed"}:
-        return "Scanner validation failed"
     if status in {"none", "clear", "not_detected"}:
         return "No post-remediation findings detected"
-    if status == "not_scanned":
-        return "Not scanned"
     return status
+
+
+def _scan_assessment_text(context: _ReportContext) -> str:
+    """Describe unavailable post-scan evidence without implying zero findings."""
+    if (
+        _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
+        == "failed"
+    ):
+        return "Unknown — authoritative scan failed"
+    return "Not assessed — no authoritative scan"
+
+
+def _reconciliation_display(context: _ReportContext, *keys: str) -> str:
+    """Render triage reconciliation only when the authoritative scan supports it."""
+    scan_state = _scan_evidence_state(
+        context.final_full_scan_result, context.new_vulnerability_status
+    )
+    if scan_state != "complete":
+        return _scan_assessment_text(context)
+    identifiers = _reconciliation_ids(context.triage_reconciliation, *keys)
+    if identifiers:
+        return ", ".join(identifiers)
+    if context.triage_required:
+        return "Pending — post-scan triage required"
+    return "None"
 
 
 def _render_summary(context: _ReportContext) -> str:
@@ -814,7 +1168,12 @@ def _render_summary(context: _ReportContext) -> str:
         ("Groups unresolved", context.groups_unresolved),
         ("Groups inconclusive", context.groups_inconclusive),
         ("Groups pending", context.groups_pending),
-        ("Re-triage groups discovered", context.groups_retriage_discovered),
+        (
+            "Re-triage groups discovered",
+            context.groups_retriage_discovered
+            if context.groups_retriage_discovered is not None
+            else _scan_assessment_text(context),
+        ),
         (
             "Targeted QA coverage",
             f"{context.targeted_qa_passed} passed / {context.targeted_qa_total} targeted groups",
@@ -823,8 +1182,14 @@ def _render_summary(context: _ReportContext) -> str:
         *token_rows,
     ]
     errors = (
-        _table(("Critical error",), [(error,) for error in context.error_strings])
-        if context.error_strings
+        _table(
+            ("Source", "Code", "Occurrences", "Critical error"),
+            [
+                (record.source, record.code, record.occurrences, record.message)
+                for record in context.error_records
+            ],
+        )
+        if context.error_records
         else "No critical errors recorded."
     )
     return "\n".join(
@@ -860,16 +1225,21 @@ def _render_overview(context: _ReportContext) -> str:
     )
     reconciliation_rows = [
         (
-            label,
-            ", ".join(_text(item) for item in _items(context.triage_reconciliation.get(key)))
-            or "None",
-        )
-        for label, key in (
-            ("Added/new groups", "new_group_ids"),
-            ("Reappeared groups", "reappeared_group_ids"),
-            ("Changed groups", "changed_group_ids"),
-            ("Removed groups", "removed_group_ids"),
-        )
+            "Added/new groups",
+            _reconciliation_display(context, "added", "new_group_ids"),
+        ),
+        (
+            "Reappeared groups",
+            _reconciliation_display(context, "reappeared", "reappeared_group_ids"),
+        ),
+        (
+            "Changed groups",
+            _reconciliation_display(context, "changed", "changed_group_ids"),
+        ),
+        (
+            "Removed groups",
+            _reconciliation_display(context, "removed", "removed_group_ids"),
+        ),
     ]
     return "\n".join(
         [
@@ -885,7 +1255,12 @@ def _render_overview(context: _ReportContext) -> str:
                     ("Task strategies", strategy_text),
                     ("Targeted remediation", _targeted_remediation_summary(context)),
                     ("Post-remediation security status", _post_scan_summary(context)),
-                    ("Re-triage discovered groups", context.groups_retriage_discovered),
+                    (
+                        "Re-triage discovered groups",
+                        context.groups_retriage_discovered
+                        if context.groups_retriage_discovered is not None
+                        else _scan_assessment_text(context),
+                    ),
                 ],
             ),
             "",
@@ -900,7 +1275,7 @@ def _render_overview(context: _ReportContext) -> str:
 
 def _render_key_decisions(context: _ReportContext) -> str:
     """Render supervisor decisions, retries, QA failures, and repairs."""
-    retry_rows = []
+    retry_rows: list[tuple[Any, ...]] = []
     for task_id in sorted(context.retry_plans):
         plan = context.retry_plans[task_id]
         retry_rows.append(
@@ -908,46 +1283,100 @@ def _render_key_decisions(context: _ReportContext) -> str:
                 task_id,
                 _text(_value(plan, "action"), _text(_value(plan, "next_node"), "retry")),
                 _text(_value(plan, "selected_version"), "—"),
-                _text(_value(plan, "instructions"), _text(_value(plan, "reason"), "—"))[:240],
+                _compact_text(
+                    _value(plan, "instructions"),
+                    240,
+                )
+                if _value(plan, "instructions")
+                else _compact_text(_value(plan, "reason"), 240),
             )
         )
     if not retry_rows:
-        retry_rows = [("None", "—", "—", "No retry plans recorded")]
-    failed_qa = []
+        retry_rows = [("None", "—", "—", "No active retry plan at termination")]
+
+    historical_retry_rows: list[tuple[Any, ...]] = []
+    for key, diagnostic in sorted(context.retry_diagnostics.items()):
+        task_id = _text(_value(diagnostic, "task_id"), key)
+        reason = _value(diagnostic, "reasoning_summary") or _value(diagnostic, "failure_reason")
+        historical_retry_rows.append(
+            (
+                task_id,
+                _package_for_task(
+                    context,
+                    task_id,
+                    diagnostic=diagnostic,
+                ),
+                _text(_value(diagnostic, "strategy_stage"), "—"),
+                _text(_value(diagnostic, "committed_attempt_id"), "—"),
+                _diagnostic_versions(diagnostic, "attempted_versions"),
+                _diagnostic_versions(diagnostic, "executed_versions"),
+                _retry_outcome(context, task_id, diagnostic),
+                _compact_text(reason, 240),
+            )
+        )
+    if not historical_retry_rows:
+        historical_retry_rows = [
+            ("None", "—", "—", "—", "—", "—", "—", "No historical retry/pivot activity recorded")
+        ]
+
+    failed_qa: list[tuple[Any, ...]] = []
     for key, evaluation in sorted(context.qa_evaluations.items()):
         if not bool(_value(evaluation, "passed", False)):
             failed_qa.append(
                 (
                     key,
                     _text(_value(evaluation, "failure_category"), "unknown"),
-                    _text(_value(evaluation, "retry_feedback"), "—")[:240],
+                    _compact_text(_value(evaluation, "retry_feedback"), 240),
                 )
             )
     if not failed_qa:
         failed_qa = [("None", "—", "No failed QA evaluations recorded")]
+
     strategies_by_group = dict(context.group_strategies)
     for task in context.task_queue.values():
         group_id = _text(_value(task, "parent_group_id"))
         if group_id and group_id not in strategies_by_group:
             strategies_by_group[group_id] = _value(task, "strategy")
+
+    initial_group_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
     strategy_rows = [
-        (group_id, _text(strategy)) for group_id, strategy in sorted(strategies_by_group.items())
-    ] or [("None", "No strategy selections recorded")]
-    action_rows = [
-        (
-            _text(_value(summary, "task_id"), "—"),
-            _text(_value(summary, "status"), "—"),
-            _text(
-                _value(summary, "summary"),
-                _text(_value(summary, "message"), _value(summary, "rationale")),
-            )[:240],
+        (group_id, _text(strategies_by_group[group_id]))
+        for group_id in sorted(initial_group_ids)
+        if group_id in strategies_by_group
+    ]
+    pivot_strategy_rows = [
+        (group_id, _text(strategy))
+        for group_id, strategy in sorted(strategies_by_group.items())
+        if group_id not in initial_group_ids
+    ]
+    if not strategy_rows:
+        strategy_rows = [("None", "No initial strategy selections recorded")]
+    if not pivot_strategy_rows:
+        pivot_strategy_rows = [("None", "No pivot strategy selections recorded")]
+
+    action_rows: list[tuple[Any, ...]] = []
+    for task_id, summary, history_count in _latest_action_summaries(context.action_summaries):
+        action_text = (
+            _value(summary, "summary") or _value(summary, "message") or _value(summary, "rationale")
         )
-        for summary in context.action_summaries
-    ] or [("None", "—", "No worker action summaries recorded")]
+        revision = _value(summary, "task_revision")
+        action_rows.append(
+            (
+                task_id,
+                _text(_value(summary, "status"), "—"),
+                _action_attempt_id(context, task_id, summary),
+                revision if revision is not None else "—",
+                f"{history_count} {'summary' if history_count == 1 else 'summaries'}",
+                _compact_text(action_text, 240),
+            )
+        )
+    if not action_rows:
+        action_rows = [("None", "—", "—", "—", "—", "No worker action summaries recorded")]
+
     event_rows = [
         (
             _text(_value(event, "event_type"), "consistency event"),
-            _text(_value(event, "reason"), event),
+            _compact_text(_value(event, "reason"), 240),
         )
         for event in context.consistency_events
     ] or [("None", "No consistency repairs recorded")]
@@ -959,15 +1388,40 @@ def _render_key_decisions(context: _ReportContext) -> str:
             "",
             _table(("Task", "Action", "Version", "Instruction/reason"), retry_rows),
             "",
+            "### Historical Retry/Pivot Activity",
+            "",
+            _table(
+                (
+                    "Task",
+                    "Package",
+                    "Stage",
+                    "Attempt",
+                    "Attempted versions",
+                    "Executed versions",
+                    "Outcome",
+                    "Reason",
+                ),
+                historical_retry_rows,
+            ),
+            "",
             "### Failed QA Gates",
             "",
             _table(("Task/group", "Category", "Feedback"), failed_qa),
             "",
-            "### Strategy Selections and Worker Actions",
+            "### Initial Strategy Selections",
             "",
             _table(("Group", "Strategy"), strategy_rows),
             "",
-            _table(("Task", "Status", "Summary"), action_rows),
+            "### Pivot Strategy Selections",
+            "",
+            _table(("Group", "Strategy"), pivot_strategy_rows),
+            "",
+            "### Latest Worker Actions by Task",
+            "",
+            _table(
+                ("Task", "Status", "Attempt", "Revision", "History", "Latest summary"),
+                action_rows,
+            ),
             "",
             "### Consistency Repairs and Replans",
             "",
@@ -1046,14 +1500,21 @@ def _render_findings(context: _ReportContext) -> str:
         snapshot = context.attempt_snapshots.get(attempt_id)
         if not task_id:
             task_id = _text(_value(snapshot, "task_id"), attempt_id)
-        package = _text(_value(snapshot, "target_package_name"), "—")
+        retry_diagnostic = context.retry_diagnostics.get(task_id)
+        package = _package_for_task(
+            context,
+            task_id,
+            snapshot=snapshot,
+            worker_result=worker_result,
+            diagnostic=retry_diagnostic,
+        )
         attempted = _value(diagnostics, "attempted_versions") or _value(
             worker_result, "attempted_versions"
         )
         executed = _value(diagnostics, "executed_versions") or _value(
             worker_result, "executed_versions"
         )
-        if package != "—" or attempted or executed:
+        if diagnostics is not None or attempted or executed:
             diagnostic_rows.append(
                 (
                     task_id,
@@ -1080,20 +1541,39 @@ def _render_findings(context: _ReportContext) -> str:
         for group in context.final_valid_groups
         if _text(_value(group, "group_id")) in discovered_ids
     ]
-    retriage_rows = [
-        (
-            _text(_value(group, "group_id")),
-            _text(_value(group, "vulnerable_component")),
-            _group_sources(group, _group_issue(group)),
-            _group_location(group),
-            _group_severity(group, _group_issue(group)),
-            context.group_statuses.get(_text(_value(group, "group_id")), "new/pending"),
-        )
-        for group in sorted(retriage_groups, key=lambda item: _text(_value(item, "group_id")))
-    ]
+    scan_state = _scan_evidence_state(
+        context.final_full_scan_result, context.new_vulnerability_status
+    )
+    if scan_state != "complete":
+        retriage_rows = [("Not assessed", "—", "—", "—", "—", _scan_assessment_text(context))]
+    else:
+        retriage_rows = [
+            (
+                _text(_value(group, "group_id")),
+                _text(_value(group, "vulnerable_component")),
+                _group_sources(group, _group_issue(group)),
+                _group_location(group),
+                _group_severity(group, _group_issue(group)),
+                context.group_statuses.get(_text(_value(group, "group_id")), "new/pending"),
+            )
+            for group in sorted(retriage_groups, key=lambda item: _text(_value(item, "group_id")))
+        ]
+        if not retriage_rows:
+            retriage_rows = [
+                (
+                    "None",
+                    "—",
+                    "—",
+                    "—",
+                    "—",
+                    "Pending — post-scan triage required"
+                    if context.triage_required
+                    else "No added or reappeared groups",
+                )
+            ]
     retriage_table = _table(
         ("Group ID", "Finding/package", "Source", "Location", "Severity", "Status"),
-        retriage_rows or [("None", "—", "—", "—", "—", "No added or reappeared groups")],
+        retriage_rows,
     )
     return "\n".join(
         [
@@ -1157,13 +1637,44 @@ def _new_scan_finding_rows(context: _ReportContext) -> list[tuple[str, str, str,
 
 def _render_validation(context: _ReportContext) -> str:
     """Render deterministic validation gates and remaining work."""
-    scan_status = _text(_value(context.final_full_scan_result, "status"), "not recorded")
+    scan_state = _scan_evidence_state(
+        context.final_full_scan_result, context.new_vulnerability_status
+    )
+    scan_status = _text(_value(context.final_full_scan_result, "status"), "not_scanned")
+    initial_group_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
     remaining_groups = [
         (group_id, status)
         for group_id, status in sorted(context.group_statuses.items())
+        if group_id in initial_group_ids
         if status not in {"qa_passed", "mitigated"}
     ]
-    new_scan_rows = _new_scan_finding_rows(context)
+    pivot_group_rows = [
+        (
+            _text(_value(group, "group_id")),
+            _text(_value(group, "vulnerable_component"), "—"),
+            context.group_statuses.get(_text(_value(group, "group_id")), "pending"),
+        )
+        for group in sorted(
+            context.final_valid_groups,
+            key=lambda item: _text(_value(item, "group_id")),
+        )
+        if _text(_value(group, "group_id")) not in initial_group_ids
+    ]
+    if not pivot_group_rows:
+        pivot_group_rows = [("None", "—", "No pivot child groups recorded")]
+    if scan_state == "complete":
+        post_scan_findings = f"{len(context.post_remediation_scan_issues)} findings"
+        post_scan_identifiers = f"{len(context.post_remediation_scan_identifiers)} identifiers"
+        new_identifiers = f"{len(context.new_vulnerability_identifiers)} identifiers"
+        new_scan_rows = _new_scan_finding_rows(context)
+        if not new_scan_rows:
+            new_scan_rows = [("None", "-", "-", "-", "-", "No newly detected findings")]
+    else:
+        assessment = _scan_assessment_text(context)
+        post_scan_findings = assessment
+        post_scan_identifiers = assessment
+        new_identifiers = assessment
+        new_scan_rows = [("Not assessed", "—", "—", "—", "—", assessment)]
     return "\n".join(
         [
             "## {number}. Validation and Remaining Issues",
@@ -1181,15 +1692,15 @@ def _render_validation(context: _ReportContext) -> str:
                     ),
                     (
                         "Post-remediation scanner findings",
-                        f"{len(context.post_remediation_scan_issues)} findings",
+                        post_scan_findings,
                     ),
                     (
                         "Post-remediation unique identifiers",
-                        f"{len(context.post_remediation_scan_identifiers)} identifiers",
+                        post_scan_identifiers,
                     ),
                     (
                         "New vulnerability identifiers",
-                        f"{len(context.new_vulnerability_identifiers)} identifiers",
+                        new_identifiers,
                     ),
                     ("Scanner/QA evidence", scan_status),
                     ("Consistency events", len(context.consistency_events)),
@@ -1204,11 +1715,15 @@ def _render_validation(context: _ReportContext) -> str:
                 or [("None", "All original groups reached a fixed or mitigated status")],
             ),
             "",
+            "### Pivot Child Groups",
+            "",
+            _table(("Group", "Package/component", "Status"), pivot_group_rows),
+            "",
             "### Newly Detected Findings",
             "",
             _table(
                 ("Identifiers", "Package/component", "Source", "Location", "Severity", "Status"),
-                new_scan_rows or [("None", "-", "-", "-", "-", "No newly detected findings")],
+                new_scan_rows,
             ),
         ]
     )

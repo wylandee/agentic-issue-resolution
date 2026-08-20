@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from remediation_engine.orchestration.graph import build_orchestrator_graph
 from remediation_engine.orchestration.report_node import (
+    _compact_text,
     finalize_report,
     generate_report,
     run_report_node,
@@ -273,3 +274,195 @@ def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
     assert "engines" not in report
     assert "deprecated" not in report
     assert "transitive-package" not in report
+
+
+def test_failed_authoritative_scan_is_reported_as_unassessed_and_errors_are_grouped():
+    """A scan timeout must not be rendered as a clean zero-finding result."""
+    state = _state()
+    state["status"] = "completed_with_errors"
+    state["final_full_scan_result"] = {
+        "completed": False,
+        "authoritative": True,
+        "status": "scan_failed",
+        "triage_required": False,
+        "error": "FAILURE: Dependency-Check timed out after 300s.",
+    }
+    state["new_vulnerability_status"] = "scan_failed"
+    state["triage_reconciliation"] = {}
+    state["errors"] = [
+        "FAILURE: Dependency-Check timed out after 300s.",
+        "supervisor: invalid planner commit rejected",
+        "supervisor: invalid planner commit rejected",
+    ]
+
+    report = generate_report(state)
+
+    assert "Unknown — authoritative scan failed" in report
+    assert "Post-remediation scanner findings | 0 findings" not in report
+    assert "No newly detected findings" not in report
+    assert "| run, final_full_scan | ODC_TIMEOUT | 2 |" in report
+    assert report.count("| supervisor | INVALID_PLANNER_COMMIT | 2 |") == 1
+
+
+def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_original_only():
+    """Pivot groups must inherit their unfixable child status, not pending."""
+    state = _state()
+    state["initial_valid_groups"] = [
+        {
+            "group_id": "group-root",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        }
+    ]
+    state["valid_groups"] = [
+        state["initial_valid_groups"][0],
+        {
+            "group_id": "group-child",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        },
+    ]
+    state["task_queue"] = {
+        "task-root": {
+            "task_id": "task-root",
+            "parent_group_id": "group-root",
+            "parent_task_id": None,
+            "strategy": "UPDATE_VERSION",
+            "status": "unfixable",
+        },
+        "task-child": {
+            "task_id": "task-child",
+            "parent_group_id": "group-child",
+            "parent_task_id": "task-root",
+            "strategy": "CODE_WORKAROUND",
+            "status": "unfixable",
+        },
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "unresolved",
+        "triage_required": True,
+    }
+    state["new_vulnerability_status"] = "unresolved"
+    state["triage_required"] = True
+    state["triage_reconciliation"] = {"new_group_ids": ["group-child"]}
+
+    report = generate_report(state)
+
+    assert "| group-child | express-jwt |" in report
+    assert "| group-child | express-jwt | odc | package.json | high | unfixable |" in report
+    assert "### Remaining or Inconclusive Groups" in report
+    assert "| group-root | unfixable |" in report
+    assert "| group-child | express-jwt | unfixable |" in report
+    assert "| group-child | pending |" not in report
+
+
+def test_report_renders_historical_retry_activity_and_latest_action_per_task():
+    """Historical diagnostics remain visible even when active plans are empty."""
+    state = _state()
+    state["retry_plans_by_task"] = {}
+    state["retry_diagnostics_by_task"] = {
+        "task-1": {
+            "task_id": "task-1",
+            "strategy_stage": "osv_minimum",
+            "committed_attempt_id": "attempt-2",
+            "target_package_name": "lodash",
+            "attempted_versions": ["4.17.20", "4.17.21"],
+            "executed_versions": ["4.17.21"],
+            "reasoning_summary": "The first attempt was superseded by a later validated version.",
+        }
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 0,
+            "status": "success",
+            "summary": "Earlier attempt summary.",
+        },
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-2",
+            "task_revision": 1,
+            "status": "surrender",
+            "summary": "Latest attempt summary with the final worker conclusion.",
+        },
+    ]
+
+    report = generate_report(state)
+
+    assert "### Historical Retry/Pivot Activity" in report
+    assert "No retry plans recorded" not in report
+    assert "| task-1 | lodash | osv_minimum | attempt-2 |" in report
+    assert "| task-1 | surrender | attempt-2 | 1 | 2 summaries |" in report
+    assert report.count("Earlier attempt summary.") == 0
+
+
+def test_report_text_truncation_is_word_safe_and_uses_ellipsis():
+    """Long report prose ends at a complete word before the ellipsis."""
+    text = "A completed remediation attempt remains unchanged after validation and review."
+
+    compact = _compact_text(text, limit=36)
+    visible = compact.removesuffix("…")
+    valid_prefixes = {" ".join(text.split()[:index]) for index in range(1, len(text.split()) + 1)}
+
+    assert compact.endswith("…")
+    assert visible in valid_prefixes
+
+
+def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
+    """Package diagnostics remain useful when an attempt snapshot omits the package."""
+    state = _state()
+    state["initial_valid_groups"].append(
+        {
+            "group_id": "group-express",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        }
+    )
+    state["task_queue"]["task-2"] = {
+        "task_id": "task-2",
+        "parent_group_id": "group-express",
+        "parent_task_id": None,
+        "strategy": "UPDATE_VERSION",
+        "status": "unfixable",
+    }
+    state["attempt_snapshots_by_id"] = {
+        "attempt-2": {
+            "attempt_id": "attempt-2",
+            "task_id": "task-2",
+            "target_package_name": None,
+        }
+    }
+    state["worker_results_by_attempt"] = {
+        "attempt-2": {
+            "attempt_id": "attempt-2",
+            "task_id": "task-2",
+            "task_revision": 1,
+            "execution_diagnostics": {
+                "attempted_versions": ["4.0.0"],
+                "executed_versions": [],
+            },
+        }
+    }
+    state["retry_diagnostics_by_task"] = {
+        "task-2": {
+            "task_id": "task-2",
+            "attempted_versions_by_target": {"express-jwt": ["4.0.0"]},
+        }
+    }
+
+    report = generate_report(state)
+
+    assert "| task-2 | express-jwt |" in report
+    assert "unknown — package missing from trace" not in report
