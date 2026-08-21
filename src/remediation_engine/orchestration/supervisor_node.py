@@ -78,10 +78,24 @@ from remediation_engine.contracts.supervisor_phases import (
     ReconciliationResult,
 )
 from remediation_engine.contracts.version_policy import select_version
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
+from remediation_engine.orchestration.supervisor_policy import (
+    _TERMINAL_STATUSES,
+    _WORKABLE_STATUSES,
+    MAX_RETRIES,
+    _dispatchable_task_ids_for_status,
+    _has_existing_workaround_child,
+    _is_exhausted_update_pivot_candidate,
+    _next_sca_stage,
+    _parent_status_for_strategy_pivot,
+    _qa_ready_task_ids,
+    _selection_for_stage,
+    _task_sort_key,
+    _worker_node_for_strategy,
+)
 from remediation_engine.orchestration.task_utils import (
-    TERMINAL_TASK_STATUSES,
     advance_no_fix_stage,
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
@@ -92,7 +106,6 @@ from remediation_engine.orchestration.task_utils import (
     is_transitive_group,
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
-from remediation_engine.settings import AppSettings
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -101,7 +114,6 @@ from remediation_engine.tools.registry_tools import (
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES: int = 3
 # Supervisor dispatch is intentionally per-task.  The worker and QA helpers
 # remain batch-capable for direct callers and a future explicit batch mode.
 UPDATE_DISPATCH_LIMIT: int = 1
@@ -142,178 +154,6 @@ _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
 _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
-
-# ---------------------------------------------------------------------------
-# Task status helpers
-# ---------------------------------------------------------------------------
-
-_TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
-_WORKABLE_STATUSES = frozenset(
-    {
-        TaskStatus.PENDING,
-        TaskStatus.NEEDS_RETRY,
-    }
-)
-
-_SEVERITY_RANK: dict[str, int] = {
-    "critical": 0,
-    "high": 1,
-    "medium": 2,
-    "low": 3,
-}
-
-
-def _task_sort_key(
-    task: RemediationTask,
-    group_by_id: dict[str, VulnerabilityGroup],
-) -> tuple[int, int, int, int, str, str]:
-    """Return the stable priority key used for deterministic task selection.
-
-    Severity is read from an optional group-level attribute when present and
-    otherwise from the most severe member finding.  This supports current
-    ``VulnerabilityGroup`` records, which store severity on their issues, and
-    legacy/fixture records that expose ``group.severity`` directly.
-    """
-    group = group_by_id.get(task.parent_group_id)
-    raw_severities: list[Any] = []
-    if group is not None:
-        raw_severities.append(getattr(group, "severity", None))
-        raw_severities.extend(getattr(issue, "severity", None) for issue in group.issues or [])
-    ranks = [
-        _SEVERITY_RANK.get(str(getattr(value, "value", value)).lower(), 4)
-        for value in raw_severities
-        if value is not None
-    ]
-    severity_rank = min(ranks, default=4)
-    strategy_rank = 0 if task.strategy == RoutingStrategy.VERSION_BUMP else 1
-    status_rank = {TaskStatus.NEEDS_RETRY: 0, TaskStatus.PENDING: 1}.get(task.status, 2)
-    return (
-        severity_rank,
-        strategy_rank,
-        status_rank,
-        task.retry_count,
-        task.parent_group_id,
-        task.task_id,
-    )
-
-
-def _dispatchable_task_ids_for_status(
-    task_queue: dict[str, RemediationTask],
-    statuses: set[TaskStatus],
-    preferred_ids: list[str] | None = None,
-    strategy: RoutingStrategy | None = None,
-    limit: int | None = None,
-    group_by_id: dict[str, VulnerabilityGroup] | None = None,
-) -> list[str]:
-    """Return non-terminal task IDs matching status and optional strategy filters."""
-    candidate_ids = list(preferred_ids) if preferred_ids is not None else list(task_queue)
-    tasks: list[RemediationTask] = []
-    seen: set[str] = set()
-    for task_id in candidate_ids:
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        task = task_queue.get(task_id)
-        if task is None or task.status in _TERMINAL_STATUSES:
-            continue
-        if task.status not in statuses:
-            continue
-        if strategy is not None and task.strategy != strategy:
-            continue
-        tasks.append(task)
-
-    if group_by_id is not None:
-        tasks.sort(key=lambda task: _task_sort_key(task, group_by_id))
-    dispatchable = [task.task_id for task in tasks]
-    if limit is not None:
-        dispatchable = dispatchable[:limit]
-
-    return dispatchable
-
-
-def _qa_ready_task_ids(
-    task_queue: dict[str, RemediationTask],
-    preferred_ids: list[str] | None = None,
-    group_by_id: dict[str, VulnerabilityGroup] | None = None,
-    limit: int | None = None,
-) -> list[str]:
-    return _dispatchable_task_ids_for_status(
-        task_queue,
-        {TaskStatus.OPTIMISTICALLY_FIXED},
-        preferred_ids=preferred_ids,
-        group_by_id=group_by_id,
-        limit=limit,
-    )
-
-
-def _is_exhausted_update_pivot_candidate(
-    task: RemediationTask,
-    diagnostics: UpdateRetryDiagnostics | None,
-) -> bool:
-    """Return True when a retry update task must pivot instead of retrying update."""
-    if task.parent_package_name and task.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-        # A transitive task may only pivot after its explicit child-override
-        # stage has also failed.  Parent registry exhaustion is not terminal.
-        return False
-    return (
-        task.strategy == RoutingStrategy.VERSION_BUMP
-        and task.status == TaskStatus.NEEDS_RETRY
-        and (
-            task.strategy_stage == SCARemediationStage.CODE_WORKAROUND
-            or (
-                diagnostics is not None
-                and (diagnostics.package_abandoned or diagnostics.exhausted_update_path)
-            )
-        )
-    )
-
-
-def _has_existing_workaround_child(
-    task: RemediationTask,
-    task_queue: dict[str, RemediationTask],
-) -> bool:
-    """Return whether a task already owns a code-workaround child.
-
-    A replayed strategy-pivot request must not be treated as a fresh update
-    pivot. The existing child is either the next dispatchable workaround or
-    terminal evidence that the parent lifecycle has already ended.
-
-    Args:
-        task: Candidate parent task.
-        task_queue: Current copy-on-write task queue.
-
-    Returns:
-        True when a code-workaround child references task.
-    """
-    return any(
-        candidate.parent_task_id == task.task_id
-        and candidate.strategy == RoutingStrategy.CODE_WORKAROUND
-        for candidate in task_queue.values()
-    )
-
-
-def _next_sca_stage(
-    stage: SCARemediationStage,
-    transitive: bool = False,
-) -> SCARemediationStage:
-    """Advance one ordered SCA version strategy stage."""
-    if stage == SCARemediationStage.OSV_MINIMUM:
-        return SCARemediationStage.NPM_SAME_MAJOR
-    if stage == SCARemediationStage.NPM_SAME_MAJOR:
-        return SCARemediationStage.NPM_LATEST
-    if stage == SCARemediationStage.NPM_LATEST and transitive:
-        return SCARemediationStage.PACKAGE_OVERRIDE
-    if stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        return SCARemediationStage.CODE_WORKAROUND
-    return SCARemediationStage.CODE_WORKAROUND
-
-
-def _selection_for_stage(stage: SCARemediationStage) -> str | None:
-    if stage == SCARemediationStage.NPM_SAME_MAJOR:
-        return "same_major"
-    if stage == SCARemediationStage.NPM_LATEST:
-        return "latest"
-    return None
 
 
 def _instruction_digest(instruction: str) -> str:
@@ -982,6 +822,40 @@ def reconcile_phase5_state_before_teardown(
         (event.task_id, event.received_attempt_id, event.error_code) for event in prior_events
     }
 
+    # A pivot child owns the remediation outcome. Repair stale parent status
+    # projections before teardown so a historical QA_PASSED parent cannot
+    # conceal an unresolved child in the final task queue.
+    pivot_repair_events: list[StateConsistencyEvent] = []
+    children_by_parent: dict[str, list[RemediationTask]] = {}
+    for task in task_queue.values():
+        if task.parent_task_id:
+            children_by_parent.setdefault(task.parent_task_id, []).append(task)
+    for parent_id, children in sorted(children_by_parent.items()):
+        parent = task_queue.get(parent_id)
+        if parent is None or parent.status == TaskStatus.PIVOTED:
+            continue
+        task_queue[parent_id] = parent.model_copy(
+            update={
+                "status": TaskStatus.PIVOTED,
+                "current_attempt_id": None,
+                "selected_version": None,
+                "task_revision": parent.task_revision + 1,
+            }
+        )
+        pivot_repair_events.append(
+            _build_consistency_event(
+                error_code="PIVOT_PARENT_STATUS_REPAIRED",
+                task_id=parent_id,
+                expected_attempt_id=parent.current_attempt_id,
+                received_attempt_id=children[0].current_attempt_id,
+                action="repaired",
+                details=(
+                    "Parent task status was normalized to PIVOTED because a child task "
+                    "owns the current remediation outcome."
+                ),
+            )
+        )
+
     events, errors = _validate_committed_state(
         task_queue,
         snapshots_by_id,
@@ -992,7 +866,7 @@ def reconcile_phase5_state_before_teardown(
     )
     new_events = [
         event
-        for event in _dedupe_consistency_events(events)
+        for event in _dedupe_consistency_events([*pivot_repair_events, *events])
         if (event.task_id, event.received_attempt_id, event.error_code) not in prior_event_keys
     ]
     prior_errors = set(state.get("errors", []) or [])
@@ -2276,46 +2150,6 @@ def _plan_initial_transitive_task(
     )
 
 
-def _worker_node_for_strategy(strategy: RoutingStrategy) -> str:
-    """Return the worker node that handles a given routing strategy."""
-    if strategy == RoutingStrategy.VERSION_BUMP:
-        return "update_subagent"
-    return "workaround_subagent"
-
-
-def _parent_status_for_strategy_pivot(
-    parent_task: RemediationTask,
-    new_strategy: RoutingStrategy,
-    qa_evaluations: dict[str, QAEvaluation],
-) -> TaskStatus:
-    """
-    Choose the terminal parent status when a strategy pivot spawns a child task.
-
-    A VERSION_BUMP parent is considered successfully remediated before a
-    migration child only when its deterministic QA evidence proves scanner
-    clearance and a hard test regression. Other pivots remain terminal failures.
-    """
-    evaluation = qa_evaluations.get(parent_task.task_id) or qa_evaluations.get(
-        parent_task.parent_group_id
-    )
-    if (
-        parent_task.strategy == RoutingStrategy.VERSION_BUMP
-        and new_strategy == RoutingStrategy.CODE_WORKAROUND
-        and evaluation is not None
-    ):
-        gates = evaluation.deterministic_gates
-        if (
-            parent_task.qa_policy == QAPolicy.VERSION_BUMP
-            and gates is not None
-            and gates.target_scanner_cleared is True
-            and gates.tests_passed is False
-        ):
-            return TaskStatus.QA_PASSED
-        if evaluation.failure_category == FailureCategory.BREAKING_CHANGE:
-            return TaskStatus.PIVOTED
-    return TaskStatus.UNFIXABLE
-
-
 def _terminalize_pivot_parents(
     task_queue: dict[str, RemediationTask],
     parent_ids: list[str],
@@ -2375,7 +2209,10 @@ def _terminalize_pivot_parents(
             updates=updates,
             close_attempt=(parent_task.current_attempt_id is not None),
             clear_selected_version=(parent_task.selected_version is not None),
-            allow_breaking_change_pivot=(terminal_status == TaskStatus.PIVOTED),
+            # A migration can legitimately close a NEEDS_RETRY parent as
+            # QA_PASSED after the child has cleared the target.  PIVOTED is
+            # already a normal transition and needs no exception.
+            allow_breaking_change_pivot=(terminal_status == TaskStatus.QA_PASSED),
         )
         if retry_plans_by_task is not None:
             retry_plans_by_task.pop(parent_id, None)
@@ -4905,7 +4742,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_id,
                 updates={"status": TaskStatus.UNFIXABLE},
                 close_attempt=task.current_attempt_id is not None,
-                clear_selected_version=task.current_attempt_id is not None,
+                clear_selected_version=task.selected_version is not None,
             )
             logger.info(
                 "supervisor: task '%s' marked UNFIXABLE after %d retries.",
@@ -5006,7 +4843,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         try:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-            model_name = AppSettings.from_env().supervisor_llm_model
+            model_name = get_runtime_settings().supervisor_llm_model
             router_llm = ChatOpenAI(model=model_name, temperature=0)
             if _needs_planner(
                 task_queue,
@@ -5824,7 +5661,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 ),
                 clear_selected_version=(
                     new_status in _TERMINAL_STATUSES
-                    and task_queue[t_id].current_attempt_id is not None
+                    and task_queue[t_id].selected_version is not None
                 ),
             )
             logger.info(
@@ -5841,7 +5678,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 t_id,
                 updates={"status": TaskStatus.UNFIXABLE},
                 close_attempt=task_queue[t_id].current_attempt_id is not None,
-                clear_selected_version=task_queue[t_id].current_attempt_id is not None,
+                clear_selected_version=task_queue[t_id].selected_version is not None,
             )
 
     # 8e. Materialize spawn requests

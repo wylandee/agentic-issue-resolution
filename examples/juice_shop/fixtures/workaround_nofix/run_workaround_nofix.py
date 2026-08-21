@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     NoFixMitigationStage,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     TaskAttemptSnapshot,
     TaskStatus,
     VulnerabilityGroup,
@@ -163,6 +164,8 @@ def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, 
         raise ValueError("Stage-two NO_FIX fixture task must start in NEEDS_RETRY.")
     if fixture_task.get("retry_count") != 1:
         raise ValueError("Stage-two NO_FIX fixture task must start with retry_count=1.")
+    if fixture_task.get("qa_policy") != QAPolicy.NO_FIX_CODE_REMOVAL.value:
+        raise ValueError("Stage-two NO_FIX fixture task must carry NO_FIX_CODE_REMOVAL policy.")
 
     context_payload = fixture["workaround_context"]
     qa_payload = fixture.get("qa_evidence")
@@ -175,6 +178,7 @@ def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, 
         update={
             "task_revision": 2,
             "no_fix_stage": requested_stage,
+            "qa_policy": QAPolicy.NO_FIX_CODE_REMOVAL,
             "status": TaskStatus.NEEDS_RETRY,
             "retry_count": 1,
         }
@@ -214,6 +218,7 @@ def _build_initial_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, 
         state_revision=2,
         task_revision=stage_two_task.task_revision,
         attempt_number=2,
+        qa_policy=stage_two_task.qa_policy,
         strategy_stage=stage_two_task.strategy_stage,
         no_fix_stage=stage_two_task.no_fix_stage,
         selected_version=stage_two_task.selected_version,

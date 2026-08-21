@@ -12,6 +12,7 @@ import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from remediation_engine.contracts import CommandResult
 from remediation_engine.runtime.sandbox_mgr import (
@@ -67,7 +68,7 @@ class TestCommandResult:
         assert restored.stdout == "ok"
 
     def test_duration_non_negative(self):
-        with pytest.raises(Exception):
+        with pytest.raises((TypeError, ValidationError)):
             CommandResult(exit_code=0, duration_seconds=-1.0)
 
 
@@ -159,6 +160,56 @@ class TestSandboxLifecycle:
         assert kwargs["volumes"] == {
             "agent_workspace_deadbeef": {"bind": "/workspace", "mode": "rw"}
         }
+
+    def test_restart_reuses_named_volume_without_recopied_host_files(self, tmp_path):
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        docker_mod, docker_errors, client, container = _docker_modules()
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path, workspace_volume="agent_workspace_deadbeef")
+            sandbox.start()
+            sandbox.restart()
+            sandbox.teardown()
+
+        assert client.containers.run.call_count == 2
+        assert container.put_archive.call_count == 1
+
+    def test_partial_startup_closes_client_and_removes_container(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.put_archive.side_effect = RuntimeError("archive upload failed")
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="archive upload failed"),
+        ):
+            DockerSandbox(tmp_path).start()
+
+        container.kill.assert_called_once()
+        container.remove.assert_called_once_with(force=True)
+        client.close.assert_called_once()
+
+    def test_workspace_initialization_failure_is_transactional(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.exec_run.return_value = (1, b"mkdir failed")
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="failed to initialize /workspace"),
+        ):
+            DockerSandbox(tmp_path).start()
+
+        container.kill.assert_called_once()
+        container.remove.assert_called_once_with(force=True)
+        client.close.assert_called_once()
 
     def test_repo_root_none_skips_archive_copy(self):
         docker_mod, docker_errors, client, container = _docker_modules()

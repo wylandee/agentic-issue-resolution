@@ -14,6 +14,7 @@ build_initial_remediation_task(group, task_id) -> RemediationTask
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
@@ -37,6 +38,216 @@ TERMINAL_TASK_STATUSES = frozenset(
         TaskStatus.PIVOTED,
     }
 )
+
+_UNRESOLVED_GROUP_STATUSES = frozenset(
+    {
+        TaskStatus.UNFIXABLE.value,
+        TaskStatus.INCONCLUSIVE.value,
+        TaskStatus.NEEDS_RETRY.value,
+        TaskStatus.PENDING.value,
+        TaskStatus.OPTIMISTICALLY_FIXED.value,
+    }
+)
+
+
+def _task_value(task: Any, field: str, default: Any = None) -> Any:
+    """Read a task field from either a Pydantic task or a mapping."""
+    if isinstance(task, Mapping):
+        return task.get(field, default)
+    return getattr(task, field, default)
+
+
+def _task_status_name(task: Any) -> str:
+    """Return a task status as its stable string value."""
+    status = _task_value(task, "status", TaskStatus.PENDING)
+    return str(getattr(status, "value", status))
+
+
+def task_group_lineage(
+    task_queue: Mapping[str, Any],
+    group_id: str,
+) -> list[Any]:
+    """Return the root task and all pivot descendants for one group.
+
+    Pivot children intentionally receive a new ``parent_group_id``.  A
+    projection that filters only on that field therefore loses the child and
+    can report a failed remediation as successful.  The task's
+    ``parent_task_id`` is the authoritative lineage relationship, so this
+    helper starts at the requested group's task and follows descendants
+    across group boundaries.
+
+    Args:
+        task_queue: Task ID to task mapping.
+        group_id: Initial or pivot group identifier.
+
+    Returns:
+        Tasks in deterministic breadth-first lineage order. An empty list is
+        returned when the group has no task.
+    """
+    tasks = {str(task_id): task for task_id, task in task_queue.items()}
+    group_task_ids = {
+        task_id
+        for task_id, task in tasks.items()
+        if _task_value(task, "parent_group_id") == group_id
+    }
+    if not group_task_ids:
+        return []
+
+    roots = sorted(
+        task_id
+        for task_id in group_task_ids
+        if _task_value(tasks[task_id], "parent_task_id") not in group_task_ids
+    )
+    children_by_parent: dict[str, list[str]] = {}
+    for task_id, task in tasks.items():
+        parent_task_id = _task_value(task, "parent_task_id")
+        if parent_task_id:
+            children_by_parent.setdefault(str(parent_task_id), []).append(task_id)
+    for child_ids in children_by_parent.values():
+        child_ids.sort()
+
+    ordered: list[Any] = []
+    queue = list(roots)
+    visited: set[str] = set()
+    while queue:
+        task_id = queue.pop(0)
+        if task_id in visited or task_id not in tasks:
+            continue
+        visited.add(task_id)
+        ordered.append(tasks[task_id])
+        queue.extend(children_by_parent.get(task_id, []))
+    return ordered
+
+
+def effective_group_status(
+    task_queue: Mapping[str, Any],
+    group_id: str,
+) -> str:
+    """Collapse a group and all pivot descendants using failure-first rules.
+
+    ``PIVOTED`` is an audit status, not a remediation outcome. It is ignored
+    when a child exists. Failed or incomplete descendants always outrank a
+    historical ``QA_PASSED`` status on the parent task.
+
+    Args:
+        task_queue: Task ID to task mapping.
+        group_id: Initial or pivot group identifier.
+
+    Returns:
+        The effective group status as a string value.
+    """
+    statuses = [_task_status_name(task) for task in task_group_lineage(task_queue, group_id)]
+    if not statuses:
+        return TaskStatus.PENDING.value
+
+    active_statuses = [status for status in statuses if status != TaskStatus.PIVOTED.value]
+    if not active_statuses:
+        return TaskStatus.PIVOTED.value
+    if TaskStatus.UNFIXABLE.value in active_statuses:
+        return TaskStatus.UNFIXABLE.value
+    if TaskStatus.INCONCLUSIVE.value in active_statuses:
+        return TaskStatus.INCONCLUSIVE.value
+    if TaskStatus.NEEDS_RETRY.value in active_statuses:
+        return TaskStatus.NEEDS_RETRY.value
+    if TaskStatus.PENDING.value in active_statuses:
+        return TaskStatus.PENDING.value
+    if TaskStatus.OPTIMISTICALLY_FIXED.value in active_statuses:
+        return TaskStatus.OPTIMISTICALLY_FIXED.value
+    if TaskStatus.QA_PASSED.value in active_statuses:
+        return TaskStatus.QA_PASSED.value
+    if TaskStatus.MITIGATED.value in active_statuses:
+        return TaskStatus.MITIGATED.value
+    return active_statuses[0]
+
+
+def terminal_outcome_issues(state: Mapping[str, Any]) -> list[str]:
+    """Return deterministic reasons the final run cannot be successful.
+
+    This is deliberately independent of the Supervisor LLM and is shared by
+    teardown, report generation, and the public API. Historical worker
+    success cannot override an unfixable task, incomplete task, or an
+    authoritative final scan that still contains findings.
+
+    Args:
+        state: Current or final orchestration state.
+
+    Returns:
+        Deduplicated human-readable failure reasons. An empty list means that
+        this helper found no terminal contradiction.
+    """
+    task_queue = {
+        str(task_id): task for task_id, task in (state.get("task_queue", {}) or {}).items()
+    }
+    reasons: list[str] = []
+    for task_id, task in sorted(task_queue.items()):
+        status = _task_status_name(task)
+        if status in _UNRESOLVED_GROUP_STATUSES:
+            reasons.append(f"task {task_id} ended in {status}")
+        elif status == TaskStatus.PIVOTED.value:
+            descendants = [
+                candidate
+                for candidate in task_queue.values()
+                if _task_value(candidate, "parent_task_id") == task_id
+            ]
+            if not descendants:
+                reasons.append(f"task {task_id} is pivoted without a child task")
+
+    final_scan = state.get("final_full_scan_result")
+    if final_scan is not None:
+        completed = _task_value(final_scan, "completed")
+        scan_status = str(_task_value(final_scan, "status", "")).lower()
+        if completed is False or scan_status in {"scan_failed", "failed", "error", "timeout"}:
+            reasons.append("authoritative final scan failed")
+        remaining = list(_task_value(final_scan, "remaining_target_identifiers", []) or [])
+        if remaining:
+            reasons.append(
+                f"authoritative final scan still contains {len(set(remaining))} target identifier(s)"
+            )
+        new_identifiers = list(_task_value(final_scan, "new_identifiers", []) or [])
+        if new_identifiers:
+            reasons.append(
+                f"authoritative final scan detected {len(set(new_identifiers))} new identifier(s)"
+            )
+    elif (
+        task_queue
+        and state.get("workspace_volume")
+        and not state.get("final_full_scan_completed", False)
+    ):
+        reasons.append("authoritative final scan was not completed")
+
+    # Keep the result stable when a malformed task projection repeats the same
+    # reason through multiple compatibility paths.
+    return list(dict.fromkeys(reasons))
+
+
+def create_skinny_subagent_group(
+    group: VulnerabilityGroup,
+    *,
+    keep_identifiers: int = 0,
+) -> VulnerabilityGroup:
+    """Create the bounded group projection supplied to an execution agent."""
+    return group.model_copy(
+        update={
+            "cve_ids": group.cve_ids[:keep_identifiers],
+            "ghsa_ids": group.ghsa_ids[:keep_identifiers],
+            "versions": group.versions[:keep_identifiers],
+            "issues": [],
+        }
+    )
+
+
+def filter_constraints_ledger(
+    constraints_ledger: Sequence[str],
+    target_groups: VulnerabilityGroup | Sequence[VulnerabilityGroup],
+) -> list[str]:
+    """Keep only constraints relevant to the requested group components."""
+    groups = [target_groups] if isinstance(target_groups, VulnerabilityGroup) else target_groups
+    components = [group.vulnerable_component for group in groups if group.vulnerable_component]
+    if not components:
+        return list(constraints_ledger)
+    return [
+        constraint for constraint in constraints_ledger if any(c in constraint for c in components)
+    ]
 
 
 def is_no_fix_package_removal_task(task: RemediationTask) -> bool:

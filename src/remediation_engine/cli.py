@@ -127,14 +127,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         issues = _load_issues(args.input, args.format)
+        settings = AppSettings.from_env()
         if args.command == "ingest":
             _write_jsonl(args.output, [issue.model_dump(mode="json") for issue in issues])
             return 0
         if args.command == "triage":
-            groups = triage_issues(issues, repo_root=args.repo)
+            groups = triage_issues(issues, repo_root=args.repo, settings=settings)
             _write_json(args.output, [group.model_dump(mode="json") for group in groups])
             return 0
-        settings = AppSettings.from_env()
         request = RemediationRequest(
             repo_root=args.repo,
             issues=issues,

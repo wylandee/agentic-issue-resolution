@@ -238,6 +238,22 @@ class TestSCAGrouping:
         )
         assert len(groups) == 2
 
+    def test_scoped_npm_purl_fallback_preserves_scope_in_group_identity(self):
+        issue = _sca(package_name=None, package_version="1.2.3").model_copy(
+            update={"purl": "pkg:npm/@scope/pkg@1.2.3"}
+        )
+        plan = FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No fix",
+            strategy_used="NO_FIX",
+        )
+
+        groups = group_issues([issue], sca_issue_plans=[(_localized(issue), plan)])
+
+        assert len(groups) == 1
+        assert groups[0].vulnerable_component == "@scope/pkg"
+        assert "@scope/pkg" in groups[0].group_id
+
     def test_group_tracks_all_manifest_paths(self):
         issues = [
             _sca(package_name="lodash", file_path="/src/package-lock.json?/lodash:4.17.20"),
@@ -361,6 +377,24 @@ class TestSCAGrouping:
         assert groups[0].fix_plan is not None
         assert groups[0].fix_plan.fixed_version == "1.2.5"
         assert len(groups[0].localized_issues) == 2
+
+    def test_highest_fixed_version_ignores_build_metadata(self):
+        issue = _sca()
+        groups = group_issues(
+            [issue],
+            sca_issue_plans=[
+                (
+                    _localized(issue),
+                    _plan(
+                        status=FixPlanStatus.VERSION_FOUND,
+                        fixed_version="1.2.3+build.1",
+                    ),
+                )
+            ],
+        )
+
+        assert groups[0].fix_plan is not None
+        assert groups[0].fix_plan.fixed_version == "1.2.3+build.1"
 
 
 # ---------------------------------------------------------------------------

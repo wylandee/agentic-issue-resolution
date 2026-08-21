@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -79,6 +80,63 @@ def test_fetch_langsmith_spans_queries_by_trace_id(monkeypatch):
 
     assert fake_client.trace_id == "trace-123"
     assert spans[0]["name"] == "phase5_orchestrator"
+
+
+def test_fetch_langsmith_spans_waits_for_pending_child_runs(monkeypatch):
+    """Remote export settles asynchronous child spans before rendering them."""
+    pending = SimpleNamespace(
+        id="run-1",
+        name="phase5_orchestrator",
+        run_type="chain",
+        parent_run_id=None,
+        start_time=datetime(2026, 8, 21, tzinfo=UTC),
+        end_time=None,
+        inputs={},
+        outputs={},
+        error=None,
+        extra={},
+        tags=[],
+        serialized={},
+        status="pending",
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+    )
+    completed = SimpleNamespace(
+        **{
+            **vars(pending),
+            "end_time": datetime(2026, 8, 21, 0, 0, 1, tzinfo=UTC),
+            "status": "completed",
+        }
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def list_runs(self, *, trace_id, limit):
+            self.calls += 1
+            return iter([pending] if self.calls == 1 else [completed])
+
+        def read_run(self, *args, **kwargs):
+            raise AssertionError("read_run should not be needed")
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.Client", lambda: fake_client
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.wait_for_all_tracers", lambda: None
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.time.sleep", lambda _seconds: None
+    )
+
+    spans = fetch_langsmith_spans("trace-123")
+
+    assert fake_client.calls == 2
+    assert spans[0]["status"] == "completed"
+    assert spans[0]["ended_at"] is not None
 
 
 def test_local_recorder_captures_llm_and_tool_fallback_events():

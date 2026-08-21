@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
 from remediation_engine.cli import _load_issues, build_parser, main
 from remediation_engine.contracts.schemas import (
@@ -45,6 +47,22 @@ def test_request_result_models_are_stable(tmp_path: Path) -> None:
         "trajectory_path": None,
         "report_path": None,
     }
+
+
+@pytest.mark.parametrize("repo_root", [Path("relative/repo"), Path("missing-repo")])
+def test_request_rejects_invalid_repository_paths(repo_root: Path) -> None:
+    """The public API fails before orchestration for unsafe repository roots."""
+    with pytest.raises(ValueError, match="repo_root"):
+        RemediationRequest(repo_root=repo_root)
+
+
+def test_request_rejects_file_as_repository_root(tmp_path: Path) -> None:
+    """A file cannot be used as the host repository workspace."""
+    file_path = tmp_path / "not-a-repository"
+    file_path.write_text("content", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="existing directory"):
+        RemediationRequest(repo_root=file_path)
 
 
 def test_run_remediation_projects_orchestrator_state(tmp_path: Path) -> None:
@@ -92,6 +110,26 @@ def test_run_remediation_reports_completed_with_errors(tmp_path: Path) -> None:
 
     assert result.status == "completed_with_errors"
     assert result.errors == ["worker surrendered"]
+
+
+def test_run_remediation_rejects_success_status_when_final_task_failed(tmp_path: Path) -> None:
+    """The public result cannot claim success over an unfixable task."""
+    request = RemediationRequest(repo_root=tmp_path)
+    state = {
+        "status": "completed",
+        "task_queue": {
+            "task-1": {
+                "task_id": "task-1",
+                "status": "unfixable",
+            }
+        },
+        "errors": [],
+    }
+    with patch("remediation_engine.api.run_orchestrator", return_value=state):
+        result = run_remediation(request)
+
+    assert result.status == "completed_with_errors"
+    assert "task task-1 ended in unfixable" in result.errors[0]
 
 
 def test_cli_auto_loads_canonical_jsonl(tmp_path: Path) -> None:

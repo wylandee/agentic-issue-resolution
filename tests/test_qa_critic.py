@@ -36,6 +36,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
     BatchQAResult,
@@ -48,6 +49,7 @@ from remediation_engine.contracts.schemas import (
     NoFixMitigationStage,
     QACriticLLMOutput,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     Severity,
@@ -81,6 +83,7 @@ from remediation_engine.orchestration.qa_critic import (
     _parse_investigation_report,
     _parse_report_identifiers,
     _QAExecutionResults,
+    _QAPackageState,
     _read_report_from_workspace,
     _run_batch_judge,
     _run_global_execution,
@@ -306,7 +309,7 @@ class TestRunUnitTests:
         _, kwargs = sandbox.run.call_args
         assert kwargs.get("timeout") == _NPM_TEST_TIMEOUT_SECONDS
 
-    def test_composite_suite_stops_after_first_failed_child(self):
+    def test_composite_suite_runs_all_children_after_first_failure(self):
         root_package = {
             "scripts": {
                 "test": "npm run test:server && npm run test:api",
@@ -333,7 +336,13 @@ class TestRunUnitTests:
                     ),
                     stderr="",
                     duration_seconds=1.0,
-                )
+                ),
+                CommandResult(
+                    exit_code=0,
+                    stdout="ok",
+                    stderr="",
+                    duration_seconds=1.0,
+                ),
             ]
         )
         sandbox.read_file.side_effect = lambda path: (
@@ -345,9 +354,14 @@ class TestRunUnitTests:
         assert ok is False
         assert "Failed Tests: 1" in summary
         assert "server rejects bad token" in summary
-        assert sandbox.run.call_count == 1
-        sandbox.run.assert_called_once_with(
+        assert "- api: passed" in summary
+        assert sandbox.run.call_count == 2
+        sandbox.run.assert_any_call(
             "npm run test:server -- --reporter json",
+            timeout=_NPM_TEST_TIMEOUT_SECONDS,
+        )
+        sandbox.run.assert_any_call(
+            "npm run test:api",
             timeout=_NPM_TEST_TIMEOUT_SECONDS,
         )
 
@@ -372,7 +386,9 @@ class TestRunUnitTests:
         ok, summary = _run_unit_tests(sandbox)
 
         assert ok is True
-        assert summary == "npm test passed."
+        assert summary.startswith("npm test passed.")
+        assert "- server: passed" in summary
+        assert "- api: passed" in summary
         assert sandbox.run.call_count == 2
 
     def test_unknown_project_uses_legacy_npm_test_text_parser(self):
@@ -647,7 +663,9 @@ class TestRunOdc:
             _run_odc("test-vol")
             args = mock_run.call_args[0][0]
 
-        excludes = {args[index + 1] for index, argument in enumerate(args[:-1]) if argument == "--exclude"}
+        excludes = {
+            args[index + 1] for index, argument in enumerate(args[:-1]) if argument == "--exclude"
+        }
         assert set(_ODC_INTERNAL_FULL_SCAN_EXCLUDES).issubset(excludes)
 
     def test_does_not_exclude_targeted_scan_root(self):
@@ -1249,6 +1267,16 @@ class TestGenerateWorkspaceDiff:
         assert "empty" in diff_text.lower() or "no changed files" in diff_text.lower()
         sandbox.read_file.assert_not_called()
 
+    def test_blocked_candidate_path_is_reported_explicitly(self, tmp_path):
+        """Traversal candidates are errors, not unchanged-file observations."""
+        sandbox = MagicMock()
+
+        diff_text, changed = _generate_workspace_diff(str(tmp_path), sandbox, ["../outside.js"])
+
+        assert changed == []
+        assert "ERROR: blocked candidate path" in diff_text
+        sandbox.read_file.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # build_qa_toolbelt â€” toolbelt composition
@@ -1370,7 +1398,7 @@ class TestQAExecutionToolGuards:
         )
         install_tool = self._get_tool(tools, "run_dependency_install")
 
-        first = install_tool.invoke({})
+        install_tool.invoke({})
         second = install_tool.invoke({})
 
         assert results.install is not None
@@ -1389,10 +1417,9 @@ class TestQAExecutionToolGuards:
                 host_repo_root=None,
             )
         scan_tool = self._get_tool(tools, "run_security_scan")
-        install_tool = self._get_tool(tools, "run_dependency_install")
         results.install = (True, "install ok")
 
-        first = scan_tool.invoke({})
+        scan_tool.invoke({})
         second = scan_tool.invoke({})
 
         assert results.scan is not None
@@ -1413,7 +1440,7 @@ class TestQAExecutionToolGuards:
         test_tool = self._get_tool(tools, "run_unit_tests")
         results.scan = (True, "scan ok", set())
 
-        first = test_tool.invoke({})
+        test_tool.invoke({})
         second = test_tool.invoke({})
 
         assert results.tests is not None
@@ -1717,6 +1744,7 @@ def _make_loop_result(
         structured_output=structured_output,
     )
 
+
 def _make_fully_populated_results(ok=True):
     """Build a _QAExecutionResults with all three phases filled in."""
     r = _QAExecutionResults()
@@ -1813,6 +1841,7 @@ class TestRunQACriticNode:
             task_id="task-1",
             parent_group_id=group.group_id,
             strategy=RoutingStrategy.CODE_WORKAROUND,
+            qa_policy=QAPolicy.NO_FIX_PACKAGE_REMOVAL,
             no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
             status=TaskStatus.OPTIMISTICALLY_FIXED,
             instruction="Remove the vulnerable package.",
@@ -1828,6 +1857,10 @@ class TestRunQACriticNode:
         results.scan = None
         results.scan_skipped = True
         results.scan_skip_reason = "no_fix_package_removal"
+        results.package_state_by_group[group.group_id] = _QAPackageState(
+            manifest_state="absent",
+            graph_state="absent",
+        )
         patches = self._patch_node(group=group, results=results)
 
         with (
@@ -1835,6 +1868,10 @@ class TestRunQACriticNode:
             patches["global_exec"] as global_exec,
             patches["investigators"],
             patches["judge"],
+            patch(
+                "remediation_engine.orchestration.qa_critic._collect_group_package_state",
+                return_value=_QAPackageState(manifest_state="absent", graph_state="absent"),
+            ),
         ):
             result = run_qa_critic_node(state)
 
@@ -2418,19 +2455,13 @@ class TestBatchQAResultSchema:
         assert result.evaluations == []
 
     def test_holistic_report_must_be_nonempty(self):
-        try:
+        with pytest.raises(ValidationError):
             BatchQAResult(holistic_report="", evaluations=[])
-            assert False, "should have raised"
-        except Exception:
-            pass
 
     def test_batch_result_is_frozen(self):
         result = BatchQAResult(holistic_report="ok", evaluations=[])
-        try:
+        with pytest.raises((TypeError, ValidationError)):
             result.holistic_report = "changed"
-            assert False, "should have raised"
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

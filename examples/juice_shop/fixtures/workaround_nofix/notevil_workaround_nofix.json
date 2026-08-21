@@ -112,6 +112,7 @@
     "current_attempt_id": null,
     "parent_group_id": "sca:package.json:notevil:NO_FIX",
     "parent_task_id": null,
+    "qa_policy": "no_fix_code_removal",
     "strategy": "code_workaround",
     "strategy_stage": "code_workaround",
     "no_fix_stage": "vulnerable_code_removal",

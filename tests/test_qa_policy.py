@@ -147,7 +147,7 @@ def test_version_bump_scanner_is_group_scoped() -> None:
             evaluations=[
                 QAEvaluation(task_id="g1", passed=True),
                 QAEvaluation(task_id="g2", passed=True),
-            ]
+            ],
         ),
         gates,
         {"g1": QAPolicy.VERSION_BUMP, "g2": QAPolicy.VERSION_BUMP},
@@ -267,7 +267,9 @@ def test_no_fix_package_state_fails_closed_for_unsupported_manager() -> None:
             ]
         }
     )
-    package_state = _collect_group_package_state(MagicMock(), group, QAPolicy.NO_FIX_PACKAGE_REMOVAL)
+    package_state = _collect_group_package_state(
+        MagicMock(), group, QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    )
     assert package_state.manifest_state == "unknown"
     assert package_state.graph_state == "unknown"
     assert "pnpm" in package_state.diagnostics[0]
@@ -309,9 +311,7 @@ def test_shared_install_failure_fails_every_group() -> None:
 
 def test_missing_initial_task_policy_is_recoverable_deterministically() -> None:
     group = _group("g1")
-    task = build_initial_remediation_task(group, "task-1").model_copy(
-        update={"qa_policy": None}
-    )
+    task = build_initial_remediation_task(group, "task-1").model_copy(update={"qa_policy": None})
 
     assert derive_missing_task_qa_policy(task, group) == QAPolicy.VERSION_BUMP
 
@@ -359,11 +359,7 @@ def test_active_qa_policy_must_match_attempt_snapshot() -> None:
         [group],
         {task.task_id: task},
         [task.task_id],
-        {
-            "attempt-1": task.model_copy(
-                update={"current_attempt_id": None, "qa_policy": None}
-            )
-        },
+        {"attempt-1": task.model_copy(update={"current_attempt_id": None, "qa_policy": None})},
     )
 
     assert policies[group.group_id] is None

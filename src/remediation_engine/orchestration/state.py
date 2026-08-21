@@ -53,10 +53,29 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    normalize_workspace_path,
+    repository_relative_path,
+)
 from remediation_engine.tools.manifest_locator import expand_dependency_ancestry_from_repository
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+
+class ChangedFilesProjection(list[str]):
+    """Authoritative final changed-file projection for the state reducer.
+
+    Worker nodes emit ordinary lists, which are accumulated across retries.
+    Teardown emits this marker after comparing candidate paths with the
+    workspace and host baseline. The reducer then replaces the historical
+    candidate ledger with the files that actually appear in the final diff.
+    """
+
+    def __init__(self, values: list[str] | tuple[str, ...] = ()) -> None:
+        """Initialize a projection from repository-relative paths."""
+        super().__init__(values)
 
 
 def merge_dict_reducer(
@@ -87,16 +106,29 @@ def replace_dict_reducer(
 
 def merge_changed_files_reducer(
     left: list[str] | None,
-    right: list[str] | None,
+    right: list[str] | ChangedFilesProjection | None,
 ) -> list[str]:
     """Merge changed-file projections while normalizing and de-duplicating paths."""
+    values = (
+        list(right or [])
+        if isinstance(right, ChangedFilesProjection)
+        else [
+            *(left or []),
+            *(right or []),
+        ]
+    )
     merged: list[str] = []
     seen: set[str] = set()
-    for value in [*(left or []), *(right or [])]:
+    for value in values:
         if not isinstance(value, str):
-            continue
-        path = value.replace("\\", "/").lstrip("/").strip()
-        if path and path not in seen:
+            raise WorkspacePathError(f"changed_files reducer rejected non-string path {value!r}")
+        try:
+            path = normalize_workspace_path(value)
+        except WorkspacePathError as exc:
+            raise WorkspacePathError(
+                f"changed_files reducer rejected path {value!r}: {exc}"
+            ) from exc
+        if path not in seen:
             seen.add(path)
             merged.append(path)
     return merged
@@ -140,29 +172,7 @@ def _repo_relative_path(value: str | None, repo_root: str) -> str | None:
     """
     if value is None:
         return None
-    raw = str(value).replace("\\", "/").strip()
-    if not raw:
-        return None
-
-    try:
-        return Path(raw).relative_to(Path(repo_root)).as_posix()
-    except ValueError:
-        pass
-    try:
-        return Path(raw).resolve().relative_to(Path(repo_root).resolve()).as_posix()
-    except (OSError, ValueError):
-        pass
-
-    raw_clean = raw.lstrip("/")
-    root_clean = str(repo_root).replace("\\", "/").strip().lstrip("/").rstrip("/")
-    if raw_clean.casefold() == root_clean.casefold():
-        return None
-    if raw_clean.casefold().startswith(root_clean.casefold() + "/"):
-        return raw_clean[len(root_clean) + 1 :].lstrip("/") or None
-
-    while raw.startswith("./"):
-        raw = raw[2:]
-    return raw or None
+    return repository_relative_path(value, repo_root)
 
 
 def normalize_group_paths(
@@ -187,16 +197,27 @@ def normalize_group_paths(
             new = _repo_relative_path(old, repo_root)
             if old and old != new:
                 replacements[str(old)] = new or "unknown-manifest"
-            odc_file_path = localized.issue.file_path or (localized.issue.raw_payload or {}).get(
-                "filePath", ""
+            odc_file_path = (
+                repository_relative_path(
+                    localized.issue.file_path
+                    or (localized.issue.raw_payload or {}).get("filePath", ""),
+                    repo_root,
+                )
+                or ""
             )
-            ancestry, versions = expand_dependency_ancestry_from_repository(
-                Path(repo_root),
-                new or old,
-                odc_file_path,
-                localized.dependency_ancestry,
-                localized.dependency_versions,
-            )
+            if new is None:
+                ancestry, versions = (
+                    list(localized.dependency_ancestry),
+                    dict(localized.dependency_versions),
+                )
+            else:
+                ancestry, versions = expand_dependency_ancestry_from_repository(
+                    Path(repo_root),
+                    new,
+                    odc_file_path,
+                    localized.dependency_ancestry,
+                    localized.dependency_versions,
+                )
             localized_updates: dict[str, Any] = {"manifest_file": new}
             if ancestry != localized.dependency_ancestry:
                 localized_updates.update(

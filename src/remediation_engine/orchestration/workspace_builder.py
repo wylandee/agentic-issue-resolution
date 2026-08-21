@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.runtime.docker_client import close_docker_client
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 
 logger = logging.getLogger(__name__)
@@ -26,9 +27,8 @@ _SKIP_PACKAGE_DIR_NAMES = frozenset({".git", "node_modules"})
 
 
 def _close_client(client) -> None:
-    close = getattr(client, "close", None)
-    if callable(close):
-        close()
+    """Compatibility wrapper for the shared Docker client boundary."""
+    close_docker_client(client)
 
 
 def _discover_package_directories(repo_root: Path) -> list[Path]:

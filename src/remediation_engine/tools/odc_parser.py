@@ -21,6 +21,8 @@ import csv
 import json
 import logging
 import os
+import re
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ from remediation_engine.contracts import (
     Severity,
     VulnerabilityIssue,
 )
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 try:
     from packageurl import PackageURL
@@ -113,30 +116,7 @@ def _package_name_from_purl(purl_str: str | None) -> str | None:
     with namespace=None.  For maven: namespace is the groupId and name is
     the artifactId; we join them with ':' (maven convention).
     """
-    if not purl_str:
-        return None
-    if _PURL_AVAILABLE:
-        try:
-            purl = PackageURL.from_string(purl_str)
-            name = purl.name or ""
-            namespace = purl.namespace or ""
-            if not name:
-                return None
-            if purl.type == "npm":
-                # namespace is None; scoped packages already have '@scope/name' in name
-                return name
-            if namespace:
-                # maven, pypi with namespace, etc. â€” join with ':'
-                return f"{namespace}:{name}"
-            return name
-        except Exception:
-            pass
-    # Fallback: strip version
-    try:
-        segment = purl_str.split("/")[-1]
-        return segment.split("@")[0].replace("%40", "@").replace("%2F", "/") or None
-    except Exception:
-        return None
+    return package_name_from_purl(purl_str)
 
 
 def _version_from_purl(purl_str: str | None) -> str | None:
@@ -162,18 +142,26 @@ def _parse_cwes(vulnerability: dict[str, Any]) -> list[CWEEntry]:
     cwes_raw = vulnerability.get("cwes") or []
     result: list[CWEEntry] = []
     for raw in cwes_raw:
-        cwe_str = str(raw).strip()
-        # Normalise: "CWE-79", "79", "CWE79" â†’ "CWE-79"
-        if not cwe_str.startswith("CWE-"):
-            digits = "".join(c for c in cwe_str if c.isdigit())
-            if digits:
-                cwe_str = f"CWE-{digits}"
-            else:
-                continue
-        try:
-            result.append(CWEEntry(id=cwe_str))
-        except Exception:
-            pass
+        if isinstance(raw, dict):
+            raw_id = raw.get("id") or raw.get("cwe") or raw.get("name") or ""
+            display_name = raw.get("description") or raw.get("name")
+        else:
+            raw_id = raw
+            display_name = None
+        raw_text = str(raw_id).strip()
+        match = re.search(r"(?i)\bCWE[- ]?(\d+)\b", raw_text)
+        if not match:
+            match = re.search(r"\b(\d+)\b", raw_text)
+        if not match:
+            continue
+        cwe_str = f"CWE-{match.group(1)}"
+        if display_name is None and match.end() < len(raw_text):
+            suffix = raw_text[match.end() :].lstrip(" :-")
+            display_name = suffix or None
+        with suppress(Exception):
+            result.append(
+                CWEEntry(id=cwe_str, name=str(display_name).strip() if display_name else None)
+            )
     return result
 
 

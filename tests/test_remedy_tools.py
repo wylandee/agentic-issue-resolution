@@ -438,6 +438,16 @@ class TestToolbeltFactories:
         assert result.startswith("FAILURE: Targeted test failed")
         assert "test/server/insecuritySpec.ts:184:112" in result
 
+    def test_targeted_test_rejects_absolute_and_traversal_paths(self):
+        sandbox = MagicMock()
+        tool = _make_run_targeted_test_tool(sandbox)
+
+        for path in ("/etc/passwd", "../outside.test.ts", r"C:\outside.test.ts"):
+            result = tool.invoke({"test_file": path})
+            assert result.startswith("ERROR: Invalid test file path")
+
+        sandbox.read_file.assert_not_called()
+
     def test_validate_workaround_runtime_smoke_catches_import_errors(self):
         sandbox = MagicMock()
         sandbox.read_file.side_effect = lambda path: (

@@ -92,6 +92,14 @@ class TestCodeMapHelpers:
         result = resolve_repo_file(str(tmp_path), "does/not/exist.js")
         assert result is None
 
+    def test_resolve_repo_file_rejects_traversal(self, tmp_path: Path):
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        target = outside / "secret.js"
+        target.write_text("secret")
+
+        assert resolve_repo_file(str(tmp_path), "../" + target.name) is None
+
     # --- load_source_bytes / load_source_lines ---
 
     def test_load_source_bytes_reads_file(self, tmp_path: Path):

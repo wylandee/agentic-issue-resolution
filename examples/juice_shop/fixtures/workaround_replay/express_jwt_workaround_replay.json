@@ -63,6 +63,7 @@
     "current_attempt_id": null,
     "parent_group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
     "parent_task_id": "task-1",
+    "qa_policy": "migration_code_workaround",
     "strategy": "code_workaround",
     "strategy_stage": "code_workaround",
     "selected_version": null,

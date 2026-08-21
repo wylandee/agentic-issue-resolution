@@ -52,13 +52,15 @@ def _load_direct_dependencies(repo_root: Path) -> set[str]:
     for key in ("dependencies", "devDependencies"):
         deps = data.get(key)
         if isinstance(deps, dict):
-            direct_deps.update(str(name) for name in deps.keys())
+            direct_deps.update(str(name) for name in deps)
     return direct_deps
 
 
 def _iter_source_files(repo_root: Path) -> Iterable[Path]:
     """Yield application source files while skipping generated/vendor paths."""
     for path in repo_root.rglob("*"):
+        if path.is_symlink():
+            continue
         if not path.is_file():
             continue
         if path.suffix.lower() not in _SOURCE_SUFFIXES:
@@ -104,7 +106,7 @@ def _collect_global_imports(repo_root: Path) -> set[str]:
 
 def analyze_reachability(groups: list[VulnerabilityGroup], repo_root: str | Path) -> None:
     """Mutate SCA groups in place with a deterministic reachability signal."""
-    root = Path(repo_root)
+    root = Path(repo_root).resolve()
     if not root.exists():
         logger.warning("Reachability: repo root does not exist: %s", root)
         return

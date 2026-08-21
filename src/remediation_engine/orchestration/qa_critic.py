@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shlex
 import shutil
@@ -69,12 +68,17 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    normalize_workspace_path,
+    resolve_repository_path,
+)
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.settings import AppSettings
 from remediation_engine.tools.lockfile_closure import (
     ClosureResolutionError,
     DependencyClosure,
@@ -487,7 +491,9 @@ def _odc_timeout_summary(exc: subprocess.TimeoutExpired) -> str:
     if isinstance(cleanup, _ODCCleanupResult):
         if cleanup.succeeded:
             cleanup_state = "already absent" if cleanup.already_absent else "removed"
-            summary += f"\nODC container cleanup completed ({cleanup_state}): {cleanup.container_name}"
+            summary += (
+                f"\nODC container cleanup completed ({cleanup_state}): {cleanup.container_name}"
+            )
         else:
             summary += (
                 f"\nODC container cleanup FAILED for {cleanup.container_name}: "
@@ -697,7 +703,7 @@ def _odc_command(
         for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES:
             cmd.extend(["--exclude", pattern])
 
-    extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
+    extra_args = get_runtime_settings().odc_extra_args
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
@@ -820,7 +826,12 @@ def _run_security_scan(
         msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
         logger.warning("qa_critic: %s", msg)
         return _SecurityScanResult(
-            False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE
+            False,
+            msg,
+            set(),
+            set(),
+            set(),
+            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
         )
 
     try:
@@ -831,7 +842,12 @@ def _run_security_scan(
             + _odc_exception_log_note(exc)
         )
         return _SecurityScanResult(
-            False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE
+            False,
+            msg,
+            set(),
+            set(),
+            set(),
+            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
         )
     except subprocess.TimeoutExpired as exc:
         msg = _odc_timeout_summary(exc)
@@ -1608,7 +1624,7 @@ def _command_targets_test_file(command: str, test_file: str, cwd: str) -> bool:
             prefix = re.split(r"[*?]", token, maxsplit=1)[0].rstrip("/")
             if prefix and relative_path.startswith(prefix):
                 return True
-        elif token == relative_path or token == test_file:
+        elif token in (relative_path, test_file):
             return True
 
     # Commands such as ``ng test`` and ``vitest`` discover files through the
@@ -2265,8 +2281,9 @@ def _format_normalized_test_summary(suites: list[_NormalizedSuiteResult]) -> str
     exit_code = failed_suites[-1].exit_code if failed_suites else 0
     failed_tests = [failure for suite in suites for failure in suite.failed_tests]
     diagnostics = [diagnostic for suite in suites for diagnostic in suite.diagnostics]
+    status_header = f"npm test FAILED (exit {exit_code})." if failed_suites else "npm test passed."
     lines = [
-        f"npm test FAILED (exit {exit_code}).",
+        status_header,
         f"Failed Tests: {len(failed_tests)}",
         f"Runner Diagnostics: {len(diagnostics)}",
         "",
@@ -2376,6 +2393,7 @@ def _generate_workspace_diff(
     host_root = Path(host_repo_root)
     changed_files: list[str] = []
     diff_parts: list[str] = []
+    blocked_paths: list[str] = []
 
     # Deduplicate files while preserving order.
     seen: set[str] = set()
@@ -2386,8 +2404,12 @@ def _generate_workspace_diff(
             unique_candidates.append(f)
 
     for rel_path in unique_candidates:
-        # Normalize path separators.
-        rel_path = rel_path.replace("\\", "/")
+        try:
+            rel_path = normalize_workspace_path(rel_path, allow_workspace_prefix=False)
+            abs_host = resolve_repository_path(host_root, rel_path)
+        except WorkspacePathError as exc:
+            blocked_paths.append(f"{rel_path!r}: {exc}")
+            continue
         parts = Path(rel_path).parts
         if any(p in _DIFF_EXCLUDE_DIRS for p in parts):
             continue
@@ -2396,8 +2418,11 @@ def _generate_workspace_diff(
         if Path(rel_path).suffix.lower() in _DIFF_EXCLUDE_SUFFIXES:
             continue
 
-        abs_host = host_root / rel_path
-        workspace_content = sandbox.read_file(rel_path)
+        try:
+            workspace_content = sandbox.read_file(rel_path)
+        except WorkspacePathError as exc:
+            blocked_paths.append(f"{rel_path!r}: {exc}")
+            continue
 
         try:
             if abs_host.is_file():
@@ -2434,13 +2459,30 @@ def _generate_workspace_diff(
 
     full_diff = "\n".join(diff_parts)
     if not full_diff:
-        return (
+        empty_diff = (
             "(diff is empty â€” workspace matches host baseline for all candidate files)",
             changed_files,
         )
+        if blocked_paths:
+            return (
+                "ERROR: blocked candidate path(s):\n"
+                + "\n".join(f"- {path}" for path in blocked_paths)
+                + "\n\n"
+                + empty_diff[0],
+                changed_files,
+            )
+        return empty_diff
 
     if len(full_diff) > _DIFF_CHAR_BUDGET:
         full_diff = full_diff[:_DIFF_CHAR_BUDGET] + "\n... (diff truncated)"
+
+    if blocked_paths:
+        full_diff = (
+            "ERROR: blocked candidate path(s):\n"
+            + "\n".join(f"- {path}" for path in blocked_paths)
+            + "\n\n"
+            + full_diff
+        )
 
     return full_diff, changed_files
 
@@ -2601,14 +2643,9 @@ def _build_qa_scan_targets(
 
 def _validate_qa_path(file_path: str) -> str:
     """Validate a repo-relative path for QA read-only review tools."""
-    candidate = (file_path or "").strip()
-    if not candidate:
+    if not str(file_path or "").strip():
         raise ValueError("file_path is required.")
-    if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
-        raise ValueError(f"Rejected absolute file path '{candidate}'.")
-    if ".." in Path(candidate).parts:
-        raise ValueError(f"Rejected path traversal in '{candidate}'.")
-    return candidate.replace("\\", "/")
+    return normalize_workspace_path(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2730,7 +2767,9 @@ def _collect_group_package_state(
             raw = (command_result.stdout or "").strip()
             tree = json.loads(raw) if raw else None
             if isinstance(tree, dict):
-                graph_states.append("present" if _dependency_tree_contains(tree, package) else "absent")
+                graph_states.append(
+                    "present" if _dependency_tree_contains(tree, package) else "absent"
+                )
             else:
                 graph_states.append("unknown")
                 graph_diagnostics.append(f"npm ls returned no parseable graph for {manifest}.")
@@ -3280,7 +3319,9 @@ def _derive_qa_group_policies(
                 raw_policy if isinstance(raw_policy, QAPolicy) else QAPolicy(str(raw_policy))
             )
         except ValueError:
-            logger.warning("qa_critic: unknown QA policy %r for group %s", raw_policy, group.group_id)
+            logger.warning(
+                "qa_critic: unknown QA policy %r for group %s", raw_policy, group.group_id
+            )
             policies[group.group_id] = None
     return policies
 
@@ -3474,7 +3515,7 @@ def _parse_investigation_report(
 
 def _targeted_extra_args_conflict() -> bool:
     """Return whether configured ODC arguments override required target paths."""
-    extra_args = os.environ.get("ODC_EXTRA_ARGS", "").strip()
+    extra_args = get_runtime_settings().odc_extra_args
     if not extra_args:
         return False
     try:
@@ -4227,13 +4268,27 @@ def _format_deterministic_test_failure_ledger(
     lines = [
         "- Failure records are evidence only; no owner has been assigned by Python.",
         "- Failed tests:",
-        *[f"  - {value}" for value in (failure_evidence.failed_tests or ["(test name unavailable)"])[:10]],
+        *[
+            f"  - {value}"
+            for value in (failure_evidence.failed_tests or ["(test name unavailable)"])[:10]
+        ],
         "- Exact diagnostics:",
-        *[f"  - {value}" for value in (failure_evidence.exact_diagnostics or ["(diagnostic unavailable)"])[:10]],
+        *[
+            f"  - {value}"
+            for value in (failure_evidence.exact_diagnostics or ["(diagnostic unavailable)"])[:10]
+        ],
         "- Source locations observed in deterministic output:",
-        *[f"  - {value}" for value in (failure_evidence.source_locations or ["(source location unavailable)"])[:10]],
+        *[
+            f"  - {value}"
+            for value in (failure_evidence.source_locations or ["(source location unavailable)"])[
+                :10
+            ]
+        ],
         "- Affected files observed in deterministic output:",
-        *[f"  - {value}" for value in (failure_evidence.affected_files or ["(affected file unavailable)"])[:10]],
+        *[
+            f"  - {value}"
+            for value in (failure_evidence.affected_files or ["(affected file unavailable)"])[:10]
+        ],
     ]
     return "\n".join(lines)
 
@@ -4266,10 +4321,13 @@ def _build_individual_investigator_prompt(
     )
     new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
 
-    summaries_text = "\n".join(
-        f"  - {s.status.value}: {_trim_action_summary_text(s.summary, group)}"
-        for s in action_summaries
-    ) or "  (none)"
+    summaries_text = (
+        "\n".join(
+            f"  - {s.status.value}: {_trim_action_summary_text(s.summary, group)}"
+            for s in action_summaries
+        )
+        or "  (none)"
+    )
     remaining_text = (
         ", ".join(group_remaining_ids)
         if group_remaining_ids
@@ -4337,6 +4395,7 @@ final response is one call to the emit_qa_evaluation tool with these fields:
 Python owns deterministic_gates, failure_evidence, scan_evidence, and contract/provenance fields. Do not attempt to fill those fields.
 """
 
+
 # ---------------------------------------------------------------------------
 # Structured evaluator: one per dispatched task
 # ---------------------------------------------------------------------------
@@ -4380,7 +4439,7 @@ def _run_individual_investigations(
     """
     from langchain_openai import ChatOpenAI
 
-    model_name = AppSettings.from_env().qa_llm_model
+    model_name = get_runtime_settings().qa_llm_model
     known_group_ids = {group.group_id for group in valid_groups}
     evaluations: dict[str, GroupInvestigation] = {}
 
@@ -4455,8 +4514,9 @@ def _run_individual_investigations(
                     "inspect_ast_symbol",
                 }:
                     review_tools_used.append(event.name)
-                    source_review_evidence = source_review_evidence or _has_successful_review_tool_evidence(
-                        event.name, event.content
+                    source_review_evidence = (
+                        source_review_evidence
+                        or _has_successful_review_tool_evidence(event.name, event.content)
                     )
 
             errors = list(loop_result.errors)
@@ -4535,6 +4595,7 @@ def _run_individual_investigations(
         )
 
     return evaluations
+
 
 def _build_fallback_investigation_for_group(
     group: VulnerabilityGroup,
@@ -4732,7 +4793,7 @@ def _run_batch_judge(
     """
     from langchain_openai import ChatOpenAI
 
-    model_name = AppSettings.from_env().qa_llm_model
+    model_name = get_runtime_settings().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(BatchQAResult)
 
     prompt = _build_batch_judge_prompt(
@@ -4818,7 +4879,9 @@ def _evaluate_policy_gates(
     install_passed = bool(results.install and results.install[0])
     install_summary = results.install[1] if results.install else "install did not run"
     tests_passed = results.tests[0] if results.tests is not None else None
-    remaining_global = set(_scan_result_value(results.scan, "remaining_identifiers", set()) or set())
+    remaining_global = set(
+        _scan_result_value(results.scan, "remaining_identifiers", set()) or set()
+    )
     scanner_status = _scan_result_value(
         results.scan, "execution_status", ScannerExecutionStatus.NOT_RUN
     )
@@ -4836,15 +4899,22 @@ def _evaluate_policy_gates(
 
     for group in valid_groups:
         policy = group_policies.get(group.group_id)
+        effective_scanner_status = (
+            ScannerExecutionStatus.SUCCESS
+            if results.scan_skipped and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL
+            else scanner_status
+        )
         remaining = _group_remaining_identifiers(group, remaining_global)
         package_state = results.package_state_by_group.get(group.group_id, _QAPackageState())
-        target_cleared = scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
+        target_cleared = (
+            effective_scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
+        )
         diagnostics: list[str] = []
         if not install_passed:
             diagnostics.append(install_summary)
-        if scanner_status != ScannerExecutionStatus.SUCCESS:
+        if effective_scanner_status != ScannerExecutionStatus.SUCCESS:
             diagnostics.append(
-                f"Scanner execution status: {scanner_status.value}. "
+                f"Scanner execution status: {effective_scanner_status.value}. "
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
             )
         diagnostics.extend(package_state.diagnostics)
@@ -4869,7 +4939,7 @@ def _evaluate_policy_gates(
         gates_by_group[group.group_id] = QADeterministicGates(
             status="pass" if deterministic_pass else "fail",
             install_passed=install_passed,
-            scanner_execution_status=scanner_status,
+            scanner_execution_status=effective_scanner_status,
             target_remaining_identifiers=remaining,
             target_scanner_cleared=target_cleared,
             tests_passed=tests_passed,
@@ -4906,6 +4976,7 @@ def _qa_evaluation_items(
         return list(source.evaluations)
     return list(source.values())
 
+
 def _apply_policy_decision(
     valid_groups: list[VulnerabilityGroup],
     batch_result: BatchQAResult | Mapping[str, QAEvaluation],
@@ -4923,7 +4994,9 @@ def _apply_policy_decision(
         if group_id not in known_group_ids:
             errors.append(f"qa_critic policy evaluator: unknown group '{group_id}' dropped.")
         elif group_id in normalized:
-            errors.append(f"qa_critic policy evaluator: duplicate evaluation for '{group_id}' dropped.")
+            errors.append(
+                f"qa_critic policy evaluator: duplicate evaluation for '{group_id}' dropped."
+            )
         else:
             normalized[group_id] = evaluation
     for group in valid_groups:
@@ -4944,7 +5017,10 @@ def _apply_policy_decision(
         current = normalized[group_id]
         gates = gates_by_group[group_id]
         if current.contract_error:
-            reason = current.contract_error_reason.strip() or "The structured QA result could not be validated."
+            reason = (
+                current.contract_error_reason.strip()
+                or "The structured QA result could not be validated."
+            )
             errors.append(f"qa_critic contract error for '{group_id}': {reason}")
             final[group_id] = current.model_copy(
                 update={
@@ -4972,25 +5048,37 @@ def _apply_policy_decision(
             failures.append(
                 (
                     current.failure_category or FailureCategory.SECURITY_FLAG,
-                    current.retry_feedback
-                    or "The structured QA evaluator failed this task.",
+                    current.retry_feedback or "The structured QA evaluator failed this task.",
                 )
             )
         if group_id in missing_ids:
-            failures.append((FailureCategory.SECURITY_FLAG, "Structured QA evaluator omitted this group."))
+            failures.append(
+                (FailureCategory.SECURITY_FLAG, "Structured QA evaluator omitted this group.")
+            )
         if not gates.install_passed:
             install_text = " ".join(gates.diagnostics)
             category = (
                 FailureCategory.PEER_CONFLICT
-                if any(pattern.lower() in install_text.lower() for pattern in _PEER_CONFLICT_PATTERNS)
+                if any(
+                    pattern.lower() in install_text.lower() for pattern in _PEER_CONFLICT_PATTERNS
+                )
                 else FailureCategory.SECURITY_FLAG
             )
-            failures.append((category, "Shared npm install failed; every group in this QA batch is failed."))
+            failures.append(
+                (category, "Shared npm install failed; every group in this QA batch is failed.")
+            )
         if policy is None:
-            failures.append((FailureCategory.SECURITY_FLAG, "Missing or invalid QA policy provenance."))
+            failures.append(
+                (FailureCategory.SECURITY_FLAG, "Missing or invalid QA policy provenance.")
+            )
         if policy in _STRICT_SCANNER_QA_POLICIES:
             if gates.scanner_execution_status != ScannerExecutionStatus.SUCCESS:
-                failures.append((FailureCategory.SECURITY_FLAG, "Strict scanner policy requires a trustworthy parseable scanner report."))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "Strict scanner policy requires a trustworthy parseable scanner report.",
+                    )
+                )
             if gates.target_remaining_identifiers:
                 if current.passed or current.failure_category == FailureCategory.BREAKING_CHANGE:
                     errors.append(
@@ -4998,33 +5086,69 @@ def _apply_policy_decision(
                         "identifiers but judge did not prioritize SECURITY_FLAG; forcing "
                         "passed=False / SECURITY_FLAG."
                     )
-                failures.append((FailureCategory.SECURITY_FLAG, "Remaining target scanner identifiers: " + ", ".join(gates.target_remaining_identifiers)))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "Remaining target scanner identifiers: "
+                        + ", ".join(gates.target_remaining_identifiers),
+                    )
+                )
         if policy in _HARD_TEST_QA_POLICIES and gates.tests_passed is not True:
-            failures.append((FailureCategory.BREAKING_CHANGE, "The required global test suite did not pass."))
+            failures.append(
+                (FailureCategory.BREAKING_CHANGE, "The required global test suite did not pass.")
+            )
         elif policy == QAPolicy.VERSION_BUMP and gates.tests_passed is not True:
             attribution = current.test_attribution
             valid_exoneration = bool(
                 attribution
                 and attribution.verdict == TestAttributionVerdict.EXONERATED
                 and attribution.responsible_group_ids
-                and all(identifier in known_group_ids for identifier in attribution.responsible_group_ids)
+                and all(
+                    identifier in known_group_ids
+                    for identifier in attribution.responsible_group_ids
+                )
                 and gates.tests_passed is False
                 and attribution.failed_tests
                 and attribution.reasoning.strip()
                 and group_id not in attribution.responsible_group_ids
             )
             if not valid_exoneration:
-                failures.append((FailureCategory.BREAKING_CHANGE, "VERSION_BUMP tests failed without valid structured exoneration evidence."))
+                failures.append(
+                    (
+                        FailureCategory.BREAKING_CHANGE,
+                        "VERSION_BUMP tests failed without valid structured exoneration evidence.",
+                    )
+                )
         if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
             if gates.package_manifest_state != "absent":
-                failures.append((FailureCategory.SECURITY_FLAG, "NO_FIX Stage 1 requires the package to be absent from every authorized direct manifest."))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "NO_FIX Stage 1 requires the package to be absent from every authorized direct manifest.",
+                    )
+                )
             if gates.package_graph_state != "absent":
-                failures.append((FailureCategory.SECURITY_FLAG, "NO_FIX Stage 1 requires the package to be absent from the resolved dependency graph."))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "NO_FIX Stage 1 requires the package to be absent from the resolved dependency graph.",
+                    )
+                )
         if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
             if gates.package_manifest_state != "present":
-                failures.append((FailureCategory.SECURITY_FLAG, "NO_FIX Stage 2 requires the package to remain present in the direct manifest."))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "NO_FIX Stage 2 requires the package to remain present in the direct manifest.",
+                    )
+                )
             if gates.package_graph_state != "present":
-                failures.append((FailureCategory.SECURITY_FLAG, "NO_FIX Stage 2 requires the package to remain present in the resolved dependency graph."))
+                failures.append(
+                    (
+                        FailureCategory.SECURITY_FLAG,
+                        "NO_FIX Stage 2 requires the package to remain present in the resolved dependency graph.",
+                    )
+                )
 
         semantic_review = current.semantic_security_review
         if policy in _REQUIRED_SEMANTIC_QA_POLICIES and not _semantic_review_is_evidence_backed(
@@ -5035,10 +5159,23 @@ def _apply_policy_decision(
                     verdict=SecurityReviewVerdict.INCONCLUSIVE,
                     reasoning="Required semantic review could not be verified from investigator evidence and structured review output.",
                 )
-            failures.append((FailureCategory.SECURITY_FLAG, "Required semantic security review is missing, inconclusive, or lacks source/diff evidence."))
+            failures.append(
+                (
+                    FailureCategory.SECURITY_FLAG,
+                    "Required semantic security review is missing, inconclusive, or lacks source/diff evidence.",
+                )
+            )
 
         category = next(
-            (candidate for candidate in (FailureCategory.SECURITY_FLAG, FailureCategory.PEER_CONFLICT, FailureCategory.BREAKING_CHANGE) if any(item[0] == candidate for item in failures)),
+            (
+                candidate
+                for candidate in (
+                    FailureCategory.SECURITY_FLAG,
+                    FailureCategory.PEER_CONFLICT,
+                    FailureCategory.BREAKING_CHANGE,
+                )
+                if any(item[0] == candidate for item in failures)
+            ),
             None,
         )
         diagnostics = [message for _category, message in failures]
@@ -5057,7 +5194,8 @@ def _apply_policy_decision(
                 task_id=group_id,
                 passed=False,
                 failure_category=category or FailureCategory.SECURITY_FLAG,
-                retry_feedback=" ".join(dict.fromkeys(diagnostics)) or "QA policy gate failed; retry required.",
+                retry_feedback=" ".join(dict.fromkeys(diagnostics))
+                or "QA policy gate failed; retry required.",
                 failure_evidence=current.failure_evidence,
                 deterministic_gates=gates,
                 semantic_security_review=semantic_review,
@@ -5112,7 +5250,11 @@ def _apply_guardrails(
             if group_strategies.get(group.group_id) != "code_workaround":
                 continue
             current = next(
-                (evaluation for evaluation in _qa_evaluation_items(batch_result) if evaluation.task_id == group.group_id),
+                (
+                    evaluation
+                    for evaluation in _qa_evaluation_items(batch_result)
+                    if evaluation.task_id == group.group_id
+                ),
                 None,
             )
             if current is None:
@@ -5121,18 +5263,20 @@ def _apply_guardrails(
             # old code-workaround scanner exemption. Supervisor-produced QA
             # always supplies an explicit policy and therefore never uses this
             # compatibility path.
-            if current.passed and evaluations[group.group_id].failure_category == FailureCategory.SECURITY_FLAG:
-                evaluations[group.group_id] = current.model_copy(
-                    update={
-                        "deterministic_gates": evaluations[group.group_id].deterministic_gates,
-                    }
-                )
-            elif (
-                not current.passed
-                and current.failure_category == FailureCategory.BREAKING_CHANGE
+            if (
+                current.passed
                 and evaluations[group.group_id].failure_category == FailureCategory.SECURITY_FLAG
-                and results.install is not None
-                and any(pattern.lower() in results.install[1].lower() for pattern in _PEER_CONFLICT_PATTERNS)
+                or (
+                    not current.passed
+                    and current.failure_category == FailureCategory.BREAKING_CHANGE
+                    and evaluations[group.group_id].failure_category
+                    == FailureCategory.SECURITY_FLAG
+                    and results.install is not None
+                    and any(
+                        pattern.lower() in results.install[1].lower()
+                        for pattern in _PEER_CONFLICT_PATTERNS
+                    )
+                )
             ):
                 evaluations[group.group_id] = current.model_copy(
                     update={
@@ -5140,114 +5284,6 @@ def _apply_guardrails(
                     }
                 )
     return evaluations, errors
-
-    known_group_ids = {group.group_id for group in valid_groups}
-    errors: list[str] = []
-
-    # Phase 1: deduplicate and filter unknown group_ids
-    seen: set[str] = set()
-    normalized: dict[str, QAEvaluation] = {}
-    for evaluation in _qa_evaluation_items(batch_result):
-        gid = evaluation.task_id
-        if gid not in known_group_ids:
-            errors.append(
-                f"qa_critic guardrail: batch judge emitted evaluation for unknown group '{gid}'; dropped."
-            )
-            continue
-        if gid in seen:
-            errors.append(
-                f"qa_critic guardrail: duplicate evaluation for group '{gid}'; keeping first."
-            )
-            continue
-        seen.add(gid)
-        normalized[gid] = evaluation
-
-    # Phase 2: fill missing groups
-    for group in valid_groups:
-        if group.group_id not in normalized:
-            errors.append(
-                f"qa_critic guardrail: batch judge omitted group '{group.group_id}'; synthesizing failure."
-            )
-            normalized[group.group_id] = QAEvaluation(
-                task_id=group.group_id,
-                passed=False,
-                failure_category=FailureCategory.SECURITY_FLAG,
-                retry_feedback="Structured QA evaluator omitted this group; retry required.",
-            )
-
-    # Phase 3: deterministic scanner guardrail
-    remaining_global: set[str] = (
-        set(_scan_result_value(results.scan, "remaining_identifiers", set()) or set())
-        if results.scan is not None
-        else set()
-    )
-    for group in valid_groups:
-        strategy = group_strategies.get(group.group_id, "version_bump")
-        group_remaining = _group_remaining_identifiers(group, remaining_global)
-        if not group_remaining:
-            continue  # Scanner cleared this group â€” no guardrail needed.
-        if strategy == "code_workaround":
-            continue  # Trust the workaround code review â€” exempt from forced failure.
-        # Strict dependency-removal strategies with remaining identifiers
-        # force failure. Stage-two NO_FIX tasks are normalized to
-        # ``code_workaround`` and intentionally skip this branch.
-        current = normalized[group.group_id]
-        if current.passed or current.failure_category == FailureCategory.BREAKING_CHANGE:
-            errors.append(
-                f"qa_critic guardrail: group '{group.group_id}' ({strategy}) has remaining "
-                f"scanner identifiers {group_remaining} but judge did not prioritize SECURITY_FLAG; "
-                "forcing passed=False / SECURITY_FLAG."
-            )
-            retry_feedback = (
-                f"Scanner still detects unresolved identifiers: {', '.join(group_remaining)}. "
-                "The dependency-removal stage did not fully remove the vulnerable dependency. "
-                "Check that the configured package declaration and resolved dependency graph were updated."
-            )
-            if (
-                current.failure_category == FailureCategory.BREAKING_CHANGE
-                and current.retry_feedback
-            ):
-                retry_feedback = (
-                    retry_feedback
-                    + " Test regressions may also be present, but SECURITY_FLAG takes precedence until the unresolved scanner findings are cleared. "
-                    + current.retry_feedback
-                )
-            normalized[group.group_id] = QAEvaluation(
-                task_id=group.group_id,
-                passed=False,
-                failure_category=FailureCategory.SECURITY_FLAG,
-                retry_feedback=retry_feedback,
-            )
-
-    # Phase 4: install conflict guardrail â€” map BREAKING_CHANGE â†’ PEER_CONFLICT
-    install_ok = results.install[0] if results.install else True
-    if not install_ok:
-        install_summary = results.install[1] if results.install else ""
-        is_peer_conflict = any(
-            p.lower() in install_summary.lower() for p in _PEER_CONFLICT_PATTERNS
-        )
-        if is_peer_conflict:
-            for group in valid_groups:
-                strategy = group_strategies.get(group.group_id, "version_bump")
-                if strategy != "version_bump":
-                    continue
-                current = normalized[group.group_id]
-                if (
-                    not current.passed
-                    and current.failure_category == FailureCategory.BREAKING_CHANGE
-                ):
-                    normalized[group.group_id] = QAEvaluation(
-                        task_id=group.group_id,
-                        passed=False,
-                        failure_category=FailureCategory.PEER_CONFLICT,
-                        retry_feedback=(
-                            (current.retry_feedback or "")
-                            + " [Guardrail: install failure contains peer conflict indicators; "
-                            "reclassified from BREAKING_CHANGE to PEER_CONFLICT.]"
-                        ),
-                    )
-
-    return normalized, errors
 
 
 def _attach_failure_evidence_to_evaluations(
@@ -5583,7 +5619,7 @@ def _run_investigator_phase(
 
     from langchain_openai import ChatOpenAI
 
-    model_name = AppSettings.from_env().qa_llm_model
+    model_name = get_runtime_settings().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0)
     initial_messages = [
         SystemMessage(content=system_prompt),
@@ -5653,7 +5689,7 @@ def _run_judge_phase(
     """Run the zero-shot Judge once per vulnerability group (backcompat)."""
     from langchain_openai import ChatOpenAI
 
-    model_name = AppSettings.from_env().qa_llm_model
+    model_name = get_runtime_settings().qa_llm_model
     llm = ChatOpenAI(model=model_name, temperature=0).with_structured_output(QAEvaluation)
 
     evaluations: dict[str, QAEvaluation] = {}
@@ -5725,7 +5761,7 @@ Return a QAEvaluation for group_id="{group.group_id}" with:
         try:
             evaluation: QAEvaluation = invoke_with_trajectory(
                 f"qa_critic.group_judge.{group.group_id}",
-                lambda: llm.invoke(prompt),
+                lambda prompt=prompt: llm.invoke(prompt),
                 prompt,
             )
             evaluations[group.group_id] = evaluation
@@ -5855,8 +5891,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 QAPolicy.INITIAL_CODE_WORKAROUND
                 if str(group_strategies.get(group.group_id, "")) == "code_workaround"
                 else QAPolicy.NO_FIX_PACKAGE_REMOVAL
-                if group.fix_plan is not None
-                and group.fix_plan.status == FixPlanStatus.NO_FIX
+                if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
                 else QAPolicy.VERSION_BUMP
             )
             for group in valid_groups
@@ -5872,9 +5907,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         bool(active_tasks)
         and len(active_tasks) == len(active_task_ids)
         and all(is_no_fix_package_removal_task(task) for task in active_tasks)
-        and not any(
-            policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL for policy in group_policies.values()
-        )
+        and any(policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL for policy in group_policies.values())
     )
     scan_is_authoritative = scan_targets is None and not skip_scan
     unscanned_projection = _scan_state_projection(

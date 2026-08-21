@@ -45,6 +45,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +71,9 @@ def _dedupe_paths(paths: list[str | None]) -> list[str]:
 
 def _component_from_issue(issue: VulnerabilityIssue) -> str:
     """Return the canonical SCA component identifier for an issue."""
-    # Prefer package_name; fall back to purl component; last resort "unknown"
-    return (
-        issue.package_name
-        or (issue.purl.split("/")[-1].split("@")[0] if issue.purl else None)
-        or "unknown"
-    )
+    # Prefer the normalized scanner field, then use the shared PURL parser so
+    # scoped npm names cannot collapse to the unscoped leaf package.
+    return issue.package_name or package_name_from_purl(issue.purl) or "unknown"
 
 
 def _fix_strategy_bucket(fix_plan: FixPlan) -> str:
@@ -153,6 +151,9 @@ def _normalise_semver_text(version: str) -> str | None:
         return None
 
     cleaned = match.group(0).lstrip("vV")
+    # Build metadata does not affect precedence and must not be fed to the
+    # integer fallback parser (for example ``1.2.3+build.1``).
+    cleaned = cleaned.split("+", 1)[0]
     core, sep, suffix = cleaned.partition("-")
     parts = core.split(".")
     while len(parts) < 3:

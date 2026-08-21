@@ -42,7 +42,8 @@ import requests
 from pydantic import BaseModel
 
 from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
-from remediation_engine.settings import AppSettings
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
 
@@ -129,11 +130,7 @@ def _package_name_from_issue(issue: Any) -> str:
     if name:
         return name
     purl = issue.purl or ""
-    if purl.startswith("pkg:npm/"):
-        raw = purl[len("pkg:npm/") :]
-        raw = raw.split("@")[0]  # drop version
-        return raw.replace("%40", "@").replace("%2F", "/")
-    return ""
+    return package_name_from_purl(purl) or ""
 
 
 def _extract_local_version(message: str | None) -> str | None:
@@ -511,7 +508,7 @@ def _github_headers() -> dict[str, str]:
         "Accept": "application/vnd.github.raw+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = get_runtime_settings().github_token
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -643,15 +640,13 @@ def _llm_extract_remediation(
         log.warning("langchain-openai not installed; skipping LLM page extraction.")
         return None
 
-    settings = AppSettings.from_env()
-    api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY", "").strip()
+    settings = get_runtime_settings()
+    api_key = settings.openai_api_key
     if not api_key:
         log.info("OPENAI_API_KEY not set â€” skipping LLM page extraction.")
         return None
 
-    model_name = (
-        settings.triage_llm_model or os.environ.get("TRIAGE_LLM_MODEL", "gpt-4o-mini").strip()
-    )
+    model_name = settings.triage_llm_model
 
     pages_text = []
     for idx, page in enumerate(page_contents, 1):
@@ -688,7 +683,7 @@ def _query_serper(issue: Any, package_name: str) -> list[dict[str, str]] | None:
     Returns up to 3 organic result items with keys 'url', 'snippet', 'title',
     or None if SERPER_API_KEY is not set, API fails, or organic results are empty.
     """
-    api_key = os.environ.get("SERPER_API_KEY", "").strip()
+    api_key = get_runtime_settings().serper_api_key
     if not api_key:
         log.info("SERPER_API_KEY not set â€” skipping Serper search.")
         return None

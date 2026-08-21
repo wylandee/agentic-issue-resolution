@@ -40,7 +40,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -74,6 +73,11 @@ from remediation_engine.orchestration.qa_critic import (
     run_qa_critic_node,
 )
 from remediation_engine.orchestration.report_node import finalize_report, run_report_node
+from remediation_engine.orchestration.runtime_context import (
+    get_bound_runtime_settings,
+    get_runtime_settings,
+    use_runtime_settings,
+)
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_orchestrator_state,
@@ -140,11 +144,23 @@ def triage_node(state: OrchestratorState) -> dict[str, Any]:
         }
 
     log.info("triage_node: running triage on %d issues.", len(issues))
+    settings = get_bound_runtime_settings()
 
     try:
+
+        def triage_call() -> Any:
+            if settings is None:
+                return run_triage_pipeline(issues, system_context, repo_root)
+            return run_triage_pipeline(
+                issues,
+                system_context,
+                repo_root,
+                settings=settings,
+            )
+
         results = invoke_with_trajectory(
             "triage.pipeline",
-            lambda: run_triage_pipeline(issues, system_context, repo_root),
+            triage_call,
             {
                 "issue_count": len(issues),
                 "repo_root": repo_root,
@@ -304,11 +320,9 @@ def _reconcile_triaged_groups(
 
 def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
     """Re-triage the complete parseable post-remediation scan snapshot."""
-    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ) or os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
+    settings = get_runtime_settings()
+    bound_settings = get_bound_runtime_settings()
+    disable_retriage = settings.remedy_disable_post_qa_triage or settings.remedy_disable_retriage
     if disable_retriage or not state.get("triage_required"):
         return {
             "status": "triage_skipped",
@@ -342,7 +356,15 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
     log.info("post_qa_triage_node: re-triaging %d current issues.", len(issues))
 
     try:
-        results = run_triage_pipeline(issues, system_context, repo_root)
+        if bound_settings is None:
+            results = run_triage_pipeline(issues, system_context, repo_root)
+        else:
+            results = run_triage_pipeline(
+                issues,
+                system_context,
+                repo_root,
+                settings=bound_settings,
+            )
         candidate_groups = [group for group, triage_result in results if triage_result.is_valid]
         valid_groups, reconciliation = _reconcile_triaged_groups(
             state,
@@ -1431,11 +1453,8 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     scan_snapshot_available = attempt_scan_is_authoritative and (
         "post_remediation_scan_issues" in result or "post_remediation_scan_issues" in state
     )
-    disable_retriage = os.environ.get("REMEDY_DISABLE_POST_QA_TRIAGE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ) or os.environ.get("REMEDY_DISABLE_RETRIAGE", "").lower() in ("1", "true", "yes")
+    settings = get_runtime_settings()
+    disable_retriage = settings.remedy_disable_post_qa_triage or settings.remedy_disable_retriage
     triage_required = (
         not disable_retriage
         and attempt_scan_is_authoritative
@@ -1610,13 +1629,14 @@ def run_orchestrator(
         BaseException: Re-raises an orchestration failure after best-effort
             trajectory export, preserving the existing public behavior.
     """
+    settings = settings or AppSettings.from_env()
     initial_state = initial_orchestrator_state(
         repo_root=repo_root,
         valid_groups=valid_groups,
         issues=issues,
         system_context=system_context,
     )
-    config, run_id = build_phase5_runnable_config(repo_root, valid_groups)
+    config, run_id = build_phase5_runnable_config(repo_root, valid_groups, settings=settings)
     recorder = TrajectoryRecorder()
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
@@ -1646,7 +1666,7 @@ def run_orchestrator(
     run_error: BaseException | None = None
     trace_url: str | None = None
     try:
-        with use_trajectory_recorder(recorder):
+        with use_runtime_settings(settings), use_trajectory_recorder(recorder):
             result = orchestrator_engine.invoke(initial_state, runnable_config)
         if langsmith_enabled and run_id is not None:
             result["langsmith_run_id"] = str(run_id)
@@ -1669,8 +1689,9 @@ def run_orchestrator(
                 "errors": fallback_errors,
             }
             try:
-                with use_trajectory_recorder(recorder):
-                    report_update = run_report_node(result)
+                with use_runtime_settings(settings):
+                    with use_trajectory_recorder(recorder):
+                        report_update = run_report_node(result)
                     report_errors = list(report_update.pop("errors", []) or [])
                     result.update(report_update)
                     if report_errors:

@@ -7,7 +7,6 @@ retains batch-capable helpers for direct callers and future explicit batch mode.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -31,10 +30,18 @@ from remediation_engine.orchestration.remedy_tools import (
     build_update_toolbelt,
     rollback_pending_package_updates,
 )
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
+from remediation_engine.orchestration.task_utils import (
+    create_skinny_subagent_group,
+    filter_constraints_ledger,
+)
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    resolve_repository_path,
+)
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -81,29 +88,14 @@ def _candidate_manifest_paths(group: VulnerabilityGroup) -> list[str]:
 
 def _create_skinny_subagent_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
     """Create a skinny copy of a group for execution agents."""
-    return group.model_copy(
-        update={
-            "cve_ids": [],
-            "ghsa_ids": [],
-            "versions": [],
-            "issues": [],
-        }
-    )
+    return create_skinny_subagent_group(group)
 
 
 def _filter_constraints_ledger(
     constraints_ledger: Sequence[str], target_groups: Sequence[VulnerabilityGroup]
 ) -> list[str]:
     """Filter ledger to only include constraints matching the target components."""
-    components = [g.vulnerable_component for g in target_groups if g.vulnerable_component]
-    if not components:
-        return list(constraints_ledger)
-
-    filtered = []
-    for constraint in constraints_ledger:
-        if any(comp in constraint for comp in components):
-            filtered.append(constraint)
-    return filtered
+    return filter_constraints_ledger(constraints_ledger, target_groups)
 
 
 def _resolve_manifest_targets(
@@ -119,22 +111,10 @@ def _resolve_manifest_targets(
     errors: list[str] = []
 
     for candidate in candidates:
-        if os.path.isabs(candidate) or candidate.startswith(("/", "\\")):
-            errors.append(
-                f"Group '{group.group_id}': rejected absolute manifest path '{candidate}'."
-            )
-            continue
-        if ".." in Path(candidate).parts:
-            errors.append(f"Group '{group.group_id}': rejected path traversal in '{candidate}'.")
-            continue
-
-        abs_target = (repo_root / candidate).resolve()
         try:
-            abs_target.relative_to(repo_root.resolve())
-        except ValueError:
-            errors.append(
-                f"Group '{group.group_id}': manifest path '{candidate}' resolves outside repo_root."
-            )
+            abs_target = resolve_repository_path(repo_root, candidate)
+        except WorkspacePathError as exc:
+            errors.append(f"Group '{group.group_id}': rejected manifest path '{candidate}': {exc}")
             continue
         if not abs_target.exists():
             errors.append(
@@ -1170,7 +1150,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     resolved_tasks: list[tuple[RemediationTask, VulnerabilityGroup, list[str]]] = []
     resolution_errors: list[str] = []
     target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
-    for task, group in zip(target_tasks, target_groups, strict=False):
+    groups_by_id = {group.group_id: group for group in target_groups}
+    for task in target_tasks:
+        group = groups_by_id.get(task.parent_group_id)
+        if group is None:
+            resolution_errors.append(
+                f"Update Subagent: no vulnerability group found for task {task.task_id} "
+                f"(parent_group_id={task.parent_group_id})."
+            )
+            continue
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is not None:
             if (
@@ -1239,7 +1227,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + [msg],
         }
 
-    model_name = AppSettings.from_env().update_llm_model
+    model_name = get_runtime_settings().update_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001

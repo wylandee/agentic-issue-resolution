@@ -283,15 +283,37 @@ def test_invalid_validation_requests_do_not_consume_gate_budget() -> None:
     responses = [
         AIMessage(
             content="",
-            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "invalid-1"}],
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"source_module": "src/app.js"},
+                    "id": "invalid-1",
+                }
+            ],
         ),
         AIMessage(
             content="",
-            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "invalid-2"}],
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {"targeted_test": "tests/app.test.js"},
+                    "id": "invalid-2",
+                }
+            ],
         ),
         AIMessage(
             content="",
-            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "gate-1"}],
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {
+                        "source_module": "src/app.js",
+                        "targeted_test": "tests/app.test.js",
+                        "runtime_smoke_file": "src/app.js",
+                    },
+                    "id": "gate-1",
+                }
+            ],
         ),
         AIMessage(content="I will revise the patch after the gate failure."),
     ]
@@ -487,13 +509,13 @@ def test_manifest_tool_calls_are_serialized_and_deferred_within_one_turn() -> No
     assert result.errors == []
     assert [event.name for event in result.tool_events] == [
         "modify_npm_dependency",
+        "modify_npm_dependency",
         "validate_manifest_sync",
         "modify_npm_dependency",
         "validate_manifest_sync",
     ]
-    llm.bind_tools.assert_called_once_with(
-        [modify_tool, validate_tool], parallel_tool_calls=False
-    )
+    assert result.tool_events[1].content.startswith("DEFERRED: manifest tools")
+    llm.bind_tools.assert_called_once_with([modify_tool, validate_tool], parallel_tool_calls=False)
     assert any(
         isinstance(message, HumanMessage)
         and "Manifest operation sequencing barrier" in message.content

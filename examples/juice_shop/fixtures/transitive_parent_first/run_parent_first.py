@@ -106,18 +106,22 @@ def main() -> int:
         default=Path("data/trajectories/juice-shop-transitive-parent-first.patch"),
     )
     args = parser.parse_args()
+    repo_root = args.repo.expanduser().resolve()
+    groups_path = args.groups.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    patch_path = args.patch_out.expanduser().resolve()
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    if not args.repo.is_dir():
-        logger.error("Repository does not exist: %s", args.repo)
+    if not repo_root.is_dir():
+        logger.error("Repository does not exist: %s", repo_root)
         return 2
-    if not args.groups.is_file():
-        logger.error("Parent-first groups fixture does not exist: %s", args.groups)
+    if not groups_path.is_file():
+        logger.error("Parent-first groups fixture does not exist: %s", groups_path)
         return 2
 
-    groups = load_parent_first_groups(args.groups)
+    groups = load_parent_first_groups(groups_path)
     baseline_issues = _baseline_issues_from_groups(groups)
     logger.info(
         "Starting parent-first remediation with packages: %s and %d baseline issue(s)",
@@ -126,18 +130,19 @@ def main() -> int:
     )
     result = run_remediation(
         RemediationRequest(
-            repo_root=args.repo,
+            repo_root=repo_root,
             valid_groups=groups,
             issues=baseline_issues,
         )
     )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
         json.dumps(result.model_dump(exclude={"raw_state"}), indent=2, default=str) + "\n",
         encoding="utf-8",
     )
-    args.patch_out.write_text(result.diff, encoding="utf-8")
+    patch_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(result.diff, encoding="utf-8")
     logger.info("status=%s changed_files=%s", result.status, result.changed_files)
     return 0 if result.status == "completed" and not result.errors else 1
 

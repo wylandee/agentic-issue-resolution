@@ -772,7 +772,7 @@ class TestPhase5GraphIntegration:
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
             graph = build_orchestrator_graph()
-            result = graph.invoke(_initial_state(tmp_path, groups))
+            graph.invoke(_initial_state(tmp_path, groups))
 
         assert supervisor.call_count == 2
         assert teardown.call_count == 1
@@ -1180,6 +1180,7 @@ class TestPhase5GraphIntegration:
                 state_revision=revision,
                 task_revision=revision,
                 strategy_stage=task.strategy_stage,
+                qa_policy=task.qa_policy,
                 selected_version=task.selected_version,
                 instruction=task.instruction,
                 instruction_digest=_instruction_digest(task.instruction),
@@ -1256,6 +1257,7 @@ class TestPhase5GraphIntegration:
             state_revision=1,
             task_revision=1,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -1307,6 +1309,7 @@ class TestPhase5GraphIntegration:
             state_revision=2,
             task_revision=2,
             strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),
@@ -1374,6 +1377,7 @@ class TestPhase5Exports:
             state_revision=2,
             task_revision=2,
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
             instruction_digest=_instruction_digest(task.instruction),

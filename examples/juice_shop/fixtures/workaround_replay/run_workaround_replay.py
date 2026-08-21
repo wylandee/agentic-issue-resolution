@@ -25,6 +25,7 @@ from langsmith import traceable
 
 from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     TaskAttemptSnapshot,
     VulnerabilityGroup,
@@ -139,6 +140,10 @@ def _build_replay_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, A
     )
 
     task = RemediationTask.model_validate(fixture["task"])
+    if task.qa_policy != QAPolicy.MIGRATION_CODE_WORKAROUND:
+        raise ValueError(
+            "Express-JWT workaround replay must carry the migration-code-workaround QA policy."
+        )
     attempt_id = str(
         fixture["replay"].get(
             "source_workaround_attempt_id",
@@ -151,6 +156,7 @@ def _build_replay_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, A
         state_revision=3,
         task_revision=task.task_revision,
         attempt_number=1,
+        qa_policy=task.qa_policy,
         strategy_stage=task.strategy_stage,
         selected_version=task.selected_version,
         instruction=task.instruction,

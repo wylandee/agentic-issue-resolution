@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -35,7 +35,7 @@ from remediation_engine.contracts.decision_codes import DecisionCode
 # ---------------------------------------------------------------------------
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     """Canonical severity levels across SAST and SCA findings."""
 
     CRITICAL = "CRITICAL"
@@ -46,7 +46,7 @@ class Severity(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-class IssueSource(str, Enum):
+class IssueSource(StrEnum):
     """The originating scanner / data source."""
 
     SEMGREP = "semgrep"
@@ -55,14 +55,14 @@ class IssueSource(str, Enum):
     SYNTHETIC = "synthetic"  # Generated for testing / benchmarks
 
 
-class IssueType(str, Enum):
+class IssueType(StrEnum):
     """Broad classification of the finding."""
 
     SAST = "sast"  # Static Application Security Testing code finding
     SCA = "sca"  # Software Composition Analysis dependency finding
 
 
-class ASTNodeType(str, Enum):
+class ASTNodeType(StrEnum):
     """Abstract Syntax Tree node kinds used by the SAST code locator."""
 
     FUNCTION = "function"
@@ -75,7 +75,7 @@ class ASTNodeType(str, Enum):
     UNKNOWN = "unknown"
 
 
-class EditStatus(str, Enum):
+class EditStatus(StrEnum):
     """Outcome of an attempted file edit."""
 
     APPLIED = "applied"  # Patch applied successfully
@@ -84,7 +84,7 @@ class EditStatus(str, Enum):
     ERROR = "error"  # Unexpected error during application
 
 
-class ValidationStatus(str, Enum):
+class ValidationStatus(StrEnum):
     """Outcome of a sandbox validation run."""
 
     PASSED = "passed"
@@ -94,7 +94,7 @@ class ValidationStatus(str, Enum):
     ERROR = "error"
 
 
-class TrajectoryEventKind(str, Enum):
+class TrajectoryEventKind(StrEnum):
     """Discrete steps recorded in a remediation trajectory."""
 
     INGEST = "ingest"
@@ -107,7 +107,7 @@ class TrajectoryEventKind(str, Enum):
     ABORT = "abort"
 
 
-class FixPlanStatus(str, Enum):
+class FixPlanStatus(StrEnum):
     """Outcome of the fix-planner waterfall for one SCA finding."""
 
     VERSION_FOUND = "version_found"  # A safe pinned version was identified
@@ -115,7 +115,7 @@ class FixPlanStatus(str, Enum):
     NO_FIX = "no_fix"  # All strategies exhausted, nothing found
 
 
-class FailureCategory(str, Enum):
+class FailureCategory(StrEnum):
     """Strict QA failure categories used for supervisor retry routing."""
 
     SECURITY_FLAG = "security_flag"
@@ -142,14 +142,14 @@ class ScanFallbackReason(str, Enum):  # noqa: UP042
     TARGETED_REPORT_UNPARSEABLE = "targeted_report_unparseable"
 
 
-class RoutingStrategy(str, Enum):
+class RoutingStrategy(StrEnum):
     """Strict supervisor routing strategies for vulnerability groups."""
 
     VERSION_BUMP = "version_bump"
     CODE_WORKAROUND = "code_workaround"
 
 
-class QAPolicy(str, Enum):
+class QAPolicy(StrEnum):
     """Supervisor-owned policy that defines the QA gates for an attempt."""
 
     VERSION_BUMP = "version_bump"
@@ -160,7 +160,7 @@ class QAPolicy(str, Enum):
     NO_FIX_CODE_REMOVAL = "no_fix_code_removal"
 
 
-class ScannerExecutionStatus(str, Enum):
+class ScannerExecutionStatus(StrEnum):
     """Trust status of the deterministic Dependency-Check execution."""
 
     SUCCESS = "success"
@@ -170,7 +170,7 @@ class ScannerExecutionStatus(str, Enum):
     NOT_RUN = "not_run"
 
 
-class SecurityReviewVerdict(str, Enum):
+class SecurityReviewVerdict(StrEnum):
     """Verdict emitted by the semantic security review."""
 
     PASS = "pass"
@@ -178,15 +178,17 @@ class SecurityReviewVerdict(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
-class TestAttributionVerdict(str, Enum):
+class TestAttributionVerdict(StrEnum):
     """LLM attribution of a shared test-suite failure."""
+
+    __test__ = False
 
     RESPONSIBLE = "responsible"
     EXONERATED = "exonerated"
     INCONCLUSIVE = "inconclusive"
 
 
-class SCARemediationStage(str, Enum):
+class SCARemediationStage(StrEnum):
     """Ordered remediation stages for an SCA version-bump task."""
 
     OSV_MINIMUM = "osv_minimum"
@@ -196,7 +198,7 @@ class SCARemediationStage(str, Enum):
     CODE_WORKAROUND = "code_workaround"
 
 
-class NoFixMitigationStage(str, Enum):
+class NoFixMitigationStage(StrEnum):
     """Ordered mitigation stages for a ``NO_FIX`` vulnerability group.
 
     ``PACKAGE_REMOVAL`` is the initial best-effort mitigation.  If that
@@ -218,14 +220,14 @@ MAX_ANCESTRY_DEPTH: int = 3
 MAX_TASK_QUEUE_SIZE: int = 20
 
 
-class AgentActionStatus(str, Enum):
+class AgentActionStatus(StrEnum):
     """Strict terminal statuses returned by subagents."""
 
     SUCCESS = "success"
     SURRENDER = "surrender"
 
 
-class GroupRemediationStatus(str, Enum):
+class GroupRemediationStatus(StrEnum):
     """Lifecycle status for one vulnerability group in the remediation pipeline."""
 
     PENDING = "pending"  # Not yet touched by any subagent
@@ -235,7 +237,7 @@ class GroupRemediationStatus(str, Enum):
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     """Lifecycle status for one RemediationTask in the task queue."""
 
     PENDING = "pending"  # Not yet dispatched to any worker
@@ -1299,14 +1301,14 @@ class TriageResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class WorkaroundPhase(str, Enum):
+class WorkaroundPhase(StrEnum):
     """Workflow phase for workaround subagent execution."""
 
     INITIAL_MITIGATION = "initial_mitigation"
     QA_REGRESSION_REPAIR = "qa_regression_repair"
 
 
-class WorkaroundExecutionPhase(str, Enum):
+class WorkaroundExecutionPhase(StrEnum):
     """Execution lifecycle phase for workaround subagent iterations."""
 
     INVESTIGATE = "INVESTIGATE"
@@ -1315,7 +1317,7 @@ class WorkaroundExecutionPhase(str, Enum):
     VALIDATE = "VALIDATE"
 
 
-class WorkaroundValidationStatus(str, Enum):
+class WorkaroundValidationStatus(StrEnum):
     """Outcome status of a workaround validation run."""
 
     PASS = "PASS"
@@ -1541,6 +1543,7 @@ class QAEvaluation(BaseModel):
             if not self.contract_error_reason.strip():
                 raise ValueError("contract_error=True requires a non-empty contract_error_reason.")
         return self
+
     scan_evidence: ODCScanEvidence | None = Field(
         None,
         description=(
@@ -1870,6 +1873,7 @@ class WorkaroundReplayPlan(BaseModel):
 
     @property
     def successful_edits(self) -> list[WorkaroundEdit]:
+        """Return all replacement records across successful edit sets."""
         return [edit for edit_set in self.successful_edit_sets for edit in edit_set.replacements]
 
 
@@ -1932,13 +1936,9 @@ class QAAttemptResult(BaseModel):
             ValueError: If the policy and provenance fields disagree.
         """
         if self.qa_policy is None and self.qa_policy_source != "missing":
-            raise ValueError(
-                "qa_policy_source must be 'missing' when qa_policy is absent."
-            )
+            raise ValueError("qa_policy_source must be 'missing' when qa_policy is absent.")
         if self.qa_policy is not None and self.qa_policy_source == "missing":
-            raise ValueError(
-                "qa_policy_source must identify the source when qa_policy is present."
-            )
+            raise ValueError("qa_policy_source must identify the source when qa_policy is present.")
         return self
 
 

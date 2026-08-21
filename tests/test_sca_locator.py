@@ -171,6 +171,7 @@ class TestPURLHelpers:
         "purl,expected_name",
         [
             ("pkg:npm/lodash@4.17.20", "lodash"),
+            ("pkg:npm/@scope/pkg@1.2.3", "@scope/pkg"),
             ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
             ("pkg:npm/base64url@0.0.6", "base64url"),
             ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),

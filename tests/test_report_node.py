@@ -366,6 +366,54 @@ def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_origina
     assert "| group-child | pending |" not in report
 
 
+def test_failed_pivot_child_overrides_historical_parent_qa_success():
+    """A failed pivot descendant cannot be hidden by a passed parent task."""
+    state = _state()
+    state["initial_valid_groups"] = [
+        {
+            "group_id": "group-root",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        }
+    ]
+    state["valid_groups"] = [state["initial_valid_groups"][0]]
+    state["task_queue"] = {
+        "task-root": {
+            "task_id": "task-root",
+            "parent_group_id": "group-root",
+            "parent_task_id": None,
+            "strategy": "VERSION_BUMP",
+            "status": "qa_passed",
+        },
+        "task-child": {
+            "task_id": "task-child",
+            "parent_group_id": "group-child",
+            "parent_task_id": "task-root",
+            "strategy": "CODE_WORKAROUND",
+            "status": "unfixable",
+        },
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "unresolved",
+        "remaining_target_identifiers": ["CVE-2020-15084"],
+        "triage_required": True,
+    }
+    state["new_vulnerability_status"] = "unresolved"
+    state["status"] = "completed"
+
+    report = generate_report(state)
+
+    assert "1/1 actionable groups fixed" not in report
+    assert "0/1 actionable groups fixed" in report
+    assert "Completed with errors (completed_with_errors)" in report
+    assert "1 target identifiers remain" in report
+
+
 def test_report_renders_historical_retry_activity_and_latest_action_per_task():
     """Historical diagnostics remain visible even when active plans are empty."""
     state = _state()

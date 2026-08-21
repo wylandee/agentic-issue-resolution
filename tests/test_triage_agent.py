@@ -135,6 +135,15 @@ class TestDeterministicTriage:
         assert result.is_valid is True
         assert result.false_positive_reason is None
 
+    def test_unknown_file_location_remains_actionable(self):
+        """Missing location is uncertainty, not positive development-only evidence."""
+        issue = _issue(file_path=None)
+        group = _group(issue)
+
+        result = run_triage(group, _context(environment="test"))
+
+        assert result.is_valid is True
+
     def test_kev_clamps_to_critical(self):
         issue = _issue(severity=Severity.LOW)
         group = _group(issue, enrichment=_kev_enrichment())

@@ -7,7 +7,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-import os
 import re
 import shlex
 from pathlib import Path
@@ -37,14 +36,18 @@ from remediation_engine.orchestration.remedy_tools import (
     _restore_newlines,
     build_workaround_toolbelt,
 )
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState, _derive_legacy_task_from_group
 from remediation_engine.orchestration.subagent_runtime import (
     has_successful_validation_gate,
     has_tool_call_before_first_successful_edit,
     run_bounded_subagent_loop,
 )
+from remediation_engine.orchestration.task_utils import (
+    create_skinny_subagent_group,
+    filter_constraints_ledger,
+)
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -58,29 +61,14 @@ except ImportError:  # pragma: no cover
 
 def _create_skinny_subagent_group(group: VulnerabilityGroup) -> VulnerabilityGroup:
     """Create a skinny copy of a group for execution agents while preserving compact vulnerability identifiers."""
-    return group.model_copy(
-        update={
-            "cve_ids": group.cve_ids[:5],
-            "ghsa_ids": group.ghsa_ids[:5],
-            "versions": group.versions[:5],
-            "issues": [],
-        }
-    )
+    return create_skinny_subagent_group(group, keep_identifiers=5)
 
 
 def _filter_constraints_ledger(
     constraints_ledger: list[str], target_group: VulnerabilityGroup
 ) -> list[str]:
     """Filter ledger to only include constraints matching the target component."""
-    comp = target_group.vulnerable_component
-    if not comp:
-        return list(constraints_ledger)
-
-    filtered = []
-    for constraint in constraints_ledger:
-        if comp in constraint:
-            filtered.append(constraint)
-    return filtered
+    return filter_constraints_ledger(constraints_ledger, target_group)
 
 
 _QA_ERROR_MARKER = re.compile(
@@ -1204,7 +1192,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     target_group = state.get("target_group")
     t_id = target_task.task_id if target_task else "unknown"
 
-    if os.environ.get("REMEDY_BYPASS_WORKAROUND_SUBAGENT", "false").lower() in ("1", "true", "yes"):
+    if get_runtime_settings().remedy_bypass_workaround_subagent:
         summaries = _build_surrender_summaries(
             t_id,
             "Workaround subagent bypassed: marked unfixable (workaround functionality currently inactive).",
@@ -1262,7 +1250,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
 
-    model_name = AppSettings.from_env().workaround_llm_model
+    model_name = get_runtime_settings().workaround_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001

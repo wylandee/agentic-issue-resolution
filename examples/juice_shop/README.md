@@ -2,6 +2,11 @@
 
 This directory contains the maintained end-to-end examples for remediating OWASP Juice Shop findings with `remediation_engine`.
 
+All commands below assume they are run from the repository root. The maintained
+runners resolve the default Juice Shop clone and explicit `--repo` values to
+absolute paths before constructing the public API request. This is required by
+the current repository-boundary validation.
+
 ## Prerequisites
 
 1. Clone Juice Shop into `data/clones/juice-shop`:
@@ -11,6 +16,11 @@ This directory contains the maintained end-to-end examples for remediating OWASP
 2. Configure environment variables in `.env` (requires Docker and an `OPENAI_API_KEY` for LLM workers).
 
 Note: All execution scripts run against isolated Docker volumes. The host clone is never edited.
+
+The manual replay fixtures also store the Supervisor-owned `qa_policy` on each
+synthetic task. Their runners copy that policy into the committed attempt
+snapshot; removing it will cause the current fail-closed dispatch validation to
+reject the replay.
 
 ### QA scan behavior
 
@@ -33,13 +43,13 @@ teardown.
 
 ### 1. Whole-pipeline execution
 
-Runs the full remediation workflow from the canonical baseline issue fixture. The engine performs triage, version selection, subagent execution, and QA evaluation:
+Runs the full remediation workflow from the canonical baseline issue fixture. This runner supplies the Juice Shop production/container context, so the graph performs initial triage before version selection, subagent execution, and QA evaluation:
 
 ```bash
 python examples/juice_shop/run.py
 ```
 
-`run.py` accepts any canonical JSONL issue fixture through `--issues`, so a different static subset can be selected without changing the runner:
+`run.py` accepts any canonical JSONL issue fixture through `--issues`, so a different static subset can be selected without changing the runner. Its default clone path is resolved to an absolute path automatically:
 
 ```bash
 python examples/juice_shop/run.py --issues examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl
@@ -171,7 +181,7 @@ After producing an ODC JSON report with the desired suppression rules, normalize
 2. **Triage the selected issues into groups:**
 
    ```bash
-      remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
-      --repo data/clones/juice-shop \
-      --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
+   remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
+     --repo "$(pwd)/data/clones/juice-shop" \
+     --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
    ```

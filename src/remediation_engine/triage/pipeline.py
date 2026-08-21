@@ -42,6 +42,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.settings import AppSettings
 from remediation_engine.triage.agent import run_triage
 from remediation_engine.triage.enrichment import enrich_cves
 from remediation_engine.triage.grouper import group_issues
@@ -61,6 +62,28 @@ _PRIORITY_ORDER: dict[Severity, int] = {
     Severity.INFO: 4,
     Severity.UNKNOWN: 5,
 }
+
+
+class TriagePipelineError(RuntimeError):
+    """Raised when one or more groups cannot receive a triage outcome."""
+
+    def __init__(self, failed_group_ids: list[str], cause: BaseException) -> None:
+        """Store failed group IDs and the first underlying triage exception."""
+        self.failed_group_ids = tuple(failed_group_ids)
+        self.cause = cause
+        groups = ", ".join(self.failed_group_ids)
+        super().__init__(f"triage failed for groups [{groups}]: {cause}")
+
+
+class TriageSelectionError(RuntimeError):
+    """Raised when a valid triage result cannot resolve an issue to execute."""
+
+    def __init__(self, group_id: str) -> None:
+        """Store the group whose valid result was internally inconsistent."""
+        self.group_id = group_id
+        super().__init__(
+            f"triage result for group {group_id!r} has no resolvable recommended issue"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +159,14 @@ def _run_grouping(
 
 
 @traceable(name="triage.cve_enrichment", run_type="chain")
-def _run_enrichment(cve_ids: list[str]) -> dict[str, CVEEnrichment]:
+def _run_enrichment(
+    cve_ids: list[str],
+    settings: AppSettings | None = None,
+) -> dict[str, CVEEnrichment]:
     """Fetch threat-intelligence enrichment for the pipeline's CVE set."""
-    return enrich_cves(cve_ids)
+    if settings is None:
+        return enrich_cves(cve_ids)
+    return enrich_cves(cve_ids, settings=settings)
 
 
 @traceable(name="triage.reachability", run_type="chain")
@@ -199,6 +227,7 @@ def run_triage_pipeline(
     issues: list[VulnerabilityIssue],
     system_context: SystemContext,
     repo_root: str | None = None,
+    settings: AppSettings | None = None,
 ) -> list[tuple[VulnerabilityGroup, TriageResult]]:
     """
     Run the full triage pipeline on a flat list of ``VulnerabilityIssue`` records.
@@ -244,7 +273,7 @@ def run_triage_pipeline(
     # Step 3: Enrich CVEs (failure-safe)
     enrichment_map: dict[str, CVEEnrichment] = {}
     if all_cve_ids:
-        enrichment_map = _run_enrichment(all_cve_ids)
+        enrichment_map = _run_enrichment(all_cve_ids, settings=settings)
         logger.info(
             "Triage pipeline: enriched %d/%d CVEs.",
             len(enrichment_map),
@@ -260,19 +289,30 @@ def run_triage_pipeline(
 
     # Step 6: Triage each group
     results: list[tuple[VulnerabilityGroup, TriageResult]] = []
+    failed_group_ids: list[str] = []
+    first_error: BaseException | None = None
     for group in groups:
         try:
-            triage_result = run_triage(group, system_context)
+            triage_result = (
+                run_triage(group, system_context)
+                if settings is None
+                else run_triage(group, system_context, settings=settings)
+            )
             results.append((group, triage_result))
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "Triage failed for group %s (%s); skipping.",
+                "Triage failed for group %s (%s); aborting result construction.",
                 group.group_id,
                 exc,
             )
+            failed_group_ids.append(group.group_id)
+            first_error = first_error or exc
+
+    if failed_group_ids and first_error is not None:
+        raise TriagePipelineError(failed_group_ids, first_error) from first_error
 
     valid_count = sum(1 for _, r in results if r.is_valid)
-    logger.info("Triage pipeline: %d/%d groups are valid.", valid_count, len(results))
+    logger.info("Triage pipeline: %d/%d groups are valid.", valid_count, len(groups))
     return results
 
 
@@ -314,8 +354,9 @@ def select_issues_for_remediation(
         if issue is None and group.issues:
             issue = group.issues[0]
 
-        if issue is not None:
-            selected.append((triage.revised_priority, issue))
+        if issue is None:
+            raise TriageSelectionError(group.group_id)
+        selected.append((triage.revised_priority, issue))
 
     # Sort by priority (lower _PRIORITY_ORDER value = higher urgency)
     selected.sort(key=lambda t: _PRIORITY_ORDER.get(t[0], 99))

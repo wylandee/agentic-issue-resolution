@@ -50,14 +50,12 @@ from remediation_engine.contracts import (
 from remediation_engine.contracts.schemas import (
     CWEEntry,  # noqa: F401 â€” re-exported for convenience
 )
-
-try:
-    from packageurl import PackageURL
-
-    _PURL_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _PURL_AVAILABLE = False
-
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    repository_relative_path,
+    resolve_repository_path,
+)
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
 
@@ -129,27 +127,7 @@ def _package_name_from_purl(purl_str: str) -> str | None:
     with namespace=None, so we just return name.
     For other ecosystems with a namespace, we join with ':'.
     """
-    if _PURL_AVAILABLE:
-        try:
-            purl = PackageURL.from_string(purl_str)
-            name = purl.name or ""
-            ns = purl.namespace or ""
-            if not name:
-                return None
-            if purl.type == "npm":
-                # name already contains '@scope/pkg' for scoped packages
-                return name
-            if ns:
-                return f"{ns}:{name}"
-            return name
-        except Exception:
-            pass
-    # Manual fallback
-    try:
-        segment = purl_str.split("/", 2)[-1]
-        return segment.split("@")[0].replace("%40", "@").replace("%2F", "/") or None
-    except Exception:
-        return None
+    return package_name_from_purl(purl_str)
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +317,10 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     fallback_dir = start_dir
     fallback_depth = -1
     for variant in variants:
-        candidate = repo_root / variant
-        current = candidate.resolve()
+        try:
+            current = resolve_repository_path(repo_root, variant)
+        except WorkspacePathError:
+            continue
         if current.exists():
             start_dir = current if current.is_dir() else current.parent
             break
@@ -663,9 +643,13 @@ def expand_dependency_ancestry_from_repository(
     if lockfile_name.lower() != "package-lock.json":
         return list(dependency_ancestry), dict(dependency_versions)
 
-    manifest_path = Path(manifest_file) if manifest_file else repo_root / "package.json"
-    if not manifest_path.is_absolute():
-        manifest_path = repo_root / manifest_path
+    if manifest_file:
+        relative_manifest = repository_relative_path(manifest_file, repo_root)
+        if relative_manifest is None:
+            return list(dependency_ancestry), dict(dependency_versions)
+        manifest_path = resolve_repository_path(repo_root, relative_manifest)
+    else:
+        manifest_path = resolve_repository_path(repo_root, "package.json")
     supplied_pairs = [(name, dependency_versions.get(name)) for name in dependency_ancestry if name]
     parsed_pairs = parse_dependency_ancestry(odc_file_path)
     if parsed_pairs and [name for name, _ in parsed_pairs] == dependency_ancestry:

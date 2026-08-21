@@ -27,6 +27,14 @@ from pathlib import Path
 from langsmith import traceable
 
 from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.runtime.docker_client import (
+    close_docker_client,
+    get_docker_client,
+)
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    normalize_workspace_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,27 +93,6 @@ def _make_tar_archive(repo_root: Path) -> bytes:
     return buf.getvalue()
 
 
-def get_docker_client():
-    """Return a connected Docker SDK client or raise a clear error."""
-    try:
-        import docker  # type: ignore[import]
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "The 'docker' package is required for DockerSandbox. "
-            "Install it with: pip install 'docker>=7.0.0'"
-        ) from exc
-
-    logger.info("DockerSandbox: connecting to Docker daemon.")
-    try:
-        client = docker.from_env()
-        client.ping()
-    except Exception as exc:
-        logger.error("DockerSandbox: Docker daemon unreachable â€” %s", exc)
-        raise RuntimeError(f"Docker daemon unreachable: {exc}") from exc
-
-    return client
-
-
 class DockerSandbox:
     """
     Ephemeral Docker sandbox for running commands inside ``/workspace``.
@@ -127,6 +114,7 @@ class DockerSandbox:
         image: str = _DEFAULT_IMAGE,
         workspace_volume: str | None = None,
     ) -> None:
+        """Initialize an unopened sandbox configuration."""
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._image = image
         self._workspace_volume = workspace_volume
@@ -150,77 +138,88 @@ class DockerSandbox:
         self._client = client
 
         try:
-            client.images.get(self._image)
-            logger.debug("DockerSandbox: image %r found locally.", self._image)
-        except docker_errors.ImageNotFound:
-            logger.info("DockerSandbox: image %r not found locally â€” pulling.", self._image)
-            client.images.pull(self._image)
-            logger.info("DockerSandbox: pull complete for %r.", self._image)
+            try:
+                client.images.get(self._image)
+                logger.debug("DockerSandbox: image %r found locally.", self._image)
+            except docker_errors.ImageNotFound:
+                logger.info("DockerSandbox: image %r not found locally - pulling.", self._image)
+                client.images.pull(self._image)
+                logger.info("DockerSandbox: pull complete for %r.", self._image)
 
-        run_kwargs = {
-            "name": self._container_name,
-            "command": "sh -c 'while true; do sleep 3600; done'",
-            "detach": True,
-            "stdin_open": False,
-            "tty": False,
-            "network_mode": "bridge",
-        }
-        if self._workspace_volume:
-            run_kwargs["volumes"] = {self._workspace_volume: {"bind": "/workspace", "mode": "rw"}}
+            run_kwargs = {
+                "name": self._container_name,
+                "command": "sh -c 'while true; do sleep 3600; done'",
+                "detach": True,
+                "stdin_open": False,
+                "tty": False,
+                "network_mode": "bridge",
+            }
+            if self._workspace_volume:
+                run_kwargs["volumes"] = {
+                    self._workspace_volume: {"bind": "/workspace", "mode": "rw"}
+                }
 
-        logger.info(
-            "DockerSandbox: starting container %r from image %r.",
-            self._container_name,
-            self._image,
-        )
-        self._container = client.containers.run(self._image, **run_kwargs)
+            logger.info(
+                "DockerSandbox: starting container %r from image %r.",
+                self._container_name,
+                self._image,
+            )
+            self._container = client.containers.run(self._image, **run_kwargs)
 
-        exit_code, _ = self._container.exec_run("mkdir -p /workspace")
-        if exit_code != 0:
-            logger.warning("DockerSandbox: non-zero exit creating /workspace (%d).", exit_code)
+            exit_code, output = self._container.exec_run("mkdir -p /workspace")
+            if exit_code != 0:
+                detail = (
+                    output.decode("utf-8", errors="replace")
+                    if isinstance(output, bytes)
+                    else output
+                )
+                raise RuntimeError(
+                    "DockerSandbox: failed to initialize /workspace "
+                    f"(exit {exit_code}): {detail or 'no diagnostic output'}"
+                )
 
-        if self._repo_root is not None:
-            logger.info("DockerSandbox: copying %s into container /workspace.", self._repo_root)
-            archive = _make_tar_archive(self._repo_root)
-            self._container.put_archive("/workspace", archive)
-            logger.info("DockerSandbox: repository copied; sandbox ready.")
-        else:
-            logger.info("DockerSandbox: no repo_root provided; skipping archive copy.")
+            if self._repo_root is not None:
+                logger.info("DockerSandbox: copying %s into container /workspace.", self._repo_root)
+                archive = _make_tar_archive(self._repo_root)
+                self._container.put_archive("/workspace", archive)
+                logger.info("DockerSandbox: repository copied; sandbox ready.")
+            else:
+                logger.info("DockerSandbox: no repo_root provided; skipping archive copy.")
 
-        self._alive = True
+            self._alive = True
+        except Exception:
+            # Container creation is transactional: a failed image pull,
+            # workspace preparation, or archive upload must not leak a
+            # partially started container or its Docker client.
+            self.teardown()
+            raise
 
     @traceable(run_type="tool", name="docker_sandbox.teardown")
     def teardown(self) -> None:
         """
         Stop and remove the container. Idempotent and safe to call repeatedly.
         """
-        if self._container is None:
-            return
-
+        container = self._container
+        client = self._client
         try:
-            import docker.errors as docker_errors  # type: ignore[import]
-        except ImportError:  # pragma: no cover
-            return
-
-        try:
-            try:
-                self._container.kill()
-            except (docker_errors.APIError, docker_errors.NotFound):
-                pass
-            try:
-                self._container.remove(force=True)
-            except (docker_errors.APIError, docker_errors.NotFound):
-                pass
-            logger.info("DockerSandbox: container %r removed.", self._container_name)
-        except Exception as exc:
-            logger.warning(
-                "DockerSandbox: teardown error for %r â€” %s",
-                self._container_name,
-                exc,
-            )
+            if container is not None:
+                try:
+                    container.kill()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("DockerSandbox: container kill skipped: %s", exc)
+                try:
+                    container.remove(force=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("DockerSandbox: container removal skipped: %s", exc)
+                logger.info("DockerSandbox: container %r removed.", self._container_name)
         finally:
             self._container = None
             self._alive = False
+            self._client = None
+            try:
+                close_docker_client(client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DockerSandbox: Docker client close failed: %s", exc)
 
     def __enter__(self) -> DockerSandbox:
         self.start()
@@ -229,6 +228,41 @@ class DockerSandbox:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.teardown()
         return None
+
+    def restart(self) -> None:
+        """Restart the container while preserving the named workspace volume.
+
+        A timed-out command tears down its container but deliberately leaves
+        the named volume intact. This method starts a fresh container against
+        that volume without copying the host repository over the existing
+        workspace. It is only valid for volume-backed sandboxes.
+
+        Raises:
+            RuntimeError: If no named workspace volume was configured.
+        """
+        if not self._workspace_volume:
+            raise RuntimeError("Sandbox restart requires a named workspace volume.")
+        self.teardown()
+        original_repo_root = self._repo_root
+        self._repo_root = None
+        try:
+            self.start()
+        finally:
+            self._repo_root = original_repo_root
+
+    def _assert_container_path(self, absolute_path: str) -> None:
+        """Reject a container path whose existing symlinks leave ``/workspace``."""
+        if self._container is None:
+            raise RuntimeError("Sandbox is not running.")
+        quoted_path = shlex.quote(absolute_path)
+        command = (
+            f"resolved=$(realpath -m -- {quoted_path}) || exit 1; "
+            'case "$resolved" in /workspace|/workspace/*) exit 0 ;; *) exit 1 ;; esac'
+        )
+        result = self._container.exec_run(["/bin/sh", "-lc", command])
+        exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
+        if exit_code != 0:
+            raise WorkspacePathError(f"container path resolves outside /workspace: {absolute_path}")
 
     @traceable(run_type="tool", name="docker_sandbox.run")
     def run(
@@ -341,11 +375,13 @@ class DockerSandbox:
         if not self._alive or self._container is None:
             raise RuntimeError("Sandbox is not running.")
 
-        abs_path = f"/workspace/{file_path.lstrip('/')}"
+        relative_path = normalize_workspace_path(file_path)
+        abs_path = f"/workspace/{relative_path}"
         parent_dir = abs_path.rsplit("/", 1)[0]
         filename = abs_path.rsplit("/", 1)[1]
 
-        self._container.exec_run(f"mkdir -p {parent_dir}")
+        self._assert_container_path(parent_dir)
+        self._container.exec_run(f"mkdir -p -- {shlex.quote(parent_dir)}")
 
         encoded = content.encode("utf-8")
         buf = io.BytesIO()
@@ -365,10 +401,14 @@ class DockerSandbox:
             logger.warning("DockerSandbox.read_file: sandbox is not running.")
             return None
 
-        abs_path = f"/workspace/{file_path.lstrip('/')}"
+        relative_path = normalize_workspace_path(file_path)
+        abs_path = f"/workspace/{relative_path}"
 
         try:
+            self._assert_container_path(abs_path)
             stream, _stat = self._container.get_archive(abs_path)
+        except WorkspacePathError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("DockerSandbox.read_file: could not retrieve %s â€” %s", abs_path, exc)
             return None

@@ -26,7 +26,6 @@ TRIAGE_LLM_MODEL     : OpenAI model name (default: "gpt-4o-mini")
 from __future__ import annotations
 
 import logging
-import os
 
 from langsmith import traceable
 
@@ -37,6 +36,7 @@ from remediation_engine.contracts.schemas import (
     TriageResult,
     VulnerabilityGroup,
 )
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
 
@@ -172,8 +172,7 @@ def _deterministic_triage(
     # Dev/test scope: only mark FP when there is clear evidence
     is_dev_env = (context.environment or "").lower() in {"dev", "test", "ci", "development"}
     all_dev_only = group.issues and all(
-        (i.file_path or "").startswith(("test/", "tests/", "spec/", "dev/")) or i.file_path is None
-        for i in group.issues
+        (i.file_path or "").startswith(("test/", "tests/", "spec/", "dev/")) for i in group.issues
     )
     if is_dev_env and all_dev_only:
         is_valid = False
@@ -382,6 +381,7 @@ def _build_triage_prompt(group: VulnerabilityGroup, context: SystemContext) -> s
 def _llm_triage(
     group: VulnerabilityGroup,
     context: SystemContext,
+    settings: AppSettings | None = None,
 ) -> TriageResult | None:
     """
     Attempt an LLM-based triage using LangChain structured output.
@@ -398,7 +398,7 @@ def _llm_triage(
         )
         return None
 
-    model_name = AppSettings.from_env().triage_llm_model
+    model_name = (settings or get_runtime_settings()).triage_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
         structured_llm = llm.with_structured_output(TriageResult)
@@ -423,7 +423,11 @@ def _llm_triage(
 
 
 @traceable(name="triage.verdict", run_type="chain")
-def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResult:
+def run_triage(
+    group: VulnerabilityGroup,
+    context: SystemContext,
+    settings: AppSettings | None = None,
+) -> TriageResult:
     """
     Produce a ``TriageResult`` for one ``VulnerabilityGroup``.
 
@@ -431,11 +435,12 @@ def run_triage(group: VulnerabilityGroup, context: SystemContext) -> TriageResul
     Deterministic guardrails are applied afterwards regardless of which path
     produced the initial verdict.
     """
-    llm_enabled = os.environ.get("TRIAGE_LLM_ENABLED", "false").lower() == "true"
+    resolved_settings = settings or get_runtime_settings()
+    llm_enabled = resolved_settings.triage_llm_enabled
     result: TriageResult | None = None
 
     if llm_enabled:
-        result = _llm_triage(group, context)
+        result = _llm_triage(group, context, resolved_settings)
 
     if result is None:
         return _deterministic_triage(group, context)

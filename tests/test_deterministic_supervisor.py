@@ -34,6 +34,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _deterministic_routing,
     _emit_audit,
     _merge_advisory,
+    _no_fix_failure_transition,
     _select_deterministic_action,
     _task_sort_key,
     supervisor_router,
@@ -184,8 +185,37 @@ def test_same_state_same_decision_is_replayable():
 def test_transition_table_accepts_worker_and_qa_edges_and_rejects_terminal_edges():
     assert validate_transition(TaskStatus.PENDING, TaskStatus.OPTIMISTICALLY_FIXED)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.INCONCLUSIVE)
+    assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.UNFIXABLE)
     assert not validate_transition(TaskStatus.QA_PASSED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.PENDING, TaskStatus.QA_PASSED)
+
+
+def test_final_no_fix_qa_failure_terminalizes_and_closes_attempt():
+    task = _task(
+        "task-1",
+        "g",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+        retry_count=1,
+        no_fix_stage=NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+    ).model_copy(
+        update={
+            "current_attempt_id": "attempt-1",
+            "selected_version": "1.2.3",
+        }
+    )
+    queue = {task.task_id: task}
+    updates, reset_workspace = _no_fix_failure_transition(task, _group("g", no_fix=True))
+
+    assert reset_workspace is False
+    _commit_task_transition(queue, task.task_id, updates=updates)
+
+    committed = queue[task.task_id]
+    assert committed.status == TaskStatus.UNFIXABLE
+    assert committed.no_fix_stage == NoFixMitigationStage.UNFIXABLE
+    assert committed.retry_count == 2
+    assert committed.current_attempt_id is None
+    assert committed.selected_version is None
 
 
 def test_commit_rejects_invalid_transition_without_mutation():

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -25,6 +25,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import Client
+
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,14 @@ _SECRET_VALUE_RE = re.compile(
 _ACTIVE_RECORDER: ContextVar[TrajectoryRecorder | None] = ContextVar(
     "phase5_trajectory_recorder",
     default=None,
+)
+_LANGSMITH_SETTLE_ATTEMPTS = 20
+_LANGSMITH_SETTLE_INTERVAL_SECONDS = 0.25
+_TERMINAL_LANGSMITH_STATUSES = frozenset(
+    {"completed", "success", "succeeded", "error", "failed", "cancelled", "canceled"}
+)
+_PENDING_LANGSMITH_STATUSES = frozenset(
+    {"pending", "running", "queued", "scheduled", "in_progress"}
 )
 
 
@@ -538,8 +548,8 @@ def invoke_with_trajectory(
 
 def default_trajectory_dir() -> Path:
     """Return the configured directory for local trajectory exports."""
-    configured = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
-    return Path(configured) if configured else _DEFAULT_TRAJECTORY_DIR
+    configured = get_runtime_settings().remediation_trajectory_dir
+    return configured if configured is not None else _DEFAULT_TRAJECTORY_DIR
 
 
 def build_phase5_trajectory_path(
@@ -588,6 +598,16 @@ def _remote_span(run: Any, sequence: int) -> dict[str, Any]:
     }
 
 
+def _run_is_pending(run: Any) -> bool:
+    """Return whether a remote LangSmith run has not reached a terminal state."""
+    status = str(getattr(run, "status", "") or "").strip().lower()
+    if status in _PENDING_LANGSMITH_STATUSES:
+        return True
+    if status in _TERMINAL_LANGSMITH_STATUSES:
+        return False
+    return getattr(run, "end_time", None) is None
+
+
 def _flatten_runs(run: Any) -> list[Any]:
     result = [run]
     for child in getattr(run, "child_runs", None) or []:
@@ -595,14 +615,33 @@ def _flatten_runs(run: Any) -> list[Any]:
     return result
 
 
-def fetch_langsmith_spans(run_id: uuid.UUID | str) -> list[dict[str, Any]]:
-    """Fetch all spans for a LangSmith trace, including nested child runs."""
-    wait_for_all_tracers()
-    client = Client()
+def _list_langsmith_runs(client: Client, run_id: uuid.UUID | str) -> list[Any]:
+    """Fetch a trace and fall back to the root run's nested children."""
     runs = list(client.list_runs(trace_id=run_id, limit=None))
     if not runs:
         root = client.read_run(run_id, load_child_runs=True)
         runs = _flatten_runs(root)
+    return runs
+
+
+def _settle_langsmith_runs(client: Client, run_id: uuid.UUID | str) -> list[Any]:
+    """Wait briefly for asynchronous LangSmith child runs to finish exporting."""
+    runs = _list_langsmith_runs(client, run_id)
+    for attempt in range(_LANGSMITH_SETTLE_ATTEMPTS):
+        if not any(_run_is_pending(run) for run in runs):
+            return runs
+        if attempt == _LANGSMITH_SETTLE_ATTEMPTS - 1:
+            break
+        time.sleep(_LANGSMITH_SETTLE_INTERVAL_SECONDS)
+        runs = _list_langsmith_runs(client, run_id)
+    return runs
+
+
+def fetch_langsmith_spans(run_id: uuid.UUID | str) -> list[dict[str, Any]]:
+    """Fetch all spans for a LangSmith trace, including nested child runs."""
+    wait_for_all_tracers()
+    client = Client()
+    runs = _settle_langsmith_runs(client, run_id)
     if not runs:
         raise RuntimeError(f"LangSmith returned no spans for trace {run_id}")
     unique: dict[str, Any] = {}
@@ -640,6 +679,18 @@ def _table_value(value: Any) -> str:
     # audit table.  Treating them as empty strings made failed QA results look
     # like QA had not run at all.
     return str("" if value is None else value).replace("|", "\\|").replace("\n", " ")
+
+
+def _display_span_status(span: Mapping[str, Any]) -> str:
+    """Return a status that does not hide an unfinished span as completed."""
+    if span.get("error"):
+        return "error"
+    status = str(span.get("status") or "").strip().lower()
+    if status in _PENDING_LANGSMITH_STATUSES:
+        return status
+    if span.get("ended_at") is None and status not in _TERMINAL_LANGSMITH_STATUSES:
+        return "pending"
+    return str(span.get("status") or "completed")
 
 
 def _render_markdown(
@@ -769,7 +820,7 @@ def _render_markdown(
                 if prompt is not None or completion is not None
                 else ""
             )
-        status = "error" if span.get("error") else span.get("status") or "completed"
+        status = _display_span_status(span)
         lines.append(
             "| "
             + " | ".join(
@@ -861,6 +912,12 @@ def export_phase5_trajectory(
         try:
             spans = fetch_langsmith_spans(trace_id)
             source = "langsmith"
+            pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
+            if pending_spans:
+                warnings.append(
+                    "LangSmith returned "
+                    f"{len(pending_spans)} span(s) without terminal status after export settling."
+                )
         except Exception as exc:  # noqa: BLE001 - fallback is intentional
             warning = f"LangSmith trace retrieval failed: {exc}"
             warnings.append(warning)

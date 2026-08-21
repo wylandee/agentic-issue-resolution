@@ -117,7 +117,7 @@ class TestLineRange:
 
     def test_frozen(self):
         lr = LineRange(start=1, end=3)
-        with pytest.raises(Exception):
+        with pytest.raises((TypeError, ValidationError)):
             lr.start = 2  # type: ignore[misc]
 
     def test_json_round_trip(self):
@@ -483,7 +483,7 @@ class TestEditRequest:
 
     def test_frozen(self):
         req = self._req()
-        with pytest.raises(Exception):
+        with pytest.raises((TypeError, ValidationError)):
             req.dry_run = True  # type: ignore[misc]
 
     def test_json_round_trip(self):
@@ -692,7 +692,7 @@ class TestTrajectoryEvent:
             kind=TrajectoryEventKind.INGEST,
             summary="test",
         )
-        with pytest.raises(Exception):
+        with pytest.raises((TypeError, ValidationError)):
             event.summary = "changed"  # type: ignore[misc]
 
     def test_json_round_trip(self):

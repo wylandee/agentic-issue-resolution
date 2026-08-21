@@ -28,11 +28,13 @@ class AppSettings:
     workaround_llm_model: str = "gpt-4o-mini"
     qa_llm_model: str = "gpt-4o-mini"
     serper_api_key: str = ""
+    github_token: str = ""
     odc_extra_args: str = ""
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""
     langsmith_project: str = "AppSec-Remediation-Engine"
     langsmith_endpoint: str = ""
+    triage_cache_dir: Path | None = None
     remediation_trajectory_dir: Path | None = None
     remediation_report_dir: Path | None = None
     report_llm_enabled: bool = False
@@ -58,12 +60,13 @@ class AppSettings:
             openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
             remedy_llm_model=default_model,
             triage_llm_enabled=_env_bool("TRIAGE_LLM_ENABLED"),
-            triage_llm_model=os.environ.get("TRIAGE_LLM_MODEL", "gpt-4o-mini").strip(),
+            triage_llm_model=model_override("TRIAGE_LLM_MODEL"),
             supervisor_llm_model=model_override("SUPERVISOR_LLM_MODEL"),
             update_llm_model=model_override("UPDATE_LLM_MODEL"),
             workaround_llm_model=model_override("WORKAROUND_LLM_MODEL"),
             qa_llm_model=model_override("QA_LLM_MODEL"),
             serper_api_key=os.environ.get("SERPER_API_KEY", "").strip(),
+            github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
             odc_extra_args=os.environ.get("ODC_EXTRA_ARGS", "").strip(),
             langsmith_tracing=_env_bool("LANGSMITH_TRACING"),
             langsmith_api_key=os.environ.get("LANGSMITH_API_KEY", "").strip(),
@@ -71,6 +74,11 @@ class AppSettings:
                 "LANGSMITH_PROJECT", "AppSec-Remediation-Engine"
             ).strip(),
             langsmith_endpoint=os.environ.get("LANGSMITH_ENDPOINT", "").strip(),
+            triage_cache_dir=(
+                Path(os.environ["TRIAGE_CACHE_DIR"].strip())
+                if os.environ.get("TRIAGE_CACHE_DIR", "").strip()
+                else None
+            ),
             remediation_trajectory_dir=Path(trajectory) if trajectory else None,
             remediation_report_dir=Path(report_dir) if report_dir else None,
             report_llm_enabled=_env_bool("REPORT_LLM_ENABLED"),

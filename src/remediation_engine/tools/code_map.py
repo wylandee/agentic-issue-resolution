@@ -32,6 +32,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    resolve_repository_path,
+)
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -90,11 +95,16 @@ def resolve_repo_file(repo_root: str, repo_relative_path: str) -> Path | None:
     Returns:
         An absolute ``Path`` pointing to the file, or ``None`` when it does not exist.
     """
-    root = Path(repo_root)
-    # Strip any accidental leading slash (VulnerabilityIssue._normalise_path already does this,
-    # but be defensive here in case callers pass raw paths).
-    rel = repo_relative_path.lstrip("/")
-    candidate = root / rel
+    # Scanner paths historically arrived with a leading slash even when they
+    # were repository-relative. Preserve that compatibility spelling while
+    # routing the actual resolution through the shared traversal/symlink
+    # containment policy.
+    rel = str(repo_relative_path).replace("\\", "/").lstrip("/")
+    try:
+        candidate = resolve_repository_path(repo_root, rel)
+    except (OSError, WorkspacePathError) as exc:
+        log.warning("resolve_repo_file: blocked path %r: %s", repo_relative_path, exc)
+        return None
     if candidate.is_file():
         return candidate
     log.debug("resolve_repo_file: not found: %s", candidate)
@@ -378,10 +388,6 @@ def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: igno
         return []
 
     results: list[str] = []
-    try:
-        lang = root.tree.language if hasattr(root, "tree") else None
-    except Exception:
-        lang = None
 
     for child in root.children:
         node_type = child.type
@@ -484,10 +490,14 @@ def extract_snippet(
     lo = max(0, start_line - 1 - _SNIPPET_RADIUS)
     hi = min(n, end_line + _SNIPPET_RADIUS)
 
-    # Apply max_lines cap symmetrically around the finding centre
+    # Apply max_lines cap symmetrically around the finding centre.  Compute
+    # the final window explicitly because the previous inclusive/exclusive
+    # arithmetic could return max_lines + 1 rows for even caps.
+    if max_lines <= 0:
+        return ""
     centre = (start_line + end_line) // 2 - 1
-    half = max_lines // 2
-    lo = max(lo, centre - half)
-    hi = min(hi, centre + half + 1)
+    if hi - lo > max_lines:
+        lo = max(0, min(n - max_lines, centre - max_lines // 2))
+        hi = lo + max_lines
 
     return "\n".join(lines[lo:hi])

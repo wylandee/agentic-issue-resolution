@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
@@ -31,6 +32,8 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.triage.pipeline import (
+    TriagePipelineError,
+    TriageSelectionError,
     _prepare_sca_issue_plans,
     run_triage_pipeline,
     select_issues_for_remediation,
@@ -285,6 +288,71 @@ class TestRunTriagePipeline:
         mock_prepare.assert_called_once()
         assert result[0][0].fix_plan is not None
         assert result[0][0].localized_issues
+
+    def test_group_triage_failure_is_explicit_instead_of_dropping_group(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed group is reported with its ID rather than omitted from results."""
+        monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
+        issues = [
+            _sca(package_name="lodash", file_path="package.json"),
+            _sca(package_name="express", file_path="backend/package.json"),
+        ]
+        planned_pairs = _sca_issue_plans(issues)
+        seen_group_ids: list[str] = []
+
+        def triage_one(group, _context):
+            seen_group_ids.append(group.group_id)
+            if len(seen_group_ids) == 2:
+                raise RuntimeError("synthetic triage failure")
+            return TriageResult(
+                group_id=group.group_id,
+                is_valid=True,
+                revised_priority=Severity.HIGH,
+                priority_reasoning="test",
+                validity_confidence_score=1.0,
+                priority_confidence_score=1.0,
+                recommended_issue_id=group.issues[0].id,
+                triage_method="deterministic",
+            )
+
+        with (
+            patch(
+                "remediation_engine.triage.pipeline.enrich_cves",
+                side_effect=_empty_enrichment_map,
+            ),
+            patch(
+                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                return_value=planned_pairs,
+            ),
+            patch("remediation_engine.triage.pipeline.run_triage", side_effect=triage_one),
+            pytest.raises(TriagePipelineError) as raised,
+        ):
+            run_triage_pipeline(issues, _ctx())
+
+        assert raised.value.failed_group_ids == (seen_group_ids[1],)
+        assert "synthetic triage failure" in str(raised.value)
+
+    def test_valid_result_without_an_issue_is_explicit(self):
+        group = VulnerabilityGroup(
+            group_id="sast:missing",
+            issue_type=IssueType.SAST,
+            representative_issue_id=uuid4(),
+            issues=[],
+        )
+        triage = TriageResult(
+            group_id=group.group_id,
+            is_valid=True,
+            revised_priority=Severity.HIGH,
+            priority_reasoning="test",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
+            recommended_issue_id="00000000-0000-0000-0000-000000000001",
+            triage_method="deterministic",
+        )
+
+        with pytest.raises(TriageSelectionError, match="sast:missing"):
+            select_issues_for_remediation([(group, triage)])
 
     def test_prepare_sca_issue_plans_calls_locator_and_planner(self, tmp_path):
         issue = _sca()

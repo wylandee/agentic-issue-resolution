@@ -14,16 +14,29 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from remediation_engine.settings import AppSettings
 
+from .report_context import ErrorRecord, PackageChange, ReportContext
+from .report_persistence import (
+    report_filename,
+    resolve_report_dir,
+    write_report_atomic,
+)
+from .runtime_context import get_runtime_settings
+from .task_utils import effective_group_status, task_group_lineage, terminal_outcome_issues
 from .trajectory_exporter import TrajectoryRecorder
 
 log = logging.getLogger(__name__)
+
+# Private aliases preserve imports used by older report-focused integrations
+# while the typed context definitions live in their own boundary module.
+_ReportContext = ReportContext
+_PackageChange = PackageChange
+_ErrorRecord = ErrorRecord
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_REPORT_DIR = _PROJECT_ROOT / "data" / "reports"
@@ -119,82 +132,6 @@ _SCAN_COMPLETE_STATUSES = {
 }
 
 
-@dataclass(frozen=True)
-class _ReportContext:
-    """Normalized, deterministic evidence used by the Markdown renderer."""
-
-    run_id: str
-    repo_root: str
-    run_started_at: str | None
-    run_ended_at: str | None
-    duration_seconds: float | None
-    total_input_tokens: int | None
-    total_output_tokens: int | None
-    total_tokens: int | None
-    status: str
-    overall_label: str
-    targeted_qa_total: int
-    targeted_qa_passed: int
-    recorded_qa_total: int
-    has_patch: bool
-    original_scanner_findings: int
-    actionable_groups: int
-    groups_fixed: int
-    groups_unresolved: int
-    groups_inconclusive: int
-    groups_pending: int
-    groups_retriage_discovered: int | None
-    consistency_events: list[Any]
-    error_strings: list[str]
-    error_records: list[_ErrorRecord]
-    initial_valid_groups: list[Any]
-    final_valid_groups: list[Any]
-    issues: list[Any]
-    task_queue: dict[str, Any]
-    action_summaries: list[Any]
-    triage_reconciliation: dict[str, Any]
-    group_strategies: dict[str, Any]
-    retry_plans: dict[str, Any]
-    qa_evaluations: dict[str, Any]
-    group_statuses: dict[str, Any]
-    worker_results: dict[str, Any]
-    qa_results: dict[str, Any]
-    attempt_snapshots: dict[str, Any]
-    retry_diagnostics: dict[str, Any]
-    final_full_scan_result: Any
-    triage_required: bool
-    post_remediation_scan_issues: list[Any]
-    post_remediation_scan_identifiers: list[str]
-    new_vulnerability_identifiers: list[str]
-    new_vulnerability_status: str
-    diff: str
-    changed_files: list[str]
-    trajectory_path: str | None
-    langsmith_trace_url: str | None
-    executive_narrative: str | None = None
-
-
-@dataclass(frozen=True)
-class _PackageChange:
-    """One direct or lockfile package version change extracted from a diff."""
-
-    name: str
-    old: str
-    new: str
-    file: str
-    scope: str
-
-
-@dataclass(frozen=True)
-class _ErrorRecord:
-    """One deduplicated, source-aware critical error for the report."""
-
-    source: str
-    code: str
-    message: str
-    occurrences: int
-
-
 def _value(item: Any, key: str, default: Any = None) -> Any:
     """Read a field from either a Pydantic object or a mapping."""
     if isinstance(item, Mapping):
@@ -272,68 +209,13 @@ def _reconciliation_ids(reconciliation: Mapping[str, Any], *names: str) -> list[
 
 
 def _group_tree(task_queue: Mapping[str, Any], group_id: str) -> list[Any]:
-    """Return the root task and all descendants for one task group.
-
-    Pivot tasks retain their original task as parent_task_id while moving
-    to a new parent_group_id. A child-group task is therefore a root from
-    that child's perspective even though it is not globally root-like.
-    """
-    group_tasks = [
-        task for task in task_queue.values() if _value(task, "parent_group_id") == group_id
-    ]
-    group_task_ids = {
-        _text(_value(task, "task_id")) for task in group_tasks if _value(task, "task_id")
-    }
-    roots = [
-        task
-        for task in group_tasks
-        if _value(task, "parent_task_id") is None
-        or _text(_value(task, "parent_task_id")) not in group_task_ids
-    ]
-    result: list[Any] = []
-    children: dict[str, list[Any]] = defaultdict(list)
-    for task in task_queue.values():
-        parent = _value(task, "parent_task_id")
-        if parent:
-            children[str(parent)].append(task)
-    stack = sorted(roots, key=lambda task: _text(_value(task, "task_id")))
-    visited: set[str] = set()
-    while stack:
-        task = stack.pop(0)
-        task_id = _text(_value(task, "task_id"))
-        if task_id in visited:
-            continue
-        visited.add(task_id)
-        result.append(task)
-        stack[0:0] = sorted(
-            children.get(task_id, []),
-            key=lambda child: _text(_value(child, "task_id")),
-        )
-    return result
+    """Return the root task and all pivot descendants for one group."""
+    return task_group_lineage(task_queue, group_id)
 
 
 def _group_status(task_queue: Mapping[str, Any], group_id: str) -> str:
-    """Collapse a root task and any pivot children to one group status."""
-    statuses = [
-        _text(_value(task, "status"), "pending") for task in _group_tree(task_queue, group_id)
-    ]
-    if not statuses:
-        return "pending"
-    if "qa_passed" in statuses:
-        return "qa_passed"
-    if "inconclusive" in statuses:
-        return "inconclusive"
-    if "unfixable" in statuses:
-        return "unfixable"
-    if "mitigated" in statuses:
-        return "mitigated"
-    if "needs_retry" in statuses:
-        return "needs_retry"
-    if "optimistically_fixed" in statuses:
-        return "optimistically_fixed"
-    if "pivoted" in statuses:
-        return "pivoted"
-    return "pending"
+    """Collapse a root task and pivot descendants with failure-first rules."""
+    return effective_group_status(task_queue, group_id)
 
 
 def _overall_label(
@@ -341,6 +223,7 @@ def _overall_label(
     counts: Mapping[str, int],
     new_vulnerability_status: str,
     new_identifier_count: int,
+    remaining_identifier_count: int = 0,
 ) -> str:
     """Map run state and post-scan evidence to a reader-facing outcome label."""
     if status in {"failed", "error"}:
@@ -358,6 +241,11 @@ def _overall_label(
 
     if new_vulnerability_status in {"scan_failed", "failed"} and base == "Successful":
         base = "Completed with errors"
+    if remaining_identifier_count:
+        if base == "Successful":
+            base = "Completed with unresolved findings"
+        elif base not in {"Failed", "Completed with errors"} and "unresolved" not in base:
+            base = f"{base}; unresolved findings"
     if new_vulnerability_status == "detected" or new_identifier_count:
         if base == "Successful":
             return "Completed with new findings"
@@ -440,7 +328,7 @@ def _classify_error(source: str, message: str, explicit_code: str | None) -> str
     return "ERROR"
 
 
-def _error_records(state: Mapping[str, Any]) -> list[_ErrorRecord]:
+def _error_records(state: Mapping[str, Any]) -> list[ErrorRecord]:
     """Collect critical errors by normalized message/code with source counts."""
     candidates = _items(state.get("errors"))
     final_scan = state.get("final_full_scan_result")
@@ -462,7 +350,7 @@ def _error_records(state: Mapping[str, Any]) -> list[_ErrorRecord]:
             record["source"].append(source)
 
     return [
-        _ErrorRecord(
+        ErrorRecord(
             source=", ".join(data["source"]),
             code=code,
             message=data["message"],
@@ -567,7 +455,7 @@ def _build_context(
     token_summary: Mapping[str, Any] | None = None,
     run_ended_at: datetime | None = None,
     executive_narrative: str | None = None,
-) -> _ReportContext:
+) -> ReportContext:
     """Normalize graph state into the renderer's evidence contract."""
     initial_groups = _items(state.get("initial_valid_groups"))
     if not initial_groups:
@@ -612,6 +500,9 @@ def _build_context(
     started = _iso(state.get("run_started_at"))
     tokens = dict(token_summary or {})
     status = _text(state.get("status"), "unknown")
+    outcome_issues = terminal_outcome_issues(state)
+    if outcome_issues and status == "completed":
+        status = "completed_with_errors"
     issues = _items(state.get("issues"))
     if not issues:
         issues = [issue for group in initial_groups for issue in _items(_value(group, "issues"))]
@@ -628,6 +519,10 @@ def _build_context(
         _items(state.get("new_vulnerability_identifiers"))
         or _items(_value(final_scan, "new_identifiers"))
     )
+    remaining_identifiers = _unique_texts(
+        _items(state.get("remaining_target_identifiers"))
+        or _items(_value(final_scan, "remaining_target_identifiers"))
+    )
     new_status = _text(
         state.get("new_vulnerability_status") or _value(final_scan, "status"),
         "not_scanned",
@@ -639,11 +534,18 @@ def _build_context(
         if triage_required_value is None
         else triage_required_value
     )
-    error_records = _error_records(state)
+    report_state = {
+        **state,
+        "errors": [
+            *(list(state.get("errors", []) or [])),
+            *(f"remediation outcome: {issue}" for issue in outcome_issues),
+        ],
+    }
+    error_records = _error_records(report_state)
     qa_evaluations = _mapping(state.get("qa_evaluations"))
     qa_results = _mapping(state.get("qa_results_by_attempt"))
     recorded_qa_total = _qa_record_summary(qa_evaluations, qa_results)
-    return _ReportContext(
+    return ReportContext(
         run_id=_text(state.get("run_id") or state.get("langsmith_run_id"), "local-run"),
         repo_root=_text(state.get("repo_root")),
         run_started_at=started,
@@ -653,7 +555,13 @@ def _build_context(
         total_output_tokens=tokens.get("output_tokens"),
         total_tokens=tokens.get("total_tokens"),
         status=status,
-        overall_label=_overall_label(status, counts, new_status, len(new_identifiers)),
+        overall_label=_overall_label(
+            status,
+            counts,
+            new_status,
+            len(new_identifiers),
+            len(remaining_identifiers),
+        ),
         targeted_qa_total=len(initial_groups),
         targeted_qa_passed=sum(
             statuses.get(_text(_value(group, "group_id")), "pending") == "qa_passed"
@@ -695,6 +603,7 @@ def _build_context(
         post_remediation_scan_identifiers=post_scan_identifiers,
         new_vulnerability_identifiers=new_identifiers,
         new_vulnerability_status=new_status,
+        remaining_target_identifiers=remaining_identifiers,
         diff=_text(state.get("diff")),
         changed_files=[_text(item) for item in _items(state.get("changed_files"))],
         trajectory_path=trajectory_path or _text(state.get("trajectory_path")) or None,
@@ -764,7 +673,7 @@ def _finding_identifier(group: Any, issue: Any | None) -> str:
     return ", ".join(labels) or _text(_value(group, "group_id"), "unknown")
 
 
-def _group_action(context: _ReportContext, group: Any) -> str:
+def _group_action(context: ReportContext, group: Any) -> str:
     """Describe the committed action for one group."""
     group_id = _text(_value(group, "group_id"))
     tasks = _group_tree(context.task_queue, group_id)
@@ -781,7 +690,7 @@ def _group_action(context: _ReportContext, group: Any) -> str:
     return "No remediation task recorded"
 
 
-def _validation_for_group(context: _ReportContext, group_id: str) -> str:
+def _validation_for_group(context: ReportContext, group_id: str) -> str:
     """Summarize the latest QA evaluation associated with a group."""
     task_ids = [
         _text(_value(task, "task_id")) for task in _group_tree(context.task_queue, group_id)
@@ -827,7 +736,7 @@ def _record_package_change(
         record["old"] = version
 
 
-def _package_change_kind(change: _PackageChange) -> str:
+def _package_change_kind(change: PackageChange) -> str:
     """Classify a package change for compact report summaries."""
     if change.old and change.new and change.old != change.new:
         return "changed"
@@ -838,7 +747,7 @@ def _package_change_kind(change: _PackageChange) -> str:
     return "unchanged"
 
 
-def _package_changes(diff: str) -> list[_PackageChange]:
+def _package_changes(diff: str) -> list[PackageChange]:
     """Extract direct manifest changes and classified lockfile changes.
 
     Only dependency-section entries from ``package.json`` are considered
@@ -930,7 +839,7 @@ def _package_changes(diff: str) -> list[_PackageChange]:
                     )
 
     direct_names = set(manifest_records)
-    changes: list[_PackageChange] = []
+    changes: list[PackageChange] = []
     for name in sorted(manifest_records):
         record = manifest_records[name]
         if record["old"] or record["new"]:
@@ -938,7 +847,7 @@ def _package_changes(diff: str) -> list[_PackageChange]:
             if name in lockfile_records:
                 evidence_file += "; lockfile synchronized"
             changes.append(
-                _PackageChange(name, record["old"], record["new"], evidence_file, "direct")
+                PackageChange(name, record["old"], record["new"], evidence_file, "direct")
             )
     for name in sorted(lockfile_records):
         if name in direct_names:
@@ -946,7 +855,7 @@ def _package_changes(diff: str) -> list[_PackageChange]:
         record = lockfile_records[name]
         if record["old"] or record["new"]:
             changes.append(
-                _PackageChange(
+                PackageChange(
                     name,
                     record["old"],
                     record["new"],
@@ -966,7 +875,7 @@ def _usable_package_name(value: Any) -> str | None:
 
 
 def _package_for_task(
-    context: _ReportContext,
+    context: ReportContext,
     task_id: str,
     snapshot: Any = None,
     worker_result: Any = None,
@@ -1022,7 +931,7 @@ def _diagnostic_versions(diagnostic: Any, field_name: str) -> str:
     return ", ".join(_text(version) for version in versions) or "—"
 
 
-def _retry_outcome(context: _ReportContext, task_id: str, diagnostic: Any) -> str:
+def _retry_outcome(context: ReportContext, task_id: str, diagnostic: Any) -> str:
     """Summarize the terminal meaning of one historical retry diagnostic."""
     task_status = _text(_value(context.task_queue.get(task_id), "status")).lower()
     if task_status == "unfixable" or bool(_value(diagnostic, "package_abandoned")):
@@ -1062,7 +971,7 @@ def _latest_action_summaries(
     return sorted(latest, key=lambda item: item[0])
 
 
-def _action_attempt_id(context: _ReportContext, task_id: str, summary: Any) -> str:
+def _action_attempt_id(context: ReportContext, task_id: str, summary: Any) -> str:
     """Return an action's attempt ID, falling back to a correlated worker result."""
     attempt_id = _text(_value(summary, "attempt_id")).strip()
     if attempt_id:
@@ -1082,7 +991,7 @@ def _action_attempt_id(context: _ReportContext, task_id: str, summary: Any) -> s
     return max(candidates)[1] if candidates else "—"
 
 
-def _failed_qa_rows(context: _ReportContext) -> list[tuple[str, str, str, str]]:
+def _failed_qa_rows(context: ReportContext) -> list[tuple[str, str, str, str]]:
     """Return failed QA evaluations with attempt provenance when available.
 
     Attempt envelopes are the authoritative historical record and may contain
@@ -1126,7 +1035,7 @@ def _failed_qa_rows(context: _ReportContext) -> list[tuple[str, str, str, str]]:
     return sorted(rows, key=lambda row: (row[0], row[1]))
 
 
-def _targeted_remediation_summary(context: _ReportContext) -> str:
+def _targeted_remediation_summary(context: ReportContext) -> str:
     """Summarize the outcome for the original actionable groups."""
     return (
         f"{context.groups_fixed}/{context.actionable_groups} actionable groups fixed; "
@@ -1136,7 +1045,7 @@ def _targeted_remediation_summary(context: _ReportContext) -> str:
     )
 
 
-def _post_scan_summary(context: _ReportContext) -> str:
+def _post_scan_summary(context: ReportContext) -> str:
     """Summarize post-remediation scan evidence without conflating its counts."""
     scan_state = _scan_evidence_state(
         context.final_full_scan_result, context.new_vulnerability_status
@@ -1146,18 +1055,28 @@ def _post_scan_summary(context: _ReportContext) -> str:
     if scan_state != "complete":
         return "Not scanned"
     status = context.new_vulnerability_status
-    if status == "detected" or context.new_vulnerability_identifiers:
+    if (
+        status == "detected"
+        or context.new_vulnerability_identifiers
+        or context.remaining_target_identifiers
+    ):
+        remaining_text = (
+            f"; {len(context.remaining_target_identifiers)} target identifiers remain"
+            if context.remaining_target_identifiers
+            else ""
+        )
         return (
             f"{len(context.post_remediation_scan_issues)} findings / "
             f"{len(context.post_remediation_scan_identifiers)} unique identifiers; "
             f"{len(context.new_vulnerability_identifiers)} new identifiers detected"
+            f"{remaining_text}"
         )
     if status in {"none", "clear", "not_detected"}:
         return "No post-remediation findings detected"
     return status
 
 
-def _scan_assessment_text(context: _ReportContext) -> str:
+def _scan_assessment_text(context: ReportContext) -> str:
     """Describe unavailable post-scan evidence without implying zero findings."""
     if (
         _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
@@ -1167,7 +1086,7 @@ def _scan_assessment_text(context: _ReportContext) -> str:
     return "Not assessed — no authoritative scan"
 
 
-def _reconciliation_display(context: _ReportContext, *keys: str) -> str:
+def _reconciliation_display(context: ReportContext, *keys: str) -> str:
     """Render triage reconciliation only when the authoritative scan supports it."""
     scan_state = _scan_evidence_state(
         context.final_full_scan_result, context.new_vulnerability_status
@@ -1182,7 +1101,7 @@ def _reconciliation_display(context: _ReportContext, *keys: str) -> str:
     return "None"
 
 
-def _render_summary(context: _ReportContext) -> str:
+def _render_summary(context: ReportContext) -> str:
     """Render the compact run summary and critical errors."""
     duration = (
         f"{context.duration_seconds:.2f} seconds"
@@ -1250,7 +1169,7 @@ def _render_summary(context: _ReportContext) -> str:
     )
 
 
-def _render_overview(context: _ReportContext) -> str:
+def _render_overview(context: ReportContext) -> str:
     """Render deterministic counts, strategies, reconciliation, and outcome."""
     issue_types = Counter(_text(_value(issue, "issue_type"), "unknown") for issue in context.issues)
     severity_counts = Counter(
@@ -1316,7 +1235,7 @@ def _render_overview(context: _ReportContext) -> str:
     )
 
 
-def _render_key_decisions(context: _ReportContext) -> str:
+def _render_key_decisions(context: ReportContext) -> str:
     """Render supervisor decisions, retries, QA failures, and repairs."""
     retry_rows: list[tuple[Any, ...]] = []
     for task_id in sorted(context.retry_plans):
@@ -1463,7 +1382,7 @@ def _render_key_decisions(context: _ReportContext) -> str:
     )
 
 
-def _render_findings(context: _ReportContext) -> str:
+def _render_findings(context: ReportContext) -> str:
     """Render original findings, package changes, and post-retriage findings."""
     rows = []
     for group in sorted(
@@ -1639,7 +1558,7 @@ def _render_findings(context: _ReportContext) -> str:
     )
 
 
-def _new_scan_finding_rows(context: _ReportContext) -> list[tuple[str, str, str, str, str, str]]:
+def _new_scan_finding_rows(context: ReportContext) -> list[tuple[str, str, str, str, str, str]]:
     """Render post-scan issues once per scanner finding, not once per identifier."""
     new_ids = set(context.new_vulnerability_identifiers)
     rows: list[tuple[str, str, str, str, str, str]] = []
@@ -1668,7 +1587,7 @@ def _new_scan_finding_rows(context: _ReportContext) -> list[tuple[str, str, str,
     return rows
 
 
-def _render_validation(context: _ReportContext) -> str:
+def _render_validation(context: ReportContext) -> str:
     """Render deterministic validation gates and remaining work."""
     scan_state = _scan_evidence_state(
         context.final_full_scan_result, context.new_vulnerability_status
@@ -1732,6 +1651,10 @@ def _render_validation(context: _ReportContext) -> str:
                         post_scan_identifiers,
                     ),
                     (
+                        "Remaining target identifiers",
+                        len(context.remaining_target_identifiers),
+                    ),
+                    (
                         "New vulnerability identifiers",
                         new_identifiers,
                     ),
@@ -1762,7 +1685,7 @@ def _render_validation(context: _ReportContext) -> str:
     )
 
 
-def _render_references(context: _ReportContext) -> str:
+def _render_references(context: ReportContext) -> str:
     """Render lightweight artifact references."""
     return "\n".join(
         [
@@ -1781,7 +1704,7 @@ def _render_references(context: _ReportContext) -> str:
     )
 
 
-def _evidence_payload(context: _ReportContext) -> dict[str, Any]:
+def _evidence_payload(context: ReportContext) -> dict[str, Any]:
     """Build the bounded deterministic evidence supplied to an optional LLM."""
     return {
         "status": context.status,
@@ -1804,7 +1727,7 @@ def _evidence_payload(context: _ReportContext) -> dict[str, Any]:
 
 
 def _generate_executive_narrative(
-    context: _ReportContext,
+    context: ReportContext,
     settings: AppSettings,
 ) -> str | None:
     """Ask an optional LLM to summarize supplied evidence without making decisions."""
@@ -1885,26 +1808,17 @@ def generate_report(
 
 def _resolve_report_dir(settings: AppSettings | None = None) -> Path:
     """Resolve the canonical report directory from validated settings."""
-    configured = (settings or AppSettings.from_env()).remediation_report_dir
-    return configured or _DEFAULT_REPORT_DIR
+    return resolve_report_dir(settings or get_runtime_settings(), _DEFAULT_REPORT_DIR)
 
 
 def _report_filename(run_id: str) -> str:
     """Return a filesystem-safe canonical report filename."""
-    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "local-run"
-    return f"remediation_{safe_id}.md"
+    return report_filename(run_id)
 
 
 def _write_report_atomic(path: Path, markdown: str) -> None:
     """Write Markdown via a sibling temporary file and atomic replacement."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_text(markdown, encoding="utf-8")
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    write_report_atomic(path, markdown)
 
 
 def run_report_node(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1955,7 +1869,7 @@ def finalize_report(
     """
     token_summary = _extract_token_summary(recorder)
     ended_at = datetime.now(UTC)
-    settings = settings or AppSettings.from_env()
+    settings = settings or get_runtime_settings()
     base_context = _build_context(
         state,
         trajectory_path=trajectory_path,

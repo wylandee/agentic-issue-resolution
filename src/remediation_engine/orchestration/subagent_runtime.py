@@ -144,28 +144,13 @@ def _tool_call_signature(tool_call: dict[str, Any]) -> tuple[str, str]:
     tool_name = str(tool_call.get("name", ""))
     tool_args = tool_call.get("args", {}) or {}
 
-    if tool_name in {"validate_workaround", "run_targeted_test"}:
-        return tool_name, str(tool_call.get("id", id(tool_call)))
-
-    if tool_name in {
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-    }:
-        file_path = tool_args.get("file_path", "")
-        old_text = tool_args.get("old_text", "") or tool_args.get("target_text", "")
-        new_text = tool_args.get("new_text", "") or tool_args.get("replacement_text", "")
-        symbol_name = tool_args.get("symbol_name", "")
-        line_hint = tool_args.get("line_hint", "")
-        return (
-            tool_name,
-            f"file:{file_path}|sym:{symbol_name}|old:{str(old_text)[:60]}|new:{str(new_text)[:60]}|line:{line_hint}",
-        )
-
-    if tool_name == "revert_workspace_file":
-        return tool_name, f"file:{tool_args.get('file_path', '')}"
-
     try:
-        serialized_args = json.dumps(tool_args, sort_keys=True, default=str)
+        serialized_args = json.dumps(
+            tool_args,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
     except (TypeError, ValueError):
         serialized_args = repr(tool_args)
     return tool_name, serialized_args
@@ -390,10 +375,7 @@ def run_bounded_subagent_loop(
         raise ValueError(
             "structured_output_model and structured_output_tool_name must be provided together."
         )
-    if (
-        structured_output_tool_name is not None
-        and structured_output_tool_name not in tool_map
-    ):
+    if structured_output_tool_name is not None and structured_output_tool_name not in tool_map:
         raise ValueError(
             f"Structured output tool {structured_output_tool_name!r} is not available."
         )
@@ -481,7 +463,9 @@ def run_bounded_subagent_loop(
                             name=structured_output_tool_name,
                         )
                     )
-                    errors.append("Structured QA output validation failed; evaluator was asked to retry.")
+                    errors.append(
+                        "Structured QA output validation failed; evaluator was asked to retry."
+                    )
                     continue
                 return SubagentRuntimeResult(
                     final_text="",
@@ -501,6 +485,7 @@ def run_bounded_subagent_loop(
         blocker_errors: list[str] = []
         manifest_call_seen = False
         deferred_manifest_calls: list[str] = []
+        turn_event_start = len(tool_events)
         for tool_call in tool_calls:
             tool_name = str(tool_call.get("name", ""))
             call_signature = _tool_call_signature(tool_call)
@@ -519,11 +504,9 @@ def run_bounded_subagent_loop(
                     tool_call_id=tool_call_id,
                     name=tool_name,
                 )
-                deferred_manifest_call = False
             else:
                 if tool_name in _SERIAL_MANIFEST_TOOL_NAMES and manifest_call_seen:
                     deferred_manifest_calls.append(tool_name)
-                    deferred_manifest_call = True
                     tool_message = ToolMessage(
                         content=(
                             "DEFERRED: manifest tools are serialized. This call was not "
@@ -534,7 +517,6 @@ def run_bounded_subagent_loop(
                         name=tool_name,
                     )
                 else:
-                    deferred_manifest_call = False
                     if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
                         manifest_call_seen = True
                     if (
@@ -554,8 +536,6 @@ def run_bounded_subagent_loop(
                     else:
                         tool_message = _invoke_bound_tool(tool_map, tool_call)
             conversation.append(tool_message)
-            if deferred_manifest_call:
-                continue
             event = ToolEvent(
                 name=tool_name,
                 args=tool_call.get("args", {}) or {},
@@ -692,11 +672,6 @@ def run_bounded_subagent_loop(
                     else:
                         consecutive_validation_failures = 0
 
-            if deferred_manifest_calls:
-                conversation.append(
-                    HumanMessage(content=_manifest_call_deferred_instruction(deferred_manifest_calls))
-                )
-
             inferred_paths = _infer_changed_files(event)
             if inferred_paths:
                 if event.name == "revert_workspace_file":
@@ -736,6 +711,11 @@ def run_bounded_subagent_loop(
                 # request. Returning here was the source of malformed OpenAI
                 # transcripts in which later tool_call_ids had no response.
                 sandbox_stopped = True
+
+        if deferred_manifest_calls:
+            conversation.append(
+                HumanMessage(content=_manifest_call_deferred_instruction(deferred_manifest_calls))
+            )
 
         if malformed_tool_call:
             errors.append(
@@ -793,7 +773,7 @@ def run_bounded_subagent_loop(
         if sandbox_stopped:
             sandbox_errors = [
                 event.content
-                for event in tool_events[-len(tool_calls) :]
+                for event in tool_events[turn_event_start:]
                 if _contains_sandbox_not_running(event.content)
             ]
             errors.extend(f"INFRASTRUCTURE_FAILURE: {message}" for message in sandbox_errors)

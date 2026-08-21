@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shlex
 import uuid
@@ -30,6 +29,8 @@ from remediation_engine.contracts.schemas import (
     WorkaroundValidationResult,
     WorkaroundValidationStatus,
 )
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.runtime.path_policy import normalize_workspace_path, resolve_repository_path
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 logger = logging.getLogger(__name__)
@@ -437,27 +438,17 @@ def _runtime_smoke_path_error(
 
 
 def _validate_workspace_path(file_path: str) -> str:
-    candidate = (file_path or "").strip().replace("\\", "/")
-    if not candidate:
-        raise ValueError("file_path is required.")
-
-    if candidate.startswith("/workspace/"):
-        candidate = candidate[len("/workspace/") :]
-    elif candidate.startswith("workspace/"):
-        candidate = candidate[len("workspace/") :]
-
-    if os.path.isabs(candidate) or candidate.startswith("/"):
-        raise ValueError(f"Rejected absolute file path '{candidate}'.")
-
+    candidate = str(file_path or "").strip()
+    if candidate.replace("\\", "/").startswith("workspace/"):
+        candidate = candidate.replace("\\", "/")[len("workspace/") :]
+    candidate = normalize_workspace_path(candidate)
     parts = Path(candidate).parts
-    if ".." in parts:
-        raise ValueError(f"Rejected path traversal in '{candidate}'.")
     if parts and parts[0] in ("build", "dist"):
         raise ValueError(
             f"Accessing compiled files in '{parts[0]}/' is strictly forbidden. Please modify the original source files instead."
         )
 
-    return candidate.replace("\\", "/")
+    return candidate
 
 
 def _normalise_newlines(text: str) -> str:
@@ -674,7 +665,10 @@ def _make_read_workspace_file_tool(
         if end_line <= 0:
             e = min(s + _READ_FILE_MAX_LINES - 1, total_lines)
         else:
-            e = min(int(end_line), total_lines)
+            requested_end = int(end_line)
+            if requested_end < s:
+                return f"ERROR: end_line {requested_end} precedes start_line {s}."
+            e = min(requested_end, s + _READ_FILE_MAX_LINES - 1, total_lines)
 
         if s > total_lines:
             return f"ERROR: start_line {s} exceeds file length ({total_lines} lines)."
@@ -717,7 +711,10 @@ def _make_revert_workspace_file_tool(
         except ValueError as exc:
             return f"ERROR: {exc}"
 
-        baseline_file = host_repo_root / rel_path
+        try:
+            baseline_file = resolve_repository_path(host_repo_root, rel_path)
+        except ValueError as exc:
+            return f"ERROR: Baseline path '{rel_path}' is blocked: {exc}"
         if not baseline_file.is_file():
             return f"ERROR: Baseline file '{rel_path}' does not exist on host."
 
@@ -2199,11 +2196,10 @@ def _make_run_targeted_test_tool(
         if not test_file or not test_file.strip():
             return "ERROR: test_file is required."
 
-        norm_path = test_file.replace("\\", "/").strip().lstrip("/")
-        if ".." in norm_path or norm_path.startswith("/") or norm_path.startswith("C:"):
-            return (
-                f"ERROR: Invalid test file path '{test_file}'. Must be a repository-relative path."
-            )
+        try:
+            norm_path = _validate_workspace_path(test_file)
+        except ValueError as exc:
+            return f"ERROR: Invalid test file path '{test_file}': {exc}"
         if norm_path.startswith(("build/", "dist/")):
             return (
                 f"ERROR: Compiled test path '{norm_path}' is not supported. "
@@ -2701,16 +2697,23 @@ def _make_validate_workaround_tool(
         test/spec files and compiled ``build/`` or ``dist/`` paths are rejected,
         and the smoke module must be distinct from the targeted test.
         """
-        requested = [
-            str(path).replace("\\", "/").strip().lstrip("/")
-            for path in (modified_files or [])
-            if str(path).strip()
-        ]
-        current = [
-            str(path).replace("\\", "/").strip().lstrip("/")
-            for path in touched_files
-            if str(path).strip()
-        ]
+        requested: list[str] = []
+        for path in modified_files or []:
+            if not str(path).strip():
+                continue
+            try:
+                requested.append(_validate_workspace_path(str(path)))
+            except ValueError as exc:
+                return _invalid_validation_request(f"Invalid modified file path: {exc}")
+
+        current: list[str] = []
+        for path in touched_files:
+            if not str(path).strip():
+                continue
+            try:
+                current.append(_validate_workspace_path(str(path)))
+            except ValueError as exc:
+                return _invalid_validation_request(f"Invalid touched file path: {exc}")
         files = list(dict.fromkeys([*requested, *current]))
         if not files:
             return _invalid_validation_request("No modified files were supplied.")
@@ -3681,7 +3684,7 @@ def _make_search_web_tool(
         if _calls_remaining[0] <= 0:
             return f"ERROR: search_web call limit reached (max {_SEARCH_WEB_MAX_CALLS} per session). Use the results you already have."
 
-        api_key = os.environ.get("SERPER_API_KEY", "").strip()
+        api_key = get_runtime_settings().serper_api_key
         if not api_key:
             return "ERROR: SERPER_API_KEY is not set. Cannot perform web search."
 
@@ -3774,7 +3777,7 @@ def _github_headers() -> dict[str, str]:
         "Accept": "application/vnd.github.raw+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = get_runtime_settings().github_token
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers

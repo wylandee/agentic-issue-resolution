@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +41,8 @@ from typing import Any
 import requests
 
 from remediation_engine.contracts.schemas import CVEEnrichment
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -60,22 +61,23 @@ KEV_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 # ---------------------------------------------------------------------------
 
 
-def _cache_dir() -> Path:
-    """Return the cache directory, honouring TRIAGE_CACHE_DIR env var."""
-    env_override = os.environ.get("TRIAGE_CACHE_DIR")
-    if env_override:
-        return Path(env_override)
-    # Walk up from this file to find repo root (contains requirements.txt)
+def _cache_dir(settings: AppSettings | None = None) -> Path:
+    """Return the configured cache directory for the current run."""
+    resolved_settings = settings or get_runtime_settings()
+    if resolved_settings.triage_cache_dir is not None:
+        return resolved_settings.triage_cache_dir
+    # Walk up from this file to find a repository marker.  This repository is
+    # pyproject-based, while older deployments may still have requirements.txt.
     here = Path(__file__).resolve()
     for parent in [here, *here.parents]:
-        if (parent / "requirements.txt").exists():
+        if (parent / "pyproject.toml").exists() or (parent / "requirements.txt").exists():
             return parent / "data" / "cache"
     # Fallback: sibling data/cache relative to CWD
     return Path("data") / "cache"
 
 
-def _kev_cache_path() -> Path:
-    return _cache_dir() / "kev_cache.json"
+def _kev_cache_path(settings: AppSettings | None = None) -> Path:
+    return _cache_dir(settings) / "kev_cache.json"
 
 
 def _is_cache_fresh(path: Path) -> bool:
@@ -91,14 +93,14 @@ def _is_cache_fresh(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _load_kev_set() -> tuple[set[str], dict[str, str]]:
+def _load_kev_set(settings: AppSettings | None = None) -> tuple[set[str], dict[str, str]]:
     """
     Return (kev_cve_set, kev_date_map).
 
     Tries the local cache first; falls back to a live download.
     On any failure returns empty structures and logs a warning.
     """
-    cache_path = _kev_cache_path()
+    cache_path = _kev_cache_path(settings)
 
     def _parse_catalog(data: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
         kev_set: set[str] = set()
@@ -197,7 +199,10 @@ def _fetch_epss_chunk(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-def enrich_cves(cve_ids: list[str]) -> dict[str, CVEEnrichment]:
+def enrich_cves(
+    cve_ids: list[str],
+    settings: AppSettings | None = None,
+) -> dict[str, CVEEnrichment]:
     """
     Enrich a list of CVE IDs with EPSS scores and CISA KEV membership.
 
@@ -225,7 +230,7 @@ def enrich_cves(cve_ids: list[str]) -> dict[str, CVEEnrichment]:
     logger.debug("Enriching %d unique CVEs.", len(normalised))
 
     # --- KEV ---
-    kev_set, kev_date_map = _load_kev_set()
+    kev_set, kev_date_map = _load_kev_set(settings)
 
     # --- EPSS (chunked) ---
     epss_map: dict[str, tuple[float, float]] = {}

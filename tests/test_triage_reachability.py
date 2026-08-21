@@ -114,3 +114,19 @@ def test_analyze_reachability_continues_after_parse_failure(monkeypatch, tmp_pat
 
     assert groups[0].is_reachable is True
     assert groups[1].is_reachable is False
+
+
+def test_analyze_reachability_skips_symlinked_source_outside_repository(tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"lodash":"1.0.0"}}',
+        encoding="utf-8",
+    )
+    outside = tmp_path.parent / f"{tmp_path.name}-reachability-outside"
+    outside.mkdir()
+    (outside / "secret.js").write_text('import lodash from "lodash";', encoding="utf-8")
+    (tmp_path / "linked.js").symlink_to(outside / "secret.js")
+
+    groups = [_sca_group("lodash")]
+    analyze_reachability(groups, tmp_path)
+
+    assert groups[0].is_reachable is False

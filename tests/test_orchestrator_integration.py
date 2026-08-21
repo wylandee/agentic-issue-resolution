@@ -125,7 +125,7 @@ class TestTriageNodeIntegration:
             mock_ws.return_value = {"status": "workspace_ready"}
             mock_teardown.return_value = {"status": "completed"}
 
-            result = graph.invoke(state)
+            graph.invoke(state)
 
             mock_pipeline.assert_not_called()
             mock_ws.assert_called_once()

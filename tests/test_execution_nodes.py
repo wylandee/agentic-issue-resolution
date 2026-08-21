@@ -16,9 +16,13 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     TaskStatus,
 )
-from remediation_engine.orchestration.state import initial_orchestrator_state
+from remediation_engine.orchestration.state import (
+    ChangedFilesProjection,
+    initial_orchestrator_state,
+    merge_changed_files_reducer,
+)
 from remediation_engine.orchestration.supervisor_node import _instruction_digest
-from remediation_engine.orchestration.teardown_node import run_teardown_node
+from remediation_engine.orchestration.teardown_node import _build_diff, run_teardown_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 
@@ -151,6 +155,16 @@ class TestWorkspaceBuilderNode:
 
 
 class TestTeardownNode:
+    def test_final_changed_file_projection_replaces_historical_candidates(self):
+        assert merge_changed_files_reducer(["stale.ts"], ChangedFilesProjection(["actual.ts"])) == [
+            "actual.ts"
+        ]
+
+    def test_diff_marks_missing_final_newline(self):
+        diff = _build_diff("src/app.js", "const before = true;", "const after = true;")
+
+        assert "\\ No newline at end of file" in diff
+
     def test_final_state_barrier_detaches_terminal_worker_attempt(self, tmp_path):
         instruction = "Apply the workaround."
         snapshot = TaskAttemptSnapshot(
@@ -184,6 +198,36 @@ class TestTeardownNode:
         assert result["active_target_task_ids"] == []
         assert any(
             event.error_code == "TERMINAL_TASK_FIELDS_NORMALIZED"
+            for event in result["consistency_events"]
+        )
+
+    def test_final_state_barrier_repairs_passed_parent_with_failed_pivot_child(self, tmp_path):
+        parent = RemediationTask(
+            task_id="task-parent",
+            parent_group_id="group-parent",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            instruction="Update the package.",
+            status=TaskStatus.QA_PASSED,
+        )
+        child = RemediationTask(
+            task_id="task-child",
+            parent_group_id="group-child",
+            parent_task_id="task-parent",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            instruction="Apply a workaround.",
+            status=TaskStatus.UNFIXABLE,
+        )
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["task_queue"] = {parent.task_id: parent, child.task_id: child}
+
+        result = run_teardown_node(state)
+
+        assert result["task_queue"]["task-parent"].status == TaskStatus.PIVOTED
+        assert result["status"] == "completed_with_errors"
+        assert any(
+            event.error_code == "PIVOT_PARENT_STATUS_REPAIRED"
             for event in result["consistency_events"]
         )
 
@@ -222,6 +266,39 @@ class TestTeardownNode:
         assert "a/routes/login.ts" in result["diff"]
         assert "b/routes/login.ts" in result["diff"]
 
+    def test_changed_files_are_derived_from_actual_final_content(self, tmp_path):
+        route_dir = tmp_path / "routes"
+        route_dir.mkdir()
+        (route_dir / "login.ts").write_text("const x = 1;\n", encoding="utf-8")
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "insecurity.ts").write_text("const safe = true;\n", encoding="utf-8")
+
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["changed_files"] = ["routes/login.ts", "lib/insecurity.ts"]
+
+        sandbox = _sandbox_mock()
+        sandbox.read_file.side_effect = lambda path: {
+            "routes/login.ts": "const x = 2;\n",
+            "lib/insecurity.ts": "const safe = true;\n",
+        }.get(path)
+        client = MagicMock()
+
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.DockerSandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+        ):
+            result = run_teardown_node(state)
+
+        assert result["changed_files"] == ["routes/login.ts"]
+        assert "lib/insecurity.ts" not in result["diff"]
+
     def test_no_changed_files_still_removes_volume(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
         state["workspace_volume"] = "agent_workspace_deadbeef"
@@ -244,6 +321,15 @@ class TestTeardownNode:
         client.volumes.get.return_value.remove.assert_called_once_with(force=True)
         assert result["changed_files"] == []
         assert result["diff"] == ""
+
+    def test_invalid_changed_file_type_is_reported(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["changed_files"] = [None]
+
+        result = run_teardown_node(state)
+
+        assert result["changed_files"] == []
+        assert any("path must be a string" in error for error in result["errors"])
 
     def test_attached_container_is_removed_before_volume(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
