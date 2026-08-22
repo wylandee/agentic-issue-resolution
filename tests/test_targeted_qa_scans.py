@@ -87,7 +87,7 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
 
 
-def test_ambiguous_target_falls_back_to_existing_full_scan() -> None:
+def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
     sandbox = MagicMock()
     sandbox.read_file.return_value = json.dumps(
         {
@@ -125,6 +125,6 @@ def test_ambiguous_target_falls_back_to_existing_full_scan() -> None:
     full_scan.assert_called_once()
     evidence: ODCScanEvidence = results.scan_evidence
     assert evidence.effective_scope == ScanScope.FULL
-    assert evidence.fallback_reason == ScanFallbackReason.AMBIGUOUS_TARGET
+    assert evidence.fallback_reason == ScanFallbackReason.MULTIPLE_TARGETS
     assert evidence.complete is False
     sandbox.run.assert_not_called()

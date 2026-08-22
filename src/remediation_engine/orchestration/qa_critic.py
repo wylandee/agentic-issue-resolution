@@ -2598,7 +2598,10 @@ def _build_qa_scan_targets(
             if task is not None and task.target_package_name
             else group.vulnerable_component or ""
         ).strip()
-        expected_version = task.selected_version if task is not None else None
+        attempt_version, has_attempt_version_evidence = _attempt_version_evidence(state, task)
+        expected_version = (
+            task.selected_version if task is not None and task.selected_version else attempt_version
+        )
         # A workaround task deliberately has no supervisor-selected package
         # version.  Its worker may leave the installed dependency at whatever
         # version the live workspace resolves after install.  Falling back to
@@ -2613,12 +2616,18 @@ def _build_qa_scan_targets(
             and task.strategy == RoutingStrategy.CODE_WORKAROUND
             and not task.selected_version
         )
-        if not expected_version and target_package and not is_unversioned_workaround:
+        if (
+            not expected_version
+            and target_package
+            and not is_unversioned_workaround
+            and not has_attempt_version_evidence
+        ):
             expected_version = (group.dependency_versions or {}).get(target_package)
         if (
             not expected_version
             and target_package == group.vulnerable_component
             and not is_unversioned_workaround
+            and not has_attempt_version_evidence
         ):
             expected_version = (group.versions or [None])[0]
         ancestry = tuple(name for name in (group.dependency_ancestry or []) if name)
@@ -2634,6 +2643,55 @@ def _build_qa_scan_targets(
             )
         )
     return targets
+
+
+def _attempt_version_evidence(
+    state: OrchestratorState,
+    task: RemediationTask | None,
+) -> tuple[str | None, bool]:
+    """Return the exact version proven by the current task attempt, if any.
+
+    The Supervisor's task projection is authoritative for planning, but a
+    failed retry can close or clear that projection while its immutable
+    attempt snapshot and worker result still describe the package that was
+    installed. QA must use that attempt-local evidence before falling back to
+    the original finding version.
+
+    Args:
+        state: Orchestrator state containing attempt snapshots and worker results.
+        task: Active task owning the QA scan target, if one was resolved.
+
+    Returns:
+        A ``(version, has_version_evidence)`` tuple. The version is populated
+        only when exactly one executed version is proven; the boolean remains
+        true when execution evidence exists but is not uniquely resolvable.
+    """
+    if task is None or task.strategy != RoutingStrategy.VERSION_BUMP:
+        return None, False
+
+    attempt_id = task.current_attempt_id
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    snapshot = snapshots.get(attempt_id) if attempt_id else None
+    snapshot_version = getattr(snapshot, "selected_version", None)
+    if isinstance(snapshot_version, str) and snapshot_version.strip():
+        return snapshot_version.strip().lstrip("vV"), True
+
+    worker_results = state.get("worker_results_by_attempt") or {}
+    worker_result = worker_results.get(attempt_id) if attempt_id else None
+    if worker_result is None:
+        return None, False
+    execution = getattr(worker_result, "execution_diagnostics", None)
+    raw_versions = list(getattr(execution, "executed_versions", []) or [])
+    if not raw_versions:
+        raw_versions = list(getattr(worker_result, "executed_versions", []) or [])
+    versions = list(
+        dict.fromkeys(
+            version.strip().lstrip("vV")
+            for version in raw_versions
+            if isinstance(version, str) and version.strip()
+        )
+    )
+    return (versions[0] if len(versions) == 1 else None), bool(versions)
 
 
 # ---------------------------------------------------------------------------
@@ -3531,7 +3589,8 @@ def _targeted_extra_args_conflict() -> bool:
 def _closure_fallback_reason(reason: str | None) -> ScanFallbackReason:
     """Map pure resolver diagnostics to the typed QA fallback vocabulary."""
     return {
-        "ambiguous_target": ScanFallbackReason.AMBIGUOUS_TARGET,
+        "no_matching_target": ScanFallbackReason.NO_MATCHING_TARGET,
+        "multiple_targets": ScanFallbackReason.MULTIPLE_TARGETS,
         "incomplete_closure": ScanFallbackReason.INCOMPLETE_CLOSURE,
         "invalid_lockfile": ScanFallbackReason.INVALID_LOCKFILE,
     }.get(reason or "", ScanFallbackReason.INCOMPLETE_CLOSURE)

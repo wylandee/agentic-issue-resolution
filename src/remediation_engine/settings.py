@@ -23,6 +23,8 @@ class AppSettings:
     remedy_llm_model: str = "gpt-4o-mini"
     triage_llm_enabled: bool = False
     triage_llm_model: str = "gpt-4o-mini"
+    # Kept as a configuration compatibility field. The Supervisor route is
+    # deterministic and no longer reads this model setting.
     supervisor_llm_model: str = "gpt-4o-mini"
     update_llm_model: str = "gpt-4o-mini"
     workaround_llm_model: str = "gpt-4o-mini"

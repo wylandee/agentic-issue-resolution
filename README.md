@@ -11,13 +11,14 @@ python -m pip install -e ".[dev]"
 ```
 
 Docker is required for workspace isolation and QA. Set `OPENAI_API_KEY` before
-running an LLM-backed remediation. Copy `.env.example` to `.env` and adjust
-the scanner, model, tracing, and cache settings as needed.
+running an LLM-backed worker or triage step. Copy `.env.example` to `.env` and
+adjust the scanner, model, tracing, and cache settings as needed.
 
 `TRIAGE_LLM_MODEL` selects the triage model. `REMEDY_LLM_MODEL` remains the
 backward-compatible default for the remediation pipeline; optionally override
-individual remediation nodes with `SUPERVISOR_LLM_MODEL`, `UPDATE_LLM_MODEL`,
-`WORKAROUND_LLM_MODEL`, and `QA_LLM_MODEL`.
+the LLM-backed worker nodes with `UPDATE_LLM_MODEL`, `WORKAROUND_LLM_MODEL`,
+and `QA_LLM_MODEL`. `SUPERVISOR_LLM_MODEL` is still accepted for configuration
+compatibility, but Supervisor routing and retry planning are deterministic.
 
 ## CLI
 

@@ -546,8 +546,8 @@ def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():
 
     updated_task = result["task_queue"][task.task_id]
     diagnostics = result["retry_diagnostics_by_task"][task.task_id]
-    assert updated_task.strategy_stage == SCARemediationStage.NPM_SAME_MAJOR
-    assert diagnostics.strategy_stage == SCARemediationStage.NPM_SAME_MAJOR
+    assert updated_task.strategy_stage == SCARemediationStage.NPM_LATEST
+    assert diagnostics.strategy_stage == SCARemediationStage.NPM_LATEST
     assert diagnostics.security_floor == "4.17.21"
 
 

@@ -10,10 +10,7 @@ from remediation_engine.contracts import (
     FixPlanStatus,
     IssueSource,
     IssueType,
-    LLMAdvisory,
     NoFixMitigationStage,
-    PlannerAdvice,
-    PlannerBatchAdvice,
     RegistryCandidate,
     RemediationTask,
     RoutingStrategy,
@@ -28,12 +25,11 @@ from remediation_engine.contracts import (
     validate_transition,
 )
 from remediation_engine.orchestration.supervisor_node import (
+    _build_deterministic_retry_plan,
     _calculate_eligible_actions,
     _commit_task_transition,
-    _convert_planner_advice_to_retry_plan,
     _deterministic_routing,
     _emit_audit,
-    _merge_advisory,
     _no_fix_failure_transition,
     _select_deterministic_action,
     _task_sort_key,
@@ -262,24 +258,6 @@ def test_supervisor_router_recomputes_invalid_route():
     assert supervisor_router(state) == "update_subagent"
 
 
-def test_advisory_cannot_change_authoritative_routing():
-    group = _group("g")
-    deterministic = _route({"task-1": _task("task-1", "g")}, [group])
-    merged = _merge_advisory(
-        deterministic,
-        LLMAdvisory(
-            reasoning="advisory context",
-            feedback_by_task={"task-1": "retry with evidence", "other": "discard"},
-            new_constraints=["keep package pinned"],
-        ),
-    )
-    assert merged.next_node == deterministic.next_node
-    assert merged.target_task_ids == deterministic.target_task_ids
-    assert merged.decision_code == deterministic.decision_code
-    assert merged.feedback_by_task == {"task-1": "retry with evidence"}
-    assert merged.new_constraints == ["keep package pinned"]
-
-
 def test_version_policy_is_deterministic_and_skips_attempts():
     candidates = [
         RegistryCandidate(
@@ -313,7 +291,7 @@ def test_version_policy_is_deterministic_and_skips_attempts():
     assert is_version_space_exhausted(candidates, SCARemediationStage.CODE_WORKAROUND, set())
 
 
-def test_planner_advice_is_typed_and_stage_regression_is_blocked(monkeypatch):
+def test_deterministic_retry_planner_preserves_committed_stage(monkeypatch):
     group = _group("g")
     task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
         update={"strategy_stage": SCARemediationStage.NPM_LATEST}
@@ -333,19 +311,12 @@ def test_planner_advice_is_typed_and_stage_regression_is_blocked(monkeypatch):
         "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
         lambda *args, **kwargs: candidates,
     )
-    advice = PlannerAdvice(
-        task_id="task-1",
-        requested_stage=SCARemediationStage.OSV_MINIMUM,
-        reasoning="try the minimum safe stage",
-    )
-    batch = PlannerBatchAdvice(advice=[advice])
-    assert batch.advice[0].task_id == "task-1"
-    plan = _convert_planner_advice_to_retry_plan(advice, task, diagnostics, group)
+    plan = _build_deterministic_retry_plan(task, diagnostics, group)
     assert plan.strategy_stage == SCARemediationStage.NPM_LATEST
     assert plan.selected_version == "1.3.0"
 
 
-def test_planner_advice_exhaustion_pivots_to_workaround(monkeypatch):
+def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch):
     group = _group("g")
     task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
         update={"strategy_stage": SCARemediationStage.NPM_LATEST}
@@ -363,12 +334,7 @@ def test_planner_advice_exhaustion_pivots_to_workaround(monkeypatch):
         "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
         lambda *args, **kwargs: [candidate],
     )
-    plan = _convert_planner_advice_to_retry_plan(
-        PlannerAdvice(task_id="task-1", requested_stage=SCARemediationStage.NPM_LATEST),
-        task,
-        diagnostics,
-        group,
-    )
+    plan = _build_deterministic_retry_plan(task, diagnostics, group)
     assert plan.action == "pivot_workaround"
     assert plan.exhausted_update_path is True
     assert plan.selected_version is None

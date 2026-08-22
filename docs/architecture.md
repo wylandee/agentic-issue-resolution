@@ -15,11 +15,12 @@ scanner report -> ingest -> triage/group/enrich -> supervisor
                                         teardown -> report -> patch result
 ```
 
-The supervisor owns task planning, retry decisions, and the authoritative task
-and attempt snapshots. Workers execute only the committed instruction they are
-given. QA evaluates the shared workspace and feeds structured evidence back to
-the supervisor. Teardown computes the host-relative diff and removes the
-temporary Docker volume.
+The Supervisor owns task planning, retry decisions, registry-version selection,
+and the authoritative task and attempt snapshots. Its routing and retry
+guardrails are deterministic; no Supervisor LLM is required. Workers execute
+only the committed instruction they are given. QA evaluates the shared
+workspace and feeds structured evidence back to the Supervisor. Teardown
+computes the host-relative diff and removes the temporary Docker volume.
 
 The host repository is never edited by the public API or CLI. Results contain a
 unified diff and changed-file list so a caller can review and apply the patch

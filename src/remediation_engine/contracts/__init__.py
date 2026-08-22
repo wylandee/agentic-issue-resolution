@@ -6,8 +6,6 @@ through these models. Agents NEVER pass raw dicts across module boundaries.
 """
 
 from .decision_codes import VALID_TRANSITIONS, DecisionCode, validate_transition
-from .llm_advisory import LLMAdvisory
-from .planner_advice import PlannerAdvice, PlannerBatchAdvice
 from .schemas import (
     # Constants
     MAX_ANCESTRY_DEPTH,
@@ -156,12 +154,9 @@ __all__ = [
     # Task queue
     "TaskSpawnRequest",
     "RemediationTask",
-    "PlannerAdvice",
-    "PlannerBatchAdvice",
     "RegistryCandidate",
     "select_version",
     "is_version_space_exhausted",
-    "LLMAdvisory",
     "ReconciliationResult",
     "EligibleActions",
     "AuditRecord",

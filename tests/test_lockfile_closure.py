@@ -88,7 +88,7 @@ def test_missing_required_edge_is_incomplete() -> None:
     assert closure.fallback_reason == "incomplete_closure"
 
 
-def test_ambiguous_target_without_ancestry_fails_closed() -> None:
+def test_multiple_targets_without_ancestry_fails_closed() -> None:
     closure = resolve_dependency_closure(
         {
             "": {},
@@ -100,7 +100,21 @@ def test_ambiguous_target_without_ancestry_fails_closed() -> None:
     )
 
     assert not closure.complete
-    assert closure.fallback_reason == "ambiguous_target"
+    assert closure.fallback_reason == "multiple_targets"
+
+
+def test_no_matching_target_fails_closed() -> None:
+    closure = resolve_dependency_closure(
+        {
+            "": {},
+            "node_modules/a": {"version": "1.0.0"},
+        },
+        target_package="a",
+        target_version="2.0.0",
+    )
+
+    assert not closure.complete
+    assert closure.fallback_reason == "no_matching_target"
 
 
 def test_optional_missing_edge_is_omitted_but_required_edge_rejected_by_artifact() -> None:

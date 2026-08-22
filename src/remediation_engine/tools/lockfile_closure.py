@@ -168,7 +168,7 @@ def resolve_dependency_closure(
             nodes={},
             includes_optional=include_optional,
             includes_peer=include_peer,
-            reason="ambiguous_target",
+            reason="no_matching_target",
             lockfile_version=lockfile_version,
         )
 
@@ -191,7 +191,7 @@ def resolve_dependency_closure(
             nodes={},
             includes_optional=include_optional,
             includes_peer=include_peer,
-            reason="ambiguous_target",
+            reason="no_matching_target",
             lockfile_version=lockfile_version,
         )
 
@@ -227,7 +227,7 @@ def resolve_dependency_closure(
             nodes={},
             includes_optional=include_optional,
             includes_peer=include_peer,
-            reason="ambiguous_target",
+            reason="multiple_targets",
             lockfile_version=lockfile_version,
         )
 

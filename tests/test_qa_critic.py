@@ -39,6 +39,7 @@ import pytest
 from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
+    AgentActionStatus,
     BatchQAResult,
     CommandResult,
     FailureCategory,
@@ -52,10 +53,14 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     Severity,
+    TaskAttemptSnapshot,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
 from remediation_engine.orchestration.qa_critic import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
@@ -229,6 +234,69 @@ def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
     assert len(targets) == 1
     assert targets[0].target_package == "express-jwt"
     assert targets[0].expected_version is None
+
+
+def test_qa_target_uses_attempt_execution_version_when_task_selection_was_cleared() -> None:
+    """QA must not revert a successful update attempt to the original baseline version."""
+    group = _make_group(
+        group_id="sca:package.json:sanitize-html:version_bump",
+    ).model_copy(
+        update={
+            "vulnerable_component": "sanitize-html",
+            "versions": ["1.4.2"],
+            "dependency_versions": {"sanitize-html": "1.4.2"},
+            "file_path": "package.json",
+        }
+    )
+    instruction = "Update sanitize-html in package.json to exact version 2.17.7."
+    task = RemediationTask(
+        task_id="task-update",
+        parent_group_id=group.group_id,
+        strategy=RoutingStrategy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+        task_revision=3,
+        current_attempt_id="attempt-update",
+        selected_version=None,
+        instruction=instruction,
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-update",
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        strategy_stage=task.strategy_stage,
+        selected_version=None,
+        instruction=instruction,
+        instruction_digest="digest",
+        dispatch_node="update_subagent",
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.17.7"],
+        instruction_digest="digest",
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            executed_versions=["2.17.7"],
+            validation_passed=True,
+        ),
+    )
+
+    targets = _build_qa_scan_targets(
+        {
+            "active_target_task_ids": [task.task_id],
+            "task_queue": {task.task_id: task},
+            "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            "worker_results_by_attempt": {worker_result.attempt_id: worker_result},
+        },
+        [group],
+    )
+
+    assert targets is not None
+    assert targets[0].expected_version == "2.17.7"
 
 
 class TestRunInstall:

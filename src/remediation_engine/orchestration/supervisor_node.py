@@ -1,14 +1,11 @@
 """
 supervisor_node.py - Agentic Supervisor Node for Phase 5 hub-and-spoke orchestration.
 
-Phase 2 architecture: High-Level Commander
-------------------------------------------
-The Supervisor now acts as a high-level commander:
-
-  Router:
-    A zero-shot ``ChatOpenAI.with_structured_output(SupervisorDecision)`` call
-    that decides which worker should run next, whether retry instructions must
-    be refreshed, and whether a child task must be spawned for a strategy pivot.
+Phase 5 architecture: deterministic Supervisor
+-----------------------------------------------
+The Supervisor owns the state machine and produces every routing and retry
+decision in Python. Registry facts are inputs to the deterministic retry
+planner; they are never selected by a model or delegated to a worker.
 
   Guardrails (Python):
     Validate and apply the decision: reject unknown task IDs, clamp cardinality,
@@ -19,8 +16,6 @@ Public API
 ----------
 MAX_RETRIES : int
     Maximum number of QA-fail-retry cycles before a task is marked unfixable.
-build_supervisor_prompt(state) -> str
-    Builds the Router prompt text.
 run_supervisor_node(state) -> Dict[str, Any]
     LangGraph node callable.
 supervisor_router(state) -> str
@@ -37,14 +32,10 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from remediation_engine.contracts.decision_codes import (
     DecisionCode,
     validate_transition,
 )
-from remediation_engine.contracts.llm_advisory import LLMAdvisory
-from remediation_engine.contracts.planner_advice import PlannerAdvice, PlannerBatchAdvice
 from remediation_engine.contracts.schemas import (
     MAX_ANCESTRY_DEPTH,
     MAX_TASK_QUEUE_SIZE,
@@ -78,9 +69,8 @@ from remediation_engine.contracts.supervisor_phases import (
     ReconciliationResult,
 )
 from remediation_engine.contracts.version_policy import select_version
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
-from remediation_engine.orchestration.subagent_runtime import ToolEvent, run_bounded_subagent_loop
+from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _WORKABLE_STATUSES,
@@ -91,7 +81,6 @@ from remediation_engine.orchestration.supervisor_policy import (
     _next_sca_stage,
     _parent_status_for_strategy_pivot,
     _qa_ready_task_ids,
-    _selection_for_stage,
     _task_sort_key,
     _worker_node_for_strategy,
 )
@@ -105,11 +94,9 @@ from remediation_engine.orchestration.task_utils import (
     is_no_fix_group,
     is_transitive_group,
 )
-from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
-    plan_npm_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,12 +115,10 @@ _VALID_NEXT_NODES: set[str] = {
     "teardown",
 }
 _WORKER_NODES = frozenset({"update_subagent", "workaround_subagent", "qa_critic"})
-_DEFAULT_MODEL = "gpt-4o-mini"
-
-# Keep planner stage parsing and validation centralized.  The router prompt
-# uses the enum values, but planner scratchpads from older prompts commonly
-# use the shorter ``same_major`` spelling.  Accept that spelling explicitly;
-# do not let an unrecognised value silently become the task's current stage.
+# Keep legacy scratchpad stage parsing and validation centralized. Historical
+# planner evidence commonly uses the shorter ``same_major`` spelling. Accept
+# that spelling explicitly; do not let an unrecognised value silently become
+# the task's current stage.
 _PLANNER_STAGE_ALIASES: dict[str, SCARemediationStage] = {
     "osv": SCARemediationStage.OSV_MINIMUM,
     "minimum": SCARemediationStage.OSV_MINIMUM,
@@ -966,9 +951,9 @@ def _parse_planner_retry_plans(
         if selected and selected not in candidates:
             candidates.insert(0, selected)
 
-        # Keep the latest registry fact when the planner states it in its
-        # scratchpad.  This is audit evidence as well as a safe deterministic
-        # fallback if the LLM selects a version that has already been tried.
+        # Keep the latest registry fact when legacy scratchpad evidence states
+        # it. This is audit evidence as well as a safe deterministic fallback
+        # when a claimed version has already been tried.
         latest_seen = prior.latest_version_seen
         latest_matches = re.findall(
             r"(?:latest\s+(?:stable\s+)?version|latest\s+stable)\s*(?:is|=|:|\(|-)\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)",
@@ -1025,7 +1010,7 @@ def _parse_planner_retry_plans(
         ):
             effective_stage = SCARemediationStage.NPM_LATEST
 
-        # A planner's free-form pivot language cannot bypass the ordered
+        # Legacy free-form pivot language cannot bypass the ordered
         # version stages. Direct tasks pivot only after NPM_LATEST. A
         # transitive task converts parent exhaustion into PACKAGE_OVERRIDE.
         group = (group_by_id or {}).get(task.parent_group_id)
@@ -1124,9 +1109,9 @@ def _planner_plan_violations(
     task_queue: dict[str, RemediationTask],
     diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
 ) -> list[str]:
-    """Validate planner semantics before a plan can mutate routing state.
+    """Validate retry-plan semantics before a plan can mutate routing state.
 
-    The planner's prose is intentionally not treated as an authority.  These
+    Free-form plan evidence is intentionally not treated as an authority. These
     checks enforce the small set of invariants that must hold for an exact
     worker instruction to be safe.  Returning human-readable violations also
     makes the corrective replan visible in LangSmith through the supervisor's
@@ -1191,7 +1176,7 @@ def _planner_plan_violations(
             and _SCA_STAGE_ORDER[plan.strategy_stage] < _SCA_STAGE_ORDER[task.strategy_stage]
         ):
             violations.append(
-                f"task {task_id}: planner stage {plan.strategy_stage.value} regresses "
+                f"task {task_id}: retry plan stage {plan.strategy_stage.value} regresses "
                 f"from committed stage {task.strategy_stage.value}"
             )
         if (
@@ -1213,11 +1198,12 @@ def _reconcile_registry_plan_evidence(
     group_by_id: dict[str, VulnerabilityGroup],
     tool_events: list[ToolEvent],
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
-    """Replace free-form version claims with the planner tool's result.
+    """Reconcile legacy retry-plan evidence with registry-tool results.
 
-    The LLM still chooses which task/stage to reason about, but the version
-    itself must come from ``plan_npm_version``.  This keeps a plausible prose
-    hallucination from surviving merely because it matches the prompt.
+    Production retry planning is deterministic and does not call this helper.
+    It remains available to direct callers that still replay historical
+    scratchpad/tool-event evidence; registry output remains authoritative for
+    any version retained by that compatibility path.
     """
     if not tool_events:
         return diagnostics_by_task, plans
@@ -1470,7 +1456,18 @@ def _repair_invalid_planner_plans(
         # has already reached code_workaround.  Let the fail-closed branch
         # below create the deterministic latest-stage pivot instead.
         if not plan_regresses and plan.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-            for version in [plan.latest_version_seen, *plan.candidate_versions_considered]:
+            # At npm_latest, only the registry's declared latest version is
+            # safe to repair into a retry. Older candidates are already
+            # covered by the bounded update stages and selecting one here can
+            # produce a null/stale dispatch state after the guardrail clears
+            # the invalid plan. If latest was attempted, fail closed into the
+            # deterministic workaround pivot.
+            repair_candidates = (
+                [plan.latest_version_seen]
+                if plan.strategy_stage == SCARemediationStage.NPM_LATEST
+                else [plan.latest_version_seen, *plan.candidate_versions_considered]
+            )
+            for version in repair_candidates:
                 if version and version.strip().lstrip("vV").lower() not in attempted:
                     candidate = version.strip().lstrip("vV")
                     break
@@ -2179,7 +2176,7 @@ def _terminalize_pivot_parents(
         # the newly materialized child owns workaround execution.  Do not
         # leave the parent with a code-workaround stage and an old exact
         # dependency instruction; that contradictory combination is what made
-        # the router prompt in the trace authorize a stale update.
+        # a stale routing trace authorize a stale update.
         if (
             parent_task.strategy == RoutingStrategy.VERSION_BUMP
             and new_strategy == RoutingStrategy.CODE_WORKAROUND
@@ -2306,9 +2303,9 @@ def _deterministic_routing(
     final_full_scan_completed: bool = False,
 ) -> SupervisorDecision:
     """
-    Pure-Python fallback routing used when the LLM call fails.
+    Pure-Python routing used as the Supervisor's authoritative state machine.
 
-    Implements the same priority rules described in the supervisor prompt.
+    Implements the fixed Supervisor priority rules.
     """
     tasks = sorted(task_queue.values(), key=lambda task: _task_sort_key(task, group_by_id))
     non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
@@ -2387,7 +2384,8 @@ def _deterministic_routing(
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
 
     # NO_FIX is a deterministic same-task state machine.  Keep it ahead of
-    # generic workaround routing so the LLM cannot skip a mitigation stage or
+    # generic workaround routing so an untrusted decision cannot skip a
+    # mitigation stage or
     # let MAX_RETRIES terminate the lifecycle early.
     no_fix_workable = sorted(
         [
@@ -2876,171 +2874,185 @@ def _no_fix_decision_requires_fallback(
     return any(request.parent_task_id == expected_task_id for request in decision.spawn_requests)
 
 
-def _should_invoke_llm(decision: SupervisorDecision) -> bool:
-    """Return whether advisory enrichment is useful for ``decision``."""
-
-    return decision.decision_code not in {
-        DecisionCode.NO_ACTIONABLE_TASKS,
-        DecisionCode.NO_VALID_GROUPS,
-    }
-
-
-def _build_advisory_prompt(
-    state: OrchestratorState,
-    deterministic_decision: SupervisorDecision,
-) -> str:
-    """Build a prompt that requests explanation and feedback only."""
-
-    targets = ", ".join(deterministic_decision.target_task_ids) or "none"
-    return "\n".join(
-        [
-            "You are an advisory reviewer for an AppSec remediation supervisor.",
-            "Python has already selected the route and task targets below.",
-            "Do not propose routing, status, version, or spawn mutations.",
-            "Return only human-readable reasoning, per-task feedback, and new constraints.",
-            f"Decision code: {deterministic_decision.decision_code or 'unknown'}",
-            f"Next node (read-only): {deterministic_decision.next_node}",
-            f"Target task IDs (read-only): {targets}",
-            f"Supervisor state status: {state.get('status', '')}",
-        ]
-    )
-
-
-def _invoke_llm_advisory(
-    state: OrchestratorState,
-    deterministic_decision: SupervisorDecision,
-    *,
-    model: str = _DEFAULT_MODEL,
-) -> LLMAdvisory | None:
-    """Optionally obtain advisory text without affecting deterministic state."""
-
-    if not _should_invoke_llm(deterministic_decision):
-        return None
-    try:
-        from langchain_openai import ChatOpenAI  # type: ignore[import]
-
-        advisory_llm = ChatOpenAI(model=model, temperature=0.0)
-        structured = advisory_llm.with_structured_output(
-            LLMAdvisory,
-            method="function_calling",
-        )
-        prompt = _build_advisory_prompt(state, deterministic_decision)
-        result = invoke_with_trajectory(
-            "supervisor.advisory",
-            lambda: structured.invoke(prompt),
-            prompt,
-        )
-        if isinstance(result, LLMAdvisory):
-            return result
-        return LLMAdvisory.model_validate(result)
-    except Exception as exc:  # noqa: BLE001
-        logger.info("supervisor: advisory call failed (%s); continuing deterministically.", exc)
-        return None
-
-
-def _merge_advisory(
-    deterministic_decision: SupervisorDecision,
-    advisory: LLMAdvisory | SupervisorDecision | None,
-    *,
-    existing_constraints: list[str] | None = None,
-) -> SupervisorDecision:
-    """Merge advisory prose while preserving every Python-owned field.
-
-    ``SupervisorDecision`` is accepted for Phase 1 compatibility with older
-    structured router responses.  Its routing and mutation fields are ignored.
-    """
-
-    if advisory is None:
-        return deterministic_decision
-
-    if isinstance(advisory, LLMAdvisory):
-        reasoning = advisory.reasoning
-        feedback = advisory.feedback_by_task
-        constraints = advisory.new_constraints
-    else:
-        reasoning = advisory.decision_reason
-        feedback = advisory.feedback_by_task
-        constraints = advisory.new_constraints
-
-    target_ids = set(deterministic_decision.target_task_ids)
-    merged_feedback = {
-        task_id: text.strip()
-        for task_id, text in deterministic_decision.feedback_by_task.items()
-        if task_id in target_ids and isinstance(text, str) and text.strip()
-    }
-    for task_id, text in feedback.items():
-        if task_id in target_ids and isinstance(text, str) and text.strip():
-            merged_feedback[task_id] = text.strip()
-    existing = set(existing_constraints or [])
-    merged_constraints = list(deterministic_decision.new_constraints)
-    for constraint in constraints:
-        if not isinstance(constraint, str):
-            continue
-        cleaned = constraint.strip()
-        if cleaned and cleaned not in existing and cleaned not in merged_constraints:
-            merged_constraints.append(cleaned)
-
-    return deterministic_decision.model_copy(
-        update={
-            "decision_reason": reasoning.strip() or deterministic_decision.decision_reason,
-            "instructions": (
-                (
-                    advisory.instructions.strip()
-                    if isinstance(advisory, SupervisorDecision)
-                    else reasoning.strip()
-                )
-                or deterministic_decision.instructions
-            ),
-            "feedback_by_task": merged_feedback,
-            "new_constraints": merged_constraints,
-        }
-    )
-
-
 # ---------------------------------------------------------------------------
 # Planner phase helpers
 # ---------------------------------------------------------------------------
 
 
-def _convert_planner_advice_to_retry_plan(
-    advice: PlannerAdvice,
+def _registry_report_value(report: str, label: str) -> str | None:
+    """Extract one normalized value from a deterministic registry-tool report."""
+    match = re.search(
+        rf"^-\s*{re.escape(label)}:\s*(\S+)",
+        report or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if not match or match.group(1).upper() == "NONE":
+        return None
+    return match.group(1).strip().lstrip("vV")
+
+
+def _registry_report_versions(report: str, label: str) -> list[str]:
+    """Extract a comma-separated version list from a registry-tool report."""
+    match = re.search(
+        rf"^-\s*{re.escape(label)}:\s*(.*)$",
+        report or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if not match:
+        return []
+    return list(
+        dict.fromkeys(
+            version.strip().lstrip("vV")
+            for version in match.group(1).split(",")
+            if version.strip() and version.strip().upper() != "NONE"
+        )
+    )
+
+
+def _build_deterministic_retry_plan(
     task: RemediationTask,
     diagnostics: UpdateRetryDiagnostics,
     group: VulnerabilityGroup | None,
+    *,
+    requested_stage: SCARemediationStage | None = None,
 ) -> SupervisorRetryPlan:
-    """Convert advisory stage selection into a Python-owned retry plan.
+    """Build an exact retry plan from committed state and registry facts.
 
-    Stage progression, registry lookup, version choice, exhaustion detection,
-    and worker instructions all remain deterministic.  Planner reasoning is
-    intentionally not embedded into the worker instruction.
+    The task's committed stage is authoritative for this pass. A later
+    Supervisor pass may advance the stage after QA evidence; this function
+    never skips an empty stage, regresses, reuses an attempted version, or
+    turns an exhausted update path back into an update retry.
     """
-
-    requested_order = _SCA_STAGE_ORDER.get(advice.requested_stage, 99)
+    requested = requested_stage or task.strategy_stage
+    requested_order = _SCA_STAGE_ORDER.get(requested, 99)
     current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
-    effective_stage = (
-        advice.requested_stage if requested_order >= current_order else task.strategy_stage
-    )
+    effective_stage = requested if requested_order >= current_order else task.strategy_stage
     attempted = set(diagnostics.attempted_versions)
     security_floor = group.fix_plan.fixed_version if group and group.fix_plan else None
-    candidates = []
+    transitive = bool(group and is_transitive_group(group))
+    candidate_versions: list[str] = []
+    latest_version_seen: str | None = None
     selected_version: str | None = None
-    if security_floor and effective_stage != SCARemediationStage.CODE_WORKAROUND:
-        candidates = fetch_registry_candidates(
-            group.vulnerable_component or "",
-            security_floor,
-            attempted,
-        )
-        selected_version = select_version(candidates, effective_stage, attempted)
+    failure_reason = ""
+    parent_minimum_version = task.parent_minimum_version
+    target_package_name = task.target_package_name
+    target_dependency_type = task.target_dependency_type
 
-    exhausted = effective_stage != SCARemediationStage.CODE_WORKAROUND and selected_version is None
-    effective_task = task.model_copy(update={"strategy_stage": effective_stage})
-    effective_diagnostics = diagnostics.model_copy(
+    if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        selected_version = security_floor
+        if group is not None:
+            target_package_name = group.vulnerable_component
+            target_dependency_type = _override_dependency_type(group)
+    elif effective_stage != SCARemediationStage.CODE_WORKAROUND and security_floor:
+        # The QA transition already advances the committed stage one step.
+        # Plan only that stage here; an empty candidate set must not silently
+        # skip ahead to a later stage in the same Supervisor pass.
+        stages = [effective_stage]
+        if transitive:
+            parent_name, parent_version, parent_type = group_parent_context(group)
+            target_package_name = target_package_name or parent_name
+            target_dependency_type = target_dependency_type or parent_type
+            if not parent_name or not parent_version or not group.vulnerable_component:
+                failure_reason = "Missing parent context for deterministic transitive planning."
+            else:
+                for stage in stages:
+                    selection = {
+                        SCARemediationStage.OSV_MINIMUM: "minimum",
+                        SCARemediationStage.NPM_SAME_MAJOR: "same_major",
+                        SCARemediationStage.NPM_LATEST: "latest",
+                    }[stage]
+                    try:
+                        report = plan_npm_parent_version.invoke(
+                            {
+                                "parent_package_name": parent_name,
+                                "child_package_name": group.vulnerable_component,
+                                "child_fixed_version": security_floor,
+                                "installed_parent_version": parent_version,
+                                "selection": selection,
+                                "attempted_versions": ",".join(sorted(attempted)),
+                                "dependency_ancestry": ",".join(group.dependency_ancestry),
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        failure_reason = f"Deterministic parent registry planning failed: {exc}"
+                        continue
+                    report_candidates = _registry_report_versions(
+                        report, "Eligible Candidates"
+                    ) or _registry_report_versions(report, "Compatible Parent Versions")
+                    candidate_versions = list(
+                        dict.fromkeys([*candidate_versions, *report_candidates])
+                    )
+                    latest_version_seen = (
+                        _registry_report_value(report, "Latest Compatible")
+                        or _registry_report_value(report, "Latest Stable")
+                        or latest_version_seen
+                    )
+                    selected = _registry_selected_version(report)
+                    if selected:
+                        selected_version = selected
+                        effective_stage = stage
+                        if stage == SCARemediationStage.OSV_MINIMUM:
+                            parent_minimum_version = selected
+                        break
+        else:
+            try:
+                candidates = fetch_registry_candidates(
+                    group.vulnerable_component or "",
+                    security_floor,
+                    attempted,
+                )
+                candidate_versions = [candidate.version for candidate in candidates[:30]]
+                latest_version_seen = candidates[-1].version if candidates else None
+                for stage in stages:
+                    selected = select_version(candidates, stage, attempted)
+                    if selected:
+                        selected_version = selected
+                        effective_stage = stage
+                        break
+            except Exception as exc:  # noqa: BLE001
+                failure_reason = f"Deterministic registry planning failed: {exc}"
+    elif effective_stage != SCARemediationStage.CODE_WORKAROUND:
+        failure_reason = "No security floor is available for deterministic version selection."
+
+    if selected_version is None and effective_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        if transitive and security_floor and effective_stage == SCARemediationStage.NPM_LATEST:
+            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
+            selected_version = security_floor
+            target_package_name = group.vulnerable_component if group else task.parent_group_id
+            target_dependency_type = _override_dependency_type(group)
+            failure_reason = "Parent update stages are exhausted; entering package override."
+        elif effective_stage == SCARemediationStage.NPM_LATEST:
+            effective_stage = SCARemediationStage.NPM_LATEST
+            target_package_name = target_package_name or task.target_package_name
+
+    exhausted = selected_version is None and effective_stage == SCARemediationStage.NPM_LATEST
+    effective_task = task.model_copy(
         update={
             "strategy_stage": effective_stage,
             "selected_version": selected_version,
-            "candidate_versions_considered": [candidate.version for candidate in candidates[:30]],
-            "latest_version_seen": candidates[-1].version if candidates else None,
+            "target_package_name": target_package_name,
+            "target_dependency_type": target_dependency_type,
+            "parent_minimum_version": parent_minimum_version,
+        }
+    )
+    safe_candidate_versions = candidate_versions[:30] if selected_version or exhausted else []
+    safe_latest_version = latest_version_seen if selected_version or exhausted else None
+    effective_diagnostics = diagnostics.model_copy(
+        update={
+            "strategy_stage": effective_stage,
+            "security_floor": security_floor or diagnostics.security_floor,
+            "selected_version": selected_version,
+            "candidate_versions_considered": safe_candidate_versions,
+            "latest_version_seen": safe_latest_version,
+            "registry_query_performed": bool(security_floor),
             "exhausted_update_path": exhausted,
+            "target_package_name": target_package_name,
+            "target_dependency_type": target_dependency_type,
+            "parent_package_name": (
+                group.parent_package_name if group is not None else diagnostics.parent_package_name
+            ),
+            "parent_minimum_version": parent_minimum_version,
+            "failure_reason": failure_reason,
         }
     )
     if exhausted:
@@ -3057,14 +3069,18 @@ def _convert_planner_advice_to_retry_plan(
             effective_diagnostics,
         )
     return SupervisorRetryPlan(
-        task_id=advice.task_id,
+        task_id=task.task_id,
         source_task_revision=task.task_revision,
         strategy_stage=effective_stage,
         selected_version=selected_version,
         attempted_versions=list(diagnostics.attempted_versions),
-        candidate_versions_considered=[candidate.version for candidate in candidates[:30]],
-        latest_version_seen=candidates[-1].version if candidates else None,
+        candidate_versions_considered=safe_candidate_versions,
+        latest_version_seen=safe_latest_version,
         exhausted_update_path=exhausted,
+        package_abandoned=diagnostics.package_abandoned,
+        target_package_name=target_package_name,
+        target_dependency_type=target_dependency_type,
+        parent_minimum_version=parent_minimum_version,
         action="pivot_workaround" if exhausted else "retry_update",
         exact_instruction=instruction,
     )
@@ -3076,9 +3092,9 @@ def _needs_planner(
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     current_status: str,
 ) -> bool:
-    """Return True when the planner should be invoked.
+    """Return True when deterministic retry planning should run.
 
-    The planner is reserved for VERSION_BUMP retry analysis and playbook selection.
+    Retry planning is reserved for VERSION_BUMP retry analysis and playbook selection.
     CODE_WORKAROUND tasks do not use the npm version planner.
     """
     version_bump_retries = [
@@ -3114,554 +3130,156 @@ def _needs_planner(
     )
 
 
-def _build_planner_prompt(
+def _run_deterministic_retry_planner(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
-    qa_evaluations: dict[str, QAEvaluation],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    action_summaries: list[AgentActionSummary],
-    constraints_ledger: list[str],
-    correction: str = "",
-) -> str:
-    """Build the planner system + user messages."""
-    lines = [
-        "You are the Planner phase of an AppSec remediation Supervisor.",
-        "You own exact version planning for retry tasks.",
-        "For direct dependencies the ordered strategy is OSV minimum, highest stable same-major release, highest stable released version, then code workaround.",
-        "For transitive dependencies, plan the nearest directly declared parent first: parent OSV-compatible minimum, parent same-major latest, parent latest compatible stable, then package-manager override, then code workaround.",
-        "The Update Subagent is a dumb worker and must receive an exact version instruction from you.",
-        "",
-        "Call plan_npm_version for direct NPM retry stages. For transitive parent stages call plan_npm_parent_version with the parent, child, complete dependency ancestry, child OSV-fixed version, installed parent version, and selection. Never delegate registry lookup or version choice to the worker.",
-        "Respect the OSV security floor and exclude already attempted versions, even when an attempted version is the security floor.",
-        "",
-        "## Actionable Retry Tasks",
-        "Write Strategy Scratchpad sections only for these NEEDS_RETRY tasks.",
-    ]
-
-    active_tasks = {
-        tid: t
-        for tid, t in task_queue.items()
-        if t.status in [TaskStatus.PENDING, TaskStatus.NEEDS_RETRY, TaskStatus.OPTIMISTICALLY_FIXED]
-    }
-
-    actionable_retry_tasks = [
-        task for task in active_tasks.values() if task.status == TaskStatus.NEEDS_RETRY
-    ]
-
-    for task in actionable_retry_tasks:
-        group = group_by_id.get(task.parent_group_id)
-        cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
-        ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
-        component = group.vulnerable_component if group else task.parent_group_id
-        parent_name, parent_version, _ = (
-            group_parent_context(group) if group is not None else (None, None, None)
-        )
-        eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
-        diagnostics = retry_diagnostics_by_task.get(task.task_id)
-
-        lines += [
-            "",
-            f"### Task: {task.task_id}",
-            f"- Component     : {component}",
-            f"- Edit Target   : {task.target_package_name or component}",
-            f"- Parent Target : {parent_name or 'none'}",
-            f"- Installed Parent: {parent_version or task.parent_package_version or 'unknown'}",
-            f"- Dependency Ancestry: {' -> '.join(group.dependency_ancestry) if group and group.dependency_ancestry else 'unknown'}",
-            f"- CVEs          : {cves}",
-            f"- GHSAs         : {ghsas}",
-            f"- Strategy      : {task.strategy.value}",
-            f"- QA Policy     : {task.qa_policy.value if task.qa_policy else 'MISSING_POLICY_PROVENANCE'}",
-            f"- Strategy Stage: {task.strategy_stage.value}",
-            f"- NPM Selection : {_selection_for_stage(task.strategy_stage) or 'none'}",
-            f"- Status        : {task.status.value}",
-            f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
-            f"- Ancestry Depth: {task.ancestry_depth}/{MAX_ANCESTRY_DEPTH}",
-            f"- Current Instr : {task.instruction or '(none)'}",
-        ]
-        if eval_ and task.status == TaskStatus.NEEDS_RETRY:
-            cat = eval_.failure_category.value if eval_.failure_category else "none"
-            lines += [
-                f"- Last QA Failed: category={cat}",
-                f"  Feedback: {eval_.retry_feedback}",
-            ]
-        diagnostics = retry_diagnostics_by_task.get(task.task_id)
-        if diagnostics is not None:
-            attempted = ", ".join(diagnostics.attempted_versions) or "none"
-            candidates = ", ".join(diagnostics.candidate_versions_considered[:10]) or "none"
-            lines += [
-                f"- Retry Diags  : registry={diagnostics.registry_query_performed}, exhausted={diagnostics.exhausted_update_path}, abandoned={diagnostics.package_abandoned}",
-                f"  Attempted: {attempted}",
-                f"  Candidates: {candidates}",
-                f"  Latest Seen: {diagnostics.latest_version_seen or 'unknown'}",
-                f"  Failure Reason: {diagnostics.failure_reason or 'none'}",
-            ]
-
-    if not actionable_retry_tasks:
-        lines.append("- (none)")
-
-    terminal_tasks = sorted(
-        [task for task in active_tasks.values() if task.status in _TERMINAL_STATUSES],
-        key=lambda item: _task_sort_key(item, group_by_id),
-    )
-    qa_ready_tasks = sorted(
-        [task for task in active_tasks.values() if task.status == TaskStatus.OPTIMISTICALLY_FIXED],
-        key=lambda item: _task_sort_key(item, group_by_id),
-    )
-
-    lines += [
-        "",
-        "## QA-Ready Tasks (read-only for planner)",
-        "These tasks must go to QA before retry planning. Do not recommend retries, pivots, or spawn_requests for them.",
-    ]
-    if qa_ready_tasks:
-        for task in qa_ready_tasks:
-            group = group_by_id.get(task.parent_group_id)
-            component = group.vulnerable_component if group else task.parent_group_id
-            lines.append(f"- {task.task_id}: {component} ({task.status.value})")
-    else:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        "## Terminal History (read-only for planner)",
-        "These tasks are audit/history only. Do not recommend retries, pivots, spawn_requests, revised instructions, or routing for them.",
-    ]
-    if terminal_tasks:
-        for task in terminal_tasks:
-            group = group_by_id.get(task.parent_group_id)
-            component = group.vulnerable_component if group else task.parent_group_id
-            lines.append(f"- {task.task_id}: {component} ({task.status.value})")
-    else:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        "## Constraints Ledger (must not violate these)",
-    ]
-    if constraints_ledger:
-        lines.extend(f"- {c}" for c in constraints_ledger)
-    else:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        "## Recent Action Summaries",
-    ]
-    for summary in _current_action_summaries(action_summaries, task_queue, 6):
-        lines.append(f"- [{summary.task_id}] {summary.status.value}: {summary.summary}")
-    if not action_summaries:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        "## Planner Playbooks",
-        "- SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance exactly one ordered version stage (VERSION_BUMP tasks only; CODE_WORKAROUND tasks simply retry).",
-        "- package_abandoned=True: direct tasks pivot from VERSION_BUMP to a CODE_WORKAROUND child task; transitive tasks first enter PACKAGE_OVERRIDE.",
-        "- exhausted_update_path=True: direct tasks pivot from VERSION_BUMP to a CODE_WORKAROUND child task; transitive parent exhaustion first enters PACKAGE_OVERRIDE.",
-        "- VERSION_BUMP + NEEDS_RETRY + exhausted_update_path=True must not be routed back to update_subagent unless the committed stage is PACKAGE_OVERRIDE.",
-        "- A strategy pivot must be expressed as a child-task recommendation, not as an in-place worker retry.",
-        "",
-        "## Queue Caps",
-        f"- MAX_TASK_QUEUE_SIZE = {MAX_TASK_QUEUE_SIZE} (current: {len(task_queue)})",
-        f"- MAX_ANCESTRY_DEPTH = {MAX_ANCESTRY_DEPTH}",
-        "",
-        "## Output Format",
-        "Write a 'Strategy Scratchpad' with these sections for each actionable retry task only:",
-        "  1. Observations",
-        "  2. Playbook selected",
-        "  3. Update-path assessment",
-        "  4. Exact selected version and manifest instruction",
-        "  5. Strategy pivot recommendation (same-task retry or workaround child)",
-        "  6. Routing notes",
-        "",
-        "Use exact version pins in the planner output. Format each result with TASK: <task-id>, SELECTED_VERSION: <version|NONE>, EFFECTIVE_STAGE: <stage>, and ACTION: <retry_update|pivot_workaround>.",
-        "When the same-major latest equals the latest stable version, skip the duplicate same-major stage. Select the latest version only if it is unattempted; if it is already attempted, emit SELECTED_VERSION: NONE, EFFECTIVE_STAGE: npm_latest, and ACTION: pivot_workaround.",
-    ]
-
-    if correction:
-        lines += [
-            "",
-            "## Previous Planner Output Rejected",
-            "The following deterministic planner invariants were violated:",
-            *[f"- {violation}" for violation in correction.splitlines() if violation.strip()],
-            "Correct only the affected task sections. Re-call the appropriate registry planner with the complete attempted-version list.",
-            "Never select an attempted version. A retry_update must contain one unattempted exact version. A latest-stage direct task with no unattempted candidate must use ACTION: pivot_workaround; a transitive task must use PACKAGE_OVERRIDE first.",
-        ]
-
-    return "\n".join(lines)
-
-
-def _run_structured_planner_phase(
-    task_queue: dict[str, RemediationTask],
-    group_by_id: dict[str, VulnerabilityGroup],
-    qa_evaluations: dict[str, QAEvaluation],
-    diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    *,
-    model: str = _DEFAULT_MODEL,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
-    """Run the typed planner and convert advice into deterministic plans.
-
-    Registry candidates are fetched before the model call and shown as facts
-    in the prompt.  The model can recommend only a stage; version selection is
-    performed by :func:`_convert_planner_advice_to_retry_plan`.
-    """
-    from langchain_openai import ChatOpenAI  # type: ignore[import]
-
+    """Plan every actionable retry from task state and deterministic registry facts."""
+    updated_diagnostics = dict(retry_diagnostics_by_task)
+    plans: dict[str, SupervisorRetryPlan] = {}
     retry_tasks = sorted(
         (
             task
             for task in task_queue.values()
             if task.status == TaskStatus.NEEDS_RETRY
             and task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.strategy_stage
+            in {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.NPM_SAME_MAJOR,
+                SCARemediationStage.NPM_LATEST,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
         ),
         key=lambda task: _task_sort_key(task, group_by_id),
     )
-    lines = [
-        "You are the typed planner for dependency remediation retries.",
-        "Return PlannerBatchAdvice. Recommend requested_stage and explain reasoning.",
-        "Python owns exact versions, retry counts, transitions, and workaround pivots.",
-    ]
-    registry_facts: dict[str, list[str]] = {}
     for task in retry_tasks:
-        group = group_by_id.get(task.parent_group_id)
-        floor = group.fix_plan.fixed_version if group and group.fix_plan else None
-        candidates = []
-        if floor and group and group.vulnerable_component:
-            try:
-                candidates = fetch_registry_candidates(
-                    group.vulnerable_component,
-                    floor,
-                    set(
-                        diagnostics_by_task.get(
-                            task.task_id, UpdateRetryDiagnostics(task_id=task.task_id)
-                        ).attempted_versions
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.info(
-                    "supervisor planner: registry facts unavailable for %s: %s", task.task_id, exc
-                )
-        registry_facts[task.task_id] = [candidate.version for candidate in candidates[:30]]
-        evaluation = qa_evaluations.get(task.task_id)
-        lines.extend(
-            [
-                f"Task {task.task_id}: current_stage={task.strategy_stage.value};",
-                f"  QA feedback: {evaluation.retry_feedback if evaluation else 'none'}",
-                f"  Registry candidates: {', '.join(registry_facts[task.task_id]) or 'none'}",
-            ]
-        )
-
-    prompt = "\n".join(lines)
-    planner_llm = ChatOpenAI(model=model, temperature=0.0)
-    structured = planner_llm.with_structured_output(
-        PlannerBatchAdvice,
-        method="function_calling",
-    )
-    batch = invoke_with_trajectory(
-        "supervisor.planner",
-        lambda: structured.invoke(prompt),
-        prompt,
-    )
-    if not isinstance(batch, PlannerBatchAdvice):
-        batch = PlannerBatchAdvice.model_validate(batch)
-
-    updated_diagnostics = dict(diagnostics_by_task)
-    plans: dict[str, SupervisorRetryPlan] = {}
-    for advice in sorted(batch.advice, key=lambda item: item.task_id):
-        task = task_queue.get(advice.task_id)
-        if task is None:
-            continue
         diagnostics = updated_diagnostics.get(
-            advice.task_id,
-            UpdateRetryDiagnostics(task_id=advice.task_id),
+            task.task_id,
+            UpdateRetryDiagnostics(task_id=task.task_id, strategy_stage=task.strategy_stage),
         )
+        # The deterministic router owns the exhausted-update pivot. Never
+        # reopen a path that its guardrail has already proven exhausted.
+        if _is_exhausted_update_pivot_candidate(task, diagnostics):
+            continue
         group = group_by_id.get(task.parent_group_id)
-        plan = _convert_planner_advice_to_retry_plan(advice, task, diagnostics, group)
-        plans[advice.task_id] = plan
-        updated_diagnostics[advice.task_id] = diagnostics.model_copy(
+        plan = _build_deterministic_retry_plan(task, diagnostics, group)
+        # An empty stage is deterministic evidence to advance to the next
+        # bounded stage, not a request for the worker to inspect the registry.
+        # Keep the worker execution-only: every update dispatch must end with
+        # an exact unattempted version, or with the terminal update pivot.
+        while plan.selected_version is None and not plan.exhausted_update_path:
+            transitive = bool(group and is_transitive_group(group))
+            next_stage = _next_sca_stage(plan.strategy_stage, transitive=transitive)
+            if next_stage == SCARemediationStage.CODE_WORKAROUND:
+                break
+            if _SCA_STAGE_ORDER.get(next_stage, 99) <= _SCA_STAGE_ORDER.get(
+                plan.strategy_stage, 99
+            ):
+                break
+            plan = _build_deterministic_retry_plan(
+                task,
+                diagnostics,
+                group,
+                requested_stage=next_stage,
+            )
+
+        if plan.selected_version is None and not plan.exhausted_update_path:
+            # This is a malformed or incomplete registry state (for example a
+            # package-override stage without a security floor). Never preserve
+            # it as retry_update: commit the same fail-closed latest-stage
+            # pivot used by the deterministic guardrail.
+            component = group.vulnerable_component if group else task.parent_group_id
+            plan = plan.model_copy(
+                update={
+                    "strategy_stage": SCARemediationStage.NPM_LATEST,
+                    "selected_version": None,
+                    "exhausted_update_path": True,
+                    "action": "pivot_workaround",
+                    "exact_instruction": (
+                        f"Implement a code workaround or isolation strategy for {component} "
+                        "because the manifest-based update path is exhausted."
+                    ),
+                }
+            )
+        plans[task.task_id] = plan
+        updated_diagnostics[task.task_id] = diagnostics.model_copy(
             update={
                 "strategy_stage": plan.strategy_stage,
+                "security_floor": diagnostics.security_floor
+                or (
+                    group_by_id[task.parent_group_id].fix_plan.fixed_version
+                    if task.parent_group_id in group_by_id
+                    and group_by_id[task.parent_group_id].fix_plan is not None
+                    else None
+                ),
                 "selected_version": plan.selected_version,
                 "candidate_versions_considered": plan.candidate_versions_considered,
                 "latest_version_seen": plan.latest_version_seen,
+                "registry_query_performed": bool(
+                    group_by_id.get(task.parent_group_id)
+                    and group_by_id[task.parent_group_id].fix_plan
+                    and group_by_id[task.parent_group_id].fix_plan.fixed_version
+                ),
                 "exhausted_update_path": plan.exhausted_update_path,
+                "target_package_name": plan.target_package_name,
+                "target_dependency_type": plan.target_dependency_type,
+                "parent_minimum_version": plan.parent_minimum_version,
             }
         )
     return updated_diagnostics, plans
 
 
-def _run_planner_phase(
+def _commit_retry_plans(
     task_queue: dict[str, RemediationTask],
-    group_by_id: dict[str, VulnerabilityGroup],
-    qa_evaluations: dict[str, QAEvaluation],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    action_summaries: list[AgentActionSummary],
-    constraints_ledger: list[str],
-    llm: Any,
-    correction: str = "",
-    return_tool_events: bool = False,
-) -> Any:
-    """Run the typed planner with a legacy scratchpad fallback.
-
-    The structured path is the normal Phase 2 path.  The scratchpad loop is
-    retained only for integrations that provide an older test double or model
-    adapter which cannot produce ``PlannerBatchAdvice`` yet.
-    """
-    try:
-        if not correction:
-            planner_model = getattr(llm, "model_name", _DEFAULT_MODEL)
-            if not isinstance(planner_model, str) or not planner_model.strip():
-                planner_model = _DEFAULT_MODEL
-            diagnostics, plans = _run_structured_planner_phase(
-                task_queue,
-                group_by_id,
-                qa_evaluations,
-                retry_diagnostics_by_task,
-                model=planner_model,
-            )
-            if return_tool_events:
-                return diagnostics, plans, []
-            return diagnostics, plans
-    except Exception as exc:  # noqa: BLE001
-        logger.info(
-            "supervisor planner: typed path unavailable (%s); using compatibility path.", exc
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    plans: dict[str, SupervisorRetryPlan],
+) -> None:
+    """Commit deterministic retry inputs before the next worker dispatch."""
+    for task_id, plan in sorted(plans.items()):
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        committed_task = _commit_task_transition(
+            task_queue,
+            task_id,
+            updates={
+                "strategy_stage": plan.strategy_stage,
+                "instruction": plan.exact_instruction,
+                "selected_version": plan.selected_version,
+                "exhausted_update_path": plan.exhausted_update_path,
+                "target_package_name": plan.target_package_name or task.target_package_name,
+                "target_dependency_type": plan.target_dependency_type
+                or task.target_dependency_type,
+                "parent_minimum_version": plan.parent_minimum_version
+                or task.parent_minimum_version,
+            },
+            close_attempt=True,
+            clear_selected_version=plan.selected_version is None,
         )
-
-    planner_prompt = _build_planner_prompt(
-        task_queue,
-        group_by_id,
-        qa_evaluations,
-        retry_diagnostics_by_task,
-        action_summaries,
-        constraints_ledger,
-        correction=correction,
-    )
-    tools = [plan_npm_version, plan_npm_parent_version]
-    initial_messages = [
-        SystemMessage(content=planner_prompt),
-        HumanMessage(
-            content=(
-                "Plan every retry task. For direct NPM stages call plan_npm_version; for transitive "
-                "parent stages call plan_npm_parent_version. Include the package/parent, complete dependency "
-                "ancestry, child OSV-fixed version or security floor, stage selection, and attempted versions. Emit TASK and "
-                "SELECTED_VERSION lines before the Strategy Scratchpad."
-                + (" Apply the previous-output correction rules exactly." if correction else "")
-            )
-        ),
-    ]
-    try:
-        result = run_bounded_subagent_loop(
-            llm=llm,
-            tools=tools,
-            initial_messages=initial_messages,
-            touched_files=set(),
-        )
-        scratchpad = result.final_text.strip()
-        if scratchpad.startswith("<MagicMock"):
-            scratchpad = ""
-        if result.errors:
-            logger.warning("supervisor planner: %d error(s): %s", len(result.errors), result.errors)
-        scratchpad = scratchpad or "(Planner produced no output.)"
-        if return_tool_events:
-            return scratchpad, list(result.tool_events)
-        return scratchpad
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("supervisor planner: loop failed (%s) â€” skipping planner.", exc)
-        scratchpad = f"(Planner failed: {exc})"
-        if return_tool_events:
-            return scratchpad, []
-        return scratchpad
-
-
-# ---------------------------------------------------------------------------
-# Router prompt builder
-# ---------------------------------------------------------------------------
-
-
-def build_supervisor_prompt(state: OrchestratorState, scratchpad: str = "") -> str:
-    """Build the structured Router LLM prompt for the Supervisor decision."""
-    valid_groups: list[VulnerabilityGroup] = state.get("valid_groups", [])
-    task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
-    constraints_ledger: list[str] = state.get("constraints_ledger", [])
-    action_summaries: list[AgentActionSummary] = state.get("action_summaries", [])
-    qa_evaluations: dict[str, QAEvaluation] = state.get("qa_evaluations", {})
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = state.get(
-        "retry_diagnostics_by_task", {}
-    )
-    retry_plans_by_task: dict[str, SupervisorRetryPlan] = state.get("retry_plans_by_task", {})
-    eval_status: str = state.get("eval_status", "")
-    baseline_scan_identifiers: list[str] = state.get("baseline_scan_identifiers", [])
-    post_remediation_scan_identifiers: list[str] = state.get(
-        "post_remediation_scan_identifiers", []
-    )
-    new_vulnerability_identifiers: list[str] = state.get("new_vulnerability_identifiers", [])
-    new_vulnerability_status: str = state.get("new_vulnerability_status", "not_scanned")
-    triage_required: bool = bool(state.get("triage_required", False))
-
-    group_by_id = {g.group_id: g for g in valid_groups}
-
-    lines = [
-        "You are the Router phase of an AppSec remediation Supervisor.",
-        "Produce exactly one SupervisorDecision to route the next graph step.",
-        "The Planner owns playbook and exact dependency-version reasoning.",
-        "You only translate planner intent and current task state into routing.",
-        "Do not invent dependency versions beyond the planner scratchpad and retry diagnostics.",
-        "",
-    ]
-
-    lines.append("## Remediation Tasks")
-
-    active_tasks = {
-        tid: t
-        for tid, t in task_queue.items()
-        if t.status in [TaskStatus.PENDING, TaskStatus.NEEDS_RETRY, TaskStatus.OPTIMISTICALLY_FIXED]
-    }
-
-    for task in sorted(active_tasks.values(), key=lambda item: _task_sort_key(item, group_by_id)):
-        group = group_by_id.get(task.parent_group_id)
-        fix_plan = group.fix_plan if group else None
-        cves = ", ".join(group.cve_ids) if group and group.cve_ids else "none"
-        ghsas = ", ".join(group.ghsa_ids) if group and group.ghsa_ids else "none"
-        eval_ = qa_evaluations.get(task.task_id) or qa_evaluations.get(task.parent_group_id)
-        diagnostics = retry_diagnostics_by_task.get(task.task_id)
-        security_floor = (
-            diagnostics.security_floor
-            if diagnostics and diagnostics.security_floor
-            else (fix_plan.fixed_version if fix_plan else "unknown")
-        )
-
-        lines += [
-            "",
-            f"### Task: {task.task_id}",
-            f"- Parent Group  : {task.parent_group_id}",
-            f"- Component     : {group.vulnerable_component if group else 'unknown'}",
-            f"- Issue Type    : {group.issue_type.value if group else 'unknown'}",
-            f"- CVEs          : {cves}",
-            f"- GHSAs         : {ghsas}",
-            f"- Fix Plan      : {fix_plan.status.value if fix_plan else 'none'}",
-            f"- Strategy      : {task.strategy.value}",
-            f"- Strategy Stage: {task.strategy_stage.value}",
-            f"- Edit Target   : {task.target_package_name or (group.vulnerable_component if group else 'unknown')}",
-            f"- Target Type   : {task.target_dependency_type or 'package dependency'}",
-            f"- Parent Target : {task.parent_package_name or 'none'}",
-            f"- Parent Minimum: {task.parent_minimum_version or 'none'}",
-            f"- NO_FIX Stage  : {task.no_fix_stage.value if task.no_fix_stage else 'none'}",
-            f"- Task Revision : {task.task_revision}",
-            f"- Current Attempt: {task.current_attempt_id or 'none'}",
-            f"- Committed Selected Version: {task.selected_version or 'none'}",
-            f"- OSV Security Floor: {security_floor}",
-            f"- Status        : {task.status.value}",
-            f"- Retries Used  : {task.retry_count}/{MAX_RETRIES}",
-            f"- Ancestry Depth: {task.ancestry_depth}/{MAX_ANCESTRY_DEPTH}",
-            f"- Instruction   : {task.instruction or '(none)'}",
-        ]
-        if task.parent_task_id:
-            lines.append(f"- Parent Task   : {task.parent_task_id}")
-        if eval_ and task.status != TaskStatus.OPTIMISTICALLY_FIXED:
-            cat = eval_.failure_category.value if eval_.failure_category else "none"
-            lines.append(
-                f"- Last QA       : passed={eval_.passed}, category={cat}, "
-                f"feedback={eval_.retry_feedback}"
-            )
+        if committed_task is None:
+            continue
+        diagnostics = retry_diagnostics_by_task.get(task_id)
         if diagnostics is not None:
-            lines.append(
-                f"- Retry Diags   : registry={diagnostics.registry_query_performed}, "
-                f"latest={diagnostics.latest_version_seen or 'unknown'}, "
-                f"exhausted={diagnostics.exhausted_update_path}, "
-                f"abandoned={diagnostics.package_abandoned}"
+            retry_diagnostics_by_task[task_id] = diagnostics.model_copy(
+                update={
+                    "committed_attempt_id": committed_task.current_attempt_id,
+                    "strategy_stage": committed_task.strategy_stage,
+                    "selected_version": committed_task.selected_version,
+                    "exhausted_update_path": committed_task.exhausted_update_path,
+                    "target_package_name": committed_task.target_package_name,
+                    "target_dependency_type": committed_task.target_dependency_type,
+                    "parent_minimum_version": committed_task.parent_minimum_version,
+                    "instruction_digest": _instruction_digest(committed_task.instruction),
+                }
             )
-            if diagnostics.selected_version:
-                lines.append(f"- Supervisor Selected Version: {diagnostics.selected_version}")
-        plan = retry_plans_by_task.get(task.task_id)
-        if plan is not None:
-            lines.append(
-                f"- Committed Planner Action: {plan.action}; "
-                f"effective_stage={plan.strategy_stage.value}; "
-                f"exhausted={plan.exhausted_update_path}"
-            )
-
-    lines += [
-        "",
-        "## NO_FIX Lifecycle Guardrails",
-        "- NO_FIX tasks stay on the same task and have exactly two supervisor-owned stages: PACKAGE_REMOVAL, then VULNERABLE_CODE_REMOVAL.",
-        "- PACKAGE_REMOVAL routes only to workaround_subagent with the supervisor-generated package-removal instruction and scoped removal tool.",
-        "- A failed PACKAGE_REMOVAL attempt becomes NEEDS_RETRY and advances to VULNERABLE_CODE_REMOVAL; the second stage keeps the package installed and removes vulnerable code paths.",
-        "- A failed VULNERABLE_CODE_REMOVAL attempt becomes UNFIXABLE. UNFIXABLE tasks never route, never spawn children, and cannot be terminalized early by an LLM decision.",
-        "- Do not route a NO_FIX task to update_subagent or teardown while it is actionable, do not change its stage, and do not replace its deterministic instruction.",
-        "",
-        "## Constraints Ledger",
-    ]
-    if constraints_ledger:
-        lines.extend(f"- {c}" for c in constraints_ledger)
-    else:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        "## Recent Action Summaries",
-    ]
-    for summary in _current_action_summaries(action_summaries, task_queue, 10):
-        lines.append(f"- [{summary.task_id}] {summary.status.value}: {summary.summary}")
-    if not action_summaries:
-        lines.append("- (none)")
-
-    lines += [
-        "",
-        f"## QA Evaluation Status: {eval_status or 'none'}",
-        "",
-        "## Global Post-remediation Scanner Findings",
-        f"- New-vulnerability status: {new_vulnerability_status}",
-        f"- Baseline identifiers: {', '.join(baseline_scan_identifiers) or '(none)'}",
-        f"- Post-remediation identifiers: {', '.join(post_remediation_scan_identifiers) or '(none or unavailable)'}",
-        f"- Newly introduced identifiers: {', '.join(new_vulnerability_identifiers) or '(none)'}",
-        f"- Post-QA triage required: {'yes' if triage_required else 'no'}",
-        "- Newly introduced identifiers are report-only until the later triage phase. Do not assign them to existing tasks before triage; after Supervisor dispatches triage, only newly created or explicitly changed groups may receive remediation tasks.",
-        "",
-        "## Planner Scratchpad",
-        scratchpad or "(none)",
-        "",
-        f"## Queue Caps: {len(task_queue)}/{MAX_TASK_QUEUE_SIZE} tasks used, depth cap = {MAX_ANCESTRY_DEPTH}",
-        "",
-        "## Router Rules (follow strictly)",
-        "0. QA-ready tasks have priority: route optimistically_fixed tasks to qa_critic before planning retries or dispatching workers.",
-        "1. When Post-QA triage required is yes after QA results are ingested, route to triage before any worker or teardown decision.",
-        "2. Send exactly one pending VERSION_BUMP task to update_subagent.",
-        "3. Send exactly one retry VERSION_BUMP task to update_subagent.",
-        "4. Every retry task routed to update_subagent MUST have a non-empty revised_instructions entry containing the exact planned version.",
-        "5. Retry revised_instructions are authoritative exact execution instructions.",
-        "6. Same-strategy retries reuse the same task.",
-        "7. Any strategy pivot must be represented with spawn_requests; do not rely on updated_task_strategies for new pivot decisions.",
-        "8. SECURITY_FLAG, PEER_CONFLICT, and BREAKING_CHANGE advance VERSION_BUMP tasks by exactly one version stage.",
-        "SECURITY_FLAG and PEER_CONFLICT remain update remediation first; BREAKING_CHANGE also advances through the ordered update stages.",
-        "8b. For transitive VERSION_BUMP tasks, update the committed parent target through OSV_MINIMUM, NPM_SAME_MAJOR, and NPM_LATEST before PACKAGE_OVERRIDE; never target the vulnerable child during parent stages.",
-        "8c. PACKAGE_OVERRIDE may target only the vulnerable child through overrides, resolutions, or pnpm overrides. Prose mentioning transitive dependencies does not change the committed target.",
-        "8a. CODE_WORKAROUND tasks that fail QA are retried; they do not advance version stages. You MUST copy the task's Last QA feedback into feedback_by_task for the retry.",
-        "9. Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task; transitive tasks use PACKAGE_OVERRIDE before that pivot.",
-        "10. Send exactly one pending or retry CODE_WORKAROUND task to workaround_subagent.",
-        "11. After a worker succeeds for the current task, route that task to qa_critic.",
-        "12. When no actionable non-terminal tasks remain, route to teardown.",
-        f"13. Any task with {MAX_RETRIES}+ retries may be marked unfixable.",
-        "14. Terminal tasks (including unfixable, mitigated, and pivoted tasks) must never appear in target_task_ids; optimistically_fixed tasks may only appear for qa_critic.",
-        "15. task_status_updates may only set QA_PASSED or UNFIXABLE.",
-        "16. Under the current routing policy, update_subagent MUST have exactly one target_task_id.",
-        "17. workaround_subagent MUST have exactly one target_task_id.",
-        "18. Under the current routing policy, qa_critic MUST have exactly one target_task_id.",
-        "19. instructions is audit/routing rationale only; do not use it as a substitute for revised_instructions.",
-        f"20. spawn_requests must respect parent depth < {MAX_ANCESTRY_DEPTH} and queue size <= {MAX_TASK_QUEUE_SIZE}.",
-        "21. When a pivot is chosen, the parent task is terminal and must not be routed back to update_subagent.",
-        "22. If multi-task worker mode is re-enabled, mixed first-pass and retry tasks must be split before routing.",
-        "23. VERSION_BUMP tasks with exhausted_update_path=True or package_abandoned=True must pivot via spawn_requests, not update_subagent.",
-        "24. You may include multiple spawn_requests in one decision, but workaround_subagent target_task_ids must still contain exactly one parent/child target.",
-        "25. When routing or spawning CODE_WORKAROUND tasks, you MUST provide a search_hint in the task `instruction` or `revised_instructions`:",
-        '    - Scenario: QA failed on unit tests -> "Hint: Unit tests failed, prioritize searching the error string / stack trace without quotation marks."',
-        '    - Scenario: QA failed on scanner/CVE unresolved, or no version bumps available -> "Hint: Prioritize searching the CVE and mitigation strategies without quotation marks."',
-        '    - Scenario: Workaround validation gate failed (retry) -> "Hint: Validation gate failed, prioritize searching the error string without quotation marks."',
-    ]
-
-    return "\n".join(lines)
+        retry_plans_by_task[task_id] = plan.model_copy(
+            update={"source_task_revision": committed_task.task_revision}
+        )
 
 
-# ---------------------------------------------------------------------------
 # Spawn request materializer
 # ---------------------------------------------------------------------------
 
@@ -3716,7 +3334,7 @@ def _materialize_spawn_requests(
             continue
 
         # Spawn requests can be replayed when the supervisor revisits the same
-        # exhausted parent, and an LLM decision can also contain duplicate
+        # exhausted parent, and an untrusted decision can also contain duplicate
         # requests in one envelope.  A workaround pivot is idempotent: one
         # parent remediation task may own at most one child for a given
         # strategy.  Check both the committed queue and children materialized
@@ -3888,9 +3506,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic.
     6. If QA produced a parseable scan and set ``triage_required``, route to
        the post-QA triage node before any worker or teardown decision.
-    7. Router phase: ChatOpenAI.with_structured_output(SupervisorDecision).
-    8. Guardrails: reject unknown IDs, enforce cardinality, fall back to
-       deterministic routing if invalid.
+    7. Plan retry inputs from deterministic registry facts and committed state.
+    8. Route through the deterministic state machine and validate its
+       dispatch projection.
     9. Apply guarded: revised_instructions, strategy updates, status overrides,
        unfixable marks, new constraints, and materialized spawn requests.
     10. Return state patch.
@@ -4797,7 +4415,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 ),
             )
 
-    # The LLM is not permitted to bypass the post-QA triage handoff.  This is
+    # The Supervisor is not permitted to bypass the post-QA triage handoff. This is
     # deliberately applied after the optimistic QA guard so Supervisor stays
     # the sole routing authority while preserving the required order:
     # worker -> supervisor -> QA -> supervisor -> triage -> supervisor.
@@ -4835,334 +4453,68 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
 
     # ------------------------------------------------------------------
-    # 6. Router phase (structured LLM call)
+    # 6. Deterministic retry planning
     # ------------------------------------------------------------------
-    planner_scratchpad = ""
-    llm_advisory: SupervisorDecision | LLMAdvisory | None = None
-    if decision is None:
-        try:
-            from langchain_openai import ChatOpenAI  # type: ignore[import]
-
-            model_name = get_runtime_settings().supervisor_llm_model
-            router_llm = ChatOpenAI(model=model_name, temperature=0)
-            if _needs_planner(
-                task_queue,
-                qa_evaluations,
-                retry_diagnostics_by_task,
-                str(state.get("status") or ""),
-            ):
-                logger.info("supervisor: invoking planner phase for retry analysis.")
-                planner_base_diagnostics = dict(retry_diagnostics_by_task)
-                planner_correction = ""
-                planner_violations: list[str] = []
-                parsed_diagnostics: dict[str, UpdateRetryDiagnostics] = {}
-                parsed_plans: dict[str, SupervisorRetryPlan] = {}
-                planner_tool_events: list[ToolEvent] = []
-
-                # Planner output is an untrusted proposal.  Give it one
-                # compact correction opportunity before applying anything to
-                # the task queue or exposing it to the router.
-                for planner_attempt in range(2):
-                    planner_result = _run_planner_phase(
-                        task_queue,
-                        group_by_id,
-                        qa_evaluations,
-                        planner_base_diagnostics,
-                        action_summaries,
-                        existing_constraints,
-                        router_llm,
-                        correction=planner_correction,
-                        return_tool_events=True,
-                    )
-                    typed_planner_result = (
-                        isinstance(planner_result, tuple)
-                        and len(planner_result) == 3
-                        and isinstance(planner_result[0], dict)
-                        and isinstance(planner_result[1], dict)
-                    )
-                    if typed_planner_result:
-                        parsed_diagnostics = dict(planner_result[0])
-                        parsed_plans = dict(planner_result[1])
-                        planner_tool_events.extend(list(planner_result[2]))
-                        planner_scratchpad = ""
-                    elif isinstance(planner_result, tuple):
-                        planner_scratchpad, attempt_tool_events = planner_result
-                        planner_tool_events.extend(attempt_tool_events)
-                    else:
-                        # Preserve compatibility with tests/integrations that
-                        # replace the planner helper with a text-only stub.
-                        planner_scratchpad = str(planner_result)
-                    if not typed_planner_result:
-                        parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
-                            planner_scratchpad,
-                            task_queue,
-                            planner_base_diagnostics,
-                            group_by_id,
-                        )
-                        parsed_diagnostics, parsed_plans = _reconcile_registry_plan_evidence(
-                            parsed_plans,
-                            parsed_diagnostics,
-                            task_queue,
-                            group_by_id,
-                            planner_tool_events,
-                        )
-                    planner_violations = _planner_plan_violations(
-                        parsed_plans,
-                        task_queue,
-                        planner_base_diagnostics,
-                    )
-                    if not planner_violations:
-                        break
-
-                    errors.extend(
-                        f"supervisor: planner semantic validation: {violation}"
-                        for violation in planner_violations
-                    )
-                    if planner_attempt == 0:
-                        planner_correction = "\n".join(planner_violations)
-                        logger.warning(
-                            "supervisor: rejecting planner output and requesting correction: %s",
-                            planner_violations,
-                        )
-                        continue
-
-                    # The second proposal is still untrusted.  Repair from
-                    # registry facts already present in the proposal, or fail
-                    # closed into the existing workaround pivot.  No stale or
-                    # attempted version can survive this boundary.
-                    parsed_diagnostics, parsed_plans = _repair_invalid_planner_plans(
-                        parsed_plans,
-                        parsed_diagnostics,
-                        task_queue,
-                        group_by_id,
-                        violations=planner_violations,
-                    )
-                    repair_violations = _planner_plan_violations(
-                        parsed_plans,
-                        task_queue,
-                        parsed_diagnostics,
-                    )
-                    if repair_violations:
-                        errors.extend(
-                            "supervisor: deterministic planner repair remained invalid: "
-                            f"{violation}"
-                            for violation in repair_violations
-                        )
-                    break
-
-                candidate_violations = _planner_plan_violations(
-                    parsed_plans,
-                    task_queue,
-                    parsed_diagnostics,
-                )
-                if not candidate_violations:
-                    retry_diagnostics_by_task = dict(parsed_diagnostics)
-                    retry_plans_by_task = dict(parsed_plans)
-                    for task_id, plan in list(retry_plans_by_task.items()):
-                        if task_id not in task_queue:
-                            continue
-                        committed_task = _commit_task_transition(
-                            task_queue,
-                            task_id,
-                            updates={
-                                "strategy_stage": plan.strategy_stage,
-                                "instruction": plan.exact_instruction,
-                                "selected_version": plan.selected_version,
-                                "exhausted_update_path": plan.exhausted_update_path,
-                                "target_package_name": plan.target_package_name
-                                or task_queue[task_id].target_package_name,
-                                "target_dependency_type": plan.target_dependency_type
-                                or task_queue[task_id].target_dependency_type,
-                                "parent_minimum_version": plan.parent_minimum_version
-                                or task_queue[task_id].parent_minimum_version,
-                            },
-                            # A planner result supersedes any previous worker
-                            # input. Closing here makes the planner commit
-                            # atomic even when a stale worker result arrived
-                            # in the same supervisor invocation.
-                            close_attempt=True,
-                        )
-                        if committed_task is None:
-                            continue
-                        diagnostics = retry_diagnostics_by_task.get(task_id)
-                        if diagnostics is not None:
-                            retry_diagnostics_by_task[task_id] = diagnostics.model_copy(
-                                update={
-                                    "committed_attempt_id": committed_task.current_attempt_id,
-                                    "strategy_stage": committed_task.strategy_stage,
-                                    "selected_version": committed_task.selected_version,
-                                    "exhausted_update_path": committed_task.exhausted_update_path,
-                                    "target_package_name": committed_task.target_package_name,
-                                    "target_dependency_type": committed_task.target_dependency_type,
-                                    "parent_minimum_version": committed_task.parent_minimum_version,
-                                    "instruction_digest": _instruction_digest(
-                                        committed_task.instruction
-                                    ),
-                                }
-                            )
-                        retry_plans_by_task[task_id] = plan.model_copy(
-                            update={"source_task_revision": committed_task.task_revision}
-                        )
-                else:
-                    # Never commit an invalid planner proposal. Fail closed to
-                    # a deterministic workaround pivot for affected retry tasks
-                    # so a stale version/instruction cannot be dispatched.
-                    # A malformed or incomplete planner response must not
-                    # leave an older retry plan alive. Every actionable retry
-                    # task is therefore moved through the same fail-closed
-                    # pivot path, including tasks for which the planner
-                    # emitted no parseable section at all.
-                    affected_ids = {
-                        task_id
-                        for task_id, task in task_queue.items()
-                        if task.status == TaskStatus.NEEDS_RETRY
-                    }
-                    affected_ids.update(
-                        plan.task_id for plan in parsed_plans.values() if plan.task_id in task_queue
-                    )
-                    for task_id in affected_ids:
-                        retry_plans_by_task.pop(task_id, None)
-                    consistency_events.append(
-                        _build_consistency_event(
-                            error_code="INVALID_PLANNER_COMMIT",
-                            task_id=next(iter(affected_ids), None),
-                            expected_attempt_id=None,
-                            received_attempt_id=None,
-                            action="replanned",
-                            details="Planner proposal rejected; deterministic pivot committed.",
-                        )
-                    )
-                    for task_id in affected_ids:
-                        task = task_queue[task_id]
-                        group = group_by_id.get(task.parent_group_id)
-                        if (
-                            group is not None
-                            and is_transitive_group(group)
-                            and group.fix_plan is not None
-                            and group.fix_plan.fixed_version
-                        ):
-                            child_version = group.fix_plan.fixed_version
-                            target_type = _override_dependency_type(group)
-                            override_instruction = (
-                                f"Apply package-manager override stage for {group.vulnerable_component}: "
-                                f"pin the vulnerable child to exact version {child_version} "
-                                f"using {target_type}; do not edit the parent declaration."
-                            )
-                            committed_task = _commit_task_transition(
-                                task_queue,
-                                task_id,
-                                updates={
-                                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                                    "target_package_name": group.vulnerable_component,
-                                    "target_dependency_type": target_type,
-                                    "selected_version": child_version,
-                                    "exhausted_update_path": False,
-                                    "instruction": override_instruction,
-                                },
-                                close_attempt=True,
-                            )
-                            retry_diagnostics_by_task[task_id] = UpdateRetryDiagnostics(
-                                task_id=task_id,
-                                committed_attempt_id=(
-                                    committed_task.current_attempt_id
-                                    if committed_task is not None
-                                    else None
-                                ),
-                                strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
-                                security_floor=child_version,
-                                selected_version=child_version,
-                                target_package_name=group.vulnerable_component,
-                                target_dependency_type=target_type,
-                                parent_package_name=group.parent_package_name,
-                                exhausted_update_path=False,
-                            )
-                            retry_plans_by_task[task_id] = SupervisorRetryPlan(
-                                task_id=task_id,
-                                source_task_revision=(
-                                    committed_task.task_revision
-                                    if committed_task is not None
-                                    else task.task_revision
-                                ),
-                                strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
-                                selected_version=child_version,
-                                exhausted_update_path=False,
-                                target_package_name=group.vulnerable_component,
-                                target_dependency_type=target_type,
-                                action="retry_update",
-                                exact_instruction=override_instruction,
-                            )
-                            continue
-                        component = group.vulnerable_component if group else task.parent_group_id
-                        pivot_instruction = (
-                            f"Implement a code workaround or isolation strategy for {component} "
-                            "because the manifest-based update path is exhausted."
-                        )
-                        committed_task = _commit_task_transition(
-                            task_queue,
-                            task_id,
-                            updates={
-                                "strategy_stage": SCARemediationStage.NPM_LATEST,
-                                "selected_version": None,
-                                "exhausted_update_path": True,
-                                "instruction": pivot_instruction,
-                            },
-                            close_attempt=True,
-                            clear_selected_version=True,
-                        )
-                        retry_diagnostics_by_task[task_id] = UpdateRetryDiagnostics(
-                            task_id=task_id,
-                            committed_attempt_id=(
-                                committed_task.current_attempt_id
-                                if committed_task is not None
-                                else None
-                            ),
-                            strategy_stage=SCARemediationStage.NPM_LATEST,
-                            security_floor=(
-                                group.fix_plan.fixed_version if group and group.fix_plan else None
-                            ),
-                            attempted_versions=list(
-                                retry_diagnostics_by_task.get(
-                                    task_id, UpdateRetryDiagnostics(task_id=task_id)
-                                ).attempted_versions
-                            ),
-                            selected_version=None,
-                            exhausted_update_path=True,
-                        )
-                        retry_plans_by_task[task_id] = SupervisorRetryPlan(
-                            task_id=task_id,
-                            source_task_revision=(
-                                committed_task.task_revision
-                                if committed_task is not None
-                                else task.task_revision
-                            ),
-                            strategy_stage=SCARemediationStage.NPM_LATEST,
-                            selected_version=None,
-                            attempted_versions=retry_diagnostics_by_task[
-                                task_id
-                            ].attempted_versions,
-                            exhausted_update_path=True,
-                            action="pivot_workaround",
-                            exact_instruction=pivot_instruction,
-                        )
-
-                # A planner-confirmed exhausted path is deterministic. Do not
-                # ask the router LLM to reinterpret a pivot as an update retry.
-                if any(plan.action == "pivot_workaround" for plan in retry_plans_by_task.values()):
-                    decision = _deterministic_routing(
-                        task_queue,
-                        group_by_id,
-                        qa_evaluations,
-                        retry_diagnostics_by_task,
-                        action_summaries=action_summaries,
-                        active_target_task_ids=active_target_task_ids,
-                        current_status=str(state.get("status") or ""),
-                    )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "supervisor: LLM call failed (%s) â€” using deterministic fallback.", exc
+    if decision is None and _needs_planner(
+        task_queue,
+        qa_evaluations,
+        retry_diagnostics_by_task,
+        str(state.get("status") or ""),
+    ):
+        parsed_diagnostics, parsed_plans = _run_deterministic_retry_planner(
+            task_queue,
+            group_by_id,
+            retry_diagnostics_by_task,
+        )
+        planner_violations = _planner_plan_violations(
+            parsed_plans,
+            task_queue,
+            parsed_diagnostics,
+        )
+        if planner_violations:
+            errors.extend(
+                f"supervisor: deterministic retry planning: {violation}"
+                for violation in planner_violations
             )
+            parsed_diagnostics, parsed_plans = _repair_invalid_planner_plans(
+                parsed_plans,
+                parsed_diagnostics,
+                task_queue,
+                group_by_id,
+                violations=planner_violations,
+            )
+            repair_violations = _planner_plan_violations(
+                parsed_plans,
+                task_queue,
+                parsed_diagnostics,
+            )
+            if repair_violations:
+                errors.extend(
+                    f"supervisor: deterministic retry repair: {violation}"
+                    for violation in repair_violations
+                )
+        retry_diagnostics_by_task = parsed_diagnostics
+        if not _planner_plan_violations(parsed_plans, task_queue, parsed_diagnostics):
+            _commit_retry_plans(
+                task_queue,
+                retry_diagnostics_by_task,
+                retry_plans_by_task,
+                parsed_plans,
+            )
+            if any(plan.action == "pivot_workaround" for plan in parsed_plans.values()):
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                )
 
-    # Re-apply optimistic short-circuit post-LLM (guard against LLM overriding)
+    # Deterministic retry planning above is the only Supervisor planning path.
+
+    # Re-apply optimistic short-circuit after retry planning.
     if state.get("status") != "qa_completed" and active_target_task_ids:
         active_qa_ready = _qa_ready_task_ids(
             task_queue,
@@ -5192,19 +4544,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         current_status=str(state.get("status") or ""),
         triage_required=bool(state.get("triage_required")),
     )
-    if llm_advisory is not None:
-        decision = _merge_advisory(
-            deterministic_decision,
-            llm_advisory,
-            existing_constraints=existing_constraints,
-        )
-    else:
-        llm_advisory = _invoke_llm_advisory(state, deterministic_decision)
-        decision = _merge_advisory(
-            deterministic_decision,
-            llm_advisory,
-            existing_constraints=existing_constraints,
-        )
+    # The deterministic decision is authoritative. QA feedback below is
+    # carried only when Python produced it for the selected task; no model
+    # can add worker feedback or constraints to this projection.
+    decision = deterministic_decision
 
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
@@ -5405,7 +4748,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     )
                 elif task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL and group:
                     # The package-removal instruction is supervisor-owned too;
-                    # an LLM cannot replace the scoped manifest capability with
+                    # an untrusted decision cannot replace the scoped manifest capability with
                     # arbitrary prose or a generic source-only workaround.
                     clean_revised_instructions[task_id] = build_no_fix_package_removal_instruction(
                         group
@@ -5440,8 +4783,37 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             if missing_retry_revisions:
                 errors.append(
                     "supervisor: rejected update_subagent retry dispatch without task-specific "
-                    f"revised_instructions for {missing_retry_revisions}."
+                    f"revised_instructions for {missing_retry_revisions}; replanning deterministically."
                 )
+                recovery_tasks = {
+                    task_id: task_queue[task_id]
+                    for task_id in missing_retry_revisions
+                    if task_id in task_queue
+                    and task_queue[task_id].strategy == RoutingStrategy.VERSION_BUMP
+                }
+                recovery_inputs = {
+                    task_id: retry_diagnostics_by_task.get(
+                        task_id,
+                        UpdateRetryDiagnostics(
+                            task_id=task_id,
+                            strategy_stage=task_queue[task_id].strategy_stage,
+                        ),
+                    )
+                    for task_id in recovery_tasks
+                }
+                if recovery_tasks:
+                    recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
+                        recovery_tasks,
+                        group_by_id,
+                        recovery_inputs,
+                    )
+                    retry_diagnostics_by_task.update(recovered_diagnostics)
+                    _commit_retry_plans(
+                        task_queue,
+                        retry_diagnostics_by_task,
+                        retry_plans_by_task,
+                        recovered_plans,
+                    )
                 decision = _deterministic_routing(
                     task_queue,
                     group_by_id,
@@ -5450,6 +4822,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
+                    triage_required=bool(state.get("triage_required")),
                 )
                 valid_target_ids = list(decision.target_task_ids)
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
@@ -5822,8 +5195,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if task_id in set(resolved_target_task_ids)
     }
 
-    # Programmatic override: Forcefully inject the latest QA feedback into
-    # workaround subagent retries, as smaller LLMs may ignore the prompt rule.
+    # Programmatic override: forcefully inject the latest QA feedback into
+    # workaround-subagent retries so the worker receives the evidence.
     if resolved_next_node == "workaround_subagent":
         for task_id in resolved_target_task_ids:
             task = task_queue.get(task_id)

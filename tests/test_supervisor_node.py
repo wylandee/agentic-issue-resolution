@@ -16,7 +16,6 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from remediation_engine.contracts.llm_advisory import LLMAdvisory
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
@@ -45,6 +44,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
@@ -55,7 +55,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _parse_planner_retry_plans,
     _planner_plan_violations,
     _reconcile_registry_plan_evidence,
-    build_supervisor_prompt,
+    _repair_invalid_planner_plans,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
     supervisor_router,
@@ -150,6 +150,28 @@ def _base_state(groups, **overrides) -> dict:
     }
     state.update(overrides)
     return state
+
+
+@pytest.fixture(autouse=True)
+def _mock_deterministic_registry(monkeypatch):
+    """Keep Supervisor retry tests inside the deterministic registry boundary."""
+
+    def candidates(_package_name, _security_floor, _attempted_versions=None):
+        return [
+            RegistryCandidate(
+                version="2.0.0",
+                semver_key=(2, 0, 0),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=False,
+                already_attempted=False,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        candidates,
+    )
 
 
 # ===========================================================================
@@ -361,17 +383,10 @@ class TestRunSupervisorNodeNormalization:
 
 
 class TestRunSupervisorNodeVersionBump:
-    @patch("langchain_openai.ChatOpenAI")
-    def test_version_bump_tasks_dispatch_one_at_a_time(self, mock_chat):
+    def test_version_bump_tasks_dispatch_one_at_a_time(self):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
         state = _base_state([g1, g2])
-
-        mock_llm = MagicMock()
-        mock_chat.return_value = mock_llm
-
-        # Make LLM fail so we rely on deterministic routing
-        mock_llm.with_structured_output.return_value.invoke.side_effect = Exception("LLM error")
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "update_subagent"
@@ -421,31 +436,6 @@ class TestRunSupervisorNodeVersionBump:
         )
         second = _deterministic_routing(task_queue, groups_by_id, {}, {})
         assert second.target_task_ids == ["task-2"]
-
-    @patch("langchain_openai.ChatOpenAI")
-    def test_version_bump_routes_to_update_subagent_via_llm(self, mock_chat):
-        g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
-        state = _base_state([g1, g2])
-
-        mock_llm = MagicMock()
-        mock_chat.return_value = mock_llm
-
-        def make_decision(prompt_text):
-            # Extract task IDs from the state's task_queue (they're created during node)
-            # We can't know them here, but we can check the result
-            return SupervisorDecision(
-                next_node="update_subagent",
-                target_task_ids=["task-1", "task-2"],
-                instructions="test",
-                decision_reason="test",
-            )
-
-        mock_llm.with_structured_output.return_value.invoke.side_effect = make_decision
-
-        result = run_supervisor_node(state)
-        assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1"]
 
 
 class TestRunSupervisorNodeWorkaround:
@@ -511,8 +501,7 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert result["active_target_task_ids"] == ["task-1"]
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_mixed_update_results_route_successful_subset_to_qa(self, mock_chat):
+    def test_mixed_update_results_route_successful_subset_to_qa(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
         tasks = {
             f"task-{i + 1}": _make_task(
@@ -562,7 +551,6 @@ class TestRunSupervisorNodeToQA:
         assert result["task_queue"]["task-3"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-4"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-5"].status == TaskStatus.NEEDS_RETRY
-        mock_chat.assert_called_once()
 
     def test_terminal_tasks_in_active_batch_are_omitted_from_qa_targets(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
@@ -582,11 +570,8 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert result["active_target_task_ids"] == ["task-1"]
 
-    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
-    def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(
-        self, mock_chat, mock_planner
-    ):
+    def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -601,8 +586,7 @@ class TestRunSupervisorNodeToQA:
 
         assert result["next_routing_step"] == "qa_critic"
         assert result["active_target_task_ids"] == ["task-1"]
-        mock_planner.assert_not_called()
-        mock_chat.assert_called_once()
+        mock_chat.assert_not_called()
 
 
 class TestRunSupervisorNodeToTeardown:
@@ -633,9 +617,7 @@ class TestRunSupervisorNodeToTeardown:
 
 
 class TestRunSupervisorNodeQAUpdates:
-    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
-    @patch("langchain_openai.ChatOpenAI")
-    def test_qa_failed_retry_invokes_planner_before_router(self, mock_chat, mock_planner):
+    def test_qa_failed_retry_uses_deterministic_planning(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.NEEDS_RETRY)
         state = _base_state(
@@ -652,27 +634,12 @@ class TestRunSupervisorNodeQAUpdates:
             },
         )
 
-        router_llm = MagicMock()
-        structured = MagicMock()
-        mock_chat.return_value = router_llm
-        router_llm.with_structured_output.return_value = structured
-        structured.invoke.return_value = SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-1"],
-            revised_instructions={
-                "task-1": "Investigate patched releases or override paths for test-pkg."
-            },
-            instructions="route retry task",
-            decision_reason="planner kept update remediation active",
-        )
-        mock_planner.return_value = "Strategy Scratchpad\nretry update path still open"
+        result = run_supervisor_node(state)
 
-        run_supervisor_node(state)
-
-        mock_planner.assert_called_once()
-        prompt_text = structured.invoke.call_args[0][0]
-        assert "Target task IDs" in prompt_text
-        assert "update_subagent" in prompt_text
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["task_queue"]["task-1"].selected_version == "2.0.0"
+        assert result["task_queue"]["task-1"].strategy_stage == SCARemediationStage.NPM_LATEST
+        assert "exact version 2.0.0" in result["task_queue"]["task-1"].instruction
 
     def test_qa_completed_passed_marks_task_qa_passed(self):
         g1 = _sca_group("g1")
@@ -799,8 +766,7 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
         assert result["constraints_ledger"] == []
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_qa_completed_failed_marks_task_needs_retry(self, mock_chat):
+    def test_qa_completed_failed_marks_task_needs_retry(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
         state = _base_state(
@@ -834,8 +800,7 @@ class TestRunSupervisorNodeQAUpdates:
         # It will route to qa_critic since task is OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_failed_group_keyed_qa_eval_replans_active_child_task(self, mock_chat):
+    def test_failed_group_keyed_qa_eval_replans_active_child_task(self):
         g1 = _sca_group("g1")
         parent = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
         child = _make_task("task-2", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -857,37 +822,17 @@ class TestRunSupervisorNodeQAUpdates:
             },
         )
 
-        router_llm = MagicMock()
-        structured = MagicMock()
-        mock_chat.return_value = router_llm
-        router_llm.with_structured_output.return_value = structured
-        structured.invoke.return_value = SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-2"],
-            revised_instructions={
-                "task-2": (
-                    "Apply strategy stage npm_same_major: update package.json "
-                    "to exact version 1.2.4."
-                )
-            },
-            instructions="retry child",
-            decision_reason="replan the active retry task",
-        )
-
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-2"].retry_count == 1
-        assert result["task_queue"]["task-2"].instruction.startswith(
-            "Investigate patched manifest remediation paths"
-        )
+        assert result["task_queue"]["task-2"].selected_version == "2.0.0"
+        assert result["task_queue"]["task-2"].strategy_stage == SCARemediationStage.NPM_LATEST
+        assert "exact version 2.0.0" in result["task_queue"]["task-2"].instruction
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_retry_update_without_revised_instruction_falls_back_to_high_level_retry(
-        self, mock_chat
-    ):
+    def test_retry_update_without_revised_instruction_falls_back_to_high_level_retry(self):
         g1 = _sca_group("g1")
         task = _make_task(
             "task-1",
@@ -900,17 +845,6 @@ class TestRunSupervisorNodeQAUpdates:
             task_queue={"task-1": task},
         )
 
-        router_llm = MagicMock()
-        structured = MagicMock()
-        mock_chat.return_value = router_llm
-        router_llm.with_structured_output.return_value = structured
-        structured.invoke.return_value = SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-1"],
-            instructions="Retry with current strategy.",
-            decision_reason="retry the failed version bump",
-        )
-
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
@@ -919,28 +853,35 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_pending_update_task_can_seed_instruction_from_revised_instructions(self, mock_chat):
+    def test_missing_retry_instruction_replans_before_dispatch(self):
+        g1 = _sca_group("g1")
+        task = _make_task(
+            "task-1",
+            "g1",
+            status=TaskStatus.NEEDS_RETRY,
+        ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_SAME_MAJOR})
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": task},
+        )
+
+        result = run_supervisor_node(state)
+
+        committed = result["task_queue"]["task-1"]
+        assert committed.selected_version == "2.0.0"
+        assert committed.strategy_stage == SCARemediationStage.NPM_LATEST
+        assert "exact version 2.0.0" in committed.instruction
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
+        assert any("replanning deterministically" in error for error in result["errors"])
+
+    def test_pending_update_task_can_seed_instruction_from_revised_instructions(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.PENDING)
         task.instruction = ""
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
-        )
-
-        router_llm = MagicMock()
-        structured = MagicMock()
-        mock_chat.return_value = router_llm
-        router_llm.with_structured_output.return_value = structured
-        structured.invoke.return_value = SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-1"],
-            revised_instructions={
-                "task-1": 'Update "test-pkg" in package.json to version "1.2.4".'
-            },
-            instructions="seed the initial task instruction",
-            decision_reason="planner provided an exact version",
         )
 
         result = run_supervisor_node(state)
@@ -1102,6 +1043,53 @@ The same-major latest version (8.21.1) is already attempted, so retry it.
     assert plans["task-1"].action == "pivot_workaround"
 
 
+def test_invalid_latest_repair_pivots_instead_of_reusing_stale_candidate():
+    """An exhausted latest stage must not create an update attempt without a version."""
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=2,
+    ).model_copy(
+        update={
+            "task_revision": 7,
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.17.7",
+            "instruction": "Update test-pkg to exact version 2.17.7.",
+        }
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        attempted_versions=["1.2.3", "2.17.7"],
+        latest_version_seen="2.17.7",
+    )
+    invalid_plan = SupervisorRetryPlan(
+        task_id="task-1",
+        source_task_revision=task.task_revision,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.17.6",
+        attempted_versions=["1.2.3", "2.17.7"],
+        candidate_versions_considered=["2.17.6", "0.1.0"],
+        latest_version_seen="2.17.7",
+        action="retry_update",
+        exact_instruction="Update test-pkg to exact version 2.17.6.",
+    )
+
+    repaired_diagnostics, repaired_plans = _repair_invalid_planner_plans(
+        {task.task_id: invalid_plan},
+        {task.task_id: diagnostics},
+        {task.task_id: task},
+        {group.group_id: group},
+        violations=["task task-1: npm_latest selected 2.17.6, but registry latest is 2.17.7"],
+    )
+
+    assert repaired_plans[task.task_id].action == "pivot_workaround"
+    assert repaired_plans[task.task_id].selected_version is None
+    assert repaired_diagnostics[task.task_id].exhausted_update_path is True
+
+
 def test_registry_tool_result_overrides_free_form_selected_version():
     group = _sca_group("g1")
     task = _make_task(
@@ -1152,7 +1140,7 @@ def test_registry_tool_result_overrides_free_form_selected_version():
     assert not _planner_plan_violations(plans, {"task-1": task}, updated)
 
 
-def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(monkeypatch):
+def test_exhausted_deterministic_guardrail_routes_workaround_child():
     group = _sca_group("g1")
     task = _make_task(
         "task-1",
@@ -1203,22 +1191,11 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
                 selected_version="1.2.3",
                 attempted_versions=["1.2.3"],
                 latest_version_seen="1.2.3",
+                exhausted_update_path=True,
             )
         },
-        status="qa_completed",
+        status="supervisor_entered",
     )
-
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
-        lambda *args, **kwargs: (
-            "TASK: task-1\n"
-            "SELECTED_VERSION: NONE\n"
-            "ACTION: pivot_workaround\n"
-            "The update path is exhausted; pivot to a workaround child."
-        ),
-    )
-    mock_chat = MagicMock()
-    monkeypatch.setattr("langchain_openai.ChatOpenAI", mock_chat)
 
     result = run_supervisor_node(state)
 
@@ -1238,7 +1215,7 @@ def test_planner_pivot_is_committed_before_router_and_routes_workaround_child(mo
     ]
 
 
-def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatch(monkeypatch):
+def test_deterministic_latest_selection_skips_attempted_versions():
     group = _sca_group("g1")
     task = _make_task(
         "task-1",
@@ -1249,7 +1226,7 @@ def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatc
     state = _base_state(
         [group],
         task_queue={"task-1": task},
-        status="qa_completed",
+        status="supervisor_entered",
         qa_evaluations={
             "task-1": QAEvaluation(
                 task_id="task-1",
@@ -1268,58 +1245,63 @@ def test_invalid_planner_selection_is_corrected_before_router_and_worker_dispatc
         },
     )
 
-    planner_outputs = iter(
-        [
-            (
-                "TASK: task-1, SELECTED_VERSION: 6.1.2, "
-                "EFFECTIVE_STAGE: npm_latest, ACTION: retry_update\n"
-                "The same-major latest is already attempted, but retry it."
-            ),
-            (
-                "TASK: task-1, SELECTED_VERSION: 8.5.1, "
-                "EFFECTIVE_STAGE: npm_latest, ACTION: retry_update\n"
-                "Use the unattempted latest stable release."
-            ),
-        ]
-    )
-    planner_mock = MagicMock(side_effect=lambda *args, **kwargs: next(planner_outputs))
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._run_planner_phase", planner_mock
-    )
-
-    router_llm = MagicMock()
-    structured = MagicMock()
-    router_llm.with_structured_output.return_value = structured
-    structured.invoke.return_value = SupervisorDecision(
-        next_node="update_subagent",
-        target_task_ids=["task-1"],
-        instructions="route the corrected retry",
-        decision_reason="planner supplied a validated exact version",
-    )
-    monkeypatch.setattr("langchain_openai.ChatOpenAI", MagicMock(return_value=router_llm))
-
     result = run_supervisor_node(state)
 
-    assert planner_mock.call_count == 2
-    correction = planner_mock.call_args_list[1].kwargs["correction"]
-    assert "already attempted" in correction
-    # QA had already advanced the committed task to the terminal update
-    # stage before the planner ran.  A corrective proposal cannot reopen that
-    # path, even when it names an otherwise unattempted version.
-    assert result["retry_diagnostics_by_task"]["task-1"].selected_version is None
+    # The deterministic planner chooses the unattempted latest registry
+    # candidate directly; no corrective model call is involved.
+    assert result["retry_diagnostics_by_task"]["task-1"].selected_version == "2.0.0"
     assert result["retry_diagnostics_by_task"]["task-1"].strategy_stage == (
         SCARemediationStage.NPM_LATEST
     )
-    assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is True
-    assert "8.5.1" not in result["task_queue"]["task-1"].instruction
-    assert "exact version" not in result["task_queue"]["task-1"].instruction.lower()
-    assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
-    assert result["next_routing_step"] == "workaround_subagent"
-    assert len(result["active_target_task_ids"]) == 1
-    assert result["task_queue"][result["active_target_task_ids"][0]].strategy == (
-        RoutingStrategy.CODE_WORKAROUND
+    assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is False
+    assert result["task_queue"]["task-1"].selected_version == "2.0.0"
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-1"]
+
+
+def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(monkeypatch):
+    group = _sca_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=1,
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_SAME_MAJOR})
+    attempted_candidate = RegistryCandidate(
+        version="2.17.7",
+        semver_key=(2, 17, 7),
+        security_floor_met=True,
+        is_stable=True,
+        same_major=True,
+        already_attempted=True,
     )
-    assert any("planner semantic validation" in error for error in result["errors"])
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        lambda *_args, **_kwargs: [attempted_candidate],
+    )
+    state = _base_state(
+        [group],
+        task_queue={"task-1": task},
+        retry_diagnostics_by_task={
+            "task-1": UpdateRetryDiagnostics(
+                task_id="task-1",
+                strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
+                attempted_versions=["2.17.7"],
+                latest_version_seen="2.17.7",
+            )
+        },
+    )
+
+    result = run_supervisor_node(state)
+
+    committed = result["task_queue"]["task-1"]
+    assert committed.strategy_stage == SCARemediationStage.NPM_LATEST
+    assert committed.selected_version is None
+    assert committed.exhausted_update_path is True
+    assert result["next_routing_step"] == "workaround_subagent"
+    child_id = result["active_target_task_ids"][0]
+    assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
+    assert not any("rejected update_subagent retry dispatch" in error for error in result["errors"])
 
 
 def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
@@ -1551,28 +1533,6 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
         ),
         instruction_digest=old_snapshot.instruction_digest,
     )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
-        lambda *args, **kwargs: (
-            "TASK: task-1, SELECTED_VERSION: 2.0.0, "
-            "EFFECTIVE_STAGE: npm_same_major, ACTION: retry_update\n"
-            "Use the unattempted same-major version."
-        ),
-    )
-    router_llm = MagicMock()
-    structured = MagicMock()
-    router_llm.with_structured_output.return_value = structured
-    structured.invoke.return_value = SupervisorDecision(
-        next_node="update_subagent",
-        target_task_ids=["task-1"],
-        instructions="route the new retry",
-        decision_reason="use the committed planner retry",
-    )
-    monkeypatch.setattr(
-        "langchain_openai.ChatOpenAI",
-        MagicMock(return_value=router_llm),
-    )
-
     result = run_supervisor_node(
         _base_state(
             [group],
@@ -1594,6 +1554,7 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
     committed = result["task_queue"]["task-1"]
     assert committed.current_attempt_id != old_snapshot.attempt_id
     assert committed.selected_version == "2.0.0"
+    assert committed.strategy_stage == SCARemediationStage.NPM_LATEST
     assert committed.task_revision > old_snapshot.task_revision
     assert (
         result["attempt_snapshots_by_id"][committed.current_attempt_id].selected_version == "2.0.0"
@@ -1779,7 +1740,7 @@ def test_terminal_pivot_parent_is_not_reseeded_from_initial_osv_plan():
     assert "task-1" not in result["retry_plans_by_task"]
 
 
-def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatch):
+def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
     group = _sca_group("g1")
     instruction = "Apply the selected dependency version 8.5.1."
     snapshot = TaskAttemptSnapshot(
@@ -1808,17 +1769,6 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
             "exhausted_update_path": False,
         }
     )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._run_planner_phase",
-        lambda *args, **kwargs: (
-            "TASK: task-1\n"
-            "SELECTED_VERSION: NONE\n"
-            "EFFECTIVE_STAGE: npm_latest\n"
-            "ACTION: pivot_workaround\n"
-            "The latest update failed; pivot to a workaround child."
-        ),
-    )
-
     result = run_supervisor_node(
         _base_state(
             [group],
@@ -1863,9 +1813,8 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
 
 
 class TestRunSupervisorNodeActionSummary:
-    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
     @patch("langchain_openai.ChatOpenAI")
-    def test_qa_passed_subset_is_removed_before_retry_routing(self, mock_chat, mock_planner):
+    def test_qa_passed_subset_is_removed_before_retry_routing(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -1891,14 +1840,12 @@ class TestRunSupervisorNodeActionSummary:
             instructions="retry remaining task",
             decision_reason="task-1 passed QA; task-2 still needs retry",
         )
-        mock_planner.return_value = "Strategy Scratchpad\nretry task-2"
-
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
-        mock_planner.assert_called_once()
+        mock_chat.assert_not_called()
 
 
 class TestRunSupervisorNodeActionSummaryUpdates:
@@ -2388,11 +2335,7 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-2"].parent_task_id == "task-1"
 
-    @patch("remediation_engine.orchestration.supervisor_node._run_planner_phase")
-    @patch("langchain_openai.ChatOpenAI")
-    def test_llm_cannot_route_exhausted_update_back_to_update_subagent(
-        self, mock_chat, mock_planner
-    ):
+    def test_deterministic_guardrail_routes_exhausted_update_to_workaround(self):
         g1 = _sca_group("g1")
         task = _make_task(
             "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
@@ -2411,19 +2354,6 @@ class TestRunSupervisorNodePeerConflict:
                 )
             },
         )
-
-        router_llm = MagicMock()
-        structured = MagicMock()
-        mock_chat.return_value = router_llm
-        router_llm.with_structured_output.return_value = structured
-        structured.invoke.return_value = SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-1"],
-            revised_instructions={"task-1": "Try update again even though it is exhausted."},
-            instructions="incorrectly retry exhausted update",
-            decision_reason="bad router decision",
-        )
-        mock_planner.return_value = "Strategy Scratchpad\nincorrect retry"
 
         result = run_supervisor_node(state)
 
@@ -2492,101 +2422,19 @@ class TestRunSupervisorNodePeerConflict:
 
 
 # ===========================================================================
-# run_supervisor_node â€” LLM fallback
+# run_supervisor_node â€” deterministic routing
 # ===========================================================================
 
 
-class TestRunSupervisorLLMFallback:
-    @patch("langchain_openai.ChatOpenAI")
-    def test_llm_exception_uses_deterministic_fallback(self, mock_chat):
+class TestRunSupervisorDeterministicRouting:
+    def test_version_bump_routes_without_a_supervisor_llm(self):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         state = _base_state([g1])
 
-        mock_chat.side_effect = ImportError("No module named langchain_openai")
-
         result = run_supervisor_node(state)
-        # Deterministic fallback routes VERSION_FOUND to update_subagent
+        # Deterministic routing sends VERSION_FOUND to update_subagent.
         assert result["next_routing_step"] == "update_subagent"
         assert len(result["active_target_task_ids"]) == 1
-
-
-# ===========================================================================
-# run_supervisor_node â€” LLM structured output call
-# ===========================================================================
-
-
-class TestSupervisorLLMStructuredOutput:
-    @patch("langchain_openai.ChatOpenAI")
-    def test_uses_with_structured_output(self, mock_chat):
-        g1 = _sca_group("g1")
-        state = _base_state([g1])
-
-        mock_llm = MagicMock()
-        mock_chat.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SupervisorDecision(
-            next_node="teardown",
-            target_task_ids=[],
-            instructions="test",
-            decision_reason="test",
-        )
-
-        run_supervisor_node(state)
-
-        mock_llm.with_structured_output.assert_called_once_with(
-            LLMAdvisory, method="function_calling"
-        )
-        mock_structured.invoke.assert_called_once()
-
-
-# ===========================================================================
-# Supervisor prompt
-# ===========================================================================
-
-
-class TestSupervisorPrompt:
-    def test_prompt_instructs_llm_to_route_one_update_and_qa_task(self):
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
-        prompt = build_supervisor_prompt(_base_state(groups))
-
-        assert "Send exactly one pending VERSION_BUMP task to update_subagent." in prompt
-        assert "Send exactly one retry VERSION_BUMP task to update_subagent." in prompt
-        assert "update_subagent MUST have exactly one target_task_id." in prompt
-        assert "qa_critic MUST have exactly one target_task_id." in prompt
-
-    def test_prompt_includes_task_ids(self):
-        g1 = _sca_group("g1")
-        task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP)
-        state = _base_state([g1], task_queue={"task-1": task})
-        prompt = build_supervisor_prompt(state)
-        assert "task-1" in prompt
-        assert "g1" in prompt
-
-    def test_prompt_carries_new_global_scanner_findings_without_task_attribution(self):
-        g1 = _sca_group("g1")
-        state = _base_state(
-            [g1],
-            baseline_scan_identifiers=["CVE-2021-23337"],
-            post_remediation_scan_identifiers=["CVE-2025-10001"],
-            new_vulnerability_identifiers=["CVE-2025-10001"],
-            new_vulnerability_status="detected",
-        )
-
-        prompt = build_supervisor_prompt(state)
-
-        assert "CVE-2025-10001" in prompt
-        assert "report-only until the later triage phase" in prompt
-
-    def test_prompt_enforces_security_flag_update_and_breaking_change_workaround(self):
-        g1 = _sca_group("g1")
-        prompt = build_supervisor_prompt(_base_state([g1]))
-
-        assert "SECURITY_FLAG and PEER_CONFLICT remain update remediation first" in prompt
-        assert "BREAKING_CHANGE also advances through the ordered update stages" in prompt
-        assert (
-            "Only an exhausted NPM_LATEST stage may pivot to a CODE_WORKAROUND child task" in prompt
-        )
 
 
 class TestBugFixes:

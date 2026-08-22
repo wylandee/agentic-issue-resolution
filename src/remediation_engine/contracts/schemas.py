@@ -136,7 +136,8 @@ class ScanFallbackReason(str, Enum):  # noqa: UP042
     UNSUPPORTED_PACKAGE_MANAGER = "unsupported_package_manager"
     MISSING_LOCKFILE = "missing_lockfile"
     INVALID_LOCKFILE = "invalid_lockfile"
-    AMBIGUOUS_TARGET = "ambiguous_target"
+    NO_MATCHING_TARGET = "no_matching_target"
+    MULTIPLE_TARGETS = "multiple_targets"
     INCOMPLETE_CLOSURE = "incomplete_closure"
     TARGETED_SCAN_FAILED = "targeted_scan_failed"
     TARGETED_REPORT_UNPARSEABLE = "targeted_report_unparseable"
@@ -1958,7 +1959,7 @@ class StateConsistencyEvent(BaseModel):
 
 
 class SupervisorRetryPlan(BaseModel):
-    """Authoritative planner decision committed before supervisor routing."""
+    """Deterministic retry plan committed before Supervisor routing."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -2021,7 +2022,7 @@ class SupervisorRetryPlan(BaseModel):
 
 class SupervisorDecision(BaseModel):
     """
-    Structured LLM output from the Supervisor Node.
+    Typed transition decision produced by the deterministic Supervisor.
 
     Controls hub-and-spoke routing in the Phase 5 orchestrator graph.
     Pydantic validators enforce routing invariants:
@@ -2085,7 +2086,7 @@ class SupervisorDecision(BaseModel):
     )
     feedback_by_task: dict[str, str] = Field(
         default_factory=dict,
-        description="Task-specific retry guidance keyed by task_id.",
+        description="QA-derived retry feedback keyed by task_id.",
     )
     instructions: str = Field(
         ...,
@@ -2120,7 +2121,7 @@ class SupervisorDecision(BaseModel):
         default_factory=dict,
         description=(
             "Manual status overrides keyed by task_id. "
-            "Python-owned status transitions. LLM advisory output cannot set this field."
+            "Python-owned status transitions; untrusted callers cannot set this field."
         ),
     )
 
@@ -2161,7 +2162,7 @@ class SupervisorDecision(BaseModel):
             if status not in _allowed:
                 raise ValueError(
                     f"task_status_updates['{tid}'] = '{status}' is not allowed; "
-                    "only QA_PASSED and UNFIXABLE may be set by the LLM."
+                    "only QA_PASSED and UNFIXABLE may be set by the Supervisor guardrail."
                 )
         return self
 
@@ -2175,11 +2176,11 @@ class TaskSpawnRequest(BaseModel):
     """
     A request from the supervisor to spawn a new child ``RemediationTask``.
 
-    The supervisor submits these inside ``SupervisorDecision.spawn_requests``;
+    The Supervisor submits these inside ``SupervisorDecision.spawn_requests``;
     the Python guardrail layer materializes the actual ``RemediationTask`` by
     assigning ``task_id``, ``parent_group_id``, ``status``, ``retry_count``,
-    and ``ancestry_depth``. The LLM never creates raw ``RemediationTask``
-    objects directly.
+    and ``ancestry_depth``. Callers never create raw ``RemediationTask``
+    objects through this contract.
     """
 
     model_config = ConfigDict(frozen=True)
