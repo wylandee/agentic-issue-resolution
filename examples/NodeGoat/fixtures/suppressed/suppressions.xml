@@ -1,0 +1,584 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for bootstrap (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/bootstrap@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for handlebars (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/handlebars@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for jquery (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/jquery@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for jquery-ui (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/jquery\-ui@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for jquery-ui-dialog (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/jquery\-ui\-dialog@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for lodash (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/lodash@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for moment.js (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/moment\.js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for underscore.js (javascript)</notes>
+        <packageUrl regex="true">^pkg:javascript/underscore\.js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep adm-zip as a selected NodeGoat fixture</notes>
+        <packageUrl regex="true">^pkg:npm/adm\-zip@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ajv (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ajv@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ansi-regex (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ansi\-regex@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for async (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/async@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for babel-traverse (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/babel\-traverse@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for bl (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/bl@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for body-parser (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/body\-parser@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for brace-expansion (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/brace\-expansion@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for braces (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/braces@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for bson (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/bson@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for chownr (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/chownr@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for cookie (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/cookie@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for cross-spawn (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/cross\-spawn@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for cryptiles (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/cryptiles@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for debug (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/debug@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for decode-uri-component (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/decode\-uri\-component@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for diff (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/diff@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for dot-prop (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/dot\-prop@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for es5-ext (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/es5\-ext@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for express (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/express@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for extend (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/extend@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for extract-zip (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/extract\-zip@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for faye-websocket (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/faye\-websocket@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for form-data (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/form\-data@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for fsevents (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/fsevents@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for fstream (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/fstream@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for getobject (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/getobject@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for got (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep growl as a selected NodeGoat fixture</notes>
+        <packageUrl regex="true">^pkg:npm/growl@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for grunt (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/grunt@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/grunt\-cli@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for handlebars (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/handlebars@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for hawk (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/hawk@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for helmet-csp (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/helmet\-csp@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for hoek (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/hoek@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for hosted-git-info (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/hosted\-git\-info@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for i (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/i@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep ini as a selected NodeGoat fixture</notes>
+        <packageUrl regex="true">^pkg:npm/ini@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for is-my-json-valid (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/is\-my\-json\-valid@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for js-yaml (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/js\-yaml@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for json-schema (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/json\-schema@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for jsonpointer (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/jsonpointer@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for kind-of (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/kind\-of@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for lodash (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/lodash@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep marked as a selected NodeGoat fixture</notes>
+        <packageUrl regex="true">^pkg:npm/marked@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for micromatch (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/micromatch@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for mime (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/mime@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for minimatch (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/minimatch@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for minimist (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/minimist@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for mixin-deep (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/mixin\-deep@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for moment (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/moment@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep mongodb as a selected NodeGoat fixture</notes>
+        <packageUrl regex="true">^pkg:npm/mongodb@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ms (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ms@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for nconf (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/nconf@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for node-uuid (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/node\-uuid@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for npm (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/npm@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for npm-user-validate (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/npm\-user\-validate@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for on-headers (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/on\-headers@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for path-parse (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/path\-parse@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for path-to-regexp (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/path\-to\-regexp@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for qs (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/qs@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ramda (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ramda@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for randomatic (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/randomatic@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for request (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/request@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for semver (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/semver@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for send (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/send@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for serve-static (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/serve\-static@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for set-value (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/set\-value@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for shelljs (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/shelljs@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for sshpk (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/sshpk@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for stringstream (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/stringstream@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for swig (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/swig@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for tar (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/tar@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for tmp (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/tmp@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for tough-cookie (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/tough\-cookie@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for trim-newlines (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/trim\-newlines@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for tunnel-agent (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/tunnel\-agent@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for uglify-js (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/uglify\-js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for undefsafe (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/undefsafe@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for underscore (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/underscore@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for uuid (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/uuid@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for websocket-driver (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/websocket\-driver@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for websocket-extensions (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/websocket\-extensions@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ws (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ws@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for xml2js (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/xml2js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for y18n (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/y18n@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for yargs-parser (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/yargs\-parser@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+</suppressions>
