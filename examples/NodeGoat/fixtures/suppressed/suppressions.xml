@@ -7,13 +7,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep handlebars as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for handlebars (javascript)</notes>
         <packageUrl regex="true">^pkg:javascript/handlebars@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for jquery (javascript)</notes>
@@ -123,11 +121,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for cross-spawn (npm)</notes>
+        <notes>Keep cross-spawn as a selected NodeGoat fixture</notes>
         <packageUrl regex="true">^pkg:npm/cross\-spawn@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for cryptiles (npm)</notes>
@@ -237,13 +237,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep handlebars as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for handlebars (npm)</notes>
         <packageUrl regex="true">^pkg:npm/handlebars@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for hawk (npm)</notes>
@@ -323,11 +321,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for micromatch (npm)</notes>
+        <notes>Keep micromatch as a selected NodeGoat fixture</notes>
         <packageUrl regex="true">^pkg:npm/micromatch@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for mime (npm)</notes>
@@ -347,13 +347,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep mixin-deep as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for mixin-deep (npm)</notes>
         <packageUrl regex="true">^pkg:npm/mixin\-deep@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for moment (npm)</notes>
@@ -421,13 +419,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep ramda as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for ramda (npm)</notes>
         <packageUrl regex="true">^pkg:npm/ramda@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for randomatic (npm)</notes>
