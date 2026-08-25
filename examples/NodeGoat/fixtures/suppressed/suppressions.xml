@@ -49,13 +49,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep adm-zip as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for adm-zip (npm)</notes>
         <packageUrl regex="true">^pkg:npm/adm\-zip@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for ajv (npm)</notes>
@@ -123,11 +121,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for cross-spawn (npm)</notes>
+        <notes>Keep cross-spawn as a selected NodeGoat fixture</notes>
         <packageUrl regex="true">^pkg:npm/cross\-spawn@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for cryptiles (npm)</notes>
@@ -219,13 +219,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep growl as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for growl (npm)</notes>
         <packageUrl regex="true">^pkg:npm/growl@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for grunt (npm)</notes>
@@ -275,13 +273,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep ini as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for ini (npm)</notes>
         <packageUrl regex="true">^pkg:npm/ini@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for is-my-json-valid (npm)</notes>
@@ -319,19 +315,19 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep marked as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for marked (npm)</notes>
         <packageUrl regex="true">^pkg:npm/marked@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for micromatch (npm)</notes>
+        <notes>Keep micromatch as a selected NodeGoat fixture</notes>
         <packageUrl regex="true">^pkg:npm/micromatch@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for mime (npm)</notes>
@@ -363,13 +359,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep mongodb as a selected NodeGoat fixture</notes>
+        <notes>Suppress all vulnerabilities for mongodb (npm)</notes>
         <packageUrl regex="true">^pkg:npm/mongodb@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for ms (npm)</notes>

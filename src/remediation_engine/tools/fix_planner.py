@@ -259,12 +259,14 @@ def _contains_workaround_snippet(text: str) -> bool:
 def _extract_fixed_from_osv_vuln(
     vuln: dict[str, Any],
     package_name: str,
+    current_version: str | None = None,
 ) -> tuple[str | None, list[str] | None]:
     """
     Walk an OSV vuln object's ``affected[].ranges[].events[]`` to find a
     non-Git ``fixed`` version.
 
-    Prefers SEMVER ranges; falls back to ECOSYSTEM; skips GIT commit ranges.
+    Prefers SEMVER ranges; falls back to ECOSYSTEM; checks database_specific
+    extracted_events for GIT ranges before skipping raw commit hashes.
     """
     preferred: list[str] = []
     fallback: list[str] = []
@@ -279,7 +281,14 @@ def _extract_fixed_from_osv_vuln(
         for rng in affected.get("ranges") or []:
             rng_type = (rng.get("type") or "").upper()
             if rng_type == "GIT":
+                db_specific = rng.get("database_specific") or {}
+                extracted = db_specific.get("extracted_events") or []
+                for event in extracted:
+                    fixed = event.get("fixed")
+                    if fixed:
+                        fallback.append(str(fixed))
                 continue  # commit hashes are not useful for manifest pins
+
             for event in rng.get("events") or []:
                 fixed = event.get("fixed")
                 if fixed:
@@ -288,15 +297,22 @@ def _extract_fixed_from_osv_vuln(
                     else:
                         fallback.append(str(fixed))
 
-    fixed = _minimum_fixed_version(preferred or fallback)
+    fixed = _minimum_fixed_version(preferred or fallback, current_version=current_version)
     if fixed:
         return fixed, None
 
     return None, _extract_osv_workaround_snippets(vuln)
 
 
-def _minimum_fixed_version(versions: list[str]) -> str | None:
-    """Return the lowest semver-like version from a collection of fixes."""
+def _minimum_fixed_version(
+    versions: list[str],
+    current_version: str | None = None,
+) -> str | None:
+    """Return the lowest appropriate semver-like version from a collection of fixes.
+
+    If current_version is provided, prioritizes fixes in the same major series
+    (or the lowest fix >= current_version) over lower major backports.
+    """
     parsed: list[tuple[tuple[int, int, int, int, str], str]] = []
     for raw in versions:
         match = re.search(
@@ -313,11 +329,34 @@ def _minimum_fixed_version(versions: list[str]) -> str | None:
         parsed.append((key, str(raw).strip().lstrip("vV")))
     if not parsed:
         return None
+
+    if current_version:
+        cur_match = re.search(
+            r"(?i)v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?",
+            str(current_version).strip(),
+        )
+        if cur_match:
+            cur_major = int(cur_match.group(1))
+            cur_minor = int(cur_match.group(2) or 0)
+            cur_patch = int(cur_match.group(3) or 0)
+            cur_prerelease = cur_match.group(4) or ""
+            cur_key = (cur_major, cur_minor, cur_patch, 0 if cur_prerelease else 1, cur_prerelease)
+
+            # 1. Look for same-major fixes that are >= current_version
+            same_major = [item for item in parsed if item[0][0] == cur_major and item[0] >= cur_key]
+            if same_major:
+                return min(same_major, key=lambda item: item[0])[1]
+
+            # 2. Look for higher major fixes that are >= current_version
+            higher_fixes = [item for item in parsed if item[0] >= cur_key]
+            if higher_fixes:
+                return min(higher_fixes, key=lambda item: item[0])[1]
+
     return min(parsed, key=lambda item: item[0])[1]
 
 
 def _fetch_osv_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
-    """GET /v1/vulns/{id} â€” fetch a single OSV advisory in full detail."""
+    """GET /v1/vulns/{id} — fetch a single OSV advisory in full detail."""
     url = OSV_VULN_URL.format(vuln_id=vuln_id)
     try:
         resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
@@ -336,6 +375,7 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
     1. Build a querybatch query using package+version.
     2. If the result already embeds ``affected`` ranges, extract the fix.
     3. If it only returns vuln IDs, fetch each via GET /v1/vulns/{id}.
+    4. Follow aliases (e.g. CVE -> GHSA) to retrieve structured ecosystem fix versions.
     """
     package_name = _package_name_from_issue(issue)
     if not package_name:
@@ -352,8 +392,9 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
 
     query: dict[str, Any] = {"package": {"name": package_name, "ecosystem": eco}}
 
-    if issue.package_version:
-        query["version"] = issue.package_version
+    current_version = getattr(issue, "package_version", None)
+    if current_version:
+        query["version"] = current_version
 
     try:
         resp = requests.post(
@@ -373,6 +414,7 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
 
     workaround_snippets: list[str] = []
     fixed_versions: list[str] = []
+    fetched_details: dict[str, dict[str, Any]] = {}
 
     def _merge_snippets(snippets: list[str] | None) -> None:
         if not snippets:
@@ -391,6 +433,14 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
         vuln for result in results for vuln in (result.get("vulns") or []) if isinstance(vuln, dict)
     ]
 
+    def _get_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
+        if vuln_id in fetched_details:
+            return fetched_details[vuln_id]
+        detail = _fetch_osv_vuln_detail(vuln_id)
+        if detail:
+            fetched_details[vuln_id] = detail
+        return detail
+
     def _matches_issue(vuln: dict[str, Any]) -> bool:
         if not wanted_ids:
             return True
@@ -399,27 +449,51 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
             for identifier in [vuln.get("id"), *(vuln.get("aliases") or [])]
             if identifier
         }
-        return bool(wanted_ids & returned_ids)
+        if bool(wanted_ids & returned_ids):
+            return True
+        vuln_id = vuln.get("id")
+        if vuln_id and not vuln.get("aliases") and not vuln.get("affected"):
+            detail = _get_vuln_detail(str(vuln_id))
+            if detail:
+                detail_ids = {
+                    str(identifier).strip().lower()
+                    for identifier in [detail.get("id"), *(detail.get("aliases") or [])]
+                    if identifier
+                }
+                return bool(wanted_ids & detail_ids)
+        return False
 
     matching_vulns = [vuln for vuln in all_vulns if _matches_issue(vuln)]
 
-    def _consume_vuln(vuln: dict[str, Any]) -> None:
-        if "affected" in vuln:
-            fixed, snippets = _extract_fixed_from_osv_vuln(vuln, package_name)
-            if fixed:
-                fixed_versions.append(fixed)
-            _merge_snippets(snippets)
-            return
-
+    def _consume_vuln(vuln: dict[str, Any], depth: int = 0) -> None:
+        vuln_to_process = vuln
         vuln_id = vuln.get("id")
-        if not vuln_id:
-            return
-        detail = _fetch_osv_vuln_detail(str(vuln_id))
-        if detail:
-            fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
-            if fixed:
-                fixed_versions.append(fixed)
+        if "affected" not in vuln and vuln_id:
+            detail = _get_vuln_detail(str(vuln_id))
+            if detail:
+                vuln_to_process = detail
+
+        fixed, snippets = _extract_fixed_from_osv_vuln(
+            vuln_to_process, package_name, current_version=current_version
+        )
+        if fixed:
+            fixed_versions.append(fixed)
+        elif snippets:
             _merge_snippets(snippets)
+
+        # If no fixed version found directly, traverse ecosystem aliases (e.g. CVE -> GHSA)
+        if not fixed and depth == 0 and isinstance(vuln_to_process, dict):
+            aliases = vuln_to_process.get("aliases") or []
+            for alias in aliases:
+                alias_id = str(alias).strip()
+                if (
+                    alias_id
+                    and alias_id.upper() != str(vuln_id).upper()
+                    and alias_id.upper().startswith("GHSA-")
+                ):
+                    alias_detail = _get_vuln_detail(alias_id)
+                    if alias_detail:
+                        _consume_vuln(alias_detail, depth=depth + 1)
 
     for vuln in matching_vulns:
         _consume_vuln(vuln)
@@ -432,15 +506,12 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
             getattr(issue, "ghsa_id", None),
         ):
             if vuln_id:
-                detail = _fetch_osv_vuln_detail(str(vuln_id))
+                detail = _get_vuln_detail(str(vuln_id))
                 if detail:
-                    fixed, snippets = _extract_fixed_from_osv_vuln(detail, package_name)
-                    if fixed:
-                        fixed_versions.append(fixed)
-                    _merge_snippets(snippets)
+                    _consume_vuln(detail)
 
     if fixed_versions:
-        return _minimum_fixed_version(fixed_versions), None
+        return _minimum_fixed_version(fixed_versions, current_version=current_version), None
     return None, (workaround_snippets or None)
 
 

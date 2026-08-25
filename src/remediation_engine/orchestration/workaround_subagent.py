@@ -1502,12 +1502,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 or has_tool_call_before_first_successful_edit(
                     runtime.tool_events,
                     lookup_tool_name="record_plan",
-                    edit_tool_name="deterministic_search_replace",
+                    edit_tool_names="deterministic_search_replace",
                 )
                 or has_tool_call_before_first_successful_edit(
                     runtime.tool_events,
                     lookup_tool_name="record_plan",
-                    edit_tool_name="deterministic_replace_ast_symbol",
+                    edit_tool_names="deterministic_replace_ast_symbol",
                 )
             )
 
