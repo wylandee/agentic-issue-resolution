@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -208,7 +209,7 @@ def test_trajectory_to_test_case_conversion() -> None:
     test_case = trajectory_to_test_case(span, doc=doc)
     assert test_case.input == "Triage prompt for CVE-2021-44228"
     assert "ACTIONABLE" in test_case.actual_output
-    assert test_case.latency == 1.25
+    assert test_case.completion_time == 1.25
     assert test_case.context is not None
     assert "sca:lodash:UPDATE_VERSION" in test_case.context[0]
     assert test_case.additional_metadata is not None
@@ -314,6 +315,18 @@ def test_eval_settings_fixture(eval_settings: EvalSettings) -> None:
     assert isinstance(eval_settings.is_live, bool)
     assert isinstance(eval_settings.trajectory_dir, Path)
     assert isinstance(eval_settings.golden_dir, Path)
+
+
+def test_eval_settings_env_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that eval_settings resolves custom EVAL_JUDGE_MODEL from environment."""
+    from tests.evals import conftest
+
+    monkeypatch.setenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
+    # Simulate eval_settings construction
+    judge = (
+        os.environ.get("EVAL_JUDGE_MODEL", "").strip() or conftest._INITIAL_JUDGE_MODEL or "gpt-4o"
+    )
+    assert judge == "gpt-4o-mini"
 
 
 def test_golden_loader_fixture(

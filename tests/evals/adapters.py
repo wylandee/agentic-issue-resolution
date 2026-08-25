@@ -48,8 +48,8 @@ except ImportError:
         retrieval_context: list[str] | None = None
         tools_called: list[DeepEvalToolCall] | None = None
         expected_tools: list[DeepEvalToolCall] | None = None
-        latency: float | None = None
-        cost: float | None = None
+        completion_time: float | None = None
+        token_cost: float | None = None
         additional_metadata: dict[str, Any] | None = None
 
 
@@ -804,8 +804,8 @@ def trajectory_to_test_case(
         context=context_list if context_list else None,
         tools_called=tools_called if tools_called else None,
         expected_tools=expected_tools,
-        latency=span.duration_seconds,
-        cost=None,
+        completion_time=span.duration_seconds,
+        token_cost=None,
         additional_metadata=meta,
     )
 

@@ -24,6 +24,30 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "data" / "trajectories"
 _DEFAULT_GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 
+# Load .env values if present in repository root
+_DOTENV_PATH = _PROJECT_ROOT / ".env"
+_DOTENV_VARS: dict[str, str] = {}
+if _DOTENV_PATH.exists():
+    try:
+        from dotenv import dotenv_values
+
+        _DOTENV_VARS = {
+            str(k): str(v) for k, v in dotenv_values(_DOTENV_PATH).items() if v is not None
+        }
+    except Exception:
+        _DOTENV_VARS = {}
+
+# Preserve API key and judge model at import time before root conftest isolation strips them
+_INITIAL_OPENAI_API_KEY = (
+    os.environ.get("OPENAI_API_KEY", "").strip() or _DOTENV_VARS.get("OPENAI_API_KEY", "").strip()
+)
+_INITIAL_JUDGE_MODEL = (
+    os.environ.get("EVAL_JUDGE_MODEL", "").strip()
+    or _DOTENV_VARS.get("EVAL_JUDGE_MODEL", "").strip()
+    or _DOTENV_VARS.get("REMEDY_LLM_MODEL", "").strip()
+    or "gpt-4o"
+)
+
 
 # ---------------------------------------------------------------------------
 # Command-Line Option & Marker Registration
@@ -64,15 +88,31 @@ class EvalSettings:
     golden_dir: Path
 
 
+@pytest.fixture(autouse=True)
+def preserve_eval_credentials(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restore OPENAI_API_KEY and judge settings when running live evals despite root conftest isolation."""
+    is_live = bool(request.config.getoption("--run-eval-live", default=False))
+    if is_live:
+        key = os.environ.get("OPENAI_API_KEY", "").strip() or _INITIAL_OPENAI_API_KEY
+        if key:
+            monkeypatch.setenv("OPENAI_API_KEY", key)
+        judge = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL
+        if judge:
+            monkeypatch.setenv("EVAL_JUDGE_MODEL", judge)
+
+
 @pytest.fixture
 def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
     """Provide configuration settings for DeepEval evaluation runs.
 
-    Reads ``EVAL_JUDGE_MODEL`` (defaults to 'gpt-4o') and respects ``--run-eval-live``.
+    Reads ``EVAL_JUDGE_MODEL`` (defaults to .env value or 'gpt-4o') and respects ``--run-eval-live``.
     """
-    judge_model = os.environ.get("EVAL_JUDGE_MODEL", "gpt-4o").strip() or "gpt-4o"
+    judge_model = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-4o"
     is_live = bool(request.config.getoption("--run-eval-live", default=False))
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip() or _INITIAL_OPENAI_API_KEY
 
     trajectory_dir_env = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
     trajectory_dir = Path(trajectory_dir_env) if trajectory_dir_env else _DEFAULT_TRAJECTORY_DIR
@@ -225,3 +265,14 @@ def load_golden_cases() -> Callable[[str], list[dict[str, Any]]]:
         return []
 
     return _loader
+
+
+@pytest.fixture
+def report_golden_cases(
+    load_golden_cases: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Provide curated report evaluation cases from golden/report_cases.json."""
+    cases = load_golden_cases("report_cases")
+    if not cases:
+        pytest.skip("No golden report cases found in tests/evals/golden/report_cases.json")
+    return cases
