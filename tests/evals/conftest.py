@@ -29,8 +29,9 @@ _DOTENV_PATH = _PROJECT_ROOT / ".env"
 _DOTENV_VARS: dict[str, str] = {}
 if _DOTENV_PATH.exists():
     try:
-        from dotenv import dotenv_values
+        from dotenv import dotenv_values, load_dotenv
 
+        load_dotenv(_DOTENV_PATH, override=False)
         _DOTENV_VARS = {
             str(k): str(v) for k, v in dotenv_values(_DOTENV_PATH).items() if v is not None
         }
@@ -46,6 +47,9 @@ _INITIAL_JUDGE_MODEL = (
     or _DOTENV_VARS.get("EVAL_JUDGE_MODEL", "").strip()
     or _DOTENV_VARS.get("REMEDY_LLM_MODEL", "").strip()
     or "gpt-4o"
+)
+_INITIAL_EVAL_RUN_LIVE = (
+    os.environ.get("EVAL_RUN_LIVE", "").strip() or _DOTENV_VARS.get("EVAL_RUN_LIVE", "").strip()
 )
 
 
@@ -94,7 +98,10 @@ def preserve_eval_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Restore OPENAI_API_KEY and judge settings when running live evals despite root conftest isolation."""
-    is_live = bool(request.config.getoption("--run-eval-live", default=False))
+    is_live = bool(request.config.getoption("--run-eval-live", default=False)) or (
+        os.environ.get("EVAL_RUN_LIVE", "").strip().lower() in ("true", "1")
+        or _INITIAL_EVAL_RUN_LIVE.lower() in ("true", "1")
+    )
     if is_live:
         key = os.environ.get("OPENAI_API_KEY", "").strip() or _INITIAL_OPENAI_API_KEY
         if key:
@@ -102,16 +109,21 @@ def preserve_eval_credentials(
         judge = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL
         if judge:
             monkeypatch.setenv("EVAL_JUDGE_MODEL", judge)
+        monkeypatch.setenv("EVAL_RUN_LIVE", "true")
 
 
 @pytest.fixture
 def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
     """Provide configuration settings for DeepEval evaluation runs.
 
-    Reads ``EVAL_JUDGE_MODEL`` (defaults to .env value or 'gpt-4o') and respects ``--run-eval-live``.
+    Reads ``EVAL_JUDGE_MODEL`` (defaults to .env value or 'gpt-4o') and respects ``--run-eval-live``
+    or ``EVAL_RUN_LIVE=true``.
     """
     judge_model = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-4o"
-    is_live = bool(request.config.getoption("--run-eval-live", default=False))
+    is_live = bool(request.config.getoption("--run-eval-live", default=False)) or (
+        os.environ.get("EVAL_RUN_LIVE", "").strip().lower() in ("true", "1")
+        or _INITIAL_EVAL_RUN_LIVE.lower() in ("true", "1")
+    )
     api_key = os.environ.get("OPENAI_API_KEY", "").strip() or _INITIAL_OPENAI_API_KEY
 
     trajectory_dir_env = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
@@ -275,4 +287,28 @@ def report_golden_cases(
     cases = load_golden_cases("report_cases")
     if not cases:
         pytest.skip("No golden report cases found in tests/evals/golden/report_cases.json")
+    return cases
+
+
+@pytest.fixture
+def triage_golden_cases(
+    load_golden_cases: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Provide curated triage evaluation cases from golden/triage_cases.json."""
+    all_cases = load_golden_cases("triage_cases")
+    cases = [c for c in all_cases if c.get("eval_type", "triage") == "triage"]
+    if not cases:
+        pytest.skip("No golden triage cases found in tests/evals/golden/triage_cases.json")
+    return cases
+
+
+@pytest.fixture
+def fix_planner_golden_cases(
+    load_golden_cases: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Provide curated fix planner evaluation cases from golden/triage_cases.json."""
+    all_cases = load_golden_cases("triage_cases")
+    cases = [c for c in all_cases if c.get("eval_type") == "fix_planner"]
+    if not cases:
+        pytest.skip("No golden fix planner cases found in tests/evals/golden/triage_cases.json")
     return cases
