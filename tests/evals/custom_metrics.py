@@ -284,3 +284,287 @@ class FixPlannerSchemaMetric(BaseMetric):
     def is_successful(self) -> bool:
         """Return whether metric passed the threshold."""
         return bool(self.success)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: QA Structured Output Metric
+# ---------------------------------------------------------------------------
+
+
+class QAStructuredOutputMetric(BaseMetric):
+    """Metric validating structured output invariants of QACriticLLMOutput.
+
+    Structural invariants enforced:
+      1. task_id must be non-empty.
+      2. If passed == True, failure_category and retry_feedback must both be None.
+      3. If passed == False, failure_category must be non-null and valid, and retry_feedback non-empty.
+      4. failure_category must be one of 'security_flag', 'peer_conflict', 'breaking_change'.
+      5. If semantic_security_review is present, verdict must be 'pass', 'fail', or 'inconclusive';
+         when verdict == 'pass', evidence_refs must be a non-empty list of non-empty strings.
+      6. If test_attribution is present, verdict must be 'responsible', 'exonerated', or 'inconclusive'.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 1.0,
+        verbose_mode: bool = True,
+    ) -> None:
+        """Initialize the QA structured output metric.
+
+        Args:
+            threshold: Minimum score required for success (default 1.0).
+            verbose_mode: Whether to generate detailed diagnostic reasons.
+        """
+        self.threshold = threshold
+        self.verbose_mode = verbose_mode
+        self.score = None
+        self.reason = None
+        self.success = None
+        self.evaluation_model = "deterministic-schema-validation"
+
+    @property
+    def __name__(self) -> str:
+        """Metric display name."""
+        return "QA Structured Output Invariants"
+
+    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+        """Validate QACriticLLMOutput invariants on the provided test case.
+
+        Expected metadata keys on test_case:
+          - 'task_id': str
+          - 'passed': bool
+          - 'failure_category': str | None
+          - 'retry_feedback': str | None
+          - 'semantic_security_review': dict | None
+          - 'test_attribution': dict | None
+        """
+        meta = getattr(test_case, "additional_metadata", {}) or {}
+
+        task_id = meta.get("task_id")
+        passed = meta.get("passed")
+        failure_category = meta.get("failure_category")
+        retry_feedback = meta.get("retry_feedback")
+        security_review = meta.get("semantic_security_review")
+        test_attribution = meta.get("test_attribution")
+
+        violations: list[str] = []
+
+        if not task_id or not str(task_id).strip():
+            violations.append("task_id must be a non-empty string.")
+
+        if not isinstance(passed, bool):
+            violations.append(f"'passed' must be a boolean, got {type(passed).__name__}.")
+
+        valid_categories = {"security_flag", "peer_conflict", "breaking_change"}
+
+        if passed is True:
+            if failure_category is not None:
+                violations.append(
+                    f"passed=True requires failure_category=None, got '{failure_category}'."
+                )
+            if retry_feedback is not None and str(retry_feedback).strip():
+                violations.append(
+                    f"passed=True requires retry_feedback=None, got '{retry_feedback}'."
+                )
+        elif passed is False:
+            if failure_category is None:
+                violations.append("passed=False requires a non-null failure_category.")
+            elif str(failure_category).lower() not in valid_categories:
+                violations.append(
+                    f"Invalid failure_category '{failure_category}'. Must be one of {sorted(valid_categories)}."
+                )
+            if not retry_feedback or not str(retry_feedback).strip():
+                violations.append("passed=False requires a non-empty retry_feedback string.")
+
+        if security_review is not None and isinstance(security_review, dict):
+            verdict = str(security_review.get("verdict", "")).lower()
+            valid_verdicts = {"pass", "fail", "inconclusive"}
+            if verdict not in valid_verdicts:
+                violations.append(
+                    f"Invalid semantic_security_review.verdict '{verdict}'. Must be one of {sorted(valid_verdicts)}."
+                )
+            if verdict == "pass":
+                refs = security_review.get("evidence_refs", [])
+                if not refs or not isinstance(refs, list) or not any(str(r).strip() for r in refs):
+                    violations.append(
+                        "semantic_security_review with verdict='pass' requires non-empty evidence_refs."
+                    )
+
+        if test_attribution is not None and isinstance(test_attribution, dict):
+            attr_verdict = str(test_attribution.get("verdict", "")).lower()
+            valid_attr_verdicts = {"responsible", "exonerated", "inconclusive"}
+            if attr_verdict not in valid_attr_verdicts:
+                violations.append(
+                    f"Invalid test_attribution.verdict '{attr_verdict}'. Must be one of {sorted(valid_attr_verdicts)}."
+                )
+
+        if violations:
+            self.score = 0.0
+            self.reason = "QACriticLLMOutput violations: " + "; ".join(violations)
+        else:
+            self.score = 1.0
+            self.reason = (
+                f"QACriticLLMOutput satisfies all structured output invariants (passed={passed})."
+            )
+
+        self.success = self.score >= self.threshold
+        return self.score
+
+    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+        """Async implementation delegating to synchronous measure."""
+        return self.measure(test_case, *args, **kwargs)
+
+    def is_successful(self) -> bool:
+        """Return whether metric passed the threshold."""
+        return bool(self.success)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: QA Guardrail Consistency Metric
+# ---------------------------------------------------------------------------
+
+
+class QAGuardrailConsistencyMetric(BaseMetric):
+    """Metric evaluating whether deterministic QA policy guardrails override LLM QA decisions.
+
+    A score of 1.0 indicates that the LLM verdict (passed, failure_category, security review)
+    is in full alignment with the engine's deterministic policy gates for the target QAPolicy.
+    A score of 0.0 indicates that post-LLM guardrails would override the verdict.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 1.0,
+        verbose_mode: bool = True,
+    ) -> None:
+        """Initialize the QA guardrail consistency metric.
+
+        Args:
+            threshold: Minimum score required for success (default 1.0).
+            verbose_mode: Whether to generate detailed diagnostic reasons.
+        """
+        self.threshold = threshold
+        self.verbose_mode = verbose_mode
+        self.score = None
+        self.reason = None
+        self.success = None
+        self.evaluation_model = "deterministic-qa-guardrails"
+
+    @property
+    def __name__(self) -> str:
+        """Metric display name."""
+        return "QA Guardrail Consistency"
+
+    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+        """Measure guardrail alignment for the provided QA test case.
+
+        Expected metadata keys on test_case:
+          - 'qa_policy': str
+          - 'execution_context': dict (install_passed, scanner_execution_status, target_remaining_identifiers, tests_passed, package_manifest_state, package_graph_state)
+          - 'llm_passed': bool
+          - 'llm_failure_category': str | None
+          - 'llm_security_review': dict | None
+        """
+        meta = getattr(test_case, "additional_metadata", {}) or {}
+
+        qa_policy_str = str(meta.get("qa_policy", "version_bump")).lower()
+        ctx = meta.get("execution_context", {})
+        llm_passed = bool(meta.get("llm_passed", False))
+        llm_category = meta.get("llm_failure_category")
+        llm_sec_review = meta.get("llm_security_review")
+
+        install_passed = bool(ctx.get("install_passed", True))
+        scanner_status = str(ctx.get("scanner_execution_status", "success")).lower()
+        remaining = list(ctx.get("target_remaining_identifiers", []))
+        tests_passed = ctx.get("tests_passed")
+        manifest_state = str(ctx.get("package_manifest_state", "present")).lower()
+        graph_state = str(ctx.get("package_graph_state", "present")).lower()
+
+        overrides: list[str] = []
+
+        # 1. Install failure rule
+        if not install_passed:
+            if llm_passed:
+                overrides.append("Install failed but LLM marked passed=True.")
+            elif llm_category not in ("peer_conflict", "security_flag", "breaking_change"):
+                overrides.append(
+                    f"Install failed but LLM gave unexpected category '{llm_category}'."
+                )
+
+        # 2. Strict scanner policies (version_bump, no_fix_package_removal)
+        strict_scanner_policies = {"version_bump", "no_fix_package_removal"}
+        if qa_policy_str in strict_scanner_policies and scanner_status == "success" and remaining:
+            if llm_passed:
+                overrides.append(
+                    f"Remaining scanner findings {remaining} require passed=False (SECURITY_FLAG), but LLM marked passed=True."
+                )
+            elif llm_category != "security_flag":
+                overrides.append(
+                    f"Remaining scanner findings {remaining} require failure_category=SECURITY_FLAG, but LLM assigned '{llm_category}'."
+                )
+
+        # 3. Hard test policies
+        if tests_passed is False:
+            if llm_passed:
+                overrides.append("Unit tests failed but LLM marked passed=True.")
+            elif llm_category not in ("breaking_change", "security_flag"):
+                overrides.append(
+                    f"Unit test failure requires BREAKING_CHANGE (or SECURITY_FLAG), but LLM assigned '{llm_category}'."
+                )
+
+        # 4. Workaround policies require semantic security review PASS
+        workaround_policies = {
+            "initial_code_workaround",
+            "mitigation_code_workaround",
+            "migration_code_workaround",
+            "no_fix_code_removal",
+        }
+        if qa_policy_str in workaround_policies:
+            review_verdict = (
+                str(llm_sec_review.get("verdict", "")).lower() if llm_sec_review else ""
+            )
+            review_refs = llm_sec_review.get("evidence_refs", []) if llm_sec_review else []
+            if (review_verdict != "pass" or not review_refs) and llm_passed:
+                overrides.append(
+                    f"Workaround policy '{qa_policy_str}' requires semantic_security_review verdict='pass' with evidence_refs, but review verdict was '{review_verdict}'."
+                )
+
+        # 5. Package removal manifest/graph invariants
+        if (
+            qa_policy_str == "no_fix_package_removal"
+            and (manifest_state != "absent" or graph_state != "absent")
+            and llm_passed
+        ):
+            overrides.append(
+                f"NO_FIX_PACKAGE_REMOVAL requires manifest & graph state 'absent', got manifest='{manifest_state}', graph='{graph_state}'."
+            )
+
+        # 6. Code removal manifest/graph invariants
+        if (
+            qa_policy_str == "no_fix_code_removal"
+            and (manifest_state != "present" or graph_state != "present")
+            and llm_passed
+        ):
+            overrides.append(
+                f"NO_FIX_CODE_REMOVAL requires package present in manifest & graph, got manifest='{manifest_state}', graph='{graph_state}'."
+            )
+
+        if overrides:
+            self.score = 0.0
+            self.reason = "Deterministic guardrail overrides: " + "; ".join(overrides)
+        else:
+            self.score = 1.0
+            self.reason = (
+                f"LLM QA verdict aligns with deterministic policy gates for '{qa_policy_str}'."
+            )
+
+        self.success = self.score >= self.threshold
+        return self.score
+
+    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+        """Async implementation delegating to synchronous measure."""
+        return self.measure(test_case, *args, **kwargs)
+
+    def is_successful(self) -> bool:
+        """Return whether metric passed the threshold."""
+        return bool(self.success)

@@ -312,3 +312,14 @@ def fix_planner_golden_cases(
     if not cases:
         pytest.skip("No golden fix planner cases found in tests/evals/golden/triage_cases.json")
     return cases
+
+
+@pytest.fixture
+def qa_golden_cases(
+    load_golden_cases: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Provide curated QA critic evaluation cases from golden/qa_cases.json."""
+    cases = load_golden_cases("qa_cases")
+    if not cases:
+        pytest.skip("No golden QA cases found in tests/evals/golden/qa_cases.json")
+    return cases
