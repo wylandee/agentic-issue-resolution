@@ -6,15 +6,18 @@
 /data/clones/*
 /data/trajectories/*
 /data/reports/*
+/data/evals/*
 /data/*.csv
 /data/*.json
 /data/*.jsonl
 /data/*.txt
+/data/*.db
 
 # Keep the directory structure intact in git
 !/data/clones/.gitkeep
 !/data/trajectories/.gitkeep
 !/data/reports/.gitkeep
+!/data/evals/.gitkeep
 
 # Triage enrichment cache (KEV JSON, future EPSS cache)
 /data/cache/*
