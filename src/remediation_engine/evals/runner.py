@@ -23,6 +23,8 @@ SUITE_PATHS: dict[str, list[str]] = {
     ],
     "update_subagent": ["tests/evals/test_update_subagent_eval.py"],
     "workaround_subagent": ["tests/evals/test_workaround_subagent_eval.py"],
+    "qa": ["tests/evals/test_qa_critic_eval.py"],
+    "qa_critic": ["tests/evals/test_qa_critic_eval.py"],
     "report": ["tests/evals/test_report_eval.py"],
     "triage": ["tests/evals/test_triage_eval.py"],
     "fix_planner": ["tests/evals/test_fix_planner_eval.py"],
