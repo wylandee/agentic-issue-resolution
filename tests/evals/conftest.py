@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +73,127 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "eval: DeepEval LLM evaluation tests (requires OPENAI_API_KEY when running live)",
     )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Persist all DeepEval evaluation test results to the SQLite evaluation database."""
+    try:
+        from deepeval.test_run import global_test_run_manager
+
+        from remediation_engine.evals.db import EvalDatabase
+        from remediation_engine.evals.models import (
+            EvalRunRecord,
+            EvalTestCaseRecord,
+            MetricRecord,
+        )
+    except ImportError:
+        return
+
+    test_run = global_test_run_manager.get_test_run()
+    if not test_run or not getattr(test_run, "test_cases", None):
+        return
+
+    run_id = (
+        getattr(test_run, "identifier", None)
+        or f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    )
+    now_iso = datetime.datetime.now().isoformat()
+    judge_model = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-4o"
+    is_live = bool(session.config.getoption("--run-eval-live", default=False))
+
+    test_case_records: list[EvalTestCaseRecord] = []
+    for tc in test_run.test_cases:
+        name_lower = (tc.name or "").lower()
+        if "report" in name_lower:
+            suite = "report"
+        elif "triage" in name_lower:
+            suite = "triage"
+        elif "fix" in name_lower or "planner" in name_lower:
+            suite = "fix_planner"
+        elif "critic" in name_lower or "qa" in name_lower:
+            suite = "qa_critic"
+        elif "subagent" in name_lower or "update" in name_lower or "workaround" in name_lower:
+            suite = "subagent"
+        else:
+            suite = "general"
+
+        metrics: list[MetricRecord] = []
+        for m in getattr(tc, "metrics_data", None) or []:
+            metrics.append(
+                MetricRecord(
+                    metric_name=m.name,
+                    score=float(m.score) if m.score is not None else 0.0,
+                    threshold=float(m.threshold) if m.threshold is not None else 0.70,
+                    success=bool(m.success),
+                    reason=getattr(m, "reason", None),
+                    evaluation_model=getattr(m, "evaluation_model", None) or judge_model,
+                    verbose_logs=getattr(m, "verbose_logs", None),
+                )
+            )
+
+        status = "PASSED" if getattr(tc, "success", True) else "FAILED"
+
+        raw_context = getattr(tc, "context", None)
+        if isinstance(raw_context, list):
+            context_str = "\n---\n".join(str(c) for c in raw_context)
+        else:
+            context_str = str(raw_context) if raw_context else None
+
+        raw_retrieval = getattr(tc, "retrieval_context", None)
+        if isinstance(raw_retrieval, list):
+            retrieval_str = "\n---\n".join(str(r) for r in raw_retrieval)
+        else:
+            retrieval_str = str(raw_retrieval) if raw_retrieval else None
+
+        test_case_records.append(
+            EvalTestCaseRecord(
+                case_id=getattr(tc, "case_id", None) or tc.name,
+                test_name=tc.name or "unnamed_test",
+                suite=suite,
+                status=status,
+                input_text=tc.input or "",
+                actual_output=tc.actual_output or "",
+                expected_output=getattr(tc, "expected_output", None),
+                context_text=context_str,
+                retrieval_context=retrieval_str,
+                latency_seconds=float(getattr(tc, "run_duration", 0.0) or 0.0),
+                cost=float(getattr(tc, "evaluation_cost", 0.0) or 0.0),
+                additional_metadata=getattr(tc, "additional_metadata", {}) or {},
+                metrics=metrics,
+            )
+        )
+
+    if not test_case_records:
+        return
+
+    total_tests = len(test_case_records)
+    passed_tests = sum(1 for r in test_case_records if r.status == "PASSED")
+    failed_tests = total_tests - passed_tests
+    duration = float(getattr(test_run, "run_duration", 0.0) or 0.0)
+    cost = float(getattr(test_run, "evaluation_cost", 0.0) or 0.0)
+
+    run_record = EvalRunRecord(
+        run_id=run_id,
+        timestamp=now_iso,
+        suite_name=getattr(test_run, "test_file", None) or "tests/evals",
+        judge_model=judge_model,
+        is_live=is_live,
+        total_tests=total_tests,
+        passed_tests=passed_tests,
+        failed_tests=failed_tests,
+        skipped_tests=0,
+        duration_seconds=duration,
+        total_cost=cost,
+        metadata={"git_branch": "feat/add-subagent-evals"},
+        test_cases=test_case_records,
+    )
+
+    try:
+        db = EvalDatabase()
+        db.save_run(run_record)
+        logger.info("Persisted %d evaluation test cases to SQLite at %s", total_tests, db.db_path)
+    except Exception as exc:
+        logger.warning("Failed to auto-persist evaluation run to SQLite: %s", exc)
 
 
 # ---------------------------------------------------------------------------

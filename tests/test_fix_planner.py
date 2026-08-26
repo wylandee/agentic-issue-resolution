@@ -57,6 +57,7 @@ from remediation_engine.tools.fix_planner import (
     _fetch_page_content,
     _is_npm_issue,
     _llm_extract_remediation,
+    _minimum_fixed_version,
     _package_name_from_issue,
     _query_osv_fixed_version,
     _query_serper,
@@ -958,3 +959,107 @@ class TestPlanFixInstructionContent:
         ):
             result = plan_fix(loc)
         assert "pnpm" in result["instruction"]
+
+
+# ===========================================================================
+# _minimum_fixed_version & context-aware version selection
+# ===========================================================================
+
+
+class TestMinimumFixedVersion:
+    def test_selects_lowest_when_no_current_version(self):
+        assert _minimum_fixed_version(["6.0.6", "7.0.5"]) == "6.0.6"
+
+    def test_selects_same_major_when_current_version_specified(self):
+        assert _minimum_fixed_version(["6.0.6", "7.0.5"], current_version="7.0.0") == "7.0.5"
+        assert _minimum_fixed_version(["6.0.6", "7.0.5"], current_version="6.0.0") == "6.0.6"
+
+    def test_selects_higher_major_when_no_same_major_available(self):
+        assert _minimum_fixed_version(["4.0.8"], current_version="3.1.10") == "4.0.8"
+
+    def test_empty_versions_returns_none(self):
+        assert _minimum_fixed_version([]) is None
+
+
+# ===========================================================================
+# OSV Alias and Database Specific Events Extraction
+# ===========================================================================
+
+
+class TestOsvAliasAndExtractedEvents:
+    def test_extract_fixed_from_database_specific_events(self):
+        vuln = {
+            "id": "CVE-2024-4067",
+            "affected": [
+                {
+                    "package": {"name": "micromatch"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "database_specific": {
+                                "extracted_events": [{"introduced": "0"}, {"fixed": "4.0.8"}]
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        fixed, snippets = _extract_fixed_from_osv_vuln(vuln, "micromatch")
+        assert fixed == "4.0.8"
+        assert snippets is None
+
+    def test_query_osv_fixed_version_follows_aliases(self):
+        issue = _make_vuln_issue(
+            package_name="micromatch",
+            package_version="3.1.10",
+            cve_id="CVE-2024-4067",
+            ghsa_id=None,
+        )
+        cve_detail = {
+            "id": "CVE-2024-4067",
+            "aliases": ["GHSA-952p-6rrq-rcjv"],
+            "affected": [
+                {
+                    "package": {"name": "micromatch"},
+                    "ranges": [{"type": "GIT"}],
+                }
+            ],
+            "details": "This should be mitigated by using safe patterns.",
+        }
+        ghsa_detail = {
+            "id": "GHSA-952p-6rrq-rcjv",
+            "aliases": ["CVE-2024-4067"],
+            "affected": [
+                {
+                    "package": {"name": "micromatch"},
+                    "ranges": [
+                        {
+                            "type": "ECOSYSTEM",
+                            "events": [{"introduced": "0"}, {"fixed": "4.0.8"}],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        def mock_fetch(vuln_id):
+            if vuln_id.upper() == "CVE-2024-4067":
+                return cve_detail
+            if vuln_id.upper() == "GHSA-952P-6RRQ-RCJV":
+                return ghsa_detail
+            return None
+
+        with (
+            patch("requests.post") as mock_post,
+            patch(
+                "remediation_engine.tools.fix_planner._fetch_osv_vuln_detail",
+                side_effect=mock_fetch,
+            ),
+        ):
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {
+                "results": [{"vulns": [{"id": "GHSA-952p-6rrq-rcjv"}]}]
+            }
+            fixed, snippets = _query_osv_fixed_version(issue)
+            assert fixed == "4.0.8"
+            assert snippets is None
