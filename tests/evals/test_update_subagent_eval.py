@@ -12,12 +12,18 @@ from tests.evals.adapters import ToolCall
 from tests.evals.conftest import EvalSettings
 from tests.evals.custom_metrics import (
     ArchitectureBoundaryMetric,
-    TaskCompletionMetric,
+    DeterministicTaskCompletionMetric,
     ToolEfficiencyMetric,
 )
 
 try:
     from deepeval import assert_test
+    from deepeval.metrics import (
+        TaskCompletionMetric as DeepEvalTaskCompletionMetric,
+    )
+    from deepeval.metrics import (
+        ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric,
+    )
     from deepeval.test_case import LLMTestCase
 
     HAS_DEEPEVAL = True
@@ -26,6 +32,8 @@ except ImportError:
 
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
+    DeepEvalTaskCompletionMetric = None  # type: ignore[assignment,misc]
+    DeepEvalToolCorrectnessMetric = None  # type: ignore[assignment,misc]
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +88,13 @@ def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
         f"Tool execution rounds: {len(tools_called)}"
     )
 
+    expected_tools: list[ToolCall] = []
+    if case.get("expected_pass", True) and status == "APPLIED":
+        if case.get("is_retry"):
+            expected_tools.append(ToolCall(name="view_npm_package_versions", input_parameters={}))
+        expected_tools.append(ToolCall(name="modify_npm_dependency", input_parameters={}))
+        expected_tools.append(ToolCall(name="validate_manifest_sync", input_parameters={}))
+
     metadata = {
         "case_id": case.get("case_id"),
         "eval_type": "update_subagent",
@@ -102,6 +117,7 @@ def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
         expected_output=f"Update {target_pkg} in manifest files and validate manifest synchronization.",
         context=[instruction, case.get("provenance", "")],
         tools_called=tools_called,
+        expected_tools=expected_tools if expected_tools else None,
         additional_metadata=metadata,
     )
 
@@ -121,8 +137,6 @@ class TestUpdateSubagentEval:
         tool_calls = case.get("tool_calls", [])
         tool_names = [tc.get("name", "") for tc in tool_calls]
 
-        # In any run that attempts manifest edits, modify_npm_dependency must be followed
-        # by validate_manifest_sync
         if "modify_npm_dependency" in tool_names:
             assert "validate_manifest_sync" in tool_names, (
                 f"Case '{case['case_id']}': 'modify_npm_dependency' was invoked without subsequent 'validate_manifest_sync'."
@@ -132,6 +146,27 @@ class TestUpdateSubagentEval:
             assert validate_idx > modify_idx, (
                 f"Case '{case['case_id']}': 'validate_manifest_sync' appeared before 'modify_npm_dependency'."
             )
+
+    @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
+    def test_tool_correctness_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in ToolCorrectnessMetric evaluates ordered tool execution."""
+        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
+            pytest.skip("DeepEval is not installed.")
+
+        test_case = build_update_test_case(case)
+        if not getattr(test_case, "expected_tools", None):
+            pytest.skip("No expected tools defined for negative/surrender case.")
+
+        metric = DeepEvalToolCorrectnessMetric(threshold=0.5, should_consider_ordering=True)
+        if assert_test:
+            assert_test(test_case, [metric], run_async=False)
+        else:
+            metric.measure(test_case)
+            assert metric.is_successful()
 
     @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
     def test_no_version_selection_boundary_violation(
@@ -181,7 +216,7 @@ class TestUpdateSubagentEval:
     ) -> None:
         """Worker produces changed files and validates matching supervisor instruction."""
         test_case = build_update_test_case(case)
-        metric = TaskCompletionMetric(threshold=0.70)
+        metric = DeterministicTaskCompletionMetric(threshold=0.70)
         expected_completion_pass = case.get("expected_completion_pass", True)
 
         if expected_completion_pass and HAS_DEEPEVAL and assert_test:
@@ -192,3 +227,29 @@ class TestUpdateSubagentEval:
                 f"Case '{case['case_id']}' was expected to fail task completion (e.g. surrender) but passed."
             )
             assert score == 0.0
+
+    @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
+    def test_live_task_completion_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in TaskCompletionMetric evaluates task completion with LLM judge (requires --run-eval-live)."""
+        if not eval_settings.is_live:
+            pytest.skip("DeepEval TaskCompletionMetric requires live LLM judge (--run-eval-live)")
+
+        if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
+            pytest.skip("DeepEval is not installed.")
+
+        test_case = build_update_test_case(case)
+        metric = DeepEvalTaskCompletionMetric(
+            threshold=0.70,
+            model=eval_settings.judge_model,
+        )
+
+        if case.get("expected_completion_pass", True) and case.get("action_status") == "APPLIED":
+            if assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                metric.measure(test_case)
+                assert metric.is_successful()

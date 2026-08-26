@@ -18,7 +18,15 @@ from tests.evals.custom_metrics import (
 
 try:
     from deepeval import assert_test
-    from deepeval.metrics import GEval
+    from deepeval.metrics import (
+        GEval,
+    )
+    from deepeval.metrics import (
+        TaskCompletionMetric as DeepEvalTaskCompletionMetric,
+    )
+    from deepeval.metrics import (
+        ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric,
+    )
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
     HAS_DEEPEVAL = True
@@ -29,6 +37,8 @@ except ImportError:
     LLMTestCaseParams = None  # type: ignore[assignment,misc]
     GEval = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
+    DeepEvalTaskCompletionMetric = None  # type: ignore[assignment,misc]
+    DeepEvalToolCorrectnessMetric = None  # type: ignore[assignment,misc]
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +93,17 @@ def build_workaround_test_case(case: dict[str, Any]) -> LLMTestCase:
         f"Tool execution rounds: {len(tools_called)}"
     )
 
+    expected_tools: list[ToolCall] = []
+    if case.get("expected_lifecycle_pass", True) and status == "APPLIED":
+        expected_tools.append(ToolCall(name="record_plan", input_parameters={}))
+        if case.get("case_id") == "workaround-no-fix-package-removal":
+            expected_tools.append(ToolCall(name="remove_no_fix_dependency", input_parameters={}))
+        else:
+            expected_tools.append(
+                ToolCall(name="deterministic_apply_edit_set", input_parameters={})
+            )
+        expected_tools.append(ToolCall(name="validate_workaround", input_parameters={}))
+
     metadata = {
         "case_id": case.get("case_id"),
         "eval_type": "workaround_subagent",
@@ -105,6 +126,7 @@ def build_workaround_test_case(case: dict[str, Any]) -> LLMTestCase:
         expected_output=f"Investigate, plan, and apply minimal code workaround for {target_pkg} without modifying unrelated files.",
         context=[instruction, case.get("provenance", "")],
         tools_called=tools_called,
+        expected_tools=expected_tools if expected_tools else None,
         additional_metadata=metadata,
     )
 
@@ -137,6 +159,27 @@ class TestWorkaroundSubagentEval:
                 f"Case '{case['case_id']}' was expected to violate lifecycle check but passed."
             )
             assert score == 0.0
+
+    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
+    def test_workaround_tool_correctness_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in ToolCorrectnessMetric evaluates ordered execution of record_plan, edit, and validate."""
+        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
+            pytest.skip("DeepEval is not installed.")
+
+        test_case = build_workaround_test_case(case)
+        if not getattr(test_case, "expected_tools", None):
+            pytest.skip("No expected tools defined for negative/unplanned case.")
+
+        metric = DeepEvalToolCorrectnessMetric(threshold=0.5, should_consider_ordering=True)
+        if assert_test:
+            assert_test(test_case, [metric], run_async=False)
+        else:
+            metric.measure(test_case)
+            assert metric.is_successful()
 
     @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
     def test_workaround_tool_correctness(self, case: dict[str, Any]) -> None:
@@ -232,3 +275,29 @@ class TestWorkaroundSubagentEval:
 
         if case.get("expected_pass", True):
             assert_test(test_case, [metric], run_async=False)
+
+    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
+    def test_workaround_live_task_completion_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in TaskCompletionMetric evaluates workaround completion with LLM judge (requires --run-eval-live)."""
+        if not eval_settings.is_live:
+            pytest.skip("DeepEval TaskCompletionMetric requires live LLM judge (--run-eval-live)")
+
+        if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
+            pytest.skip("DeepEval is not installed.")
+
+        test_case = build_workaround_test_case(case)
+        metric = DeepEvalTaskCompletionMetric(
+            threshold=0.70,
+            model=eval_settings.judge_model,
+        )
+
+        if case.get("expected_completion_pass", True) and case.get("action_status") == "APPLIED":
+            if assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                metric.measure(test_case)
+                assert metric.is_successful()

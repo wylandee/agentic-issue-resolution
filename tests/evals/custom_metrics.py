@@ -609,7 +609,7 @@ class WorkaroundLifecycleMetric(BaseMetric):
 # ---------------------------------------------------------------------------
 
 
-class TaskCompletionMetric(BaseMetric):
+class DeterministicTaskCompletionMetric(BaseMetric):
     """Deterministic metric evaluating whether a subagent worker completed its assigned task.
 
     Checks:
@@ -623,7 +623,7 @@ class TaskCompletionMetric(BaseMetric):
         threshold: float = 0.70,
         verbose_mode: bool = True,
     ) -> None:
-        """Initialize the task completion metric."""
+        """Initialize the deterministic task completion metric."""
         self.threshold = threshold
         self.verbose_mode = verbose_mode
         self.score = None
@@ -634,7 +634,7 @@ class TaskCompletionMetric(BaseMetric):
     @property
     def __name__(self) -> str:
         """Metric display name."""
-        return "Task Completion"
+        return "Deterministic Task Completion"
 
     def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
         """Measure task completion status for the test case."""
@@ -666,3 +666,7 @@ class TaskCompletionMetric(BaseMetric):
     def is_successful(self) -> bool:
         """Return whether metric passed the threshold."""
         return bool(self.success)
+
+
+# Backwards compatibility alias
+TaskCompletionMetric = DeterministicTaskCompletionMetric
