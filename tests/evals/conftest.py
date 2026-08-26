@@ -475,4 +475,3 @@ def qa_golden_cases(
     if not cases:
         pytest.skip("No golden QA cases found in tests/evals/golden/qa_cases.json")
     return cases
-
