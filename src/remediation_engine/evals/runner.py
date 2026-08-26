@@ -17,6 +17,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 SUITE_PATHS: dict[str, list[str]] = {
     "all": ["tests/evals"],
+    "subagent": [
+        "tests/evals/test_update_subagent_eval.py",
+        "tests/evals/test_workaround_subagent_eval.py",
+    ],
+    "update_subagent": ["tests/evals/test_update_subagent_eval.py"],
+    "workaround_subagent": ["tests/evals/test_workaround_subagent_eval.py"],
     "report": ["tests/evals/test_report_eval.py"],
     "triage": ["tests/evals/test_triage_eval.py"],
     "fix_planner": ["tests/evals/test_fix_planner_eval.py"],

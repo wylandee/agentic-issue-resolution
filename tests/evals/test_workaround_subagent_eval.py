@@ -99,6 +99,7 @@ def build_workaround_test_case(case: dict[str, Any]) -> LLMTestCase:
     }
 
     return LLMTestCase(
+        name=f"{case.get('case_id')} [Workaround Subagent]",
         input=instruction,
         actual_output=actual_output,
         expected_output=f"Investigate, plan, and apply minimal code workaround for {target_pkg} without modifying unrelated files.",
@@ -126,15 +127,12 @@ class TestWorkaroundSubagentEval:
         """Workaround worker follows investigate -> plan -> execute -> validate lifecycle."""
         test_case = build_workaround_test_case(case)
         metric = WorkaroundLifecycleMetric()
-        score = metric.measure(test_case)
-
         expected_lifecycle_pass = case.get("expected_lifecycle_pass", True)
-        if expected_lifecycle_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed lifecycle check: {metric.reason}"
-            )
-            assert score == 1.0
+
+        if expected_lifecycle_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful(), (
                 f"Case '{case['case_id']}' was expected to violate lifecycle check but passed."
             )
@@ -175,15 +173,12 @@ class TestWorkaroundSubagentEval:
         """Workaround worker does not call update-only manifest modification tools."""
         test_case = build_workaround_test_case(case)
         metric = ArchitectureBoundaryMetric()
-        score = metric.measure(test_case)
-
         expected_boundary_pass = case.get("expected_boundary_pass", True)
-        if expected_boundary_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed boundary check: {metric.reason}"
-            )
-            assert score == 1.0
+
+        if expected_boundary_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful()
             assert score == 0.0
 
@@ -196,15 +191,12 @@ class TestWorkaroundSubagentEval:
         """Workaround worker operates efficiently within tool rounds budget."""
         test_case = build_workaround_test_case(case)
         metric = ToolEfficiencyMetric(threshold=0.70)
-        score = metric.measure(test_case)
-
         expected_efficiency_pass = case.get("expected_efficiency_pass", True)
-        if expected_efficiency_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed efficiency: {metric.reason} (score={score})"
-            )
-            assert score >= 0.70
+
+        if expected_efficiency_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful()
             assert score < 0.70
 
@@ -238,8 +230,5 @@ class TestWorkaroundSubagentEval:
             threshold=0.70,
         )
 
-        metric.measure(test_case)
         if case.get("expected_pass", True):
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' failed Workaround Minimality: {metric.reason}"
-            )
+            assert_test(test_case, [metric], run_async=False)

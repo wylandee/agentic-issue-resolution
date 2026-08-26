@@ -17,6 +17,7 @@ from tests.evals.custom_metrics import (
 )
 
 try:
+    from deepeval import assert_test
     from deepeval.test_case import LLMTestCase
 
     HAS_DEEPEVAL = True
@@ -24,6 +25,7 @@ except ImportError:
     from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
 
     HAS_DEEPEVAL = False
+    assert_test = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,7 @@ def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
     }
 
     return LLMTestCase(
+        name=f"{case.get('case_id')} [Update Subagent]",
         input=instruction,
         actual_output=actual_output,
         expected_output=f"Update {target_pkg} in manifest files and validate manifest synchronization.",
@@ -139,15 +142,12 @@ class TestUpdateSubagentEval:
         """Worker does not attempt to discover or select dependency versions during first-pass."""
         test_case = build_update_test_case(case)
         metric = ArchitectureBoundaryMetric()
-        score = metric.measure(test_case)
-
         expected_boundary_pass = case.get("expected_boundary_pass", True)
-        if expected_boundary_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed boundary check: {metric.reason}"
-            )
-            assert score == 1.0
+
+        if expected_boundary_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful(), (
                 f"Case '{case['case_id']}' was expected to violate boundary check but passed."
             )
@@ -162,15 +162,12 @@ class TestUpdateSubagentEval:
         """Worker completes task within reasonable tool call budget without redundant reads."""
         test_case = build_update_test_case(case)
         metric = ToolEfficiencyMetric(threshold=0.70)
-        score = metric.measure(test_case)
-
         expected_efficiency_pass = case.get("expected_efficiency_pass", True)
-        if expected_efficiency_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed efficiency metric: {metric.reason} (score={score})"
-            )
-            assert score >= 0.70
+
+        if expected_efficiency_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful(), (
                 f"Case '{case['case_id']}' was expected to fail efficiency metric but scored {score}."
             )
@@ -185,15 +182,12 @@ class TestUpdateSubagentEval:
         """Worker produces changed files and validates matching supervisor instruction."""
         test_case = build_update_test_case(case)
         metric = TaskCompletionMetric(threshold=0.70)
-        score = metric.measure(test_case)
-
         expected_completion_pass = case.get("expected_completion_pass", True)
-        if expected_completion_pass:
-            assert metric.is_successful(), (
-                f"Case '{case['case_id']}' unexpectedly failed task completion: {metric.reason} (score={score})"
-            )
-            assert score == 1.0
+
+        if expected_completion_pass and HAS_DEEPEVAL and assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
+            score = metric.measure(test_case)
             assert not metric.is_successful(), (
                 f"Case '{case['case_id']}' was expected to fail task completion (e.g. surrender) but passed."
             )
