@@ -26,10 +26,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-mock>=3,<4", "ruff>=0.15,<1"]
-eval = ["deepeval>=2,<3"]
+eval = ["deepeval>=2,<3", "pandas>=2,<3", "streamlit>=1.30,<2"]
 
 [project.scripts]
 remedy = "remediation_engine.cli:main"
+remedy-ui = "remediation_engine.evals.ui.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
