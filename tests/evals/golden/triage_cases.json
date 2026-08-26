@@ -1,0 +1,930 @@
+[
+  {
+    "case_id": "case_1_kev_production_override",
+    "eval_type": "triage",
+    "provenance": "CISA KEV production scenario based on Juice Shop baseline finding for @tootallnate/once (CVE-2022-37601 / CVE-2022-0001). Demonstrates 'Drop Everything' guardrail rule where KEV + production forces CRITICAL.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "@tootallnate/once",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2022-37601"],
+      "ghsa_ids": ["GHSA-4hgj-pp95-mc43"],
+      "versions": ["1.1.2"],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10001-0001-0001-0001-000000000001",
+          "cve_id": "CVE-2022-37601",
+          "severity": "HIGH",
+          "message": "Prototype pollution in @tootallnate/once before 2.0.0 allows attacker to modify Object.prototype.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "high"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2022-37601",
+      "epss": 0.85,
+      "epss_percentile": 0.98,
+      "in_kev": true,
+      "kev_date_added": "2023-01-10",
+      "enrichment_source": "epss+kev"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "The vulnerability is CVE-2022-37601 affecting @tootallnate/once. It is listed in CISA KEV and the environment is production. High EPSS (0.85). Under Drop Everything rule, priority is CRITICAL.",
+      "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "CRITICAL",
+      "is_unreachable_code": false,
+      "priority_reasoning": "CVE is in CISA KEV and environment is production. EPSS score is 0.85. Priority is CRITICAL.",
+      "validity_confidence_score": 1.0,
+      "priority_confidence_score": 1.0,
+      "recommended_issue_id": "b1a10001-0001-0001-0001-000000000001",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "CRITICAL",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_2_kev_staging_imminent_threat",
+    "eval_type": "triage",
+    "provenance": "Staging environment with high EPSS (0.45 >= 0.36) and public-facing flag. Demonstrates 'Imminent Threat' guardrail rule elevating priority to CRITICAL.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "express-jwt",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2020-15084"],
+      "ghsa_ids": ["GHSA-c7hr-j4mj-j2w6"],
+      "versions": ["0.1.3"],
+      "original_severity": "MEDIUM",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10002-0002-0002-0002-000000000002",
+          "cve_id": "CVE-2020-15084",
+          "severity": "MEDIUM",
+          "message": "Algorithm confusion in express-jwt allows token signature bypass.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "staging",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2020-15084",
+      "epss": 0.45,
+      "epss_percentile": 0.92,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2020-15084 in express-jwt has an EPSS score of 0.45 (>= 0.36) and the application is public-facing. Imminent Threat rule applies, escalating priority to CRITICAL.",
+      "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "MEDIUM",
+      "revised_priority": "CRITICAL",
+      "is_unreachable_code": false,
+      "priority_reasoning": "EPSS score 0.45 >= 0.36 on a public-facing service indicates imminent exploit probability. Escalated to CRITICAL.",
+      "validity_confidence_score": 0.95,
+      "priority_confidence_score": 0.95,
+      "recommended_issue_id": "b1a10002-0002-0002-0002-000000000002",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "CRITICAL",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_3_high_epss_internal_threat",
+    "eval_type": "triage",
+    "provenance": "Internal service with high EPSS (0.50 >= 0.36) and low data sensitivity. Demonstrates Imminent Threat elevation to at least HIGH.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:axios:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "axios",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2023-45857"],
+      "ghsa_ids": ["GHSA-8hc4-vh64-cxmj"],
+      "versions": ["0.21.1"],
+      "original_severity": "MEDIUM",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10003-0003-0003-0003-000000000003",
+          "cve_id": "CVE-2023-45857",
+          "severity": "MEDIUM",
+          "message": "Axios SSRF vulnerability through follow-redirects.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": false,
+      "primary_language": "javascript",
+      "deployment_architecture": "microservice",
+      "data_sensitivity": "low"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2023-45857",
+      "epss": 0.50,
+      "epss_percentile": 0.94,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "Axios CVE-2023-45857 is MEDIUM original severity, but EPSS is 0.50 (>= 0.36). For internal services, Imminent Threat forces at least HIGH priority.",
+      "group_id": "sca:package.json:axios:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "MEDIUM",
+      "revised_priority": "HIGH",
+      "is_unreachable_code": false,
+      "priority_reasoning": "EPSS score 0.50 >= 0.36 indicates high active exploitation likelihood. Elevated to HIGH priority.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10003-0003-0003-0003-000000000003",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "HIGH",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_4_low_epss_floor_downgrade",
+    "eval_type": "triage",
+    "provenance": "Internal non-public service with original HIGH severity but EPSS < 0.01 (0.003). Demonstrates 'Floor Downgrade' rule to MEDIUM.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:libxmljs:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "libxmljs",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2015-1823"],
+      "ghsa_ids": ["GHSA-3r4x-2963-3m3c"],
+      "versions": ["0.18.0"],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10004-0004-0004-0004-000000000004",
+          "cve_id": "CVE-2015-1823",
+          "severity": "HIGH",
+          "message": "Type confusion in libxmljs XML schema validator.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": false,
+      "primary_language": "javascript",
+      "deployment_architecture": "internal-daemon",
+      "data_sensitivity": "low"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2015-1823",
+      "epss": 0.003,
+      "epss_percentile": 0.20,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "libxmljs CVE-2015-1823 has original HIGH severity. However, the service is internal (public_facing=false) and EPSS is 0.003 (< 0.01). Floor downgrade rule applies, reducing priority to MEDIUM.",
+      "group_id": "sca:package.json:libxmljs:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "MEDIUM",
+      "is_unreachable_code": false,
+      "priority_reasoning": "EPSS < 0.01 for an internal service indicates negligible remote exploitation probability. Downgraded to MEDIUM.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10004-0004-0004-0004-000000000004",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "MEDIUM",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_5_dev_test_scope_false_positive",
+    "eval_type": "triage",
+    "provenance": "Findings located exclusively in dev/test paths within a development environment. Demonstrates Rule C (test/dev scope false positive).",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:mocha:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "mocha",
+      "file_path": "test/mocha.opts",
+      "cve_ids": ["CVE-2021-99999"],
+      "ghsa_ids": ["GHSA-test-mocha-0001"],
+      "versions": ["8.0.0"],
+      "original_severity": "HIGH",
+      "is_reachable": false,
+      "issues": [
+        {
+          "issue_id": "b1a10005-0005-0005-0005-000000000005",
+          "cve_id": "CVE-2021-99999",
+          "severity": "HIGH",
+          "message": "Command injection vulnerability in test runner runner CLI parser.",
+          "file_path": "test/helpers/runner.js"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "dev",
+      "deployment_os": "linux",
+      "public_facing": false,
+      "primary_language": "javascript",
+      "deployment_architecture": "ci",
+      "data_sensitivity": "low"
+    },
+    "enrichment": null,
+    "llm_triage_result": {
+      "chain_of_thought": "All findings for mocha are located in test/ paths (test/helpers/runner.js) and the environment is 'dev'. Under Rule C, this is a dev/test scope false positive.",
+      "group_id": "sca:package.json:mocha:UPDATE_VERSION",
+      "is_valid": false,
+      "false_positive_reason": "All findings are in dev/test paths and environment is 'dev'. Treating as out-of-scope for production remediation.",
+      "original_severity": "HIGH",
+      "revised_priority": "LOW",
+      "is_unreachable_code": true,
+      "priority_reasoning": "Dev/test scope only; excluded from production remediation.",
+      "validity_confidence_score": 1.0,
+      "priority_confidence_score": 1.0,
+      "recommended_issue_id": "b1a10005-0005-0005-0005-000000000005",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": false,
+    "expected_priority": "LOW",
+    "expected_is_unreachable": true
+  },
+  {
+    "case_id": "case_6_unreachable_code_valid_finding",
+    "eval_type": "triage",
+    "provenance": "Juice Shop transitive dependency not imported by source code. Reachability analysis confirms is_reachable=False, but Rule D specifies that unreachable code remains is_valid=True.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:sqlite3:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "sqlite3",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2022-42915"],
+      "ghsa_ids": ["GHSA-f5pq-9vj3-2w5q"],
+      "versions": ["5.0.0"],
+      "original_severity": "HIGH",
+      "is_reachable": false,
+      "issues": [
+        {
+          "issue_id": "b1a10006-0006-0006-0006-000000000006",
+          "cve_id": "CVE-2022-42915",
+          "severity": "HIGH",
+          "message": "Buffer overflow in sqlite3 node bindings.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2022-42915",
+      "epss": 0.05,
+      "epss_percentile": 0.65,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "AST reachability shows sqlite3 is not directly imported in application code. However, under Rule D, unreachable code does not invalidate the vulnerability. is_valid remains True and is_unreachable_code is set to True.",
+      "group_id": "sca:package.json:sqlite3:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "HIGH",
+      "is_unreachable_code": true,
+      "priority_reasoning": "Reachability analysis shows the package is not imported by the application source code. Retaining HIGH priority for defensive posture.",
+      "validity_confidence_score": 0.85,
+      "priority_confidence_score": 0.85,
+      "recommended_issue_id": "b1a10006-0006-0006-0006-000000000006",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "HIGH",
+    "expected_is_unreachable": true
+  },
+  {
+    "case_id": "case_7_wrong_os_scanner_mismatch_fp",
+    "eval_type": "triage",
+    "provenance": "Rule B false positive: scanner flagged a Linux kernel / ELF binary specific CVE against a project deployed on Windows.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:node-linux-syscalls:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "node-linux-syscalls",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2021-38209"],
+      "ghsa_ids": ["GHSA-lx-syscalls-001"],
+      "versions": ["1.0.0"],
+      "original_severity": "CRITICAL",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10007-0007-0007-0007-000000000007",
+          "cve_id": "CVE-2021-38209",
+          "severity": "CRITICAL",
+          "message": "Privilege escalation via Linux kernel epoll syscall emulation.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "windows",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "windows-service",
+      "data_sensitivity": "high"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2021-38209",
+      "epss": 0.05,
+      "epss_percentile": 0.50,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2021-38209 requires Linux kernel epoll syscalls. The system context explicitly states deployment_os='windows'. Under Rule B (contradictory OS requirements), this is a false positive.",
+      "group_id": "sca:package.json:node-linux-syscalls:UPDATE_VERSION",
+      "is_valid": false,
+      "false_positive_reason": "Vulnerability requires Linux kernel syscalls and ELF binaries, but deployment OS is Windows.",
+      "original_severity": "CRITICAL",
+      "revised_priority": "LOW",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Inapplicable due to contradictory OS requirements (Windows vs Linux).",
+      "validity_confidence_score": 0.95,
+      "priority_confidence_score": 0.95,
+      "recommended_issue_id": "b1a10007-0007-0007-0007-000000000007",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": false,
+    "expected_priority": "LOW",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_8_wrong_technology_scanner_mismatch_fp",
+    "eval_type": "triage",
+    "provenance": "Rule A false positive: scanner matched Apache Commons (Java) CVE against an unrelated JavaScript npm package with a similar name.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:commons-io:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "commons-io",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2021-37533"],
+      "ghsa_ids": ["GHSA-786p-5q7g-89j2"],
+      "versions": ["1.0.0"],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10008-0008-0008-0008-000000000008",
+          "cve_id": "CVE-2021-37533",
+          "severity": "HIGH",
+          "message": "Apache Commons IO Java JVM class loader RCE.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "node-runtime",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2021-37533",
+      "epss": 0.20,
+      "epss_percentile": 0.80,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2021-37533 is a Java JVM vulnerability in Apache Commons IO. The current project is pure JavaScript running on Node.js. Scanner erroneously mapped the Java CVE to the npm package commons-io. Under Rule A, this is a technology mismatch false positive.",
+      "group_id": "sca:package.json:commons-io:UPDATE_VERSION",
+      "is_valid": false,
+      "false_positive_reason": "Scanner matched a Java JVM CVE (Apache Commons IO) against an unrelated npm package in a Node.js project.",
+      "original_severity": "HIGH",
+      "revised_priority": "LOW",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Mismatched technology stack: Java CVE on Node.js package.",
+      "validity_confidence_score": 1.0,
+      "priority_confidence_score": 1.0,
+      "recommended_issue_id": "b1a10008-0008-0008-0008-000000000008",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": false,
+    "expected_priority": "LOW",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_9_actionable_cookie_upgrade",
+    "eval_type": "triage",
+    "provenance": "Juice Shop baseline finding for cookie CVE-2024-47764. Valid actionable high severity finding.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:cookie:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "cookie",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2024-47764"],
+      "ghsa_ids": ["GHSA-pxg6-pf52-xh8x"],
+      "versions": ["0.4.1"],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10009-0009-0009-0009-000000000009",
+          "cve_id": "CVE-2024-47764",
+          "severity": "HIGH",
+          "message": "cookie before 0.7.0 allows out-of-bounds domain verification.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "high"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2024-47764",
+      "epss": 0.08,
+      "epss_percentile": 0.72,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2024-47764 in cookie is a valid finding affecting cookie handling in a public-facing web app with high data sensitivity. Retains HIGH priority.",
+      "group_id": "sca:package.json:cookie:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "HIGH",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Valid actionable high severity cookie vulnerability in public-facing application.",
+      "validity_confidence_score": 0.95,
+      "priority_confidence_score": 0.95,
+      "recommended_issue_id": "b1a10009-0009-0009-0009-000000000009",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "HIGH",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_10_actionable_nanoid_upgrade",
+    "eval_type": "triage",
+    "provenance": "Juice Shop baseline finding for nanoid CVE-2024-55565. Valid actionable medium severity finding.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:nanoid:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "nanoid",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2024-55565"],
+      "ghsa_ids": ["GHSA-mwcw-c2x4-8c55"],
+      "versions": ["3.3.4"],
+      "original_severity": "MEDIUM",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10010-0010-0010-0010-000000000010",
+          "cve_id": "CVE-2024-55565",
+          "severity": "MEDIUM",
+          "message": "Predictable ID generation in nanoid when custom pool is reused.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2024-55565",
+      "epss": 0.02,
+      "epss_percentile": 0.40,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2024-55565 in nanoid has medium original severity, moderate EPSS, and is reachable. Retains MEDIUM priority.",
+      "group_id": "sca:package.json:nanoid:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "MEDIUM",
+      "revised_priority": "MEDIUM",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Actionable finding for ID generator library in production.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10010-0010-0010-0010-000000000010",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "MEDIUM",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_11_sast_code_injection",
+    "eval_type": "triage",
+    "provenance": "SAST finding from Semgrep rule javascript.express.security.audit.remote-property-injection in production application.",
+    "vulnerability_context": {
+      "group_id": "sast:routes/dataErasure.ts:remote-property-injection:35",
+      "issue_type": "sast",
+      "vulnerable_component": "routes/dataErasure.ts",
+      "file_path": "routes/dataErasure.ts",
+      "cve_ids": [],
+      "ghsa_ids": [],
+      "versions": [],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10011-0011-0011-0011-000000000011",
+          "cve_id": null,
+          "severity": "HIGH",
+          "message": "User input from req.body is used in dynamic object property lookup without validation.",
+          "file_path": "routes/dataErasure.ts"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "typescript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "high"
+    },
+    "enrichment": null,
+    "llm_triage_result": {
+      "chain_of_thought": "SAST finding flags unvalidated property access in dataErasure route. In a production app with high data sensitivity, remote property injection can lead to denial of service or prototype manipulation. Valid HIGH priority.",
+      "group_id": "sast:routes/dataErasure.ts:remote-property-injection:35",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "HIGH",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Valid SAST remote property injection on production sensitive endpoint.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10011-0011-0011-0011-000000000011",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "HIGH",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_12_disputed_cve_maintained_low",
+    "eval_type": "triage",
+    "provenance": "Disputed CVE finding with vendor clarification and very low EPSS. Valid but deprioritized to LOW.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:qs:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "qs",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2017-1000048"],
+      "ghsa_ids": ["GHSA-hrpp-h998-j3pp"],
+      "versions": ["6.5.0"],
+      "original_severity": "LOW",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10012-0012-0012-0012-000000000012",
+          "cve_id": "CVE-2017-1000048",
+          "severity": "LOW",
+          "message": "** DISPUTED ** qs prototype pollution via parameter keys.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": false,
+      "primary_language": "javascript",
+      "deployment_architecture": "internal",
+      "data_sensitivity": "low"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2017-1000048",
+      "epss": 0.005,
+      "epss_percentile": 0.30,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2017-1000048 is disputed by the vendor and has very low EPSS (0.005) on an internal service. Maintained as valid but priority remains LOW.",
+      "group_id": "sca:package.json:qs:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "LOW",
+      "revised_priority": "LOW",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Disputed CVE with negligible exploit probability in internal service; prioritized as LOW.",
+      "validity_confidence_score": 0.8,
+      "priority_confidence_score": 0.85,
+      "recommended_issue_id": "b1a10012-0012-0012-0012-000000000012",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "LOW",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_13_transitive_parent_first_actionable",
+    "eval_type": "triage",
+    "provenance": "Transitive dependency finding in package.json requiring parent-first or override resolution.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:semver:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "semver",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2022-25883"],
+      "ghsa_ids": ["GHSA-c2qf-rxjj-qqgw"],
+      "versions": ["7.3.5"],
+      "original_severity": "HIGH",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10013-0013-0013-0013-000000000013",
+          "cve_id": "CVE-2022-25883",
+          "severity": "HIGH",
+          "message": "Regular expression denial of service in semver comparison function.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2022-25883",
+      "epss": 0.15,
+      "epss_percentile": 0.78,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "CVE-2022-25883 is a valid ReDoS finding in semver in a public-facing application. Priority remains HIGH.",
+      "group_id": "sca:package.json:semver:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "HIGH",
+      "revised_priority": "HIGH",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Valid ReDoS vulnerability in production dependency.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10013-0013-0013-0013-000000000013",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "HIGH",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_14_no_cve_ghsa_only_medium",
+    "eval_type": "triage",
+    "provenance": "GitHub security advisory with no CVE assigned yet. Valid finding prioritized from original severity.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:validator:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "validator",
+      "file_path": "package.json",
+      "cve_ids": [],
+      "ghsa_ids": ["GHSA-952p-6rrq-rcjv"],
+      "versions": ["13.6.0"],
+      "original_severity": "MEDIUM",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10014-0014-0014-0014-000000000014",
+          "cve_id": null,
+          "severity": "MEDIUM",
+          "message": "Bypass in validator URL validation allows malformed URLs.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": true,
+      "primary_language": "javascript",
+      "deployment_architecture": "container",
+      "data_sensitivity": "medium"
+    },
+    "enrichment": null,
+    "llm_triage_result": {
+      "chain_of_thought": "GHSA-952p-6rrq-rcjv has no CVE ID or EPSS data, but represents a valid advisory for input validation library in a public app. Retains MEDIUM priority.",
+      "group_id": "sca:package.json:validator:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "MEDIUM",
+      "revised_priority": "MEDIUM",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Valid advisory finding without CVE ID; prioritized at MEDIUM.",
+      "validity_confidence_score": 0.85,
+      "priority_confidence_score": 0.85,
+      "recommended_issue_id": "b1a10014-0014-0014-0014-000000000014",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "MEDIUM",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_15_low_severity_info_finding",
+    "eval_type": "triage",
+    "provenance": "Low severity / informational finding for outdated cryptographic default configuration.",
+    "vulnerability_context": {
+      "group_id": "sca:package.json:ms:UPDATE_VERSION",
+      "issue_type": "sca",
+      "vulnerable_component": "ms",
+      "file_path": "package.json",
+      "cve_ids": ["CVE-2020-7792"],
+      "ghsa_ids": ["GHSA-w978-rmpf-qghg"],
+      "versions": ["2.0.0"],
+      "original_severity": "LOW",
+      "is_reachable": true,
+      "issues": [
+        {
+          "issue_id": "b1a10015-0015-0015-0015-000000000015",
+          "cve_id": "CVE-2020-7792",
+          "severity": "LOW",
+          "message": "Inefficient regular expression in ms time conversion helper.",
+          "file_path": "package.json"
+        }
+      ]
+    },
+    "system_context": {
+      "environment": "production",
+      "deployment_os": "linux",
+      "public_facing": false,
+      "primary_language": "javascript",
+      "deployment_architecture": "internal",
+      "data_sensitivity": "low"
+    },
+    "enrichment": {
+      "cve_id": "CVE-2020-7792",
+      "epss": 0.001,
+      "epss_percentile": 0.10,
+      "in_kev": false,
+      "kev_date_added": null,
+      "enrichment_source": "epss"
+    },
+    "llm_triage_result": {
+      "chain_of_thought": "Low severity ReDoS in helper utility with negligible EPSS score on an internal system. Valid but remains LOW priority.",
+      "group_id": "sca:package.json:ms:UPDATE_VERSION",
+      "is_valid": true,
+      "false_positive_reason": null,
+      "original_severity": "LOW",
+      "revised_priority": "LOW",
+      "is_unreachable_code": false,
+      "priority_reasoning": "Low severity finding with low exploitation risk.",
+      "validity_confidence_score": 0.9,
+      "priority_confidence_score": 0.9,
+      "recommended_issue_id": "b1a10015-0015-0015-0015-000000000015",
+      "triage_method": "llm"
+    },
+    "expected_is_valid": true,
+    "expected_priority": "LOW",
+    "expected_is_unreachable": false
+  },
+  {
+    "case_id": "case_16_fp_version_bump_github_advisory",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic GitHub security advisory page for cookie out-of-bounds domain validation vulnerability.",
+    "source_page_content": "# GitHub Advisory GHSA-pxg6-pf52-xh8x\n\nCookie package before version 0.7.0 contains an out-of-bounds validation flaw when parsing domain attributes.\n\n### Impact\nAttackers can bypass domain cookie isolation under certain proxy configurations.\n\n### Patched Versions\nUpgrade to version **0.7.0** or later to mitigate this vulnerability.\n\n### References\n- https://github.com/jshttp/cookie/commit/d265330e",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "0.7.0",
+      "workaround_snippets": null,
+      "reasoning": "The advisory explicitly states that the vulnerability is patched in version 0.7.0."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "0.7.0",
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_17_fp_code_workaround_issue_thread",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic GitHub issue thread for deep-extend prototype pollution where maintainer provides code workaround snippet.",
+    "source_page_content": "# Issue #42: Prototype pollution vulnerability in deepExtend\n\n**Reporter**: Calling `deepExtend({}, JSON.parse(userInput))` allows `__proto__` injection.\n\n**Maintainer**: Note that v0.4.x is end-of-life and no upstream version will be released. You can safely mitigate this in application code by checking object keys before invoking deepExtend:\n\n```javascript\nfunction safeExtend(target, source) {\n  for (const key of Object.keys(source)) {\n    if (key === '__proto__' || key === 'constructor') {\n      delete source[key];\n    }\n  }\n  return deepExtend(target, source);\n}\n```",
+    "llm_extraction_result": {
+      "strategy": "CODE_WORKAROUND",
+      "fixed_version": null,
+      "workaround_snippets": [
+        "function safeExtend(target, source) {\n  for (const key of Object.keys(source)) {\n    if (key === '__proto__' || key === 'constructor') {\n      delete source[key];\n    }\n  }\n  return deepExtend(target, source);\n}"
+      ],
+      "reasoning": "No patched version is available for the EOL release, but the maintainer provided a concrete code workaround function to strip __proto__ keys."
+    },
+    "expected_strategy": "CODE_WORKAROUND",
+    "expected_fixed_version": null,
+    "expected_workaround_snippets": [
+      "if (key === '__proto__' || key === 'constructor')"
+    ]
+  },
+  {
+    "case_id": "case_18_fp_no_fix_disputed_wontfix",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic issue thread closed as WONTFIX with no fix and no code workaround.",
+    "source_page_content": "# Issue #104: High CPU usage with malicious regex input\n\n**Maintainer**: This is expected behavior when processing untrusted massive inputs without a payload size limit. We will not be modifying the regex engine as it would break backward compatibility. Closing as intended behavior. No patch or workaround is provided.",
+    "llm_extraction_result": {
+      "strategy": "NO_FIX",
+      "fixed_version": null,
+      "workaround_snippets": null,
+      "reasoning": "Issue closed as intended behavior by maintainers with no patched version or code workaround."
+    },
+    "expected_strategy": "NO_FIX",
+    "expected_fixed_version": null,
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_19_fp_version_semver_prerelease",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic release note page for a security pre-release version with semver prerelease tag.",
+    "source_page_content": "# Release v2.0.0-beta.1\n\nThis pre-release patches CVE-2023-9999 (ReDoS vulnerability in route dispatcher).\n\nUsers affected by the vulnerability should upgrade to `2.0.0-beta.1`.",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "2.0.0-beta.1",
+      "workaround_snippets": null,
+      "reasoning": "Release notes confirm vulnerability is fixed in version 2.0.0-beta.1."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "2.0.0-beta.1",
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_20_fp_multiple_versions_picks_latest",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic multi-branch advisory mentioning patch releases in multiple maintenance branches.",
+    "source_page_content": "# Security Advisory for Package XYZ\n\nMultiple buffer overflow issues were fixed in the following patch releases:\n- Branch 1.x: Fixed in version **1.4.9**\n- Branch 2.x: Fixed in version **2.1.2**\n- Branch 3.x: Fixed in version **3.0.4**\n\nPlease update your dependency to the appropriate patched release for your major version.",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "3.0.4",
+      "workaround_snippets": null,
+      "reasoning": "Advisory lists patched versions 1.4.9, 2.1.2, and 3.0.4. Extracted version 3.0.4 for modern releases."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "3.0.4",
+    "expected_workaround_snippets": null
+  }
+]

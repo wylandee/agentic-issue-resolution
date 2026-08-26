@@ -55,6 +55,7 @@ dist/
 # ==============================================================================
 .pytest_cache/
 .pytest-tmp/
+.deepeval/
 .mypy_cache/
 .ruff_cache/
 .coverage

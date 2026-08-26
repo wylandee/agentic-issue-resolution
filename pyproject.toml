@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-mock>=3,<4", "ruff>=0.15,<1"]
+eval = ["deepeval>=2,<3"]
 
 [project.scripts]
 remedy = "remediation_engine.cli:main"
@@ -57,4 +58,5 @@ markers = [
   "docker: requires a live Docker daemon",
   "network: requires external network access",
   "llm: requires an LLM provider",
+  "eval: DeepEval LLM evaluation tests (requires OPENAI_API_KEY)",
 ]

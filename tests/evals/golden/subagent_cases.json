@@ -1,0 +1,599 @@
+[
+  {
+    "case_id": "update-lodash-direct-bump",
+    "eval_type": "update_subagent",
+    "provenance": "Juice Shop baseline direct SCA version bump for lodash 4.17.15 -> 4.17.21 (CVE-2021-44228 / Prototype Pollution). Grounded in trajectory phase5_20260825T094830Z_3e231517-522a-4128-9e87-8e909b5474c2.md (Trace: 3e231517-522a-4128-9e87-8e909b5474c2) and fixture triaged_groups_baseline.json.",
+    "supervisor_instruction": "Update \"lodash\" in package.json to version \"4.17.21\".",
+    "target_package_name": "lodash",
+    "selected_version": "4.17.21",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository contains package.json, package-lock.json, lib/, routes/, server.ts"
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "lodash",
+          "target_version": "4.17.21"
+        },
+        "output": "SUCCESS: Updated 'lodash' in 'package.json' to '4.17.21'."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "lodash"
+        },
+        "output": "SUCCESS: npm install --package-lock=true completed successfully with code 0."
+      }
+    ],
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "update-transitive-tootallnate-once-overrides",
+    "eval_type": "update_subagent",
+    "provenance": "Juice Shop transitive dependency pinning for @tootallnate/once 1.1.2 -> 2.0.1 (CVE-2026-3449 / GHSA-VPQ2-C234-7XJ6 in ancestry sqlite3 -> http-proxy-agent -> @tootallnate/once). Grounded in trajectory phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md (Trace: d661e0c3-2466-4cf0-902a-a3215e3affdd) and fixture examples/juice_shop/fixtures/transitive_parent_first/triaged_groups_transitive_parent_first.json.",
+    "supervisor_instruction": "Add or update \"overrides\": {\"@tootallnate/once\": \"2.0.1\"} in package.json to pin the transitive dependency via npm overrides.",
+    "target_package_name": "@tootallnate/once",
+    "selected_version": "2.0.1",
+    "dependency_type": "overrides",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Workspace initialized with root package.json."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "@tootallnate/once",
+          "target_version": "2.0.1",
+          "dependency_type": "overrides"
+        },
+        "output": "SUCCESS: Added override for '@tootallnate/once' -> '2.0.1' in 'package.json'."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "@tootallnate/once"
+        },
+        "output": "SUCCESS: Manifest sync validated against lockfile (npm install exit 0)."
+      }
+    ],
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "update-retry-with-registry",
+    "eval_type": "update_subagent",
+    "provenance": "Multi-attempt rescue after peer conflict from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). ws update from 7.4.5 caused QA failure PEER_CONFLICT with react-scripts; supervisor dispatches retry with view_npm_package_versions enabled. Worker queries registry, evaluates candidate versions, and applies 7.5.5.",
+    "supervisor_instruction": "Update \"ws\" in frontend/package.json to version \"7.5.5\". Prior attempt with 7.5.1 encountered peer conflict.",
+    "target_package_name": "ws",
+    "selected_version": "7.5.5",
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Multi-project repository with frontend/package.json."
+      },
+      {
+        "name": "view_npm_package_versions",
+        "args": {
+          "package_name": "ws"
+        },
+        "output": "SUCCESS: Published versions for ws: 7.4.5, 7.5.0, 7.5.1, 7.5.2, 7.5.3, 7.5.4, 7.5.5, 8.0.0, 8.11.0 (latest: 8.11.0)"
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "frontend/package.json",
+          "package_name": "ws",
+          "target_version": "7.5.5"
+        },
+        "output": "SUCCESS: Modified 'ws' to '7.5.5' in 'frontend/package.json'."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "frontend/package.json",
+          "package_name": "ws"
+        },
+        "output": "SUCCESS: npm install validated with zero peer conflicts."
+      }
+    ],
+    "changed_files": [
+      "frontend/package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "update-boundary-violation-version-hunting",
+    "eval_type": "update_subagent",
+    "provenance": "Synthetic architectural boundary violation test grounded in supervisor invariant: Worker is execution-only; Supervisor owns version selection. First-pass worker attempts to hunt versions using search_web and read_web_page.",
+    "supervisor_instruction": "Update \"lodash\" in package.json to version \"4.17.21\".",
+    "target_package_name": "lodash",
+    "selected_version": "4.17.21",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "search_web",
+        "args": {
+          "query": "lodash latest security patch CVE-2021-44228"
+        },
+        "output": "SUCCESS: Results found for lodash patches..."
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://github.com/lodash/lodash/releases"
+        },
+        "output": "SUCCESS: Page content extracted."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "lodash",
+          "target_version": "4.17.21"
+        },
+        "output": "SUCCESS: Updated lodash."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "lodash"
+        },
+        "output": "SUCCESS: Validated."
+      }
+    ],
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": false,
+    "expected_boundary_pass": false,
+    "expected_efficiency_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "update-inefficient-redundant-reads",
+    "eval_type": "update_subagent",
+    "provenance": "Synthetic inefficiency pattern grounded in subagent_runtime.py bounded loop rules and test_subagent_runtime.py stagnation tests. Worker repeatedly re-reads package.json 5 times and encounters 4 failed tool inputs before succeeding.",
+    "supervisor_instruction": "Update \"cookie\" in package.json to version \"0.7.0\".",
+    "target_package_name": "cookie",
+    "selected_version": "0.7.0",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repo map loaded."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "package.json"
+        },
+        "output": "SUCCESS: Read package.json."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "package.json"
+        },
+        "output": "SUCCESS: Read package.json."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "package.json"
+        },
+        "output": "SUCCESS: Read package.json."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "package.json"
+        },
+        "output": "SUCCESS: Read package.json."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "package.json"
+        },
+        "output": "SUCCESS: Read package.json."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "package": "cookie"
+        },
+        "output": "ERROR: Missing required field 'manifest_path'."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "package": "cookie"
+        },
+        "output": "ERROR: Missing required field 'manifest_path'."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "package": "cookie"
+        },
+        "output": "ERROR: Missing required field 'manifest_path'."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "package": "cookie"
+        },
+        "output": "ERROR: Missing required field 'manifest_path'."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "cookie",
+          "target_version": "0.7.0"
+        },
+        "output": "SUCCESS: Updated cookie to 0.7.0."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "cookie"
+        },
+        "output": "SUCCESS: Manifest sync validated."
+      }
+    ],
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": false,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": false,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "update-surrender-clean-peer-conflict",
+    "eval_type": "update_subagent",
+    "provenance": "Clean-room surrender from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). Worker attempts validate_manifest_sync for express-jwt@8.5.1, encounters ERESOLVE peer conflict, executes revert_workspace_file(file_path=\"package.json\", package_name=\"express-jwt\"), and surrenders cleanly.",
+    "supervisor_instruction": "Update \"express-jwt\" in package.json to version \"8.5.1\".",
+    "target_package_name": "express-jwt",
+    "selected_version": "8.5.1",
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repo map loaded."
+      },
+      {
+        "name": "modify_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "express-jwt",
+          "target_version": "8.5.1"
+        },
+        "output": "SUCCESS: Modified express-jwt to 8.5.1."
+      },
+      {
+        "name": "validate_manifest_sync",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "express-jwt"
+        },
+        "output": "ERROR: npm ERR! ERESOLVE could not resolve dependency: express-jwt@8.5.1 requires express@^4.18.0 but project root has express@4.17.1"
+      },
+      {
+        "name": "revert_workspace_file",
+        "args": {
+          "file_path": "package.json",
+          "package_name": "express-jwt"
+        },
+        "output": "SUCCESS: Reverted express-jwt changes in package.json."
+      }
+    ],
+    "changed_files": [],
+    "action_status": "SURRENDER",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_completion_pass": false
+  },
+  {
+    "case_id": "workaround-simple-ast-patch",
+    "eval_type": "workaround_subagent",
+    "provenance": "Juice Shop prototype pollution workaround in lib/insecurity.ts (CVE-2020-15084 / Algorithm Confusion in express-jwt) from fixture examples/juice_shop/fixtures/workaround_replay/express_jwt_workaround_replay.json (Trace: 249c81ed-5f64-42f2-98d8-013fb6ed0723).",
+    "supervisor_instruction": "Implement a code workaround for express-jwt in lib/insecurity.ts to configure algorithm whitelist ['HS256', 'RS256'].",
+    "target_package_name": "express-jwt",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "pattern": "express-jwt",
+          "file_path": "lib/insecurity.ts"
+        },
+        "output": "SUCCESS: Found match at line 54 in lib/insecurity.ts."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "symbol_name": "isAuthorized"
+        },
+        "output": "SUCCESS: AST inspected: function isAuthorized exports expressJwt middleware configuration."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "investigation_findings": "express-jwt usage in isAuthorized needs explicit algorithms array to prevent algorithm confusion vulnerability.",
+          "target_files": [
+            "lib/insecurity.ts"
+          ],
+          "replacement_strategy": "ast_transform",
+          "proposed_changes": "Specify algorithms: ['HS256', 'RS256'] in expressJwt options."
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "patch_id": "patch-insecurity-jwt",
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_code": "expressJwt({ secret: publicKey })",
+              "new_code": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })"
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\": [\"lib/insecurity.ts\"], \"status\": \"applied\"}"
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts"
+        },
+        "output": "SUCCESS: Runtime smoke and targeted test passed cleanly."
+      }
+    ],
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_lifecycle_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "workaround-lifecycle-violation-unplanned-edit",
+    "eval_type": "workaround_subagent",
+    "provenance": "Synthetic workaround safety violation grounded in test_workaround_atomic_patches.py and test_workaround_refactor.py. Worker attempts to immediately execute deterministic_apply_edit_set without calling record_plan.",
+    "supervisor_instruction": "Apply sanitization patch to routes/b2bOrder.ts for notevil sandbox escape.",
+    "target_package_name": "notevil",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/b2bOrder.ts"
+        },
+        "output": "SUCCESS: Read routes/b2bOrder.ts."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "patch_id": "patch-b2b-unplanned",
+          "replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_code": "const notevil = require('notevil');",
+              "new_code": "const safeJson = JSON.parse;"
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\": [\"routes/b2bOrder.ts\"], \"status\": \"applied\"}"
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "runtime_smoke_file": "routes/b2bOrder.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts"
+        },
+        "output": "SUCCESS: Validated."
+      }
+    ],
+    "changed_files": [
+      "routes/b2bOrder.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": false,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_lifecycle_pass": false,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "workaround-replay-from-plan",
+    "eval_type": "workaround_subagent",
+    "provenance": "Workaround replay after failed version update pivot grounded in examples/juice_shop/fixtures/workaround_replay/express_jwt_workaround_replay.json (Trace: 249c81ed-5f64-42f2-98d8-013fb6ed0723) and test_workaround_replay.py. Pre-existing WorkaroundReplayPlan is validated and executed.",
+    "supervisor_instruction": "Replay verified workaround plan for express-jwt in lib/insecurity.ts.",
+    "target_package_name": "express-jwt",
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository map loaded."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "symbol_name": "isAuthorized"
+        },
+        "output": "SUCCESS: Symbol inspected."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "investigation_findings": "Replaying verified edit set from prior attempt for express-jwt.",
+          "target_files": [
+            "lib/insecurity.ts"
+          ],
+          "replacement_strategy": "ast_transform",
+          "proposed_changes": "Replay verified configuration."
+        },
+        "output": "SUCCESS: Plan recorded."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "patch_id": "patch-insecurity-jwt-replay",
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_code": "expressJwt({ secret: publicKey })",
+              "new_code": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })"
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\": [\"lib/insecurity.ts\"], \"status\": \"applied\"}"
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts"
+        },
+        "output": "SUCCESS: Validation passed."
+      }
+    ],
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_lifecycle_pass": true,
+    "expected_completion_pass": true
+  },
+  {
+    "case_id": "workaround-no-fix-package-removal",
+    "eval_type": "workaround_subagent",
+    "provenance": "Deprecated package removal mitigation grounded in fixture examples/juice_shop/fixtures/workaround_nofix/notevil_workaround_nofix.json (CVE-2021-23771 for notevil 1.3.3 / routes/b2bOrder.ts / test/server/b2bOrderSpec.ts). No upstream fix exists; worker removes notevil via remove_no_fix_dependency and removes call site.",
+    "supervisor_instruction": "Execute NO_FIX package removal mitigation for deprecated package notevil@1.3.3 and remove consumer code in routes/b2bOrder.ts.",
+    "target_package_name": "notevil",
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Workspace initialized."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "pattern": "notevil",
+          "file_path": "routes/b2bOrder.ts"
+        },
+        "output": "SUCCESS: Found require('notevil') in routes/b2bOrder.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "investigation_findings": "notevil has no upstream fix; removing package and rewriting order deserializer",
+          "target_files": [
+            "routes/b2bOrder.ts",
+            "package.json"
+          ],
+          "replacement_strategy": "package_removal",
+          "proposed_changes": "Remove notevil from package.json and replace eval call in routes/b2bOrder.ts with safe JSON parser."
+        },
+        "output": "SUCCESS: Plan recorded for package removal."
+      },
+      {
+        "name": "remove_no_fix_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "notevil"
+        },
+        "output": "SUCCESS: Removed 'notevil' dependency declaration from 'package.json'."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "patch_id": "patch-remove-notevil-call",
+          "replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_code": "const notevil = require('notevil');",
+              "new_code": "// notevil removed: secure JSON parser used"
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\": [\"routes/b2bOrder.ts\"], \"status\": \"applied\"}"
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "runtime_smoke_file": "routes/b2bOrder.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts"
+        },
+        "output": "SUCCESS: Validation passed with zero security flags."
+      }
+    ],
+    "changed_files": [
+      "package.json",
+      "routes/b2bOrder.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_pass": true,
+    "expected_boundary_pass": true,
+    "expected_efficiency_pass": true,
+    "expected_lifecycle_pass": true,
+    "expected_completion_pass": true
+  }
+]
