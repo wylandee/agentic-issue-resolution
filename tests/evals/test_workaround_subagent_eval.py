@@ -151,8 +151,14 @@ class TestWorkaroundSubagentEval:
         metric = WorkaroundLifecycleMetric()
         expected_lifecycle_pass = case.get("expected_lifecycle_pass", True)
 
-        if expected_lifecycle_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_lifecycle_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass lifecycle check but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful(), (
@@ -218,8 +224,14 @@ class TestWorkaroundSubagentEval:
         metric = ArchitectureBoundaryMetric()
         expected_boundary_pass = case.get("expected_boundary_pass", True)
 
-        if expected_boundary_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_boundary_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass boundary check but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful()
@@ -236,8 +248,14 @@ class TestWorkaroundSubagentEval:
         metric = ToolEfficiencyMetric(threshold=0.70)
         expected_efficiency_pass = case.get("expected_efficiency_pass", True)
 
-        if expected_efficiency_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_efficiency_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass efficiency check but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful()

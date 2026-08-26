@@ -43,6 +43,7 @@ except ImportError:
 
         input: str
         actual_output: str
+        name: str | None = None
         expected_output: str | None = None
         context: list[str] | None = None
         retrieval_context: list[str] | None = None
@@ -51,6 +52,35 @@ except ImportError:
         completion_time: float | None = None
         token_cost: float | None = None
         additional_metadata: dict[str, Any] | None = None
+
+        def __init__(
+            self,
+            input: str = "",
+            actual_output: str = "",
+            name: str | None = None,
+            expected_output: str | None = None,
+            context: list[str] | None = None,
+            retrieval_context: list[str] | None = None,
+            tools_called: list[DeepEvalToolCall] | None = None,
+            expected_tools: list[DeepEvalToolCall] | None = None,
+            completion_time: float | None = None,
+            token_cost: float | None = None,
+            additional_metadata: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            self.input = input
+            self.actual_output = actual_output
+            self.name = name
+            self.expected_output = expected_output
+            self.context = context
+            self.retrieval_context = retrieval_context
+            self.tools_called = tools_called
+            self.expected_tools = expected_tools
+            self.completion_time = completion_time
+            self.token_cost = token_cost
+            self.additional_metadata = additional_metadata or {}
+            for k, v in kwargs.items():
+                setattr(self, k, v)
 
 
 ToolCall = DeepEvalToolCall

@@ -18,16 +18,57 @@ from tests.evals.custom_metrics import (
 
 try:
     from deepeval import assert_test
-    from deepeval.metrics import GEval
-    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+    from deepeval.metrics import (
+        GEval,
+    )
+    from deepeval.metrics import (
+        TaskCompletionMetric as DeepEvalTaskCompletionMetric,
+    )
+    from deepeval.metrics import (
+        ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric,
+    )
+    from deepeval.test_case import LLMTestCase, LLMTestCaseParams, ToolCall
 
     HAS_DEEPEVAL = True
 except ImportError:
+    from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
+    from tests.evals.adapters import DeepEvalToolCall as ToolCall  # type: ignore[assignment]
+
     HAS_DEEPEVAL = False
-    LLMTestCase = None  # type: ignore[assignment,misc]
     LLMTestCaseParams = None  # type: ignore[assignment,misc]
     GEval = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
+    DeepEvalTaskCompletionMetric = None  # type: ignore[assignment,misc]
+    DeepEvalToolCorrectnessMetric = None  # type: ignore[assignment,misc]
+
+
+# ---------------------------------------------------------------------------
+# Authorized Tool Constants for QA Critic
+# ---------------------------------------------------------------------------
+
+_AUTHORIZED_QA_TOOLS = frozenset(
+    {
+        "list_changed_files",
+        "generate_workspace_diff",
+        "read_file_context",
+        "search_codebase_pattern",
+        "inspect_ast_symbol",
+        "query_qa_logs",
+        "emit_qa_evaluation",
+    }
+)
+
+_MUTATING_WORKER_TOOLS = frozenset(
+    {
+        "modify_npm_dependency",
+        "validate_manifest_sync",
+        "deterministic_apply_edit_set",
+        "deterministic_search_replace",
+        "remove_no_fix_dependency",
+        "revert_workspace_file",
+        "record_plan",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +133,73 @@ def build_qa_production_prompt(case: dict[str, Any]) -> str:
     )
 
 
+def build_qa_test_case(case: dict[str, Any]) -> LLMTestCase:
+    """Construct an LLMTestCase from a golden QA Critic evaluation case dictionary."""
+    tool_calls_raw = case.get("tool_calls", [])
+    tools_called = [
+        ToolCall(
+            name=tc.get("name", ""),
+            input_parameters=tc.get("args", {}) or {},
+            output=tc.get("output", ""),
+        )
+        for tc in tool_calls_raw
+    ]
+
+    expected_tools: list[ToolCall] = []
+    if case.get("expected_tool_correctness_pass", True):
+        for tc in tool_calls_raw:
+            expected_tools.append(
+                ToolCall(
+                    name=tc.get("name", ""),
+                    input_parameters=tc.get("args", {}) or {},
+                )
+            )
+
+    prompt = build_qa_production_prompt(case)
+    llm_output = case.get("llm_qa_output", {})
+    actual_output = json.dumps(llm_output, indent=2)
+    expected_output = case.get(
+        "expected_output",
+        json.dumps(
+            {
+                "passed": case.get("expected_passed"),
+                "failure_category": case.get("expected_failure_category"),
+                "security_review_verdict": case.get("expected_security_review_verdict"),
+            },
+            indent=2,
+        ),
+    )
+
+    metadata = {
+        "case_id": case.get("case_id"),
+        "eval_type": "qa_critic",
+        "provenance": case.get("provenance"),
+        "qa_policy": case.get("qa_policy"),
+        "task_id": llm_output.get("task_id"),
+        "passed": llm_output.get("passed"),
+        "failure_category": llm_output.get("failure_category"),
+        "retry_feedback": llm_output.get("retry_feedback"),
+        "semantic_security_review": llm_output.get("semantic_security_review"),
+        "test_attribution": llm_output.get("test_attribution"),
+        "execution_context": case.get("execution_context", {}),
+        "expected_passed": case.get("expected_passed"),
+        "expected_failure_category": case.get("expected_failure_category"),
+        "expected_tool_correctness_pass": case.get("expected_tool_correctness_pass", True),
+        "expected_task_completion_pass": case.get("expected_task_completion_pass", True),
+    }
+
+    return LLMTestCase(
+        name=f"{case.get('case_id')} [QA Critic]",
+        input=prompt,
+        actual_output=actual_output,
+        expected_output=expected_output,
+        context=[prompt, case.get("provenance", "")],
+        tools_called=tools_called,
+        expected_tools=expected_tools if expected_tools else None,
+        additional_metadata=metadata,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Structural & Deterministic Validation Helpers
 # ---------------------------------------------------------------------------
@@ -144,6 +252,43 @@ def validate_qa_category_accuracy(
     return violations
 
 
+def validate_qa_tool_sequence(tool_calls: list[dict[str, Any]]) -> list[str]:
+    """Validate that tool calls strictly conform to QA Critic read-only boundary and terminal invariants."""
+    violations: list[str] = []
+    if not tool_calls:
+        violations.append(
+            "QA Critic made no tool calls; expected read-only inspection and emit_qa_evaluation."
+        )
+        return violations
+
+    tool_names = [tc.get("name", "") for tc in tool_calls]
+
+    # 1. Check for unauthorized mutating tools
+    mutating = [name for name in tool_names if name in _MUTATING_WORKER_TOOLS]
+    if mutating:
+        violations.append(f"QA Critic called unauthorized mutating tools: {mutating}")
+
+    # 2. Check for unknown/unauthorized tools
+    unauthorized = [name for name in tool_names if name not in _AUTHORIZED_QA_TOOLS]
+    if unauthorized:
+        violations.append(f"QA Critic called unauthorized/unknown tools: {unauthorized}")
+
+    # 3. Check for terminal tool emit_qa_evaluation
+    if "emit_qa_evaluation" not in tool_names:
+        violations.append("QA Critic did not invoke terminal tool 'emit_qa_evaluation'.")
+    elif tool_names[-1] != "emit_qa_evaluation":
+        violations.append(
+            f"Terminal tool 'emit_qa_evaluation' appeared at position {tool_names.index('emit_qa_evaluation') + 1} "
+            f"of {len(tool_names)}, but must be the final tool call."
+        )
+
+    # 4. Check emit_qa_evaluation is not called multiple times
+    if tool_names.count("emit_qa_evaluation") > 1:
+        violations.append("QA Critic invoked terminal tool 'emit_qa_evaluation' multiple times.")
+
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # Test Suite: TestQACriticEval
 # ---------------------------------------------------------------------------
@@ -152,6 +297,112 @@ def validate_qa_category_accuracy(
 @pytest.mark.eval
 class TestQACriticEval:
     """Evaluation test suite for QA Critic diagnostics."""
+
+    @pytest.mark.parametrize(
+        "case",
+        _QA_CASES or [{}],
+        ids=_QA_CASE_IDS or ["no_cases"],
+    )
+    def test_qa_tool_sequence_correctness(self, case: dict[str, Any]) -> None:
+        """QA Critic uses only authorized read-only review tools and terminates with emit_qa_evaluation."""
+        if not case:
+            pytest.skip("No golden QA cases available")
+
+        case_id = case.get("case_id", "unknown")
+        tool_calls = case.get("tool_calls", [])
+        violations = validate_qa_tool_sequence(tool_calls)
+        assert not violations, f"Case '{case_id}' failed tool sequence validation: {violations}"
+
+    @pytest.mark.parametrize(
+        "case",
+        _QA_CASES or [{}],
+        ids=_QA_CASE_IDS or ["no_cases"],
+    )
+    def test_qa_tool_correctness_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in ToolCorrectnessMetric evaluates QA Critic ordered tool execution."""
+        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
+            pytest.skip("DeepEval is not installed in the current environment.")
+
+        if not case:
+            pytest.skip("No golden QA cases available")
+
+        test_case = build_qa_test_case(case)
+        if not getattr(test_case, "expected_tools", None):
+            pytest.skip("No expected tools defined for case.")
+
+        metric = DeepEvalToolCorrectnessMetric(threshold=0.5, should_consider_ordering=True)
+        if assert_test:
+            assert_test(test_case, [metric], run_async=False)
+        else:
+            metric.measure(test_case)
+            assert metric.is_successful()
+
+    @pytest.mark.parametrize(
+        "case",
+        _QA_CASES or [{}],
+        ids=_QA_CASE_IDS or ["no_cases"],
+    )
+    def test_qa_deterministic_task_completion(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """QA Critic produces a complete diagnostic evaluation matching ground truth."""
+        if not case:
+            pytest.skip("No golden QA cases available")
+
+        case_id = case.get("case_id", "unknown")
+        llm_output = case.get("llm_qa_output", {})
+
+        # 1. Output exists and contains required task_id
+        assert llm_output.get("task_id"), f"Case '{case_id}' missing task_id in QA output"
+
+        # 2. Output matches ground truth verdict & failure category
+        accuracy_violations = validate_qa_category_accuracy(llm_output, case)
+        assert not accuracy_violations, (
+            f"Case '{case_id}' failed task completion accuracy: {accuracy_violations}"
+        )
+
+        # 3. When failed, retry feedback is provided
+        if case.get("expected_passed") is False:
+            feedback = llm_output.get("retry_feedback")
+            assert feedback and len(str(feedback).strip()) > 10, (
+                f"Case '{case_id}' with passed=False requires actionable retry_feedback"
+            )
+
+    @pytest.mark.parametrize(
+        "case",
+        _QA_CASES or [{}],
+        ids=_QA_CASE_IDS or ["no_cases"],
+    )
+    def test_qa_live_task_completion_deepeval(
+        self,
+        case: dict[str, Any],
+        eval_settings: EvalSettings,
+    ) -> None:
+        """DeepEval built-in TaskCompletionMetric evaluates QA completion with LLM judge (requires --run-eval-live)."""
+        if not eval_settings.is_live:
+            pytest.skip("DeepEval TaskCompletionMetric requires live LLM judge (--run-eval-live)")
+
+        if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
+            pytest.skip("DeepEval is not installed in the current environment.")
+
+        test_case = build_qa_test_case(case)
+        metric = DeepEvalTaskCompletionMetric(
+            threshold=0.70,
+            model=eval_settings.judge_model,
+        )
+
+        if case.get("expected_task_completion_pass", True):
+            if assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                metric.measure(test_case)
+                assert metric.is_successful()
 
     @pytest.mark.parametrize(
         "case",
@@ -519,3 +770,27 @@ def test_qa_guardrail_metric_catches_overrides() -> None:
     score = metric.measure(test_case)
     assert score == 0.0
     assert "Remaining scanner findings" in metric.reason
+
+
+def test_qa_evaluator_catches_mutating_tool_boundary_violation() -> None:
+    """Ensure validate_qa_tool_sequence rejects unauthorized mutating worker tools in QA Critic."""
+    bad_tool_calls = [
+        {"name": "list_changed_files", "args": {}},
+        {
+            "name": "modify_npm_dependency",
+            "args": {"manifest_path": "package.json", "package_name": "lodash"},
+        },
+        {"name": "emit_qa_evaluation", "args": {}},
+    ]
+    violations = validate_qa_tool_sequence(bad_tool_calls)
+    assert any("mutating tools" in v for v in violations)
+
+
+def test_qa_evaluator_catches_missing_terminal_tool() -> None:
+    """Ensure validate_qa_tool_sequence rejects tool sequences that omit emit_qa_evaluation."""
+    incomplete_tool_calls = [
+        {"name": "list_changed_files", "args": {}},
+        {"name": "query_qa_logs", "args": {"query_type": "install"}},
+    ]
+    violations = validate_qa_tool_sequence(incomplete_tool_calls)
+    assert any("emit_qa_evaluation" in v for v in violations)

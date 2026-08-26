@@ -179,8 +179,14 @@ class TestUpdateSubagentEval:
         metric = ArchitectureBoundaryMetric()
         expected_boundary_pass = case.get("expected_boundary_pass", True)
 
-        if expected_boundary_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_boundary_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass boundary check but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful(), (
@@ -199,8 +205,14 @@ class TestUpdateSubagentEval:
         metric = ToolEfficiencyMetric(threshold=0.70)
         expected_efficiency_pass = case.get("expected_efficiency_pass", True)
 
-        if expected_efficiency_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_efficiency_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass efficiency metric but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful(), (
@@ -219,8 +231,14 @@ class TestUpdateSubagentEval:
         metric = DeterministicTaskCompletionMetric(threshold=0.70)
         expected_completion_pass = case.get("expected_completion_pass", True)
 
-        if expected_completion_pass and HAS_DEEPEVAL and assert_test:
-            assert_test(test_case, [metric], run_async=False)
+        if expected_completion_pass:
+            if HAS_DEEPEVAL and assert_test:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                score = metric.measure(test_case)
+                assert metric.is_successful(), (
+                    f"Case '{case['case_id']}' was expected to pass task completion but scored {score}."
+                )
         else:
             score = metric.measure(test_case)
             assert not metric.is_successful(), (

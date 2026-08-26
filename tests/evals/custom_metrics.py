@@ -309,13 +309,13 @@ class ArchitectureBoundaryMetric(BaseMetric):
         tool_names_and_args: list[tuple[str, dict[str, Any]]] = []
 
         for tool in tools_called:
-            if isinstance(tool, ToolCall):
-                name = getattr(tool, "name", "")
-                params = getattr(tool, "input_parameters", {}) or {}
-                tool_names_and_args.append((name, params))
-            elif isinstance(tool, dict):
+            if isinstance(tool, dict):
                 name = tool.get("name", "")
                 params = tool.get("args") or tool.get("input_parameters") or {}
+                tool_names_and_args.append((name, params))
+            else:
+                name = getattr(tool, "name", "")
+                params = getattr(tool, "input_parameters", None) or getattr(tool, "args", {}) or {}
                 tool_names_and_args.append((name, params))
 
         violations: list[str] = []
@@ -412,20 +412,22 @@ class ToolEfficiencyMetric(BaseMetric):
 
         tool_calls: list[dict[str, Any]] = []
         for tool in tools_called:
-            if isinstance(tool, ToolCall):
-                tool_calls.append(
-                    {
-                        "name": getattr(tool, "name", ""),
-                        "args": getattr(tool, "input_parameters", {}) or {},
-                        "output": getattr(tool, "output", ""),
-                    }
-                )
-            elif isinstance(tool, dict):
+            if isinstance(tool, dict):
                 tool_calls.append(
                     {
                         "name": tool.get("name", ""),
                         "args": tool.get("args") or tool.get("input_parameters") or {},
                         "output": tool.get("output", ""),
+                    }
+                )
+            else:
+                tool_calls.append(
+                    {
+                        "name": getattr(tool, "name", ""),
+                        "args": getattr(tool, "input_parameters", None)
+                        or getattr(tool, "args", {})
+                        or {},
+                        "output": getattr(tool, "output", ""),
                     }
                 )
 
@@ -546,10 +548,10 @@ class WorkaroundLifecycleMetric(BaseMetric):
         tool_names: list[str] = []
 
         for tool in tools_called:
-            if isinstance(tool, ToolCall):
-                tool_names.append(getattr(tool, "name", ""))
-            elif isinstance(tool, dict):
+            if isinstance(tool, dict):
                 tool_names.append(tool.get("name", ""))
+            else:
+                tool_names.append(getattr(tool, "name", ""))
 
         edit_tools = {
             "deterministic_apply_edit_set",

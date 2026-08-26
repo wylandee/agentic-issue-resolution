@@ -29,6 +29,40 @@
     },
     "changed_files": ["package.json", "package-lock.json"],
     "worker_action_summary": "Updated sanitize-html from 1.4.2 to 1.4.3 in package.json and synchronized package-lock.json.",
+    "tool_calls": [
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: package.json, package-lock.json"
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "install"},
+        "output": "added 1 package, changed 1 package in 2.14s\n0 vulnerabilities found"
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "scan"},
+        "output": "OWASP Dependency-Check completed successfully (exit 0). 0 vulnerabilities found for sanitize-html. Target CVE-2017-16016 cleared."
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "test"},
+        "output": "451 passing (12s)\n0 failing"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-sanitize-html",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-sanitize-html."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-sanitize-html",
       "passed": true,
@@ -40,6 +74,9 @@
     "expected_passed": true,
     "expected_failure_category": null,
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: True. Target CVE-2017-16016 cleared in scanner, install and tests all passed under version_bump policy.",
     "semantic_criteria": {
       "diagnostic_quality": "Clean pass validation: install, scan, and tests all succeed without error.",
       "evaluation_guidance": "Confirm that passed=True and no failure_category is assigned."
@@ -75,6 +112,30 @@
     },
     "changed_files": ["package.json"],
     "worker_action_summary": "Attempted version bump to @tootallnate/once@1.1.2 via npm override.",
+    "tool_calls": [
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "scan"},
+        "output": "OWASP Dependency-Check completed successfully (exit 0). Found 1 vulnerability affecting @tootallnate/once@1.1.2: CVE-2022-37601 (Prototype Pollution). Versions <2.0.0 remain vulnerable."
+      },
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: package.json"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-once",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "Dependency-Check scan indicates CVE-2022-37601 remains active on @tootallnate/once@1.1.2. The version bump to 1.1.2 did not clear the vulnerability. Advance version stage to npm_same_major or npm_latest (target >=2.0.1).",
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-once."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-once",
       "passed": false,
@@ -86,6 +147,9 @@
     "expected_passed": false,
     "expected_failure_category": "security_flag",
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: security_flag. Dependency-Check scan indicates CVE-2022-37601 remains active on @tootallnate/once@1.1.2.",
     "semantic_criteria": {
       "diagnostic_quality": "Correctly categorizes remaining scanner findings as SECURITY_FLAG and gives actionable version guidance.",
       "evaluation_guidance": "Confirm passed=False, failure_category=security_flag, and retry_feedback references the remaining CVE-2022-37601."
@@ -121,6 +185,25 @@
     },
     "changed_files": ["package.json"],
     "worker_action_summary": "Updated swagger-ui-express to 5.0.0 in package.json.",
+    "tool_calls": [
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "install"},
+        "output": "npm error code ERESOLVE\nnpm error ERESOLVE could not resolve\nnpm error While resolving: swagger-ui-express@5.0.0\nnpm error Found: express@4.17.1\nnpm error node_modules/express\nnpm error   express@\"^4.17.1\" from the root project\nnpm error Could not resolve dependency:\nnpm error peer express@\">=5.0.0\" from swagger-ui-express@5.0.0"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-swagger-ui-express",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "npm install failed with ERESOLVE peer dependency conflict: swagger-ui-express@5.0.0 requires peer express@>=5.0.0, but the root project uses express@4.17.1. Retry with a compatible version within the express 4.x ecosystem (e.g. 4.1.6).",
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-swagger-ui-express."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-swagger-ui-express",
       "passed": false,
@@ -132,6 +215,9 @@
     "expected_passed": false,
     "expected_failure_category": "peer_conflict",
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: peer_conflict. npm install failed with ERESOLVE peer dependency conflict against express@4.17.1.",
     "semantic_criteria": {
       "diagnostic_quality": "Accurately identifies npm ERESOLVE error as PEER_CONFLICT and identifies the incompatible peer dependency.",
       "evaluation_guidance": "Confirm passed=False, failure_category=peer_conflict, and retry_feedback references express peer dependency incompatibility."
@@ -167,6 +253,35 @@
     },
     "changed_files": ["package.json", "package-lock.json"],
     "worker_action_summary": "Updated express-jwt to 8.5.1 in package.json.",
+    "tool_calls": [
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "test"},
+        "output": "npm test FAILED (exit 1).\nstdout tail:\n  error: '(0 , import_express_jwt.default) is not a function'\n  code: 'ERR_TEST_FAILURE'\n  name: 'TypeError'\n  stack: |-\n    Object.isAuthorized (/workspace/lib/insecurity.ts:54:35)\n    configureApp (/workspace/server.ts:355:36)\n    createApp (/workspace/server.ts:779:3)\n    createTestApp (/workspace/test/api/helpers/setup.ts:11:16)"
+      },
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: package.json, package-lock.json"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "lib/insecurity.ts", "start_line": 50, "end_line": 60},
+        "output": "54: expressJwt({\n55:   secret: '...'\n56: })"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-express-jwt",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The express-jwt@8.5.1 update introduced a breaking API change: express-jwt v8 no longer exports a default callable middleware function. Calls to express_jwt(...) at lib/insecurity.ts:54 fail with TypeError: (0, import_express_jwt.default) is not a function, causing 451 unit tests to fail. The manifest update path is exhausted; pivot to CODE_WORKAROUND.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-express-jwt."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-express-jwt",
       "passed": false,
@@ -178,6 +293,9 @@
     "expected_passed": false,
     "expected_failure_category": "breaking_change",
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: breaking_change. express-jwt v8 API export signature change caused TypeError in lib/insecurity.ts.",
     "semantic_criteria": {
       "diagnostic_quality": "Accurately attributes unit test suite crash to the express-jwt v8 export signature change and categorizes as BREAKING_CHANGE.",
       "evaluation_guidance": "Confirm passed=False, failure_category=breaking_change, and retry_feedback references the TypeError and API breakage."
@@ -213,6 +331,39 @@
     },
     "changed_files": ["lib/insecurity.ts"],
     "worker_action_summary": "Updated lib/insecurity.ts to use the named export { expressjwt } from 'express-jwt' and configured explicit algorithms: ['HS256'].",
+    "tool_calls": [
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: lib/insecurity.ts"
+      },
+      {
+        "name": "generate_workspace_diff",
+        "args": {"file_path": "lib/insecurity.ts"},
+        "output": "-import expressJwt from 'express-jwt'\n+import { expressjwt as expressJwt } from 'express-jwt'\n-algorithms: undefined\n+algorithms: ['HS256']"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "lib/insecurity.ts", "start_line": 50, "end_line": 65},
+        "output": "54: expressJwt({ secret: privateKey, algorithms: ['HS256'] })"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-express-jwt-workaround",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": {
+            "verdict": "pass",
+            "reasoning": "Workaround in lib/insecurity.ts replaces the legacy default import with the expressjwt named export and explicitly enforces algorithms: ['HS256']. This neutralizes CVE-2020-15084 authorization bypass while maintaining full compatibility with the Juice Shop test suite.",
+            "evidence_refs": ["lib/insecurity.ts:54-58"]
+          },
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-express-jwt-workaround."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-express-jwt-workaround",
       "passed": true,
@@ -228,6 +379,9 @@
     "expected_passed": true,
     "expected_failure_category": null,
     "expected_security_review_verdict": "pass",
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: True. Workaround in lib/insecurity.ts successfully passed semantic security review and all unit tests passed.",
     "semantic_criteria": {
       "diagnostic_quality": "Validates that the code workaround correctly neutralizes the algorithm confusion vulnerability and confirms tests pass.",
       "evaluation_guidance": "Confirm passed=True, security review verdict=pass, and evidence_refs cites lib/insecurity.ts."
@@ -263,6 +417,39 @@
     },
     "changed_files": ["routes/b2bOrder.ts"],
     "worker_action_summary": "Wrapped notevil.run(orderScript) in a try/catch block to prevent uncaught runtime errors.",
+    "tool_calls": [
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: routes/b2bOrder.ts"
+      },
+      {
+        "name": "generate_workspace_diff",
+        "args": {"file_path": "routes/b2bOrder.ts"},
+        "output": "+try {\n+  return notevil.run(orderScript)\n+} catch (err) { ... }"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "routes/b2bOrder.ts", "start_line": 20, "end_line": 35},
+        "output": "24: try {\n25:   notevil.run(orderScript)\n26: } catch (e) { ... }"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-notevil-workaround",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The code workaround in routes/b2bOrder.ts does not neutralize CVE-2021-23771. Wrapping notevil execution in a try/catch block fails to restrict prototype traversal on the sandbox object; attackers can still escape via this.constructor.constructor('return process')(). You must remove notevil usage or sanitize the input AST before execution.",
+          "semantic_security_review": {
+            "verdict": "fail",
+            "reasoning": "The workaround wraps notevil.run() in a try/catch block at routes/b2bOrder.ts:24-32 but does not sanitize the input or restrict prototype access. Attackers can still supply malicious expressions to escape the sandbox context. CVE-2021-23771 remains active and exploitable.",
+            "evidence_refs": ["routes/b2bOrder.ts:24-32"]
+          },
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-notevil-workaround."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-notevil-workaround",
       "passed": false,
@@ -278,6 +465,9 @@
     "expected_passed": false,
     "expected_failure_category": "security_flag",
     "expected_security_review_verdict": "fail",
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: security_flag. Workaround in routes/b2bOrder.ts failed semantic security review because try/catch does not prevent prototype sandbox escape.",
     "semantic_criteria": {
       "diagnostic_quality": "Detects superficial workaround that does not neutralize the underlying sandbox escape vulnerability.",
       "evaluation_guidance": "Confirm passed=False, failure_category=security_flag, and security review verdict=fail with clear exploit explanation."
@@ -313,6 +503,39 @@
     },
     "changed_files": ["routes/b2bOrder.ts"],
     "worker_action_summary": "Replaced notevil expression evaluation with strict JSON.parse in routes/b2bOrder.ts.",
+    "tool_calls": [
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "test"},
+        "output": "FAIL test/server/b2bOrderSpec.ts\n  ● b2bOrder > should calculate dynamic discount formula\n    AssertionError: expected null to deeply equal 150.00\n1 failed, 17 passed"
+      },
+      {
+        "name": "generate_workspace_diff",
+        "args": {"file_path": "routes/b2bOrder.ts"},
+        "output": "-notevil.run(orderScript)\n+JSON.parse(orderScript)"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "routes/b2bOrder.ts", "start_line": 20, "end_line": 30},
+        "output": "22: const result = JSON.parse(orderScript);"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-notevil-regression",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The code workaround in routes/b2bOrder.ts caused a test regression in test/server/b2bOrderSpec.ts: replacing expression evaluation with JSON.parse breaks custom discount formula evaluation. Implement safe arithmetic evaluation instead of strict JSON parsing.",
+          "semantic_security_review": {
+            "verdict": "pass",
+            "reasoning": "Replacing notevil with JSON.parse successfully eliminated the sandbox escape vulnerability, but broke application functionality required by tests.",
+            "evidence_refs": ["routes/b2bOrder.ts:20-28"]
+          },
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-notevil-regression."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-notevil-regression",
       "passed": false,
@@ -328,6 +551,9 @@
     "expected_passed": false,
     "expected_failure_category": "breaking_change",
     "expected_security_review_verdict": "pass",
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: breaking_change. Workaround broke application unit test b2bOrderSpec despite passing semantic security review.",
     "semantic_criteria": {
       "diagnostic_quality": "Correctly classifies test regression as BREAKING_CHANGE even though security review passed.",
       "evaluation_guidance": "Confirm passed=False, failure_category=breaking_change, and retry_feedback references b2bOrderSpec test failure."
@@ -363,6 +589,35 @@
     },
     "changed_files": ["package.json", "package-lock.json"],
     "worker_action_summary": "Removed unused legacy dependency marsdb from package.json and regenerated package-lock.json.",
+    "tool_calls": [
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: package.json, package-lock.json"
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "install"},
+        "output": "removed 1 package in 1.9s\n0 vulnerabilities found"
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "scan"},
+        "output": "OWASP Dependency-Check completed successfully (exit 0). marsdb package is absent from scan targets. Target CVE-2021-23424 cleared."
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-marsdb-removal",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-marsdb-removal."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-marsdb-removal",
       "passed": true,
@@ -374,6 +629,9 @@
     "expected_passed": true,
     "expected_failure_category": null,
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: True. Clean package removal of unused package marsdb under no_fix_package_removal policy.",
     "semantic_criteria": {
       "diagnostic_quality": "Validates clean package removal: package is absent from manifest and graph, scan cleared, tests pass.",
       "evaluation_guidance": "Confirm passed=True and no failure_category is set."
@@ -409,6 +667,35 @@
     },
     "changed_files": ["package.json", "package-lock.json"],
     "worker_action_summary": "Removed notevil from package.json and lockfile.",
+    "tool_calls": [
+      {
+        "name": "query_qa_logs",
+        "args": {"query_type": "test"},
+        "output": "Error: Cannot find module 'notevil'\nRequire stack:\n- /workspace/routes/b2bOrder.ts\n- /workspace/server.ts"
+      },
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: package.json, package-lock.json"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "routes/b2bOrder.ts", "start_line": 1, "end_line": 15},
+        "output": "1: import notevil from 'notevil'"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-notevil-pkg-removal-fail",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "Stage 1 package removal of notevil failed QA because routes/b2bOrder.ts still imports notevil (MODULE_NOT_FOUND error during test run). Advance task to Stage 2: vulnerable_code_removal.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-notevil-pkg-removal-fail."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-notevil-pkg-removal-fail",
       "passed": false,
@@ -420,6 +707,9 @@
     "expected_passed": false,
     "expected_failure_category": "breaking_change",
     "expected_security_review_verdict": null,
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: False. Failure category: breaking_change. Removing notevil broke routes/b2bOrder.ts import (MODULE_NOT_FOUND).",
     "semantic_criteria": {
       "diagnostic_quality": "Identifies that removing a package still in use causes runtime MODULE_NOT_FOUND test failures and recommends vulnerable_code_removal stage.",
       "evaluation_guidance": "Confirm passed=False, failure_category=breaking_change, and retry_feedback references the missing module in routes/b2bOrder.ts."
@@ -455,6 +745,39 @@
     },
     "changed_files": ["routes/b2bOrder.ts"],
     "worker_action_summary": "Decommissioned vulnerable B2B order evaluation route in routes/b2bOrder.ts to return HTTP 410 Gone without invoking notevil.",
+    "tool_calls": [
+      {
+        "name": "list_changed_files",
+        "args": {},
+        "output": "Changed files: routes/b2bOrder.ts"
+      },
+      {
+        "name": "generate_workspace_diff",
+        "args": {"file_path": "routes/b2bOrder.ts"},
+        "output": "-notevil.run(orderScript)\n+res.status(410).json({ error: 'Endpoint deprecated' })"
+      },
+      {
+        "name": "read_file_context",
+        "args": {"file_path": "routes/b2bOrder.ts", "start_line": 10, "end_line": 35},
+        "output": "12: // Route deprecated - returns 410 Gone\n13: res.status(410).json({ message: 'B2B order evaluation decommissioned' })"
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "task-notevil-code-removal-pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": {
+            "verdict": "pass",
+            "reasoning": "Vulnerable notevil execution was completely eliminated from routes/b2bOrder.ts:12-35. The endpoint now returns HTTP 410 Gone without invoking notevil. All application tests pass.",
+            "evidence_refs": ["routes/b2bOrder.ts:12-35"]
+          },
+          "test_attribution": null
+        },
+        "output": "SUCCESS: Recorded QA evaluation for task-notevil-code-removal-pass."
+      }
+    ],
     "llm_qa_output": {
       "task_id": "task-notevil-code-removal-pass",
       "passed": true,
@@ -470,6 +793,9 @@
     "expected_passed": true,
     "expected_failure_category": null,
     "expected_security_review_verdict": "pass",
+    "expected_tool_correctness_pass": true,
+    "expected_task_completion_pass": true,
+    "expected_output": "Passed: True. Vulnerable notevil execution eliminated from routes/b2bOrder.ts (HTTP 410 Gone), passing semantic security review.",
     "semantic_criteria": {
       "diagnostic_quality": "Validates that vulnerable code removal successfully eliminates vulnerable call sites while package is retained in manifest.",
       "evaluation_guidance": "Confirm passed=True, security review verdict=pass, and evidence_refs references the decommissioned route in routes/b2bOrder.ts."

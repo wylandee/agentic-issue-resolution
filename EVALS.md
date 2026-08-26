@@ -268,21 +268,55 @@ Each case documents its provenance and includes the supervisor instruction that 
 #### [NEW] `tests/evals/test_qa_critic_eval.py`
 
 Metrics applied:
-- **`ToolCorrectnessMetric`** — QA critic uses read-only tools (`list_changed_files`, `read_file_context`, `query_qa_logs`, `generate_workspace_diff`) and terminates with `emit_qa_evaluation`
+- **`ToolCorrectnessMetric(threshold=0.5)`** — Evaluates QA critic ordered tool sequence (`list_changed_files`, `query_qa_logs`, `generate_workspace_diff`, `read_file_context`, `search_codebase_pattern`, `inspect_ast_symbol`) and verifies termination with `emit_qa_evaluation`
+- **`TaskCompletionMetric(threshold=0.7)`** — Evaluates whether the QA Critic successfully completed its diagnostic review, emitted a valid verdict, and provided actionable retry feedback (evaluated via live LLM judge under `--run-eval-live`)
 - **`GEval("Failure Attribution Accuracy")`** — Criteria: "Given the install log, scan diff, and test output, evaluate whether the QA critic correctly attributed the failure to the changed package vs. a pre-existing repo issue"
 - **`GEval("Failure Category Precision")`** — Criteria: "Evaluate whether the assigned FailureCategory (SECURITY_FLAG, PEER_CONFLICT, BREAKING_CHANGE, TEST_REGRESSION, etc.) matches the evidence"
 - **Custom `QAStructuredOutputMetric(BaseMetric)`** — Validates that `QAEvaluation` fields are internally consistent (e.g., `passed=False` must have non-empty `failure_category` and `retry_feedback`)
+- **Custom `QAGuardrailConsistencyMetric(BaseMetric)`** — Evaluates whether deterministic policy guardrails override LLM QA decisions
+
+Test structure:
+```python
+@pytest.mark.eval
+class TestQACriticEval:
+    def test_qa_tool_sequence_correctness(self, case):
+        """QA Critic uses only authorized read-only review tools and terminates with emit_qa_evaluation."""
+
+    def test_qa_tool_correctness_deepeval(self, case, eval_settings):
+        """DeepEval built-in ToolCorrectnessMetric evaluates QA Critic ordered tool execution."""
+
+    def test_qa_deterministic_task_completion(self, case, eval_settings):
+        """QA Critic produces a complete diagnostic evaluation matching ground truth."""
+
+    def test_qa_live_task_completion_deepeval(self, case, eval_settings):
+        """DeepEval built-in TaskCompletionMetric evaluates QA completion with LLM judge (requires --run-eval-live)."""
+
+    def test_qa_structured_output_validity(self, case, eval_settings):
+        """QACriticLLMOutput conforms to strict Pydantic invariants."""
+
+    def test_qa_failure_category_accuracy(self, case, eval_settings):
+        """LLM assigns the correct failure category (SECURITY_FLAG, PEER_CONFLICT, BREAKING_CHANGE)."""
+
+    def test_qa_guardrail_consistency(self, case, eval_settings):
+        """LLM QA verdict survives deterministic policy guardrails without override."""
+
+    def test_qa_semantic_security_review(self, case, eval_settings):
+        """Semantic security review verdicts and evidence references are sound."""
+
+    def test_qa_retry_feedback_actionability(self, case, eval_settings):
+        """When passed=False, retry feedback provides clear and actionable diagnostic guidance."""
+```
 
 ---
 
 #### [NEW] `tests/evals/golden/qa_cases.json`
 
-8–10 cases from diverse sources:
+8–10 cases from diverse sources with structured `tool_calls`, `expected_tools`, `expected_output`, and diagnostic logs:
 - **Juice Shop derived**: Clean pass (all gates green), `PEER_CONFLICT` failure from `npm install`
 - **Synthetic scenarios**: `SECURITY_FLAG` — ODC scan finds new/persistent issues, `BREAKING_CHANGE` — test failure attributed to the update, pre-existing test failure misattributed to the remediation (false positive QA failure)
 - **Additional real-world projects**: Cases with ambiguous test output, multi-group shared dependency conflicts
 
-Each case documents its provenance and includes the raw install/scan/test logs fed to the QA Critic.
+Each case documents its provenance and includes the raw install/scan/test logs fed to the QA Critic along with full tool execution sequences.
 
 ---
 
