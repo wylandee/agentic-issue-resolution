@@ -114,6 +114,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             suite = "qa_critic"
         elif "subagent" in name_lower or "update" in name_lower or "workaround" in name_lower:
             suite = "subagent"
+        elif "budget" in name_lower or "sla" in name_lower or "business" in name_lower:
+            suite = "business_rules"
         else:
             suite = "general"
 

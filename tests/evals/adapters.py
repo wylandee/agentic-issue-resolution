@@ -483,9 +483,13 @@ def parse_trajectory_markdown(
 
     # 5. Parse Span Details
     spans: list[TrajectorySpan] = []
-    spans_match = re.search(r"## Span Details\s*\n(.*?)(?=\n##|\Z)", markdown_text, re.DOTALL)
-    if spans_match:
-        span_blocks = re.split(r"(?=\n###\s+\d+\.)", "\n" + spans_match.group(1))
+    span_details_idx = markdown_text.find("## Span Details")
+    if span_details_idx != -1:
+        details_text = markdown_text[span_details_idx + len("## Span Details") :]
+        diag_idx = details_text.find("\n## Diagnostics and Guardrails")
+        if diag_idx != -1:
+            details_text = details_text[:diag_idx]
+        span_blocks = re.split(r"(?=\n###\s+\d+\.)", details_text)
         for block in span_blocks:
             block = block.strip()
             if not block.startswith("###"):
@@ -903,3 +907,78 @@ def spans_to_test_cases(
             test_cases.append(trajectory_to_test_case(s, doc=doc))
 
     return test_cases
+
+
+def extract_token_usage(span: TrajectorySpan) -> tuple[int, int]:
+    """Extract prompt and completion token counts from a TrajectorySpan.
+
+    Args:
+        span: The TrajectorySpan to inspect.
+
+    Returns:
+        A tuple of ``(prompt_tokens, completion_tokens)``.
+    """
+    if span.prompt_tokens is not None and span.completion_tokens is not None:
+        return span.prompt_tokens, span.completion_tokens
+
+    # Search in span.outputs
+    def _search_dict(obj: Any) -> tuple[int | None, int | None]:
+        if isinstance(obj, dict):
+            # 1. Direct token_usage dict
+            tu = obj.get("token_usage")
+            if isinstance(tu, dict):
+                p = tu.get("prompt_tokens")
+                c = tu.get("completion_tokens")
+                if p is not None or c is not None:
+                    return (int(p or 0), int(c or 0))
+
+            # 2. usage_metadata dict
+            um = obj.get("usage_metadata")
+            if isinstance(um, dict):
+                p = um.get("input_tokens")
+                c = um.get("output_tokens")
+                if p is not None or c is not None:
+                    return (int(p or 0), int(c or 0))
+
+            # 3. llm_output dict
+            llm_out = obj.get("llm_output")
+            if isinstance(llm_out, dict):
+                res = _search_dict(llm_out)
+                if res != (None, None):
+                    return res
+
+            # 4. generations list
+            gens = obj.get("generations")
+            if isinstance(gens, list):
+                res = _search_dict(gens)
+                if res != (None, None):
+                    return res
+
+            # Recursive search for any nested usage
+            for k, v in obj.items():
+                if k in ("messages", "kwargs", "response_metadata"):
+                    res = _search_dict(v)
+                    if res != (None, None):
+                        return res
+        elif isinstance(obj, list):
+            for item in obj:
+                res = _search_dict(item)
+                if res != (None, None):
+                    return res
+        return None, None
+
+    if span.outputs:
+        p, c = _search_dict(span.outputs)
+        if p is not None and c is not None:
+            return p, c
+
+    if span.metadata:
+        p, c = _search_dict(span.metadata)
+        if p is not None and c is not None:
+            return p, c
+
+    # Fallback to total_tokens if available
+    if span.total_tokens is not None and span.total_tokens > 0:
+        return span.total_tokens, 0
+
+    return 0, 0
