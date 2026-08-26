@@ -60,6 +60,10 @@ class ReportContext:
     trajectory_path: str | None
     langsmith_trace_url: str | None
     executive_narrative: str | None = None
+    new_groups_discovered: int | None = None
+    new_groups_unresolved: int | None = None
+    new_groups_inconclusive: int | None = None
+    new_groups_pending: int | None = None
 
 
 @dataclass(frozen=True)

@@ -62,8 +62,8 @@ def _state() -> dict:
     }
 
 
-def test_generate_report_contains_overview_metrics_findings_and_diff_evidence():
-    """The canonical report exposes the run overview and deterministic evidence."""
+def test_generate_report_contains_four_sections_and_final_change_evidence():
+    """The canonical report exposes only the user-facing sections and final change."""
     report = generate_report(
         _state(),
         token_summary={
@@ -75,6 +75,13 @@ def test_generate_report_contains_overview_metrics_findings_and_diff_evidence():
         trajectory_path="data/trajectories/trace.md",
     )
 
+    headings = [line for line in report.splitlines() if line.startswith("## ")]
+    assert headings == [
+        "## 1. Summary",
+        "## 2. Follow up Actions",
+        "## 3. Findings Overview",
+        "## 4. References",
+    ]
     assert "Total time taken" in report
     assert "2.00 seconds" in report
     assert "Total tokens" in report
@@ -85,6 +92,16 @@ def test_generate_report_contains_overview_metrics_findings_and_diff_evidence():
     assert "QA passed" in report or "qa_passed" in report
     assert "\\|" in report
     assert "data/trajectories/trace.md" in report
+    assert "Final change" in report
+    assert "### Critical Errors Encountered" not in report
+    assert "Targeted remediation" not in report
+    assert "Post-remediation security status" not in report
+    assert "Re-triage groups discovered" not in report
+    assert "Targeted QA coverage" not in report
+    assert "Patch present" not in report
+    assert "## 2. Run Overview" not in report
+    assert "## 3. Key Decisions" not in report
+    assert "Validation and Remaining Issues" not in report
 
 
 def test_preliminary_report_marks_final_metrics_pending():
@@ -93,6 +110,82 @@ def test_preliminary_report_marks_final_metrics_pending():
 
     assert "Pending finalization" in report
     assert "Unavailable" in report
+    assert "| New groups discovered | Not assessed — no authoritative scan |" in report
+
+
+def test_non_authoritative_scan_keeps_new_group_metrics_unassessed():
+    """Only an authoritative final scan can produce new-group counts."""
+    state = _state()
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": False,
+        "status": "none",
+    }
+    state["new_vulnerability_status"] = "none"
+
+    report = generate_report(state)
+
+    assert "| New groups discovered | Not assessed — no authoritative scan |" in report
+
+
+def test_findings_tables_share_columns_and_successful_rows_show_only_final_change():
+    """Attempt detail is reserved for follow-up rows, not successful findings."""
+    state = _state()
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "status": "success",
+            "summary": "Detailed successful attempt that should not be repeated.",
+        }
+    ]
+
+    report = generate_report(state)
+    header = (
+        "| Finding | Source | Location | Package/component | Severity | Remediation | "
+        "Final change | Final status | Validation |"
+    )
+
+    assert report.count(header) == 2
+    assert "4.17.15 → 4.17.21" in report
+    assert "Detailed successful attempt that should not be repeated." not in report
+
+
+def test_follow_up_actions_include_only_outstanding_groups():
+    """Successful groups stay out of follow-up actions while open groups remain."""
+    state = _state()
+    pending_group = {
+        "group_id": "group-pending",
+        "vulnerable_component": "express",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package.json",
+        "issues": [{"severity": "high", "source": "odc"}],
+    }
+    state["initial_valid_groups"].append(pending_group)
+    state["valid_groups"] = list(state["initial_valid_groups"])
+    state["task_queue"]["task-pending"] = {
+        "task_id": "task-pending",
+        "parent_group_id": "group-pending",
+        "parent_task_id": None,
+        "status": "pending",
+        "instruction": "Update express and rerun QA.",
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-pending",
+            "status": "surrender",
+            "summary": "Complete pending attempt evidence.",
+        }
+    ]
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Findings Overview", 1
+    )[0]
+
+    assert "| group-pending | express | Pending |" in follow_up
+    assert "Complete pending attempt evidence." in follow_up
+    assert "group-1" not in follow_up
 
 
 def test_finalize_report_writes_canonical_report_atomically(tmp_path: Path, monkeypatch):
@@ -168,79 +261,93 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
         result = build_orchestrator_graph().invoke(state)
 
     assert "report" in build_orchestrator_graph().get_graph().nodes
-    assert "workspace volume cleanup failed" in result["report_markdown"]
+    assert "workspace volume cleanup failed" not in result["report_markdown"]
     assert result["report_markdown"].startswith("# Remediation Run Report")
     assert result["report_status"] == "rendered"
     assert result["report_path"] is None
     assert result["report_error"] is None
 
 
-def test_report_separates_targeted_success_from_new_scan_findings_and_qa_records():
-    """The overview distinguishes target QA coverage from post-scan security status."""
+def test_report_summary_counts_new_and_reappeared_group_statuses():
+    """New Summary metrics cover only new and reappeared groups."""
     state = _state()
-    state["initial_valid_groups"] = [
-        state["initial_valid_groups"][0],
+    new_groups = [
         {
-            "group_id": "group-2",
-            "vulnerable_component": "got",
+            "group_id": "group-new-unresolved",
+            "vulnerable_component": "express",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        },
+        {
+            "group_id": "group-new-inconclusive",
+            "vulnerable_component": "lodash",
             "issue_type": "sca",
             "sources": ["odc"],
             "file_path": "package.json",
             "issues": [{"severity": "medium", "source": "odc"}],
-            "fix_plan": {"status": "version_found"},
+        },
+        {
+            "group_id": "group-reappeared-pending",
+            "vulnerable_component": "got",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "low", "source": "odc"}],
         },
     ]
-    state["task_queue"]["task-2"] = {
-        "task_id": "task-2",
-        "parent_group_id": "group-2",
-        "parent_task_id": None,
-        "strategy": "VERSION_BUMP",
-        "instruction": "Update got.",
-        "status": "qa_passed",
+    state["valid_groups"] = new_groups
+    state["task_queue"].update(
+        {
+            "task-new-unresolved": {
+                "task_id": "task-new-unresolved",
+                "parent_group_id": "group-new-unresolved",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "unfixable",
+            },
+            "task-new-inconclusive": {
+                "task_id": "task-new-inconclusive",
+                "parent_group_id": "group-new-inconclusive",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "inconclusive",
+            },
+            "task-reappeared-pending": {
+                "task_id": "task-reappeared-pending",
+                "parent_group_id": "group-reappeared-pending",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "pending",
+            },
+        }
+    )
+    state["triage_reconciliation"] = {
+        "new_group_ids": ["group-new-unresolved", "group-new-inconclusive"],
+        "reappeared_group_ids": ["group-reappeared-pending"],
     }
-    state["qa_evaluations"] = {"task-1": {"task_id": "task-1", "passed": True}}
-    state["post_remediation_scan_issues"] = [
-        {
-            "cve_id": "CVE-2026-0001",
-            "ghsa_id": "GHSA-AAAA-BBBB-CCCC",
-            "finding_id": "ghsa-aaaa-bbbb-cccc",
-            "package_name": "new-package",
-            "source": "odc",
-            "file_path": "package-lock.json",
-            "severity": "high",
-        },
-        {
-            "cve_id": "CVE-2026-0002",
-            "package_name": "another-package",
-            "source": "odc",
-            "file_path": "package-lock.json",
-            "severity": "low",
-        },
-    ]
-    state["post_remediation_scan_identifiers"] = [
-        "CVE-2026-0001",
-        "GHSA-AAAA-BBBB-CCCC",
-        "CVE-2026-0002",
-    ]
-    state["new_vulnerability_identifiers"] = list(state["post_remediation_scan_identifiers"])
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+    }
     state["new_vulnerability_status"] = "detected"
 
     report = generate_report(state)
 
-    assert "Completed with new findings (completed)" in report
-    assert "Overall outcome: **Completed with new findings**" in report
-    assert "2 passed / 2 targeted groups" in report
-    assert "1 records retained" in report
-    assert "2 findings" in report
-    assert "3 unique identifiers" in report
-    assert "### Newly Detected Findings" in report
-    assert "CVE-2026-0001, GHSA-AAAA-BBBB-CCCC" in report
-    assert "GHSA-AAAA-BBBB-CCCC, ghsa-aaaa-bbbb-cccc" not in report
-    assert "Overall outcome: **Successful**" not in report
+    assert "| New groups discovered | 3 |" in report
+    assert "| New unresolved groups | 1 |" in report
+    assert "| New inconclusive groups | 1 |" in report
+    assert "| New pending groups | 1 |" in report
+    assert "### Newly Discovered Groups" in report
+    assert "group-new-unresolved" in report
+    assert "group-new-inconclusive" in report
+    assert "group-reappeared-pending" in report
 
 
-def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
-    """Package output lists direct changes and summarizes transitive lockfile churn."""
+def test_findings_show_final_package_change_without_package_detail_sections():
+    """Successful findings show the final package change only."""
     state = _state()
     state["diff"] = (
         "--- a/package.json\n"
@@ -268,17 +375,19 @@ def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
 
     report = generate_report(state)
 
-    assert "#### Direct Manifest Changes" in report
+    assert "Final change" in report
     assert "lodash" in report
     assert "4.17.15" in report
     assert "4.17.21" in report
-    assert "1 transitive lockfile package entries changed" in report
+    assert "Packages Added or Changed" not in report
+    assert "Worker Package Execution Evidence" not in report
+    assert "transitive lockfile package entries changed" not in report
     assert "engines" not in report
     assert "deprecated" not in report
     assert "transitive-package" not in report
 
 
-def test_failed_authoritative_scan_is_reported_as_unassessed_and_errors_are_grouped():
+def test_failed_authoritative_scan_is_reported_as_unassessed_without_error_details():
     """A scan timeout must not be rendered as a clean zero-finding result."""
     state = _state()
     state["status"] = "completed_with_errors"
@@ -300,13 +409,13 @@ def test_failed_authoritative_scan_is_reported_as_unassessed_and_errors_are_grou
     report = generate_report(state)
 
     assert "Unknown — authoritative scan failed" in report
-    assert "Post-remediation scanner findings | 0 findings" not in report
-    assert "No newly detected findings" not in report
-    assert "| run, final_full_scan | ODC_TIMEOUT | 2 |" in report
-    assert report.count("| supervisor | INVALID_PLANNER_COMMIT | 2 |") == 1
+    assert "Post-remediation scanner findings" not in report
+    assert "ODC_TIMEOUT" not in report
+    assert "INVALID_PLANNER_COMMIT" not in report
+    assert "Critical Errors Encountered" not in report
 
 
-def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_original_only():
+def test_pivot_child_group_status_uses_child_tasks_in_findings_and_follow_up():
     """Pivot groups must inherit their unfixable child status, not pending."""
     state = _state()
     state["initial_valid_groups"] = [
@@ -359,10 +468,9 @@ def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_origina
     report = generate_report(state)
 
     assert "| group-child | express-jwt |" in report
-    assert "| group-child | express-jwt | odc | package.json | high | unfixable |" in report
-    assert "### Remaining or Inconclusive Groups" in report
-    assert "| group-root | unfixable |" in report
-    assert "| group-child | express-jwt | unfixable |" in report
+    assert "No validated change" in report
+    assert "| group-root | express-jwt | Unresolved |" in report
+    assert "| group-child | express-jwt | Unresolved |" in report
     assert "| group-child | pending |" not in report
 
 
@@ -409,13 +517,12 @@ def test_failed_pivot_child_overrides_historical_parent_qa_success():
     report = generate_report(state)
 
     assert "1/1 actionable groups fixed" not in report
-    assert "0/1 actionable groups fixed" in report
     assert "Completed with errors (completed_with_errors)" in report
-    assert "1 target identifiers remain" in report
+    assert "1 target identifiers remain" not in report
 
 
-def test_report_renders_historical_retry_activity_and_latest_action_per_task():
-    """Historical diagnostics remain visible even when active plans are empty."""
+def test_report_omits_retry_history_for_successful_findings():
+    """Successful findings do not expose retry histories in the compact report."""
     state = _state()
     state["retry_plans_by_task"] = {}
     state["retry_diagnostics_by_task"] = {
@@ -448,11 +555,10 @@ def test_report_renders_historical_retry_activity_and_latest_action_per_task():
 
     report = generate_report(state)
 
-    assert "### Historical Retry/Pivot Activity" in report
-    assert "No retry plans recorded" not in report
-    assert "| task-1 | lodash | osv_minimum | attempt-2 |" in report
-    assert "| task-1 | surrender | attempt-2 | 1 | 2 summaries |" in report
-    assert report.count("Earlier attempt summary.") == 0
+    assert "Historical Retry/Pivot Activity" not in report
+    assert "Earlier attempt summary." not in report
+    assert "Latest attempt summary with the final worker conclusion." not in report
+    assert "attempt-2" not in report
 
 
 def test_report_text_preserves_full_text_without_truncation():
@@ -462,14 +568,14 @@ def test_report_text_preserves_full_text_without_truncation():
     assert _full_text(text) == text
 
 
-def test_report_renders_full_prose_and_failed_qa_attempt_history():
-    """Full retry, QA, action, and repair prose is rendered without ellipses."""
+def test_follow_up_actions_preserve_full_attempt_prose_without_history_sections():
+    """Follow-up attempt evidence remains complete without exposing trace history."""
     state = _state()
+    state["task_queue"]["task-1"]["status"] = "needs_retry"
     retry_instruction = "retry instruction " + " ".join(f"detail-{index}" for index in range(120))
     retry_reason = "retry reason " + " ".join(f"reason-{index}" for index in range(120))
     qa_feedback = "QA feedback " + " ".join(f"feedback-{index}" for index in range(120))
     action_summary = "worker summary " + " ".join(f"summary-{index}" for index in range(120))
-    repair_reason = "repair reason " + " ".join(f"repair-{index}" for index in range(120))
     state["retry_plans_by_task"] = {
         "task-1": {
             "action": "retry_update",
@@ -504,24 +610,21 @@ def test_report_renders_full_prose_and_failed_qa_attempt_history():
             "summary": action_summary,
         }
     ]
-    state["consistency_events"] = [
-        {"event_type": "repair", "reason": repair_reason},
-    ]
-
     report = generate_report(state)
 
     assert retry_instruction in report
     assert retry_reason in report
     assert qa_feedback in report
     assert action_summary in report
-    assert repair_reason in report
-    assert "### Failed QA Gates (Attempt History)" in report
-    assert "| task-1 | attempt-1 | security_flag |" in report
+    assert "Attempted fixes" in report
+    assert "Historical Retry/Pivot Activity" not in report
+    assert "Failed QA Gates" not in report
+    assert "attempt-1" not in report
     assert "…" not in report
 
 
 def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
-    """Package diagnostics remain useful when an attempt snapshot omits the package."""
+    """Retry diagnostics remain useful when an attempt snapshot omits the package."""
     state = _state()
     state["initial_valid_groups"].append(
         {
@@ -567,5 +670,5 @@ def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
 
     report = generate_report(state)
 
-    assert "| task-2 | express-jwt |" in report
+    assert "4.0.0" in report
     assert "unknown — package missing from trace" not in report

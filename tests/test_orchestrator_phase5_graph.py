@@ -275,7 +275,7 @@ class TestPhase5RunOrchestrator:
         report_files = list(report_dir.glob("*.md"))
         assert len(report_files) == 1
         report_text = report_files[0].read_text(encoding="utf-8")
-        assert "orchestrator failed before report phase" in report_text
+        assert "orchestrator failed before report phase" not in report_text
 
     def test_trajectory_export_failure_does_not_mask_orchestration_error(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
