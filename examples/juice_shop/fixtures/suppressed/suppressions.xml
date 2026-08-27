@@ -123,13 +123,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep form-data as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for form-data (npm)</notes>
         <packageUrl regex="true">^pkg:npm/form-data@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
     <suppress>
         <notes>Suppress all vulnerabilities for got (npm)</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
@@ -275,11 +273,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for undici (npm)</notes>
+        <notes>Keep undici as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/undici@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for uuid (npm)</notes>

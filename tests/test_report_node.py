@@ -179,9 +179,7 @@ def test_follow_up_actions_include_only_outstanding_groups():
     ]
 
     report = generate_report(state)
-    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
-        "## 3. Findings Overview", 1
-    )[0]
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split("## 3. Findings Overview", 1)[0]
 
     assert "| group-pending | express | Pending |" in follow_up
     assert "Complete pending attempt evidence." in follow_up
@@ -568,8 +566,8 @@ def test_report_text_preserves_full_text_without_truncation():
     assert _full_text(text) == text
 
 
-def test_follow_up_actions_preserve_full_attempt_prose_without_history_sections():
-    """Follow-up attempt evidence remains complete without exposing trace history."""
+def test_follow_up_actions_include_only_remediation_attempt_prose():
+    """Follow-up rows exclude QA feedback and retry diagnostics from attempt text."""
     state = _state()
     state["task_queue"]["task-1"]["status"] = "needs_retry"
     retry_instruction = "retry instruction " + " ".join(f"detail-{index}" for index in range(120))
@@ -612,19 +610,146 @@ def test_follow_up_actions_preserve_full_attempt_prose_without_history_sections(
     ]
     report = generate_report(state)
 
-    assert retry_instruction in report
-    assert retry_reason in report
-    assert qa_feedback in report
     assert action_summary in report
     assert "Attempted fixes" in report
+    attempted_fixes = report.split("| Remediation attempt (surrender):", 1)[1]
+    assert retry_instruction not in attempted_fixes
+    assert retry_reason not in report
+    assert qa_feedback not in report
+    assert "QA feedback:" not in report
+    assert "Retry details:" not in report
+    assert "Attempted versions:" not in report
     assert "Historical Retry/Pivot Activity" not in report
     assert "Failed QA Gates" not in report
     assert "attempt-1" not in report
     assert "…" not in report
 
 
-def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
-    """Retry diagnostics remain useful when an attempt snapshot omits the package."""
+def test_attempted_fixes_strip_agent_detail_sections():
+    """Attempted fixes keep the action and files but omit verbose agent sections."""
+    state = _state()
+    state["task_queue"]["task-1"]["status"] = "unfixable"
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 1,
+            "status": "success",
+            "summary": (
+                "Completed validated code workaround edits; changed files: src/guard.ts. "
+                "Final note: Added a startup guard for the vulnerable dependency.\n\n"
+                "What changed:\n- Added a guard around the vulnerable call.\n\n"
+                "Validation:\n- Runtime smoke passed.\n\n"
+                "Note:\n- This is an agent detail that should not be rendered."
+            ),
+        }
+    ]
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split("## 3. Findings Overview", 1)[0]
+
+    assert (
+        "Remediation attempt (success): Added a startup guard for the vulnerable dependency; "
+        "changed files: src/guard.ts."
+    ) in follow_up
+    assert "What changed:" not in follow_up
+    assert "Validation:" not in follow_up
+    assert "This is an agent detail" not in follow_up
+
+
+def test_new_group_metrics_are_unassessed_until_post_scan_triage_runs():
+    """A scan requiring triage cannot be reported as zero newly discovered groups."""
+    state = _state()
+    state["triage_reconciliation"] = {}
+    state["triage_required"] = True
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "new_identifiers": ["CVE-2026-0001"],
+        "triage_required": True,
+    }
+    state["new_vulnerability_status"] = "detected"
+
+    report = generate_report(state)
+
+    assert report.count("Not assessed — post-scan triage required") == 5
+    assert "| Not assessed | — | — | — | — | — | No validated change | pending |" in report
+
+
+def test_authoritative_remaining_finding_reopens_targeted_success():
+    """A repository-wide finding overrides a narrower targeted QA success."""
+    state = _state()
+    state["initial_valid_groups"][0]["cve_ids"] = ["CVE-2024-0001"]
+    state["initial_valid_groups"][0]["issues"][0]["cve_id"] = "CVE-2024-0001"
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "remaining_target_identifiers": ["CVE-2024-0001"],
+    }
+    state["new_vulnerability_status"] = "detected"
+    state["triage_reconciliation"] = {}
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split("## 3. Findings Overview", 1)[0]
+
+    assert "| Groups fixed | 0 |" in report
+    assert "| Groups unresolved | 1 |" in report
+    assert "CVE-2024-0001" in follow_up
+    assert "Unresolved — retry required" in follow_up
+    assert "No validated change" in report
+
+
+def test_follow_up_actions_collapse_undiscovered_pivot_child_into_parent():
+    """A pivot child is not a second follow-up issue without new-group evidence."""
+    state = _state()
+    state["initial_valid_groups"] = [
+        {
+            "group_id": "group-root",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        }
+    ]
+    state["valid_groups"] = [
+        state["initial_valid_groups"][0],
+        {
+            "group_id": "group-child",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        },
+    ]
+    state["task_queue"] = {
+        "task-root": {
+            "task_id": "task-root",
+            "parent_group_id": "group-root",
+            "parent_task_id": None,
+            "status": "pivoted",
+        },
+        "task-child": {
+            "task_id": "task-child",
+            "parent_group_id": "group-child",
+            "parent_task_id": "task-root",
+            "status": "unfixable",
+        },
+    }
+    state["triage_reconciliation"] = {}
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split("## 3. Findings Overview", 1)[0]
+
+    assert follow_up.count("| group-root | express-jwt |") == 1
+    assert "| group-child | express-jwt |" not in follow_up
+
+
+def test_worker_package_diagnostics_are_excluded_without_an_attempt_summary():
+    """Worker summaries populate Attempted fixes without leaking retry diagnostics."""
     state = _state()
     state["initial_valid_groups"].append(
         {
@@ -655,6 +780,10 @@ def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
             "attempt_id": "attempt-2",
             "task_id": "task-2",
             "task_revision": 1,
+            "action_summary": {
+                "status": "surrender",
+                "summary": "Worker remediation attempt summary.",
+            },
             "execution_diagnostics": {
                 "attempted_versions": ["4.0.0"],
                 "executed_versions": [],
@@ -670,5 +799,7 @@ def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
 
     report = generate_report(state)
 
-    assert "4.0.0" in report
+    assert "Worker remediation attempt summary." in report
+    assert "No remediation attempt recorded." not in report
+    assert "4.0.0" not in report
     assert "unknown — package missing from trace" not in report

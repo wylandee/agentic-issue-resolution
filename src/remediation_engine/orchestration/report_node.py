@@ -449,6 +449,49 @@ def _issue_identifiers(issue: Any) -> list[str]:
     return identifiers
 
 
+def _group_identifiers(group: Any) -> set[str]:
+    """Return normalized scanner identifiers associated with a group."""
+    identifiers: set[str] = set()
+    for field in ("cve_ids", "ghsa_ids", "finding_ids", "rule_ids", "identifiers"):
+        identifiers.update(
+            _text(value).strip().casefold()
+            for value in _items(_value(group, field))
+            if _text(value).strip()
+        )
+    for issue in _items(_value(group, "issues")):
+        identifiers.update(identifier.casefold() for identifier in _issue_identifiers(issue))
+    return identifiers
+
+
+def _reconcile_authoritative_statuses(
+    statuses: Mapping[str, str],
+    groups: Sequence[Any],
+    final_scan: Any,
+    new_status: str,
+    remaining_identifiers: Sequence[str],
+) -> dict[str, str]:
+    """Reopen targeted successes contradicted by an authoritative scan.
+
+    Targeted QA can cover one manifest or dependency closure while the final
+    scan covers the whole repository.  A successful task therefore cannot
+    remain a successful report row when the authoritative scan still contains
+    one of that group's original vulnerability identifiers.
+    """
+    result = dict(statuses)
+    if _scan_evidence_state(final_scan, new_status) != "complete":
+        return result
+    remaining = {identifier.casefold() for identifier in remaining_identifiers}
+    if not remaining:
+        return result
+    for group in groups:
+        group_id = _text(_value(group, "group_id"))
+        if result.get(group_id) not in {"qa_passed", "mitigated"}:
+            continue
+        if _group_identifiers(group).intersection(remaining):
+            result[group_id] = "needs_retry"
+    return result
+
+
 def _build_context(
     state: Mapping[str, Any],
     *,
@@ -473,15 +516,6 @@ def _build_context(
             task_queue, _text(_value(group, "group_id"))
         )
         for group in all_groups
-    }
-    status_counts = Counter(
-        statuses.get(_text(_value(group, "group_id")), "pending") for group in initial_groups
-    )
-    counts = {
-        "fixed": status_counts.get("qa_passed", 0) + status_counts.get("mitigated", 0),
-        "unresolved": status_counts.get("unfixable", 0) + status_counts.get("needs_retry", 0),
-        "inconclusive": status_counts.get("inconclusive", 0),
-        "pending": status_counts.get("pending", 0) + status_counts.get("optimistically_fixed", 0),
     }
     reconciliation = _mapping(state.get("triage_reconciliation"))
     added_ids = _reconciliation_ids(reconciliation, "added", "new_group_ids")
@@ -522,8 +556,30 @@ def _build_context(
         "not_scanned",
     )
     scan_evidence_state = _scan_evidence_state(final_scan, new_status)
+    triage_required_value = state.get("triage_required")
+    triage_required = bool(
+        _value(final_scan, "triage_required")
+        if triage_required_value is None
+        else triage_required_value
+    )
+    statuses = _reconcile_authoritative_statuses(
+        statuses,
+        all_groups,
+        final_scan,
+        new_status,
+        remaining_identifiers,
+    )
+    status_counts = Counter(
+        statuses.get(_text(_value(group, "group_id")), "pending") for group in initial_groups
+    )
+    counts = {
+        "fixed": status_counts.get("qa_passed", 0) + status_counts.get("mitigated", 0),
+        "unresolved": status_counts.get("unfixable", 0) + status_counts.get("needs_retry", 0),
+        "inconclusive": status_counts.get("inconclusive", 0),
+        "pending": status_counts.get("pending", 0) + status_counts.get("optimistically_fixed", 0),
+    }
     discovered_ids = _unique_texts([*added_ids, *reappeared_ids])
-    if scan_evidence_state == "complete":
+    if scan_evidence_state == "complete" and (discovered_ids or not triage_required):
         discovered_status_counts = Counter(
             statuses.get(group_id, "pending") for group_id in discovered_ids
         )
@@ -542,12 +598,6 @@ def _build_context(
             "inconclusive": None,
             "pending": None,
         }
-    triage_required_value = state.get("triage_required")
-    triage_required = bool(
-        _value(final_scan, "triage_required")
-        if triage_required_value is None
-        else triage_required_value
-    )
     report_state = {
         **state,
         "errors": [
@@ -754,6 +804,59 @@ def _report_groups(context: ReportContext) -> list[Any]:
     return sorted(groups, key=lambda item: _text(_value(item, "group_id")))
 
 
+def _lineage_root_group_id(context: ReportContext, group_id: str) -> str:
+    """Return the original group ID for a pivot child group."""
+    task_queue = context.task_queue
+    candidates = sorted(
+        (str(task_id), task)
+        for task_id, task in task_queue.items()
+        if _text(_value(task, "parent_group_id")) == group_id
+    )
+    if not candidates:
+        return group_id
+
+    task_id, task = candidates[0]
+    visited: set[str] = set()
+    while task_id not in visited:
+        visited.add(task_id)
+        parent_task_id = _text(_value(task, "parent_task_id"))
+        if not parent_task_id:
+            return _text(_value(task, "parent_group_id"), group_id)
+        parent_task = task_queue.get(parent_task_id)
+        if parent_task is None:
+            return _text(_value(task, "parent_group_id"), group_id)
+        task_id = parent_task_id
+        task = parent_task
+    return group_id
+
+
+def _follow_up_groups(context: ReportContext) -> list[tuple[str, Any]]:
+    """Return one follow-up row per issue lineage plus discovered groups."""
+    discovered_ids = set(_discovered_group_ids(context))
+    initial_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
+    selected: dict[str, tuple[str, Any]] = {}
+    for group in _report_groups(context):
+        group_id = _text(_value(group, "group_id"))
+        canonical_id = (
+            group_id if group_id in discovered_ids else _lineage_root_group_id(context, group_id)
+        )
+        current = selected.get(canonical_id)
+        if current is None:
+            selected[canonical_id] = (canonical_id, group)
+            continue
+        current_group_id = _text(_value(current[1], "group_id"))
+        if group_id in initial_ids and current_group_id not in initial_ids:
+            selected[canonical_id] = (canonical_id, group)
+
+    scan_state = _scan_evidence_state(
+        context.final_full_scan_result, context.new_vulnerability_status
+    )
+    if scan_state == "complete":
+        for group_id in discovered_ids:
+            selected.setdefault(group_id, (group_id, {"group_id": group_id}))
+    return sorted(selected.values(), key=lambda item: item[0])
+
+
 def _discovered_group_ids(context: ReportContext) -> list[str]:
     """Return newly added and reappeared group IDs from reconciliation."""
     return _reconciliation_ids(
@@ -767,7 +870,15 @@ def _discovered_group_ids(context: ReportContext) -> list[str]:
 
 def _new_group_metric(context: ReportContext, value: int | None) -> int | str:
     """Render a discovered-group metric without treating missing scans as zero."""
-    return value if value is not None else _scan_assessment_text(context)
+    if value is not None:
+        return value
+    if (
+        _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
+        == "complete"
+        and context.triage_required
+    ):
+        return "Not assessed — post-scan triage required"
+    return _scan_assessment_text(context)
 
 
 def _task_ids_for_group(context: ReportContext, group_id: str) -> list[str]:
@@ -822,9 +933,7 @@ def _final_change_for_group(context: ReportContext, group: Any) -> str:
         if result_status != "success" and not bool(_value(diagnostics, "validation_passed")):
             continue
         changed_files.extend(_text(path) for path in _items(_value(result, "changed_files")))
-        changed_files.extend(
-            _text(path) for path in _items(_value(diagnostics, "validated_files"))
-        )
+        changed_files.extend(_text(path) for path in _items(_value(diagnostics, "validated_files")))
         action_summary = _value(result, "action_summary")
         if action_summary is not None and (
             result_status == "success"
@@ -841,7 +950,11 @@ def _final_change_for_group(context: ReportContext, group: Any) -> str:
 
     final_summary = ""
     for summary in reversed(successful_summaries):
-        text = _text(_value(summary, "summary")).strip()
+        text = _compact_remediation_attempt(
+            _value(summary, "summary"),
+            status=_text(_value(summary, "status"), "success"),
+            include_changed_files=False,
+        )
         if text:
             final_summary = text
             break
@@ -855,9 +968,15 @@ def _final_change_for_group(context: ReportContext, group: Any) -> str:
     return "Validated remediation recorded"
 
 
-def _required_follow_up_action(context: ReportContext, group: Any, status: str) -> str:
+def _required_follow_up_action(
+    context: ReportContext,
+    group: Any,
+    status: str,
+    *,
+    group_id: str | None = None,
+) -> str:
     """Describe the next user-facing action for an outstanding group."""
-    group_id = _text(_value(group, "group_id"))
+    group_id = group_id or _text(_value(group, "group_id"))
     if status == "needs_retry":
         action_prefix = "Retry the remediation using the current plan"
     elif status == "unfixable":
@@ -881,7 +1000,8 @@ def _required_follow_up_action(context: ReportContext, group: Any, status: str) 
                 or _value(task, "instruction")
             )
             if _text(instruction).strip():
-                return f"{action_prefix}: {_full_text(instruction)}. Then rerun QA."
+                instruction_text = _full_text(instruction).rstrip(" .")
+                return f"{action_prefix}: {instruction_text}. Then rerun QA."
 
     if group_id in set(_discovered_group_ids(context)) and not _task_ids_for_group(
         context, group_id
@@ -890,82 +1010,165 @@ def _required_follow_up_action(context: ReportContext, group: Any, status: str) 
     return f"{action_prefix}, then rerun QA and the authoritative security scan."
 
 
+_ATTEMPT_DETAIL_LINE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:what changed|changes?|validation|validated|"
+    r"verification|tests?|notes?|note|evidence|diagnostics?|retry details?)\s*:?.*$",
+    re.IGNORECASE,
+)
+_ATTEMPT_DETAIL_INLINE_RE = re.compile(
+    r"\s+(?:what changed|changes?|validation|verification|tests?|"
+    r"notes?|note|evidence|diagnostics?|retry details?)\s*:",
+    re.IGNORECASE,
+)
+_FINAL_NOTE_RE = re.compile(r"\s+(?:final note|final conclusion)\s*:\s*", re.IGNORECASE)
+_CHANGED_FILES_RE = re.compile(r"\bchanged files?\s*:\s*", re.IGNORECASE)
+
+
+def _attempt_primary_text(value: Any) -> str:
+    """Keep the first remediation paragraph and discard agent detail sections."""
+    raw = _text(value).strip()
+    if not raw:
+        return ""
+    lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if lines:
+                break
+            continue
+        if _ATTEMPT_DETAIL_LINE_RE.match(stripped):
+            break
+        lines.append(stripped)
+    primary = " ".join(lines)
+    final_note = _FINAL_NOTE_RE.search(primary)
+    if final_note is not None:
+        note = _ATTEMPT_DETAIL_INLINE_RE.split(primary[final_note.end() :], maxsplit=1)[0].strip()
+        prefix = primary[: final_note.start()].strip()
+        if note:
+            return f"{prefix} Final note: {note}".strip()
+        return prefix
+    return _ATTEMPT_DETAIL_INLINE_RE.split(primary, maxsplit=1)[0].strip()
+
+
+def _attempt_changed_files(value: Any) -> tuple[list[str], bool]:
+    """Extract a concise changed-file list from an attempt's lead paragraph."""
+    text = _attempt_primary_text(value)
+    match = _CHANGED_FILES_RE.search(text)
+    if match is None:
+        return [], False
+    file_text = text[match.end() :]
+    file_text = _FINAL_NOTE_RE.split(file_text, maxsplit=1)[0]
+    file_text = file_text.strip().rstrip(".;")
+    if file_text.casefold() in {"", "none", "no files", "n/a"}:
+        return [], True
+    files = [part.strip().strip("`") for part in file_text.split(",")]
+    return [part for part in files if part], False
+
+
+def _compact_remediation_attempt(
+    value: Any,
+    *,
+    status: str,
+    changed_files: Sequence[Any] = (),
+    include_changed_files: bool = True,
+) -> str:
+    """Render only the concise remediation action from an agent summary.
+
+    The worker summary is run-specific prose and may contain separate
+    validation, notes, evidence, or diagnostic sections.  The report keeps
+    the lead remediation action and changed files, while dropping those
+    sections without truncating the retained action text.
+    """
+    raw = _text(value).strip()
+    if not raw:
+        return ""
+    primary = _attempt_primary_text(raw)
+    if not primary:
+        return ""
+
+    final_note = _FINAL_NOTE_RE.search(primary)
+    status_name = status.strip().casefold()
+    if final_note is not None:
+        prefix = primary[: final_note.start()].strip(" ;:-")
+        note = primary[final_note.end() :].strip()
+        action = note if status_name in {"success", "mitigated"} and note else prefix or note
+    else:
+        action = primary
+
+    parsed_files, explicit_no_files = _attempt_changed_files(raw)
+    files = _unique_texts([*changed_files, *parsed_files])
+    changed_clause = _CHANGED_FILES_RE.search(action)
+    if changed_clause is not None:
+        action = action[: changed_clause.start()].strip(" ;:-.")
+    action = " ".join(action.split()).rstrip(" ;.:")
+    if not action:
+        action = "Remediation attempt recorded"
+
+    parts = [action]
+    if include_changed_files:
+        if files:
+            parts.append(f"changed files: {', '.join(files)}")
+        elif explicit_no_files:
+            parts.append("no files changed")
+    return "; ".join(parts).rstrip(".") + "."
+
+
 def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
-    """Aggregate complete remediation-attempt evidence for one follow-up row."""
+    """Aggregate remediation-attempt summaries for one follow-up row."""
     task_ids = set(_task_ids_for_group(context, group_id))
     entries: list[str] = []
+    seen_attempt_ids: set[str] = set()
     seen_entries: set[tuple[str, str]] = set()
+    worker_results = sorted(
+        context.worker_results.values(),
+        key=lambda item: _text(_value(item, "attempt_id")),
+    )
+    worker_by_attempt = {
+        _text(_value(result, "attempt_id")): result
+        for result in worker_results
+        if _text(_value(result, "attempt_id"))
+    }
 
-    def add_entry(label: str, value: Any) -> None:
-        text = _text(value).strip()
-        if not text:
+    def add_attempt(summary: Any, metadata: Any = None) -> None:
+        if summary is None:
             return
-        key = (label, text)
+        summary_text = summary if isinstance(summary, (str, bytes)) else _value(summary, "summary")
+        if not _text(summary_text).strip():
+            return
+        attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+        if attempt_id and attempt_id in seen_attempt_ids:
+            return
+        status = _text(_value(summary, "status")) or _text(_value(metadata, "status"), "recorded")
+        structured_files = [
+            *_items(_value(summary, "changed_files")),
+            *_items(_value(metadata, "changed_files")),
+        ]
+        compact = _compact_remediation_attempt(
+            summary_text,
+            status=status,
+            changed_files=structured_files,
+        )
+        if not compact:
+            return
+        key = (status.casefold(), compact.casefold())
         if key in seen_entries:
             return
         seen_entries.add(key)
-        entries.append(f"{label}: {_full_text(text)}")
+        if attempt_id:
+            seen_attempt_ids.add(attempt_id)
+        entries.append(f"Remediation attempt ({status}): {compact}")
 
     for summary in context.action_summaries:
         if _text(_value(summary, "task_id")) not in task_ids:
             continue
-        status = _text(_value(summary, "status"), "recorded")
-        add_entry(f"Remediation attempt ({status})", _value(summary, "summary"))
+        attempt_id = _text(_value(summary, "attempt_id"))
+        add_attempt(summary, worker_by_attempt.get(attempt_id))
 
-    for result in sorted(
-        context.worker_results.values(),
-        key=lambda item: _text(_value(item, "attempt_id")),
-    ):
+    for result in worker_results:
         if _text(_value(result, "task_id")) not in task_ids:
             continue
         action_summary = _value(result, "action_summary")
-        if action_summary is not None:
-            status = _text(_value(action_summary, "status"), "recorded")
-            add_entry(f"Remediation attempt ({status})", _value(action_summary, "summary"))
-
-    for _, result in sorted(context.qa_results.items()):
-        evaluation = _value(result, "evaluation")
-        task_id = _text(_value(result, "task_id")) or _text(_value(evaluation, "task_id"))
-        if task_id not in task_ids:
-            continue
-        feedback = _value(evaluation, "retry_feedback")
-        if feedback is None:
-            feedback = _value(result, "retry_feedback")
-        add_entry("QA feedback", feedback)
-
-    recorded_qa_feedback_task_ids: set[str] = set()
-    for result in context.qa_results.values():
-        evaluation = _value(result, "evaluation")
-        task_id = _text(_value(result, "task_id")) or _text(_value(evaluation, "task_id"))
-        feedback = _value(evaluation, "retry_feedback")
-        if feedback is None:
-            feedback = _value(result, "retry_feedback")
-        if task_id and _text(feedback).strip():
-            recorded_qa_feedback_task_ids.add(task_id)
-    for key, evaluation in sorted(context.qa_evaluations.items()):
-        task_id = _text(_value(evaluation, "task_id")) or str(key)
-        if task_id in task_ids and task_id not in recorded_qa_feedback_task_ids:
-            add_entry("QA feedback", _value(evaluation, "retry_feedback"))
-
-    for task_id in _task_ids_for_group(context, group_id):
-        diagnostic = context.retry_diagnostics.get(task_id)
-        if diagnostic is None:
-            continue
-        details: list[str] = []
-        attempted = _diagnostic_versions(diagnostic, "attempted_versions")
-        executed = _diagnostic_versions(diagnostic, "executed_versions")
-        if attempted != "—":
-            details.append(f"Attempted versions: {attempted}")
-        if executed != "—":
-            details.append(f"Executed versions: {executed}")
-        reasoning = _text(_value(diagnostic, "reasoning_summary")).strip()
-        failure = _text(_value(diagnostic, "failure_reason")).strip()
-        if reasoning:
-            details.append(f"Reasoning: {_full_text(reasoning)}")
-        if failure:
-            details.append(f"Failure: {_full_text(failure)}")
-        if details:
-            add_entry("Retry details", "; ".join(details))
+        add_attempt(action_summary, result)
 
     return "\n\n".join(entries) or "No remediation attempt recorded."
 
@@ -1116,24 +1319,6 @@ def _package_changes(diff: str) -> list[PackageChange]:
     return sorted(changes, key=lambda change: (change.scope != "direct", change.name))
 
 
-def _diagnostic_versions(diagnostic: Any, field_name: str) -> str:
-    """Format version evidence, retaining per-target detail when available."""
-    versions_by_target = _mapping(_value(diagnostic, "attempted_versions_by_target"))
-    if field_name == "executed_versions":
-        versions_by_target = _mapping(_value(diagnostic, "executed_versions_by_target"))
-    if versions_by_target:
-        return (
-            "; ".join(
-                f"{package}: {', '.join(_text(version) for version in _items(versions))}"
-                for package, versions in sorted(versions_by_target.items())
-                if _items(versions)
-            )
-            or "—"
-        )
-    versions = _items(_value(diagnostic, field_name))
-    return ", ".join(_text(version) for version in versions) or "—"
-
-
 def _scan_assessment_text(context: ReportContext) -> str:
     """Describe unavailable post-scan evidence without implying zero findings."""
     if (
@@ -1255,21 +1440,21 @@ def _newly_discovered_finding_rows(context: ReportContext) -> list[tuple[str, ..
             for group_id in sorted(discovered_ids)
         ]
 
-    return [
-        (
-            "None",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "Pending — post-scan triage required"
-            if context.triage_required
-            else "No newly discovered groups",
-        )
-    ]
+    if context.triage_required:
+        return [
+            (
+                "Not assessed",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                "No validated change",
+                "pending",
+                "Not assessed — post-scan triage required",
+            )
+        ]
+    return [("None", "—", "—", "—", "—", "—", "—", "—", "No newly discovered groups")]
 
 
 def _render_follow_up_actions(context: ReportContext) -> str:
@@ -1283,41 +1468,28 @@ def _render_follow_up_actions(context: ReportContext) -> str:
         "optimistically_fixed": 5,
     }
     groups = [
-        group
-        for group in _report_groups(context)
-        if context.group_statuses.get(_text(_value(group, "group_id")), "pending")
-        in _OUTSTANDING_GROUP_STATUSES
+        (group_id, group)
+        for group_id, group in _follow_up_groups(context)
+        if context.group_statuses.get(group_id, "pending") in _OUTSTANDING_GROUP_STATUSES
     ]
-    known_group_ids = {
-        _text(_value(group, "group_id")) for group in _report_groups(context)
-    }
-    if _scan_evidence_state(
-        context.final_full_scan_result, context.new_vulnerability_status
-    ) == "complete":
-        groups.extend(
-            {"group_id": group_id}
-            for group_id in _discovered_group_ids(context)
-            if group_id not in known_group_ids
-        )
     groups.sort(
-        key=lambda group: (
+        key=lambda item: (
             status_order.get(
-                context.group_statuses.get(_text(_value(group, "group_id")), "pending"),
+                context.group_statuses.get(item[0], "pending"),
                 99,
             ),
-            _text(_value(group, "group_id")),
+            item[0],
         )
     )
     rows: list[tuple[str, ...]] = []
-    for group in groups:
-        group_id = _text(_value(group, "group_id"))
+    for group_id, group in groups:
         status = context.group_statuses.get(group_id, "pending")
         rows.append(
             (
                 _finding_identifier(group, _group_issue(group)),
                 _text(_value(group, "vulnerable_component"), "—"),
                 _FOLLOW_UP_STATUS_LABELS.get(status, status),
-                _required_follow_up_action(context, group, status),
+                _required_follow_up_action(context, group, status, group_id=group_id),
                 _attempted_fixes_for_group(context, group_id),
             )
         )
