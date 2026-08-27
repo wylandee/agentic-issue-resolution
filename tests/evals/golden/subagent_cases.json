@@ -7,28 +7,17 @@
     "target_package_name": "lodash",
     "selected_version": "4.17.21",
     "is_retry": false,
+    "repository_map": "package.json\npackage-lock.json\nlib\nlib/insecurity.ts\nroutes\nroutes/server.ts",
     "tool_calls": [
       {
-        "name": "read_repository_map",
-        "args": {},
-        "output": "SUCCESS: Repository contains package.json, package-lock.json, lib/, routes/, server.ts"
-      },
-      {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
           "package_name": "lodash",
-          "target_version": "4.17.21"
+          "target_version": "4.17.21",
+          "dependency_type": "dependencies"
         },
-        "output": "SUCCESS: Updated 'lodash' in 'package.json' to '4.17.21'."
-      },
-      {
-        "name": "validate_manifest_sync",
-        "args": {
-          "manifest_path": "package.json",
-          "package_name": "lodash"
-        },
-        "output": "SUCCESS: npm install --package-lock=true completed successfully with code 0."
+        "output": "SUCCESS: Updated and synchronized 'lodash' in 'package.json' to '4.17.21'."
       }
     ],
     "changed_files": [
@@ -49,29 +38,17 @@
     "selected_version": "2.0.1",
     "dependency_type": "overrides",
     "is_retry": false,
+    "repository_map": "package.json\npackage-lock.json",
     "tool_calls": [
       {
-        "name": "read_repository_map",
-        "args": {},
-        "output": "SUCCESS: Workspace initialized with root package.json."
-      },
-      {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
           "package_name": "@tootallnate/once",
           "target_version": "2.0.1",
           "dependency_type": "overrides"
         },
-        "output": "SUCCESS: Added override for '@tootallnate/once' -> '2.0.1' in 'package.json'."
-      },
-      {
-        "name": "validate_manifest_sync",
-        "args": {
-          "manifest_path": "package.json",
-          "package_name": "@tootallnate/once"
-        },
-        "output": "SUCCESS: Manifest sync validated against lockfile (npm install exit 0)."
+        "output": "SUCCESS: Added and synchronized override for '@tootallnate/once' -> '2.0.1' in 'package.json'."
       }
     ],
     "changed_files": [
@@ -84,42 +61,34 @@
     "expected_completion_pass": true
   },
   {
-    "case_id": "update-retry-with-registry",
+    "case_id": "update-retry-with-approved-candidate",
     "eval_type": "update_subagent",
-    "provenance": "Multi-attempt rescue after peer conflict from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). ws update from 7.4.5 caused QA failure PEER_CONFLICT with react-scripts; supervisor dispatches retry with view_npm_package_versions enabled. Worker queries registry, evaluates candidate versions, and applies 7.5.5.",
+    "provenance": "Multi-attempt rescue after peer conflict from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). ws update from 7.4.5 caused QA failure PEER_CONFLICT with react-scripts; the Supervisor commits a changed approved candidate and the worker applies 7.5.5.",
     "supervisor_instruction": "Update \"ws\" in frontend/package.json to version \"7.5.5\". Prior attempt with 7.5.1 encountered peer conflict.",
     "target_package_name": "ws",
     "selected_version": "7.5.5",
     "is_retry": true,
+    "repository_map": "frontend\nfrontend/package.json\nfrontend/package-lock.json",
     "tool_calls": [
       {
-        "name": "read_repository_map",
-        "args": {},
-        "output": "SUCCESS: Multi-project repository with frontend/package.json."
-      },
-      {
-        "name": "view_npm_package_versions",
-        "args": {
-          "package_name": "ws"
-        },
-        "output": "SUCCESS: Published versions for ws: 7.4.5, 7.5.0, 7.5.1, 7.5.2, 7.5.3, 7.5.4, 7.5.5, 8.0.0, 8.11.0 (latest: 8.11.0)"
-      },
-      {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "frontend/package.json",
           "package_name": "ws",
-          "target_version": "7.5.5"
+          "target_version": "7.5.1",
+          "dependency_type": "dependencies"
         },
-        "output": "SUCCESS: Modified 'ws' to '7.5.5' in 'frontend/package.json'."
+        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: peer conflict with react-scripts"
       },
       {
-        "name": "validate_manifest_sync",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "frontend/package.json",
-          "package_name": "ws"
+          "package_name": "ws",
+          "target_version": "7.5.5",
+          "dependency_type": "dependencies"
         },
-        "output": "SUCCESS: npm install validated with zero peer conflicts."
+        "output": "SUCCESS: Updated and synchronized 'ws' to '7.5.5' in 'frontend/package.json'."
       }
     ],
     "changed_files": [
@@ -155,21 +124,14 @@
         "output": "SUCCESS: Page content extracted."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
           "package_name": "lodash",
-          "target_version": "4.17.21"
+          "target_version": "4.17.21",
+          "dependency_type": "dependencies"
         },
         "output": "SUCCESS: Updated lodash."
-      },
-      {
-        "name": "validate_manifest_sync",
-        "args": {
-          "manifest_path": "package.json",
-          "package_name": "lodash"
-        },
-        "output": "SUCCESS: Validated."
       }
     ],
     "changed_files": [
@@ -191,11 +153,6 @@
     "is_retry": false,
     "tool_calls": [
       {
-        "name": "read_repository_map",
-        "args": {},
-        "output": "SUCCESS: Repo map loaded."
-      },
-      {
         "name": "read_workspace_file",
         "args": {
           "file_path": "package.json"
@@ -231,49 +188,42 @@
         "output": "SUCCESS: Read package.json."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "package": "cookie"
         },
         "output": "ERROR: Missing required field 'manifest_path'."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "package": "cookie"
         },
         "output": "ERROR: Missing required field 'manifest_path'."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "package": "cookie"
         },
         "output": "ERROR: Missing required field 'manifest_path'."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "package": "cookie"
         },
         "output": "ERROR: Missing required field 'manifest_path'."
       },
       {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
           "package_name": "cookie",
-          "target_version": "0.7.0"
+          "target_version": "0.7.0",
+          "dependency_type": "dependencies"
         },
         "output": "SUCCESS: Updated cookie to 0.7.0."
-      },
-      {
-        "name": "validate_manifest_sync",
-        "args": {
-          "manifest_path": "package.json",
-          "package_name": "cookie"
-        },
-        "output": "SUCCESS: Manifest sync validated."
       }
     ],
     "changed_files": [
@@ -288,41 +238,51 @@
   {
     "case_id": "update-surrender-clean-peer-conflict",
     "eval_type": "update_subagent",
-    "provenance": "Clean-room surrender from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). Worker attempts validate_manifest_sync for express-jwt@8.5.1, encounters ERESOLVE peer conflict, executes revert_workspace_file(file_path=\"package.json\", package_name=\"express-jwt\"), and surrenders cleanly.",
+    "provenance": "Clean-room surrender from trajectory phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67). Worker attempts three Supervisor-approved combined transactions for express-jwt, encounters an ERESOLVE peer conflict on each, and surrenders cleanly after automatic rollback.",
     "supervisor_instruction": "Update \"express-jwt\" in package.json to version \"8.5.1\".",
     "target_package_name": "express-jwt",
     "selected_version": "8.5.1",
     "is_retry": true,
     "tool_calls": [
       {
-        "name": "read_repository_map",
-        "args": {},
-        "output": "SUCCESS: Repo map loaded."
-      },
-      {
-        "name": "modify_npm_dependency",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
           "package_name": "express-jwt",
-          "target_version": "8.5.1"
+          "target_version": "8.5.1",
+          "dependency_type": "dependencies"
         },
-        "output": "SUCCESS: Modified express-jwt to 8.5.1."
+        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict"
       },
       {
-        "name": "validate_manifest_sync",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
           "manifest_path": "package.json",
-          "package_name": "express-jwt"
+          "package_name": "express-jwt",
+          "target_version": "8.5.2",
+          "dependency_type": "dependencies"
         },
-        "output": "ERROR: npm ERR! ERESOLVE could not resolve dependency: express-jwt@8.5.1 requires express@^4.18.0 but project root has express@4.17.1"
+        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict"
       },
       {
-        "name": "revert_workspace_file",
+        "name": "modify_and_validate_npm_dependency",
         "args": {
-          "file_path": "package.json",
-          "package_name": "express-jwt"
+          "manifest_path": "package.json",
+          "package_name": "express-jwt",
+          "target_version": "8.5.3",
+          "dependency_type": "dependencies"
         },
-        "output": "SUCCESS: Reverted express-jwt changes in package.json."
+        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict"
+      },
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "manifest_path": "package.json",
+          "package_name": "express-jwt",
+          "target_version": "8.5.4",
+          "dependency_type": "dependencies"
+        },
+        "output": "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined update attempts are allowed for this package."
       }
     ],
     "changed_files": [],

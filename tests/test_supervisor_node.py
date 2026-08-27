@@ -48,10 +48,12 @@ from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
+    _create_attempt_snapshot,
     _deterministic_routing,
     _instruction_digest,
     _materialize_spawn_requests,
     _normalize_target_task_ids_for_node,
+    _ordered_update_candidates,
     _parse_planner_retry_plans,
     _planner_plan_violations,
     _reconcile_registry_plan_evidence,
@@ -264,6 +266,63 @@ class TestSupervisorDecisionSchema:
                 instructions="test",
                 decision_reason="test",
             )
+
+
+def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
+    """New candidate fields remain readable when historical snapshots omit them."""
+    snapshot = TaskAttemptSnapshot(
+        task_id="task-1",
+        instruction="Update test-pkg.",
+        instruction_digest=_instruction_digest("Update test-pkg."),
+        dispatch_node="update_subagent",
+    )
+
+    assert snapshot.allowed_target_versions == []
+    assert snapshot.allowed_dependency_types == []
+
+
+def test_ordered_update_candidates_excludes_attempted_versions_and_types():
+    """A committed retry snapshot contains only unattempted Supervisor candidates."""
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "selected_version": "2.0.0",
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "overrides",
+        }
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        strategy_stage=SCARemediationStage.PACKAGE_OVERRIDE,
+        attempted_versions=["2.0.0"],
+        candidate_versions_considered=["2.0.0", "2.1.0"],
+        attempted_dependency_types=["overrides"],
+        candidate_dependency_types=["overrides", "resolutions"],
+    )
+
+    versions, dependency_types = _ordered_update_candidates(task, diagnostics=diagnostics)
+
+    assert versions == ["2.1.0"]
+    assert dependency_types == ["pnpm_overrides", "resolutions"]
+
+
+def test_create_attempt_snapshot_commits_update_candidate_allowlists():
+    """Candidate lists are captured in the immutable worker input snapshot."""
+    task = _make_task("task-1", "g1").model_copy(
+        update={"instruction": "Update the committed dependency candidate."}
+    )
+    committed, snapshot = _create_attempt_snapshot(
+        task,
+        dispatch_node="update_subagent",
+        snapshots_by_id={},
+        state_revision=3,
+        allowed_target_versions=["1.2.3", "1.4.0", "1.2.3"],
+        allowed_dependency_types=["dependencies", "devDependencies", "dependencies"],
+    )
+
+    assert committed.current_attempt_id == snapshot.attempt_id
+    assert snapshot.allowed_target_versions == ["1.2.3", "1.4.0"]
+    assert snapshot.allowed_dependency_types == ["dependencies", "devDependencies"]
 
 
 # ===========================================================================
@@ -1431,6 +1490,136 @@ def test_worker_result_persists_attempts_by_target_and_override_usage():
     assert diagnostics.target_dependency_type == "overrides"
     assert diagnostics.used_overrides is True
     assert result["next_routing_step"] == "qa_critic"
+
+
+def test_allowlisted_alternate_update_candidate_is_reconciled_as_effective():
+    """A worker may succeed with a different committed version and declaration type."""
+    group = _sca_group("g1")
+    instruction = "Update test-pkg using an approved candidate."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-alternate",
+        task_id="task-1",
+        task_revision=1,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="1.0.0",
+        allowed_target_versions=["1.0.0", "1.1.0"],
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        allowed_dependency_types=["dependencies", "devDependencies"],
+        instruction=instruction,
+        instruction_digest=_instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "target_dependency_type": snapshot.target_dependency_type,
+            "instruction": instruction,
+        }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["1.1.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["1.0.0", "1.1.0"],
+            executed_versions=["1.1.0"],
+            effective_target_version="1.1.0",
+            effective_dependency_type="devDependencies",
+            manifest_transaction_attempts=2,
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            worker_results_by_attempt={snapshot.attempt_id: worker_result},
+        )
+    )
+
+    diagnostics = result["retry_diagnostics_by_task"][task.task_id]
+    assert diagnostics.effective_target_version == "1.1.0"
+    assert diagnostics.effective_dependency_type == "devDependencies"
+    assert diagnostics.attempted_versions == ["1.0.0", "1.1.0"]
+    assert result["task_queue"][task.task_id].status == TaskStatus.OPTIMISTICALLY_FIXED
+
+
+@pytest.mark.parametrize(
+    ("executed_versions", "effective_dependency_type", "error_code"),
+    [
+        (["9.9.9"], "dependencies", "EXECUTED_VERSION_MISMATCH"),
+        (["1.0.0"], "peerDependencies", "EXECUTED_DEPENDENCY_TYPE_MISMATCH"),
+    ],
+)
+def test_unallowlisted_effective_update_candidate_is_rejected(
+    executed_versions, effective_dependency_type, error_code
+):
+    """Successful-looking worker output cannot escape the committed allowlists."""
+    group = _sca_group("g1")
+    instruction = "Update test-pkg using the committed candidate."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=f"attempt-invalid-{error_code}",
+        task_id="task-1",
+        task_revision=1,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="1.0.0",
+        allowed_target_versions=["1.0.0"],
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        allowed_dependency_types=["dependencies"],
+        instruction=instruction,
+        instruction_digest=_instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "target_dependency_type": snapshot.target_dependency_type,
+            "instruction": instruction,
+        }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=executed_versions,
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=executed_versions,
+            executed_versions=executed_versions,
+            effective_target_version=executed_versions[-1],
+            effective_dependency_type=effective_dependency_type,
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            worker_results_by_attempt={snapshot.attempt_id: worker_result},
+        )
+    )
+
+    assert any(event.error_code == error_code for event in result["consistency_events"])
 
 
 @patch("langchain_openai.ChatOpenAI")

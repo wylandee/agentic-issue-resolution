@@ -104,6 +104,7 @@ _KNOWN_LLM_SPAN_NAMES = frozenset(
 
 _KNOWN_TOOL_NAMES = frozenset(
     {
+        "modify_and_validate_npm_dependency",
         "modify_npm_dependency",
         "validate_manifest_sync",
         "list_changed_files",

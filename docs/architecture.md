@@ -22,6 +22,17 @@ only the committed instruction they are given. QA evaluates the shared
 workspace and feeds structured evidence back to the Supervisor. Teardown
 computes the host-relative diff and removes the temporary Docker volume.
 
+The update worker receives a deterministic repository map as read-only prompt
+context, produced by `tools/repository_map.py` from the validated host path.
+Its only manifest mutation capability is
+`modify_and_validate_npm_dependency`. That transaction runs `npm pkg set`
+followed immediately by `npm install --package-lock-only --ignore-scripts`;
+failures restore the internal package checkpoint. The worker may choose only a
+target version and dependency type committed in the immutable attempt snapshot.
+After an error-coded transaction, the bounded runtime requests a changed
+approved candidate, up to three calls per package. Workaround workers retain
+their investigation, repository-map, and internal recovery tools.
+
 The host repository is never edited by the public API or CLI. Results contain a
 unified diff and changed-file list so a caller can review and apply the patch
 through its own workflow. Trajectory files are written only when configured by
@@ -66,8 +77,9 @@ on teardown or the targeted-scan cleanup path.
 
 The `task_queue` and `attempt_snapshots_by_id` projections are the
 authoritative orchestration state. A newly dispatched attempt records its task
-ID, task revision, attempt ID, strategy stage, selected version, exact
-instruction and digest, QA policy, and dispatch node. Worker and QA results
+ID, task revision, attempt ID, strategy stage, selected version, Supervisor-
+approved target-version and dependency-type candidates, exact instruction and
+digest, QA policy, and dispatch node. Worker and QA results
 must match that envelope; stale or policyless results are rejected before any
 workspace mutation or evaluation.
 

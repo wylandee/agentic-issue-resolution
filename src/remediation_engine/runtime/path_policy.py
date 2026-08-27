@@ -8,6 +8,7 @@ callers from making subtly different decisions about traversal and symlinks.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path, PurePosixPath
 
@@ -112,7 +113,11 @@ def repository_relative_path(value: str | Path | None, repo_root: str | Path) ->
     # running on POSIX.  ``Path('C:/...')`` would otherwise be interpreted as
     # a harmless relative name on POSIX and could bypass the cross-platform
     # scanner-path policy.
-    if _WINDOWS_ABSOLUTE_PATH.match(raw):
+    # A Windows absolute path is valid input when this service is running on
+    # Windows; the containment check below still rejects paths outside the
+    # repository. On POSIX, reject it because it cannot be resolved safely
+    # against the host repository's native path semantics.
+    if _WINDOWS_ABSOLUTE_PATH.match(raw) and os.name != "nt":
         return None
 
     if raw.startswith("/workspace/"):

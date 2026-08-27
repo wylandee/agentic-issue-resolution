@@ -876,6 +876,48 @@ def _worker_attempts_succeeded(
     )
 
 
+def _has_partial_update_success(
+    state: OrchestratorState,
+    result: dict[str, Any],
+    target_tasks: list[RemediationTask],
+) -> bool:
+    """Return whether a direct update batch has mixed package outcomes.
+
+    The combined update tool rolls back each failed package independently. A
+    direct batch therefore must keep successful package transactions when a
+    different package exhausts its retry budget. The normal Supervisor path
+    dispatches one task at a time; this exception is restricted to a complete
+    update-only batch without retained QA rollback anchors.
+    """
+    if result.get("errors") or len(target_tasks) < 2:
+        return False
+    if _workspace_rollback_anchor_ids(state, target_tasks):
+        return False
+
+    snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    if any(
+        task.current_attempt_id is None
+        or (snapshot := snapshots.get(task.current_attempt_id)) is None
+        or snapshot.dispatch_node != "update_subagent"
+        for task in target_tasks
+    ):
+        return False
+
+    worker_results = result.get("worker_results_by_attempt") or {}
+    if not worker_results:
+        return False
+    by_task = {item.task_id: item for item in worker_results.values()}
+    outcomes = [by_task.get(task.task_id) for task in target_tasks]
+    if any(outcome is None for outcome in outcomes):
+        return False
+    succeeded = [
+        outcome.status == AgentActionStatus.SUCCESS
+        and outcome.execution_diagnostics.validation_passed
+        for outcome in outcomes
+    ]
+    return any(succeeded) and not all(succeeded)
+
+
 def _finalize_worker_workspace_snapshot(
     state: OrchestratorState,
     target_tasks: list[RemediationTask],
@@ -889,6 +931,11 @@ def _finalize_worker_workspace_snapshot(
         # QA owns the next decision. It must still be able to restore this
         # exact candidate if install, scanning, or tests reject it.
         return []
+    if _has_partial_update_success(state, result, target_tasks):
+        # Failed combined transactions have already restored their own
+        # package checkpoints. Remove only the outer batch archive so the
+        # successful package transactions remain available for later QA.
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
     if _workspace_rollback_anchor_ids(state, target_tasks):
         # A retry may have started from a previously rejected candidate. A
         # failed worker must not preserve that candidate for the next task;
@@ -1223,9 +1270,9 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
     )
     if worker_results:
         out["worker_results_by_attempt"] = worker_results
-    elif result.get("retry_diagnostics_by_task") and not target_attempt_snapshots:
-        # Compatibility for legacy direct bridge callers that do not provide
-        # attempt envelopes. Real Phase 5 dispatches always use envelopes.
+    if result.get("retry_diagnostics_by_task"):
+        # Keep cumulative version/type evidence available to the Supervisor in
+        # addition to the attempt-correlated worker envelope.
         out["retry_diagnostics_by_task"] = result["retry_diagnostics_by_task"]
     out["errors"] = list(out.get("errors", [])) + _finalize_worker_workspace_snapshot(
         state,

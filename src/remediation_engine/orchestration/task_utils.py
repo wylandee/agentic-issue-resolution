@@ -552,11 +552,15 @@ def build_initial_remediation_task(
     target_package_name = (
         parent_name
         if has_parent_target
-        else (
-            group.vulnerable_component
-            if transitive and strategy == RoutingStrategy.VERSION_BUMP
-            else None
-        )
+        else (group.vulnerable_component if strategy == RoutingStrategy.VERSION_BUMP else None)
+    )
+    direct_dependency_type = next(
+        (
+            localized.declaration_type
+            for localized in group.localized_issues
+            if localized.declaration_type
+        ),
+        None if transitive else "dependencies",
     )
     target_dependency_type = (
         parent_type
@@ -564,7 +568,7 @@ def build_initial_remediation_task(
         else (
             _group_override_dependency_type(group)
             if transitive and strategy == RoutingStrategy.VERSION_BUMP
-            else None
+            else direct_dependency_type
         )
     )
     if has_parent_target:

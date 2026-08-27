@@ -456,42 +456,51 @@ def test_successful_workaround_edit_injects_immediate_validation_instruction() -
 
 
 def test_manifest_tool_calls_are_serialized_and_deferred_within_one_turn() -> None:
-    """Only the first manifest operation in a model turn is executed."""
-    modify_tool = MagicMock()
-    modify_tool.name = "modify_npm_dependency"
-    modify_tool.invoke.side_effect = [
-        "SUCCESS: updated lodash",
-        "SUCCESS: updated axios",
+    """Only the first combined transaction in a model turn is executed."""
+    combined_tool = MagicMock()
+    combined_tool.name = "modify_and_validate_npm_dependency"
+    combined_tool.invoke.side_effect = [
+        "SUCCESS: updated and synchronized lodash",
+        "SUCCESS: updated and synchronized axios",
     ]
-    validate_tool = MagicMock()
-    validate_tool.name = "validate_manifest_sync"
-    validate_tool.invoke.side_effect = ["SUCCESS: validated lodash", "SUCCESS: validated axios"]
 
     bound_llm = MagicMock()
     bound_llm.invoke.side_effect = [
         AIMessage(
             content="",
             tool_calls=[
-                {"name": modify_tool.name, "args": {"package_name": "lodash"}, "id": "modify-1"},
-                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-2"},
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.21",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-1",
+                },
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "axios",
+                        "target_version": "1.7.4",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-2",
+                },
             ],
         ),
         AIMessage(
             content="",
             tool_calls=[
-                {"name": validate_tool.name, "args": {"package_name": "lodash"}, "id": "validate-1"}
-            ],
-        ),
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-3"}
-            ],
-        ),
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": validate_tool.name, "args": {"package_name": "axios"}, "id": "validate-2"}
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "axios",
+                        "target_version": "1.7.4",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-3",
+                }
             ],
         ),
         AIMessage(content="complete"),
@@ -501,38 +510,40 @@ def test_manifest_tool_calls_are_serialized_and_deferred_within_one_turn() -> No
 
     result = run_bounded_subagent_loop(
         llm,
-        [modify_tool, validate_tool],
+        [combined_tool],
         [HumanMessage(content="Update the dependencies.")],
         set(),
     )
 
     assert result.errors == []
     assert [event.name for event in result.tool_events] == [
-        "modify_npm_dependency",
-        "modify_npm_dependency",
-        "validate_manifest_sync",
-        "modify_npm_dependency",
-        "validate_manifest_sync",
+        "modify_and_validate_npm_dependency",
+        "modify_and_validate_npm_dependency",
+        "modify_and_validate_npm_dependency",
     ]
     assert result.tool_events[1].content.startswith("DEFERRED: manifest tools")
-    llm.bind_tools.assert_called_once_with([modify_tool, validate_tool], parallel_tool_calls=False)
+    assert combined_tool.invoke.call_count == 2
+    assert combined_tool.invoke.call_args_list[0].args[0] == {
+        "package_name": "lodash",
+        "target_version": "4.17.21",
+        "dependency_type": "dependencies",
+    }
+    llm.bind_tools.assert_called_once_with([combined_tool], parallel_tool_calls=False)
     assert any(
         isinstance(message, HumanMessage)
-        and "Manifest operation sequencing barrier" in message.content
+        and "Manifest transaction sequencing barrier" in message.content
         for message in bound_llm.invoke.call_args_list[1].args[0]
     )
 
 
-def test_manifest_validation_failure_does_not_stop_later_batch_items() -> None:
-    """A failed package validation still allows later packages to run."""
-    modify_tool = MagicMock()
-    modify_tool.name = "modify_npm_dependency"
-    modify_tool.invoke.side_effect = ["SUCCESS: updated lodash", "SUCCESS: updated axios"]
-    validate_tool = MagicMock()
-    validate_tool.name = "validate_manifest_sync"
-    validate_tool.invoke.side_effect = [
-        "FAILURE: rolled back lodash",
-        "SUCCESS: validated axios",
+def test_manifest_transaction_failure_does_not_stop_later_batch_items() -> None:
+    """A failed package transaction can be retried without blocking another package."""
+    combined_tool = MagicMock()
+    combined_tool.name = "modify_and_validate_npm_dependency"
+    combined_tool.invoke.side_effect = [
+        "ERROR_CODE: MANIFEST_SYNC_FAILED: rolled back lodash",
+        "SUCCESS: updated and synchronized lodash",
+        "SUCCESS: updated and synchronized axios",
     ]
 
     bound_llm = MagicMock()
@@ -540,25 +551,157 @@ def test_manifest_validation_failure_does_not_stop_later_batch_items() -> None:
         AIMessage(
             content="",
             tool_calls=[
-                {"name": modify_tool.name, "args": {"package_name": "lodash"}, "id": "modify-1"}
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.21",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-1",
+                }
             ],
         ),
         AIMessage(
             content="",
             tool_calls=[
-                {"name": validate_tool.name, "args": {"package_name": "lodash"}, "id": "validate-1"}
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.22",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-2",
+                }
             ],
         ),
         AIMessage(
             content="",
             tool_calls=[
-                {"name": modify_tool.name, "args": {"package_name": "axios"}, "id": "modify-2"}
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "axios",
+                        "target_version": "1.7.4",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "combined-3",
+                }
+            ],
+        ),
+        AIMessage(content="lodash retried; axios completed"),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [combined_tool],
+        [HumanMessage(content="Update the dependencies.")],
+        set(),
+    )
+
+    assert result.errors == []
+    assert combined_tool.invoke.call_count == 3
+    assert "rolled back lodash" in result.tool_events[0].content
+    assert any(
+        isinstance(message, HumanMessage)
+        and "different value from the Supervisor-approved candidate lists" in message.content
+        for message in bound_llm.invoke.call_args_list[1].args[0]
+    )
+
+
+def test_manifest_retry_limit_is_scoped_to_one_package() -> None:
+    """Three failed calls surrender one package while another package continues."""
+    combined_tool = MagicMock()
+    combined_tool.name = "modify_and_validate_npm_dependency"
+    combined_tool.invoke.side_effect = [
+        "ERROR_CODE: EDIT_FAILED: first package attempt failed",
+        "ERROR_CODE: MANIFEST_SYNC_FAILED: second package attempt failed",
+        "FAILURE: third package attempt failed",
+        "SUCCESS: updated and synchronized axios",
+    ]
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.21",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "lodash-1",
+                }
             ],
         ),
         AIMessage(
             content="",
             tool_calls=[
-                {"name": validate_tool.name, "args": {"package_name": "axios"}, "id": "validate-2"}
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.22",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "lodash-2",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.23",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "lodash-3",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "lodash",
+                        "target_version": "4.17.24",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "lodash-4",
+                },
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "axios",
+                        "target_version": "1.7.4",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "axios-deferred",
+                },
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": combined_tool.name,
+                    "args": {
+                        "package_name": "axios",
+                        "target_version": "1.7.4",
+                        "dependency_type": "dependencies",
+                    },
+                    "id": "axios-1",
+                }
             ],
         ),
         AIMessage(content="lodash surrendered; axios completed"),
@@ -568,12 +711,17 @@ def test_manifest_validation_failure_does_not_stop_later_batch_items() -> None:
 
     result = run_bounded_subagent_loop(
         llm,
-        [modify_tool, validate_tool],
+        [combined_tool],
         [HumanMessage(content="Update the dependencies.")],
         set(),
     )
 
     assert result.errors == []
-    assert modify_tool.invoke.call_count == 2
-    assert validate_tool.invoke.call_count == 2
-    assert "rolled back lodash" in result.tool_events[1].content
+    assert combined_tool.invoke.call_count == 4
+    assert result.tool_events[3].content.startswith("ERROR_CODE: RETRY_LIMIT_REACHED:")
+    assert result.tool_events[4].content.startswith("DEFERRED: manifest tools")
+    assert result.tool_events[5].content.startswith("SUCCESS:")
+    assert any(
+        isinstance(message, HumanMessage) and "exhausted its 3-attempt limit" in message.content
+        for message in bound_llm.invoke.call_args_list[4].args[0]
+    )

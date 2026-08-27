@@ -486,13 +486,13 @@ def test_update_worker_records_failed_exact_version_attempts_without_selecting_n
         [(task, group, ["package.json"])],
         [
             ToolEvent(
-                name="modify_npm_dependency",
+                name="modify_and_validate_npm_dependency",
                 args={
                     "package_name": group.vulnerable_component,
                     "target_version": "5.0.0",
                     "dependency_type": "dependencies",
                 },
-                content="FAILURE: package install failed",
+                content="ERROR_CODE: MANIFEST_SYNC_FAILED: package install failed",
             )
         ],
         "surrender",

@@ -148,6 +148,10 @@ class TestUpdateSubagentWrapper:
         assert "First-pass planning questions:" not in prompt
         assert "Planning Answers" not in prompt
         assert "Reasoning Summary" not in prompt
+        assert "Deterministic repository map:" in prompt
+        assert "read_repository_map" not in prompt
+        assert "revert_workspace_file" not in prompt
+        assert "validate_manifest_sync" not in prompt
 
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
@@ -220,7 +224,7 @@ class TestUpdateSubagentWrapper:
         assert "## Task task-2" in prompt
         assert "Planning Answers" not in prompt
 
-    def test_success_requires_validation_after_manifest_edit(self):
+    def test_success_requires_combined_manifest_transaction(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
         group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
         group_b.vulnerable_component = "axios"
@@ -238,7 +242,7 @@ class TestUpdateSubagentWrapper:
                 content="updating",
                 tool_calls=[
                     {
-                        "name": "modify_npm_dependency",
+                        "name": "modify_and_validate_npm_dependency",
                         "args": {
                             "package_name": "lodash",
                             "target_version": "4.17.21",
@@ -251,39 +255,17 @@ class TestUpdateSubagentWrapper:
                 ],
             ),
             AIMessage(
-                content="validating",
-                tool_calls=[
-                    {
-                        "name": "validate_manifest_sync",
-                        "args": {"package_name": "lodash"},
-                        "id": "call-2",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
                 content="updating second package",
                 tool_calls=[
                     {
-                        "name": "modify_npm_dependency",
+                        "name": "modify_and_validate_npm_dependency",
                         "args": {
                             "package_name": "axios",
                             "target_version": "1.7.4",
                             "dependency_type": "dependencies",
                             "manifest_path": "frontend/package.json",
                         },
-                        "id": "call-3",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="validating second package",
-                tool_calls=[
-                    {
-                        "name": "validate_manifest_sync",
-                        "args": {"package_name": "axios"},
-                        "id": "call-4",
+                        "id": "call-2",
                         "type": "tool_call",
                     }
                 ],
@@ -291,16 +273,12 @@ class TestUpdateSubagentWrapper:
             AIMessage(content="done"),
         )
         sandbox = _sandbox_mock()
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        tool_edit.invoke.return_value = (
-            "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
-        )
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_manifest_sync"
-        tool_validate.invoke.return_value = (
-            "SUCCESS: Manifest synchronization succeeded for package.json, frontend/package.json."
-        )
+        combined_tool = MagicMock()
+        combined_tool.name = "modify_and_validate_npm_dependency"
+        combined_tool.invoke.side_effect = [
+            "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.21 in package.json.",
+            "SUCCESS: Natively updated and synchronized dependencies.axios to 1.7.4 in frontend/package.json.",
+        ]
 
         with (
             patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
@@ -317,12 +295,12 @@ class TestUpdateSubagentWrapper:
             ),
             patch(
                 "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
-                return_value=[tool_edit, tool_validate],
+                return_value=[combined_tool],
             ),
         ):
             result = run_update_subagent_node(state)
 
-        assert bound.invoke.call_count == 5
+        assert bound.invoke.call_count == 3
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert "messages" not in result
         assert "package.json" in result["changed_files"]
@@ -348,11 +326,9 @@ class TestUpdateSubagentWrapper:
 
         llm, _bound = _mock_llm_with_responses(AIMessage(content="done"))
         sandbox = _sandbox_mock()
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        tool_edit.invoke.return_value = (
-            "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
-        )
+        combined_tool = MagicMock()
+        combined_tool.name = "modify_and_validate_npm_dependency"
+        combined_tool.invoke.return_value = "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.21 in package.json."
 
         with (
             patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
@@ -366,7 +342,7 @@ class TestUpdateSubagentWrapper:
             ),
             patch(
                 "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
-                return_value=[tool_edit],
+                return_value=[combined_tool],
             ),
         ):
             result = run_update_subagent_node(state)
@@ -389,7 +365,7 @@ class TestUpdateSubagentWrapper:
                 content="updating",
                 tool_calls=[
                     {
-                        "name": "modify_npm_dependency",
+                        "name": "modify_and_validate_npm_dependency",
                         "args": {
                             "package_name": "lodash",
                             "target_version": "4.17.21",
@@ -397,17 +373,6 @@ class TestUpdateSubagentWrapper:
                             "manifest_path": "package.json",
                         },
                         "id": "call-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="validating",
-                tool_calls=[
-                    {
-                        "name": "validate_manifest_sync",
-                        "args": {},
-                        "id": "call-2",
                         "type": "tool_call",
                     }
                 ],
@@ -422,16 +387,9 @@ class TestUpdateSubagentWrapper:
             ),
         )
         sandbox = _sandbox_mock()
-        tool_edit = MagicMock()
-        tool_edit.name = "modify_npm_dependency"
-        tool_edit.invoke.return_value = (
-            "SUCCESS: Natively updated dependencies.lodash to 4.17.21 in package.json."
-        )
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_manifest_sync"
-        tool_validate.invoke.return_value = (
-            "SUCCESS: Manifest synchronization succeeded for package.json."
-        )
+        combined_tool = MagicMock()
+        combined_tool.name = "modify_and_validate_npm_dependency"
+        combined_tool.invoke.return_value = "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.21 in package.json."
 
         with (
             patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
@@ -445,7 +403,7 @@ class TestUpdateSubagentWrapper:
             ),
             patch(
                 "remediation_engine.orchestration.update_subagent.build_update_toolbelt",
-                return_value=[tool_edit, tool_validate],
+                return_value=[combined_tool],
             ),
         ):
             result = run_update_subagent_node(state)
@@ -554,14 +512,14 @@ class TestUpdateSubagentWrapper:
         group2.vulnerable_component = "ws"
         tool_events = [
             ToolEvent(
-                name="modify_npm_dependency",
-                args={"package_name": "lodash", "target_version": "4.17.21"},
-                content="SUCCESS",
-            ),
-            ToolEvent(
-                name="validate_manifest_sync",
-                args={},
-                content="SUCCESS: Manifest synchronization succeeded for package.json.",
+                name="modify_and_validate_npm_dependency",
+                args={
+                    "package_name": "lodash",
+                    "target_version": "4.17.21",
+                    "dependency_type": "dependencies",
+                    "manifest_path": "package.json",
+                },
+                content="SUCCESS: Updated and synchronized lodash.",
             ),
         ]
         summaries = _build_action_summaries(
@@ -589,27 +547,24 @@ class TestUpdateSubagentWrapper:
 
         tool_events = [
             ToolEvent(
-                name="modify_npm_dependency",
+                name="modify_and_validate_npm_dependency",
                 args={
                     "package_name": "lodash",
                     "target_version": "4.17.21",
+                    "dependency_type": "dependencies",
                     "manifest_path": "package.json",
                 },
-                content="SUCCESS",
+                content="SUCCESS: Updated and synchronized lodash.",
             ),
             ToolEvent(
-                name="validate_manifest_sync",
-                args={},
-                content="SUCCESS: Manifest synchronization succeeded for package.json.",
-            ),
-            ToolEvent(
-                name="modify_npm_dependency",
+                name="modify_and_validate_npm_dependency",
                 args={
                     "package_name": "ws",
                     "target_version": "8.20.1",
+                    "dependency_type": "dependencies",
                     "manifest_path": "package.json",
                 },
-                content="SUCCESS",
+                content="ERROR_CODE: MANIFEST_SYNC_FAILED: rolled back ws.",
             ),
             ToolEvent(
                 name="revert_workspace_file",

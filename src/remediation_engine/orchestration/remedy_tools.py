@@ -812,256 +812,329 @@ def _make_revert_workspace_file_tool(
     return revert_workspace_file
 
 
-def _make_modify_npm_dependency_tool(
+def _tool_error(code: str, message: str) -> str:
+    """Return a stable machine-readable update-tool error."""
+    return f"ERROR_CODE: {code}: {message}"
+
+
+def _bounded_command_output(value: Any, limit: int = 4_000) -> str:
+    """Convert command output to a bounded diagnostic string."""
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... (truncated)"
+
+
+def _sync_package_manifests(
+    sandbox: DockerSandbox,
+    manifest_paths: Sequence[str],
+) -> tuple[bool, str]:
+    """Synchronize all manifests belonging to one package target."""
+    for manifest_path in manifest_paths:
+        workspace_dir = _workspace_dir_for_manifest(manifest_path)
+        cmd = f"cd {shlex.quote(workspace_dir)} && npm install --package-lock-only --ignore-scripts"
+        try:
+            result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            return False, _tool_error(
+                "MANIFEST_SYNC_FAILED",
+                f"Manifest sync failed for {manifest_path}: {exc}",
+            )
+        if result.exit_code != 0:
+            return False, _tool_error(
+                "MANIFEST_SYNC_FAILED",
+                (
+                    f"Manifest sync failed for {manifest_path} (exit {result.exit_code}). "
+                    f"stdout: {_bounded_command_output(result.stdout)}; "
+                    f"stderr: {_bounded_command_output(result.stderr)}"
+                ),
+            )
+    return True, ""
+
+
+def _make_modify_and_validate_npm_dependency_tool(
     sandbox: DockerSandbox,
     touched_files: set[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
-    attempted_versions_by_package: Mapping[str, set[str]] | None = None,
+    allowed_target_versions_by_package: Mapping[str, Iterable[str]] | None = None,
     override_required_packages: Iterable[str] | None = None,
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
-    require_planning_answers: bool = False,
-    planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
 ):
+    """Build the atomic update transaction tool.
+
+    The returned tool performs the manifest edit and synchronization in one
+    invocation. A failed edit or synchronization restores the package
+    checkpoint before returning an ``ERROR_CODE`` result.
+    """
     allowed_manifest_paths_by_package = {
         package_name: set(manifest_paths)
         for package_name, manifest_paths in _normalize_package_manifest_targets(
             package_manifest_paths
         ).items()
     }
+    if execution_state is None:
+        execution_state = {}
+    if package_checkpoints is None:
+        package_checkpoints = {}
     override_required_package_names = {
         package_name.strip()
         for package_name in (override_required_packages or [])
         if package_name and package_name.strip()
     }
     allowed_dependency_types = {
-        package_name.strip(): {value.strip() for value in dependency_types if value.strip()}
+        str(package_name).strip(): {
+            str(value).strip() for value in dependency_types if str(value).strip()
+        }
         for package_name, dependency_types in (allowed_dependency_types_by_package or {}).items()
-        if package_name.strip()
+        if str(package_name).strip()
     }
+    allowed_target_versions = {
+        str(package_name).strip(): {
+            str(version).strip().lstrip("vV") for version in versions if str(version).strip()
+        }
+        for package_name, versions in (allowed_target_versions_by_package or {}).items()
+        if str(package_name).strip()
+    }
+    supported_dependency_types = (
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+        "overrides",
+        "resolutions",
+        "pnpm_overrides",
+    )
+    override_types = {"overrides", "resolutions", "pnpm_overrides"}
+    safe_pattern = re.compile(r"^[a-zA-Z0-9.\-/@~^*]+$")
+
+    def record_attempt(package_name: str, signature: str) -> str | None:
+        """Track one package call and reject duplicate or exhausted attempts."""
+        attempts_by_package = execution_state.setdefault(
+            "manifest_transaction_attempts_by_package", {}
+        )
+        signatures_by_package = execution_state.setdefault(
+            "manifest_transaction_signatures_by_package", {}
+        )
+        attempts = int(attempts_by_package.get(package_name, 0))
+        signatures = set(signatures_by_package.get(package_name, []))
+        if signature in signatures:
+            return _tool_error(
+                "RETRY_PARAMETERS_UNCHANGED",
+                "Retry the package with a different allowed target_version or dependency_type.",
+            )
+        if attempts >= 3:
+            return _tool_error(
+                "RETRY_LIMIT_REACHED",
+                "At most three combined update attempts are allowed for this package.",
+            )
+        signatures.add(signature)
+        signatures_by_package[package_name] = sorted(signatures)
+        attempts_by_package[package_name] = attempts + 1
+        execution_state["manifest_transaction_attempts"] = (
+            int(execution_state.get("manifest_transaction_attempts", 0)) + 1
+        )
+        return None
 
     @tool
-    def modify_npm_dependency(
+    def modify_and_validate_npm_dependency(
         package_name: str,
         target_version: str,
         dependency_type: str,
         manifest_path: str = "package.json",
     ) -> str:
-        """
-        Modify a package.json dependency declaration or native package-manager
-        override field.
-        """
-        import re
+        """Atomically edit and synchronize one npm dependency transaction."""
+        package_key = str(package_name or "").strip()
+        version = str(target_version or "").strip()
+        dependency_key = str(dependency_type or "").strip()
 
-        safe_pattern = re.compile(r"^[a-zA-Z0-9.\-/@~^*]+$")
-        if not safe_pattern.match(package_name):
-            return (
-                f"ERROR: Invalid package_name '{package_name}'. Only alphanumeric "
-                "characters, dots, hyphens, slashes, and @ signs are allowed."
+        if not safe_pattern.fullmatch(package_key):
+            return _tool_error(
+                "INVALID_ARGUMENT",
+                f"Invalid package_name {package_key!r}; only safe npm package characters are allowed.",
             )
-        if not safe_pattern.match(target_version):
-            return (
-                f"ERROR: Invalid target_version '{target_version}'. Only "
-                "alphanumeric characters, dots, hyphens, slashes, @, ~, ^, and * "
-                "are allowed."
+        if not safe_pattern.fullmatch(version):
+            return _tool_error(
+                "INVALID_ARGUMENT",
+                f"Invalid target_version {version!r}; only safe npm version characters are allowed.",
             )
-        supported_dependency_types = (
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-            "overrides",
-            "resolutions",
-            "pnpm_overrides",
-        )
-        if dependency_type not in supported_dependency_types:
-            return (
-                "ERROR: dependency_type must be strictly one of: "
-                + ", ".join(repr(value) for value in supported_dependency_types)
-                + "."
+        if dependency_key not in supported_dependency_types:
+            return _tool_error(
+                "INVALID_ARGUMENT",
+                "dependency_type must be one of: " + ", ".join(supported_dependency_types) + ".",
             )
-        override_types = {"overrides", "resolutions", "pnpm_overrides"}
+
+        package_allowed_versions = allowed_target_versions.get(package_key)
+        normalized_version = version.lstrip("vV")
         if (
-            package_name in override_required_package_names
-            and dependency_type not in override_types
+            package_key in allowed_target_versions
+            and normalized_version not in package_allowed_versions
         ):
-            return (
-                f"ERROR: Package '{package_name}' is constrained to npm overrides/native "
-                "package-manager overrides for this task. Retry modify_npm_dependency with "
-                "dependency_type='overrides' (or use 'resolutions'/'pnpm_overrides'). "
-                "No manifest changes were made."
+            allowed = ", ".join(sorted(package_allowed_versions)) or "none"
+            return _tool_error(
+                "TARGET_NOT_ALLOWED",
+                f"target_version {version!r} is not in the Supervisor-approved candidates: {allowed}.",
             )
-        package_allowed_types = allowed_dependency_types.get(package_name)
-        if package_allowed_types and dependency_type not in package_allowed_types:
-            allowed = ", ".join(sorted(package_allowed_types))
-            return (
-                f"ERROR: Package '{package_name}' is committed to declaration type "
-                f"{allowed} for this strategy stage; dependency_type='{dependency_type}' "
-                "would violate target ownership. No manifest changes were made."
+
+        if package_key in override_required_package_names and dependency_key not in override_types:
+            return _tool_error(
+                "TARGET_NOT_ALLOWED",
+                f"Package {package_key!r} requires a native override dependency type.",
+            )
+        package_allowed_types = allowed_dependency_types.get(package_key)
+        if package_key in allowed_dependency_types and dependency_key not in package_allowed_types:
+            allowed = ", ".join(sorted(package_allowed_types)) or "none"
+            return _tool_error(
+                "TARGET_NOT_ALLOWED",
+                f"dependency_type {dependency_key!r} is not in the Supervisor-approved candidates: {allowed}.",
             )
 
         try:
             rel_manifest = _validate_workspace_path(manifest_path)
         except ValueError as exc:
-            return f"ERROR: {exc}"
-
+            return _tool_error("INVALID_ARGUMENT", str(exc))
         if Path(rel_manifest).name != "package.json":
-            return "ERROR: manifest_path must point to a package.json file."
-        allowed_manifest_paths = allowed_manifest_paths_by_package.get(package_name)
+            return _tool_error("INVALID_ARGUMENT", "manifest_path must point to package.json.")
+
+        allowed_manifest_paths = allowed_manifest_paths_by_package.get(package_key)
         if not allowed_manifest_paths:
             known_packages = ", ".join(sorted(allowed_manifest_paths_by_package))
-            return (
-                f"ERROR: package_name '{package_name}' is not an allowed target for "
-                f"this batch. Allowed package_name values: {known_packages}."
+            return _tool_error(
+                "TARGET_NOT_ALLOWED",
+                f"package_name {package_key!r} is not an allowed target; allowed packages: {known_packages}.",
             )
         if rel_manifest not in allowed_manifest_paths:
             allowed = ", ".join(sorted(allowed_manifest_paths))
-            return (
-                f"ERROR: manifest_path '{rel_manifest}' is not an allowed target for "
-                f"package '{package_name}'. Allowed manifest_path values: {allowed}."
-            )
-
-        if execution_state is not None:
-            pending_package = str(execution_state.get("pending_validation_package", "") or "")
-            if pending_package and pending_package != package_name:
-                return (
-                    f"ERROR: Package '{pending_package}' must be validated before editing "
-                    f"package '{package_name}'."
-                )
-
-        if package_checkpoints is not None and package_name not in package_checkpoints:
-            package_checkpoints[package_name] = _capture_package_checkpoint(
-                sandbox,
-                allowed_manifest_paths,
-                touched_files,
-            )
-
-        package_path = "pnpm.overrides" if dependency_type == "pnpm_overrides" else dependency_type
-        package_expr = f"{package_path}[{package_name}]={target_version}"
-        npm_cmd = shlex.join(["npm", "pkg", "set", package_expr])
-        workspace_dir = _workspace_dir_for_manifest(rel_manifest)
-        if workspace_dir == "/workspace":
-            cmd_str = npm_cmd
-        else:
-            cmd_str = f"cd {shlex.quote(workspace_dir)} && {npm_cmd}"
-
-        logger.info("remedy_tools: modifying npm dependency in sandbox: %s", cmd_str)
-        result = sandbox.run(cmd_str)
-        if result.exit_code == 0:
-            touched_files.add(rel_manifest)
-            if execution_state is not None:
-                execution_state["edits_started"] = True
-                execution_state["pending_validation_package"] = package_name
-            return (
-                "SUCCESS: Natively updated "
-                f"{dependency_type}.{package_name} to {target_version} in {rel_manifest}."
-            )
-        return (
-            f"FAILURE: Failed to modify npm dependency in {rel_manifest} "
-            f"(exit {result.exit_code}).\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-
-    return modify_npm_dependency
-
-
-def _make_validate_manifest_sync_tool(
-    sandbox: DockerSandbox,
-    package_manifest_paths: Mapping[str, Iterable[str]],
-    touched_files: set[str],
-    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
-    execution_state: dict[str, Any] | None = None,
-):
-    normalized_package_manifest_paths = _normalize_package_manifest_targets(package_manifest_paths)
-
-    @tool
-    def validate_manifest_sync(package_name: str) -> str:
-        """
-        Validate one package's target manifests without scripts.
-
-        Each package must be validated separately so a failed package can be
-        rolled back without discarding earlier successful updates in the batch.
-        """
-        package_key = (package_name or "").strip()
-        if not package_key:
-            return "ERROR: package_name is required for per-package manifest validation."
-
-        manifest_paths = normalized_package_manifest_paths.get(package_key)
-        if not manifest_paths:
-            known_packages = ", ".join(sorted(normalized_package_manifest_paths))
-            return (
-                f"ERROR: package_name '{package_key}' is not an allowed validation target. "
-                f"Allowed package_name values: {known_packages}."
+            return _tool_error(
+                "TARGET_NOT_ALLOWED",
+                f"manifest_path {rel_manifest!r} is not allowed for {package_key!r}; allowed paths: {allowed}.",
             )
 
         if execution_state is not None:
             pending_package = str(execution_state.get("pending_validation_package", "") or "")
             if pending_package and pending_package != package_key:
-                return (
-                    f"ERROR: Validate package '{pending_package}' before validating "
-                    f"package '{package_key}'."
+                return _tool_error(
+                    "TARGET_NOT_ALLOWED",
+                    f"Package {pending_package!r} has an unfinished update transaction.",
                 )
-            calls = int(execution_state.get("validation_calls", 0))
-            if not execution_state.get("edits_started", False):
-                return "ERROR: validate_manifest_sync is only allowed after manifest edits."
-            execution_state["validation_calls"] = calls + 1
 
-        checkpoint = package_checkpoints.get(package_key) if package_checkpoints else None
-        if execution_state is not None and package_checkpoints is not None and checkpoint is None:
-            return f"ERROR: Package '{package_key}' must be modified before it can be validated."
+        # Count only a fully validated transaction candidate. Invalid input
+        # and disallowed targets must not consume the package's retry budget or
+        # leave retry bookkeeping behind.
+        signature = "|".join((package_key, normalized_version, dependency_key, rel_manifest))
+        attempt_error = record_attempt(package_key, signature)
+        if attempt_error:
+            return attempt_error
 
-        for manifest_path in manifest_paths:
-            workspace_dir = _workspace_dir_for_manifest(manifest_path)
-            cmd = (
-                f"cd {shlex.quote(workspace_dir)} && "
-                "npm install --package-lock-only --ignore-scripts"
+        checkpoint = None
+        try:
+            if package_checkpoints is not None and package_key not in package_checkpoints:
+                package_checkpoints[package_key] = _capture_package_checkpoint(
+                    sandbox,
+                    allowed_manifest_paths,
+                    touched_files,
+                )
+            checkpoint = package_checkpoints.get(package_key) if package_checkpoints else None
+
+            package_path = (
+                "pnpm.overrides" if dependency_key == "pnpm_overrides" else dependency_key
             )
-            result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
-            if result.exit_code != 0:
-                failure = (
-                    f"FAILURE: Manifest sync failed for {manifest_path} "
-                    f"(exit {result.exit_code}).\n"
-                    f"stdout:\n{result.stdout}\n"
-                    f"stderr:\n{result.stderr}"
+            package_expr = f"{package_path}[{package_key}]={version}"
+            npm_cmd = shlex.join(["npm", "pkg", "set", package_expr])
+            workspace_dir = _workspace_dir_for_manifest(rel_manifest)
+            cmd_str = (
+                npm_cmd
+                if workspace_dir == "/workspace"
+                else (f"cd {shlex.quote(workspace_dir)} && {npm_cmd}")
+            )
+
+            logger.info("remedy_tools: modifying npm dependency in sandbox: %s", cmd_str)
+            edit_result = sandbox.run(cmd_str)
+            if edit_result.exit_code != 0:
+                failure = _tool_error(
+                    "EDIT_FAILED",
+                    (
+                        f"Failed to modify npm dependency in {rel_manifest} (exit {edit_result.exit_code}). "
+                        f"stdout: {_bounded_command_output(edit_result.stdout)}; "
+                        f"stderr: {_bounded_command_output(edit_result.stderr)}"
+                    ),
                 )
                 rollback_error = (
                     _restore_package_checkpoint(sandbox, checkpoint, touched_files)
                     if checkpoint is not None
                     else None
                 )
-                if execution_state is not None:
-                    execution_state["pending_validation_package"] = None
                 if package_checkpoints is not None:
                     package_checkpoints.pop(package_key, None)
-                if rollback_error:
-                    return f"{failure}\n{rollback_error}"
-                return (
-                    f"{failure}\nRolled back package '{package_key}' to its pre-update checkpoint."
+                if execution_state is not None:
+                    execution_state["pending_validation_package"] = None
+                return f"{failure} {rollback_error}" if rollback_error else failure
+
+            touched_files.add(rel_manifest)
+            if execution_state is not None:
+                execution_state["edits_started"] = True
+                execution_state["pending_validation_package"] = package_key
+                execution_state["validation_calls"] = (
+                    int(execution_state.get("validation_calls", 0)) + 1
                 )
 
-        if checkpoint is not None:
-            for path, before in checkpoint.files.items():
-                after = sandbox.read_file(path)
-                if after != before:
-                    touched_files.add(path)
+            manifest_sync_succeeded, sync_error = _sync_package_manifests(
+                sandbox,
+                sorted(allowed_manifest_paths),
+            )
+            if not manifest_sync_succeeded:
+                rollback_error = (
+                    _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+                    if checkpoint is not None
+                    else None
+                )
+                if package_checkpoints is not None:
+                    package_checkpoints.pop(package_key, None)
+                if execution_state is not None:
+                    execution_state["pending_validation_package"] = None
+                rollback_note = (
+                    f" Rollback: {rollback_error}"
+                    if rollback_error
+                    else " Rollback: package checkpoint restored."
+                )
+                return f"{sync_error}{rollback_note}"
+
+            if checkpoint is not None:
+                for path, before in checkpoint.files.items():
+                    after_value = sandbox.read_file(path)
+                    after = after_value if isinstance(after_value, str) else None
+                    if after != before:
+                        touched_files.add(path)
+                if package_checkpoints is not None:
+                    package_checkpoints.pop(package_key, None)
+
+            if execution_state is not None:
+                execution_state["pending_validation_package"] = None
+                validated_packages = list(execution_state.get("validated_packages", []) or [])
+                if package_key not in validated_packages:
+                    validated_packages.append(package_key)
+                execution_state["validated_packages"] = validated_packages
+
+            return (
+                "SUCCESS: Natively updated and synchronized "
+                f"{dependency_key}.{package_key} to {version} in {rel_manifest}; "
+                f"validated manifests: {', '.join(sorted(allowed_manifest_paths))}."
+            )
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = (
+                _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+                if checkpoint is not None
+                else None
+            )
             if package_checkpoints is not None:
                 package_checkpoints.pop(package_key, None)
+            if execution_state is not None:
+                execution_state["pending_validation_package"] = None
+            rollback_note = f" Rollback: {rollback_error}" if rollback_error else ""
+            return f"{_tool_error('EDIT_FAILED', str(exc))}{rollback_note}"
 
-        if execution_state is not None:
-            execution_state["pending_validation_package"] = None
-            validated_packages = list(execution_state.get("validated_packages", []) or [])
-            if package_key not in validated_packages:
-                validated_packages.append(package_key)
-            execution_state["validated_packages"] = validated_packages
-
-        return (
-            f"SUCCESS: Manifest synchronization succeeded for package '{package_key}' "
-            f"in {', '.join(manifest_paths)}."
-        )
-
-    return validate_manifest_sync
+    return modify_and_validate_npm_dependency
 
 
 def _is_prohibited_target(rel_path: str) -> bool:
@@ -3109,15 +3182,11 @@ def _make_validate_workaround_tool(
 def build_update_toolbelt(
     sandbox: DockerSandbox,
     touched_files: set[str],
-    host_repo_root: Path,
     target_manifest_paths: Iterable[str],
     package_manifest_paths: Mapping[str, Iterable[str]],
-    enable_registry_lookup: bool = False,
-    attempted_versions_by_package: Mapping[str, set[str]] | None = None,
+    allowed_target_versions_by_package: Mapping[str, Iterable[str]] | None = None,
     override_required_packages: Iterable[str] | None = None,
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
-    require_planning_answers: bool = False,
-    planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
 ) -> list:
@@ -3127,26 +3196,15 @@ def build_update_toolbelt(
     if package_checkpoints is None:
         package_checkpoints = {}
     toolbelt = [
-        _make_read_repository_map_tool(sandbox),
-        _make_modify_npm_dependency_tool(
+        _make_modify_and_validate_npm_dependency_tool(
             sandbox,
             touched_files,
             normalized_package_manifest_paths,
-            attempted_versions_by_package=attempted_versions_by_package,
+            allowed_target_versions_by_package=allowed_target_versions_by_package,
             override_required_packages=override_required_packages,
             allowed_dependency_types_by_package=allowed_dependency_types_by_package,
-            require_planning_answers=require_planning_answers,
-            planning_state=planning_state,
             execution_state=execution_state,
             package_checkpoints=package_checkpoints,
-        ),
-        _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_manifest_sync_tool(
-            sandbox,
-            normalized_package_manifest_paths,
-            touched_files,
-            package_checkpoints=package_checkpoints,
-            execution_state=execution_state,
         ),
     ]
     return toolbelt

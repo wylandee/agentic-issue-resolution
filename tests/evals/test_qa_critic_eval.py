@@ -60,6 +60,7 @@ _AUTHORIZED_QA_TOOLS = frozenset(
 
 _MUTATING_WORKER_TOOLS = frozenset(
     {
+        "modify_and_validate_npm_dependency",
         "modify_npm_dependency",
         "validate_manifest_sync",
         "deterministic_apply_edit_set",

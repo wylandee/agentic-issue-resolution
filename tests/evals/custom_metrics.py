@@ -276,9 +276,9 @@ class ArchitectureBoundaryMetric(BaseMetric):
     Core Invariant:
       - The Update Worker is strictly an execution worker. It must NOT select versions
         or query external registries/web during first-pass executions.
-      - Version discovery tools (search_web, read_web_page) are prohibited for update workers.
-      - view_npm_package_versions is allowed ONLY during retry mode (`is_retry=True`).
-      - Workaround workers must NOT call update-only manifest modification tools (modify_npm_dependency).
+      - Version discovery tools (search_web, read_web_page, view_npm_package_versions) are prohibited for update workers.
+      - Update manifest mutations use only modify_and_validate_npm_dependency.
+      - Workaround workers must NOT call update-only manifest modification tools.
     """
 
     def __init__(
@@ -303,7 +303,6 @@ class ArchitectureBoundaryMetric(BaseMetric):
         """Measure architectural boundary compliance for the test case."""
         meta = getattr(test_case, "additional_metadata", {}) or {}
         eval_type = meta.get("eval_type", "update_subagent")
-        is_retry = bool(meta.get("is_retry", False))
 
         tools_called = getattr(test_case, "tools_called", []) or []
         tool_names_and_args: list[tuple[str, dict[str, Any]]] = []
@@ -326,10 +325,19 @@ class ArchitectureBoundaryMetric(BaseMetric):
                     violations.append(
                         f"Update worker illegally invoked research tool '{name}' (version hunting prohibited)."
                     )
-                elif name == "view_npm_package_versions" and not is_retry:
+                elif name == "view_npm_package_versions":
                     violations.append(
-                        "Update worker called 'view_npm_package_versions' during first-pass execution "
-                        "(only permitted in retry mode)."
+                        "Update worker called prohibited registry tool 'view_npm_package_versions'."
+                    )
+                elif name in (
+                    "modify_npm_dependency",
+                    "validate_manifest_sync",
+                    "read_repository_map",
+                    "revert_workspace_file",
+                ):
+                    violations.append(
+                        f"Update worker called obsolete or unsafe update tool '{name}'; "
+                        "use the combined transaction tool."
                     )
                 elif name == "run_sandbox_command":
                     cmd = str(params.get("command", "") or params.get("cmd", "")).lower()
@@ -348,10 +356,8 @@ class ArchitectureBoundaryMetric(BaseMetric):
 
         elif eval_type == "workaround_subagent":
             for name, _params in tool_names_and_args:
-                if name == "modify_npm_dependency":
-                    violations.append(
-                        "Workaround worker called update-only tool 'modify_npm_dependency'."
-                    )
+                if name in {"modify_npm_dependency", "modify_and_validate_npm_dependency"}:
+                    violations.append(f"Workaround worker called update-only tool '{name}'.")
 
         if violations:
             self.score = 0.0
@@ -616,7 +622,7 @@ class DeterministicTaskCompletionMetric(BaseMetric):
 
     Checks:
       1. changed_files contains the target manifest/source file.
-      2. validate_manifest_sync or validate_workaround succeeded.
+      2. The combined manifest transaction or validate_workaround succeeded.
       3. action_status is APPLIED (fails if SURRENDER or FAILED).
     """
 

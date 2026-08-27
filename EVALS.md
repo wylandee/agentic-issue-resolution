@@ -215,24 +215,31 @@ Each case documents its provenance (source fixture, synthetic rationale, or exte
 #### [NEW] `tests/evals/test_update_subagent_eval.py`
 
 Metrics applied:
-- **`ToolCorrectnessMetric(threshold=0.9)`** — Verifies correct tool sequence (`modify_npm_dependency` → `validate_manifest_sync`)
+- **`ToolCorrectnessMetric(threshold=0.9)`** — Verifies the combined manifest transaction (`modify_and_validate_npm_dependency`) and its ordered edit/synchronization behavior
 - **`TaskCompletionMetric(threshold=0.7)`** — Did the worker produce a valid patch matching the supervisor instruction?
 - **Custom `ArchitectureBoundaryMetric(BaseMetric)`** — Negative assertion: worker must NOT have called tools that select versions (no `search_web` for version hunting, no `run_sandbox_command npm view` to pick versions). Only the Supervisor owns version selection.
 - **Custom `ToolEfficiencyMetric(BaseMetric)`** — Penalizes: (a) reading the same file >2 times, (b) >3 failed tool calls before success, (c) total tool rounds > `MAX_SUBAGENT_TOOL_CALL_ROUNDS / 2`
+
+The update prompt includes the deterministic repository map as read-only
+context. Error-coded transaction results are represented in retry cases as
+changed, Supervisor-approved version or dependency-type calls, with a maximum
+of three attempts per package. Historical trajectory adapters may still parse
+the former update tool names; active update metrics reject them. Workaround
+cases retain their repository-map and revert events.
 
 Test structure:
 ```python
 @pytest.mark.eval
 class TestUpdateSubagentEval:
     def test_tool_sequence_correctness(self, update_trajectory_cases):
-        """Update worker calls modify_npm_dependency then validate_manifest_sync."""
-    
+        """Update worker uses the combined edit-and-synchronize transaction."""
+
     def test_no_version_selection_boundary_violation(self, update_trajectory_cases):
         """Worker does not attempt to discover or select dependency versions."""
-    
+
     def test_tool_call_efficiency(self, update_trajectory_cases):
         """Worker completes task within reasonable tool call budget."""
-    
+
     def test_task_completion(self, update_trajectory_cases):
         """Worker produces a valid patch matching the supervisor instruction."""
 ```

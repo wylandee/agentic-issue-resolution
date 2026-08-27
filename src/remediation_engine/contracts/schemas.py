@@ -1631,8 +1631,10 @@ class TaskAttemptSnapshot(BaseModel):
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
+    allowed_target_versions: list[str] = Field(default_factory=list)
     target_package_name: str | None = None
     target_dependency_type: str | None = None
+    allowed_dependency_types: list[str] = Field(default_factory=list)
     parent_minimum_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
@@ -1660,7 +1662,11 @@ class UpdateRetryDiagnostics(BaseModel):
     executed_versions: list[str] = Field(default_factory=list)
     attempted_versions_by_target: dict[str, list[str]] = Field(default_factory=dict)
     candidate_versions_considered: list[str] = Field(default_factory=list)
+    attempted_dependency_types: list[str] = Field(default_factory=list)
+    candidate_dependency_types: list[str] = Field(default_factory=list)
     selected_version: str | None = None
+    effective_target_version: str | None = None
+    effective_dependency_type: str | None = None
     latest_version_seen: str | None = None
     used_overrides: bool = False
     package_abandoned: bool = False
@@ -1686,6 +1692,29 @@ class UpdateRetryDiagnostics(BaseModel):
         for item in value:
             if not isinstance(item, str):
                 raise ValueError("version lists must contain only strings.")
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+        return cleaned
+
+    @field_validator(
+        "attempted_dependency_types",
+        "candidate_dependency_types",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_dependency_type_lists(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("dependency type lists must be lists of strings.")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("dependency type lists must contain only strings.")
             normalized = item.strip()
             if not normalized or normalized in seen:
                 continue
@@ -1719,7 +1748,12 @@ class UpdateRetryDiagnostics(BaseModel):
             normalized[package_name] = cleaned
         return normalized
 
-    @field_validator("selected_version", "latest_version_seen", mode="before")
+    @field_validator(
+        "selected_version",
+        "effective_target_version",
+        "latest_version_seen",
+        mode="before",
+    )
     @classmethod
     def _normalize_optional_version(cls, value: Any) -> str | None:
         if value is None:
@@ -1746,6 +1780,9 @@ class WorkerExecutionDiagnostics(BaseModel):
 
     attempted_versions: list[str] = Field(default_factory=list)
     executed_versions: list[str] = Field(default_factory=list)
+    effective_target_version: str | None = None
+    effective_dependency_type: str | None = None
+    manifest_transaction_attempts: int = Field(default=0, ge=0)
     validation_calls: int = Field(default=0, ge=0)
     validation_input_errors: int = Field(
         default=0,
@@ -1973,6 +2010,7 @@ class SupervisorRetryPlan(BaseModel):
     parent_minimum_version: str | None = None
     attempted_versions: list[str] = Field(default_factory=list)
     candidate_versions_considered: list[str] = Field(default_factory=list)
+    candidate_dependency_types: list[str] = Field(default_factory=list)
     latest_version_seen: str | None = None
     exhausted_update_path: bool = False
     package_abandoned: bool = False
@@ -1996,6 +2034,24 @@ class SupervisorRetryPlan(BaseModel):
             if not isinstance(item, str):
                 raise ValueError("planner version lists must contain only strings.")
             normalized = item.strip().lstrip("vV")
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
+    @field_validator("candidate_dependency_types", mode="before")
+    @classmethod
+    def _normalize_plan_dependency_types(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("planner dependency type candidates must be a list of strings.")
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("planner dependency type candidates must contain only strings.")
+            normalized = item.strip()
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 result.append(normalized)

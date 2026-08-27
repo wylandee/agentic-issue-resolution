@@ -7,8 +7,7 @@ retains batch-capable helpers for direct callers and future explicit batch mode.
 from __future__ import annotations
 
 import logging
-import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     RemediationTask,
+    RoutingStrategy,
     SCARemediationStage,
     TaskStatus,
     UpdateRetryDiagnostics,
@@ -36,19 +36,18 @@ from remediation_engine.orchestration.subagent_runtime import run_bounded_subage
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
+    is_transitive_group,
 )
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
     resolve_repository_path,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.repository_map import build_repository_map
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "gpt-4o-mini"
-_REGISTRY_VERSION_LINE_RE = re.compile(r"^\s+(\d+\.[0-9A-Za-z.+-]+)")
-_REGISTRY_MAJOR_LINE_RE = re.compile(r"^\s+v\d+\.x\s+â†’\s+([^\s]+)")
-_REGISTRY_LATEST_TAG_RE = re.compile(r"^\s*latest:\s*([^\s]+)")
+_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -132,14 +131,6 @@ def _resolve_manifest_targets(
     return resolved_paths, errors
 
 
-def _format_manifest_paths(manifest_paths: Sequence[str]) -> str:
-    if not manifest_paths:
-        return "none"
-    if len(manifest_paths) == 1:
-        return manifest_paths[0]
-    return "\n".join(f"- {path}" for path in manifest_paths)
-
-
 def _build_package_manifest_map(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
 ) -> dict[str, list[str]]:
@@ -199,7 +190,18 @@ def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) ->
         for localized in group.localized_issues:
             if localized.parent_declaration_type:
                 return localized.parent_declaration_type
-    return "overrides" if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE else None
+        for localized in group.localized_issues:
+            if localized.declaration_type:
+                return localized.declaration_type
+    if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        return "overrides"
+    # Direct dependency localization normally supplies declaration_type. Keep
+    # legacy group-based callers executable when that optional enrichment is
+    # absent, while leaving transitive targets fail-closed until their parent
+    # declaration policy is committed.
+    if task.strategy == RoutingStrategy.VERSION_BUMP and not is_transitive_group(group):
+        return "dependencies"
+    return None
 
 
 def _is_retry_task(task: RemediationTask) -> bool:
@@ -225,683 +227,28 @@ def _is_mixed_retry_batch(
     return saw_retry and saw_first_pass
 
 
-def _legacy_build_update_prompt(
-    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-    constraints_ledger: Sequence[str],
-    feedback_by_task: dict[str, str],
-    previous_action_summaries_by_task: dict[str, str],
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
-) -> str:
-    retry_diagnostics_by_task = dict(retry_diagnostics_by_task or {})
-    retry_batch = _is_retry_batch(resolved_tasks)
-    constraints_text = (
-        "\n".join(f"- {item}" for item in constraints_ledger) if constraints_ledger else "- none"
+def _has_successful_manifest_transaction_for_package(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    tool_events: Sequence[Any] | None,
+) -> bool:
+    """Return whether the package has a successful edit-and-sync transaction."""
+    if not tool_events:
+        return False
+    package_name = _target_package_name(task, group)
+    return any(
+        getattr(event, "name", "") == _UPDATE_MANIFEST_TOOL_NAME
+        and str((getattr(event, "args", {}) or {}).get("package_name", "")).strip() == package_name
+        and str(getattr(event, "content", "")).startswith("SUCCESS:")
+        for event in tool_events
     )
-    sections = [
-        "\n".join(
-            [
-                "You are a dependency-resolution specialist operating inside a shared Docker workspace.",
-                "You may only modify package manifests through modify_npm_dependency.",
-                "You must inspect the repository map before making manifest changes.",
-                "Emit at most one modify_npm_dependency or validate_manifest_sync tool call per assistant turn; tool calls in one message cannot observe each other's results.",
-                "After completing the exact manifest edits for each package, call validate_manifest_sync for that package before editing the next package.",
-                "If validate_manifest_sync fails, you must resolve the peer conflict or invalid manifest state before finishing.",
-                "Every modify_npm_dependency call must include the exact manifest_path you intend to edit.",
-                "If the vulnerable component appears in multiple manifest paths, call modify_npm_dependency once for each manifest_path that declares it.",
-                "Never downgrade a package that is constrained by the constraints ledger.",
-                "Use revert_workspace_file if you reach a structurally bad manifest state. For package.json files, specify the package_name parameter to revert only that specific dependency.",
-                "Do not search the codebase and do not edit source code files.",
-                "For each target below, the Task Instruction is the authoritative directive.",
-            ]
-        )
-    ]
-
-    if retry_batch:
-        sections.append(
-            "\n".join(
-                [
-                    "You are an autonomous Dependency Resolution Specialist.",
-                    "",
-                    "Your previous attempt to mitigate vulnerabilities in this package FAILED during the QA Evaluation phase.",
-                    'You are now in the "Smart Planning & Rescue" phase.',
-                    "",
-                    "For each target below, the Task Instruction remains authoritative.",
-                ]
-            )
-        )
-        sections.append(
-            "\n".join(
-                [
-                    "## Standard Operating Procedure (SOP)",
-                    "You must act autonomously to find a working solution. Follow these steps strictly:",
-                    "",
-                    "1. **Reconnaissance:** You MUST use the `view_npm_package_versions` tool on the target component to see the actual, historical versions published to the NPM registry. Do NOT hallucinate version numbers.",
-                    "2. **Analysis & Selection:** Evaluate the registry versions against the QA feedback and prior retry diagnostics.",
-                    "   - **LATEST-FIRST RULE:** After viewing the NPM registry, you MUST attempt the LATEST version found on the npm registry (`latest` dist-tag or newest published version) instead of selecting the next newest version from the attempted version.",
-                    "   - *If PEER_CONFLICT (ERESOLVE):* Only if the latest version was already attempted and caused a peer conflict should you select an untried compatible backported security patch or lower compatible version.",
-                    "   - *If SECURITY_FLAG:* Attempt the latest version from the registry unless it was already attempted.",
-                    "   - **CRITICAL CEILING CHECK:** If the registry shows you are ALREADY on the absolute latest version and that version was already attempted, do NOT re-apply it. Re-applying the same version will fail QA again.",
-                    "3. **Execution:** Use `modify_npm_dependency` to apply the selected version or override. For transitive dependencies, NPM `overrides` or `resolutions` in the root `package.json` may be required.",
-                    "4. **Validation:** After completing all required manifest edits for one package, you MUST call `validate_manifest_sync` with that package's exact package_name before moving to the next package.",
-                    "5. **Iteration:** If `validate_manifest_sync` fails with an NPM error, do not surrender immediately. Review the error, select a different candidate from the registry, and try again.",
-                    "6. **Clean Room Surrender & Exhaustion:**",
-                    "   - In a multi-target batch, if one package cannot be resolved due to a peer conflict, you MUST call `revert_workspace_file(file_path, package_name='failing_package')` ONLY for that specific failing package. Preserve and validate the manifest updates for all other successful packages in the batch.",
-                    "   - If the latest version on the NPM registry was already attempted and still failed QA due to an unresolved vulnerability (`SECURITY_FLAG`), do NOT re-attempt it or try older versions. Immediately perform a Clean Room Surrender for that package and explicitly state 'update path is exhausted' in your Reasoning Summary.",
-                    "",
-                    "Do not edit source code files. Your domain is strictly package manifests. Return control to the Supervisor only when every package has a successful per-package `validate_manifest_sync` result, or you have executed a Clean Room Surrender.",
-                ]
-            )
-        )
-        sections.append(
-            "\n".join(
-                [
-                    "## Shared Planning Questions (for reference)",
-                    "1. What version or override path did the last fix attempt use?",
-                    "2. What attempted_versions are already recorded for this task?",
-                    "3. What is the latest version currently available according to npm?",
-                    "4. Which candidate versions from npm have not been attempted yet?",
-                    "5. Is the vulnerable package a direct dependency or does it need npm overrides?",
-                    "6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target?",
-                    "7. Does the constraints ledger forbid any downgrade or conflicting change?",
-                    "8. What version should be attempted next? (You MUST prioritize attempting the latest version found on the npm registry rather than stepping incrementally from the attempted version)",
-                    "9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward?",
-                    "10. If the latest available version on the NPM registry was already attempted (unless resolving a peer conflict), the update path is exhausted. Explicitly state 'update path is exhausted' in your Reasoning Summary.",
-                ]
-            )
-        )
-    else:
-        sections.append(
-            "\n".join(
-                [
-                    "First-pass mode:",
-                    "- This is an initial execution batch.",
-                    "- Execute the Task Instruction exactly as written.",
-                    "- Do not use view_npm_package_versions or invent alternate versions.",
-                    "- If the exact requested manifest remediation cannot validate, revert and surrender.",
-                ]
-            )
-        )
-
-    sections.append("Constraints ledger:\n" + constraints_text)
-
-    for task, group, manifest_paths in resolved_tasks:
-        feedback = feedback_by_task.get(task.task_id, "none")
-        previous_outcome = previous_action_summaries_by_task.get(task.task_id, "none")
-        diagnostics = retry_diagnostics_by_task.get(task.task_id)
-        diagnostics_text = "none"
-        if diagnostics is not None:
-            attempted = ", ".join(diagnostics.attempted_versions) or "none"
-            candidates = ", ".join(diagnostics.candidate_versions_considered[:8]) or "none"
-            latest_seen = diagnostics.latest_version_seen or "unknown"
-            diagnostics_text = (
-                f"attempted={attempted}; candidates={candidates}; "
-                f"latest_seen={latest_seen}; exhausted={diagnostics.exhausted_update_path}"
-            )
-        if retry_batch:
-            attempted_set = set(diagnostics.attempted_versions) if diagnostics else set()
-            latest_seen = diagnostics.latest_version_seen if diagnostics else None
-            candidate_choices = [
-                version
-                for version in (diagnostics.candidate_versions_considered if diagnostics else [])
-                if version not in attempted_set
-            ]
-            if latest_seen and latest_seen in attempted_set:
-                next_version_hint = (
-                    f"NONE (latest version '{latest_seen}' already attempted â€” surrender required)"
-                    if not candidate_choices
-                    else candidate_choices[0]
-                )
-            elif latest_seen:
-                next_version_hint = latest_seen
-            elif candidate_choices:
-                next_version_hint = candidate_choices[0]
-            else:
-                next_version_hint = "see registry candidates"
-
-            retry_answers = [
-                "1. What version or override path did the last fix attempt use?",
-                f"2. What attempted_versions are already recorded for this task? {diagnostics.attempted_versions if diagnostics else 'none'}",
-                f"3. What is the latest version currently available according to npm? {diagnostics.latest_version_seen if diagnostics and diagnostics.latest_version_seen else 'unknown'}",
-                f"4. Which candidate versions from npm have not been attempted yet? {', '.join(candidate_choices) or 'none'}",
-                f"5. Is the vulnerable package a direct dependency or does it need npm overrides? {'npm overrides' if diagnostics and diagnostics.used_overrides else 'direct dependency version bump'}",
-                f"6. Do the prior QA feedback and previous worker outcome suggest a peer conflict, stale version, or wrong manifest target? {feedback if feedback != 'none' else previous_outcome}",
-                f"7. Does the constraints ledger forbid any downgrade or conflicting change? {'yes' if constraints_ledger else 'no blocking constraints recorded'}",
-                f"8. What version should be attempted next? (You MUST prioritize attempting the latest version found on the npm registry rather than stepping incrementally from the attempted version) {next_version_hint}",
-                f"9. Was the previous manifest update structurally validated, and if so, did QA or scanner findings still remain afterward? {previous_outcome}",
-                "10. If the latest available version was already attempted and no untried candidates remain, the update path is exhausted.",
-            ]
-            sections.append(
-                "\n".join(
-                    [
-                        "## Task Context",
-                        f"- Task ID: {task.task_id}",
-                        f"- Component: {group.vulnerable_component or 'unknown'}",
-                        f"- Manifest Path: {_format_manifest_paths(manifest_paths)}",
-                        f"- Supervisor's Revised Instruction: {task.instruction or 'Derive the safest manifest update.'}",
-                        "",
-                        "## Why The Previous Attempt Failed",
-                        f"- QA Feedback: {feedback}",
-                        f"- Previous Worker Outcome: {previous_outcome}",
-                        "",
-                        "## Prior Retry Diagnostics",
-                        diagnostics_text,
-                        "",
-                        f"## Planning Answers (for Task {task.task_id})",
-                        "Provide a short visible answer for each planning question before you make any manifest edit.",
-                        "\n".join(retry_answers),
-                    ]
-                )
-            )
-        else:
-            sections.append(
-                "\n".join(
-                    [
-                        "## Task Context",
-                        f"- Task ID: {task.task_id}",
-                        f"- Component: {group.vulnerable_component or 'unknown'}",
-                        f"- Manifest Path: {_format_manifest_paths(manifest_paths)}",
-                        f"- Supervisor's Revised Instruction: {task.instruction or 'Derive the safest manifest update.'}",
-                    ]
-                )
-            )
-
-    sections.append(
-        "\n".join(
-            [
-                "Completion rule:",
-                "Return control only after manifest synchronization succeeds and you have completed the required manifest updates.",
-            ]
-        )
-    )
-    return "\n\n".join(sections)
 
 
-def _was_package_reverted(
-    task: RemediationTask,
-    group: VulnerabilityGroup,
-    tool_events: Sequence[Any] | None,
-) -> bool:
-    if not tool_events:
-        return False
-    pkg = _target_package_name(task, group)
-    reverted = False
-    for event in tool_events:
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        content = getattr(event, "content", "")
-        if name == "modify_npm_dependency":
-            if args.get("package_name") == pkg and content.startswith("SUCCESS:"):
-                reverted = False
-        elif name == "revert_workspace_file" and content.startswith("SUCCESS:"):
-            revert_pkg = args.get("package_name")
-            if revert_pkg == pkg or not revert_pkg:
-                reverted = True
-    return reverted
-
-
-def _was_package_modified(
-    task: RemediationTask,
-    group: VulnerabilityGroup,
-    tool_events: Sequence[Any] | None,
-) -> bool:
-    if not tool_events:
-        return False
-    pkg = _target_package_name(task, group)
-    modified = False
-    for event in tool_events:
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        content = str(getattr(event, "content", ""))
-        if name == "modify_npm_dependency" and args.get("package_name") == pkg:
-            modified = content.startswith("SUCCESS:") or content == "SUCCESS"
-        elif name == "validate_manifest_sync" and args.get("package_name") == pkg:
-            if content.startswith("FAILURE:") or content.startswith("ERROR:"):
-                modified = False
-        elif name == "revert_workspace_file" and (
-            content.startswith("SUCCESS:") or content == "SUCCESS"
-        ):
-            revert_pkg = args.get("package_name")
-            if revert_pkg == pkg or not revert_pkg:
-                modified = False
-    return modified
-
-
-def _has_successful_validation_for_package(
-    task: RemediationTask,
-    group: VulnerabilityGroup,
-    tool_events: Sequence[Any] | None,
-) -> bool:
-    """Return whether a package's final manifest state was validated successfully."""
-    if not tool_events:
-        return False
-
-    pkg = _target_package_name(task, group)
-    last_successful_edit_index = -1
-
-    for index, event in enumerate(tool_events):
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        content = str(getattr(event, "content", ""))
-        if (
-            name == "modify_npm_dependency"
-            and args.get("package_name") == pkg
-            and (content.startswith("SUCCESS:") or content == "SUCCESS")
-        ):
-            last_successful_edit_index = index
-
-    if last_successful_edit_index < 0:
-        return False
-
-    for event in tool_events[last_successful_edit_index + 1 :]:
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        content = str(getattr(event, "content", ""))
-        if (
-            name == "validate_manifest_sync"
-            and (not args.get("package_name") or args.get("package_name") == pkg)
-            and (content.startswith("SUCCESS:") or content == "SUCCESS")
-        ):
-            return True
-
-    return False
-
-
-def _had_registry_lookup_before_package_edit(
-    task: RemediationTask,
-    group: VulnerabilityGroup,
-    tool_events: Sequence[Any] | None,
-) -> bool:
-    """Return whether retry-mode registry lookup happened before this package's first edit."""
-    if not tool_events:
-        return False
-
-    pkg = _target_package_name(task, group)
-    first_successful_edit_index = -1
-
-    for index, event in enumerate(tool_events):
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        content = str(getattr(event, "content", ""))
-        if (
-            name == "modify_npm_dependency"
-            and args.get("package_name") == pkg
-            and (content.startswith("SUCCESS:") or content == "SUCCESS")
-        ):
-            first_successful_edit_index = index
-            break
-
-    if first_successful_edit_index < 0:
-        return False
-
-    for event in tool_events[:first_successful_edit_index]:
-        name = getattr(event, "name", "")
-        args = getattr(event, "args", {}) or {}
-        if name == "view_npm_package_versions" and args.get("package_name") == pkg:
-            return True
-
-    return False
-
-
-def _legacy_build_action_summaries(
-    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-    changed_files: Sequence[str],
-    final_text: str,
-    succeeded: bool,
-    retry_batch: bool = False,
-    tool_events: Sequence[Any] | None = None,
-) -> list[AgentActionSummary]:
-    final_note = final_text.strip()
-    normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
-    include_final_note = bool(final_note) and len(resolved_tasks) == 1
-    summaries: list[AgentActionSummary] = []
-
-    for task, group, manifest_paths in resolved_tasks:
-        component = (group.vulnerable_component or "unknown component").strip()
-        manifest_label = ", ".join(manifest_paths) if manifest_paths else "no manifests"
-        relevant_changed_files = [
-            path for path in manifest_paths if path.replace("\\", "/") in normalized_changed_files
-        ]
-        pkg_reverted = _was_package_reverted(task, group, tool_events)
-        pkg_modified = (
-            _was_package_modified(task, group, tool_events)
-            if tool_events is not None
-            else (bool(relevant_changed_files) and not pkg_reverted)
-        )
-        pkg_validated = (
-            _has_successful_validation_for_package(task, group, tool_events)
-            if tool_events is not None
-            else succeeded
-        )
-        # Registry lookup and version selection are supervisor responsibilities.
-        # A retry is successful when the exact committed edit was applied and
-        # the final manifest validation passed; requiring a worker-side lookup
-        # here would make every retry fail despite the execution-only contract.
-        task_succeeded = pkg_modified and pkg_validated
-        summary_status = (
-            AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
-        )
-        outcome = (
-            "Completed validated manifest updates"
-            if task_succeeded
-            else "Stopped without a validated manifest update (reverted/surrendered)"
-        )
-
-        changed_label = ", ".join(
-            relevant_changed_files or (manifest_paths if pkg_modified else ["no files"])
-        )
-        summary_text = (
-            f"{outcome} for {component} in {manifest_label}; changed files: {changed_label}."
-        )
-        if include_final_note:
-            summary_text = f"{summary_text} Final note: {final_note}"
-        summaries.append(
-            AgentActionSummary(
-                task_id=task.task_id,
-                status=summary_status,
-                summary=summary_text,
-            )
-        )
-
-    return summaries
-
-
-def _build_surrender_summaries(task_ids: Sequence[str], message: str) -> list[AgentActionSummary]:
-    return [
-        AgentActionSummary(task_id=t_id, status=AgentActionStatus.SURRENDER, summary=message)
-        for t_id in task_ids
-    ]
-
-
-def _worker_result_map(
-    target_tasks: Sequence[RemediationTask],
-    snapshots: dict[str, Any],
-    summaries: Sequence[AgentActionSummary],
-    *,
-    succeeded: bool,
-    errors: Sequence[str] = (),
-    attempted_versions_by_task: dict[str, list[str]] | None = None,
-    executed_versions_by_task: dict[str, list[str]] | None = None,
-    validation_calls: int = 0,
-) -> dict[str, WorkerAttemptResult]:
-    """Build attempt-correlated worker envelopes without changing task state."""
-    summary_by_task = {summary.task_id: summary for summary in summaries}
-    results: dict[str, WorkerAttemptResult] = {}
-    attempted_versions_by_task = attempted_versions_by_task or {}
-    executed_versions_by_task = executed_versions_by_task or attempted_versions_by_task
-    for task in target_tasks:
-        snapshot = snapshots.get(task.task_id)
-        if snapshot is None:
-            continue
-        summary = summary_by_task.get(task.task_id)
-        attempted = list(attempted_versions_by_task.get(task.task_id, []))
-        executed = list(executed_versions_by_task.get(task.task_id, []))
-        results[snapshot.attempt_id] = WorkerAttemptResult(
-            attempt_id=snapshot.attempt_id,
-            task_id=task.task_id,
-            task_revision=snapshot.task_revision,
-            status=(
-                summary.status
-                if summary is not None
-                else AgentActionStatus.SUCCESS
-                if succeeded
-                else AgentActionStatus.SURRENDER
-            ),
-            executed_versions=executed,
-            action_summary=summary,
-            execution_diagnostics=WorkerExecutionDiagnostics(
-                attempted_versions=attempted,
-                executed_versions=executed,
-                validation_calls=validation_calls,
-                validation_passed=succeeded,
-                failure_reason=" | ".join(errors),
-            ),
-            instruction_digest=snapshot.instruction_digest,
-            errors=list(errors),
-        )
-    return results
-
-
-def _attempted_versions_for_current_run(
-    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-    tool_events: Sequence[Any],
-) -> dict[str, list[str]]:
-    """Collect version targets from this invocation only.
-
-    ``UpdateRetryDiagnostics`` is intentionally cumulative for compatibility,
-    but a ``WorkerAttemptResult`` must describe only the attempt that produced
-    it.  In particular, carrying the previous attempt's target here would make
-    the supervisor interpret a valid retry as having executed multiple versions.
-    Tool events include failed edit calls, so this also preserves attempted
-    targets when the edit itself did not succeed.
-    """
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
-
-    result: dict[str, list[str]] = {task.task_id: [] for task, _group, _paths in resolved_tasks}
-    for event in tool_events:
-        if getattr(event, "name", "") != "modify_npm_dependency":
-            continue
-        args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
-        if not package or not target:
-            continue
-        for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
-    return result
-
-
-def _executed_versions_for_current_run(
-    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-    tool_events: Sequence[Any],
-) -> dict[str, list[str]]:
-    """Collect only successful exact edit targets from this worker run."""
-    result: dict[str, list[str]] = {task.task_id: [] for task, _group, _paths in resolved_tasks}
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
-    for event in tool_events:
-        if getattr(event, "name", "") != "modify_npm_dependency":
-            continue
-        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
-            continue
-        args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
-        if not package or not target:
-            continue
-        for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
-    return result
-
-
-def _parse_registry_report_versions(report_text: str) -> tuple[Sequence[str], str | None]:
-    """Extract candidate versions and the dist-tag latest version from a registry report."""
-    candidates: list[str] = []
-    seen: set[str] = set()
-    latest_version: str | None = None
-
-    for raw_line in report_text.splitlines():
-        line = raw_line.rstrip()
-        latest_match = _REGISTRY_LATEST_TAG_RE.match(line)
-        if latest_match:
-            latest_version = latest_match.group(1).strip()
-            if latest_version and latest_version not in seen:
-                seen.add(latest_version)
-                candidates.append(latest_version)
-            continue
-
-        version_match = _REGISTRY_VERSION_LINE_RE.match(line)
-        if version_match:
-            version = version_match.group(1).strip()
-            if version and version not in seen:
-                seen.add(version)
-                candidates.append(version)
-            continue
-
-        major_match = _REGISTRY_MAJOR_LINE_RE.match(line)
-        if major_match:
-            version = major_match.group(1).strip()
-            if version and version not in seen:
-                seen.add(version)
-                candidates.append(version)
-
-    return candidates, latest_version
-
-
-def _merge_ordered_versions(existing: Sequence[str], new_values: Sequence[str]) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    for value in [*existing, *new_values]:
-        normalized = value.strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        merged.append(normalized)
-    return merged
-
-
-def _extract_reasoning_summary(final_text: str) -> str:
-    """Extract a concise visible reasoning summary from the agent final text."""
-    cleaned = (final_text or "").strip()
-    if not cleaned:
-        return ""
-
-    lowered = cleaned.lower()
-    for marker in ("reasoning summary", "reasoning", "planning summary"):
-        marker_index = lowered.find(marker)
-        if marker_index >= 0:
-            return cleaned[marker_index:].strip()
-    return cleaned
-
-
-def _legacy_build_retry_diagnostics(
-    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
-    tool_events: Sequence[Any],
-    final_text: str,
-    errors: Sequence[str],
-    succeeded: bool,
-    prior_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    constraints_ledger: Sequence[str],
-) -> dict[str, UpdateRetryDiagnostics]:
-    """Build per-task retry diagnostics from tool events and prior evidence."""
-    diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = {}
-    lowered_final_text = final_text.lower()
-    joined_errors = " | ".join(error.strip() for error in errors if error.strip())
-
-    for task, group, _manifest_paths in resolved_tasks:
-        package_name = (group.vulnerable_component or "").strip()
-        prior = prior_diagnostics_by_task.get(task.task_id)
-        attempted_versions = list(prior.attempted_versions) if prior else []
-        candidate_versions = list(prior.candidate_versions_considered) if prior else []
-        registry_query_performed = bool(prior.registry_query_performed) if prior else False
-        latest_version_seen = prior.latest_version_seen if prior else None
-        used_overrides = bool(prior.used_overrides) if prior else False
-        package_abandoned = bool(prior.package_abandoned) if prior else False
-
-        for event in tool_events:
-            event_package = str(event.args.get("package_name", "") or "").strip()
-            if event.name == "view_npm_package_versions" and event_package == package_name:
-                registry_query_performed = True
-                parsed_candidates, parsed_latest = _parse_registry_report_versions(event.content)
-                candidate_versions = _merge_ordered_versions(
-                    candidate_versions,
-                    parsed_candidates,
-                )
-                if parsed_latest:
-                    latest_version_seen = parsed_latest
-                if event.content.startswith("PACKAGE NOT FOUND:"):
-                    package_abandoned = True
-
-            if event.name == "modify_npm_dependency" and event_package == package_name:
-                target_version = str(event.args.get("target_version", "") or "").strip()
-                if target_version:
-                    attempted_versions = _merge_ordered_versions(
-                        attempted_versions,
-                        [target_version],
-                    )
-                if str(event.args.get("dependency_type", "") or "").strip() == "overrides":
-                    used_overrides = True
-
-        if "package abandoned" in lowered_final_text:
-            package_abandoned = True
-
-        selected_version = None
-        if succeeded and attempted_versions:
-            selected_version = attempted_versions[-1]
-        elif prior and prior.selected_version:
-            selected_version = prior.selected_version
-
-        attempted_set = set(attempted_versions)
-        is_peer_conflict = "peer" in (joined_errors + " " + lowered_final_text) or "eresolve" in (
-            joined_errors + " " + lowered_final_text
-        )
-        reasoning_summary = _extract_reasoning_summary(final_text)
-        if not reasoning_summary and prior:
-            reasoning_summary = prior.reasoning_summary
-
-        exhausted_update_path = bool(prior.exhausted_update_path) if prior else False
-        reasoned_exhausted = any(
-            phrase in (lowered_final_text + " " + reasoning_summary.lower())
-            for phrase in [
-                "exhausted",
-                "update path is exhausted",
-                "no further version",
-                "no other version",
-                "no valid candidate",
-                "already attempted the latest",
-                "already attempted latest",
-                "latest version has been attempted",
-                "latest version was already attempted",
-            ]
-        )
-        reverted_on_retry = _is_retry_task(task) and _was_package_reverted(task, group, tool_events)
-        latest_attempted_on_retry = (
-            _is_retry_task(task)
-            and latest_version_seen is not None
-            and latest_version_seen in attempted_set
-        )
-        if (
-            package_abandoned
-            or reasoned_exhausted
-            or (reverted_on_retry or latest_attempted_on_retry)
-            and not is_peer_conflict
-        ):
-            exhausted_update_path = True
-
-        failure_reason = ""
-        if not succeeded:
-            failure_reason = joined_errors or final_text.strip()
-        elif prior and prior.failure_reason and not selected_version:
-            failure_reason = prior.failure_reason
-
-        diagnostics_by_task[task.task_id] = UpdateRetryDiagnostics(
-            task_id=task.task_id,
-            registry_query_performed=registry_query_performed,
-            attempted_versions=attempted_versions,
-            candidate_versions_considered=candidate_versions,
-            selected_version=selected_version,
-            latest_version_seen=latest_version_seen,
-            used_overrides=used_overrides,
-            package_abandoned=package_abandoned,
-            exhausted_update_path=exhausted_update_path,
-            failure_reason=failure_reason,
-            reasoning_summary=reasoning_summary,
-        )
-
-    return diagnostics_by_task
-
-
-# ---------------------------------------------------------------------------
-# Execution-only worker overrides
-# ---------------------------------------------------------------------------
+def _is_executed_manifest_transaction(event: Any) -> bool:
+    """Return whether an update event represents an attempted tool execution."""
+    return getattr(event, "name", "") == _UPDATE_MANIFEST_TOOL_NAME and not str(
+        getattr(event, "content", "")
+    ).lstrip().startswith("DEFERRED:")
 
 
 def _build_update_prompt(
@@ -910,21 +257,31 @@ def _build_update_prompt(
     feedback_by_task: dict[str, str],
     previous_action_summaries_by_task: dict[str, str],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    repository_map: str = "(repository map unavailable)",
+    allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
+    allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     """Build an execution-only prompt; strategy selection belongs to Supervisor."""
+    allowed_target_versions_by_task = allowed_target_versions_by_task or {}
+    allowed_dependency_types_by_task = allowed_dependency_types_by_task or {}
+    retry_diagnostics_by_task = retry_diagnostics_by_task or {}
     sections = [
         "You are a dependency-manifest execution worker.",
         "The Supervisor's task instruction is authoritative. Execute it exactly.",
-        "Do not search the NPM registry, choose alternate versions, or perform retry planning.",
-        "Use only read_repository_map, modify_npm_dependency, revert_workspace_file, and validate_manifest_sync.",
-        "Inspect the repository map before editing.",
-        "Emit at most one modify_npm_dependency or validate_manifest_sync tool call per assistant turn; tool calls in one message cannot observe each other's results.",
-        "For each package, apply all of its exact task instructions, then call validate_manifest_sync with that package_name before moving to the next package.",
-        "The validator rolls back only the current package to its pre-update checkpoint when synchronization fails; preserve earlier packages whose validations succeeded.",
-        "If a package validation fails, do not choose another version or retry inside this worker; surrender to the Supervisor.",
+        "Do not search the NPM registry or perform retry planning.",
+        "Use only modify_and_validate_npm_dependency for manifest changes.",
+        "The repository map below is deterministic read-only context.",
+        "Each modify_and_validate_npm_dependency call edits the manifest and immediately synchronizes its package manifests before returning.",
+        "Transactions are serialized per-package; call the tool with that package_name fixed while changing only an approved retry candidate.",
+        "If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that package with a different Supervisor-approved target_version or dependency_type.",
+        "Keep package_name and manifest_path within the committed task allowlists, and never invent a candidate or query the registry.",
+        "A package may receive at most three combined transaction attempts. After its limit is exhausted, continue with the next independent package.",
+        "A failed transaction is rolled back automatically; continue using the same transaction protocol.",
         "Never edit source-code files in this worker.",
-        "During parent stages (OSV_MINIMUM, NPM_SAME_MAJOR, NPM_LATEST), edit only the committed parent target and never add an override.",
-        "During PACKAGE_OVERRIDE, edit only the committed vulnerable child through the package manager's native override mechanism.",
+        "The Supervisor-owned dependency-type candidates are the only permitted strategy alternatives.",
+        "",
+        "Deterministic repository map:",
+        repository_map,
         "",
         "Constraints ledger:",
     ]
@@ -932,6 +289,29 @@ def _build_update_prompt(
     if not constraints_ledger:
         sections.append("- none")
     for task, group, manifest_paths in resolved_tasks:
+        diagnostics = retry_diagnostics_by_task.get(task.task_id)
+        allowed_versions = list(allowed_target_versions_by_task.get(task.task_id, ()))
+        if not allowed_versions:
+            allowed_versions = list(
+                dict.fromkeys(
+                    value
+                    for value in [
+                        task.selected_version,
+                        *(diagnostics.candidate_versions_considered if diagnostics else []),
+                    ]
+                    if value
+                )
+            )
+        allowed_types = list(allowed_dependency_types_by_task.get(task.task_id, ()))
+        if not allowed_types:
+            allowed_types = [
+                value
+                for value in [
+                    _target_dependency_type(task, group),
+                    *(diagnostics.candidate_dependency_types if diagnostics else []),
+                ]
+                if value
+            ]
         sections.extend(
             [
                 "",
@@ -942,6 +322,8 @@ def _build_update_prompt(
                 f"- Strategy stage: {task.strategy_stage.value}",
                 f"- Parent package: {task.parent_package_name or group.parent_package_name or 'none'}",
                 f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
+                f"- Allowed target versions: {', '.join(allowed_versions) or 'none supplied'}",
+                f"- Allowed dependency types: {', '.join(dict.fromkeys(allowed_types)) or 'none supplied'}",
                 f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
                 f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
                 f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
@@ -951,7 +333,7 @@ def _build_update_prompt(
         [
             "",
             "Completion rule:",
-            "Return control only after every package has one successful per-package manifest synchronization call, or after surrendering on the first package validation failure.",
+            "Return control only after every package has one successful combined transaction or has exhausted its three attempts and been surrendered.",
         ]
     )
     return "\n".join(sections)
@@ -970,8 +352,10 @@ def _build_action_summaries(
     final_note = (final_text or "").strip()
     summaries: list[AgentActionSummary] = []
     for task, group, manifest_paths in resolved_tasks:
-        package_modified = _was_package_modified(task, group, tool_events)
-        package_validated = _has_successful_validation_for_package(task, group, tool_events)
+        package_modified = _has_successful_manifest_transaction_for_package(
+            task, group, tool_events
+        )
+        package_validated = package_modified
         task_succeeded = package_modified and package_validated
         if tool_events is None:
             task_succeeded = succeeded and bool(normalized_changed_files)
@@ -992,6 +376,189 @@ def _build_action_summaries(
     return summaries
 
 
+def _build_surrender_summaries(
+    task_ids: Sequence[str],
+    message: str,
+) -> list[AgentActionSummary]:
+    """Build surrender summaries when execution cannot start or complete."""
+    return [
+        AgentActionSummary(
+            task_id=task_id,
+            status=AgentActionStatus.SURRENDER,
+            summary=message,
+        )
+        for task_id in task_ids
+    ]
+
+
+def _worker_result_map(
+    target_tasks: Sequence[RemediationTask],
+    snapshots: dict[str, Any],
+    summaries: Sequence[AgentActionSummary],
+    *,
+    succeeded: bool,
+    errors: Sequence[str] = (),
+    attempted_versions_by_task: dict[str, list[str]] | None = None,
+    executed_versions_by_task: dict[str, list[str]] | None = None,
+    effective_target_version_by_task: dict[str, str | None] | None = None,
+    effective_dependency_type_by_task: dict[str, str | None] | None = None,
+    validation_calls: int = 0,
+    manifest_transaction_attempts: int = 0,
+    manifest_transaction_attempts_by_task: Mapping[str, int] | None = None,
+) -> dict[str, WorkerAttemptResult]:
+    """Build attempt-correlated worker envelopes without changing task state."""
+    summary_by_task = {summary.task_id: summary for summary in summaries}
+    results: dict[str, WorkerAttemptResult] = {}
+    attempted_versions_by_task = attempted_versions_by_task or {}
+    executed_versions_by_task = executed_versions_by_task or attempted_versions_by_task
+    effective_target_version_by_task = effective_target_version_by_task or {}
+    effective_dependency_type_by_task = effective_dependency_type_by_task or {}
+    manifest_transaction_attempts_by_task = manifest_transaction_attempts_by_task or {}
+    for task in target_tasks:
+        snapshot = snapshots.get(task.task_id)
+        if snapshot is None:
+            continue
+        summary = summary_by_task.get(task.task_id)
+        attempted = list(attempted_versions_by_task.get(task.task_id, []))
+        executed = list(executed_versions_by_task.get(task.task_id, []))
+        task_succeeded = summary is not None and summary.status == AgentActionStatus.SUCCESS
+        results[snapshot.attempt_id] = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=(
+                summary.status
+                if summary is not None
+                else AgentActionStatus.SUCCESS
+                if succeeded
+                else AgentActionStatus.SURRENDER
+            ),
+            executed_versions=executed,
+            action_summary=summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                attempted_versions=attempted,
+                executed_versions=executed,
+                effective_target_version=effective_target_version_by_task.get(task.task_id),
+                effective_dependency_type=effective_dependency_type_by_task.get(task.task_id),
+                manifest_transaction_attempts=manifest_transaction_attempts_by_task.get(
+                    task.task_id, manifest_transaction_attempts
+                ),
+                validation_calls=validation_calls,
+                validation_passed=task_succeeded,
+                failure_reason=" | ".join(errors),
+            ),
+            instruction_digest=snapshot.instruction_digest,
+            errors=list(errors),
+        )
+    return results
+
+
+def _attempted_versions_for_current_run(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> dict[str, list[str]]:
+    """Collect version targets from combined transactions in this worker run."""
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+
+    result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
+    return result
+
+
+def _executed_versions_for_current_run(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> dict[str, list[str]]:
+    """Collect only successful version targets from this worker run."""
+    result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
+    return result
+
+
+def _attempted_dependency_types_for_current_run(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> dict[str, list[str]]:
+    """Collect dependency declaration types from combined transactions."""
+    result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        dependency_type = str(args.get("dependency_type", "")).strip()
+        if not package or not dependency_type:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if dependency_type not in result[task_id]:
+                result[task_id].append(dependency_type)
+    return result
+
+
+def _effective_targets_for_current_run(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    tool_events: Sequence[Any],
+) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    """Collect effective version and dependency type from successful transactions."""
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+
+    versions: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
+    dependency_types: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        version = str(args.get("target_version", "")).strip().lstrip("vV") or None
+        dependency_type = str(args.get("dependency_type", "")).strip() or None
+        for task_id in package_to_task_ids.get(package, []):
+            versions[task_id] = version
+            dependency_types[task_id] = dependency_type
+    return versions, dependency_types
+
+
 def _build_retry_diagnostics(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
@@ -1000,8 +567,13 @@ def _build_retry_diagnostics(
     succeeded: bool,
     prior_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     constraints_ledger: Sequence[str],
+    allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
+    allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, UpdateRetryDiagnostics]:
     """Record worker evidence while keeping strategy planning in Supervisor."""
+    del constraints_ledger
+    allowed_target_versions_by_task = allowed_target_versions_by_task or {}
+    allowed_dependency_types_by_task = allowed_dependency_types_by_task or {}
     result: dict[str, UpdateRetryDiagnostics] = {}
     joined_errors = " | ".join(error.strip() for error in errors if error.strip())
     lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
@@ -1013,20 +585,40 @@ def _build_retry_diagnostics(
         attempted = list(
             prior_attempts_by_target.get(target_package, prior.attempted_versions if prior else [])
         )
+        executed = list(prior.executed_versions) if prior else []
+        attempted_dependency_types = list(prior.attempted_dependency_types) if prior else []
+        candidate_dependency_types = list(prior.candidate_dependency_types) if prior else []
+        candidate_dependency_types.extend(
+            value
+            for value in allowed_dependency_types_by_task.get(task.task_id, ())
+            if value not in candidate_dependency_types
+        )
+        if not candidate_dependency_types and target_dependency_type:
+            candidate_dependency_types = [target_dependency_type]
+        effective_target_version = prior.effective_target_version if prior else None
+        effective_dependency_type = prior.effective_dependency_type if prior else None
         used_overrides = bool(prior.used_overrides) if prior else False
         for event in tool_events:
-            if event.name != "modify_npm_dependency":
+            if not _is_executed_manifest_transaction(event):
                 continue
             if str(event.args.get("package_name", "")).strip() != target_package:
                 continue
             target = str(event.args.get("target_version", "")).strip().lstrip("vV")
             if target and target not in attempted:
                 attempted.append(target)
-            used_overrides = used_overrides or event.args.get("dependency_type") in {
+            dependency_type = str(event.args.get("dependency_type", "")).strip()
+            if dependency_type and dependency_type not in attempted_dependency_types:
+                attempted_dependency_types.append(dependency_type)
+            used_overrides = used_overrides or dependency_type in {
                 "overrides",
                 "resolutions",
                 "pnpm_overrides",
             }
+            if str(event.content).startswith("SUCCESS:"):
+                if target and target not in executed:
+                    executed.append(target)
+                effective_target_version = target or effective_target_version
+                effective_dependency_type = dependency_type or effective_dependency_type
         package_abandoned = bool(prior.package_abandoned) if prior else False
         if "package abandoned" in lowered_outcome or "package not found" in lowered_outcome:
             package_abandoned = True
@@ -1042,12 +634,7 @@ def _build_retry_diagnostics(
             )
         ):
             exhausted_update_path = True
-        if (
-            _is_retry_task(task)
-            and _was_package_reverted(task, group, tool_events)
-            and "peer" not in lowered_outcome
-            and "eresolve" not in lowered_outcome
-        ):
+        if "retry_limit_reached" in lowered_outcome:
             exhausted_update_path = True
         task_stage = getattr(task, "strategy_stage", SCARemediationStage.OSV_MINIMUM)
         if not isinstance(task_stage, SCARemediationStage):
@@ -1061,13 +648,22 @@ def _build_retry_diagnostics(
             else (group.fix_plan.fixed_version if group.fix_plan else None),
             registry_query_performed=prior.registry_query_performed if prior else False,
             attempted_versions=attempted,
-            executed_versions=attempted,
-            candidate_versions_considered=list(prior.candidate_versions_considered)
-            if prior
-            else [],
+            executed_versions=executed,
+            candidate_versions_considered=list(
+                dict.fromkeys(
+                    [
+                        *(prior.candidate_versions_considered if prior else []),
+                        *allowed_target_versions_by_task.get(task.task_id, ()),
+                    ]
+                )
+            ),
+            attempted_dependency_types=attempted_dependency_types,
+            candidate_dependency_types=candidate_dependency_types,
             # Version selection belongs to the Supervisor planner. A worker
             # failure must not resurrect the previous planner selection.
             selected_version=prior.selected_version if prior else None,
+            effective_target_version=effective_target_version,
+            effective_dependency_type=effective_dependency_type,
             latest_version_seen=prior.latest_version_seen if prior else None,
             used_overrides=used_overrides,
             package_abandoned=package_abandoned,
@@ -1150,6 +746,8 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     resolved_tasks: list[tuple[RemediationTask, VulnerabilityGroup, list[str]]] = []
     resolution_errors: list[str] = []
     target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
+    allowed_target_versions_by_task: dict[str, list[str]] = {}
+    allowed_dependency_types_by_task: dict[str, list[str]] = {}
     groups_by_id = {group.group_id: group for group in target_groups}
     for task in target_tasks:
         group = groups_by_id.get(task.parent_group_id)
@@ -1181,6 +779,39 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     "parent_minimum_version": snapshot.parent_minimum_version,
                     "instruction": snapshot.instruction,
                 }
+            )
+            snapshot_versions = list(snapshot.allowed_target_versions)
+            if not snapshot_versions and snapshot.selected_version:
+                snapshot_versions = [snapshot.selected_version]
+            snapshot_dependency_types = list(snapshot.allowed_dependency_types)
+            if not snapshot_dependency_types and snapshot.target_dependency_type:
+                snapshot_dependency_types = [snapshot.target_dependency_type]
+            allowed_target_versions_by_task[task.task_id] = snapshot_versions
+            allowed_dependency_types_by_task[task.task_id] = snapshot_dependency_types
+        else:
+            diagnostics = prior_retry_diagnostics_by_task.get(task.task_id)
+            attempted_versions = set(diagnostics.attempted_versions) if diagnostics else set()
+            allowed_target_versions_by_task[task.task_id] = list(
+                dict.fromkeys(
+                    version
+                    for version in [
+                        task.selected_version,
+                        *(diagnostics.candidate_versions_considered if diagnostics else []),
+                    ]
+                    if version and version not in attempted_versions
+                )
+            )
+            target_type = _target_dependency_type(task, group)
+            attempted_types = set(diagnostics.attempted_dependency_types) if diagnostics else set()
+            allowed_dependency_types_by_task[task.task_id] = list(
+                dict.fromkeys(
+                    dependency_type
+                    for dependency_type in [
+                        target_type,
+                        *(diagnostics.candidate_dependency_types if diagnostics else []),
+                    ]
+                    if dependency_type and dependency_type not in attempted_types
+                )
             )
         manifest_paths, errors = _resolve_manifest_targets(group, repo_root)
         resolution_errors.extend(errors)
@@ -1249,6 +880,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     execution_state: dict[str, Any] = {
         "edits_started": False,
         "validation_calls": 0,
+        "manifest_transaction_attempts": 0,
     }
 
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
@@ -1263,12 +895,16 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         feedback_by_task,
         previous_action_summaries_by_task,
         prior_retry_diagnostics_by_task,
+        repository_map=build_repository_map(repo_root),
+        allowed_target_versions_by_task=allowed_target_versions_by_task,
+        allowed_dependency_types_by_task=allowed_dependency_types_by_task,
     )
     initial_messages = [
         SystemMessage(
             content=(
-                "You are an execution-only dependency worker. The Supervisor owns all version planning. "
-                "Execute the exact task instruction, validate manifest synchronization, and do not query registries."
+                "You are an execution-only dependency worker. The Supervisor owns candidate generation. "
+                "Use only the combined manifest transaction tool, retry failed transactions with a different "
+                "Supervisor-approved candidate, and do not query registries."
             )
         ),
         HumanMessage(content=prompt),
@@ -1276,11 +912,14 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
 
     override_required_packages: set[str] = set()
     allowed_dependency_types_by_package: dict[str, set[str]] = {}
+    allowed_target_versions_by_package: dict[str, set[str]] = {}
     for task, group, _ in skinny_resolved_tasks:
         pkg_name = _target_package_name(task, group)
-        target_type = _target_dependency_type(task, group)
-        if pkg_name and target_type:
-            allowed_dependency_types_by_package.setdefault(pkg_name, set()).add(target_type)
+        if pkg_name:
+            allowed_versions = allowed_target_versions_by_task.get(task.task_id, [])
+            allowed_target_versions_by_package.setdefault(pkg_name, set()).update(allowed_versions)
+            allowed_types = allowed_dependency_types_by_task.get(task.task_id, [])
+            allowed_dependency_types_by_package.setdefault(pkg_name, set()).update(allowed_types)
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
         if pkg_name and _requires_override_remediation(
             task,
@@ -1296,13 +935,13 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             toolbelt = build_update_toolbelt(
                 sandbox,
                 touched_files,
-                repo_root,
                 target_manifest_paths=[
                     manifest_path
                     for _, _, manifest_paths in skinny_resolved_tasks
                     for manifest_path in manifest_paths
                 ],
                 package_manifest_paths=package_manifest_map,
+                allowed_target_versions_by_package=allowed_target_versions_by_package,
                 override_required_packages=override_required_packages,
                 allowed_dependency_types_by_package=allowed_dependency_types_by_package,
                 execution_state=execution_state,
@@ -1314,6 +953,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     toolbelt,
                     initial_messages,
                     touched_files,
+                    execution_state=execution_state,
                 )
             finally:
                 rollback_errors = rollback_pending_package_updates(
@@ -1336,9 +976,6 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + cleanup_errors + [msg],
         }
 
-    validation_events = [
-        event for event in runtime.tool_events if event.name == "validate_manifest_sync"
-    ]
     package_names = {
         _target_package_name(task, group)
         for task, group, _ in resolved_tasks
@@ -1347,7 +984,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     successful_packages = {
         _target_package_name(task, group)
         for task, group, _ in resolved_tasks
-        if _has_successful_validation_for_package(task, group, runtime.tool_events)
+        if _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
     }
     unvalidated_manifest_paths = {
         path.replace("\\", "/")
@@ -1362,17 +999,19 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             for path in runtime.changed_files
             if path.replace("\\", "/") not in unvalidated_manifest_paths
         )
-    succeeded = (
-        bool(committed_changed_files)
-        and bool(package_names)
-        and len(validation_events) == len(package_names)
-        and int(execution_state.get("validation_calls", 0)) == len(package_names)
-        and all(
-            _has_successful_validation_for_package(task, group, runtime.tool_events)
-            for _, group, _ in resolved_tasks
-        )
+    # A worker succeeds only when every target package has a successful
+    # combined edit-and-sync transaction. Failed transactions may precede a
+    # later success, so neither raw event counts nor changed-file counts are
+    # used as a proxy for completion.
+    succeeded = bool(package_names) and all(
+        _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
+        for task, group, _ in resolved_tasks
     )
     attempted_by_task = _attempted_versions_for_current_run(
+        resolved_tasks,
+        runtime.tool_events,
+    )
+    attempted_dependency_types_by_task = _attempted_dependency_types_for_current_run(
         resolved_tasks,
         runtime.tool_events,
     )
@@ -1380,23 +1019,72 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         resolved_tasks,
         runtime.tool_events,
     )
+    effective_versions_by_task, effective_dependency_types_by_task = (
+        _effective_targets_for_current_run(
+            resolved_tasks,
+            runtime.tool_events,
+        )
+    )
+    runtime_manifest_attempts_by_package = dict(
+        execution_state.get("manifest_transaction_attempts_by_package", {})
+    )
+    runtime_manifest_attempts_by_package.update(
+        {
+            package: max(
+                int(runtime_manifest_attempts_by_package.get(package, 0)),
+                int(attempts),
+            )
+            for package, attempts in execution_state.get(
+                "manifest_runtime_attempts_by_package", {}
+            ).items()
+        }
+    )
+    manifest_transaction_attempts_by_task = {
+        task.task_id: runtime_manifest_attempts_by_package.get(
+            _target_package_name(task, group),
+            0,
+        )
+        for task, group, _ in resolved_tasks
+    }
     instruction_mismatch_task_ids: set[str] = set()
     instruction_mismatch_errors: list[str] = []
     for task, _group, _manifest_paths in resolved_tasks:
         snapshot = target_attempt_snapshots.get(task.task_id)
-        if snapshot is None or snapshot.selected_version is None:
+        if snapshot is None:
             continue
-        expected = snapshot.selected_version.strip().lstrip("vV").lower()
+        allowed_versions = list(getattr(snapshot, "allowed_target_versions", []) or [])
+        if not allowed_versions and snapshot.selected_version:
+            allowed_versions = [snapshot.selected_version]
+        allowed = {version.strip().lstrip("vV").lower() for version in allowed_versions if version}
         observed = {
             version.strip().lstrip("vV").lower()
             for version in attempted_by_task.get(task.task_id, [])
             if version
         }
-        if observed and expected not in observed:
+        unexpected = observed - allowed if allowed else set()
+        if unexpected:
             instruction_mismatch_task_ids.add(task.task_id)
             instruction_mismatch_errors.append(
-                f"Task {task.task_id}: worker attempted {', '.join(sorted(observed))} "
-                f"instead of committed version {snapshot.selected_version}."
+                f"Task {task.task_id}: worker attempted unallowlisted versions "
+                f"{', '.join(sorted(unexpected))}; Supervisor-approved versions are "
+                f"{', '.join(sorted(allowed))}."
+            )
+        allowed_dependency_types = list(getattr(snapshot, "allowed_dependency_types", []) or [])
+        if not allowed_dependency_types and snapshot.target_dependency_type:
+            allowed_dependency_types = [snapshot.target_dependency_type]
+        allowed_types = {value.strip().lower() for value in allowed_dependency_types if value}
+        observed_types = {
+            value.strip().lower()
+            for value in attempted_dependency_types_by_task.get(task.task_id, [])
+            if value
+        }
+        unexpected_types = observed_types - allowed_types if allowed_types else set()
+        if unexpected_types:
+            instruction_mismatch_task_ids.add(task.task_id)
+            instruction_mismatch_errors.append(
+                f"Task {task.task_id}: worker attempted unallowlisted dependency types "
+                f"{', '.join(sorted(unexpected_types))}; Supervisor-approved types are "
+                f"{', '.join(sorted(allowed_types))}."
             )
 
     if instruction_mismatch_task_ids:
@@ -1411,6 +1099,8 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         succeeded,
         prior_retry_diagnostics_by_task,
         constraints_ledger=constraints_ledger,
+        allowed_target_versions_by_task=allowed_target_versions_by_task,
+        allowed_dependency_types_by_task=allowed_dependency_types_by_task,
     )
     summaries = _build_action_summaries(
         resolved_tasks,
@@ -1460,9 +1150,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             errors=runtime.errors,
             attempted_versions_by_task=attempted_by_task,
             executed_versions_by_task=executed_by_task,
+            effective_target_version_by_task=effective_versions_by_task,
+            effective_dependency_type_by_task=effective_dependency_types_by_task,
             validation_calls=sum(
-                1 for event in runtime.tool_events if event.name == "validate_manifest_sync"
+                1 for event in runtime.tool_events if _is_executed_manifest_transaction(event)
             ),
+            manifest_transaction_attempts=int(
+                execution_state.get("manifest_transaction_attempts", 0)
+            ),
+            manifest_transaction_attempts_by_task=manifest_transaction_attempts_by_task,
         ),
         "errors": resolution_errors + runtime.errors,
     }

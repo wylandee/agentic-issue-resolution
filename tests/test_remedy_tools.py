@@ -21,20 +21,15 @@ from remediation_engine.orchestration.remedy_tools import (
 def _update_tool_map(
     sandbox,
     touched_files=None,
-    host_repo_root=None,
     manifest_paths=None,
     package_manifest_paths=None,
-    enable_registry_lookup=False,
-    attempted_versions_by_package=None,
     override_required_packages=None,
-    require_planning_answers=False,
-    planning_state=None,
+    allowed_target_versions_by_package=None,
+    allowed_dependency_types_by_package=None,
     execution_state=None,
 ):
     if touched_files is None:
         touched_files = set()
-    if host_repo_root is None:
-        host_repo_root = Path("/dummy/repo/root")
     if manifest_paths is None:
         manifest_paths = ["package.json"]
     if package_manifest_paths is None:
@@ -42,14 +37,11 @@ def _update_tool_map(
     tools = build_update_toolbelt(
         sandbox,
         touched_files,
-        host_repo_root,
         manifest_paths,
         package_manifest_paths,
-        enable_registry_lookup=enable_registry_lookup,
-        attempted_versions_by_package=attempted_versions_by_package,
+        allowed_target_versions_by_package=allowed_target_versions_by_package,
         override_required_packages=override_required_packages,
-        require_planning_answers=require_planning_answers,
-        planning_state=planning_state,
+        allowed_dependency_types_by_package=allowed_dependency_types_by_package,
         execution_state=execution_state,
     )
     return {tool.name: tool for tool in tools}
@@ -71,12 +63,7 @@ class TestToolbeltFactories:
         sandbox = MagicMock()
         tools = _update_tool_map(sandbox)
 
-        assert set(tools) == {
-            "read_repository_map",
-            "modify_npm_dependency",
-            "revert_workspace_file",
-            "validate_manifest_sync",
-        }
+        assert set(tools) == {"modify_and_validate_npm_dependency"}
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -539,23 +526,29 @@ class TestToolbeltFactories:
         assert "const isAuthorized = () => expressjwt" in written
 
 
-class TestModifyNpmDependency:
-    def test_success_tracks_manifest_path(self):
-        sandbox = MagicMock()
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="ok",
-            stderr="",
-            duration_seconds=0.5,
+class TestModifyAndValidateNpmDependency:
+    @staticmethod
+    def _success() -> CommandResult:
+        return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.5)
+
+    @staticmethod
+    def _baseline_reads(sandbox, baseline: str = '{"dependencies": {"lodash": "4.17.20"}}\n'):
+        sandbox.read_file.side_effect = lambda path: (
+            baseline if path.endswith("package.json") else None
         )
-        touched_files = set()
+
+    def test_success_runs_edit_then_immediate_manifest_sync(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = self._success()
+        self._baseline_reads(sandbox)
+        touched_files: set[str] = set()
         tools = _update_tool_map(
             sandbox,
             touched_files=touched_files,
             manifest_paths=["frontend/package.json"],
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "lodash",
                 "target_version": "4.17.21",
@@ -566,9 +559,14 @@ class TestModifyNpmDependency:
 
         assert result.startswith("SUCCESS:")
         assert "frontend/package.json" in result
+        assert "dependencies" in result
+        assert "4.17.21" in result
         assert touched_files == {"frontend/package.json"}
-        sandbox.run.assert_called_once()
-        assert "cd /workspace/frontend" in sandbox.run.call_args[0][0]
+        assert sandbox.run.call_count == 2
+        edit_command, sync_command = [call.args[0] for call in sandbox.run.call_args_list]
+        assert "npm pkg set" in edit_command
+        assert "cd /workspace/frontend" in edit_command
+        assert "npm install --package-lock-only --ignore-scripts" in sync_command
 
     def test_rejects_manifest_outside_allowed_batch_targets(self):
         sandbox = MagicMock()
@@ -578,7 +576,7 @@ class TestModifyNpmDependency:
             package_manifest_paths={"lodash": ["package.json"]},
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "lodash",
                 "target_version": "4.17.21",
@@ -587,45 +585,16 @@ class TestModifyNpmDependency:
             }
         )
 
-        assert result.startswith("ERROR:")
-        assert "not an allowed target for package 'lodash'" in result
-        assert "package.json" in result
-        sandbox.run.assert_not_called()
-
-    def test_rejects_manifest_not_allowed_for_package_in_mixed_batch(self):
-        sandbox = MagicMock()
-        tools = _update_tool_map(
-            sandbox,
-            manifest_paths=["package.json", "frontend/package.json"],
-            package_manifest_paths={
-                "lodash": ["package.json"],
-                "axios": ["frontend/package.json"],
-            },
-        )
-
-        result = tools["modify_npm_dependency"].invoke(
-            {
-                "package_name": "lodash",
-                "target_version": "4.17.21",
-                "dependency_type": "dependencies",
-                "manifest_path": "frontend/package.json",
-            }
-        )
-
-        assert result.startswith("ERROR:")
-        assert "not an allowed target for package 'lodash'" in result
+        assert result.startswith("ERROR_CODE: TARGET_NOT_ALLOWED:")
+        assert "not allowed for 'lodash'" in result
         assert "package.json" in result
         sandbox.run.assert_not_called()
 
     def test_allows_package_specific_manifest_in_mixed_batch(self):
         sandbox = MagicMock()
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="ok",
-            stderr="",
-            duration_seconds=0.5,
-        )
-        touched_files = set()
+        sandbox.run.return_value = self._success()
+        self._baseline_reads(sandbox)
+        touched_files: set[str] = set()
         tools = _update_tool_map(
             sandbox,
             touched_files=touched_files,
@@ -636,7 +605,7 @@ class TestModifyNpmDependency:
             },
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "axios",
                 "target_version": "1.7.4",
@@ -648,17 +617,16 @@ class TestModifyNpmDependency:
         assert result.startswith("SUCCESS:")
         assert "frontend/package.json" in result
         assert touched_files == {"frontend/package.json"}
-        sandbox.run.assert_called_once()
+        assert sandbox.run.call_count == 2
 
     def test_rejects_unknown_package_name_for_batch(self):
         sandbox = MagicMock()
         tools = _update_tool_map(
             sandbox,
-            manifest_paths=["package.json"],
             package_manifest_paths={"lodash": ["package.json"]},
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "express",
                 "target_version": "4.21.0",
@@ -667,15 +635,15 @@ class TestModifyNpmDependency:
             }
         )
 
-        assert result.startswith("ERROR:")
-        assert "package_name 'express' is not an allowed target for this batch" in result
+        assert result.startswith("ERROR_CODE: TARGET_NOT_ALLOWED:")
+        assert "package_name 'express' is not an allowed target" in result
         sandbox.run.assert_not_called()
 
-    def test_invalid_manifest_path_rejected(self):
+    def test_invalid_manifest_path_rejected_without_sandbox_mutation(self):
         sandbox = MagicMock()
         tools = _update_tool_map(sandbox)
 
-        result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "lodash",
                 "target_version": "4.17.21",
@@ -684,59 +652,157 @@ class TestModifyNpmDependency:
             }
         )
 
-        assert result == "ERROR: manifest_path must point to a package.json file."
+        assert result.startswith("ERROR_CODE: INVALID_ARGUMENT:")
+        assert "package.json" in result
+        sandbox.run.assert_not_called()
 
-    def test_rejects_direct_dependency_edit_when_overrides_required(self):
+    def test_rejects_unapproved_version_and_dependency_type(self):
         sandbox = MagicMock()
         tools = _update_tool_map(
             sandbox,
-            package_manifest_paths={"cookie": ["package.json"]},
-            override_required_packages={"cookie"},
+            allowed_target_versions_by_package={"lodash": ["4.17.21", "4.17.22"]},
+            allowed_dependency_types_by_package={"lodash": ["dependencies", "devDependencies"]},
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        bad_version = tools["modify_and_validate_npm_dependency"].invoke(
             {
-                "package_name": "cookie",
-                "target_version": "0.7.0",
+                "package_name": "lodash",
+                "target_version": "4.17.20",
                 "dependency_type": "dependencies",
-                "manifest_path": "package.json",
+            }
+        )
+        bad_type = tools["modify_and_validate_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "peerDependencies",
             }
         )
 
-        assert result.startswith("ERROR:")
-        assert "constrained to npm overrides" in result
-        assert "dependency_type='overrides'" in result
+        assert bad_version.startswith("ERROR_CODE: TARGET_NOT_ALLOWED:")
+        assert bad_type.startswith("ERROR_CODE: TARGET_NOT_ALLOWED:")
         sandbox.run.assert_not_called()
 
-    def test_allows_override_edit_when_overrides_required(self):
+    def test_failed_sync_restores_checkpoint_and_changed_candidate_can_retry(self):
         sandbox = MagicMock()
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="ok",
-            stderr="",
-            duration_seconds=0.5,
+        success = self._success()
+        failure = CommandResult(
+            exit_code=1,
+            stdout="partial",
+            stderr="ERESOLVE unable to resolve dependency tree",
+            duration_seconds=1.0,
         )
-        touched_files = set()
+        sandbox.run.side_effect = [
+            success,
+            failure,
+            success,
+            success,
+            success,
+            success,
+        ]
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
+        touched_files: set[str] = set()
+        execution_state: dict[str, object] = {}
         tools = _update_tool_map(
             sandbox,
             touched_files=touched_files,
-            package_manifest_paths={"cookie": ["package.json"]},
-            override_required_packages={"cookie"},
+            execution_state=execution_state,
+            allowed_target_versions_by_package={"lodash": ["4.17.21", "4.17.22"]},
         )
 
-        result = tools["modify_npm_dependency"].invoke(
+        failed = tools["modify_and_validate_npm_dependency"].invoke(
             {
-                "package_name": "cookie",
-                "target_version": "0.7.0",
-                "dependency_type": "overrides",
-                "manifest_path": "package.json",
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+            }
+        )
+        succeeded = tools["modify_and_validate_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.22",
+                "dependency_type": "dependencies",
             }
         )
 
-        assert result.startswith("SUCCESS:")
-        assert "overrides.cookie" in result
+        assert failed.startswith("ERROR_CODE: MANIFEST_SYNC_FAILED:")
+        assert "ERESOLVE" in failed
+        assert "Rollback" in failed
+        assert succeeded.startswith("SUCCESS:")
         assert touched_files == {"package.json"}
-        sandbox.run.assert_called_once()
+        assert execution_state["manifest_transaction_attempts"] == 2
+        sandbox.write_file.assert_called_once_with("package.json", baseline)
+
+    def test_edit_failure_restores_checkpoint(self):
+        sandbox = MagicMock()
+        failure = CommandResult(
+            exit_code=1, stdout="", stderr="permission denied", duration_seconds=1.0
+        )
+        sandbox.run.side_effect = [failure, self._success(), self._success()]
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
+        touched_files: set[str] = set()
+        tools = _update_tool_map(sandbox, touched_files=touched_files)
+
+        result = tools["modify_and_validate_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+            }
+        )
+
+        assert result.startswith("ERROR_CODE: EDIT_FAILED:")
+        assert "permission denied" in result
+        assert touched_files == set()
+        sandbox.write_file.assert_called_once_with("package.json", baseline)
+
+    def test_repeated_signature_and_retry_limit_are_stable(self):
+        sandbox = MagicMock()
+        failure = CommandResult(exit_code=1, stdout="", stderr="failed", duration_seconds=1.0)
+        sandbox.run.side_effect = [
+            failure,
+            self._success(),
+            self._success(),
+            failure,
+            self._success(),
+            self._success(),
+            failure,
+            self._success(),
+            self._success(),
+        ]
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
+        tools = _update_tool_map(
+            sandbox,
+            allowed_target_versions_by_package={
+                "lodash": ["4.17.21", "4.17.22", "4.17.23", "4.17.24"]
+            },
+        )
+        call = {
+            "package_name": "lodash",
+            "target_version": "4.17.21",
+            "dependency_type": "dependencies",
+        }
+
+        first = tools["modify_and_validate_npm_dependency"].invoke(call)
+        repeated = tools["modify_and_validate_npm_dependency"].invoke(call)
+        second = tools["modify_and_validate_npm_dependency"].invoke(
+            {**call, "target_version": "4.17.22"}
+        )
+        third = tools["modify_and_validate_npm_dependency"].invoke(
+            {**call, "target_version": "4.17.23"}
+        )
+        exhausted = tools["modify_and_validate_npm_dependency"].invoke(
+            {**call, "target_version": "4.17.24"}
+        )
+
+        assert first.startswith("ERROR_CODE: EDIT_FAILED:")
+        assert repeated.startswith("ERROR_CODE: RETRY_PARAMETERS_UNCHANGED:")
+        assert second.startswith("ERROR_CODE: EDIT_FAILED:")
+        assert third.startswith("ERROR_CODE: EDIT_FAILED:")
+        assert exhausted.startswith("ERROR_CODE: RETRY_LIMIT_REACHED:")
 
 
 class TestRevertWorkspaceFile:
@@ -779,7 +845,7 @@ class TestRevertWorkspaceFile:
         }
         sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
 
-        tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
+        tools = _workaround_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
 
         result = tools["revert_workspace_file"].invoke(
             {"file_path": "package.json", "package_name": "axios"}
@@ -811,7 +877,7 @@ class TestRevertWorkspaceFile:
         sandbox_json = {"dependencies": {"lodash": "4.17.20", "newpkg": "1.0.0"}}
         sandbox.read_file.return_value = json.dumps(sandbox_json, indent=2)
 
-        tools = _update_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
+        tools = _workaround_tool_map(sandbox, touched_files=touched_files, host_repo_root=host_repo)
 
         result = tools["revert_workspace_file"].invoke(
             {"file_path": "package.json", "package_name": "newpkg"}
@@ -842,8 +908,8 @@ class TestRevertWorkspaceFile:
         assert "only be specified for package.json files" in result
 
 
-class TestValidateManifestSync:
-    def test_validation_runs_once_per_package_in_worker_run(self):
+class TestCombinedManifestTransaction:
+    def test_transaction_runs_once_per_package(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
             exit_code=0,
@@ -851,7 +917,11 @@ class TestValidateManifestSync:
             stderr="",
             duration_seconds=1.0,
         )
-        execution_state = {"edits_started": False, "validation_calls": 0}
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: (
+            baseline if path.endswith("package.json") else None
+        )
+        execution_state: dict[str, object] = {}
         tools = _update_tool_map(
             sandbox,
             manifest_paths=["package.json", "frontend/package.json"],
@@ -862,7 +932,7 @@ class TestValidateManifestSync:
             execution_state=execution_state,
         )
 
-        edit_result = tools["modify_npm_dependency"].invoke(
+        lodash_result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "lodash",
                 "target_version": "4.17.22",
@@ -870,8 +940,7 @@ class TestValidateManifestSync:
                 "manifest_path": "package.json",
             }
         )
-        first_validation = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
-        second_edit_result = tools["modify_npm_dependency"].invoke(
+        axios_result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "axios",
                 "target_version": "1.7.4",
@@ -879,15 +948,14 @@ class TestValidateManifestSync:
                 "manifest_path": "frontend/package.json",
             }
         )
-        second_validation = tools["validate_manifest_sync"].invoke({"package_name": "axios"})
 
-        assert edit_result.startswith("SUCCESS:")
-        assert second_edit_result.startswith("SUCCESS:")
-        assert first_validation.startswith("SUCCESS:")
-        assert second_validation.startswith("SUCCESS:")
+        assert lodash_result.startswith("SUCCESS:")
+        assert axios_result.startswith("SUCCESS:")
         assert execution_state["validation_calls"] == 2
+        assert execution_state["manifest_transaction_attempts"] == 2
+        assert sandbox.run.call_count == 4
 
-    def test_success_runs_ignore_scripts_for_each_manifest_directory(self):
+    def test_success_runs_sync_for_each_manifest_directory(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
             exit_code=0,
@@ -895,36 +963,33 @@ class TestValidateManifestSync:
             stderr="",
             duration_seconds=1.0,
         )
+        baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
+        sandbox.read_file.side_effect = lambda path: (
+            baseline if path.endswith("package.json") else None
+        )
         tools = _update_tool_map(
             sandbox,
             manifest_paths=["package.json", "frontend/package.json"],
+            package_manifest_paths={"lodash": ["package.json", "frontend/package.json"]},
         )
 
-        result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
+        result = tools["modify_and_validate_npm_dependency"].invoke(
+            {
+                "package_name": "lodash",
+                "target_version": "4.17.21",
+                "dependency_type": "dependencies",
+                "manifest_path": "package.json",
+            }
+        )
 
         assert result.startswith("SUCCESS:")
-        assert sandbox.run.call_count == 2
+        assert sandbox.run.call_count == 3
         commands = [call.args[0] for call in sandbox.run.call_args_list]
-        assert all("--package-lock-only --ignore-scripts" in cmd for cmd in commands)
-        assert any("cd /workspace/frontend" in cmd for cmd in commands)
+        assert "npm pkg set" in commands[0]
+        assert all("--package-lock-only --ignore-scripts" in cmd for cmd in commands[1:])
+        assert any("cd /workspace/frontend" in cmd for cmd in commands[1:])
 
-    def test_failure_surfaces_stderr(self):
-        sandbox = MagicMock()
-        sandbox.run.return_value = CommandResult(
-            exit_code=1,
-            stdout="partial",
-            stderr="ERESOLVE unable to resolve dependency tree",
-            duration_seconds=1.0,
-        )
-        tools = _update_tool_map(sandbox)
-
-        result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
-
-        assert result.startswith("FAILURE:")
-        assert "ERESOLVE" in result
-        assert "partial" in result
-
-    def test_failed_package_validation_restores_its_checkpoint(self):
+    def test_sync_failure_surfaces_stderr_and_restores_checkpoint(self):
         sandbox = MagicMock()
         success = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0)
         failure = CommandResult(
@@ -937,26 +1002,20 @@ class TestValidateManifestSync:
         baseline = '{"dependencies": {"lodash": "4.17.20"}}\n'
         sandbox.read_file.side_effect = lambda path: baseline if path == "package.json" else None
         touched_files: set[str] = set()
-        execution_state = {"edits_started": False, "validation_calls": 0}
-        tools = _update_tool_map(
-            sandbox,
-            touched_files=touched_files,
-            execution_state=execution_state,
-        )
+        tools = _update_tool_map(sandbox, touched_files=touched_files)
 
-        edit_result = tools["modify_npm_dependency"].invoke(
+        result = tools["modify_and_validate_npm_dependency"].invoke(
             {
                 "package_name": "lodash",
-                "target_version": "4.17.22",
+                "target_version": "4.17.21",
                 "dependency_type": "dependencies",
-                "manifest_path": "package.json",
             }
         )
-        validation_result = tools["validate_manifest_sync"].invoke({"package_name": "lodash"})
 
-        assert edit_result.startswith("SUCCESS:")
-        assert validation_result.startswith("FAILURE:")
-        assert "Rolled back package 'lodash'" in validation_result
+        assert result.startswith("ERROR_CODE: MANIFEST_SYNC_FAILED:")
+        assert "ERESOLVE" in result
+        assert "partial" in result
+        assert "Rollback" in result
         assert touched_files == set()
         sandbox.write_file.assert_called_once_with("package.json", baseline)
 

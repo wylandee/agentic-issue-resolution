@@ -90,10 +90,9 @@ def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
 
     expected_tools: list[ToolCall] = []
     if case.get("expected_pass", True) and status == "APPLIED":
-        if case.get("is_retry"):
-            expected_tools.append(ToolCall(name="view_npm_package_versions", input_parameters={}))
-        expected_tools.append(ToolCall(name="modify_npm_dependency", input_parameters={}))
-        expected_tools.append(ToolCall(name="validate_manifest_sync", input_parameters={}))
+        expected_tools.append(
+            ToolCall(name="modify_and_validate_npm_dependency", input_parameters={})
+        )
 
     metadata = {
         "case_id": case.get("case_id"),
@@ -114,8 +113,12 @@ def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
         name=f"{case.get('case_id')} [Update Subagent]",
         input=instruction,
         actual_output=actual_output,
-        expected_output=f"Update {target_pkg} in manifest files and validate manifest synchronization.",
-        context=[instruction, case.get("provenance", "")],
+        expected_output=f"Update {target_pkg} in manifest files with the combined edit-and-sync transaction.",
+        context=[
+            instruction,
+            case.get("provenance", ""),
+            f"Deterministic repository map:\n{case.get('repository_map', '(workspace is empty)')}",
+        ],
         tools_called=tools_called,
         expected_tools=expected_tools if expected_tools else None,
         additional_metadata=metadata,
@@ -133,19 +136,16 @@ class TestUpdateSubagentEval:
 
     @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
     def test_tool_sequence_correctness(self, case: dict[str, Any]) -> None:
-        """Update worker calls modify_npm_dependency then validate_manifest_sync."""
+        """Active update trajectories expose only the combined manifest transaction."""
         tool_calls = case.get("tool_calls", [])
         tool_names = [tc.get("name", "") for tc in tool_calls]
 
-        if "modify_npm_dependency" in tool_names:
-            assert "validate_manifest_sync" in tool_names, (
-                f"Case '{case['case_id']}': 'modify_npm_dependency' was invoked without subsequent 'validate_manifest_sync'."
-            )
-            modify_idx = tool_names.index("modify_npm_dependency")
-            validate_idx = tool_names.index("validate_manifest_sync")
-            assert validate_idx > modify_idx, (
-                f"Case '{case['case_id']}': 'validate_manifest_sync' appeared before 'modify_npm_dependency'."
-            )
+        assert "modify_npm_dependency" not in tool_names
+        assert "validate_manifest_sync" not in tool_names
+        assert "read_repository_map" not in tool_names
+        assert "revert_workspace_file" not in tool_names
+        if case.get("action_status") == "APPLIED" and case.get("expected_pass", True):
+            assert "modify_and_validate_npm_dependency" in tool_names
 
     @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
     def test_tool_correctness_deepeval(

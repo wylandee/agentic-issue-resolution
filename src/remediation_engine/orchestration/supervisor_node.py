@@ -147,6 +147,21 @@ def _instruction_digest(instruction: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _supervisor_dependency_type_candidates(
+    strategy_stage: SCARemediationStage,
+    target_dependency_type: str | None,
+) -> list[str]:
+    """Return dependency-type candidates permitted by the committed strategy."""
+    if strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        candidates = (
+            [target_dependency_type] if target_dependency_type in _OVERRIDE_DEPENDENCY_TYPES else []
+        )
+        candidates.extend(sorted(_OVERRIDE_DEPENDENCY_TYPES))
+    else:
+        candidates = [target_dependency_type] if target_dependency_type else []
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
 def _attempts_for_task(
     snapshots_by_id: dict[str, TaskAttemptSnapshot],
     task_id: str,
@@ -155,6 +170,78 @@ def _attempts_for_task(
         (snapshot for snapshot in snapshots_by_id.values() if snapshot.task_id == task_id),
         key=lambda snapshot: (snapshot.attempt_number, snapshot.created_at),
     )
+
+
+def _ordered_update_candidates(
+    task: RemediationTask,
+    *,
+    plan: SupervisorRetryPlan | None = None,
+    diagnostics: UpdateRetryDiagnostics | None = None,
+) -> tuple[list[str], list[str]]:
+    """Build immutable version and dependency-type candidates for an update attempt."""
+    selected_version = (
+        plan.selected_version
+        if plan is not None and plan.selected_version
+        else task.selected_version
+    )
+    attempted_version_values = [
+        *(diagnostics.attempted_versions if diagnostics else []),
+        *(plan.attempted_versions if plan else []),
+    ]
+    attempted_versions = {item.strip().lstrip("vV") for item in attempted_version_values if item}
+    if plan is not None:
+        candidate_versions = list(plan.candidate_versions_considered)
+    elif diagnostics is not None:
+        candidate_versions = list(diagnostics.candidate_versions_considered)
+    else:
+        candidate_versions = []
+
+    allowed_versions: list[str] = []
+    seen_versions: set[str] = set()
+    for version in [selected_version, *candidate_versions]:
+        if not version:
+            continue
+        normalized = version.strip().lstrip("vV")
+        if not normalized or normalized in seen_versions:
+            continue
+        if normalized in attempted_versions:
+            continue
+        seen_versions.add(normalized)
+        allowed_versions.append(normalized)
+
+    selected_type = (
+        (plan.target_dependency_type if plan is not None else None)
+        or task.target_dependency_type
+        or (diagnostics.target_dependency_type if diagnostics else None)
+    )
+    strategy_stage = plan.strategy_stage if plan is not None else task.strategy_stage
+    policy_types = _supervisor_dependency_type_candidates(strategy_stage, selected_type)
+    if plan is not None and plan.candidate_dependency_types:
+        committed_plan_types = set(plan.candidate_dependency_types)
+        candidate_types = [
+            dependency_type
+            for dependency_type in policy_types
+            if dependency_type in committed_plan_types
+        ]
+    else:
+        candidate_types = policy_types
+    attempted_types = {
+        item.strip()
+        for item in (diagnostics.attempted_dependency_types if diagnostics else ())
+        if item
+    }
+    allowed_types: list[str] = []
+    seen_types: set[str] = set()
+    for dependency_type in candidate_types:
+        if not dependency_type:
+            continue
+        normalized = str(dependency_type).strip()
+        if normalized in attempted_types:
+            continue
+        if normalized and normalized not in seen_types:
+            seen_types.add(normalized)
+            allowed_types.append(normalized)
+    return allowed_versions, allowed_types
 
 
 def _build_consistency_event(
@@ -239,6 +326,8 @@ def _create_attempt_snapshot(
     state_revision: int,
     plan_id: str | None = None,
     workaround_context: WorkaroundContext | None = None,
+    allowed_target_versions: Iterable[str] = (),
+    allowed_dependency_types: Iterable[str] = (),
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
     """Commit the exact worker input and return the revised task projection."""
     task_revision = task.task_revision + 1
@@ -262,8 +351,20 @@ def _create_attempt_snapshot(
         strategy_stage=task.strategy_stage,
         no_fix_stage=task.no_fix_stage,
         selected_version=task.selected_version,
+        allowed_target_versions=list(
+            dict.fromkeys(
+                str(value).strip().lstrip("vV")
+                for value in allowed_target_versions
+                if str(value).strip()
+            )
+        ),
         target_package_name=task.target_package_name,
         target_dependency_type=task.target_dependency_type,
+        allowed_dependency_types=list(
+            dict.fromkeys(
+                str(value).strip() for value in allowed_dependency_types if str(value).strip()
+            )
+        ),
         parent_minimum_version=task.parent_minimum_version,
         instruction=task.instruction,
         instruction_digest=_instruction_digest(task.instruction),
@@ -1047,6 +1148,10 @@ def _parse_planner_retry_plans(
             )
             else "retry_update"
         )
+        candidate_dependency_types = _supervisor_dependency_type_candidates(
+            effective_stage,
+            target_type,
+        )
         diagnostics = prior.model_copy(
             update={
                 "strategy_stage": effective_stage,
@@ -1057,6 +1162,7 @@ def _parse_planner_retry_plans(
                 "exhausted_update_path": exhausted,
                 "target_package_name": target_package,
                 "target_dependency_type": target_type,
+                "candidate_dependency_types": candidate_dependency_types,
                 "parent_package_name": (
                     group.parent_package_name if group is not None else task.parent_package_name
                 ),
@@ -1092,6 +1198,7 @@ def _parse_planner_retry_plans(
             selected_version=selected,
             attempted_versions=attempted,
             candidate_versions_considered=candidates,
+            candidate_dependency_types=candidate_dependency_types,
             latest_version_seen=latest_seen,
             exhausted_update_path=exhausted,
             package_abandoned=prior.package_abandoned,
@@ -1935,7 +2042,7 @@ def _build_high_level_retry_instruction(
             f"during strategy stage {task.strategy_stage.value}: "
             f"{target_clause} in {manifest} to exact version {diagnostics.selected_version}; "
             "do not edit any other dependency target; "
-            "after all requested manifest edits, run the single final manifest synchronization validation."
+            "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
         )
     if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
         floor = group.fix_plan.fixed_version
@@ -1946,12 +2053,12 @@ def _build_high_level_retry_instruction(
                     f"Apply strategy stage {task.strategy_stage.value} for transitive package {component}: "
                     f"update only directly declared parent {parent_name} in {manifest} to the "
                     "supervisor-selected compatible parent version; do not use a child override; "
-                    "after all requested manifest edits, run the single final manifest synchronization validation."
+                    "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
                 )
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update {manifest} to exact OSV minimum fixed version {floor}; "
-                "after all requested manifest edits, run the single final manifest synchronization validation."
+                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
             )
     if diagnostics and task.strategy in {RoutingStrategy.VERSION_BUMP}:
         attempted = set(diagnostics.attempted_versions)
@@ -1973,32 +2080,34 @@ def _build_high_level_retry_instruction(
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update only {target} in {manifest} to exact version {candidate}; "
-                "after all requested manifest edits, run the single final manifest synchronization validation."
+                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
             )
     if diagnostics and diagnostics.package_abandoned:
         return (
-            f"Investigate whether {component} still has a supported manifest-based update path. "
-            "Use registry evidence to confirm whether the package is unpublished, abandoned, or "
-            "otherwise exhausted, and report that clearly if no valid update path remains."
+            f"The Supervisor found no remaining supported manifest-based update candidate for {component}. "
+            "Do not select another version; report the bounded update failure so the Supervisor can "
+            "pivot this task safely."
         )
     if category == FailureCategory.PEER_CONFLICT:
         return (
-            f"Investigate compatible patched releases or override paths for {component}. "
-            "Prioritize peer-compatible backports or npm overrides that preserve validation."
+            f"Use only the Supervisor-approved peer-compatible candidate or override path for {component}. "
+            "Preserve the committed package and manifest targets while retrying the combined transaction."
         )
     if category == FailureCategory.SECURITY_FLAG:
         return (
-            f"Investigate patched manifest remediation paths for {component}. "
-            "Use registry evidence to compare newer releases, backported patches, and override strategies."
+            f"Use only the Supervisor-approved patched manifest candidate for {component}. "
+            "Do not query a registry or invent a newer release; retry the combined transaction with "
+            "a different committed candidate when instructed."
         )
     if category == FailureCategory.BREAKING_CHANGE:
         return (
-            f"Document the validated version outcome for {component} and the specific API or test regressions. "
-            "Do not search for another version unless new evidence shows a safer compatible patch exists."
+            f"Use only the Supervisor-approved compatible candidate for {component} and preserve the "
+            "committed manifest target. Do not search for another version or change source code."
         )
     return (
-        f"Investigate remaining safe manifest remediation paths for {component}. "
-        "Use registry evidence and prior validation failures to choose the next bounded retry."
+        f"Execute the next Supervisor-approved manifest candidate for {component}. "
+        "Use prior validation failures only to follow the committed retry instruction; do not query "
+        "a registry or choose a candidate."
     )
 
 
@@ -2030,6 +2139,8 @@ def _override_dependency_type(group: VulnerabilityGroup | None) -> str:
 def _plan_initial_transitive_task(
     task: RemediationTask,
     group: VulnerabilityGroup,
+    *,
+    candidate_versions: list[str] | None = None,
 ) -> RemediationTask:
     """Select the first parent-first candidate before worker dispatch.
 
@@ -2037,6 +2148,12 @@ def _plan_initial_transitive_task(
     failures or an empty candidate set advance deterministically to the next
     parent stage, and only a fully exhausted parent path commits a child
     package-manager override.
+
+    Args:
+        task: Pending transitive dependency task to plan.
+        group: Vulnerability group containing the transitive dependency chain.
+        candidate_versions: Optional mutable output list populated with the
+            unfiltered registry candidates used for the selected parent stage.
     """
     if (
         task.strategy != RoutingStrategy.VERSION_BUMP
@@ -2091,7 +2208,14 @@ def _plan_initial_transitive_task(
                 exc,
             )
             report = ""
+        report_candidates = _registry_report_versions(report, "Eligible Candidates")
+        if not report_candidates:
+            report_candidates = _registry_report_versions(report, "Compatible Parent Versions")
         selected = _registry_selected_version(report)
+        if selected and candidate_versions is not None:
+            for candidate in [*report_candidates, selected]:
+                if candidate not in candidate_versions:
+                    candidate_versions.append(candidate)
         if not selected:
             continue
         attempted.add(selected)
@@ -2791,16 +2915,21 @@ def _apply_transition(
         for task_id in target_ids:
             task = projected_tasks[task_id]
             if task.current_attempt_id is None and task.instruction:
+                plan = retry_plans_by_task.get(task_id)
+                diagnostics = retry_diagnostics_by_task.get(task_id)
+                allowed_versions, allowed_dependency_types = (
+                    _ordered_update_candidates(task, plan=plan, diagnostics=diagnostics)
+                    if decision.next_node == "update_subagent"
+                    else ([], [])
+                )
                 committed, _snapshot = _create_attempt_snapshot(
                     task,
                     dispatch_node=decision.next_node,
                     snapshots_by_id=projected_snapshots,
                     state_revision=state_revision,
-                    plan_id=(
-                        retry_plans_by_task[task_id].plan_id
-                        if task_id in retry_plans_by_task
-                        else None
-                    ),
+                    plan_id=(plan.plan_id if plan is not None else None),
+                    allowed_target_versions=allowed_versions,
+                    allowed_dependency_types=allowed_dependency_types,
                 )
                 projected_tasks[task_id] = committed
     return {
@@ -3037,6 +3166,10 @@ def _build_deterministic_retry_plan(
     )
     safe_candidate_versions = candidate_versions[:30] if selected_version or exhausted else []
     safe_latest_version = latest_version_seen if selected_version or exhausted else None
+    candidate_dependency_types = _supervisor_dependency_type_candidates(
+        effective_stage,
+        target_dependency_type,
+    )
     effective_diagnostics = diagnostics.model_copy(
         update={
             "strategy_stage": effective_stage,
@@ -3048,6 +3181,7 @@ def _build_deterministic_retry_plan(
             "exhausted_update_path": exhausted,
             "target_package_name": target_package_name,
             "target_dependency_type": target_dependency_type,
+            "candidate_dependency_types": candidate_dependency_types,
             "parent_package_name": (
                 group.parent_package_name if group is not None else diagnostics.parent_package_name
             ),
@@ -3075,6 +3209,7 @@ def _build_deterministic_retry_plan(
         selected_version=selected_version,
         attempted_versions=list(diagnostics.attempted_versions),
         candidate_versions_considered=safe_candidate_versions,
+        candidate_dependency_types=candidate_dependency_types,
         latest_version_seen=safe_latest_version,
         exhausted_update_path=exhausted,
         package_abandoned=diagnostics.package_abandoned,
@@ -3225,6 +3360,7 @@ def _run_deterministic_retry_planner(
                 "exhausted_update_path": plan.exhausted_update_path,
                 "target_package_name": plan.target_package_name,
                 "target_dependency_type": plan.target_dependency_type,
+                "candidate_dependency_types": plan.candidate_dependency_types,
                 "parent_minimum_version": plan.parent_minimum_version,
             }
         )
@@ -3268,6 +3404,7 @@ def _commit_retry_plans(
                     "committed_attempt_id": committed_task.current_attempt_id,
                     "strategy_stage": committed_task.strategy_stage,
                     "selected_version": committed_task.selected_version,
+                    "candidate_dependency_types": plan.candidate_dependency_types,
                     "exhausted_update_path": committed_task.exhausted_update_path,
                     "target_package_name": committed_task.target_package_name,
                     "target_dependency_type": committed_task.target_dependency_type,
@@ -3694,7 +3831,50 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and task.parent_package_name
             and task.strategy_stage == SCARemediationStage.OSV_MINIMUM
         ):
-            task_queue[task_id] = _plan_initial_transitive_task(task, group)
+            initial_candidates: list[str] = []
+            planned_task = _plan_initial_transitive_task(
+                task,
+                group,
+                candidate_versions=initial_candidates,
+            )
+            task_queue[task_id] = planned_task
+            prior_diagnostics = retry_diagnostics_by_task.get(task_id)
+            parent_name, _, parent_type = group_parent_context(group)
+            target_type = planned_task.target_dependency_type or parent_type
+            initial_diagnostics = prior_diagnostics or UpdateRetryDiagnostics(task_id=task_id)
+            retry_diagnostics_by_task[task_id] = initial_diagnostics.model_copy(
+                update={
+                    "strategy_stage": planned_task.strategy_stage,
+                    "security_floor": (
+                        group.fix_plan.fixed_version
+                        if group.fix_plan is not None
+                        else initial_diagnostics.security_floor
+                    ),
+                    "selected_version": planned_task.selected_version,
+                    "candidate_versions_considered": list(
+                        dict.fromkeys(
+                            [
+                                *initial_diagnostics.candidate_versions_considered,
+                                *initial_candidates,
+                                *(
+                                    [planned_task.selected_version]
+                                    if planned_task.selected_version
+                                    else []
+                                ),
+                            ]
+                        )
+                    ),
+                    "candidate_dependency_types": _supervisor_dependency_type_candidates(
+                        planned_task.strategy_stage,
+                        target_type,
+                    ),
+                    "target_package_name": planned_task.target_package_name,
+                    "target_dependency_type": target_type,
+                    "parent_package_name": parent_name,
+                    "parent_minimum_version": planned_task.parent_minimum_version,
+                    "registry_query_performed": bool(initial_candidates),
+                }
+            )
 
     # ------------------------------------------------------------------
     # 2. Ingest attempt-tagged worker results (active targets only)
@@ -3774,26 +3954,51 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 continue
 
             execution = result.execution_diagnostics
-            attempted_versions = list(
-                dict.fromkeys(execution.attempted_versions or result.executed_versions)
-            )
             result_status = result.status
-            normalized_executed = {
-                version.strip().lstrip("vV").lower()
-                for version in result.executed_versions
-                if version
-            }
-            normalized_selected = (
-                snapshot.selected_version.strip().lstrip("vV").lower()
-                if snapshot.selected_version
+            raw_executed_versions = list(
+                dict.fromkeys(
+                    [
+                        *result.executed_versions,
+                        *execution.executed_versions,
+                    ]
+                )
+            )
+            reported_effective_version = execution.effective_target_version or (
+                raw_executed_versions[-1] if raw_executed_versions else None
+            )
+            effective_version = (
+                reported_effective_version or snapshot.selected_version
+                if result_status == AgentActionStatus.SUCCESS
                 else None
             )
-            if (
-                result_status == AgentActionStatus.SUCCESS
-                and normalized_selected
-                and normalized_executed
-                and normalized_selected not in normalized_executed
-            ):
+            reported_effective_dependency_type = execution.effective_dependency_type
+            effective_dependency_type = (
+                reported_effective_dependency_type or snapshot.target_dependency_type
+                if result_status == AgentActionStatus.SUCCESS
+                else None
+            )
+            attempted_versions = list(
+                dict.fromkeys(
+                    [
+                        *execution.attempted_versions,
+                        *raw_executed_versions,
+                        *([reported_effective_version] if reported_effective_version else []),
+                    ]
+                )
+            )
+            allowed_versions = list(snapshot.allowed_target_versions)
+            if not allowed_versions and snapshot.selected_version:
+                allowed_versions = [snapshot.selected_version]
+            normalized_executed = {
+                version.strip().lstrip("vV").lower()
+                for version in [*raw_executed_versions, reported_effective_version]
+                if version
+            }
+            normalized_allowed = {
+                version.strip().lstrip("vV").lower() for version in allowed_versions if version
+            }
+            unexpected_executed = normalized_executed - normalized_allowed
+            if unexpected_executed:
                 result_status = AgentActionStatus.SURRENDER
                 consistency_events.append(
                     _build_consistency_event(
@@ -3803,15 +4008,60 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         received_attempt_id=result.attempt_id,
                         action="replanned",
                         details=(
-                            f"Committed {snapshot.selected_version}; worker executed "
-                            f"{', '.join(result.executed_versions)}."
+                            f"Supervisor-approved versions were {', '.join(sorted(normalized_allowed))}; "
+                            f"worker executed {', '.join(raw_executed_versions or [reported_effective_version or 'unknown'])}."
                         ),
                     )
                 )
                 errors.append(
                     f"supervisor: rejected worker result for {task_id} because the "
-                    "executed version differed from the committed version."
+                    "executed version was outside the committed candidate allowlist."
                 )
+            allowed_dependency_types = list(snapshot.allowed_dependency_types)
+            if not allowed_dependency_types and snapshot.target_dependency_type:
+                allowed_dependency_types = [snapshot.target_dependency_type]
+            observed_dependency_type = (
+                str(reported_effective_dependency_type).strip()
+                if reported_effective_dependency_type
+                else None
+            )
+            normalized_effective_type = (
+                effective_dependency_type.strip() if effective_dependency_type else None
+            )
+            normalized_allowed_dependency_types = {
+                value.strip().lower() for value in allowed_dependency_types if value
+            }
+            if (
+                observed_dependency_type
+                and observed_dependency_type.lower() not in normalized_allowed_dependency_types
+            ):
+                result_status = AgentActionStatus.SURRENDER
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="EXECUTED_DEPENDENCY_TYPE_MISMATCH",
+                        task_id=task_id,
+                        expected_attempt_id=current_attempt_id,
+                        received_attempt_id=result.attempt_id,
+                        action="replanned",
+                        details=(
+                            f"Supervisor-approved dependency types were {', '.join(allowed_dependency_types)}; "
+                            f"worker executed {observed_dependency_type}."
+                        ),
+                    )
+                )
+                errors.append(
+                    f"supervisor: rejected worker result for {task_id} because the "
+                    "executed dependency type was outside the committed candidate allowlist."
+                )
+            if result_status != AgentActionStatus.SUCCESS:
+                # Effective values describe a successful committed
+                # transaction only. Attempted but rejected candidates remain
+                # in the attempted lists and must never be presented as the
+                # effective Supervisor-approved result.
+                effective_version = None
+                effective_dependency_type = None
+            else:
+                effective_dependency_type = normalized_effective_type
             if (
                 result_status == AgentActionStatus.SUCCESS
                 and task.strategy == RoutingStrategy.CODE_WORKAROUND
@@ -3874,6 +4124,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         ]
                     )
                 )
+            attempted_dependency_types = list(
+                dict.fromkeys(
+                    prior.attempted_dependency_types
+                    + ([observed_dependency_type] if observed_dependency_type else [])
+                )
+            )
             used_overrides = (
                 prior.used_overrides
                 or task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
@@ -3886,7 +4142,20 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         dict.fromkeys(prior.attempted_versions + attempted_versions)
                     ),
                     "executed_versions": list(
-                        dict.fromkeys(prior.executed_versions + result.executed_versions)
+                        dict.fromkeys(
+                            prior.executed_versions
+                            + list(result.executed_versions or execution.executed_versions)
+                        )
+                    ),
+                    "effective_target_version": effective_version or prior.effective_target_version,
+                    "effective_dependency_type": effective_dependency_type
+                    or prior.effective_dependency_type,
+                    "attempted_dependency_types": attempted_dependency_types,
+                    "candidate_versions_considered": list(
+                        dict.fromkeys(prior.candidate_versions_considered + allowed_versions)
+                    ),
+                    "candidate_dependency_types": list(
+                        dict.fromkeys(prior.candidate_dependency_types + allowed_dependency_types)
                     ),
                     "selected_version": task.selected_version,
                     "strategy_stage": task.strategy_stage,
@@ -5354,6 +5623,24 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 state_revision=state_revision,
                 plan_id=plan.plan_id if plan is not None else None,
                 workaround_context=workaround_ctx,
+                allowed_target_versions=(
+                    _ordered_update_candidates(
+                        task,
+                        plan=plan,
+                        diagnostics=retry_diagnostics_by_task.get(task_id),
+                    )[0]
+                    if resolved_next_node == "update_subagent"
+                    else []
+                ),
+                allowed_dependency_types=(
+                    _ordered_update_candidates(
+                        task,
+                        plan=plan,
+                        diagnostics=retry_diagnostics_by_task.get(task_id),
+                    )[1]
+                    if resolved_next_node == "update_subagent"
+                    else []
+                ),
             )
             task_queue[task_id] = task
             prior = retry_diagnostics_by_task.get(task_id)

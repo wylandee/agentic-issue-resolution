@@ -20,17 +20,14 @@ from remediation_engine.orchestration.trajectory_exporter import (
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
 MAX_VALIDATION_GATE_ATTEMPTS = 3
 MAX_VALIDATION_INPUT_ERRORS = 3
+MAX_UPDATE_MANIFEST_ATTEMPTS = 3
 SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
+_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
 
 # Manifest mutations and validation form a single ordered transaction. The
 # worker must observe the result of one operation before issuing the next.
-_SERIAL_MANIFEST_TOOL_NAMES = frozenset(
-    {
-        "modify_npm_dependency",
-        "validate_manifest_sync",
-    }
-)
+_SERIAL_MANIFEST_TOOL_NAMES = frozenset({_UPDATE_MANIFEST_TOOL_NAME})
 
 
 @dataclass(frozen=True)
@@ -89,7 +86,12 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
                     res.append(str(r["file_path"]).replace("\\", "/").lstrip("/"))
             return res
 
-    if tool_event.name == "modify_npm_dependency":
+    if tool_event.name == _UPDATE_MANIFEST_TOOL_NAME:
+        # Deferred and failed transactions did not leave a committed file
+        # change. The combined tool's SUCCESS result is the authoritative
+        # changed-file signal.
+        if not tool_event.content.lstrip().startswith("SUCCESS:"):
+            return []
         manifest_path = tool_event.args.get("manifest_path", "package.json")
         if isinstance(manifest_path, str) and manifest_path.strip():
             return [manifest_path.replace("\\", "/")]
@@ -159,7 +161,41 @@ def _tool_call_signature(tool_call: dict[str, Any]) -> tuple[str, str]:
 def _is_failed_tool_result(content: str) -> bool:
     """Return whether a tool response indicates that the requested operation failed."""
     lowered = content.lstrip().lower()
-    return lowered.startswith(("error:", "not found:", "failed:", "failure:"))
+    return lowered.startswith(("error:", "error_code:", "not found:", "failed:", "failure"))
+
+
+def _manifest_retry_recovery_instruction(
+    tool_event: ToolEvent,
+    *,
+    attempts: int,
+) -> str:
+    """Build the next-step instruction after a failed update transaction."""
+    package_name = str(tool_event.args.get("package_name", "")).strip() or "the same package"
+    current_version = (
+        str(tool_event.args.get("target_version", "")).strip() or "the current version"
+    )
+    current_type = (
+        str(tool_event.args.get("dependency_type", "")).strip() or "the current dependency type"
+    )
+    evidence = (
+        tool_event.content.strip()[:2_000]
+        or "The combined update transaction failed without diagnostics."
+    )
+    if attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS:
+        return (
+            f"The update transaction for {package_name} has exhausted its {MAX_UPDATE_MANIFEST_ATTEMPTS}-attempt limit. "
+            "Do not call modify_and_validate_npm_dependency for this package again; continue with the next independent task "
+            "or surrender this package.\n"
+            f"Exact transaction result:\n{evidence}"
+        )
+    return (
+        f"The combined manifest transaction for {package_name} failed on attempt {attempts} with "
+        f"target_version={current_version!r}, dependency_type={current_type!r}.\n"
+        f"Exact transaction result:\n{evidence}\n"
+        "Call modify_and_validate_npm_dependency again for the same Supervisor-owned package and manifest, "
+        "but change target_version or dependency_type to a different value from the Supervisor-approved candidate lists. "
+        "Do not query the registry, edit source files, or repeat the exact same call signature."
+    )
 
 
 def _stagnation_recovery_instruction(
@@ -327,12 +363,12 @@ def _manifest_call_deferred_instruction(deferred_tool_names: Sequence[str]) -> s
     """
     names = ", ".join(deferred_tool_names)
     return (
-        "Manifest operation sequencing barrier: only one modify_npm_dependency "
-        "or validate_manifest_sync call may execute per assistant turn. "
-        f"Deferred call(s): {names}. The prior manifest operation has already "
-        "been executed. On the next turn, inspect its result and continue with "
-        "the required validate_manifest_sync call for that same package before "
-        "moving to the next package. Do not repeat a successful modification."
+        "Manifest transaction sequencing barrier: only one "
+        f"{_UPDATE_MANIFEST_TOOL_NAME} call may execute per assistant turn. "
+        f"Deferred call(s): {names}. The prior combined edit-and-sync transaction "
+        "has already been executed. On the next turn, inspect its result and "
+        "continue with the next authorized package or a changed candidate; do not "
+        "repeat a successful transaction."
     )
 
 
@@ -388,6 +424,8 @@ def run_bounded_subagent_loop(
     failed_tool_call_counts: dict[tuple[str, str], int] = {}
     recovery_signatures: set[tuple[str, str]] = set()
     last_failed_tool_content: dict[tuple[str, str], str] = {}
+    manifest_attempts_by_package: dict[str, int] = {}
+    manifest_retry_exhausted_packages: set[str] = set()
     consecutive_validation_failures = 0
     validation_gate_call_count = int((execution_state or {}).get("validation_calls", 0))
     validation_input_error_count = int((execution_state or {}).get("validation_input_errors", 0))
@@ -485,6 +523,7 @@ def run_bounded_subagent_loop(
         blocker_errors: list[str] = []
         manifest_call_seen = False
         deferred_manifest_calls: list[str] = []
+        manifest_retry_instructions: dict[str, str] = {}
         turn_event_start = len(tool_events)
         for tool_call in tool_calls:
             tool_name = str(tool_call.get("name", ""))
@@ -493,6 +532,31 @@ def run_bounded_subagent_loop(
             if not isinstance(tool_call_id, str) or not tool_call_id.strip():
                 malformed_tool_call = True
                 tool_call_id = "invalid-tool-call-id"
+            if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
+                # Set the barrier before handling suppressed or synthetic
+                # failures as well. Every manifest call in an assistant turn
+                # must be deferred after the first one, regardless of whether
+                # the first call reached the underlying tool.
+                if manifest_call_seen:
+                    deferred_manifest_calls.append(tool_name)
+                    tool_message = ToolMessage(
+                        content=(
+                            "DEFERRED: manifest tools are serialized. This call was not "
+                            "executed; continue it in the next assistant turn after the "
+                            "current package operation has been observed."
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                    conversation.append(tool_message)
+                    event = ToolEvent(
+                        name=tool_name,
+                        args=tool_call.get("args", {}) or {},
+                        content=tool_message.content,
+                    )
+                    tool_events.append(event)
+                    continue
+                manifest_call_seen = True
             if call_signature in recovery_signatures:
                 prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
                 tool_message = ToolMessage(
@@ -505,25 +569,59 @@ def run_bounded_subagent_loop(
                     name=tool_name,
                 )
             else:
-                if tool_name in _SERIAL_MANIFEST_TOOL_NAMES and manifest_call_seen:
-                    deferred_manifest_calls.append(tool_name)
-                    tool_message = ToolMessage(
-                        content=(
-                            "DEFERRED: manifest tools are serialized. This call was not "
-                            "executed; continue it in the next assistant turn after the "
-                            "current package operation has been observed."
-                        ),
-                        tool_call_id=tool_call_id,
-                        name=tool_name,
+                if tool_name == _UPDATE_MANIFEST_TOOL_NAME:
+                    # A synthetic retry-limit response is still the one
+                    # serialized manifest call for this assistant turn.
+                    package_name = str(
+                        (tool_call.get("args", {}) or {}).get("package_name", "")
+                    ).strip()
+                    state_attempts = int(
+                        (
+                            (execution_state or {}).get(
+                                "manifest_transaction_attempts_by_package", {}
+                            )
+                        ).get(package_name, 0)
                     )
+                    runtime_attempts = manifest_attempts_by_package.get(package_name, 0)
+                    attempts = max(state_attempts, runtime_attempts)
+                    if (
+                        package_name in manifest_retry_exhausted_packages
+                        or attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS
+                    ):
+                        tool_message = ToolMessage(
+                            content=(
+                                "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined "
+                                f"update attempts are allowed for package {package_name or '(unknown)'}."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        )
+                    else:
+                        tool_message = _invoke_bound_tool(tool_map, tool_call)
+                        manifest_attempts_by_package[package_name] = attempts + 1
+                        if execution_state is not None:
+                            runtime_attempts_by_package = execution_state.setdefault(
+                                "manifest_runtime_attempts_by_package", {}
+                            )
+                            runtime_attempts_by_package[package_name] = max(
+                                int(runtime_attempts_by_package.get(package_name, 0)),
+                                manifest_attempts_by_package[package_name],
+                            )
+                            execution_state["manifest_transaction_attempts"] = max(
+                                int(execution_state.get("manifest_transaction_attempts", 0)),
+                                sum(manifest_attempts_by_package.values()),
+                            )
                 else:
-                    if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
-                        manifest_call_seen = True
                     if (
                         execution_state is not None
                         and execution_state.get("phase") == "VALIDATE"
                         and tool_name
-                        in {"record_plan", "search_web", "read_web_page", "read_repository_map"}
+                        in {
+                            "record_plan",
+                            "search_web",
+                            "read_web_page",
+                            "read_repository_map",
+                        }
                     ):
                         tool_message = ToolMessage(
                             content=(
@@ -581,6 +679,30 @@ def run_bounded_subagent_loop(
                     recovery_signatures.add(call_signature)
             else:
                 failed_tool_call_counts.pop(call_signature, None)
+
+            if event.name == _UPDATE_MANIFEST_TOOL_NAME and _is_failed_tool_result(
+                tool_message.content
+            ):
+                package_name = str(event.args.get("package_name", "")).strip()
+                attempts_by_package = (execution_state or {}).get(
+                    "manifest_transaction_attempts_by_package", {}
+                )
+                attempts = max(
+                    int(attempts_by_package.get(package_name, 0)),
+                    manifest_attempts_by_package.get(package_name, 0),
+                )
+                if attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS:
+                    manifest_retry_exhausted_packages.add(package_name)
+                    if execution_state is not None:
+                        exhausted = list(
+                            execution_state.get("manifest_retry_exhausted_packages", []) or []
+                        )
+                        if package_name not in exhausted:
+                            exhausted.append(package_name)
+                        execution_state["manifest_retry_exhausted_packages"] = exhausted
+                manifest_retry_instructions[package_name or "__unknown__"] = (
+                    _manifest_retry_recovery_instruction(event, attempts=attempts)
+                )
 
             if event.name == "run_targeted_test" and event.content.startswith("FAILURE:"):
                 conversation.append(
@@ -716,6 +838,9 @@ def run_bounded_subagent_loop(
             conversation.append(
                 HumanMessage(content=_manifest_call_deferred_instruction(deferred_manifest_calls))
             )
+
+        for instruction in manifest_retry_instructions.values():
+            conversation.append(HumanMessage(content=instruction))
 
         if malformed_tool_call:
             errors.append(

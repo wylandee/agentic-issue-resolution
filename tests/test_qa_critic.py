@@ -1369,6 +1369,7 @@ class TestBuildQaToolbelt:
     }
     _FORBIDDEN_TOOL_NAMES = {
         "deterministic_search_replace",
+        "modify_and_validate_npm_dependency",
         "modify_npm_dependency",
         "revert_workspace_file",
         "validate_manifest_sync",
@@ -2480,7 +2481,6 @@ class TestQAToolsNotInSubagentToolbelts:
         tools = build_update_toolbelt(
             sandbox,
             touched_files=set(),
-            host_repo_root=Path("/repo"),
             target_manifest_paths=["package.json"],
             package_manifest_paths={"lodash": ["package.json"]},
         )
