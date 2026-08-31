@@ -1,15 +1,15 @@
-"""Deterministic human-readable reporting for a Phase 5 remediation run.
+"""Human-readable reporting for a Phase 5 remediation run.
 
 The graph node renders the state available after teardown and before the graph
-exits.  The orchestrator then finalizes and persists that report before the
+exits. The orchestrator then finalizes and persists that report before the
 final trajectory export, so both artifacts contain the same report metadata.
-The optional LLM call is limited to an executive narrative and cannot
-determine any report facts or statuses.
+Report facts, statuses, findings, and file changes are derived
+deterministically; the report contains no model-generated narrative or error
+telemetry.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections import Counter
@@ -46,6 +46,7 @@ _PACKAGE_FILE_RE = re.compile(
 )
 _PACKAGE_LINE_RE = re.compile(r'^\s*"(?P<name>(?:@[^" ]+/)?[^" ]+)"\s*:\s*"(?P<version>[^"\n]+)"')
 _LOCKFILE_PACKAGE_RE = re.compile(r'^\s*"(?P<name>(?:node_modules/)?(?:@[^" ]+/)?[^" ]+)"\s*:\s*\{')
+_LOCKFILE_RESOLVED_RE = re.compile(r'^\s*"resolved"\s*:\s*"(?P<url>[^"\n]+)"')
 _MANIFEST_SECTION_RE = re.compile(
     r'^\s*"(?P<section>dependencies|devDependencies|optionalDependencies|'
     r'peerDependencies|overrides|resolutions)"\s*:\s*\{'
@@ -403,6 +404,107 @@ def _unique_texts(values: Sequence[Any]) -> list[str]:
     return result
 
 
+_USER_FRIENDLY_STATUS_LABELS = {
+    "qa_passed": "Fixed",
+    "mitigated": "Fixed",
+    "unfixable": "Unresolved",
+    "needs_retry": "Retry needed",
+    "inconclusive": "Inconclusive",
+    "pending": "Pending",
+    "optimistically_fixed": "Awaiting validation",
+    "awaiting_validation": "Awaiting validation",
+    "pivoted": "Unresolved",
+}
+
+
+def _user_friendly_status(status: Any) -> str:
+    """Convert an internal lifecycle status into reader-facing language.
+
+    Args:
+        status: Enum or string status from a task or group projection.
+
+    Returns:
+        A concise status label that does not expose orchestration terminology.
+    """
+    normalized = _text(status).strip().casefold()
+    if not normalized:
+        return "Pending"
+    return _USER_FRIENDLY_STATUS_LABELS.get(
+        normalized,
+        normalized.replace("_", " ").capitalize(),
+    )
+
+
+def _format_duration(seconds: float | None) -> str:
+    """Format an elapsed run duration for the summary table.
+
+    Args:
+        seconds: Elapsed seconds, or ``None`` while a preliminary report is
+            waiting for finalization.
+
+    Returns:
+        ``Pending finalization`` when unavailable, a two-decimal seconds value
+        for short runs, or a compact hours/minutes/seconds value.
+    """
+    if seconds is None:
+        return "Pending finalization"
+    try:
+        elapsed = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "Pending finalization"
+    if elapsed < 60:
+        return f"{elapsed:.2f}s"
+
+    whole_seconds = int(round(elapsed))
+    minutes, remainder = divmod(whole_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {remainder}s"
+    return f"{minutes}m {remainder}s"
+
+
+def _format_token_summary(context: ReportContext) -> str:
+    """Format total token usage and its prompt/completion breakdown."""
+    total = context.total_tokens
+    if (
+        total is None
+        and context.total_input_tokens is not None
+        and context.total_output_tokens is not None
+    ):
+        total = context.total_input_tokens + context.total_output_tokens
+    if total is None:
+        return "Unavailable"
+
+    total_text = f"{int(total):,}"
+    if context.total_input_tokens is None or context.total_output_tokens is None:
+        return total_text
+    return (
+        f"{total_text} (Input: {int(context.total_input_tokens):,}, "
+        f"Output: {int(context.total_output_tokens):,})"
+    )
+
+
+def _diff_file_paths(diff: str) -> list[str]:
+    """Return repository paths represented by unified-diff file headers."""
+    return _unique_texts(
+        line[6:].strip() for line in diff.splitlines() if line.startswith("+++ b/")
+    )
+
+
+def _patch_file_paths(context: ReportContext) -> list[str]:
+    """Return changed files from the patch projection and diff headers."""
+    return _unique_texts([*context.changed_files, *_diff_file_paths(context.diff)])
+
+
+def _format_patch_status(context: ReportContext) -> str:
+    """Format whether a unified patch is available and how many files changed."""
+    if not context.has_patch:
+        return "Not available"
+    count = len(_patch_file_paths(context))
+    noun = "file" if count == 1 else "files"
+    return f"Available ({count} {noun} changed)"
+
+
 def _qa_record_summary(
     qa_evaluations: Mapping[str, Any],
     qa_results_by_attempt: Mapping[str, Any],
@@ -499,7 +601,6 @@ def _build_context(
     trace_url: str | None = None,
     token_summary: Mapping[str, Any] | None = None,
     run_ended_at: datetime | None = None,
-    executive_narrative: str | None = None,
 ) -> ReportContext:
     """Normalize graph state into the renderer's evidence contract."""
     initial_groups = _items(state.get("initial_valid_groups"))
@@ -518,12 +619,6 @@ def _build_context(
         for group in all_groups
     }
     reconciliation = _mapping(state.get("triage_reconciliation"))
-    added_ids = _reconciliation_ids(reconciliation, "added", "new_group_ids")
-    reappeared_ids = _reconciliation_ids(
-        reconciliation,
-        "reappeared",
-        "reappeared_group_ids",
-    )
     ended = _iso(run_ended_at)
     started = _iso(state.get("run_started_at"))
     tokens = dict(token_summary or {})
@@ -535,28 +630,48 @@ def _build_context(
     if not issues:
         issues = [issue for group in initial_groups for issue in _items(_value(group, "issues"))]
     final_scan = state.get("final_full_scan_result")
-    post_scan_issues = _items(state.get("post_remediation_scan_issues"))
-    if not post_scan_issues:
-        post_scan_issues = _items(_value(final_scan, "found_issues"))
+    final_scan_issues = _value(final_scan, "found_issues")
+    post_scan_issues = (
+        _items(final_scan_issues)
+        if final_scan_issues is not None
+        else _items(state.get("post_remediation_scan_issues"))
+    )
+    final_scan_identifiers = _value(final_scan, "found_identifiers")
     post_scan_identifiers = _unique_texts(
-        _items(state.get("post_remediation_scan_identifiers"))
-        or _items(_value(final_scan, "found_identifiers"))
-        or [identifier for issue in post_scan_issues for identifier in _issue_identifiers(issue)]
+        _items(final_scan_identifiers)
+        if final_scan_identifiers is not None
+        else _items(state.get("post_remediation_scan_identifiers"))
     )
+    if not post_scan_identifiers:
+        post_scan_identifiers = _unique_texts(
+            identifier for issue in post_scan_issues for identifier in _issue_identifiers(issue)
+        )
+    final_new_identifiers = _value(final_scan, "new_identifiers")
     new_identifiers = _unique_texts(
-        _items(state.get("new_vulnerability_identifiers"))
-        or _items(_value(final_scan, "new_identifiers"))
+        _items(final_new_identifiers)
+        if final_new_identifiers is not None
+        else _items(state.get("new_vulnerability_identifiers"))
     )
+    final_remaining_identifiers = _value(final_scan, "remaining_target_identifiers")
     remaining_identifiers = _unique_texts(
-        _items(state.get("remaining_target_identifiers"))
-        or _items(_value(final_scan, "remaining_target_identifiers"))
+        _items(final_remaining_identifiers)
+        if final_remaining_identifiers is not None
+        else _items(state.get("remaining_target_identifiers"))
     )
+    final_scan_status = _value(final_scan, "status")
     new_status = _text(
-        state.get("new_vulnerability_status") or _value(final_scan, "status"),
+        final_scan_status
+        if final_scan_status is not None
+        else state.get("new_vulnerability_status"),
         "not_scanned",
     )
     scan_evidence_state = _scan_evidence_state(final_scan, new_status)
-    triage_required_value = state.get("triage_required")
+    final_scan_triage_required = _value(final_scan, "triage_required")
+    triage_required_value = (
+        final_scan_triage_required
+        if final_scan_triage_required is not None
+        else state.get("triage_required")
+    )
     triage_required = bool(
         _value(final_scan, "triage_required")
         if triage_required_value is None
@@ -570,7 +685,7 @@ def _build_context(
         remaining_identifiers,
     )
     status_counts = Counter(
-        statuses.get(_text(_value(group, "group_id")), "pending") for group in initial_groups
+        statuses.get(_text(_value(group, "group_id")), "pending") for group in all_groups
     )
     counts = {
         "fixed": status_counts.get("qa_passed", 0) + status_counts.get("mitigated", 0),
@@ -578,8 +693,17 @@ def _build_context(
         "inconclusive": status_counts.get("inconclusive", 0),
         "pending": status_counts.get("pending", 0) + status_counts.get("optimistically_fixed", 0),
     }
-    discovered_ids = _unique_texts([*added_ids, *reappeared_ids])
-    if scan_evidence_state == "complete" and (discovered_ids or not triage_required):
+    discovered_ids = _reconciliation_ids(
+        reconciliation,
+        "added",
+        "new_group_ids",
+        "reappeared",
+        "reappeared_group_ids",
+        "final_scan_reopened_group_ids",
+    )
+    if scan_evidence_state == "complete" and (
+        discovered_ids or (not triage_required and not new_identifiers)
+    ):
         discovered_status_counts = Counter(
             statuses.get(group_id, "pending") for group_id in discovered_ids
         )
@@ -634,7 +758,7 @@ def _build_context(
         recorded_qa_total=recorded_qa_total,
         has_patch=bool(_text(state.get("diff"))),
         original_scanner_findings=len(issues),
-        actionable_groups=len(initial_groups),
+        actionable_groups=len(all_groups),
         groups_fixed=counts["fixed"],
         groups_unresolved=counts["unresolved"],
         groups_inconclusive=counts["inconclusive"],
@@ -670,11 +794,11 @@ def _build_context(
         changed_files=[_text(item) for item in _items(state.get("changed_files"))],
         trajectory_path=trajectory_path or _text(state.get("trajectory_path")) or None,
         langsmith_trace_url=trace_url or _text(state.get("langsmith_trace_url")) or None,
-        executive_narrative=executive_narrative,
         new_groups_discovered=new_group_metrics["discovered"],
         new_groups_unresolved=new_group_metrics["unresolved"],
         new_groups_inconclusive=new_group_metrics["inconclusive"],
         new_groups_pending=new_group_metrics["pending"],
+        workaround_replay_plans=_mapping(state.get("workaround_replay_plans_by_task")),
     )
 
 
@@ -704,71 +828,88 @@ def _group_issue(group: Any) -> Any | None:
     return issues[0] if issues else None
 
 
-def _group_location(group: Any) -> str:
-    """Return the most useful source location for a group."""
-    paths = _items(_value(group, "file_paths"))
-    if paths:
-        return ", ".join(_text(path) for path in paths)
-    return _text(_value(group, "file_path"), "—")
-
-
-def _group_sources(group: Any, issue: Any | None) -> str:
-    """Return scanner/source labels for a group."""
-    sources = [_text(source) for source in _items(_value(group, "sources"))]
-    if not sources and issue is not None:
-        sources = [_text(_value(issue, "source"))]
-    return ", ".join(sorted(set(sources))) or "—"
-
-
 def _group_severity(group: Any, issue: Any | None) -> str:
     """Return the original scanner severity for a group."""
-    return _text(
-        _value(issue, "severity") if issue is not None else _value(group, "severity"),
-        "unknown",
+    return (
+        _text(
+            _value(issue, "severity") if issue is not None else _value(group, "severity"),
+            "UNKNOWN",
+        )
+        .strip()
+        .upper()
     )
+
+
+def _group_package_or_target(context: ReportContext, group: Any) -> str:
+    """Return the package a remediation action should edit.
+
+    A transitive finding may have a different editable target: for example,
+    the finding can be for ``lodash`` while the worker updates its directly
+    declared parent ``sanitize-html``.  Callers that identify the finding
+    itself must use :func:`_group_finding_package` instead.
+    """
+    group_id = _text(_value(group, "group_id"))
+    for task in reversed(_group_tree(context.task_queue, group_id)):
+        target = _text(_value(task, "target_package_name")).strip()
+        if target:
+            return target
+
+    issue = _group_issue(group)
+    for value in (
+        _value(issue, "package_name"),
+        _value(group, "package_name"),
+        _value(group, "vulnerable_component"),
+    ):
+        candidate = _text(value).strip()
+        if not candidate:
+            continue
+        # Group components may carry a parent/package suffix. The first
+        # component is the clearest package label when no typed package field
+        # is available.
+        return re.split(r"\s*[|,]\s*", candidate, maxsplit=1)[0]
+    return "Unspecified target"
+
+
+def _group_finding_package(group: Any) -> str:
+    """Return the package or component identified by the scanner finding.
+
+    The vulnerable component is the stable finding identity.  It must not be
+    replaced by a remediation target selected for a transitive dependency.
+    """
+    issue = _group_issue(group)
+    for value in (
+        _value(group, "vulnerable_component"),
+        _value(issue, "package_name"),
+        _value(group, "package_name"),
+    ):
+        candidate = _text(value).strip()
+        if not candidate:
+            continue
+        return re.split(r"\s*[|,]\s*", candidate, maxsplit=1)[0]
+    return "Unspecified finding"
 
 
 def _finding_identifier(group: Any, issue: Any | None) -> str:
     """Return a stable human-facing identifier for a finding row."""
-    identifiers = _items(_value(group, "cve_ids")) + _items(_value(group, "ghsa_ids"))
+    identifiers = (
+        _items(_value(group, "cve_ids"))
+        + _items(_value(group, "ghsa_ids"))
+        + _items(_value(group, "finding_ids"))
+        + _items(_value(group, "rule_ids"))
+    )
     if issue is not None:
         identifiers.extend(
-            [_value(issue, "cve_id"), _value(issue, "ghsa_id"), _value(issue, "rule_id")]
+            [
+                _value(issue, "cve_id"),
+                _value(issue, "ghsa_id"),
+                _value(issue, "finding_id"),
+                _value(issue, "rule_id"),
+            ]
         )
     labels = sorted({_text(identifier) for identifier in identifiers if identifier})
     return ", ".join(labels) or _text(_value(group, "group_id"), "unknown")
 
 
-def _validation_for_group(context: ReportContext, group_id: str) -> str:
-    """Summarize the latest QA evaluation associated with a group."""
-    task_ids = [
-        _text(_value(task, "task_id")) for task in _group_tree(context.task_queue, group_id)
-    ]
-    evaluations = [context.qa_evaluations.get(key) for key in [group_id, *task_ids]]
-    for evaluation in reversed([item for item in evaluations if item is not None]):
-        if bool(_value(evaluation, "passed", False)):
-            return "Passed"
-        category = _text(_value(evaluation, "failure_category"), "failed")
-        return f"Failed ({category})"
-    status = context.group_statuses.get(group_id, "pending")
-    return {
-        "qa_passed": "Passed",
-        "inconclusive": "Inconclusive",
-        "unfixable": "Not fixed",
-    }.get(status, "Not evaluated")
-
-
-_FINDING_HEADERS = (
-    "Finding",
-    "Source",
-    "Location",
-    "Package/component",
-    "Severity",
-    "Remediation",
-    "Final change",
-    "Final status",
-    "Validation",
-)
 _OUTSTANDING_GROUP_STATUSES = frozenset(
     {
         "unfixable",
@@ -780,15 +921,6 @@ _OUTSTANDING_GROUP_STATUSES = frozenset(
         "pivoted",
     }
 )
-_FOLLOW_UP_STATUS_LABELS = {
-    "unfixable": "Unresolved",
-    "needs_retry": "Unresolved — retry required",
-    "inconclusive": "Inconclusive",
-    "pending": "Pending",
-    "optimistically_fixed": "Awaiting validation",
-    "awaiting_validation": "Awaiting validation",
-    "pivoted": "Unresolved — no active task",
-}
 
 
 def _report_groups(context: ReportContext) -> list[Any]:
@@ -830,8 +962,50 @@ def _lineage_root_group_id(context: ReportContext, group_id: str) -> str:
     return group_id
 
 
+def _synthetic_scan_group(context: ReportContext, identifier: str) -> dict[str, Any]:
+    """Create a display-only group for an untriaged authoritative finding."""
+    issue = _scan_issue_for_identifier(context, identifier)
+    issue_data: dict[str, Any] = {}
+    if issue is not None:
+        for field_name in (
+            "cve_id",
+            "ghsa_id",
+            "finding_id",
+            "rule_id",
+            "source",
+            "severity",
+            "file_path",
+            "package_name",
+        ):
+            value = _value(issue, field_name)
+            if value is not None:
+                issue_data[field_name] = value
+    normalized_identifier = identifier.strip()
+    if normalized_identifier.casefold().startswith("cve-"):
+        for field_name in ("ghsa_id", "finding_id", "rule_id"):
+            issue_data.pop(field_name, None)
+        issue_data.setdefault("cve_id", normalized_identifier.upper())
+    elif normalized_identifier.casefold().startswith("ghsa-"):
+        for field_name in ("cve_id", "finding_id", "rule_id"):
+            issue_data.pop(field_name, None)
+        issue_data.setdefault("ghsa_id", normalized_identifier.upper())
+    else:
+        for field_name in ("cve_id", "ghsa_id", "rule_id"):
+            issue_data.pop(field_name, None)
+        issue_data.setdefault("finding_id", normalized_identifier)
+    package = _text(issue_data.get("package_name")).strip() or "Untriaged finding"
+    return {
+        "group_id": normalized_identifier,
+        "vulnerable_component": package,
+        "issue_type": "sca",
+        "sources": [_text(issue_data.get("source"), "final_full_scan")],
+        "file_path": _text(issue_data.get("file_path"), "authoritative final scan"),
+        "issues": [issue_data],
+    }
+
+
 def _follow_up_groups(context: ReportContext) -> list[tuple[str, Any]]:
-    """Return one follow-up row per issue lineage plus discovered groups."""
+    """Return every open finding, including untriaged final-scan findings."""
     discovered_ids = set(_discovered_group_ids(context))
     initial_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
     selected: dict[str, tuple[str, Any]] = {}
@@ -854,31 +1028,44 @@ def _follow_up_groups(context: ReportContext) -> list[tuple[str, Any]]:
     if scan_state == "complete":
         for group_id in discovered_ids:
             selected.setdefault(group_id, (group_id, {"group_id": group_id}))
+
+        represented_identifiers = (
+            set().union(*(_group_identifiers(group) for _, group in selected.values()))
+            if selected
+            else set()
+        )
+        for identifier in context.new_vulnerability_identifiers:
+            if identifier.casefold() not in represented_identifiers:
+                selected.setdefault(
+                    identifier,
+                    (identifier, _synthetic_scan_group(context, identifier)),
+                )
+
+    # A malformed or partially projected state can contain a status without a
+    # corresponding group object. Keep that open work visible instead of
+    # silently dropping it from the user report.
+    selected_ids = set(selected)
+    for group_id, status in context.group_statuses.items():
+        lineage_id = _lineage_root_group_id(context, group_id)
+        if (
+            status in _OUTSTANDING_GROUP_STATUSES
+            and group_id not in selected_ids
+            and lineage_id not in selected_ids
+        ):
+            selected[group_id] = (group_id, {"group_id": group_id})
     return sorted(selected.values(), key=lambda item: item[0])
 
 
 def _discovered_group_ids(context: ReportContext) -> list[str]:
-    """Return newly added and reappeared group IDs from reconciliation."""
+    """Return groups added, reappeared, or reopened by the authoritative scan."""
     return _reconciliation_ids(
         context.triage_reconciliation,
         "added",
         "new_group_ids",
         "reappeared",
         "reappeared_group_ids",
+        "final_scan_reopened_group_ids",
     )
-
-
-def _new_group_metric(context: ReportContext, value: int | None) -> int | str:
-    """Render a discovered-group metric without treating missing scans as zero."""
-    if value is not None:
-        return value
-    if (
-        _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
-        == "complete"
-        and context.triage_required
-    ):
-        return "Not assessed — post-scan triage required"
-    return _scan_assessment_text(context)
 
 
 def _task_ids_for_group(context: ReportContext, group_id: str) -> list[str]:
@@ -890,8 +1077,8 @@ def _task_ids_for_group(context: ReportContext, group_id: str) -> list[str]:
     ]
 
 
-def _package_change_matches_group(change: PackageChange, group: Any) -> bool:
-    """Return whether a package change identifies the supplied finding group."""
+def _group_package_names(group: Any) -> set[str]:
+    """Return package names that can identify a group in a manifest diff."""
     names: set[str] = set()
     issue = _group_issue(group)
     for value in (
@@ -900,72 +1087,123 @@ def _package_change_matches_group(change: PackageChange, group: Any) -> bool:
         _value(group, "parent_package_name"),
         _value(issue, "package_name"),
     ):
-        text = _text(value).strip()
-        if not text:
+        value_text = _text(value).strip()
+        if not value_text:
             continue
-        names.add(text)
-        names.update(part.strip() for part in re.split(r"[|,]", text) if part.strip())
-    return change.name in names
+        names.add(value_text)
+        names.update(part.strip() for part in re.split(r"[|,]", value_text) if part.strip())
+    for parent_context in _items(_value(group, "parent_contexts")):
+        parent_name = _text(_value(parent_context, "package_name")).strip()
+        if parent_name:
+            names.add(parent_name)
+    return names
 
 
-def _final_change_for_group(context: ReportContext, group: Any) -> str:
-    """Render only the final validated change for a successful group."""
-    group_id = _text(_value(group, "group_id"))
-    status = context.group_statuses.get(group_id, "pending")
-    if status not in {"qa_passed", "mitigated"}:
-        return "No validated change"
+def _normalized_path(value: Any) -> str:
+    """Normalize a repository path for comparisons while preserving display text elsewhere."""
+    return _text(value).strip().replace("\\", "/").removeprefix("./")
 
-    for change in _package_changes(context.diff):
-        if not _package_change_matches_group(change, group):
-            continue
-        previous = change.old or "not present"
-        current = change.new or "removed"
-        return f"{change.name}: {previous} → {current} ({change.file})"
 
-    task_ids = set(_task_ids_for_group(context, group_id))
-    changed_files: list[str] = []
-    successful_summaries: list[Any] = []
-    for result in context.worker_results.values():
-        if _text(_value(result, "task_id")) not in task_ids:
+def _path_matches_any(path: Any, candidates: Sequence[Any]) -> bool:
+    """Return whether a path matches one of several relative path candidates."""
+    normalized = _normalized_path(path)
+    if not normalized:
+        return False
+    for candidate in candidates:
+        candidate_normalized = _normalized_path(candidate)
+        if not candidate_normalized:
             continue
-        result_status = _text(_value(result, "status")).lower()
-        diagnostics = _value(result, "execution_diagnostics")
-        if result_status != "success" and not bool(_value(diagnostics, "validation_passed")):
-            continue
-        changed_files.extend(_text(path) for path in _items(_value(result, "changed_files")))
-        changed_files.extend(_text(path) for path in _items(_value(diagnostics, "validated_files")))
-        action_summary = _value(result, "action_summary")
-        if action_summary is not None and (
-            result_status == "success"
-            or _text(_value(action_summary, "status")).lower() == "success"
+        if normalized == candidate_normalized:
+            return True
+        if normalized.endswith(f"/{candidate_normalized}") or candidate_normalized.endswith(
+            f"/{normalized}"
         ):
-            successful_summaries.append(action_summary)
+            return True
+    return False
 
-    for summary in reversed(context.action_summaries):
-        if _text(_value(summary, "task_id")) not in task_ids:
-            continue
-        if _text(_value(summary, "status")).lower() != "success":
-            continue
-        successful_summaries.append(summary)
 
-    final_summary = ""
-    for summary in reversed(successful_summaries):
-        text = _compact_remediation_attempt(
-            _value(summary, "summary"),
-            status=_text(_value(summary, "status"), "success"),
-            include_changed_files=False,
-        )
-        if text:
-            final_summary = text
-            break
-    final_files = _unique_texts([*changed_files, *context.changed_files])
-    if final_files and final_summary:
-        return f"Changed files: {', '.join(final_files)}; {final_summary}"
-    if final_files:
-        return "Changed files: " + ", ".join(final_files)
-    if final_summary:
-        return final_summary
-    return "Validated remediation recorded"
+def _package_change_files(change: PackageChange) -> list[str]:
+    """Return displayable file paths recorded for one package change."""
+    files: list[str] = []
+    for value in _text(change.file).split(";"):
+        path = value.strip()
+        if not path or "synchronized" in path.casefold():
+            continue
+        if path not in files:
+            files.append(path)
+    return files
+
+
+def _package_name_from_resolved_url(value: Any) -> str:
+    """Extract an npm package name from a registry tarball URL."""
+    match = re.search(
+        r"(?:https?://[^/]+/)(?P<package>(?:@[^/]+/)?[^/]+)/-/",
+        _text(value),
+        re.IGNORECASE,
+    )
+    return match.group("package") if match else ""
+
+
+def _dependency_mechanism(
+    context: ReportContext,
+    group_id: str,
+    change: PackageChange | None = None,
+) -> str:
+    """Resolve the manifest mechanism used for a package change."""
+    section = _text(_value(change, "section")).strip().casefold()
+    if section:
+        if "override" in section:
+            return "overrides"
+        if "resolution" in section:
+            return "resolutions"
+        if section == "lockfile":
+            return "lockfile"
+        return section
+
+    for task_id in _task_ids_for_group(context, group_id):
+        task = context.task_queue.get(task_id)
+        diagnostic = context.retry_diagnostics.get(task_id)
+        for value in (
+            _value(_value(task, "target_dependency_type"), "value"),
+            _value(task, "target_dependency_type"),
+            _value(diagnostic, "target_dependency_type"),
+        ):
+            value_text = _text(value).strip().casefold()
+            if not value_text:
+                continue
+            if "override" in value_text:
+                return "overrides"
+            if "resolution" in value_text:
+                return "resolutions"
+            return value_text
+        if _text(_value(task, "strategy_stage")).casefold() == "package_override":
+            return "overrides"
+        if bool(_value(diagnostic, "used_overrides", False)):
+            return "overrides"
+
+    if change is not None and change.scope == "transitive":
+        return "lockfile"
+    return "dependencies"
+
+
+def _package_change_matches_group(change: PackageChange, group: Any) -> bool:
+    """Return whether a package change identifies the supplied finding group."""
+    names = _group_package_names(group)
+    return change.name in names or change.name.casefold() in {name.casefold() for name in names}
+
+
+def _package_change_detail(change: PackageChange, mechanism: str) -> str:
+    """Describe the exact manifest entry changed by a package remediation."""
+    previous = change.old or "not present"
+    current = change.new or "removed"
+    return f"{change.name}: {previous} → {current} via {mechanism}"
+
+
+def _package_attempt_text(change: PackageChange, mechanism: str) -> str:
+    """Render a compact package transition for an attempted remediation."""
+    previous = change.old or "not present"
+    current = change.new or "removed"
+    return f"Updated {change.name} {previous} → {current} via {mechanism}."
 
 
 def _required_follow_up_action(
@@ -976,38 +1214,20 @@ def _required_follow_up_action(
     group_id: str | None = None,
 ) -> str:
     """Describe the next user-facing action for an outstanding group."""
-    group_id = group_id or _text(_value(group, "group_id"))
+    package = _group_package_or_target(context, group)
+    target = f" for {package}" if package and package != "Unspecified target" else ""
     if status == "needs_retry":
-        action_prefix = "Retry the remediation using the current plan"
+        return f"Retry the remediation{target}, then rerun validation and the security scan."
     elif status == "unfixable":
-        action_prefix = "Apply an alternative remediation"
+        return f"Apply an alternative remediation{target}, then rerun validation and the security scan."
     elif status == "inconclusive":
-        action_prefix = "Resolve the incomplete or invalid validation evidence"
+        return f"Review the attempted change{target} and complete validation, then rerun the security scan."
     elif status in {"optimistically_fixed", "awaiting_validation"}:
-        action_prefix = "Complete QA for the attempted remediation"
+        return f"Complete validation for the attempted remediation{target}."
     elif status == "pivoted":
-        action_prefix = "Resume remediation for the issue"
+        return f"Apply an alternative remediation{target}, then rerun validation and the security scan."
     else:
-        action_prefix = "Complete the planned remediation"
-
-    if status in {"needs_retry", "pending"}:
-        for task_id in reversed(_task_ids_for_group(context, group_id)):
-            plan = context.retry_plans.get(task_id)
-            task = context.task_queue.get(task_id)
-            instruction = (
-                _value(plan, "exact_instruction")
-                or _value(plan, "instructions")
-                or _value(task, "instruction")
-            )
-            if _text(instruction).strip():
-                instruction_text = _full_text(instruction).rstrip(" .")
-                return f"{action_prefix}: {instruction_text}. Then rerun QA."
-
-    if group_id in set(_discovered_group_ids(context)) and not _task_ids_for_group(
-        context, group_id
-    ):
-        return "Remediate the newly discovered issue, then rerun QA and the authoritative security scan."
-    return f"{action_prefix}, then rerun QA and the authoritative security scan."
+        return f"Complete the planned remediation{target}, then rerun validation and the security scan."
 
 
 _ATTEMPT_DETAIL_LINE_RE = re.compile(
@@ -1022,6 +1242,161 @@ _ATTEMPT_DETAIL_INLINE_RE = re.compile(
 )
 _FINAL_NOTE_RE = re.compile(r"\s+(?:final note|final conclusion)\s*:\s*", re.IGNORECASE)
 _CHANGED_FILES_RE = re.compile(r"\bchanged files?\s*:\s*", re.IGNORECASE)
+_NO_CHANGED_FILES_RE = re.compile(
+    r"\bno files?(?: were)? changed\b|\bno file changes\b", re.IGNORECASE
+)
+_NO_CODE_CHANGE_RE = re.compile(
+    r"\b(?:no (?:validated )?(?:code )?change|without applying a change|"
+    r"nothing (?:was )?changed)\b",
+    re.IGNORECASE,
+)
+_ATTEMPT_SECTION_LABELS = (
+    "specific code changes",
+    "what changed",
+    "code changes",
+    "implementation",
+    "changes",
+    "current modified source",
+    "modified source",
+    "file changes",
+    "files changed",
+    "changed files",
+    "what i found",
+    "final conclusion",
+    "final note",
+    "final outcome",
+    "outcome",
+    "validation status",
+    "validation",
+    "verification",
+    "test status",
+    "tests",
+    "notes",
+    "note",
+)
+_ATTEMPT_SECTION_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?P<label>"
+    + "|".join(re.escape(label) for label in _ATTEMPT_SECTION_LABELS)
+    + r")\s*(?::\s*(?P<value>.*))?$",
+    re.IGNORECASE,
+)
+_INLINE_ATTEMPT_SECTION_RE = re.compile(
+    r"\s+(?P<label>final note|final conclusion|final outcome|outcome)\s*:\s*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_CHANGE_LANGUAGE_RE = re.compile(
+    r"\b(?:add(?:ed|s)?|chang(?:e|ed|es|ing)|implement(?:ed|s|ing)?|"
+    r"modif(?:y|ied|ies|ying)|patch(?:ed|es|ing)?|remov(?:e|ed|es|ing)|"
+    r"replac(?:e|ed|es|ing)|updat(?:e|ed|es|ing)|workaround|guard|annotation)\b",
+    re.IGNORECASE,
+)
+
+
+def _attempt_sections(value: Any) -> dict[str, list[str]]:
+    """Split an action summary into lead, change, outcome, and validation sections."""
+    sections: dict[str, list[str]] = {"lead": []}
+    current = "lead"
+    raw = _text(value).strip()
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        inline_match = _INLINE_ATTEMPT_SECTION_RE.search(stripped)
+        if inline_match:
+            prefix = stripped[: inline_match.start()].strip()
+            if prefix:
+                sections.setdefault(current, []).append(prefix)
+            current = inline_match.group("label").casefold()
+            sections.setdefault(current, [])
+            value_text = inline_match.group("value").strip()
+            if value_text:
+                sections[current].append(value_text)
+            continue
+
+        section_match = _ATTEMPT_SECTION_RE.match(stripped)
+        if section_match:
+            current = section_match.group("label").casefold()
+            sections.setdefault(current, [])
+            value_text = (section_match.group("value") or "").strip()
+            if value_text:
+                sections[current].append(value_text)
+            continue
+
+        sections.setdefault(current, []).append(stripped)
+    return sections
+
+
+def _clean_detail_text(lines: Sequence[Any]) -> str:
+    """Normalize summary-detail lines for one Markdown table cell."""
+    cleaned: list[str] = []
+    for line in lines:
+        text = _text(line).strip()
+        if not text or text in {"```", "~~~"}:
+            continue
+        text = re.sub(r"^[-*]\s+", "", text)
+        text = re.sub(r"^\d+[.)]\s+", "", text)
+        if text:
+            cleaned.append(text)
+    return " ".join(cleaned)
+
+
+def _summarize_outcome_text(value: Any) -> str:
+    """Keep natural outcome prose while removing embedded code blocks and markup."""
+    text = _clean_detail_text([value])
+    if not text:
+        return ""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) > 2:
+        text = " ".join(sentences[:2])
+    return text
+
+
+def _section_text(sections: Mapping[str, Sequence[Any]], *labels: str) -> str:
+    """Return normalized text from the first populated named summary sections."""
+    for label in labels:
+        text = _clean_detail_text(sections.get(label.casefold(), []))
+        if text:
+            return text
+    return ""
+
+
+def _inline_code_text(value: Any, limit: int = 420) -> str:
+    """Compact a code fragment without losing its leading change semantics."""
+    text = re.sub(r"\s+", " ", _text(value).strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 13)].rstrip() + "... (truncated)"
+
+
+def _attempt_lead_action(value: Any) -> str:
+    """Return the lead action sentence without changed-file or note metadata."""
+    sections = _attempt_sections(value)
+    action = _clean_detail_text(sections.get("lead", []))
+    final_note = _FINAL_NOTE_RE.search(action)
+    if final_note is not None:
+        action = action[: final_note.start()].strip(" ;:-")
+    changed_clause = _CHANGED_FILES_RE.search(action)
+    if changed_clause is not None:
+        action = action[: changed_clause.start()].strip(" ;:-.")
+    return action.rstrip(" ;:.")
+
+
+def _attempt_final_note(value: Any) -> str:
+    """Return the concise final-note or outcome prose from an action summary."""
+    sections = _attempt_sections(value)
+    return _section_text(
+        sections,
+        "final note",
+        "final conclusion",
+        "final outcome",
+        "outcome",
+    )
 
 
 def _attempt_primary_text(value: Any) -> str:
@@ -1051,74 +1426,649 @@ def _attempt_primary_text(value: Any) -> str:
 
 
 def _attempt_changed_files(value: Any) -> tuple[list[str], bool]:
-    """Extract a concise changed-file list from an attempt's lead paragraph."""
+    """Extract changed-file evidence from an attempt summary."""
     text = _attempt_primary_text(value)
-    match = _CHANGED_FILES_RE.search(text)
-    if match is None:
-        return [], False
-    file_text = text[match.end() :]
-    file_text = _FINAL_NOTE_RE.split(file_text, maxsplit=1)[0]
-    file_text = file_text.strip().rstrip(".;")
-    if file_text.casefold() in {"", "none", "no files", "n/a"}:
+    if _NO_CHANGED_FILES_RE.search(text):
         return [], True
-    files = [part.strip().strip("`") for part in file_text.split(",")]
-    return [part for part in files if part], False
+    match = _CHANGED_FILES_RE.search(text)
+    if match is not None:
+        file_text = text[match.end() :]
+        file_text = _FINAL_NOTE_RE.split(file_text, maxsplit=1)[0]
+        file_text = file_text.strip().rstrip(".;")
+        if file_text.casefold() in {"", "none", "no files", "n/a"}:
+            return [], True
+        files = [part.strip().strip("`") for part in file_text.split(",")]
+        return [part for part in files if part], False
+
+    sections = _attempt_sections(value)
+    for label in ("file changes", "files changed", "changed files", "current modified source"):
+        lines = sections.get(label, [])
+        if not lines:
+            continue
+        section_text = _clean_detail_text(lines)
+        if section_text.casefold() in {
+            "",
+            "none",
+            "no files",
+            "n/a",
+        } or _NO_CHANGED_FILES_RE.search(section_text):
+            return [], True
+        files = [
+            part.strip().strip("`")
+            for line in lines
+            for part in re.split(r"[,;]", _text(line))
+            if part.strip()
+        ]
+        if files:
+            return files, False
+    return [], False
 
 
-def _compact_remediation_attempt(
-    value: Any,
+def _attempt_replay_change_details(metadata: Any) -> tuple[list[str], list[str]]:
+    """Extract exact source replacements and affected files from a replay plan."""
+    replay_plan = _value(metadata, "replay_plan")
+    if replay_plan is None:
+        return [], []
+
+    details: list[str] = []
+    files = [_text(path) for path in _items(_value(replay_plan, "validated_files"))]
+
+    edit_sets = _items(_value(replay_plan, "successful_edit_sets"))
+    for edit_set in edit_sets:
+        files.extend(_text(path) for path in _items(_value(edit_set, "affected_files")))
+        for replacement in _items(_value(edit_set, "replacements")):
+            path = _text(_value(replacement, "file_path"))
+            if path:
+                files.append(path)
+            old_text = _inline_code_text(_value(replacement, "old_text"))
+            new_text = _inline_code_text(_value(replacement, "new_text"))
+            if not path:
+                continue
+            if old_text or new_text:
+                details.append(
+                    f"{path}: replaced {old_text or 'nothing'} with {new_text or 'nothing'}"
+                )
+
+    return details, _unique_texts(files)
+
+
+def _diff_line_changes(diff: str) -> dict[str, list[tuple[str, str]]]:
+    """Collect added and removed lines by file from a unified diff."""
+    changes: dict[str, list[tuple[str, str]]] = {}
+    current_file = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+            continue
+        if line.startswith("--- a/"):
+            continue
+        if not current_file or line.startswith(("+++", "---")):
+            continue
+        if line[:1] in {"+", "-"}:
+            content = _inline_code_text(_diff_content(line).strip())
+            changes.setdefault(current_file, []).append((line[:1], content))
+    return changes
+
+
+def _diff_code_change_details(diff: str, files: Sequence[Any] = ()) -> list[str]:
+    """Summarize source-line additions and removals for selected files."""
+    details: list[str] = []
+    for path, line_changes in _diff_line_changes(diff).items():
+        if _PACKAGE_FILE_RE.search(path) or (files and not _path_matches_any(path, files)):
+            continue
+        index = 0
+        while index < len(line_changes):
+            prefix, content = line_changes[index]
+            if (
+                prefix == "-"
+                and index + 1 < len(line_changes)
+                and line_changes[index + 1][0] == "+"
+            ):
+                details.append(
+                    f"{path}: removed {content or 'blank line'}; added {line_changes[index + 1][1] or 'blank line'}"
+                )
+                index += 2
+                continue
+            verb = "added" if prefix == "+" else "removed"
+            details.append(f"{path}: {verb} {content or 'blank line'}")
+            index += 1
+    return details
+
+
+def _unified_diff_blocks(diff: str, files: Sequence[Any] = ()) -> list[str]:
+    """Return complete unified-diff file blocks for selected source files.
+
+    The report uses these blocks for code workarounds so a reviewer can inspect
+    the exact source edit. Package manifests are excluded because their
+    compact version transition is already rendered as prose.
+    """
+    blocks: list[tuple[str, list[str]]] = []
+    current_path = ""
+    current_lines: list[str] = []
+
+    def finish() -> None:
+        if current_path and current_lines:
+            blocks.append((current_path, list(current_lines)))
+
+    for line in diff.splitlines():
+        if line.startswith("--- a/"):
+            finish()
+            current_path = ""
+            current_lines = [line]
+            continue
+        if current_lines:
+            current_lines.append(line)
+            if line.startswith("+++ b/"):
+                current_path = line[6:].strip()
+    finish()
+
+    selected = [_normalized_path(path) for path in files if _normalized_path(path)]
+    result: list[str] = []
+    for path, lines in blocks:
+        if _PACKAGE_FILE_RE.search(path):
+            continue
+        if selected and not _path_matches_any(path, selected):
+            continue
+        result.append("\n".join(lines).strip())
+    return result
+
+
+def _replay_diff_blocks(metadata: Any) -> list[str]:
+    """Build unified-diff blocks from committed workaround replacements."""
+    replay_plan = _value(metadata, "replay_plan")
+    if replay_plan is None:
+        return []
+
+    blocks: list[str] = []
+    for edit_set in _items(_value(replay_plan, "successful_edit_sets")):
+        for replacement in _items(_value(edit_set, "replacements")):
+            path = _text(_value(replacement, "file_path")).strip()
+            if not path or _PACKAGE_FILE_RE.search(path):
+                continue
+            old_text = _text(_value(replacement, "old_text"))
+            new_text = _text(_value(replacement, "new_text"))
+            old_lines = old_text.splitlines() or [""]
+            new_lines = new_text.splitlines() or [""]
+            block = [f"--- a/{path}", f"+++ b/{path}", "@@"]
+            block.extend(f"-{line}" for line in old_lines)
+            block.extend(f"+{line}" for line in new_lines)
+            blocks.append("\n".join(block))
+    return blocks
+
+
+def _attempt_diff_blocks(
+    context: ReportContext,
+    summary: Any,
+    metadata: Any,
+    files: Sequence[Any],
+) -> list[str]:
+    """Return exact source diff blocks for one workaround attempt."""
+    source_files = [path for path in files if not _PACKAGE_FILE_RE.search(_text(path))]
+    blocks = _unified_diff_blocks(context.diff, source_files)
+    if blocks:
+        return blocks
+    return _replay_diff_blocks(metadata)
+
+
+def _attempt_package_metadata(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+    attempt_id: str,
+) -> tuple[str, str, str, str, str] | None:
+    """Recover a package/version operation from committed attempt metadata."""
+    task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+    task = context.task_queue.get(task_id)
+    snapshot = context.attempt_snapshots.get(attempt_id)
+    diagnostic = context.retry_diagnostics.get(task_id)
+    candidates = [snapshot, metadata, task, diagnostic]
+
+    package = ""
+    for item in candidates:
+        package = _text(_value(item, "target_package_name")).strip()
+        if package:
+            break
+    if not package:
+        return None
+
+    selected_version = ""
+    for item in candidates:
+        selected_version = _text(_value(item, "selected_version")).strip()
+        if selected_version:
+            break
+    if not selected_version:
+        for item in candidates:
+            executed = [_text(version) for version in _items(_value(item, "executed_versions"))]
+            if executed:
+                selected_version = executed[-1]
+                break
+    if not selected_version:
+        return None
+
+    previous_version = ""
+    for item in (task, diagnostic):
+        previous_version = _text(_value(item, "parent_package_version")).strip()
+        if previous_version:
+            break
+    group = next(
+        (
+            item
+            for item in [*context.initial_valid_groups, *context.final_valid_groups]
+            if _text(_value(item, "group_id")) == group_id
+        ),
+        None,
+    )
+    if group is not None and not previous_version:
+        package_names = _group_package_names(group)
+        for issue in _items(_value(group, "issues")):
+            issue_package = _text(_value(issue, "package_name")).strip()
+            issue_version = _text(_value(issue, "package_version")).strip()
+            if issue_version and (not issue_package or issue_package in package_names):
+                previous_version = issue_version
+                break
+
+    dependency_type = ""
+    for item in candidates:
+        dependency_type = _text(_value(item, "target_dependency_type")).strip()
+        if dependency_type:
+            break
+    synthetic_change = PackageChange(
+        package,
+        previous_version,
+        selected_version,
+        "",
+        "direct",
+        dependency_type,
+    )
+    mechanism = _dependency_mechanism(context, group_id, synthetic_change)
+    file_path = ""
+    for item in candidates:
+        instruction = _text(_value(item, "instruction"))
+        file_match = _PACKAGE_FILE_RE.search(instruction)
+        if file_match:
+            file_path = file_match.group(0)
+            break
+    if not file_path and group is not None:
+        for path in _items(_value(group, "file_paths")) + [_value(group, "file_path")]:
+            if _PACKAGE_FILE_RE.search(_text(path)):
+                file_path = _text(path)
+                break
+    return package, previous_version, selected_version, mechanism, file_path
+
+
+def _attempt_kind(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+) -> str:
+    """Classify an attempt as a version update or source-code workaround."""
+    task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+    task = context.task_queue.get(task_id)
+    snapshot = context.attempt_snapshots.get(
+        _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+    )
+    explicit_strategy = False
+    for item in (metadata, snapshot, task):
+        for field_name in ("strategy", "dispatch_node", "strategy_stage", "no_fix_stage"):
+            value = _text(_value(item, field_name)).strip().casefold()
+            if "workaround" in value or "code" in value or "no_fix" in value:
+                return "Code Workaround"
+            if "version" in value or "update" in value:
+                explicit_strategy = True
+    replay_plan = _value(metadata, "replay_plan")
+    if replay_plan is not None and (
+        _items(_value(replay_plan, "successful_edit_sets"))
+        or _items(_value(replay_plan, "validated_files"))
+    ):
+        return "Code Workaround"
+
+    if explicit_strategy:
+        return "Version Update"
+    summary_text = _text(_value(summary, "summary"))
+    if re.search(r"\b(?:code\s+workaround|source\s+edit|source\s+change)\b", summary_text, re.I):
+        return "Code Workaround"
+    return "Version Update"
+
+
+def _attempt_result_status(context: ReportContext, summary: Any, metadata: Any) -> str:
+    """Return a reader-facing outcome label for one recorded attempt."""
+    attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+    qa_result = context.qa_results.get(attempt_id)
+    evaluation = _value(qa_result, "evaluation")
+    if evaluation is not None:
+        if bool(_value(evaluation, "passed", False)):
+            return "Succeeded"
+        return "Failed"
+
+    status = (
+        (_text(_value(metadata, "status")) or _text(_value(summary, "status")) or "pending")
+        .strip()
+        .casefold()
+    )
+    if status in {"success", "mitigated", "qa_passed"}:
+        return "Succeeded"
+    if status in {"pending", "optimistically_fixed", "awaiting_validation"}:
+        return "Pending"
+    return "Failed"
+
+
+def _sanitize_report_outcome(value: Any) -> str:
+    """Remove internal prefixes and lifecycle codes from attempt outcome prose."""
+    text = _summarize_outcome_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"\bODC\s+(?:FAILURE|ERROR)\b\s*:?\s*", "security scan issue: ", text, flags=re.I)
+    text = re.sub(r"\b(?:supervisor|planner|subagent|worker)\s*:\s*", "", text, flags=re.I)
+    text = re.sub(
+        r"^(?:worker|agent)(?:\s+(?:summary|result|outcome|report))?\s*[-:]*\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\b(?:qa_passed|unfixable|needs_retry|optimistically_fixed|awaiting_validation|pivoted|inconclusive)\b",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\b(?:stack trace|traceback|crash diagnostics?)\b", "", text, flags=re.I)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ;:")
+    if text:
+        text = text[0].upper() + text[1:]
+    return _inline_code_text(text, 260)
+
+
+def _attempt_package_changes(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+    *,
+    attempt_id: str,
+    files: Sequence[Any],
+    explicit_no_files: bool,
+) -> list[tuple[PackageChange, str]]:
+    """Collect package transitions evidenced by one attempt."""
+    if explicit_no_files:
+        return []
+    group = next(
+        (
+            item
+            for item in [*context.initial_valid_groups, *context.final_valid_groups]
+            if _text(_value(item, "group_id")) == group_id
+        ),
+        {},
+    )
+    changes: list[tuple[PackageChange, str]] = []
+    for change in _package_changes(context.diff):
+        if not _package_change_matches_group(change, group):
+            continue
+        change_files = _package_change_files(change)
+        if files and not any(_path_matches_any(path, files) for path in change_files):
+            continue
+        changes.append((change, _dependency_mechanism(context, group_id, change)))
+    if changes:
+        return changes
+
+    metadata_change = _attempt_package_metadata(
+        context,
+        group_id,
+        summary,
+        metadata,
+        attempt_id,
+    )
+    if metadata_change is None:
+        return []
+    package, previous, selected, mechanism, file_path = metadata_change
+    if files and file_path and not any(_path_matches_any(file_path, files) for _ in files):
+        return []
+    return [
+        (
+            PackageChange(package, previous, selected, file_path, "direct", mechanism),
+            mechanism,
+        )
+    ]
+
+
+def _attempt_code_details(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+    *,
+    attempt_id: str = "",
+    files: Sequence[Any] = (),
+    include_package_diff: bool = True,
+    include_source_diff: bool = True,
+    include_metadata_fallback: bool = True,
+) -> list[str]:
+    """Build specific code-change descriptions for one remediation attempt."""
+    summary_text = _text(_value(summary, "summary")) if summary is not None else ""
+    status = _text(_value(summary, "status")) or _text(_value(metadata, "status"), "recorded")
+    details: list[str] = []
+    group = next(
+        (
+            item
+            for item in [*context.initial_valid_groups, *context.final_valid_groups]
+            if _text(_value(item, "group_id")) == group_id
+        ),
+        {},
+    )
+
+    if include_package_diff:
+        for change in _package_changes(context.diff):
+            if not _package_change_matches_group(change, group):
+                continue
+            if files and not any(
+                _path_matches_any(path, files) for path in _package_change_files(change)
+            ):
+                continue
+            mechanism = _dependency_mechanism(context, group_id, change)
+            details.append(_package_change_detail(change, mechanism))
+
+    replay_details, _ = _attempt_replay_change_details(metadata)
+    details.extend(replay_details)
+
+    for field_name in ("specific_code_changes", "code_changes"):
+        structured_changes = _value(summary, field_name)
+        if isinstance(structured_changes, (str, bytes)):
+            structured_text = _text(structured_changes).strip()
+        else:
+            structured_text = _clean_detail_text(_items(structured_changes))
+        if structured_text:
+            details.append(structured_text)
+
+    sections = _attempt_sections(summary_text)
+    for label in (
+        "specific code changes",
+        "what changed",
+        "code changes",
+        "implementation",
+        "changes",
+    ):
+        text = _section_text(sections, label)
+        if text:
+            details.append(text)
+    if not any(details):
+        found_lines = [
+            line
+            for line in sections.get("what i found", [])
+            if _CHANGE_LANGUAGE_RE.search(_text(line))
+        ]
+        if found_lines:
+            details.append(_clean_detail_text(found_lines))
+
+    if not details:
+        final_note = _attempt_final_note(summary_text)
+        if (
+            final_note
+            and _CHANGE_LANGUAGE_RE.search(final_note)
+            and not _NO_CODE_CHANGE_RE.search(final_note)
+        ):
+            details.append(final_note)
+
+    if not details and status.casefold() not in {"surrender", "unfixable", "failed"}:
+        lead_action = _attempt_lead_action(summary_text)
+        if lead_action and _CHANGE_LANGUAGE_RE.search(lead_action):
+            details.append(lead_action)
+
+    if include_source_diff and files:
+        details.extend(_diff_code_change_details(context.diff, files))
+
+    metadata_change = _attempt_package_metadata(
+        context,
+        group_id,
+        summary,
+        metadata,
+        attempt_id,
+    )
+    if not details and include_metadata_fallback and metadata_change is not None:
+        package, previous, selected, mechanism, _ = metadata_change
+        details.append(f"{package}: {previous or 'unknown'} → {selected} via {mechanism}")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for detail in details:
+        normalized = re.sub(r"\s+", " ", _text(detail).strip())
+        if normalized and normalized.casefold() not in seen:
+            unique.append(normalized)
+            seen.add(normalized.casefold())
+    if unique:
+        return unique
+    if status.casefold() in {"surrender", "unfixable", "failed"}:
+        return ["No validated code change was applied"]
+    return ["No specific code change recorded"]
+
+
+def _attempt_files(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+    *,
+    attempt_id: str = "",
+) -> tuple[list[str], bool]:
+    """Collect file evidence for one attempt and report explicit no-file claims."""
+    summary_text = _text(_value(summary, "summary")) if summary is not None else ""
+    parsed_files, explicit_no_files = _attempt_changed_files(summary_text)
+    values: list[Any] = [
+        *_items(_value(summary, "changed_files")),
+        *_items(_value(summary, "file_changes")),
+        *_items(_value(summary, "files_changed")),
+        *_items(_value(metadata, "changed_files")),
+        *_items(_value(metadata, "file_changes")),
+        *_items(_value(metadata, "files_changed")),
+    ]
+    diagnostics = _value(metadata, "execution_diagnostics")
+    values.extend(_items(_value(diagnostics, "validated_files")))
+    _, replay_files = _attempt_replay_change_details(metadata)
+    values.extend(replay_files)
+    values.extend(parsed_files)
+    files = _unique_texts(values)
+    if not files and not explicit_no_files:
+        metadata_change = _attempt_package_metadata(
+            context,
+            group_id,
+            summary,
+            metadata,
+            attempt_id,
+        )
+        if metadata_change is not None and metadata_change[4]:
+            files.append(metadata_change[4])
+    return _unique_texts(files), explicit_no_files
+
+
+def _attempt_outcome(
+    summary: Any,
+    metadata: Any,
     *,
     status: str,
-    changed_files: Sequence[Any] = (),
-    include_changed_files: bool = True,
 ) -> str:
-    """Render only the concise remediation action from an agent summary.
+    """Summarize the final outcome of one attempt without exposing retry diagnostics."""
+    summary_text = _text(_value(summary, "summary")) if summary is not None else ""
+    sections = _attempt_sections(summary_text)
+    outcome = (
+        _text(_value(summary, "final_outcome")).strip() or _text(_value(summary, "outcome")).strip()
+    )
+    outcome = outcome or _attempt_final_note(summary_text) or _section_text(sections, "lead")
+    outcome = _summarize_outcome_text(outcome)
+    if not outcome:
+        if status.casefold() in {"success", "mitigated"}:
+            outcome = "Attempt completed successfully"
+        else:
+            outcome = "Attempt ended without a validated remediation"
 
-    The worker summary is run-specific prose and may contain separate
-    validation, notes, evidence, or diagnostic sections.  The report keeps
-    the lead remediation action and changed files, while dropping those
-    sections without truncating the retained action text.
-    """
-    raw = _text(value).strip()
-    if not raw:
-        return ""
-    primary = _attempt_primary_text(raw)
-    if not primary:
-        return ""
-
-    final_note = _FINAL_NOTE_RE.search(primary)
-    status_name = status.strip().casefold()
-    if final_note is not None:
-        prefix = primary[: final_note.start()].strip(" ;:-")
-        note = primary[final_note.end() :].strip()
-        action = note if status_name in {"success", "mitigated"} and note else prefix or note
-    else:
-        action = primary
-
-    parsed_files, explicit_no_files = _attempt_changed_files(raw)
-    files = _unique_texts([*changed_files, *parsed_files])
-    changed_clause = _CHANGED_FILES_RE.search(action)
-    if changed_clause is not None:
-        action = action[: changed_clause.start()].strip(" ;:-.")
-    action = " ".join(action.split()).rstrip(" ;.:")
-    if not action:
-        action = "Remediation attempt recorded"
-
-    parts = [action]
-    if include_changed_files:
-        if files:
-            parts.append(f"changed files: {', '.join(files)}")
-        elif explicit_no_files:
-            parts.append("no files changed")
-    return "; ".join(parts).rstrip(".") + "."
+    verification = _section_text(
+        sections,
+        "validation status",
+        "validation",
+        "verification",
+        "test status",
+        "tests",
+    )
+    diagnostics = _value(metadata, "execution_diagnostics")
+    validation_passed = bool(_value(diagnostics, "validation_passed", False))
+    if verification and not re.search(
+        r"\b(?:pass(?:ed)?|fail(?:ed)?|success(?:ful)?|unable|could not|couldn't|not claim)\b",
+        outcome,
+        re.IGNORECASE,
+    ):
+        outcome = (
+            f"{outcome.rstrip('.; ')}. Verification result: {_summarize_outcome_text(verification)}"
+        )
+    if status.casefold() in {"success", "mitigated"}:
+        if validation_passed and not re.search(
+            r"\b(?:pass(?:ed)?|success(?:ful)?|validat(?:e|ed|ion))\b", outcome, re.IGNORECASE
+        ):
+            outcome = (
+                f"{outcome.rstrip('.; ')}. Attempt completed successfully with validation passed"
+            )
+    elif not re.search(
+        r"\b(?:without|stopp(?:ed|ing)|fail(?:ed|ure)|could not|couldn't|unfixable|not claim)\b",
+        outcome,
+        re.IGNORECASE,
+    ):
+        outcome = f"{outcome.rstrip('.; ')}. Attempt ended without a validated remediation"
+    cleaned = _sanitize_report_outcome(outcome.rstrip(" ;.") + ".")
+    return cleaned or "Attempt ended without a validated remediation."
 
 
-def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
-    """Aggregate remediation-attempt summaries for one follow-up row."""
+def _attempt_change_summary(summary: Any, details: Sequence[Any]) -> str:
+    """Return short natural prose describing the change in a successful attempt."""
+    summary_text = _text(_value(summary, "summary")) if summary is not None else ""
+    sections = _attempt_sections(summary_text)
+    candidate = (
+        _section_text(
+            sections,
+            "specific code changes",
+            "what changed",
+            "code changes",
+            "implementation",
+            "changes",
+        )
+        or _attempt_final_note(summary_text)
+        or _attempt_lead_action(summary_text)
+    )
+    if candidate:
+        candidate = _summarize_outcome_text(candidate)
+        return candidate.rstrip(" ;.") + "."
+    for detail in details:
+        text = _text(detail).strip()
+        if text:
+            text = _summarize_outcome_text(text)
+            return text.rstrip(" ;.") + "."
+    return "Validated remediation recorded."
+
+
+def _attempt_records_for_group(
+    context: ReportContext,
+    group_id: str,
+) -> list[tuple[Any, Any]]:
+    """Return deduplicated worker/action evidence for a group in stable order."""
     task_ids = set(_task_ids_for_group(context, group_id))
-    entries: list[str] = []
-    seen_attempt_ids: set[str] = set()
-    seen_entries: set[tuple[str, str]] = set()
     worker_results = sorted(
         context.worker_results.values(),
         key=lambda item: _text(_value(item, "attempt_id")),
@@ -1128,47 +2078,156 @@ def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
         for result in worker_results
         if _text(_value(result, "attempt_id"))
     }
+    records: list[tuple[Any, Any]] = []
+    seen_records: set[tuple[str, str, str]] = set()
 
-    def add_attempt(summary: Any, metadata: Any = None) -> None:
-        if summary is None:
-            return
-        summary_text = summary if isinstance(summary, (str, bytes)) else _value(summary, "summary")
-        if not _text(summary_text).strip():
+    def metadata_with_replay_plan(summary: Any, metadata: Any) -> Any:
+        """Attach the task-keyed replay plan when an attempt lacks one."""
+        if metadata is not None and _value(metadata, "replay_plan") is not None:
+            return metadata
+        task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+        replay_plan = context.workaround_replay_plans.get(task_id)
+        if replay_plan is None:
+            return metadata
+        if metadata is None:
+            return {"task_id": task_id, "replay_plan": replay_plan}
+        if isinstance(metadata, Mapping):
+            enriched = dict(metadata)
+        elif hasattr(metadata, "model_dump"):
+            enriched = metadata.model_dump()
+        else:
+            enriched = {
+                field_name: getattr(metadata, field_name)
+                for field_name in dir(metadata)
+                if not field_name.startswith("_")
+                and not callable(getattr(metadata, field_name, None))
+            }
+        enriched["replay_plan"] = replay_plan
+        return enriched
+
+    def add(summary: Any, metadata: Any = None) -> None:
+        metadata = metadata_with_replay_plan(summary, metadata)
+        task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+        if task_id not in task_ids:
             return
         attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
-        if attempt_id and attempt_id in seen_attempt_ids:
-            return
         status = _text(_value(summary, "status")) or _text(_value(metadata, "status"), "recorded")
-        structured_files = [
-            *_items(_value(summary, "changed_files")),
-            *_items(_value(metadata, "changed_files")),
-        ]
-        compact = _compact_remediation_attempt(
-            summary_text,
-            status=status,
-            changed_files=structured_files,
+        record_key = (
+            attempt_id,
+            task_id,
+            status.casefold() if attempt_id else _text(_value(summary, "summary")),
         )
-        if not compact:
+        if record_key in seen_records:
             return
-        key = (status.casefold(), compact.casefold())
-        if key in seen_entries:
-            return
-        seen_entries.add(key)
-        if attempt_id:
-            seen_attempt_ids.add(attempt_id)
-        entries.append(f"Remediation attempt ({status}): {compact}")
+        seen_records.add(record_key)
+        records.append((summary, metadata))
 
     for summary in context.action_summaries:
-        if _text(_value(summary, "task_id")) not in task_ids:
-            continue
         attempt_id = _text(_value(summary, "attempt_id"))
-        add_attempt(summary, worker_by_attempt.get(attempt_id))
-
+        add(summary, worker_by_attempt.get(attempt_id))
     for result in worker_results:
-        if _text(_value(result, "task_id")) not in task_ids:
+        add(_value(result, "action_summary"), result)
+    return records
+
+
+def _attempt_summary_key(summary: Any, metadata: Any) -> str:
+    """Return the stable key used to attach an optional summary to an attempt."""
+    attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+    if attempt_id:
+        return attempt_id
+    task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"), "attempt")
+    status = _text(_value(summary, "status")) or _text(_value(metadata, "status"), "recorded")
+    summary_text = _inline_code_text(_value(summary, "summary"), 160)
+    return f"{task_id}:{status}:{summary_text}"
+
+
+def _successful_attempts_for_group(
+    context: ReportContext,
+    group_id: str,
+) -> list[tuple[Any, Any]]:
+    """Return successful worker/action evidence for a group in stable order."""
+    records: list[tuple[Any, Any]] = []
+    for summary, metadata in _attempt_records_for_group(context, group_id):
+        result_status = _text(_value(metadata, "status")).casefold()
+        summary_status = _text(_value(summary, "status")).casefold()
+        diagnostics = _value(metadata, "execution_diagnostics")
+        if (
+            result_status in {"success", "mitigated"}
+            or summary_status in {"success", "mitigated"}
+            or bool(_value(diagnostics, "validation_passed", False))
+        ):
+            records.append((summary, metadata))
+    return records
+
+
+def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
+    """Render concise, numbered attempt history for one follow-up finding."""
+    entries: list[str] = []
+    seen_entries: set[tuple[str, str, str]] = set()
+    for number, (summary, metadata) in enumerate(
+        _attempt_records_for_group(context, group_id),
+        start=1,
+    ):
+        attempt_id = _attempt_summary_key(summary, metadata)
+        kind = _attempt_kind(context, group_id, summary, metadata)
+        outcome_status = _attempt_result_status(context, summary, metadata)
+        files, explicit_no_files = _attempt_files(
+            context,
+            group_id,
+            summary,
+            metadata,
+            attempt_id=attempt_id,
+        )
+        package_changes = _attempt_package_changes(
+            context,
+            group_id,
+            summary,
+            metadata,
+            attempt_id=attempt_id,
+            files=files,
+            explicit_no_files=explicit_no_files,
+        )
+        change_lines: list[str] = []
+        if package_changes:
+            for change, mechanism in package_changes:
+                change_lines.append(_package_attempt_text(change, mechanism))
+        elif kind == "Code Workaround":
+            if files:
+                change_lines.append(f"Attempted a code workaround in {', '.join(files)}.")
+            else:
+                change_lines.append("Attempted a code workaround; source files were not recorded.")
+        elif explicit_no_files:
+            change_lines.append("No validated package change was applied.")
+        else:
+            change_lines.append("Attempted a package version update.")
+
+        diff_blocks = (
+            _attempt_diff_blocks(context, summary, metadata, files)
+            if kind == "Code Workaround"
+            else []
+        )
+        raw_attempt_status = (
+            _text(_value(metadata, "status")) or _text(_value(summary, "status")) or "pending"
+        )
+        outcome = _attempt_outcome(summary, metadata, status=raw_attempt_status)
+        # The task result can be marked successful even when its QA envelope
+        # failed. Keep the report aligned with the evidence available to the
+        # reviewer.
+        if outcome_status == "Failed" and not re.search(
+            r"\b(?:fail|timed out|without a validated)\b", outcome, re.I
+        ):
+            outcome = "Validation failed."
+        key = (kind.casefold(), outcome_status.casefold(), "\n".join(change_lines))
+        if key in seen_entries:
             continue
-        action_summary = _value(result, "action_summary")
-        add_attempt(action_summary, result)
+        seen_entries.add(key)
+
+        lines = [f"{number}. **Attempt {number} ({kind} — {outcome_status}):**"]
+        lines.extend(f"   - {line}" for line in change_lines)
+        for block in diff_blocks:
+            lines.extend(["   ```diff", *block.splitlines(), "   ```"])
+        lines.append(f"   - Outcome: {outcome}")
+        entries.append("\n".join(lines))
 
     return "\n\n".join(entries) or "No remediation attempt recorded."
 
@@ -1189,11 +2248,20 @@ def _record_package_change(
     version: str,
     prefix: str,
     file_path: str,
+    section: str = "",
 ) -> None:
     """Record one added or removed package version from a diff line."""
     if name in _NON_PACKAGE_KEYS:
         return
-    record = records.setdefault(name, {"old": "", "new": "", "file": file_path})
+    record = records.setdefault(
+        name,
+        {"old": "", "new": "", "file": file_path, "section": section},
+    )
+    recorded_files = [item.strip() for item in record.get("file", "").split(";")]
+    if file_path and file_path not in recorded_files:
+        record["file"] = "; ".join([*recorded_files, file_path])
+    if section and not record.get("section"):
+        record["section"] = section
     if prefix == "+":
         record["new"] = version
     elif prefix == "-":
@@ -1211,14 +2279,21 @@ def _package_changes(diff: str) -> list[PackageChange]:
     manifest_records: dict[str, dict[str, str]] = {}
     lockfile_records: dict[str, dict[str, str]] = {}
     current_file = ""
-    manifest_section_indent: int | None = None
+    manifest_section: tuple[str, int] | None = None
     lockfile_package: tuple[str, int] | None = None
+    lockfile_version_candidates: list[tuple[int, str, str, str, str]] = []
 
-    for line in diff.splitlines():
+    for line_number, line in enumerate(diff.splitlines()):
+        if line.startswith("@@"):
+            manifest_section = None
+            lockfile_package = None
+            lockfile_version_candidates.clear()
+            continue
         if line.startswith("+++ b/"):
             current_file = line[6:].strip()
-            manifest_section_indent = None
+            manifest_section = None
             lockfile_package = None
+            lockfile_version_candidates.clear()
             continue
         if line.startswith("--- a/") or not _PACKAGE_FILE_RE.search(current_file):
             continue
@@ -1231,11 +2306,12 @@ def _package_changes(diff: str) -> list[PackageChange]:
         ):
             section_match = _MANIFEST_SECTION_RE.match(content)
             if section_match:
-                manifest_section_indent = indent
+                manifest_section = (section_match.group("section"), indent)
                 continue
-            if manifest_section_indent is not None:
-                if content.strip() and indent <= manifest_section_indent:
-                    manifest_section_indent = None
+            if manifest_section is not None:
+                section_name, section_indent = manifest_section
+                if content.strip() and indent <= section_indent:
+                    manifest_section = None
                 elif prefix in {"+", "-"}:
                     package_match = _PACKAGE_LINE_RE.match(content)
                     if package_match:
@@ -1245,6 +2321,7 @@ def _package_changes(diff: str) -> list[PackageChange]:
                             package_match.group("version"),
                             prefix,
                             current_file,
+                            section_name,
                         )
             elif prefix in {"+", "-"}:
                 # Sparse diffs may omit the surrounding dependency-section
@@ -1257,6 +2334,7 @@ def _package_changes(diff: str) -> list[PackageChange]:
                         package_match.group("version"),
                         prefix,
                         current_file,
+                        "",
                     )
             continue
 
@@ -1267,6 +2345,7 @@ def _package_changes(diff: str) -> list[PackageChange]:
                 name = raw_name.removeprefix("node_modules/")
                 if name and name not in _NON_PACKAGE_KEYS:
                     lockfile_package = (name, indent)
+                    lockfile_version_candidates.clear()
                 elif lockfile_package and indent <= lockfile_package[1]:
                     lockfile_package = None
             elif (
@@ -1283,12 +2362,45 @@ def _package_changes(diff: str) -> list[PackageChange]:
                     and version_match.group("name") == "version"
                     and indent > lockfile_package[1]
                 ):
+                    version = version_match.group("version")
                     _record_package_change(
                         lockfile_records,
                         lockfile_package[0],
-                        version_match.group("version"),
+                        version,
                         prefix,
                         current_file,
+                        "lockfile",
+                    )
+                    lockfile_version_candidates.append(
+                        (line_number, prefix, current_file, lockfile_package[0], version)
+                    )
+
+            resolved_match = _LOCKFILE_RESOLVED_RE.match(content)
+            if prefix in {"+", "-"} and resolved_match:
+                resolved_name = _package_name_from_resolved_url(resolved_match.group("url"))
+                candidate = next(
+                    (
+                        item
+                        for item in reversed(lockfile_version_candidates)
+                        if item[1] == prefix
+                        and item[2] == current_file
+                        and 0 < line_number - item[0] <= 4
+                    ),
+                    None,
+                )
+                if resolved_name and candidate is not None and candidate[3] != resolved_name:
+                    _, _, _, previous_name, version = candidate
+                    previous_record = lockfile_records.get(previous_name)
+                    version_key = "new" if prefix == "+" else "old"
+                    if previous_record is not None and previous_record.get(version_key) == version:
+                        previous_record[version_key] = ""
+                    _record_package_change(
+                        lockfile_records,
+                        resolved_name,
+                        version,
+                        prefix,
+                        current_file,
+                        "lockfile",
                     )
 
     direct_names = set(manifest_records)
@@ -1298,9 +2410,16 @@ def _package_changes(diff: str) -> list[PackageChange]:
         if record["old"] or record["new"]:
             evidence_file = record["file"]
             if name in lockfile_records:
-                evidence_file += "; lockfile synchronized"
+                evidence_file += f"; {lockfile_records[name]['file']}"
             changes.append(
-                PackageChange(name, record["old"], record["new"], evidence_file, "direct")
+                PackageChange(
+                    name,
+                    record["old"],
+                    record["new"],
+                    evidence_file,
+                    "direct",
+                    record.get("section", ""),
+                )
             )
     for name in sorted(lockfile_records):
         if name in direct_names:
@@ -1314,158 +2433,143 @@ def _package_changes(diff: str) -> list[PackageChange]:
                     record["new"],
                     record["file"],
                     "transitive",
+                    record.get("section", "lockfile"),
                 )
             )
     return sorted(changes, key=lambda change: (change.scope != "direct", change.name))
 
 
-def _scan_assessment_text(context: ReportContext) -> str:
-    """Describe unavailable post-scan evidence without implying zero findings."""
-    if (
-        _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
-        == "failed"
-    ):
-        return "Unknown — authoritative scan failed"
-    return "Not assessed — no authoritative scan"
-
-
 def _render_summary(context: ReportContext) -> str:
-    """Render the compact user-facing run summary."""
-    duration = (
-        f"{context.duration_seconds:.2f} seconds"
-        if context.duration_seconds is not None
-        else "Pending finalization"
+    """Render the seven-metric, user-facing run summary."""
+    follow_up = context.groups_unresolved + context.groups_inconclusive + context.groups_pending
+    visible_open_groups = sum(
+        context.group_statuses.get(group_id, "pending") in _OUTSTANDING_GROUP_STATUSES
+        for group_id, _ in _follow_up_groups(context)
     )
-    token_rows = (
-        [
-            ("Input tokens", context.total_input_tokens),
-            ("Output tokens", context.total_output_tokens),
-            ("Total tokens", context.total_tokens),
-        ]
-        if context.total_tokens is not None
-        else [("Tokens", "Unavailable")]
+    follow_up = max(follow_up, visible_open_groups)
+    fixed = context.groups_fixed
+    actionable = max(context.actionable_groups, fixed + follow_up)
+    sentence = (
+        f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
+        f"**{follow_up} require follow-up review.**"
     )
     metrics = [
         ("Run ID", context.run_id),
-        ("Repository", context.repo_root),
-        ("Status", f"{context.overall_label} ({context.status})"),
-        ("Total time taken", duration),
-        ("Original scanner findings", context.original_scanner_findings),
-        ("Actionable groups", context.actionable_groups),
-        ("Groups fixed", context.groups_fixed),
-        ("Groups unresolved", context.groups_unresolved),
-        ("Groups inconclusive", context.groups_inconclusive),
-        ("Groups pending", context.groups_pending),
-        ("New groups discovered", _new_group_metric(context, context.new_groups_discovered)),
-        ("New unresolved groups", _new_group_metric(context, context.new_groups_unresolved)),
-        (
-            "New inconclusive groups",
-            _new_group_metric(context, context.new_groups_inconclusive),
-        ),
-        ("New pending groups", _new_group_metric(context, context.new_groups_pending)),
-        *token_rows,
+        ("Total findings scanned", context.original_scanner_findings),
+        ("Successfully remediated", fixed),
+        ("Require follow-up", follow_up),
+        ("Run duration", _format_duration(context.duration_seconds)),
+        ("Total tokens", _format_token_summary(context)),
+        ("Patch status", _format_patch_status(context)),
     ]
-    lines = ["# Remediation Run Report", "", "## 1. Summary", ""]
-    if context.executive_narrative:
-        narrative = "\n".join(
-            line
-            for line in context.executive_narrative.splitlines()
-            if not line.lstrip().startswith("#")
-        ).strip()
-        if narrative:
-            lines.extend([narrative, ""])
-    lines.append(_table(("Metric", "Value"), metrics))
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "# Remediation Run Report",
+            "",
+            "## 1. Summary",
+            "",
+            sentence,
+            "",
+            _table(("Metric", "Value"), metrics),
+        ]
+    )
 
 
-def _finding_row(context: ReportContext, group: Any) -> tuple[str, ...]:
-    """Build one compact findings-overview row."""
-    issue = _group_issue(group)
+def _scan_issue_for_identifier(context: ReportContext, identifier: str) -> Any | None:
+    """Find the authoritative post-scan issue associated with an identifier."""
+    normalized = identifier.casefold()
+    for issue in context.post_remediation_scan_issues:
+        if normalized in {item.casefold() for item in _issue_identifiers(issue)}:
+            return issue
+    return None
+
+
+def _package_transition(change: PackageChange, mechanism: str) -> str:
+    """Render only the version transition for a successful package change."""
+    previous = change.old or "not present"
+    current = change.new or "removed"
+    return f"{previous} → {current} via {mechanism}"
+
+
+def _successful_remediation_evidence(
+    context: ReportContext,
+    group: Any,
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Collect table text and source diff evidence for one fixed group.
+
+    Returns:
+        A tuple containing the remediation-change text, changed files, compact
+        code-workaround summaries, and complete unified-diff blocks.
+    """
     group_id = _text(_value(group, "group_id"))
-    return (
-        _finding_identifier(group, issue),
-        _group_sources(group, issue),
-        _group_location(group),
-        _text(_value(group, "vulnerable_component"), "—"),
-        _group_severity(group, issue),
-        _text(_value(_value(group, "fix_plan"), "status"), "—"),
-        _final_change_for_group(context, group),
-        context.group_statuses.get(group_id, "pending"),
-        _validation_for_group(context, group_id),
-    )
-
-
-def _newly_discovered_finding_rows(context: ReportContext) -> list[tuple[str, ...]]:
-    """Build findings-overview rows for new and reappeared groups."""
-    scan_state = _scan_evidence_state(
-        context.final_full_scan_result, context.new_vulnerability_status
-    )
-    if scan_state != "complete":
-        assessment = _scan_assessment_text(context)
-        return [
-            (
-                "Not assessed",
-                "—",
-                "—",
-                "—",
-                "—",
-                "—",
-                "No validated change",
-                "—",
-                assessment,
-            )
-        ]
-
-    discovered_ids = set(_discovered_group_ids(context))
-    groups = [
-        group
-        for group in _report_groups(context)
-        if _text(_value(group, "group_id")) in discovered_ids
+    package_changes = [
+        (change, _dependency_mechanism(context, group_id, change))
+        for change in _package_changes(context.diff)
+        if _package_change_matches_group(change, group)
     ]
-    if groups:
-        return [_finding_row(context, group) for group in groups]
-    if discovered_ids:
-        return [
-            (
-                group_id,
-                "—",
-                "—",
-                "—",
-                "unknown",
-                "—",
-                "No validated change",
-                "pending",
-                "Not evaluated",
-            )
-            for group_id in sorted(discovered_ids)
-        ]
+    package_text = [_package_transition(change, mechanism) for change, mechanism in package_changes]
+    files: list[str] = []
+    for change, _ in package_changes:
+        files.extend(_package_change_files(change))
 
-    if context.triage_required:
-        return [
-            (
-                "Not assessed",
-                "—",
-                "—",
-                "—",
-                "—",
-                "—",
-                "No validated change",
-                "pending",
-                "Not assessed — post-scan triage required",
-            )
-        ]
-    return [("None", "—", "—", "—", "—", "—", "—", "—", "No newly discovered groups")]
+    code_summaries: list[str] = []
+    diff_blocks: list[str] = []
+    for summary, metadata in _successful_attempts_for_group(context, group_id):
+        if _attempt_kind(context, group_id, summary, metadata) != "Code Workaround":
+            continue
+        attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+        attempt_files, _ = _attempt_files(
+            context,
+            group_id,
+            summary,
+            metadata,
+            attempt_id=attempt_id,
+        )
+        files.extend(attempt_files)
+        details = _attempt_code_details(
+            context,
+            group_id,
+            summary,
+            metadata,
+            attempt_id=attempt_id,
+            files=attempt_files,
+            include_package_diff=False,
+        )
+        detail_summary = _sanitize_report_outcome(_attempt_change_summary(summary, details))
+        if detail_summary and detail_summary.casefold() not in {
+            "validated remediation recorded.",
+            "no specific code change recorded.",
+        }:
+            code_summaries.append(detail_summary)
+        diff_blocks.extend(_attempt_diff_blocks(context, summary, metadata, attempt_files))
+
+    files = _unique_texts(files)
+    if not files and len(context.initial_valid_groups) == 1:
+        files = list(context.changed_files)
+    diff_blocks = _unique_texts(diff_blocks)
+
+    changes: list[str] = []
+    if package_text:
+        changes.extend(package_text)
+    if code_summaries:
+        changes.append(f"Code workaround: {'; '.join(_unique_texts(code_summaries))}")
+    elif diff_blocks:
+        changes.append("Code workaround: source changes applied")
+    if not changes:
+        changes.append("Validated remediation recorded")
+    return "; ".join(_unique_texts(changes)), files, _unique_texts(code_summaries), diff_blocks
 
 
 def _render_follow_up_actions(context: ReportContext) -> str:
-    """Render required actions and complete attempt evidence for open groups."""
+    """Render one action-oriented block for every open finding."""
     status_order = {
         "unfixable": 0,
         "needs_retry": 1,
-        "pivoted": 2,
-        "inconclusive": 3,
+        "inconclusive": 2,
+        "pivoted": 3,
         "pending": 4,
         "optimistically_fixed": 5,
+        "awaiting_validation": 5,
     }
     groups = [
         (group_id, group)
@@ -1474,77 +2578,127 @@ def _render_follow_up_actions(context: ReportContext) -> str:
     ]
     groups.sort(
         key=lambda item: (
-            status_order.get(
-                context.group_statuses.get(item[0], "pending"),
-                99,
-            ),
+            status_order.get(context.group_statuses.get(item[0], "pending"), 99),
             item[0],
         )
     )
-    rows: list[tuple[str, ...]] = []
-    for group_id, group in groups:
+
+    lines = ["## 2. Follow up Actions", ""]
+    if not groups:
+        lines.append("No follow-up actions are required.")
+        return "\n".join(lines)
+
+    for index, (group_id, group) in enumerate(groups):
+        issue = _group_issue(group)
         status = context.group_statuses.get(group_id, "pending")
+        finding = _finding_identifier(group, issue)
+        package = _group_finding_package(group)
+        severity = _group_severity(group, issue)
+        lines.extend(
+            [
+                f"### {finding} — {package} ({severity})",
+                "",
+                f"- **Status:** {_user_friendly_status(status)}",
+                f"- **Recommended action:** {_required_follow_up_action(context, group, status, group_id=group_id)}",
+                "- **Attempted remediations:**",
+            ]
+        )
+        attempt_text = _attempted_fixes_for_group(context, group_id)
+        if attempt_text == "No remediation attempt recorded.":
+            lines.append("  No remediation attempt recorded.")
+        else:
+            # The attempt renderer already owns numbering and indentation. The
+            # first item is kept under the labelled list for readable Markdown.
+            in_diff = False
+            for line in attempt_text.splitlines():
+                stripped = line.strip()
+                if stripped == "```diff":
+                    lines.append("   ```diff")
+                    in_diff = True
+                elif in_diff and stripped == "```":
+                    lines.append("   ```")
+                    in_diff = False
+                elif in_diff:
+                    lines.append(line)
+                else:
+                    lines.append(f"  {line}")
+        if index != len(groups) - 1:
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _render_successful_remediations(context: ReportContext) -> str:
+    """Render one consolidated table of successful package and code fixes."""
+    groups = [
+        group
+        for group in _report_groups(context)
+        if context.group_statuses.get(_text(_value(group, "group_id")), "pending")
+        in {"qa_passed", "mitigated"}
+    ]
+    lines = ["## 3. Successful Remediations", ""]
+    if not groups:
+        lines.append("No successful remediations were produced during this run.")
+        return "\n".join(lines)
+
+    rows: list[tuple[str, ...]] = []
+    code_evidence: list[tuple[str, str, str, str, list[str], list[str]]] = []
+    for group in groups:
+        issue = _group_issue(group)
+        change_text, files, code_summaries, diff_blocks = _successful_remediation_evidence(
+            context,
+            group,
+        )
         rows.append(
             (
-                _finding_identifier(group, _group_issue(group)),
-                _text(_value(group, "vulnerable_component"), "—"),
-                _FOLLOW_UP_STATUS_LABELS.get(status, status),
-                _required_follow_up_action(context, group, status, group_id=group_id),
-                _attempted_fixes_for_group(context, group_id),
+                _finding_identifier(group, issue),
+                _group_finding_package(group),
+                _group_severity(group, issue),
+                change_text,
+                ", ".join(files) or "Not recorded",
             )
         )
-    if not rows:
-        rows = [("None", "—", "—", "No follow-up actions required", "—")]
-
-    return "\n".join(
-        [
-            "## {number}. Follow up Actions",
-            "",
-            _table(
+        if code_summaries or diff_blocks:
+            code_evidence.append(
                 (
-                    "Finding",
-                    "Package/component",
-                    "Status",
-                    "Required follow-up action",
-                    "Attempted fixes",
-                ),
-                rows,
-            ),
-        ]
-    )
+                    _finding_identifier(group, issue),
+                    _group_finding_package(group),
+                    _group_severity(group, issue),
+                    "; ".join(code_summaries) or "Source changes applied.",
+                    files,
+                    diff_blocks,
+                )
+            )
 
-
-def _render_findings(context: ReportContext) -> str:
-    """Render original and newly discovered findings with shared columns."""
-    original_rows = [
-        _finding_row(context, group)
-        for group in sorted(
-            context.initial_valid_groups,
-            key=lambda item: _text(_value(item, "group_id")),
+    lines.append(
+        _table(
+            ("Finding", "Package / Target", "Severity", "Remediation Change", "Files Changed"),
+            rows,
         )
-    ]
-    original_table = _table(_FINDING_HEADERS, original_rows or [("None",) * 9])
-    discovered_table = _table(_FINDING_HEADERS, _newly_discovered_finding_rows(context))
-    return "\n".join(
-        [
-            "## {number}. Findings Overview",
-            "",
-            "### Original Findings",
-            "",
-            original_table,
-            "",
-            "### Newly Discovered Groups",
-            "",
-            discovered_table,
-        ]
     )
+    if code_evidence:
+        lines.extend(["", "### Code workaround details", ""])
+        for finding, package, severity, summary, files, diff_blocks in code_evidence:
+            lines.extend(
+                [
+                    f"#### {finding} — {package} ({severity})",
+                    "",
+                    f"- **Summary:** {summary}",
+                    f"- **Files changed:** {', '.join(files) or 'Not recorded'}",
+                ]
+            )
+            for block in diff_blocks:
+                lines.extend(["", "```diff", block, "```"])
+            lines.append("")
+        while lines and lines[-1] == "":
+            lines.pop()
+    return "\n".join(lines)
 
 
 def _render_references(context: ReportContext) -> str:
-    """Render lightweight artifact references."""
+    """Render the three artifact references useful to an end user."""
     return "\n".join(
         [
-            "## {number}. References",
+            "## 4. References",
             "",
             _table(
                 ("Artifact", "Reference"),
@@ -1552,67 +2706,10 @@ def _render_references(context: ReportContext) -> str:
                     ("Trajectory", context.trajectory_path or "Not available"),
                     ("LangSmith trace", context.langsmith_trace_url or "Not available"),
                     ("Patch", "Included in run result" if context.has_patch else "No unified diff"),
-                    ("Changed files", ", ".join(context.changed_files) or "None"),
                 ],
             ),
         ]
     )
-
-
-def _evidence_payload(context: ReportContext) -> dict[str, Any]:
-    """Build the bounded deterministic evidence supplied to an optional LLM."""
-    return {
-        "status": context.status,
-        "overall_label": context.overall_label,
-        "metrics": {
-            "original_scanner_findings": context.original_scanner_findings,
-            "actionable_groups": context.actionable_groups,
-            "groups_fixed": context.groups_fixed,
-            "groups_unresolved": context.groups_unresolved,
-            "groups_inconclusive": context.groups_inconclusive,
-            "groups_pending": context.groups_pending,
-            "new_groups_discovered": context.new_groups_discovered,
-            "new_groups_unresolved": context.new_groups_unresolved,
-            "new_groups_inconclusive": context.new_groups_inconclusive,
-            "new_groups_pending": context.new_groups_pending,
-        },
-        "group_statuses": context.group_statuses,
-        "strategies": {key: _text(value) for key, value in context.group_strategies.items()},
-        "reconciliation": context.triage_reconciliation,
-        "changed_files": context.changed_files,
-    }
-
-
-def _generate_executive_narrative(
-    context: ReportContext,
-    settings: AppSettings,
-) -> str | None:
-    """Ask an optional LLM to summarize supplied evidence without making decisions."""
-    if not settings.report_llm_enabled:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-
-        evidence = json.dumps(_evidence_payload(context), sort_keys=True, default=str)
-        prompt = (
-            "Write a concise executive narrative for a human reader of a software security remediation run.\n"
-            "Use only the deterministic evidence below. Do not add facts, calculate metrics, change statuses, "
-            "or recommend actions. Do not use a heading. Write 3 to 6 short paragraphs.\n\n"
-            f"Deterministic evidence:\n{evidence[:16000]}"
-        )
-        response = ChatOpenAI(
-            model=settings.report_llm_model,
-            temperature=0.3,
-            max_tokens=1500,
-        ).invoke(prompt)
-        content = _value(response, "content")
-        narrative = "\n".join(
-            line for line in _text(content).splitlines() if not line.lstrip().startswith("#")
-        ).strip()
-        return narrative or None
-    except Exception as exc:  # noqa: BLE001 - optional narrative must not block reporting
-        log.warning("report narrative generation failed: %s", exc)
-        return None
 
 
 def generate_report(
@@ -1622,7 +2719,6 @@ def generate_report(
     trace_url: str | None = None,
     token_summary: Mapping[str, Any] | None = None,
     run_ended_at: datetime | None = None,
-    executive_narrative: str | None = None,
 ) -> str:
     """Render a deterministic Markdown report from graph state.
 
@@ -1632,7 +2728,6 @@ def generate_report(
         trace_url: Optional LangSmith trace reference.
         token_summary: Optional prompt/completion token totals.
         run_ended_at: Optional final timestamp; omitted values remain pending.
-        executive_narrative: Optional bounded narrative supplied by the caller.
 
     Returns:
         Markdown text. This function does not write files or call external
@@ -1644,19 +2739,13 @@ def generate_report(
         trace_url=trace_url,
         token_summary=token_summary,
         run_ended_at=run_ended_at,
-        executive_narrative=executive_narrative,
     )
     sections = [
         _render_follow_up_actions(context),
-        _render_findings(context),
+        _render_successful_remediations(context),
         _render_references(context),
     ]
-    report = _render_summary(context)
-    section_number = 2
-    for section in sections:
-        report += "\n\n" + section.replace("{number}", str(section_number), 1)
-        section_number += 1
-    return report + "\n"
+    return _render_summary(context) + "\n\n" + "\n\n".join(sections) + "\n"
 
 
 def _resolve_report_dir(settings: AppSettings | None = None) -> Path:
@@ -1702,7 +2791,7 @@ def finalize_report(
     trace_url: str | None,
     settings: AppSettings | None = None,
 ) -> tuple[str, Path | None]:
-    """Enrich, optionally narrate, and atomically persist the final report.
+    """Render and atomically persist the final report.
 
     Args:
         state: Final graph state to summarize.
@@ -1710,15 +2799,15 @@ def finalize_report(
         trajectory_path: Path to the exported trajectory, when available.
         trace_url: Remote trace URL, when available.
         settings: Optional validated settings for report persistence and the
-            optional narrative model.
+            report directory.
 
     Returns:
         A tuple containing Markdown and the canonical path. The path is
         ``None`` if persistence fails; the Markdown remains available.
 
     Side Effects:
-        May invoke the optional report narrative LLM and writes the canonical
-        Markdown report through an atomic sibling-file replacement.
+        Writes the canonical Markdown report through an atomic sibling-file
+        replacement.
     """
     token_summary = _extract_token_summary(recorder)
     ended_at = datetime.now(UTC)
@@ -1730,14 +2819,12 @@ def finalize_report(
         token_summary=token_summary,
         run_ended_at=ended_at,
     )
-    narrative = _generate_executive_narrative(base_context, settings)
     markdown = generate_report(
         state,
         trajectory_path=trajectory_path,
         trace_url=trace_url,
         token_summary=token_summary,
         run_ended_at=ended_at,
-        executive_narrative=narrative,
     )
     try:
         report_dir = _resolve_report_dir(settings)

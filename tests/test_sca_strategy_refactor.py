@@ -25,6 +25,7 @@ from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _build_high_level_retry_instruction,
     _next_sca_stage,
+    _plan_initial_transitive_task,
     run_supervisor_node,
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
@@ -424,6 +425,38 @@ def test_transitive_initial_task_targets_parent_before_override():
     assert task.selected_version is None
     assert "direct-parent" in task.instruction
     assert "overrides" not in task.instruction
+
+
+def test_transitive_initial_planner_recovers_parent_version_from_group_evidence():
+    issue = _issue("CVE-2026-0003", package="transitive-child")
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        is_direct_dependency=False,
+        dependency_ancestry=["direct-parent", "transitive-child"],
+        dependency_versions={"direct-parent": "1.0.0", "transitive-child": "1.0.0"},
+        parent_package_name="direct-parent",
+        parent_declaration_type="dependencies",
+        localization_confidence=1.0,
+    )
+    group = group_issues(
+        [issue],
+        sca_issue_plans=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
+    )[0]
+    task = build_initial_remediation_task(group, "task-1")
+
+    with patch(
+        "remediation_engine.orchestration.supervisor_node.plan_npm_parent_version"
+    ) as parent_planner:
+        parent_planner.invoke.return_value = "- Selected Version: 1.0.1"
+        planned = _plan_initial_transitive_task(task, group)
+
+    assert planned.parent_package_version == "1.0.0"
+    assert planned.strategy_stage == SCARemediationStage.OSV_MINIMUM
+    assert planned.target_package_name == "direct-parent"
+    assert planned.selected_version == "1.0.1"
+    parent_planner.invoke.assert_called_once()
 
 
 def test_transitive_stage_progression_reaches_override_before_workaround():

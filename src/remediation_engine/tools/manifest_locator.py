@@ -562,10 +562,15 @@ def _expand_npm_lockfile_ancestry(
     if parent_version and str(parent_metadata.get("version")) != parent_version:
         return ancestry
 
+    # Physical node_modules paths often omit versions even though the npm
+    # lockfile has the exact installed parent version. Preserve that resolved
+    # value so the Supervisor can perform its parent-first planning stages.
+    resolved_parent_version = str(parent_metadata.get("version") or "").strip() or parent_version
+
     hint_names = [name for name, _ in ancestry]
     hint_versions = {name: version for name, version in ancestry if version}
     queue: list[tuple[str, list[tuple[str, str | None]], int]] = [
-        (parent_key, [(parent_name, parent_version)], 1)
+        (parent_key, [(parent_name, resolved_parent_version)], 1)
     ]
     visited: set[tuple[str, int]] = set()
 
@@ -640,8 +645,12 @@ def expand_dependency_ancestry_from_repository(
     """
     lockfile_rel, _, _ = parse_lockfile_path(odc_file_path)
     lockfile_name = Path(lockfile_rel).name if lockfile_rel else ""
-    if lockfile_name.lower() != "package-lock.json":
+    # ODC may report either a synthetic package-lock ancestry path or the
+    # physical nested node_modules path. In the latter case, use the lockfile
+    # adjacent to the resolved manifest as the source of exact versions.
+    if lockfile_name and lockfile_name.lower() != "package-lock.json":
         return list(dependency_ancestry), dict(dependency_versions)
+    lockfile_name = lockfile_name or "package-lock.json"
 
     if manifest_file:
         relative_manifest = repository_relative_path(manifest_file, repo_root)
@@ -655,10 +664,7 @@ def expand_dependency_ancestry_from_repository(
     if parsed_pairs and [name for name, _ in parsed_pairs] == dependency_ancestry:
         supplied_pairs = parsed_pairs
 
-    expanded = _expand_npm_lockfile_ancestry(
-        manifest_path.parent / lockfile_name,
-        supplied_pairs,
-    )
+    expanded = _expand_npm_lockfile_ancestry(manifest_path.parent / lockfile_name, supplied_pairs)
     return (
         [name for name, _ in expanded],
         {name: version for name, version in expanded if version},

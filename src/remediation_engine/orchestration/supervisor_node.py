@@ -2046,8 +2046,10 @@ def _plan_initial_transitive_task(
     ):
         return task
     child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
-    installed_parent_version = task.parent_package_version
-    parent_name, _, parent_type = group_parent_context(group)
+    parent_name, parent_version, parent_type = group_parent_context(group)
+    installed_parent_version = task.parent_package_version or parent_version
+    if installed_parent_version and task.parent_package_version != installed_parent_version:
+        task = task.model_copy(update={"parent_package_version": installed_parent_version})
     if not child_fixed_version or not installed_parent_version or not parent_name:
         stage = SCARemediationStage.PACKAGE_OVERRIDE
         target_type = _override_dependency_type(group)

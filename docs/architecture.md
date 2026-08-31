@@ -91,12 +91,12 @@ supported at the application boundary.
 The report node consumes the final graph projection after teardown. It first
 normalizes statuses, task/attempt evidence, scan state, package changes, diff
 content, errors, and triage reconciliation into a deterministic report
-context. Rendering is pure Markdown generation. Optional executive narrative
-generation receives only that bounded deterministic evidence and cannot alter
-statuses or findings. Persistence is isolated in `report_persistence.py` and
-uses a sibling temporary file followed by atomic replacement. Report failures
-remain visible as typed error metadata while the in-memory Markdown result is
-preserved.
+context. Rendering is pure Markdown generation with a concise four-section
+end-user layout; internal errors and orchestration diagnostics are retained in
+state but are not included in the user report. Persistence is isolated in
+`report_persistence.py` and uses a sibling temporary file followed by atomic
+replacement. Report failures remain visible as typed error metadata while the
+in-memory Markdown result is preserved.
 
 The graph performs post-QA triage only when an authoritative scan reports new
 or unresolved findings. The final full scan is a separate Supervisor-owned

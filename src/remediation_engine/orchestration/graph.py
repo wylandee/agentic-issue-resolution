@@ -217,6 +217,14 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
         "cve_ids": sorted(group.cve_ids or []),
         "ghsa_ids": sorted(group.ghsa_ids or []),
         "versions": sorted(group.versions or []),
+        "dependency_ancestry": list(group.dependency_ancestry or []),
+        "dependency_versions": dict(sorted((group.dependency_versions or {}).items())),
+        "parent_package_name": group.parent_package_name,
+        "parent_package_version": group.parent_package_version,
+        "parent_declaration_type": group.parent_declaration_type,
+        "parent_contexts": [
+            context.model_dump(mode="json") for context in group.parent_contexts or []
+        ],
         "sources": sorted(source.value for source in (group.sources or [])),
         "issues": sorted(_stable_issue_fingerprint(issue) for issue in (group.issues or [])),
         "fix_plan": group.fix_plan.model_dump(mode="json") if group.fix_plan else None,

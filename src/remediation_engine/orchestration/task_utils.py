@@ -262,7 +262,7 @@ def is_no_fix_group(group: VulnerabilityGroup) -> bool:
 
 def is_transitive_group(group: VulnerabilityGroup) -> bool:
     """Return whether an SCA group represents a transitive dependency."""
-    if group.parent_package_name:
+    if group.parent_package_name or group.parent_contexts:
         return True
     return any(localized.is_direct_dependency is False for localized in group.localized_issues)
 
@@ -273,12 +273,23 @@ def group_parent_context(group: VulnerabilityGroup) -> tuple[str | None, str | N
     parent_version = group.parent_package_version
     parent_type = group.parent_declaration_type
     if parent_name:
+        if not parent_version:
+            parent_version = group.dependency_versions.get(parent_name)
         return parent_name, parent_version, parent_type
+    for context in group.parent_contexts:
+        return (
+            context.package_name,
+            context.package_version or context.dependency_versions.get(context.package_name),
+            context.declaration_type,
+        )
     for localized in group.localized_issues:
         if localized.parent_package_name:
+            parent_version = localized.parent_package_version or localized.dependency_versions.get(
+                localized.parent_package_name
+            )
             return (
                 localized.parent_package_name,
-                localized.parent_package_version,
+                parent_version,
                 localized.parent_declaration_type,
             )
     return None, None, None

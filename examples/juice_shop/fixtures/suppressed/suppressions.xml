@@ -36,11 +36,15 @@
         <packageUrl regex="true">^pkg:npm/%40sigstore%2Fcore@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for @tootallnate/once (npm)</notes>
+        <notes>Keep @tootallnate/once as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/%40tootallnate%2Fonce@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
+
     <suppress>
         <notes>Suppress all vulnerabilities for base64url (npm)</notes>
         <packageUrl regex="true">^pkg:npm/base64url@.*$</packageUrl>
@@ -112,11 +116,15 @@
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
+        <notes>Keep express-jwt as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
+
     <suppress>
         <notes>Suppress all vulnerabilities for file-type (npm)</notes>
         <packageUrl regex="true">^pkg:npm/file-type@.*$</packageUrl>
@@ -128,11 +136,15 @@
         <packageUrl regex="true">^pkg:npm/form-data@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for got (npm)</notes>
+        <notes>Keep got as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
+
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>
         <packageUrl regex="true">^pkg:npm/grunt-cli@.*$</packageUrl>
@@ -222,11 +234,15 @@
         <packageUrl regex="true">^pkg:npm/nanoid@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for notevil (npm)</notes>
+        <notes>Keep notevil as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/notevil@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
+
     <suppress>
         <notes>Suppress all vulnerabilities for parseuri (npm)</notes>
         <packageUrl regex="true">^pkg:npm/parseuri@.*$</packageUrl>
@@ -238,11 +254,15 @@
         <packageUrl regex="true">^pkg:npm/piscina@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for sanitize-html (npm)</notes>
+        <notes>Keep sanitize-html as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/sanitize-html@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
+
     <suppress>
         <notes>Suppress all vulnerabilities for serialize-javascript (npm)</notes>
         <packageUrl regex="true">^pkg:npm/serialize-javascript@.*$</packageUrl>
@@ -273,13 +293,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep undici as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for undici (npm)</notes>
         <packageUrl regex="true">^pkg:npm/undici@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for uuid (npm)</notes>

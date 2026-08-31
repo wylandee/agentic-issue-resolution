@@ -762,6 +762,40 @@ class TestLocateDependency:
         assert result["parent_manifest_line"] is not None
         assert '"sqlite3": "^5.1.7"' in result["parent_manifest_snippet"]
 
+    def test_physical_node_modules_path_recovers_parent_version_from_lockfile(self, tmp_repo):
+        package_json = json.loads((tmp_repo / "package.json").read_text())
+        package_json["dependencies"]["sanitize-html"] = "1.4.2"
+        (tmp_repo / "package.json").write_text(json.dumps(package_json, indent=2))
+        (tmp_repo / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"dependencies": {"sanitize-html": "1.4.2"}},
+                        "node_modules/sanitize-html": {
+                            "version": "1.4.2",
+                            "dependencies": {"lodash": "2.4.x"},
+                        },
+                        "node_modules/sanitize-html/node_modules/lodash": {"version": "2.4.2"},
+                    },
+                }
+            )
+        )
+
+        result = locate_dependency(
+            repo_path=tmp_repo,
+            raw_dependency_name="lodash",
+            odc_file_path="/src/node_modules/sanitize-html/node_modules/lodash/dist/lodash.js",
+        )
+
+        assert result["dependency_ancestry"] == ["sanitize-html", "lodash"]
+        assert result["dependency_versions"] == {
+            "sanitize-html": "1.4.2",
+            "lodash": "2.4.2",
+        }
+        assert result["parent_package_name"] == "sanitize-html"
+        assert result["parent_package_version"] == "1.4.2"
+
     def test_expands_compressed_odc_ancestry_from_npm_lockfile(self, tmp_repo):
         package_json = json.loads((tmp_repo / "package.json").read_text())
         package_json["dependencies"]["sqlite3"] = "^5.1.7"

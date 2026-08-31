@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from remediation_engine.contracts.schemas import (
+    DependencyParentContext,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -151,6 +152,58 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     assert changed.group_id not in result["qa_evaluations"]
     assert result["task_queue"]["task-unchanged"] is unchanged_task
     assert result["active_target_task_ids"] == []
+
+
+def test_post_triage_reopens_group_when_parent_context_becomes_available():
+    """Parent evidence changes group content without changing its canonical ID."""
+    issue = _issue("CVE-2026-0005")
+    previous = _group("sca:package.json:lodash:UPDATE_VERSION", issue)
+    candidate = previous.model_copy(
+        update={
+            "dependency_ancestry": ["sanitize-html", "lodash"],
+            "dependency_versions": {"sanitize-html": "1.4.2", "lodash": "2.4.2"},
+            "parent_package_name": "sanitize-html",
+            "parent_package_version": "1.4.2",
+            "parent_declaration_type": "dependencies",
+            "parent_contexts": [
+                DependencyParentContext(
+                    package_name="sanitize-html",
+                    package_version="1.4.2",
+                    declaration_type="dependencies",
+                    manifest_file="package.json",
+                    dependency_ancestry=["sanitize-html", "lodash"],
+                    dependency_versions={"sanitize-html": "1.4.2", "lodash": "2.4.2"},
+                )
+            ],
+        }
+    )
+    task = build_initial_remediation_task(previous, "task-lodash")
+    state = initial_orchestrator_state(
+        "repo",
+        [previous],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {"task-lodash": task},
+            "triage_required": True,
+            "new_vulnerability_status": "detected",
+            "post_remediation_scan_issues": [issue],
+            "active_target_task_ids": ["task-lodash"],
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[(candidate, _triage_result(candidate))],
+    ):
+        result = post_qa_triage_node(state)
+
+    assert result["triage_reconciliation"]["changed_group_ids"] == [previous.group_id]
+    assert result["valid_groups"] == [candidate]
+    assert result["task_queue"]["task-lodash"].status == TaskStatus.PENDING
+    assert result["task_queue"]["task-lodash"].task_revision == 1
 
 
 def test_post_triage_uses_post_scan_odc_issues_and_retains_non_odc_baseline():

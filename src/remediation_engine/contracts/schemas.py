@@ -706,6 +706,41 @@ class LocalizedIssue(BaseModel):
         }
 
 
+class DependencyParentContext(BaseModel):
+    """Typed context for a directly declared parent of a transitive finding.
+
+    Parent context is evidence used by the Supervisor to choose the first
+    remediation stage. It is deliberately separate from the group's identity
+    so duplicate scanner paths for the same vulnerable child do not create
+    independent remediation tasks.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    package_name: str = Field(..., min_length=1, description="Directly declared parent package.")
+    package_version: str | None = Field(
+        None, description="Resolved installed version of the parent package, when available."
+    )
+    declaration_type: str | None = Field(
+        None, description="Manifest declaration section containing the parent package."
+    )
+    manifest_file: str | None = Field(
+        None, description="Repo-relative manifest containing the parent declaration."
+    )
+    manifest_line: int | None = Field(
+        None, ge=1, description="1-indexed manifest line for the parent declaration."
+    )
+    manifest_snippet: str | None = Field(
+        None, description="Bounded manifest snippet around the parent declaration."
+    )
+    dependency_ancestry: list[str] = Field(
+        default_factory=list, description="Resolved ancestry from parent to vulnerable leaf."
+    )
+    dependency_versions: dict[str, str] = Field(
+        default_factory=dict, description="Resolved versions keyed by dependency name."
+    )
+
+
 # ---------------------------------------------------------------------------
 # EditRequest / EditResult
 # ---------------------------------------------------------------------------
@@ -1048,7 +1083,8 @@ class VulnerabilityGroup(BaseModel):
         ...,
         description=(
             "Deterministic group key.  "
-            "SCA: 'sca:{manifest_file}:{package_name}:{fix_strategy}'. "
+            "SCA: 'sca:{manifest_file}:{package_name}:{fix_strategy}'. Parent "
+            "contexts are retained as evidence, not included in the identity. "
             "SAST: 'sast:{file_path}:{rule_id}:{line_start}-{line_end}'."
         ),
     )
@@ -1105,6 +1141,13 @@ class VulnerabilityGroup(BaseModel):
     parent_declaration_type: str | None = Field(
         None,
         description="Manifest declaration section for the directly declared parent package.",
+    )
+    parent_contexts: list[DependencyParentContext] = Field(
+        default_factory=list,
+        description=(
+            "All directly declared parent contexts observed for this vulnerable child. "
+            "The group identity is independent of this list."
+        ),
     )
 
     # Scanner provenance

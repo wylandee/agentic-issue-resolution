@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -59,11 +59,11 @@ class ReportContext:
     changed_files: list[str]
     trajectory_path: str | None
     langsmith_trace_url: str | None
-    executive_narrative: str | None = None
     new_groups_discovered: int | None = None
     new_groups_unresolved: int | None = None
     new_groups_inconclusive: int | None = None
     new_groups_pending: int | None = None
+    workaround_replay_plans: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,7 @@ class PackageChange:
     new: str
     file: str
     scope: str
+    section: str = ""
 
 
 @dataclass(frozen=True)
