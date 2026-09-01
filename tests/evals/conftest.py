@@ -457,12 +457,11 @@ def update_subagent_golden_cases(
 def workaround_subagent_golden_cases(
     load_golden_cases: Callable[[str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Provide curated workaround subagent evaluation cases from golden/subagent_cases.json."""
-    all_cases = load_golden_cases("subagent_cases")
-    cases = [c for c in all_cases if c.get("eval_type") == "workaround_subagent"]
+    """Provide curated workaround cases from the dedicated golden dataset."""
+    cases = load_golden_cases("workaround_subagent_cases")
     if not cases:
         pytest.skip(
-            "No golden workaround subagent cases found in tests/evals/golden/subagent_cases.json"
+            "No golden workaround subagent cases found in tests/evals/golden/workaround_subagent_cases.json"
         )
     return cases
 

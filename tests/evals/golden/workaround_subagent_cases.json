@@ -1,0 +1,2420 @@
+[
+  {
+    "case_id": "workaround-code-change-initial-normal",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "clean_initial_pass_web_assisted",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §194, spans 199, 202, 205, 208, 210, 212, 214, and successful validation span 247. The clean golden preserves the observed local-inspection then web-evidence branch.",
+    "evaluation_note": "Web evidence is optional in general, but when used it must follow local inspection. Expected tool arguments use the current remedy_tools schemas.",
+    "supervisor_instruction": "Implement a code workaround for express-jwt in lib/insecurity.ts that configures an explicit algorithm allowlist for JWT verification.",
+    "completion_task": "Investigate the express-jwt call site, record an evidence-backed plan, apply the minimal source edit, and pass runtime-smoke and targeted-test validation on the first attempt.",
+    "target_package_name": "express-jwt",
+    "attempt_id": "attempt-workaround-normal-001",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "expressJwt",
+          "target_directory": "lib"
+        },
+        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "start_line": 45,
+          "end_line": 75
+        },
+        "output": "SUCCESS: Read the express-jwt authorization call site."
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "express-jwt explicit algorithms option algorithm confusion migration"
+        },
+        "output": "SUCCESS: Found authoritative guidance for an explicit algorithms allowlist."
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
+        },
+        "output": "SUCCESS: Read the relevant JWT algorithm-confusion guidance."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "lib/insecurity.ts"
+          ],
+          "affected_symbols": [
+            "isAuthorized"
+          ],
+          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
+          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist, allowing algorithm confusion at the authorization boundary.",
+          "planned_replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "lib/insecurity.ts"
+          ],
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts",
+          "targeted_test_name": "JWT authorization"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: express-jwt workaround was applied and runtime-smoke plus targeted-test validation passed on the first attempt.",
+    "expected_output": "The worker completes the express-jwt workaround with one evidence-backed source edit and reports validation PASS without claiming unrelated changes.",
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-code-change-pivot",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "code_workaround_after_strategy_pivot",
+    "provenance": "Historical trajectory phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a, workaround run §181, attempt 532509e4-18b1-5257-a075-1e8ff91d8f59. The Supervisor pivoted from exhausted manifest remediation to a code workaround.",
+    "evaluation_note": "The pivot is supervisor-owned input state, not a worker tool. The worker must execute the committed code-workaround instruction without selecting a dependency version.",
+    "supervisor_instruction": "Pivot from the exhausted fstream manifest update to a code workaround. In server.js, replace the vulnerable archive extraction call while preserving the existing behavior.",
+    "completion_task": "Follow the committed code-workaround pivot, investigate the source, plan and apply one safe edit, and pass validation.",
+    "target_package_name": "fstream",
+    "attempt_id": "attempt-workaround-pivot-002",
+    "task_revision": 2,
+    "parent_attempt_id": "attempt-fstream-update-001",
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "archive.extract|fstream",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the fstream extraction call in server.js."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.js",
+          "start_line": 110,
+          "end_line": 155
+        },
+        "output": "SUCCESS: Read the extraction call and its surrounding control flow."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.js"
+          ],
+          "affected_symbols": [
+            "extractArchive"
+          ],
+          "security_invariant": "Archive extraction must not follow unsafe filesystem links or write outside the workspace.",
+          "causal_hypothesis": "The vulnerable fstream extraction call accepts archive entries without the required path-safety guard.",
+          "planned_replacements": [
+            {
+              "file_path": "server.js",
+              "old_text": "archive.extract(input)",
+              "new_text": "safeArchiveExtract(archive, input)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.js; supervisor:code-workaround-pivot",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.js",
+              "old_text": "archive.extract(input)",
+              "new_text": "safeArchiveExtract(archive, input)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.js\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.js"
+          ],
+          "runtime_smoke_file": "lib/archive-utils.js",
+          "targeted_test_file": "test/security/archiveSpec.js",
+          "targeted_test_name": "safe archive extraction"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: fstream code-workaround pivot completed; server.js changed and validation passed.",
+    "expected_output": "The worker follows the Supervisor's code-workaround pivot, makes the scoped source change, and reports validation PASS.",
+    "changed_files": [
+      "server.js"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-code-change-clean-first-attempt",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "clean_initial_pass_ast_branch",
+    "provenance": "Clean positive normalization of the Juice Shop workaround replay fixture and the successful source-edit/validation tails in historical workaround traces. This case intentionally has no validation retry.",
+    "evaluation_note": "This is the revised #3: a first-attempt pass, not a validation-retry case. The AST inspection branch is the accepted alternative to read_workspace_file.",
+    "supervisor_instruction": "Implement the committed code workaround for the CORS configuration in server.ts and validate the resulting source change.",
+    "completion_task": "Inspect the CORS call site, record the exact plan, apply the one planned source edit, and pass validation on the first attempt.",
+    "target_package_name": "hono",
+    "attempt_id": "attempt-workaround-clean-003",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "cors|origin",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the CORS configuration in server.ts."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "server.ts",
+          "symbol_name": "createApp",
+          "line_hint": 18
+        },
+        "output": "SUCCESS: AST inspected: createApp configures the CORS middleware."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.ts"
+          ],
+          "affected_symbols": [
+            "createApp"
+          ],
+          "security_invariant": "CORS accepts only the configured trusted origins.",
+          "causal_hypothesis": "The current middleware permits an unrestricted origin, so untrusted callers can reach the protected API surface.",
+          "planned_replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "lib/cors-policy.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: CORS workaround applied and validation passed on the first attempt.",
+    "expected_output": "The worker completes the CORS workaround with the exact planned source edit and reports validation PASS without retrying.",
+    "changed_files": [
+      "server.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-no-fix-package-removal",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "package_removal_with_consumer_edit",
+    "provenance": "Historical trajectory phase5_20260819T030725Z_340808b8-5eeb-4c4d-a673-8fc737bbe4d6, workaround run §23, attempt 88ee0e54-9807-5c50-96a8-017815a12aee, spans 40, 42, 53, 60, 75, 77, and 83. The final validation passed after correcting a stale directive.",
+    "evaluation_note": "The current removal tool uses requested_package and manifest_path. Because this case also changes a source consumer, validation includes the cumulative package and source files.",
+    "supervisor_instruction": "Execute the NO_FIX package-removal mitigation for deprecated notevil@1.3.3 and remove its consumer call from routes/b2bOrder.ts.",
+    "completion_task": "Record an explicit package-removal plan, remove only the configured dependency, update the source consumer, and pass cumulative validation.",
+    "target_package_name": "notevil",
+    "attempt_id": "attempt-workaround-nofix-004",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "notevil|eval",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found the notevil consumer in routes/b2bOrder.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/b2bOrder.ts",
+          "start_line": 1,
+          "end_line": 90
+        },
+        "output": "SUCCESS: Read the notevil import and vulnerable consumer call."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "package.json",
+            "routes/b2bOrder.ts"
+          ],
+          "affected_symbols": [
+            "deserializeOrder"
+          ],
+          "security_invariant": "The vulnerable notevil package and its unsafe consumer are absent from the remediation workspace.",
+          "causal_hypothesis": "No upstream fixed version is available, so removing the package and replacing its consumer eliminates the vulnerable execution path.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/b2bOrder.ts; supervisor:no-fix-package-removal",
+          "package_removal_requested": true
+        },
+        "output": "SUCCESS: Package-removal workaround plan recorded successfully."
+      },
+      {
+        "name": "remove_no_fix_dependency",
+        "args": {
+          "requested_package": "notevil",
+          "manifest_path": "package.json"
+        },
+        "output": "SUCCESS: Removed 'notevil' through the scoped package-removal tool."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/b2bOrder.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "package.json",
+            "package-lock.json",
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "routes/b2bOrder.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2bOrder"
+        },
+        "output": "SUCCESS: Workaround validation gate passed; package removal and source replacement verified."
+      }
+    ],
+    "final_output": "APPLIED: notevil was removed through the scoped no-fix tool, its consumer was replaced, and cumulative validation passed.",
+    "expected_output": "The worker performs the authorized no-fix package removal, updates only the consumer source, and reports validation PASS.",
+    "changed_files": [
+      "package.json",
+      "package-lock.json",
+      "routes/b2bOrder.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-no-fix-pivot",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "no_fix_package_removal_exhausted_then_code_workaround",
+    "provenance": "Historical trajectory phase5_20260819T065848Z_f450504b-6248-4305-8b06-340a73171c96, no-fix package-removal run §59 followed by code-only run §174. The pivot is represented as committed Supervisor context for the child workaround attempt.",
+    "evaluation_note": "This is distinct from the ordinary code pivot: the input states that package removal was attempted and is no longer permitted. The worker must execute the new source-only strategy.",
+    "supervisor_instruction": "The NO_FIX package-removal attempt for swig is exhausted. Pivot to a source-only code workaround in server.js; do not edit package manifests or select another package version.",
+    "completion_task": "Follow the no-fix-to-code pivot, investigate the source-only mitigation, apply the committed edit, and pass validation without touching package manifests.",
+    "target_package_name": "swig",
+    "attempt_id": "attempt-workaround-nofix-pivot-005",
+    "task_revision": 2,
+    "parent_attempt_id": "attempt-swig-nofix-removal-001",
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "swig.render|template",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the swig consumer in server.js."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.js",
+          "start_line": 220,
+          "end_line": 270
+        },
+        "output": "SUCCESS: Read the source-only workaround target."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.js"
+          ],
+          "affected_symbols": [
+            "renderTemplate"
+          ],
+          "security_invariant": "Template rendering must not evaluate untrusted template expressions.",
+          "causal_hypothesis": "The vulnerable swig consumer evaluates attacker-controlled template expressions and package removal is unavailable in this pivot.",
+          "planned_replacements": [
+            {
+              "file_path": "server.js",
+              "old_text": "swig.render(template, context)",
+              "new_text": "safeRenderTemplate(template, context)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.js; supervisor:no-fix-code-pivot",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Source-only workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.js",
+              "old_text": "swig.render(template, context)",
+              "new_text": "safeRenderTemplate(template, context)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.js\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.js"
+          ],
+          "runtime_smoke_file": "lib/template-policy.js",
+          "targeted_test_file": "test/security/templateSpec.js",
+          "targeted_test_name": "safe template rendering"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: no-fix package-removal attempt was replaced by a validated source-only swig workaround.",
+    "expected_output": "The worker follows the committed no-fix code pivot, changes only server.js, and reports validation PASS.",
+    "changed_files": [
+      "server.js"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-retry-after-local-inspection-first-error",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "search_web_before_local_inspection_then_recovery",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §194, span 197 returned [INVESTIGATION_REQUIRED] before spans 199, 202, and 205 completed local inspection.",
+    "evaluation_note": "This variant uses the search_web-first error. A separate record_plan-before-evidence variant can reuse the same expected recovery suffix.",
+    "supervisor_instruction": "Implement the express-jwt algorithm allowlist workaround in lib/insecurity.ts and validate it.",
+    "completion_task": "Recover from the local-inspection guard, complete local investigation, record a plan, apply the edit, and pass validation.",
+    "target_package_name": "express-jwt",
+    "attempt_id": "attempt-workaround-local-guard-006",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "search_web",
+        "args": {
+          "query": "express-jwt algorithm allowlist"
+        },
+        "output": "ERROR: [INVESTIGATION_REQUIRED] Local codebase investigation must complete using search_codebase_pattern, read_workspace_file, or inspect_ast_symbol before calling search_web."
+      },
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "expressJwt",
+          "target_directory": "lib"
+        },
+        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "start_line": 45,
+          "end_line": 75
+        },
+        "output": "SUCCESS: Read the express-jwt authorization call site."
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "express-jwt explicit algorithms option algorithm confusion migration"
+        },
+        "output": "SUCCESS: Found authoritative guidance for an explicit algorithms allowlist."
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
+        },
+        "output": "SUCCESS: Read the relevant JWT algorithm-confusion guidance."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "lib/insecurity.ts"
+          ],
+          "affected_symbols": [
+            "isAuthorized"
+          ],
+          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
+          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist.",
+          "planned_replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "lib/insecurity.ts"
+          ],
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts",
+          "targeted_test_name": "JWT authorization"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "expressJwt",
+          "target_directory": "lib"
+        },
+        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "start_line": 45,
+          "end_line": 75
+        },
+        "output": "SUCCESS: Read the express-jwt authorization call site."
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "express-jwt explicit algorithms option algorithm confusion migration"
+        },
+        "output": "SUCCESS: Found authoritative guidance for an explicit algorithms allowlist."
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
+        },
+        "output": "SUCCESS: Read the relevant JWT algorithm-confusion guidance."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "lib/insecurity.ts"
+          ],
+          "affected_symbols": [
+            "isAuthorized"
+          ],
+          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
+          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist.",
+          "planned_replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "lib/insecurity.ts"
+          ],
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts",
+          "targeted_test_name": "JWT authorization"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: local investigation guard was recovered from; express-jwt workaround and validation completed.",
+    "expected_output": "The worker recovers from the premature web call, then completes the same validated workaround using the correct local-first sequence.",
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-retry-after-plan-exact-match-error",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "invalid_record_plan_then_correct_plan",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run 1171, spans 1197, 1199, 1203, 1211, and accepted plan span 1216. The historical failures required authoritative evidence before a QA repair plan was accepted.",
+    "evaluation_note": "This case tests invalid record_plan arguments. A deterministic edit PLAN_MISMATCH is a separate error class and is not conflated here.",
+    "supervisor_instruction": "Implement the committed workaround for the verification handler in routes/verify.ts and validate it.",
+    "completion_task": "Recover from an invalid evidence-backed plan request, record the corrected plan, apply it, and pass validation.",
+    "target_package_name": "jsonwebtoken",
+    "attempt_id": "attempt-workaround-plan-retry-007",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "verify|jwt",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found the verification handler in routes/verify.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "start_line": 1,
+          "end_line": 100
+        },
+        "output": "SUCCESS: Read the verification handler."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Token verification must enforce the configured algorithm policy.",
+          "causal_hypothesis": "The verification handler delegates to jsonwebtoken without constraining the accepted algorithm.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "package_removal_requested": false
+        },
+        "output": "ERROR: [MISSING_EVIDENCE] Authoritative evidence is required before accepting a QA_REGRESSION_REPAIR plan."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Token verification must enforce the configured algorithm policy.",
+          "causal_hypothesis": "The verification handler delegates to jsonwebtoken without constraining the accepted algorithm.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts; workspace:README.md",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "verify|jwt",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found the verification handler in routes/verify.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "start_line": 1,
+          "end_line": 100
+        },
+        "output": "SUCCESS: Read the verification handler."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Token verification must enforce the configured algorithm policy.",
+          "causal_hypothesis": "The verification handler delegates to jsonwebtoken without constraining the accepted algorithm.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts; workspace:README.md",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: invalid plan request was corrected with authoritative evidence; verification workaround and validation completed.",
+    "expected_output": "The worker does not proceed with the evidence-deficient plan, records the corrected plan, and completes the validated source workaround.",
+    "changed_files": [
+      "routes/verify.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-retry-after-no-validate-after-edit-error",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "phase_violation_after_edit_then_validation",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §412, spans 430, 442, and eventual successful validation span 481. The same guard appears in run §104 after span 131.",
+    "evaluation_note": "The generic non-validation command is made concrete as search_codebase_pattern. After an edit, the worker must call validate_workaround before further investigation.",
+    "supervisor_instruction": "Apply the committed Hono CORS workaround in server.ts and validate it.",
+    "completion_task": "Recover from a phase violation caused by investigating after an edit, then validate the pending edit and report the completed workaround.",
+    "target_package_name": "hono",
+    "attempt_id": "attempt-workaround-phase-008",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "cors",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the CORS middleware in server.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.ts",
+          "start_line": 15,
+          "end_line": 45
+        },
+        "output": "SUCCESS: Read server.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.ts"
+          ],
+          "affected_symbols": [
+            "createApp"
+          ],
+          "security_invariant": "CORS accepts only trusted origins.",
+          "causal_hypothesis": "The current CORS middleware is unrestricted.",
+          "planned_replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "allowedOrigins",
+          "target_directory": "."
+        },
+        "output": "ERROR: [PHASE_VIOLATION] A source edit must be followed by validate_workaround before further investigation."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "lib/cors-policy.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "cors",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the CORS middleware in server.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.ts",
+          "start_line": 15,
+          "end_line": 45
+        },
+        "output": "SUCCESS: Read server.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.ts"
+          ],
+          "affected_symbols": [
+            "createApp"
+          ],
+          "security_invariant": "CORS accepts only trusted origins.",
+          "causal_hypothesis": "The current CORS middleware is unrestricted.",
+          "planned_replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "lib/cors-policy.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: the post-edit phase violation was recovered from and the pending CORS workaround validated successfully.",
+    "expected_output": "The worker recognizes that investigation after an edit is invalid, then validates the pending edit and reports PASS.",
+    "changed_files": [
+      "server.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-retry-after-validation-failure",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "valid_validation_code_failure_then_recovery",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §980, first validation failure followed by inspection and a corrected plan. The clean first-attempt case is #3; this case intentionally retains a real validation retry.",
+    "evaluation_note": "This is independent of the clean #3 case. The first validate_workaround call has valid arguments but returns CODE_FAILURE; the worker must inspect, re-plan, edit, and validate again.",
+    "supervisor_instruction": "Implement the verification-handler workaround in routes/verify.ts and validate the security behavior.",
+    "completion_task": "Recover from a valid validation gate that reports a code-level failure, then produce and validate the corrected workaround.",
+    "target_package_name": "jsonwebtoken",
+    "attempt_id": "attempt-workaround-validation-retry-009",
+    "task_revision": 1,
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.verify",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found jwt.verify in routes/verify.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "start_line": 20,
+          "end_line": 65
+        },
+        "output": "SUCCESS: Read the verification call site."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Verification must enforce the approved JWT algorithm.",
+          "causal_hypothesis": "The vulnerable call site lacks an explicit algorithm constraint.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "FAILURE: CODE_FAILURE: targeted test assertion failed because the verification result shape changed unexpectedly."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "symbol_name": "verifyToken",
+          "line_hint": 32
+        },
+        "output": "SUCCESS: AST inspected: the complete option is not required by the security invariant."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Verification must enforce the approved JWT algorithm.",
+          "causal_hypothesis": "The first patch added an unnecessary complete-result option that broke the existing response contract.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts; validation:targeted-test-code-failure",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Corrected workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: the valid validation failure was investigated, the workaround was corrected, and the second validation passed.",
+    "expected_output": "The worker treats the first validation result as a code failure, rebuilds the complete planned replacement, and reports final validation PASS.",
+    "changed_files": [
+      "routes/verify.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-retry-after-invalid-smoke-file",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "unsafe_runtime_smoke_then_correct_source_module",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §412, span 437 rejected app.ts as an unsafe runtime smoke target; later validation used lib/utils.ts and passed at span 481.",
+    "evaluation_note": "This case is specifically an invalid runtime smoke file. Compiled or source-module targeted-test errors are separate validation-input variants.",
+    "supervisor_instruction": "Apply the Hono CORS workaround in server.ts and validate it with a lightweight source-module smoke target.",
+    "completion_task": "Recover from an unsafe application-starting smoke target, select a lightweight source module, and complete validation.",
+    "target_package_name": "hono",
+    "attempt_id": "attempt-workaround-smoke-010",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "cors",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the CORS middleware in server.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.ts",
+          "start_line": 15,
+          "end_line": 45
+        },
+        "output": "SUCCESS: Read server.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.ts"
+          ],
+          "affected_symbols": [
+            "createApp"
+          ],
+          "security_invariant": "CORS accepts only trusted origins.",
+          "causal_hypothesis": "The current middleware is unrestricted.",
+          "planned_replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "app.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "ERROR: [INVALID_RUNTIME_SMOKE] [INVALID_VALIDATION_INPUT] Runtime smoke target 'app.ts' is unsafe because it starts the application."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "lib/cors-policy.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "cors",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found the CORS middleware in server.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "server.ts",
+          "start_line": 15,
+          "end_line": 45
+        },
+        "output": "SUCCESS: Read server.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "server.ts"
+          ],
+          "affected_symbols": [
+            "createApp"
+          ],
+          "security_invariant": "CORS accepts only trusted origins.",
+          "causal_hypothesis": "The current middleware is unrestricted.",
+          "planned_replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:server.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "server.ts",
+              "old_text": "app.use(cors())",
+              "new_text": "app.use(cors({ origin: allowedOrigins }))",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "server.ts"
+          ],
+          "runtime_smoke_file": "lib/cors-policy.ts",
+          "targeted_test_file": "test/security/corsSpec.ts",
+          "targeted_test_name": "trusted origins"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: unsafe app.ts smoke target was rejected and the corrected source-module smoke validation passed.",
+    "expected_output": "The worker replaces the unsafe application-starting smoke target with a lightweight source module and reports validation PASS.",
+    "changed_files": [
+      "server.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-retry-after-validation-infra-failure",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "infra_failure_targeted_test_substitution",
+    "provenance": "Historical trajectories phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52 §212 and phase5_20260819T065848Z_f450504b-6248-4305-8b06-340a73171c96 §174 contain infrastructure-like/no-test failures, but their substitutions were rejected because the runtime classified the failures as CODE_FAILURE. The accepted substitution contract is covered by test_workaround_lifecycle_alternative_tests.py.",
+    "evaluation_note": "This is a controlled positive substitution fixture. The first validation result must be INFRA_FAILURE or BLOCKED with infrastructure-only evidence; no source re-edit is allowed before the substitution.",
+    "supervisor_instruction": "Apply the express-jwt workaround in lib/insecurity.ts. If the targeted test fails only because its native test dependency is unavailable, register one existing alternative test and validate it.",
+    "completion_task": "Complete the workaround despite an infrastructure-only targeted-test failure by selecting and registering one valid alternative test, then pass validation.",
+    "target_package_name": "express-jwt",
+    "attempt_id": "attempt-workaround-infra-011",
+    "task_revision": 1,
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "expressJwt",
+          "target_directory": "lib"
+        },
+        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "lib/insecurity.ts",
+          "start_line": 45,
+          "end_line": 75
+        },
+        "output": "SUCCESS: Read the express-jwt authorization call site."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "lib/insecurity.ts"
+          ],
+          "affected_symbols": [
+            "isAuthorized"
+          ],
+          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
+          "causal_hypothesis": "The express-jwt middleware lacks an explicit algorithm allowlist.",
+          "planned_replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:lib/insecurity.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "lib/insecurity.ts"
+          ],
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/auth.test.ts",
+          "targeted_test_name": "JWT authorization"
+        },
+        "output": "INFRA_FAILURE: Targeted test runner could not load the native crypto helper; no application assertions executed."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "test/api/auth.unit.test.ts",
+          "start_line": 1,
+          "end_line": 80
+        },
+        "output": "SUCCESS: Inspected existing unit alternative with the same JWT authorization behavior and no native helper dependency."
+      },
+      {
+        "name": "record_targeted_test_substitution",
+        "args": {
+          "original_test": "test/api/auth.test.ts",
+          "alternative_test": "test/api/auth.unit.test.ts",
+          "infrastructure_failure_evidence": "Targeted test runner could not load the native crypto helper; no application assertions executed.",
+          "shared_behavior_explanation": "Both tests exercise the express-jwt authorization algorithm allowlist.",
+          "evidence_sources": [
+            "workspace:test/api/auth.unit.test.ts",
+            "validation:test/api/auth.test.ts:INFRA_FAILURE"
+          ],
+          "infrastructure_avoidance_explanation": "The alternative unit test uses the repository's pure-JavaScript JWT harness and avoids the unavailable native helper."
+        },
+        "output": "SUCCESS: Targeted test substitution registered for this validation iteration."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "lib/insecurity.ts"
+          ],
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/auth.unit.test.ts",
+          "targeted_test_name": "JWT authorization"
+        },
+        "output": "SUCCESS: Workaround validation gate passed using the registered alternative test."
+      }
+    ],
+    "final_output": "APPLIED: infrastructure-only targeted-test failure was supported by one evidence-backed substitution and final validation passed.",
+    "expected_output": "The worker does not re-edit after an infrastructure-only failure, registers exactly one valid alternative test with complete evidence, and reports validation PASS.",
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-retry-after-prohibited-file-edit-error",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "prohibited_plan_target_then_source_only_recovery",
+    "provenance": "Historical trajectory phase5_20260825T072131Z_a4625065-b5a0-4a38-8c64-e39bb1be0afd, workaround run §256, rejected a plan targeting package.json with [PROHIBITED_TARGET]. The current record_plan guard rejects prohibited replacement targets before deterministic_apply_edit_set can run.",
+    "evaluation_note": "The requested prohibited-file behavior is modeled at the actual current guard location: an invalid record_plan targeting package.json, followed by a valid source-only plan/edit/validate. An edit-level prohibited-target fixture would require bypassing record_plan and is not a production trace.",
+    "supervisor_instruction": "Implement the notevil source workaround in routes/b2bOrder.ts without modifying package manifests or test files.",
+    "completion_task": "Recover from a prohibited package-manifest target, record a source-only plan, apply it, and pass validation.",
+    "target_package_name": "notevil",
+    "attempt_id": "attempt-workaround-prohibited-012",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "notevil",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found the notevil consumer in routes/b2bOrder.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/b2bOrder.ts",
+          "start_line": 1,
+          "end_line": 70
+        },
+        "output": "SUCCESS: Read the source consumer."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "package.json",
+            "routes/b2bOrder.ts"
+          ],
+          "affected_symbols": [
+            "deserializeOrder"
+          ],
+          "security_invariant": "The workaround must remove the unsafe notevil execution path without direct manifest edits.",
+          "causal_hypothesis": "The package manifest target is prohibited for workaround source edits.",
+          "planned_replacements": [
+            {
+              "file_path": "package.json",
+              "old_text": "\"notevil\": \"1.3.3\"",
+              "new_text": "",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/b2bOrder.ts",
+          "package_removal_requested": false
+        },
+        "output": "ERROR: [PROHIBITED_TARGET] Workaround workers cannot modify dependency manifests or test files."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "affected_symbols": [
+            "deserializeOrder"
+          ],
+          "security_invariant": "The notevil execution path is replaced with a safe parser in the consumer source.",
+          "causal_hypothesis": "The vulnerable consumer invokes notevil for deserialization and can be replaced locally.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/b2bOrder.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Source-only workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/b2bOrder.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "routes/b2bOrder.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2bOrder"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "notevil",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found the notevil consumer in routes/b2bOrder.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/b2bOrder.ts",
+          "start_line": 1,
+          "end_line": 70
+        },
+        "output": "SUCCESS: Read the source consumer."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "affected_symbols": [
+            "deserializeOrder"
+          ],
+          "security_invariant": "The notevil execution path is replaced with a safe parser in the consumer source.",
+          "causal_hypothesis": "The vulnerable consumer invokes notevil for deserialization and can be replaced locally.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/b2bOrder.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Source-only workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/b2bOrder.ts",
+              "old_text": "const notevil = require('notevil');",
+              "new_text": "const safeJson = JSON.parse;",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/b2bOrder.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "routes/b2bOrder.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2bOrder"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: prohibited manifest target was rejected, then the source-only notevil workaround was validated successfully.",
+    "expected_output": "The worker refuses the prohibited manifest target, makes only the allowed source edit, and reports validation PASS.",
+    "changed_files": [
+      "routes/b2bOrder.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-retry-after-stagnation",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "repeated_identical_failed_edit_call_then_recovery",
+    "provenance": "Historical trajectory phase5_20260805T072103Z_60de8d6e-e6ca-494e-95b4-fd5d518a2d43, span 175192 emitted [REPEATED_INVALID_CALL] after the same deterministic_apply_edit_set PLAN_MISMATCH was repeated.",
+    "evaluation_note": "The current stagnation threshold is two identical failed call signatures. The repeated invalid calls remain observable and are omitted from expected_tool_calls.",
+    "supervisor_instruction": "Apply the planned JWT verification workaround in routes/verify.ts and validate it.",
+    "completion_task": "Recover from a repeated identical invalid edit call, use the corrected planned replacement, and pass validation.",
+    "target_package_name": "jsonwebtoken",
+    "attempt_id": "attempt-workaround-stagnation-013",
+    "task_revision": 1,
+    "is_retry": false,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.verify",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found jwt.verify in routes/verify.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "start_line": 20,
+          "end_line": 65
+        },
+        "output": "SUCCESS: Read the verification call site."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Verification must enforce the approved JWT algorithm.",
+          "causal_hypothesis": "The vulnerable call site lacks an explicit algorithm constraint.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "ERROR: [PLAN_MISMATCH] Submitted replacements do not match the recorded plan's planned_replacements exactly."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "ERROR: [REPEATED_INVALID_CALL] Repeated failed tool call suppressed. Choose a different tool or argument set."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.verify",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found jwt.verify in routes/verify.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/verify.ts",
+          "start_line": 20,
+          "end_line": 65
+        },
+        "output": "SUCCESS: Read the verification call site."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/verify.ts"
+          ],
+          "affected_symbols": [
+            "verifyToken"
+          ],
+          "security_invariant": "Verification must enforce the approved JWT algorithm.",
+          "causal_hypothesis": "The vulnerable call site lacks an explicit algorithm constraint.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/verify.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/verify.ts",
+              "old_text": "jwt.verify(token, publicKey)",
+              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/verify.ts"
+          ],
+          "runtime_smoke_file": "lib/jwt-policy.ts",
+          "targeted_test_file": "test/security/verifySpec.ts",
+          "targeted_test_name": "algorithm allowlist"
+        },
+        "output": "SUCCESS: Workaround validation gate passed."
+      }
+    ],
+    "final_output": "APPLIED: repeated invalid edit calls were suppressed, the corrected replacement was applied, and validation passed.",
+    "expected_output": "The worker changes its call after the repeated-invalid-call guard and completes the validated workaround.",
+    "changed_files": [
+      "routes/verify.ts"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-surrender-after-max-validation-input-limit",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "three_distinct_invalid_validation_requests",
+    "provenance": "Historical trajectory phase5_20260825T091340Z_153e9f01-a422-4ec9-a3c9-b9d8598b487a, workaround run §104, attempt 724996d4-4aa8-5e1d-84f9-2f38cece098c. Spans 138, 160, and 179 show invalid validation inputs before VALIDATION_INPUT_LIMIT_REACHED.",
+    "evaluation_note": "The three invalid validation signatures are distinct and need not be consecutive. Repeating the same signature would test the separate VALIDATION_INPUT_RETRY_LOOP guard.",
+    "supervisor_instruction": "Apply the committed Angular workaround in lib/angular.ts and validate it using a safe source smoke module and a source targeted test.",
+    "completion_task": "Attempt the requested remediation, but do not claim completion after the runtime rejects three distinct invalid validation inputs; report the bounded surrender reason.",
+    "target_package_name": "@angular/common",
+    "attempt_id": "724996d4-4aa8-5e1d-84f9-2f38cece098c",
+    "task_revision": 1,
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "DatePipe|formatDate",
+          "target_directory": "src"
+        },
+        "output": "SUCCESS: Found the Angular date formatting call site."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "src/app/date.ts",
+          "start_line": 1,
+          "end_line": 100
+        },
+        "output": "SUCCESS: Read the date formatting source."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "src/app/date.ts"
+          ],
+          "affected_symbols": [
+            "formatDateValue"
+          ],
+          "security_invariant": "Date formatting must not evaluate attacker-controlled format expressions.",
+          "causal_hypothesis": "The vulnerable Angular date formatter receives untrusted format input.",
+          "planned_replacements": [
+            {
+              "file_path": "src/app/date.ts",
+              "old_text": "formatDate(value, format)",
+              "new_text": "formatDate(value, SAFE_DATE_FORMAT)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:src/app/date.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "src/app/date.ts",
+              "old_text": "formatDate(value, format)",
+              "new_text": "formatDate(value, SAFE_DATE_FORMAT)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"src/app/date.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "src/app/date.ts"
+          ],
+          "runtime_smoke_file": "src/app/date.ts",
+          "targeted_test_file": "build/test/api/angular-dist.test.js",
+          "targeted_test_name": "date formatting"
+        },
+        "output": "ERROR: [INVALID_VALIDATION_INPUT] Compiled test path 'build/test/api/angular-dist.test.js' is not supported."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "src/app/date.ts",
+          "start_line": 1,
+          "end_line": 80
+        },
+        "output": "SUCCESS: Re-read the source after the invalid validation request."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "src/app/date.ts"
+          ],
+          "runtime_smoke_file": "src/app/date.ts",
+          "targeted_test_file": "src/app/date.ts",
+          "targeted_test_name": "date formatting"
+        },
+        "output": "ERROR: [INVALID_VALIDATION_INPUT] Targeted test 'src/app/date.ts' is a source module, not a test/spec file."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "src/app/date.ts"
+          ],
+          "runtime_smoke_file": "src/app/date.ts",
+          "targeted_test_file": "test/api/angular-dist.test.js",
+          "targeted_test_name": "date formatting"
+        },
+        "output": "ERROR: [INVALID_VALIDATION_INPUT] Targeted test path 'test/api/angular-dist.test.js' does not exist in the workspace."
+      }
+    ],
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "DatePipe|formatDate",
+          "target_directory": "src"
+        },
+        "output": "SUCCESS: Found the Angular date formatting call site."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "src/app/date.ts",
+          "start_line": 1,
+          "end_line": 100
+        },
+        "output": "SUCCESS: Read the date formatting source."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "src/app/date.ts"
+          ],
+          "affected_symbols": [
+            "formatDateValue"
+          ],
+          "security_invariant": "Date formatting must not evaluate attacker-controlled format expressions.",
+          "causal_hypothesis": "The vulnerable Angular date formatter receives untrusted format input.",
+          "planned_replacements": [
+            {
+              "file_path": "src/app/date.ts",
+              "old_text": "formatDate(value, format)",
+              "new_text": "formatDate(value, SAFE_DATE_FORMAT)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:src/app/date.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "src/app/date.ts",
+              "old_text": "formatDate(value, format)",
+              "new_text": "formatDate(value, SAFE_DATE_FORMAT)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"src/app/date.ts\"],\"status\":\"applied\"}."
+      }
+    ],
+    "final_output": "SURRENDER: validation input limit reached after three distinct invalid validation requests; remediation is not reported as complete.",
+    "expected_output": "The worker must not claim a successful workaround after VALIDATION_INPUT_LIMIT_REACHED. It reports a bounded surrender and preserves the remediation as incomplete.",
+    "changed_files": [
+      "src/app/date.ts"
+    ],
+    "action_status": "SURRENDER",
+    "terminal_error_code": "VALIDATION_INPUT_LIMIT_REACHED",
+    "expected_completion_pass": false,
+    "expected_tool_correctness_pass": false
+  },
+  {
+    "case_id": "workaround-surrender-after-max-validation-gate-limit",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "three_valid_validation_failures",
+    "provenance": "Historical trajectory phase5_20260805T085310Z_fcf1e02b-4dfe-4c33-93d8-99d1718d02d7, workaround run §292. Spans 325, 361, and 406 are valid executed validation gates that fail before VALIDATION_LIMIT_REACHED.",
+    "evaluation_note": "All three validate_workaround calls use valid source-smoke and targeted-test arguments. This is distinct from #14, where validation input preflight rejects the request and does not consume the gate budget.",
+    "supervisor_instruction": "Apply the sanitize-html workaround in routes/sanitize.ts and validate the resulting behavior.",
+    "completion_task": "Attempt bounded validation retries, but after three executed validation failures report the gate-limit surrender without claiming remediation success.",
+    "target_package_name": "sanitize-html",
+    "attempt_id": "attempt-workaround-gate-limit-015",
+    "task_revision": 1,
+    "is_retry": true,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "sanitizeHtml",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found sanitizeHtml in routes/sanitize.ts."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "routes/sanitize.ts",
+          "start_line": 1,
+          "end_line": 90
+        },
+        "output": "SUCCESS: Read the sanitization call site."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/sanitize.ts"
+          ],
+          "affected_symbols": [
+            "sanitizeInput"
+          ],
+          "security_invariant": "Untrusted HTML is sanitized before insertion into the response.",
+          "causal_hypothesis": "The vulnerable sanitizer is called without the required restrictive configuration.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, SAFE_OPTIONS)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/sanitize.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, SAFE_OPTIONS)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/sanitize.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/sanitize.ts"
+          ],
+          "runtime_smoke_file": "lib/sanitize-policy.ts",
+          "targeted_test_file": "test/security/sanitizeSpec.ts",
+          "targeted_test_name": "HTML sanitization"
+        },
+        "output": "FAILURE: CODE_FAILURE: targeted assertion still reports the unsafe HTML behavior."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "routes/sanitize.ts",
+          "symbol_name": "sanitizeInput",
+          "line_hint": 28
+        },
+        "output": "SUCCESS: AST inspected: the option constant is incomplete."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/sanitize.ts"
+          ],
+          "affected_symbols": [
+            "sanitizeInput"
+          ],
+          "security_invariant": "Untrusted HTML is sanitized before insertion into the response.",
+          "causal_hypothesis": "The first option set did not disable the vulnerable HTML context.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, { allowedTags: SAFE_TAGS, allowedAttributes: SAFE_ATTRIBUTES })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/sanitize.ts; validation:targeted-assertion-failure",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Corrected workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, { allowedTags: SAFE_TAGS, allowedAttributes: SAFE_ATTRIBUTES })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/sanitize.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/sanitize.ts"
+          ],
+          "runtime_smoke_file": "lib/sanitize-policy.ts",
+          "targeted_test_file": "test/security/sanitizeSpec.ts",
+          "targeted_test_name": "HTML sanitization"
+        },
+        "output": "FAILURE: CODE_FAILURE: targeted assertion still reports an unsafe HTML behavior."
+      },
+      {
+        "name": "inspect_ast_symbol",
+        "args": {
+          "file_path": "routes/sanitize.ts",
+          "symbol_name": "sanitizeInput",
+          "line_hint": 28
+        },
+        "output": "SUCCESS: AST inspected: the sanitizer must use the repository policy helper."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/sanitize.ts"
+          ],
+          "affected_symbols": [
+            "sanitizeInput"
+          ],
+          "security_invariant": "Untrusted HTML is sanitized before insertion into the response.",
+          "causal_hypothesis": "The prior inline option still diverges from the repository's tested sanitization policy.",
+          "planned_replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, repositorySanitizePolicy)",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:routes/sanitize.ts; validation:two-targeted-assertion-failures",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Final workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "routes/sanitize.ts",
+              "old_text": "sanitizeHtml(input)",
+              "new_text": "sanitizeHtml(input, repositorySanitizePolicy)",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/sanitize.ts\"],\"status\":\"applied\"}."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/sanitize.ts"
+          ],
+          "runtime_smoke_file": "lib/sanitize-policy.ts",
+          "targeted_test_file": "test/security/sanitizeSpec.ts",
+          "targeted_test_name": "HTML sanitization"
+        },
+        "output": "FAILURE: CODE_FAILURE: targeted assertion still reports an unsafe HTML behavior."
+      }
+    ],
+    "final_output": "SURRENDER: VALIDATION_LIMIT_REACHED after three executed validation gate failures; remediation is not reported as complete.",
+    "expected_output": "The worker reports the bounded validation-gate surrender after three valid failed executions and does not claim that the sanitize-html workaround passed.",
+    "changed_files": [
+      "routes/sanitize.ts"
+    ],
+    "action_status": "SURRENDER",
+    "terminal_error_code": "VALIDATION_LIMIT_REACHED",
+    "expected_completion_pass": false,
+    "expected_tool_correctness_pass": true
+  },
+  {
+    "case_id": "workaround-surrender-after-max-tool-round-limit",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "maximum_subagent_rounds",
+    "provenance": "Historical trajectory phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52, workaround run §212. The run reached the maximum subagent loop bound and reported 'Subagent exceeded the maximum tool-call rounds without reaching a final answer'; it contained 24 LLM spans and 29 tool spans.",
+    "evaluation_note": "The runtime constant is MAX_SUBAGENT_TOOL_CALL_ROUNDS=24. This case records 24 rounds and 29 raw tool spans; the exact counter is a runtime-boundary assertion, not a ToolCorrectness assertion.",
+    "supervisor_instruction": "Implement the committed workaround for the authentication handler and validate it before returning a final result.",
+    "completion_task": "Do not claim remediation completion when the worker reaches the 24-round execution bound without a final answer; report the bounded surrender.",
+    "target_package_name": "express-jwt",
+    "attempt_id": "attempt-workaround-round-limit-016",
+    "task_revision": 1,
+    "is_retry": false,
+    "observed_round_count": 24,
+    "observed_tool_count": 29,
+    "tool_round_limit": 24,
+    "tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "expressJwt",
+          "target_directory": "lib"
+        },
+        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "lib/insecurity.ts"
+          ],
+          "affected_symbols": [
+            "isAuthorized"
+          ],
+          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
+          "causal_hypothesis": "The middleware lacks an explicit algorithm allowlist.",
+          "planned_replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:lib/insecurity.ts",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Workaround plan recorded successfully."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "lib/insecurity.ts",
+              "old_text": "expressJwt({ secret: publicKey })",
+              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "expected_occurrences": 1
+            }
+          ]
+        },
+        "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
+      }
+    ],
+    "final_output": "SURRENDER: Subagent exceeded the maximum tool-call rounds without reaching a final answer; remediation is not reported as complete.",
+    "expected_output": "The worker must not claim a completed workaround after the 24-round bound. It reports the bounded execution surrender and leaves completion false.",
+    "changed_files": [
+      "lib/insecurity.ts"
+    ],
+    "action_status": "SURRENDER",
+    "terminal_error_code": "MAX_SUBAGENT_TOOL_CALL_ROUNDS",
+    "expected_completion_pass": false,
+    "expected_tool_correctness_pass": true
+  }
+]
+

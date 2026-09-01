@@ -245,10 +245,13 @@ class TestUpdateSubagentEval:
 
 #### [NEW] `tests/evals/test_workaround_subagent_eval.py`
 
-Metrics applied (in addition to the above):
-- **`GEval("Workaround Minimality")`** — Criteria: "The code change should only modify the vulnerable sink/call site. It should not refactor unrelated code, rename variables unnecessarily, or restructure control flow beyond what is needed for the security fix"
-- **Custom `WoraroundLifecycleMetric(BaseMetric)`** — Enforces the `record_plan` → edit → `validate_workaround` lifecycle. Plans must be recorded before any `deterministic_apply_edit_set` calls.
-- **`ToolCorrectnessMetric`** — Includes `record_plan` as mandatory first expected tool
+Metrics applied:
+- **`ToolCorrectnessMetric(threshold=1.0)`** — Checks exact workaround tool names, current input schemas, and order. Recovery goldens retain the erroneous call in the observed trace and omit it from the expected trace so the metric exposes the tool error.
+- **`TaskCompletionMetric(threshold=0.7)`** — Judges whether the worker completed the supervisor's workaround instruction. It runs only with `--run-eval-live`; bounded surrender cases intentionally remain incomplete.
+
+The active dataset is `tests/evals/golden/workaround_subagent_cases.json` and contains 16 trajectory-backed or deterministic-contract cases: clean code changes, pivots, validation recovery, no-fix removal, guardrail retries, infrastructure substitution, and bounded surrender paths. The clean first-attempt case and the validation-failure retry case are separate goldens.
+
+Each case documents its provenance, attempt identity, exact observed and expected tool arguments, final validation output, and expected result for both metrics. Optional tool branches such as web research and AST versus file inspection are represented by case-specific traces rather than being mandatory in every case.
 
 ---
 
@@ -261,8 +264,8 @@ Metrics applied (in addition to the above):
 
 Each case documents its provenance, evidence status, supervisor instruction,
 exact tool arguments, and expected completion status. The older shared
-`subagent_cases.json` remains for the workaround suite and is not loaded by the
-update suite.
+`subagent_cases.json` remains only as legacy shared data and is loaded by neither
+of the dedicated worker suites.
 
 ---
 
@@ -489,6 +492,7 @@ tests/evals/
     ├── report_cases.json           # 5–8 cases (Juice Shop + synthetic + real-world)
     ├── triage_cases.json           # 15–20 cases (includes Fix Planner web-extraction)
     ├── update_subagent_cases.json  # 11 update cases (two DeepEval metrics)
-    ├── subagent_cases.json         # Workaround cases plus legacy shared data
+    ├── subagent_cases.json         # Legacy shared update/workaround data
+    ├── workaround_subagent_cases.json  # 16 workaround cases (two DeepEval metrics)
     └── qa_cases.json               # 8–10 cases (pass/fail, misattribution edge cases)
 ```

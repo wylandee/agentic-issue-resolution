@@ -1,4 +1,15 @@
-"""Phase 3: DeepEval and structural evaluation for Workaround Subagent code-patching specialists."""
+"""DeepEval evaluation suite for the workaround subagent.
+
+The workaround worker is evaluated on exactly two dimensions:
+
+* ``ToolCorrectnessMetric`` checks the exact ordered tool calls and arguments.
+* ``TaskCompletionMetric`` checks whether the supervisor instruction was
+  completed, or intentionally remained incomplete after a bounded surrender.
+
+The cases are replay fixtures. Tool failures are kept in ``tools_called`` so
+that recovery behavior remains observable, while ``expected_tool_calls``
+describes the correct trace for the case.
+"""
 
 from __future__ import annotations
 
@@ -10,300 +21,267 @@ import pytest
 
 from tests.evals.adapters import ToolCall
 from tests.evals.conftest import EvalSettings
-from tests.evals.custom_metrics import (
-    ArchitectureBoundaryMetric,
-    ToolEfficiencyMetric,
-    WorkaroundLifecycleMetric,
-)
 
 try:
     from deepeval import assert_test
-    from deepeval.metrics import (
-        GEval,
-    )
     from deepeval.metrics import (
         TaskCompletionMetric as DeepEvalTaskCompletionMetric,
     )
     from deepeval.metrics import (
         ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric,
     )
-    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+    from deepeval.test_case import LLMTestCase, ToolCallParams
 
     HAS_DEEPEVAL = True
 except ImportError:
     from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
 
     HAS_DEEPEVAL = False
-    LLMTestCaseParams = None  # type: ignore[assignment,misc]
-    GEval = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
     DeepEvalTaskCompletionMetric = None  # type: ignore[assignment,misc]
     DeepEvalToolCorrectnessMetric = None  # type: ignore[assignment,misc]
+    ToolCallParams = None  # type: ignore[assignment,misc]
 
 
-# ---------------------------------------------------------------------------
-# Golden Dataset Loader for Pytest Parametrization
-# ---------------------------------------------------------------------------
-
-_GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "subagent_cases.json"
+_GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "workaround_subagent_cases.json"
 
 
 def _load_workaround_cases() -> list[dict[str, Any]]:
+    """Load the dedicated workaround-subagent golden dataset.
+
+    Returns:
+        Workaround golden case dictionaries. A missing or malformed optional
+        dataset produces an empty list so collection remains safe in minimal
+        environments.
+    """
     if not _GOLDEN_FILE.exists():
         return []
     try:
         data = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [c for c in data if c.get("eval_type") == "workaround_subagent"]
+    except (OSError, TypeError, ValueError):
         return []
-    except Exception:
-        return []
+    if isinstance(data, list):
+        return [case for case in data if isinstance(case, dict)]
+    if isinstance(data, dict) and isinstance(data.get("cases"), list):
+        return [case for case in data["cases"] if isinstance(case, dict)]
+    return []
 
 
 _WORKAROUND_CASES = _load_workaround_cases()
-_WORKAROUND_CASE_IDS = [c.get("case_id", f"case_{i}") for i, c in enumerate(_WORKAROUND_CASES)]
+_WORKAROUND_CASE_IDS = [
+    case.get("case_id", f"case_{index}") for index, case in enumerate(_WORKAROUND_CASES)
+]
 
 
-# ---------------------------------------------------------------------------
-# Test Case Construction Helper
-# ---------------------------------------------------------------------------
+def _make_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
+    """Convert serialized golden calls into DeepEval tool calls.
+
+    Args:
+        raw_calls: Serialized calls with ``name``, ``args``, and ``output``.
+
+    Returns:
+        DeepEval-compatible tool-call objects.
+
+    Raises:
+        TypeError: If the serialized call collection is not a list.
+    """
+    if not isinstance(raw_calls, list):
+        raise TypeError("Workaround golden tool calls must be lists.")
+    return [
+        ToolCall(
+            name=str(tool_call.get("name", "")),
+            input_parameters=tool_call.get("args", {}) or {},
+            output=tool_call.get("output", ""),
+        )
+        for tool_call in raw_calls
+    ]
+
+
+def _format_tool_trace(raw_calls: list[dict[str, Any]]) -> str:
+    """Render the complete observed tool trace for the task-completion judge."""
+    if not raw_calls:
+        return "Observed tool trace: none"
+    lines = ["Observed tool trace:"]
+    for index, tool_call in enumerate(raw_calls, start=1):
+        args = json.dumps(tool_call.get("args", {}) or {}, sort_keys=True)
+        output = str(tool_call.get("output", ""))
+        lines.append(f"{index}. {tool_call.get('name', '')}({args}) -> {output}")
+    return "\n".join(lines)
 
 
 def build_workaround_test_case(case: dict[str, Any]) -> LLMTestCase:
-    """Construct an LLMTestCase from a golden workaround subagent case dictionary."""
+    """Construct one DeepEval test case from a workaround golden.
+
+    Args:
+        case: Golden containing the supervisor instruction, observed and
+            expected tool traces, completion task, and final outcome.
+
+    Returns:
+        An ``LLMTestCase`` suitable for both requested DeepEval metrics.
+
+    Raises:
+        TypeError: If ``tool_calls`` or ``expected_tool_calls`` is not a list.
+    """
     tool_calls_raw = case.get("tool_calls", [])
-    tools_called = [
-        ToolCall(
-            name=tc.get("name", ""),
-            input_parameters=tc.get("args", {}) or {},
-            output=tc.get("output", ""),
+    expected_tool_calls_raw = case.get("expected_tool_calls", tool_calls_raw)
+    if not isinstance(tool_calls_raw, list) or not isinstance(expected_tool_calls_raw, list):
+        raise TypeError("Workaround golden tool_calls and expected_tool_calls must be lists.")
+
+    tools_called = _make_tool_calls(tool_calls_raw)
+    expected_tools = _make_tool_calls(expected_tool_calls_raw)
+
+    instruction = str(case.get("supervisor_instruction", ""))
+    target_package = str(case.get("target_package_name", ""))
+    action_status = str(case.get("action_status", "APPLIED"))
+    changed_files = case.get("changed_files", []) or []
+    final_output = str(case.get("final_output", ""))
+    if not final_output:
+        final_output = (
+            f"Status: {action_status}; package={target_package}; "
+            f"changed_files={', '.join(changed_files) if changed_files else 'none'}."
         )
-        for tc in tool_calls_raw
-    ]
 
-    instruction = case.get("supervisor_instruction", "")
-    target_pkg = case.get("target_package_name", "")
-    changed_files = case.get("changed_files", [])
-    status = case.get("action_status", "APPLIED")
-
-    actual_output = (
-        f"Status: {status}\n"
-        f"Workaround target component: {target_pkg}\n"
-        f"Modified source/manifest files: {', '.join(changed_files) if changed_files else 'none'}\n"
-        f"Tool execution rounds: {len(tools_called)}"
+    actual_output = f"{final_output}\n\n{_format_tool_trace(tool_calls_raw)}"
+    expected_output = str(
+        case.get(
+            "expected_output",
+            "Complete and validate the supervisor's workaround instruction, or report a bounded surrender without claiming success.",
+        )
     )
-
-    expected_tools: list[ToolCall] = []
-    if case.get("expected_lifecycle_pass", True) and status == "APPLIED":
-        expected_tools.append(ToolCall(name="record_plan", input_parameters={}))
-        if case.get("case_id") == "workaround-no-fix-package-removal":
-            expected_tools.append(ToolCall(name="remove_no_fix_dependency", input_parameters={}))
-        else:
-            expected_tools.append(
-                ToolCall(name="deterministic_apply_edit_set", input_parameters={})
-            )
-        expected_tools.append(ToolCall(name="validate_workaround", input_parameters={}))
+    completion_task = str(
+        case.get(
+            "completion_task",
+            "Apply the requested workaround and validate it against the selected smoke module and targeted test.",
+        )
+    )
+    provenance = str(case.get("provenance", ""))
+    evaluation_note = str(case.get("evaluation_note", ""))
+    attempt_id = case.get("attempt_id")
+    task_revision = case.get("task_revision")
 
     metadata = {
         "case_id": case.get("case_id"),
         "eval_type": "workaround_subagent",
-        "provenance": case.get("provenance"),
-        "is_retry": case.get("is_retry", False),
-        "target_package_name": target_pkg,
+        "golden_kind": case.get("golden_kind"),
+        "provenance": provenance,
+        "evaluation_note": evaluation_note,
+        "is_retry": bool(case.get("is_retry", False)),
+        "attempt_id": attempt_id,
+        "task_revision": task_revision,
+        "target_package_name": target_package,
         "changed_files": changed_files,
-        "action_status": status,
-        "expected_pass": case.get("expected_pass", True),
-        "expected_boundary_pass": case.get("expected_boundary_pass", True),
-        "expected_efficiency_pass": case.get("expected_efficiency_pass", True),
-        "expected_lifecycle_pass": case.get("expected_lifecycle_pass", True),
-        "expected_completion_pass": case.get("expected_completion_pass", True),
+        "action_status": action_status,
+        "terminal_error_code": case.get("terminal_error_code"),
+        "observed_round_count": case.get("observed_round_count"),
+        "observed_tool_count": case.get("observed_tool_count", len(tool_calls_raw)),
+        "expected_completion_pass": bool(case.get("expected_completion_pass", True)),
+        "expected_tool_correctness_pass": bool(
+            case.get("expected_tool_correctness_pass", True)
+        ),
     }
 
     return LLMTestCase(
         name=f"{case.get('case_id')} [Workaround Subagent]",
         input=instruction,
         actual_output=actual_output,
-        expected_output=f"Investigate, plan, and apply minimal code workaround for {target_pkg} without modifying unrelated files.",
-        context=[instruction, case.get("provenance", "")],
+        expected_output=expected_output,
+        context=[
+            f"Completion task:\n{completion_task}",
+            f"Golden provenance:\n{provenance}",
+            f"Evaluation note:\n{evaluation_note}",
+            f"Attempt identity: attempt_id={attempt_id}; task_revision={task_revision}",
+        ],
         tools_called=tools_called,
-        expected_tools=expected_tools if expected_tools else None,
+        expected_tools=expected_tools,
         additional_metadata=metadata,
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 3 Workaround Subagent Evaluation Test Suite
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.eval
-class TestWorkaroundSubagentEval:
-    """Evaluation suite for Workaround Subagent lifecycle ordering, boundaries, and minimality."""
-
-    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_lifecycle_enforcement(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Workaround worker follows investigate -> plan -> execute -> validate lifecycle."""
-        test_case = build_workaround_test_case(case)
-        metric = WorkaroundLifecycleMetric()
-        expected_lifecycle_pass = case.get("expected_lifecycle_pass", True)
-
-        if expected_lifecycle_pass:
-            if HAS_DEEPEVAL and assert_test:
-                assert_test(test_case, [metric], run_async=False)
-            else:
-                score = metric.measure(test_case)
-                assert metric.is_successful(), (
-                    f"Case '{case['case_id']}' was expected to pass lifecycle check but scored {score}."
-                )
-        else:
-            score = metric.measure(test_case)
-            assert not metric.is_successful(), (
-                f"Case '{case['case_id']}' was expected to violate lifecycle check but passed."
-            )
-            assert score == 0.0
-
-    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_tool_correctness_deepeval(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """DeepEval built-in ToolCorrectnessMetric evaluates ordered execution of record_plan, edit, and validate."""
-        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
-            pytest.skip("DeepEval is not installed.")
-
-        test_case = build_workaround_test_case(case)
-        if not getattr(test_case, "expected_tools", None):
-            pytest.skip("No expected tools defined for negative/unplanned case.")
-
-        metric = DeepEvalToolCorrectnessMetric(threshold=0.5, should_consider_ordering=True)
+def _measure_expected_completion(
+    metric: Any,
+    test_case: LLMTestCase,
+    *,
+    expected_pass: bool,
+    case_id: str,
+) -> None:
+    """Run TaskCompletionMetric while supporting intentional surrender cases."""
+    if expected_pass:
         if assert_test:
             assert_test(test_case, [metric], run_async=False)
         else:
             metric.measure(test_case)
-            assert metric.is_successful()
+            assert metric.is_successful(), f"Case {case_id!r} did not complete the task."
+        return
 
-    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_tool_correctness(self, case: dict[str, Any]) -> None:
-        """record_plan appears before any edit tools in compliant cases."""
-        tool_calls = case.get("tool_calls", [])
-        tool_names = [tc.get("name", "") for tc in tool_calls]
+    # A bounded surrender is intentionally not a completed remediation. The
+    # metric is measured directly so the expected negative result is asserted
+    # without making the pytest case itself look like an evaluation failure.
+    metric.measure(test_case)
+    assert not metric.is_successful(), (
+        f"Case {case_id!r} was expected to remain incomplete after surrender, "
+        f"but scored {getattr(metric, 'score', None)}."
+    )
 
-        edit_tools = {
-            "deterministic_apply_edit_set",
-            "remove_no_fix_dependency",
-            "deterministic_search_replace",
-            "deterministic_replace_ast_symbol",
-        }
 
-        has_edit = any(name in edit_tools for name in tool_names)
-        expected_lifecycle_pass = case.get("expected_lifecycle_pass", True)
-
-        if expected_lifecycle_pass and has_edit:
-            assert "record_plan" in tool_names, (
-                f"Case '{case['case_id']}': record_plan was missing despite code edits."
-            )
-            plan_idx = tool_names.index("record_plan")
-            first_edit_idx = min(i for i, name in enumerate(tool_names) if name in edit_tools)
-            assert plan_idx < first_edit_idx, (
-                f"Case '{case['case_id']}': record_plan appeared at step {plan_idx + 1}, after first edit at {first_edit_idx + 1}."
-            )
-
-    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_no_boundary_violation(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Workaround worker does not call update-only manifest modification tools."""
-        test_case = build_workaround_test_case(case)
-        metric = ArchitectureBoundaryMetric()
-        expected_boundary_pass = case.get("expected_boundary_pass", True)
-
-        if expected_boundary_pass:
-            if HAS_DEEPEVAL and assert_test:
-                assert_test(test_case, [metric], run_async=False)
-            else:
-                score = metric.measure(test_case)
-                assert metric.is_successful(), (
-                    f"Case '{case['case_id']}' was expected to pass boundary check but scored {score}."
-                )
+def _measure_expected_tool_correctness(
+    metric: Any,
+    test_case: LLMTestCase,
+    *,
+    expected_pass: bool,
+    case_id: str,
+) -> None:
+    """Run ToolCorrectnessMetric, including intentional erroneous-call traces."""
+    if expected_pass:
+        if assert_test:
+            assert_test(test_case, [metric], run_async=False)
         else:
-            score = metric.measure(test_case)
-            assert not metric.is_successful()
-            assert score == 0.0
+            metric.measure(test_case)
+            assert metric.is_successful(), f"Case {case_id!r} used an incorrect tool trace."
+        return
+
+    # The erroneous call remains in tools_called and is intentionally omitted
+    # from expected_tools. This lets the tool metric flag the model's bad call
+    # while the task metric independently evaluates recovery.
+    metric.measure(test_case)
+    assert not metric.is_successful(), (
+        f"Case {case_id!r} was expected to expose an incorrect tool call, "
+        f"but scored {getattr(metric, 'score', None)}."
+    )
+
+
+@pytest.mark.eval
+class TestWorkaroundSubagentEval:
+    """Evaluate workaround goldens with exactly two DeepEval metrics."""
 
     @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_efficiency(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Workaround worker operates efficiently within tool rounds budget."""
-        test_case = build_workaround_test_case(case)
-        metric = ToolEfficiencyMetric(threshold=0.70)
-        expected_efficiency_pass = case.get("expected_efficiency_pass", True)
-
-        if expected_efficiency_pass:
-            if HAS_DEEPEVAL and assert_test:
-                assert_test(test_case, [metric], run_async=False)
-            else:
-                score = metric.measure(test_case)
-                assert metric.is_successful(), (
-                    f"Case '{case['case_id']}' was expected to pass efficiency check but scored {score}."
-                )
-        else:
-            score = metric.measure(test_case)
-            assert not metric.is_successful()
-            assert score < 0.70
-
-    @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_minimality(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Code change only modifies the vulnerable sink/call site (requires --run-eval-live)."""
-        if not eval_settings.is_live:
-            pytest.skip("Workaround Minimality GEval requires live LLM judge (--run-eval-live)")
-
-        if not HAS_DEEPEVAL or GEval is None:
-            pytest.skip("DeepEval is not installed in the current environment.")
+    def test_tool_correctness_deepeval(self, case: dict[str, Any]) -> None:
+        """Check exact workaround tool names, arguments, and order."""
+        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
+            pytest.skip("DeepEval is not installed.")
 
         test_case = build_workaround_test_case(case)
-        metric = GEval(
-            name="Workaround Minimality",
-            criteria=(
-                "The code change should only modify the vulnerable sink or call site. "
-                "It should not refactor unrelated code, rename variables unnecessarily, "
-                "or restructure control flow beyond what is needed for the security fix."
-            ),
-            evaluation_params=[
-                LLMTestCaseParams.INPUT,
-                LLMTestCaseParams.ACTUAL_OUTPUT,
-                LLMTestCaseParams.EXPECTED_OUTPUT,
-            ],
-            model=eval_settings.judge_model,
-            threshold=0.70,
+        metric = DeepEvalToolCorrectnessMetric(
+            threshold=1.0,
+            evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
+            should_consider_ordering=True,
+            should_exact_match=True,
+        )
+        _measure_expected_tool_correctness(
+            metric,
+            test_case,
+            expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
+            case_id=str(case.get("case_id", "unknown")),
         )
 
-        if case.get("expected_pass", True):
-            assert_test(test_case, [metric], run_async=False)
-
     @pytest.mark.parametrize("case", _WORKAROUND_CASES, ids=_WORKAROUND_CASE_IDS)
-    def test_workaround_live_task_completion_deepeval(
+    def test_task_completion_deepeval(
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
     ) -> None:
-        """DeepEval built-in TaskCompletionMetric evaluates workaround completion with LLM judge (requires --run-eval-live)."""
+        """Judge whether the requested workaround was completed, live only."""
         if not eval_settings.is_live:
-            pytest.skip("DeepEval TaskCompletionMetric requires live LLM judge (--run-eval-live)")
-
+            pytest.skip("DeepEval TaskCompletionMetric requires --run-eval-live.")
         if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
             pytest.skip("DeepEval is not installed.")
 
@@ -312,10 +290,9 @@ class TestWorkaroundSubagentEval:
             threshold=0.70,
             model=eval_settings.judge_model,
         )
-
-        if case.get("expected_completion_pass", True) and case.get("action_status") == "APPLIED":
-            if assert_test:
-                assert_test(test_case, [metric], run_async=False)
-            else:
-                metric.measure(test_case)
-                assert metric.is_successful()
+        _measure_expected_completion(
+            metric,
+            test_case,
+            expected_pass=bool(case.get("expected_completion_pass", True)),
+            case_id=str(case.get("case_id", "unknown")),
+        )
