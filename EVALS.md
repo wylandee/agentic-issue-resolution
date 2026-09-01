@@ -206,42 +206,39 @@ Each case documents its provenance (source fixture, synthetic rationale, or exte
 
 ---
 
-### Phase 3 — Subagent Tool Use Evaluation: Update & Workaround Workers (Week 4–5)
+### Phase 3 — Update & Workaround Workers (Week 4–5)
 
-> Goal: Evaluate tool-calling correctness, architectural boundary adherence, and execution efficiency for the two specialist ReAct agents.
+> Goal: Evaluate update task completion and exact combined-tool calls for the update worker. Workaround evaluation remains a separate suite.
 
 ---
 
 #### [NEW] `tests/evals/test_update_subagent_eval.py`
 
 Metrics applied:
-- **`ToolCorrectnessMetric(threshold=0.9)`** — Verifies the combined manifest transaction (`modify_and_validate_npm_dependency`) and its ordered edit/synchronization behavior
-- **`TaskCompletionMetric(threshold=0.7)`** — Did the worker produce a valid patch matching the supervisor instruction?
-- **Custom `ArchitectureBoundaryMetric(BaseMetric)`** — Negative assertion: worker must NOT have called tools that select versions (no `search_web` for version hunting, no `run_sandbox_command npm view` to pick versions). Only the Supervisor owns version selection.
-- **Custom `ToolEfficiencyMetric(BaseMetric)`** — Penalizes: (a) reading the same file >2 times, (b) >3 failed tool calls before success, (c) total tool rounds > `MAX_SUBAGENT_TOOL_CALL_ROUNDS / 2`
+- **`ToolCorrectnessMetric(threshold=1.0)`** — Requires the combined manifest transaction (`modify_and_validate_npm_dependency`) with exact input parameters and exact order.
+- **`TaskCompletionMetric(threshold=0.7)`** — Judges whether the worker completed the supervisor instruction. It runs only with `--run-eval-live`; an intentional surrender is expected to remain incomplete.
 
 The update prompt includes the deterministic repository map as read-only
 context. Error-coded transaction results are represented in retry cases as
-changed, Supervisor-approved version or dependency-type calls, with a maximum
-of three attempts per package. Historical trajectory adapters may still parse
-the former update tool names; active update metrics reject them. Workaround
-cases retain their repository-map and revert events.
+ordered combined-tool calls, with exact package, version, dependency type, and
+manifest arguments. Historical trajectories used the former split update and
+validation tools, so their semantic sequences are normalized to the current
+combined tool and marked with provenance in the dedicated dataset.
+Retry goldens retain the bad or repeated call in `tools_called` but omit it
+from `expected_tools`; this intentionally makes ToolCorrectnessMetric fail the
+tool trace while TaskCompletionMetric can independently pass a recovered
+update. Surrender cases likewise test the bounded outcome separately from the
+tool trace.
 
 Test structure:
 ```python
 @pytest.mark.eval
 class TestUpdateSubagentEval:
-    def test_tool_sequence_correctness(self, update_trajectory_cases):
-        """Update worker uses the combined edit-and-synchronize transaction."""
+    def test_tool_correctness_deepeval(self, update_golden_cases):
+        """Exact combined-tool names, arguments, and order."""
 
-    def test_no_version_selection_boundary_violation(self, update_trajectory_cases):
-        """Worker does not attempt to discover or select dependency versions."""
-
-    def test_tool_call_efficiency(self, update_trajectory_cases):
-        """Worker completes task within reasonable tool call budget."""
-
-    def test_task_completion(self, update_trajectory_cases):
-        """Worker produces a valid patch matching the supervisor instruction."""
+    def test_task_completion_deepeval(self, update_golden_cases):
+        """Task completion judged by DeepEval's live LLM metric."""
 ```
 
 ---
@@ -255,14 +252,17 @@ Metrics applied (in addition to the above):
 
 ---
 
-#### [NEW] `tests/evals/golden/subagent_cases.json`
+#### [NEW] `tests/evals/golden/update_subagent_cases.json`
 
-8–12 cases from diverse sources:
-- **Juice Shop trajectories**: Simple version bump (lodash, express), transitive dependency with parent-first strategy
-- **Synthetic scenarios**: Code workaround with AST-targeted edit, failed validation → retry sequence, workaround replay (pivot from failed update)
-- **Additional real-world projects**: Cases with different package managers, monorepo layouts, and dependency conflict patterns
+11 update cases:
+- **Historical normalization**: direct, transitive override, development dependency, parent update, invalid dependency type, and invalid manifest retries mapped to exact trajectory spans.
+- **Runtime-contract cases**: invalid version syntax, manifest-sync retry, stagnation recovery, retry-limit surrender, and next-candidate fallback where historical traces predate the combined tool or do not contain the proposed values.
+- The original max-round surrender is omitted because it is a global runtime-boundary test rather than a discriminative update golden; the runtime limit remains authoritative in `subagent_runtime.py`.
 
-Each case documents its provenance and includes the supervisor instruction that produced it.
+Each case documents its provenance, evidence status, supervisor instruction,
+exact tool arguments, and expected completion status. The older shared
+`subagent_cases.json` remains for the workaround suite and is not loaded by the
+update suite.
 
 ---
 
@@ -481,13 +481,14 @@ tests/evals/
 ├── test_report_eval.py            # Phase 1: Hallucination, Faithfulness, Summarization
 ├── test_triage_eval.py            # Phase 2: Triage classification accuracy
 ├── test_fix_planner_eval.py       # Phase 2: Fix Planner extraction accuracy
-├── test_update_subagent_eval.py   # Phase 3: Update worker tool correctness
+├── test_update_subagent_eval.py   # Phase 3: Update worker DeepEval metrics
 ├── test_workaround_subagent_eval.py  # Phase 3: Workaround worker eval
 ├── test_qa_critic_eval.py         # Phase 4: QA diagnostic accuracy
 ├── test_business_rules.py         # Phase 5: Token/latency/cost SLAs
 └── golden/                        # Curated evaluation datasets (multi-source, provenance-tracked)
     ├── report_cases.json           # 5–8 cases (Juice Shop + synthetic + real-world)
     ├── triage_cases.json           # 15–20 cases (includes Fix Planner web-extraction)
-    ├── subagent_cases.json         # 8–12 cases (version bumps, workarounds, retries)
+    ├── update_subagent_cases.json  # 11 update cases (two DeepEval metrics)
+    ├── subagent_cases.json         # Workaround cases plus legacy shared data
     └── qa_cases.json               # 8–10 cases (pass/fail, misattribution edge cases)
 ```

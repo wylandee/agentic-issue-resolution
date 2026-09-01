@@ -444,12 +444,11 @@ def subagent_golden_cases(
 def update_subagent_golden_cases(
     load_golden_cases: Callable[[str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Provide curated update subagent evaluation cases from golden/subagent_cases.json."""
-    all_cases = load_golden_cases("subagent_cases")
-    cases = [c for c in all_cases if c.get("eval_type") == "update_subagent"]
+    """Provide curated update cases from golden/update_subagent_cases.json."""
+    cases = load_golden_cases("update_subagent_cases")
     if not cases:
         pytest.skip(
-            "No golden update subagent cases found in tests/evals/golden/subagent_cases.json"
+            "No golden update subagent cases found in tests/evals/golden/update_subagent_cases.json"
         )
     return cases
 
