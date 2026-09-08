@@ -1300,6 +1300,18 @@ def _make_remove_no_fix_dependency_tool(
                 normalized_manifests,
                 touched_files,
             )
+            # Keep an attempt-local rollback anchor as well as the stage
+            # baseline.  A failed package-removal attempt must be undone
+            # without restoring edits accepted for another task in the same
+            # cumulative workspace.
+            attempt_snapshots = plan_state.setdefault("attempt_file_snapshots", {})
+            attempt_absent = set(plan_state.setdefault("attempt_absent_paths", []))
+            for path, content in checkpoint.files.items():
+                if isinstance(content, str):
+                    attempt_snapshots.setdefault(path, content)
+                else:
+                    attempt_absent.add(path)
+            plan_state["attempt_absent_paths"] = sorted(attempt_absent)
             baseline = plan_state.setdefault("stage_baseline_snapshots", {})
             absent = set(plan_state.setdefault("stage_baseline_absent_paths", []))
             for path, content in checkpoint.files.items():
@@ -1562,6 +1574,10 @@ def _make_deterministic_apply_edit_set_tool(
             if curr is None:
                 return f"ERROR: Could not read '{rel_path}'."
             file_snapshots[rel_path] = curr
+        if plan_state is not None:
+            attempt_snapshots = plan_state.setdefault("attempt_file_snapshots", {})
+            for rel_path, content in file_snapshots.items():
+                attempt_snapshots.setdefault(rel_path, content)
         _remember_stage_baseline(sandbox, plan_state, affected_files_set)
 
         replacements_by_file: dict[str, list[WorkaroundPlannedReplacement]] = {}
@@ -1731,6 +1747,8 @@ def _make_deterministic_search_replace_tool(
                 f"ERROR: Could not read '{rel_path}'. Use inspect_ast_symbol or "
                 "search_codebase_pattern to verify the current file content."
             )
+        if plan_state is not None:
+            plan_state.setdefault("attempt_file_snapshots", {}).setdefault(rel_path, current)
         _remember_stage_baseline(sandbox, plan_state, [rel_path])
 
         newline_style = _detect_newline_style(current)
@@ -1844,6 +1862,8 @@ def _make_deterministic_replace_ast_symbol_tool(
         content = sandbox.read_file(rel_path)
         if content is None:
             return f"ERROR: Could not read '{rel_path}'."
+        if plan_state is not None:
+            plan_state.setdefault("attempt_file_snapshots", {}).setdefault(rel_path, content)
         _remember_stage_baseline(sandbox, plan_state, [rel_path])
 
         try:

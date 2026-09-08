@@ -93,6 +93,7 @@ from remediation_engine.orchestration.supervisor_node import (
 from remediation_engine.orchestration.task_utils import (
     TERMINAL_TASK_STATUSES,
     build_initial_remediation_task,
+    task_group_lineage,
 )
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.orchestration.trajectory_exporter import (
@@ -106,10 +107,15 @@ from remediation_engine.orchestration.update_subagent import run_update_subagent
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.settings import AppSettings
+from remediation_engine.settings import (
+    DEFAULT_REMEDY_RETRIAGE_LIMIT,
+    AppSettings,
+)
 from remediation_engine.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
+# Backward-compatible name for callers that imported the previous default.
+POST_QA_RETRIAGE_LIMIT = DEFAULT_REMEDY_RETRIAGE_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +223,14 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
         "cve_ids": sorted(group.cve_ids or []),
         "ghsa_ids": sorted(group.ghsa_ids or []),
         "versions": sorted(group.versions or []),
+        "dependency_ancestry": list(group.dependency_ancestry or []),
+        "dependency_versions": dict(sorted((group.dependency_versions or {}).items())),
+        "parent_package_name": group.parent_package_name,
+        "parent_package_version": group.parent_package_version,
+        "parent_declaration_type": group.parent_declaration_type,
+        "parent_contexts": [
+            context.model_dump(mode="json") for context in group.parent_contexts or []
+        ],
         "sources": sorted(source.value for source in (group.sources or [])),
         "issues": sorted(_stable_issue_fingerprint(issue) for issue in (group.issues or [])),
         "fix_plan": group.fix_plan.model_dump(mode="json") if group.fix_plan else None,
@@ -251,6 +265,146 @@ def _post_triage_issue_input(
                     seen_issue_fingerprints.add(fingerprint)
 
     return retained_non_odc + post_scan_issues
+
+
+def _worker_result_value(result: Any, field: str, default: Any = None) -> Any:
+    """Read one worker/QA result field from a model or a compatibility mapping."""
+    if isinstance(result, Mapping):
+        return result.get(field, default)
+    return getattr(result, field, default)
+
+
+def _accepted_remediation_task_ids(
+    state: OrchestratorState,
+    task_ids: set[str] | None = None,
+) -> set[str]:
+    """Return tasks whose changed workspace was accepted by QA.
+
+    A worker status is only provisional. The final scan must not use a worker
+    success, a stale changed-file projection, or a failed attempt as proof
+    that a finding was materially remediated. Attempt-correlated QA envelopes
+    are authoritative; the task-keyed QA map is retained for legacy states.
+    """
+    worker_results = state.get("worker_results_by_attempt", {}) or {}
+    qa_results = state.get("qa_results_by_attempt", {}) or {}
+    qa_evaluations = state.get("qa_evaluations", {}) or {}
+    attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    accepted: set[str] = set()
+
+    # Results are retained for auditability, so do not let an old accepted
+    # attempt make a later no-op retry look like fresh material work. Select
+    # only the latest worker result for each task; attempt number and revision
+    # are committed Supervisor fields and provide a deterministic ordering.
+    latest_by_task: dict[str, tuple[tuple[int, int, int, str], str, Any]] = {}
+    for attempt_key, result in worker_results.items():
+        raw_task_id = _worker_result_value(result, "task_id", "")
+        result_task_id = str(raw_task_id) if raw_task_id else ""
+        if task_ids is not None and result_task_id not in task_ids:
+            continue
+        if not result_task_id:
+            continue
+        attempt_id = str(_worker_result_value(result, "attempt_id", "") or attempt_key)
+        snapshot = attempt_snapshots.get(attempt_id)
+
+        def _as_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        order = (
+            _as_int(_worker_result_value(result, "task_revision")),
+            _as_int(_worker_result_value(snapshot, "attempt_number")),
+            _as_int(_worker_result_value(snapshot, "state_revision")),
+            attempt_id,
+        )
+        previous = latest_by_task.get(result_task_id)
+        if previous is None or order >= previous[0]:
+            latest_by_task[result_task_id] = (order, attempt_id, result)
+
+    for _order, attempt_id, result in latest_by_task.values():
+        raw_task_id = _worker_result_value(result, "task_id", "")
+        result_task_id = str(raw_task_id) if raw_task_id else ""
+        changed_files = _worker_result_value(result, "changed_files", []) or []
+        if not any(isinstance(path, str) and path.strip() for path in changed_files):
+            continue
+
+        qa_result = qa_results.get(attempt_id) if attempt_id else None
+        evaluation = _worker_result_value(qa_result, "evaluation")
+        if evaluation is None and result_task_id:
+            evaluation = qa_evaluations.get(result_task_id)
+        if evaluation is not None:
+            if bool(_worker_result_value(evaluation, "passed", False)):
+                accepted.add(result_task_id)
+            continue
+
+        # Compatibility callers may not emit a QA envelope. Only accept the
+        # worker's own validated result in that legacy case; a non-success
+        # result can never make a final scan reopen a group.
+        status = _worker_result_value(result, "status")
+        status_value = str(getattr(status, "value", status)).casefold()
+        diagnostics = _worker_result_value(result, "execution_diagnostics")
+        if status_value in {"success", "qa_passed", "mitigated"} and bool(
+            _worker_result_value(diagnostics, "validation_passed", False)
+        ):
+            accepted.add(result_task_id)
+
+    return accepted
+
+
+def _final_scan_has_material_remediation_change(
+    state: OrchestratorState,
+    group_id: str | None = None,
+) -> bool:
+    """Return whether a final-scan target has an accepted material change.
+
+    Final-scan findings are not enough to reopen work. A group must have an
+    accepted worker change associated with its task lineage. Fingerprint
+    comparison remains a compatibility fallback for old manually constructed
+    states that have no attempt envelopes.
+
+    Args:
+        state: Current orchestrator state after the final full scan.
+        group_id: Optional group whose task lineage is being evaluated. When
+            omitted, the helper checks whether any accepted remediation changed
+            the workspace.
+
+    Returns:
+        ``True`` when the supplied group (or any group) has material accepted
+        remediation since the prior final scan; otherwise ``False``.
+    """
+    task_ids: set[str] | None = None
+    task_queue = state.get("task_queue", {}) or {}
+    if group_id is not None:
+        task_ids = {
+            str(task_id)
+            for task in task_group_lineage(task_queue, group_id)
+            if (task_id := _worker_result_value(task, "task_id"))
+        }
+
+    accepted_task_ids = _accepted_remediation_task_ids(state, task_ids)
+    if accepted_task_ids:
+        return True
+
+    # A state with worker/QA envelopes is current-format state. Fail closed
+    # for that state: a global fingerprint change from another group must not
+    # reopen this group.
+    has_attempt_evidence = bool(
+        state.get("worker_results_by_attempt") or state.get("qa_results_by_attempt")
+    )
+    if has_attempt_evidence:
+        return False
+
+    if "final_scan_workspace_fingerprint" not in state:
+        return False
+    previous = state.get("previous_final_scan_workspace_fingerprint")
+    if previous is None:
+        # A first final scan has no prior fingerprint to compare. Without an
+        # accepted attempt envelope, there is no authoritative proof that
+        # this group's workspace changed.
+        return False
+    current = state.get("final_scan_workspace_fingerprint")
+    return current is not None and current != previous
 
 
 def _reconcile_triaged_groups(
@@ -326,6 +480,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
     if disable_retriage or not state.get("triage_required"):
         return {
             "status": "triage_skipped",
+            "triage_required": False,
             "triage_reconciliation": {},
             "active_target_task_ids": [],
             "active_target_group_ids": [],
@@ -350,6 +505,27 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "active_target_task_ids": [],
             "active_target_group_ids": [],
         }
+
+    retriage_count = int(state.get("post_qa_retriage_count", 0) or 0)
+    retriage_limit = settings.remedy_retriage_limit
+    if settings.remedy_retriage_limit_enabled and retriage_count >= retriage_limit:
+        message = (
+            "Development post-QA re-triage limit reached "
+            f"({retriage_limit}); stopping further re-triage."
+        )
+        log.warning("post_qa_triage_node: %s", message)
+        return {
+            "status": "retriage_limit_reached",
+            "triage_required": False,
+            "post_qa_retriage_count": retriage_count,
+            "post_qa_retriage_limit_reached": True,
+            "triage_reconciliation": {},
+            "active_target_task_ids": [],
+            "active_target_group_ids": [],
+            "errors": [message],
+        }
+
+    retriage_count += 1
 
     system_context = state.get("system_context") or SystemContext()
     repo_root = state.get("repo_root")
@@ -391,6 +567,17 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         changed_group_ids.update(final_scan_reopened_group_ids)
         if final_scan_reopened_group_ids:
             reconciliation["final_scan_reopened_group_ids"] = final_scan_reopened_group_ids
+        if final_scan_reopened_group_ids:
+            skipped_reopens = {
+                group_id
+                for group_id in final_scan_reopened_group_ids
+                if not _final_scan_has_material_remediation_change(state, group_id)
+            }
+            changed_group_ids.difference_update(skipped_reopens)
+            if skipped_reopens:
+                reconciliation["final_scan_reopen_skipped_no_material_change_group_ids"] = sorted(
+                    skipped_reopens
+                )
         groups_by_id = {group.group_id: group for group in valid_groups}
         reopened_task_ids: set[str] = set()
         preserved_unfixable_task_ids: set[str] = set()
@@ -459,6 +646,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "valid_groups": valid_groups,
             "status": "triage_completed" if valid_groups else "triage_completed_no_work",
             "triage_required": False,
+            "post_qa_retriage_count": retriage_count,
             "triage_reconciliation": reconciliation,
             "task_queue": task_queue,
             "qa_evaluations": qa_evaluations,
@@ -476,6 +664,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         return {
             "status": "triage_failed",
             "triage_required": False,
+            "post_qa_retriage_count": retriage_count,
             "triage_reconciliation": {},
             "errors": [f"post_qa_triage_node raised: {exc}"],
         }
@@ -1126,8 +1315,34 @@ def _ensure_worker_attempt_results(
 ) -> dict[str, WorkerAttemptResult]:
     """Normalize worker compatibility output into attempt-tagged envelopes."""
     existing = result.get("worker_results_by_attempt") or {}
+    reported_changed_files = [
+        path
+        for path in result.get("changed_files", []) or []
+        if isinstance(path, str) and path.strip()
+    ]
     if existing:
-        return dict(existing)
+        normalized_existing = dict(existing)
+        # Some older worker bridges already emitted an attempt envelope but
+        # omitted its file projection. Recover that projection only for the
+        # single-task dispatch; assigning a batch-wide list to every task
+        # would recreate cross-group patch attribution.
+        if len(target_tasks) == 1 and reported_changed_files:
+            target_task_id = target_tasks[0].task_id
+            for attempt_id, attempt_result in normalized_existing.items():
+                if _worker_result_value(attempt_result, "task_id") != target_task_id:
+                    continue
+                if _worker_result_value(attempt_result, "changed_files", []):
+                    continue
+                if isinstance(attempt_result, WorkerAttemptResult):
+                    normalized_existing[attempt_id] = attempt_result.model_copy(
+                        update={"changed_files": reported_changed_files}
+                    )
+                elif isinstance(attempt_result, Mapping):
+                    normalized_existing[attempt_id] = {
+                        **attempt_result,
+                        "changed_files": reported_changed_files,
+                    }
+        return normalized_existing
     summaries = list(result.get("action_summaries", []) or [])
     summary_by_task = {summary.task_id: summary for summary in summaries}
     errors = list(result.get("errors", []) or [])
@@ -1153,6 +1368,7 @@ def _ensure_worker_attempt_results(
                 failure_reason=" | ".join(errors),
             ),
             instruction_digest=snapshot.instruction_digest,
+            changed_files=(reported_changed_files if len(target_tasks) == 1 else []),
             errors=errors,
         )
     return output

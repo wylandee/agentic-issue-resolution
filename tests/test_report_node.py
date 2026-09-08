@@ -14,6 +14,7 @@ from remediation_engine.orchestration.report_node import (
     generate_report,
     run_report_node,
 )
+from remediation_engine.settings import AppSettings
 
 
 def _state() -> dict:
@@ -62,8 +63,8 @@ def _state() -> dict:
     }
 
 
-def test_generate_report_contains_overview_metrics_findings_and_diff_evidence():
-    """The canonical report exposes the run overview and deterministic evidence."""
+def test_generate_report_contains_four_sections_and_final_change_evidence():
+    """The canonical report exposes only the user-facing sections and final change."""
     report = generate_report(
         _state(),
         token_summary={
@@ -75,16 +76,38 @@ def test_generate_report_contains_overview_metrics_findings_and_diff_evidence():
         trajectory_path="data/trajectories/trace.md",
     )
 
-    assert "Total time taken" in report
-    assert "2.00 seconds" in report
+    headings = [line for line in report.splitlines() if line.startswith("## ")]
+    assert headings == [
+        "## 1. Summary",
+        "## 2. Follow up Actions",
+        "## 3. Successful Remediations",
+        "## 4. References",
+    ]
+    assert "Run duration" in report
+    assert "2.00s" in report
+    assert "Total findings (CVEs and GHSAs)" in report
+    assert "Successfully remediated vulnerability groups" in report
+    assert "Vulnerability groups requiring follow-up" in report
     assert "Total tokens" in report
-    assert "15" in report
+    assert "15 (Input: 10, Output: 5)" in report
+    assert "Patch status" in report
     assert "lodash" in report
     assert "4.17.15" in report
     assert "4.17.21" in report
-    assert "QA passed" in report or "qa_passed" in report
-    assert "\\|" in report
     assert "data/trajectories/trace.md" in report
+    assert "Remediation Change" in report
+    assert "### Critical Errors Encountered" not in report
+    assert "Targeted remediation" not in report
+    assert "Post-remediation security status" not in report
+    assert "Re-triage groups discovered" not in report
+    assert "Targeted QA coverage" not in report
+    assert "Patch present" not in report
+    assert "## 2. Run Overview" not in report
+    assert "## 3. Key Decisions" not in report
+    assert "Validation and Remaining Issues" not in report
+    assert "qa_passed" not in report
+    assert "unfixable" not in report
+    assert "optimistically_fixed" not in report
 
 
 def test_preliminary_report_marks_final_metrics_pending():
@@ -93,6 +116,86 @@ def test_preliminary_report_marks_final_metrics_pending():
 
     assert "Pending finalization" in report
     assert "Unavailable" in report
+    assert "| Patch status | Available (1 file changed) |" in report
+
+
+def test_non_authoritative_scan_does_not_change_the_four_section_contract():
+    """Internal post-scan state does not add diagnostic sections to the report."""
+    state = _state()
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": False,
+        "status": "none",
+    }
+    state["new_vulnerability_status"] = "none"
+
+    report = generate_report(state)
+
+    assert [line for line in report.splitlines() if line.startswith("## ")] == [
+        "## 1. Summary",
+        "## 2. Follow up Actions",
+        "## 3. Successful Remediations",
+        "## 4. References",
+    ]
+    assert "New groups discovered" not in report
+
+
+def test_successful_remediation_table_shows_only_final_change():
+    """Attempt detail is reserved for follow-up rows, not successful findings."""
+    state = _state()
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "status": "success",
+            "summary": "Detailed successful attempt that should not be repeated.",
+        }
+    ]
+
+    report = generate_report(state)
+    header = "| Finding | Package / Target | Severity | Remediation Change | Files Changed |"
+
+    assert report.count(header) == 1
+    assert "4.17.15 → 4.17.21" in report
+    assert "Detailed successful attempt that should not be repeated." not in report
+
+
+def test_follow_up_actions_include_only_outstanding_groups():
+    """Successful groups stay out of follow-up actions while open groups remain."""
+    state = _state()
+    pending_group = {
+        "group_id": "group-pending",
+        "vulnerable_component": "express",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package.json",
+        "issues": [{"severity": "high", "source": "odc"}],
+    }
+    state["initial_valid_groups"].append(pending_group)
+    state["valid_groups"] = list(state["initial_valid_groups"])
+    state["task_queue"]["task-pending"] = {
+        "task_id": "task-pending",
+        "parent_group_id": "group-pending",
+        "parent_task_id": None,
+        "status": "pending",
+        "instruction": "Update express and rerun QA.",
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-pending",
+            "status": "surrender",
+            "summary": "Complete pending attempt evidence.",
+        }
+    ]
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "### group-pending — express (HIGH)" in follow_up
+    assert "**Status:** Pending" in follow_up
+    assert "Complete pending attempt evidence." in follow_up
+    assert "group-1" not in follow_up
 
 
 def test_finalize_report_writes_canonical_report_atomically(tmp_path: Path, monkeypatch):
@@ -168,79 +271,95 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
         result = build_orchestrator_graph().invoke(state)
 
     assert "report" in build_orchestrator_graph().get_graph().nodes
-    assert "workspace volume cleanup failed" in result["report_markdown"]
+    assert "workspace volume cleanup failed" not in result["report_markdown"]
     assert result["report_markdown"].startswith("# Remediation Run Report")
     assert result["report_status"] == "rendered"
     assert result["report_path"] is None
     assert result["report_error"] is None
 
 
-def test_report_separates_targeted_success_from_new_scan_findings_and_qa_records():
-    """The overview distinguishes target QA coverage from post-scan security status."""
+def test_follow_up_consolidates_new_and_reappeared_group_statuses():
+    """New and reappeared groups are shown with the same follow-up format."""
     state = _state()
-    state["initial_valid_groups"] = [
-        state["initial_valid_groups"][0],
+    new_groups = [
         {
-            "group_id": "group-2",
-            "vulnerable_component": "got",
+            "group_id": "group-new-unresolved",
+            "vulnerable_component": "express",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        },
+        {
+            "group_id": "group-new-inconclusive",
+            "vulnerable_component": "lodash",
             "issue_type": "sca",
             "sources": ["odc"],
             "file_path": "package.json",
             "issues": [{"severity": "medium", "source": "odc"}],
-            "fix_plan": {"status": "version_found"},
+        },
+        {
+            "group_id": "group-reappeared-pending",
+            "vulnerable_component": "got",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "low", "source": "odc"}],
         },
     ]
-    state["task_queue"]["task-2"] = {
-        "task_id": "task-2",
-        "parent_group_id": "group-2",
-        "parent_task_id": None,
-        "strategy": "VERSION_BUMP",
-        "instruction": "Update got.",
-        "status": "qa_passed",
+    state["valid_groups"] = new_groups
+    state["task_queue"].update(
+        {
+            "task-new-unresolved": {
+                "task_id": "task-new-unresolved",
+                "parent_group_id": "group-new-unresolved",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "unfixable",
+            },
+            "task-new-inconclusive": {
+                "task_id": "task-new-inconclusive",
+                "parent_group_id": "group-new-inconclusive",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "inconclusive",
+            },
+            "task-reappeared-pending": {
+                "task_id": "task-reappeared-pending",
+                "parent_group_id": "group-reappeared-pending",
+                "parent_task_id": None,
+                "strategy": "VERSION_BUMP",
+                "status": "pending",
+            },
+        }
+    )
+    state["triage_reconciliation"] = {
+        "new_group_ids": ["group-new-unresolved", "group-new-inconclusive"],
+        "reappeared_group_ids": ["group-reappeared-pending"],
     }
-    state["qa_evaluations"] = {"task-1": {"task_id": "task-1", "passed": True}}
-    state["post_remediation_scan_issues"] = [
-        {
-            "cve_id": "CVE-2026-0001",
-            "ghsa_id": "GHSA-AAAA-BBBB-CCCC",
-            "finding_id": "ghsa-aaaa-bbbb-cccc",
-            "package_name": "new-package",
-            "source": "odc",
-            "file_path": "package-lock.json",
-            "severity": "high",
-        },
-        {
-            "cve_id": "CVE-2026-0002",
-            "package_name": "another-package",
-            "source": "odc",
-            "file_path": "package-lock.json",
-            "severity": "low",
-        },
-    ]
-    state["post_remediation_scan_identifiers"] = [
-        "CVE-2026-0001",
-        "GHSA-AAAA-BBBB-CCCC",
-        "CVE-2026-0002",
-    ]
-    state["new_vulnerability_identifiers"] = list(state["post_remediation_scan_identifiers"])
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+    }
     state["new_vulnerability_status"] = "detected"
 
     report = generate_report(state)
 
-    assert "Completed with new findings (completed)" in report
-    assert "Overall outcome: **Completed with new findings**" in report
-    assert "2 passed / 2 targeted groups" in report
-    assert "1 records retained" in report
-    assert "2 findings" in report
-    assert "3 unique identifiers" in report
-    assert "### Newly Detected Findings" in report
-    assert "CVE-2026-0001, GHSA-AAAA-BBBB-CCCC" in report
-    assert "GHSA-AAAA-BBBB-CCCC, ghsa-aaaa-bbbb-cccc" not in report
-    assert "Overall outcome: **Successful**" not in report
+    assert "| Successfully remediated vulnerability groups | 1 |" in report
+    assert "| Vulnerability groups requiring follow-up | 3 |" in report
+    assert "| Total vulnerability groups | 4 |" in report
+    assert "### Newly Discovered Groups" not in report
+    assert "group-new-unresolved" in report
+    assert "group-new-inconclusive" in report
+    assert "group-reappeared-pending" in report
+    assert "**Status:** Unresolved" in report
+    assert "**Status:** Inconclusive" in report
+    assert "**Status:** Pending" in report
 
 
-def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
-    """Package output lists direct changes and summarizes transitive lockfile churn."""
+def test_findings_show_final_package_change_without_package_detail_sections():
+    """Successful findings show the final package change only."""
     state = _state()
     state["diff"] = (
         "--- a/package.json\n"
@@ -268,18 +387,20 @@ def test_report_summarizes_transitive_lockfile_changes_and_ignores_metadata():
 
     report = generate_report(state)
 
-    assert "#### Direct Manifest Changes" in report
+    assert "Remediation Change" in report
     assert "lodash" in report
     assert "4.17.15" in report
     assert "4.17.21" in report
-    assert "1 transitive lockfile package entries changed" in report
+    assert "Packages Added or Changed" not in report
+    assert "Worker Package Execution Evidence" not in report
+    assert "transitive lockfile package entries changed" not in report
     assert "engines" not in report
     assert "deprecated" not in report
     assert "transitive-package" not in report
 
 
-def test_failed_authoritative_scan_is_reported_as_unassessed_and_errors_are_grouped():
-    """A scan timeout must not be rendered as a clean zero-finding result."""
+def test_failed_authoritative_scan_does_not_leak_error_details():
+    """Internal scan and planner diagnostics are omitted from the user report."""
     state = _state()
     state["status"] = "completed_with_errors"
     state["final_full_scan_result"] = {
@@ -299,14 +420,15 @@ def test_failed_authoritative_scan_is_reported_as_unassessed_and_errors_are_grou
 
     report = generate_report(state)
 
-    assert "Unknown — authoritative scan failed" in report
-    assert "Post-remediation scanner findings | 0 findings" not in report
-    assert "No newly detected findings" not in report
-    assert "| run, final_full_scan | ODC_TIMEOUT | 2 |" in report
-    assert report.count("| supervisor | INVALID_PLANNER_COMMIT | 2 |") == 1
+    assert "Dependency-Check timed out" not in report
+    assert "authoritative scan failed" not in report
+    assert "ODC_TIMEOUT" not in report
+    assert "INVALID_PLANNER_COMMIT" not in report
+    assert "Critical Errors Encountered" not in report
+    assert "scan_failed" not in report
 
 
-def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_original_only():
+def test_pivot_child_group_status_uses_child_tasks_in_findings_and_follow_up():
     """Pivot groups must inherit their unfixable child status, not pending."""
     state = _state()
     state["initial_valid_groups"] = [
@@ -358,11 +480,9 @@ def test_pivot_child_group_status_uses_child_tasks_and_remaining_work_is_origina
 
     report = generate_report(state)
 
-    assert "| group-child | express-jwt |" in report
-    assert "| group-child | express-jwt | odc | package.json | high | unfixable |" in report
-    assert "### Remaining or Inconclusive Groups" in report
-    assert "| group-root | unfixable |" in report
-    assert "| group-child | express-jwt | unfixable |" in report
+    assert "### group-child — express-jwt (HIGH)" in report
+    assert "### group-root — express-jwt (HIGH)" in report
+    assert report.count("**Status:** Unresolved") == 2
     assert "| group-child | pending |" not in report
 
 
@@ -409,13 +529,14 @@ def test_failed_pivot_child_overrides_historical_parent_qa_success():
     report = generate_report(state)
 
     assert "1/1 actionable groups fixed" not in report
-    assert "0/1 actionable groups fixed" in report
-    assert "Completed with errors (completed_with_errors)" in report
-    assert "1 target identifiers remain" in report
+    assert "| Successfully remediated vulnerability groups | 0 |" in report
+    assert "| Vulnerability groups requiring follow-up | 2 |" in report
+    assert "completed_with_errors" not in report
+    assert "1 target identifiers remain" not in report
 
 
-def test_report_renders_historical_retry_activity_and_latest_action_per_task():
-    """Historical diagnostics remain visible even when active plans are empty."""
+def test_report_omits_retry_history_for_successful_findings():
+    """Successful findings do not expose retry histories in the compact report."""
     state = _state()
     state["retry_plans_by_task"] = {}
     state["retry_diagnostics_by_task"] = {
@@ -448,11 +569,10 @@ def test_report_renders_historical_retry_activity_and_latest_action_per_task():
 
     report = generate_report(state)
 
-    assert "### Historical Retry/Pivot Activity" in report
-    assert "No retry plans recorded" not in report
-    assert "| task-1 | lodash | osv_minimum | attempt-2 |" in report
-    assert "| task-1 | surrender | attempt-2 | 1 | 2 summaries |" in report
-    assert report.count("Earlier attempt summary.") == 0
+    assert "Historical Retry/Pivot Activity" not in report
+    assert "Earlier attempt summary." not in report
+    assert "Latest attempt summary with the final worker conclusion." not in report
+    assert "attempt-2" not in report
 
 
 def test_report_text_preserves_full_text_without_truncation():
@@ -462,14 +582,14 @@ def test_report_text_preserves_full_text_without_truncation():
     assert _full_text(text) == text
 
 
-def test_report_renders_full_prose_and_failed_qa_attempt_history():
-    """Full retry, QA, action, and repair prose is rendered without ellipses."""
+def test_follow_up_actions_include_only_remediation_attempt_prose():
+    """Follow-up rows exclude QA feedback and retry diagnostics from attempt text."""
     state = _state()
+    state["task_queue"]["task-1"]["status"] = "needs_retry"
     retry_instruction = "retry instruction " + " ".join(f"detail-{index}" for index in range(120))
     retry_reason = "retry reason " + " ".join(f"reason-{index}" for index in range(120))
     qa_feedback = "QA feedback " + " ".join(f"feedback-{index}" for index in range(120))
     action_summary = "worker summary " + " ".join(f"summary-{index}" for index in range(120))
-    repair_reason = "repair reason " + " ".join(f"repair-{index}" for index in range(120))
     state["retry_plans_by_task"] = {
         "task-1": {
             "action": "retry_update",
@@ -504,24 +624,646 @@ def test_report_renders_full_prose_and_failed_qa_attempt_history():
             "summary": action_summary,
         }
     ]
-    state["consistency_events"] = [
-        {"event_type": "repair", "reason": repair_reason},
-    ]
-
     report = generate_report(state)
 
-    assert retry_instruction in report
-    assert retry_reason in report
-    assert qa_feedback in report
-    assert action_summary in report
-    assert repair_reason in report
-    assert "### Failed QA Gates (Attempt History)" in report
-    assert "| task-1 | attempt-1 | security_flag |" in report
+    assert "Updated lodash 4.17.15 → 4.17.21 via dependencies." in report
+    assert action_summary not in report
+    assert "Attempted remediations" in report
+    attempted_fixes = report.split("**Attempted remediations:**", 1)[1]
+    assert retry_instruction not in attempted_fixes
+    assert retry_reason not in report
+    assert qa_feedback not in report
+    assert "QA feedback:" not in report
+    assert "Retry details:" not in report
+    assert "Attempted versions:" not in report
+    assert "Historical Retry/Pivot Activity" not in report
+    assert "Failed QA Gates" not in report
+    assert "attempt-1" not in report
     assert "…" not in report
 
 
-def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
-    """Package diagnostics remain useful when an attempt snapshot omits the package."""
+def test_attempted_fixes_strip_agent_detail_sections():
+    """Attempted fixes expose code, file, and outcome evidence without raw agent noise."""
+    state = _state()
+    state["task_queue"]["task-1"]["status"] = "unfixable"
+    state["task_queue"]["task-1"]["strategy"] = "CODE_WORKAROUND"
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 1,
+            "status": "success",
+            "summary": (
+                "Completed validated code workaround edits; changed files: src/guard.ts. "
+                "Final note: Added a startup guard for the vulnerable dependency.\n\n"
+                "What changed:\n- Added a guard around the vulnerable call.\n\n"
+                "Validation:\n- Runtime smoke passed.\n\n"
+                "Note:\n- This is an agent detail that should not be rendered."
+            ),
+        }
+    ]
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "Attempted a code workaround in src/guard.ts." in follow_up
+    assert "Outcome: Added a startup guard for the vulnerable dependency." in follow_up
+    assert "What changed:" not in follow_up
+    assert "Validation:" not in follow_up
+    assert "This is an agent detail" not in follow_up
+
+
+def test_final_change_describes_manifest_entry_and_natural_package_summary():
+    """Final changes include the exact override edit, files, and a readable summary."""
+    state = _state()
+    state["initial_valid_groups"][0].update(
+        {
+            "vulnerable_component": "undici",
+            "issues": [
+                {
+                    "package_name": "undici",
+                    "package_version": "5.0",
+                    "severity": "high",
+                    "source": "odc",
+                }
+            ],
+        }
+    )
+    state["task_queue"]["task-1"].update(
+        {
+            "target_package_name": "undici",
+            "target_dependency_type": "overrides",
+            "selected_version": "5.1",
+        }
+    )
+    state["diff"] = (
+        "--- a/package.json\n"
+        "+++ b/package.json\n"
+        "@@\n"
+        '  "overrides": {\n'
+        '-    "undici": "5.0"\n'
+        '+    "undici": "5.1"\n'
+        "  }\n"
+    )
+
+    report = generate_report(state)
+
+    assert "| group-1 | undici | HIGH | 5.0 → 5.1 via overrides | package.json |" in report
+
+
+def test_final_change_pairs_lockfile_version_with_package_from_resolved_url():
+    """A replacement block must not attribute the new version to a removed nested package."""
+    state = _state()
+    state["initial_valid_groups"][0].update(
+        {
+            "vulnerable_component": "got",
+            "issues": [{"package_name": "got", "package_version": "8.3.2"}],
+        }
+    )
+    state["task_queue"]["task-1"].update(
+        {
+            "target_package_name": "got",
+            "target_dependency_type": "overrides",
+            "selected_version": "11.8.5",
+        }
+    )
+    state["diff"] = (
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@\n"
+        '     "node_modules/got": {\n'
+        '-      "version": "8.3.2",\n'
+        '-      "resolved": "https://registry.npmjs.org/got/-/got-8.3.2.tgz",\n'
+        '-    "node_modules/got/node_modules/pify": {\n'
+        '-      "version": "3.0.0",\n'
+        '-      "resolved": "https://registry.npmjs.org/pify/-/pify-3.0.0.tgz",\n'
+        '-      "license": "MIT",\n'
+        '-        "node": ">=4"\n'
+        '+      "version": "11.8.5",\n'
+        '+      "resolved": "https://registry.npmjs.org/got/-/got-11.8.5.tgz",\n'
+        "       }\n"
+        "     },\n"
+    )
+
+    report = generate_report(state)
+
+    assert "| group-1 | got | UNKNOWN | 8.3.2 → 11.8.5 via lockfile | package-lock.json |" in report
+    assert "got: 8.3.2 → removed via lockfile" not in report
+
+
+def test_finalize_report_is_deterministic_when_report_llm_is_enabled(tmp_path: Path):
+    """Report settings cannot cause model calls or model-written report prose."""
+    state = _state()
+    settings = AppSettings(
+        remediation_report_dir=tmp_path,
+        report_llm_enabled=True,
+        report_llm_model="test-report-model",
+    )
+    with patch("langchain_openai.ChatOpenAI") as chat_openai:
+        report, _ = finalize_report(
+            state,
+            recorder=None,
+            trajectory_path="trajectory.md",
+            trace_url="https://trace.example/run",
+            settings=settings,
+        )
+
+    chat_openai.assert_not_called()
+    assert "4.17.15 → 4.17.21 via dependencies" in report
+    assert "executive narrative" not in report.casefold()
+
+
+def test_finalize_report_uses_deterministic_fallback_when_tokens_are_unavailable(tmp_path: Path):
+    """Finalization still produces the canonical report without recorder usage."""
+    settings = AppSettings(remediation_report_dir=tmp_path)
+    report, path = finalize_report(
+        _state(),
+        recorder=None,
+        trajectory_path="trajectory.md",
+        trace_url=None,
+        settings=settings,
+    )
+
+    assert path == tmp_path / "remediation_trace-report-1.md"
+    assert "| Total tokens | Unavailable |" in report
+    assert "| Patch status | Available (1 file changed) |" in report
+
+
+def test_workaround_final_change_includes_replacement_evidence():
+    """Successful source workarounds expose replay replacements, files, and the final note."""
+    state = _state()
+    state["initial_valid_groups"][0]["vulnerable_component"] = "express-jwt"
+    state["task_queue"]["task-1"]["strategy"] = "CODE_WORKAROUND"
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "status": "success",
+            "summary": (
+                "Completed validated code workaround edits; changed files: src/guard.ts. "
+                "Final note: Guarded the vulnerable call before rendering."
+            ),
+        }
+    ]
+    state["worker_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "status": "success",
+            "changed_files": ["src/guard.ts"],
+            "execution_diagnostics": {"validation_passed": True},
+            "replay_plan": {
+                "successful_edit_sets": [
+                    {
+                        "affected_files": ["src/guard.ts"],
+                        "replacements": [
+                            {
+                                "file_path": "src/guard.ts",
+                                "old_text": "render(input)",
+                                "new_text": "render(escape(input))",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+    }
+
+    report = generate_report(state)
+
+    assert "Code workaround: Guarded the vulnerable call before rendering." in report
+    assert "Files Changed |" in report
+    assert "src/guard.ts" in report
+    assert "```diff\n--- a/src/guard.ts" in report
+    assert "-render(input)" in report
+    assert "+render(escape(input))" in report
+
+
+def test_workaround_replay_projection_supplies_attempt_diff_when_worker_result_is_sparse():
+    """Task-keyed replay evidence remains visible when the attempt envelope is sparse."""
+    state = _state()
+    state["initial_valid_groups"][0]["vulnerable_component"] = "express-jwt"
+    state["task_queue"]["task-1"]["strategy"] = "CODE_WORKAROUND"
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "status": "success",
+            "summary": "Applied a guarded source change.",
+        }
+    ]
+    state["workaround_replay_plans_by_task"] = {
+        "task-1": {
+            "successful_edit_sets": [
+                {
+                    "affected_files": ["src/guard.ts"],
+                    "replacements": [
+                        {
+                            "file_path": "src/guard.ts",
+                            "old_text": "render(input)",
+                            "new_text": "render(escape(input))",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    report = generate_report(state)
+
+    assert "```diff\n--- a/src/guard.ts" in report
+    assert "-render(input)" in report
+    assert "+render(escape(input))" in report
+
+
+def test_workaround_diffs_are_isolated_when_attempts_share_a_source_file():
+    """Each workaround report block contains only its attempt's replacements."""
+    state = _state()
+    express_group = {
+        "group_id": "group-express-jwt",
+        "vulnerable_component": "express-jwt",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package.json",
+        "issues": [{"cve_id": "CVE-EXPRESS", "severity": "high", "source": "odc"}],
+    }
+    sanitize_group = {
+        "group_id": "group-sanitize-html",
+        "vulnerable_component": "sanitize-html",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package.json",
+        "issues": [{"cve_id": "CVE-SANITIZE", "severity": "high", "source": "odc"}],
+    }
+    state["initial_valid_groups"] = [express_group, sanitize_group]
+    state["valid_groups"] = [express_group, sanitize_group]
+    state["task_queue"] = {
+        "task-express": {
+            "task_id": "task-express",
+            "parent_group_id": express_group["group_id"],
+            "parent_task_id": None,
+            "strategy": "CODE_WORKAROUND",
+            "status": "qa_passed",
+        },
+        "task-sanitize": {
+            "task_id": "task-sanitize",
+            "parent_group_id": sanitize_group["group_id"],
+            "parent_task_id": None,
+            "strategy": "CODE_WORKAROUND",
+            "status": "qa_passed",
+        },
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-express",
+            "attempt_id": "attempt-express",
+            "status": "success",
+            "summary": "Updated express-jwt middleware.",
+            "changed_files": ["lib/insecurity.ts"],
+        },
+        {
+            "task_id": "task-sanitize",
+            "attempt_id": "attempt-sanitize",
+            "status": "success",
+            "summary": "Updated sanitizeSecure.",
+            "changed_files": ["lib/insecurity.ts"],
+        },
+    ]
+    state["worker_results_by_attempt"] = {
+        "attempt-express": {
+            "attempt_id": "attempt-express",
+            "task_id": "task-express",
+            "status": "success",
+            "changed_files": ["lib/insecurity.ts"],
+            "execution_diagnostics": {"validation_passed": True},
+            "replay_plan": {
+                "successful_edit_sets": [
+                    {
+                        "affected_files": ["lib/insecurity.ts"],
+                        "replacements": [
+                            {
+                                "file_path": "lib/insecurity.ts",
+                                "old_text": "old express middleware",
+                                "new_text": "new express middleware",
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+        "attempt-sanitize": {
+            "attempt_id": "attempt-sanitize",
+            "task_id": "task-sanitize",
+            "status": "success",
+            "changed_files": ["lib/insecurity.ts"],
+            "execution_diagnostics": {"validation_passed": True},
+            "replay_plan": {
+                "successful_edit_sets": [
+                    {
+                        "affected_files": ["lib/insecurity.ts"],
+                        "replacements": [
+                            {
+                                "file_path": "lib/insecurity.ts",
+                                "old_text": "old sanitize implementation",
+                                "new_text": "new sanitize implementation",
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+    }
+    state["diff"] = (
+        "--- a/lib/insecurity.ts\n"
+        "+++ b/lib/insecurity.ts\n"
+        "@@\n"
+        "-old express middleware\n"
+        "+new express middleware\n"
+        "@@\n"
+        "-old sanitize implementation\n"
+        "+new sanitize implementation\n"
+    )
+    state["changed_files"] = ["lib/insecurity.ts"]
+
+    report = generate_report(state)
+    express_section = report.split("#### CVE-EXPRESS — express-jwt", 1)[1].split(
+        "#### CVE-SANITIZE — sanitize-html", 1
+    )[0]
+    sanitize_section = report.split("#### CVE-SANITIZE — sanitize-html", 1)[1]
+
+    assert "-old express middleware" in express_section
+    assert "+new express middleware" in express_section
+    assert "old sanitize implementation" not in express_section
+    assert "new sanitize implementation" not in express_section
+    assert "-old sanitize implementation" in sanitize_section
+    assert "+new sanitize implementation" in sanitize_section
+    assert "old express middleware" not in sanitize_section
+    assert "new express middleware" not in sanitize_section
+
+
+def test_attempt_without_files_does_not_claim_metadata_version_change():
+    """A surrendered attempt with no edits must not report its planned version as applied."""
+    state = _state()
+    state["initial_valid_groups"][0].update(
+        {
+            "vulnerable_component": "undici",
+            "issues": [{"package_name": "undici", "package_version": "5.0"}],
+        }
+    )
+    state["task_queue"]["task-1"].update(
+        {
+            "status": "unfixable",
+            "target_package_name": "undici",
+            "target_dependency_type": "overrides",
+            "selected_version": "5.1",
+            "parent_package_version": "5.0",
+        }
+    )
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "status": "surrender",
+            "summary": "Stopped without a validated code workaround; no files changed.",
+        }
+    ]
+    state["attempt_snapshots_by_id"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "target_package_name": "undici",
+            "selected_version": "5.1",
+            "instruction": "Update package.json using overrides.",
+        }
+    }
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "No validated package change was applied." in follow_up
+    assert "undici: 5.0 → 5.1" not in follow_up
+
+
+def test_untriaged_authoritative_findings_require_follow_up():
+    """A newly detected scanner identifier is presented as an open finding."""
+    state = _state()
+    state["triage_reconciliation"] = {}
+    state["triage_required"] = True
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "new_identifiers": ["CVE-2026-0001"],
+        "triage_required": True,
+    }
+    state["new_vulnerability_status"] = "detected"
+
+    report = generate_report(state)
+
+    assert "| Successfully remediated vulnerability groups | 1 |" in report
+    assert "| Vulnerability groups requiring follow-up | 1 |" in report
+    assert "### CVE-2026-0001 — Untriaged finding (UNKNOWN)" in report
+    assert "### Newly Discovered Groups" not in report
+
+
+def test_multiple_untriaged_authoritative_findings_are_consolidated_as_follow_up():
+    """Raw final-scan identifiers remain visible without a discovery subsection."""
+    state = _state()
+    state["triage_required"] = False
+    state["triage_reconciliation"] = {}
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "found_identifiers": ["CVE-2026-0001", "GHSA-ABCD-EFGH-IJKL"],
+        "new_identifiers": ["CVE-2026-0001", "GHSA-ABCD-EFGH-IJKL"],
+        "remaining_target_identifiers": [],
+        "triage_required": True,
+        "found_issues": [
+            {
+                "cve_id": "CVE-2026-0001",
+                "ghsa_id": "GHSA-ABCD-EFGH-IJKL",
+                "package_name": "new-package",
+                "file_path": "package-lock.json",
+                "severity": "HIGH",
+                "source": "odc",
+            }
+        ],
+    }
+
+    report = generate_report(state)
+
+    assert "| Successfully remediated vulnerability groups | 1 |" in report
+    assert "| Vulnerability groups requiring follow-up | 2 |" in report
+    assert "### CVE-2026-0001 — new-package (HIGH)" in report
+    assert "### GHSA-ABCD-EFGH-IJKL — new-package (HIGH)" in report
+    assert "New findings detected" not in report
+
+
+def test_final_scan_reopened_groups_are_follow_up_actions():
+    """A reopened group is rendered with the same follow-up block as any open group."""
+    state = _state()
+    reopened = {
+        "group_id": "group-reopened",
+        "vulnerable_component": "extract-zip",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package-lock.json",
+        "issues": [{"cve_id": "CVE-2026-0002", "severity": "high", "source": "odc"}],
+    }
+    state["valid_groups"] = [reopened]
+    state["task_queue"]["task-reopened"] = {
+        "task_id": "task-reopened",
+        "parent_group_id": "group-reopened",
+        "parent_task_id": None,
+        "status": "unfixable",
+    }
+    state["triage_reconciliation"] = {
+        "final_scan_reopened_group_ids": ["group-reopened"],
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "new_identifiers": ["CVE-2026-0002"],
+        "found_identifiers": ["CVE-2026-0002"],
+        "triage_required": True,
+        "found_issues": [
+            {
+                "cve_id": "CVE-2026-0002",
+                "file_path": "scan/package-lock.json?/extract-zip:2.0.1",
+                "package_name": "extract-zip",
+                "severity": "HIGH",
+                "source": "odc",
+            }
+        ],
+    }
+
+    report = generate_report(state)
+
+    assert "| Vulnerability groups requiring follow-up | 1 |" in report
+    assert "### CVE-2026-0002 — extract-zip (HIGH)" in report
+    assert "**Status:** Unresolved" in report
+    assert "CVE-2026-0002" in report
+
+
+def test_authoritative_remaining_finding_reopens_targeted_success():
+    """A repository-wide finding overrides a narrower targeted QA success."""
+    state = _state()
+    state["initial_valid_groups"][0]["cve_ids"] = ["CVE-2024-0001"]
+    state["initial_valid_groups"][0]["issues"][0]["cve_id"] = "CVE-2024-0001"
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "detected",
+        "remaining_target_identifiers": ["CVE-2024-0001"],
+    }
+    state["new_vulnerability_status"] = "detected"
+    state["triage_reconciliation"] = {}
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "| Successfully remediated vulnerability groups | 0 |" in report
+    assert "| Vulnerability groups requiring follow-up | 1 |" in report
+    assert "CVE-2024-0001" in follow_up
+    assert "**Status:** Retry needed" in follow_up
+    assert "No successful remediations were produced during this run." in report
+
+
+def test_follow_up_actions_collapse_undiscovered_pivot_child_into_parent():
+    """A pivot child is not a second follow-up issue without new-group evidence."""
+    state = _state()
+    state["initial_valid_groups"] = [
+        {
+            "group_id": "group-root",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        }
+    ]
+    state["valid_groups"] = [
+        state["initial_valid_groups"][0],
+        {
+            "group_id": "group-child",
+            "vulnerable_component": "express-jwt",
+            "issue_type": "sca",
+            "sources": ["odc"],
+            "file_path": "package.json",
+            "issues": [{"severity": "high", "source": "odc"}],
+        },
+    ]
+    state["task_queue"] = {
+        "task-root": {
+            "task_id": "task-root",
+            "parent_group_id": "group-root",
+            "parent_task_id": None,
+            "status": "pivoted",
+        },
+        "task-child": {
+            "task_id": "task-child",
+            "parent_group_id": "group-child",
+            "parent_task_id": "task-root",
+            "status": "unfixable",
+        },
+    }
+    state["triage_reconciliation"] = {}
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert follow_up.count("### group-root — express-jwt (HIGH)") == 1
+    assert "### group-child — express-jwt" not in follow_up
+
+
+def test_finding_label_uses_vulnerable_component_not_transitive_edit_target():
+    """A transitive finding stays labelled by its vulnerable package."""
+    state = _state()
+    group = state["initial_valid_groups"][0]
+    group.update(
+        {
+            "vulnerable_component": "lodash",
+            "issues": [
+                {
+                    "package_name": "lodash",
+                    "package_version": "2.4.2",
+                    "severity": "high",
+                    "source": "odc",
+                }
+            ],
+        }
+    )
+    state["task_queue"]["task-1"].update(
+        {
+            "target_package_name": "sanitize-html",
+            "parent_package_name": "sanitize-html",
+            "parent_package_version": "1.4.2",
+            "status": "unfixable",
+        }
+    )
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "### group-1 — lodash (HIGH)" in follow_up
+    assert "### group-1 — sanitize-html (HIGH)" not in follow_up
+    assert "alternative remediation for sanitize-html" in follow_up
+
+
+def test_worker_package_diagnostics_are_excluded_without_an_attempt_summary():
+    """Worker summaries populate Attempted fixes without leaking retry diagnostics."""
     state = _state()
     state["initial_valid_groups"].append(
         {
@@ -552,6 +1294,10 @@ def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
             "attempt_id": "attempt-2",
             "task_id": "task-2",
             "task_revision": 1,
+            "action_summary": {
+                "status": "surrender",
+                "summary": "Worker remediation attempt summary.",
+            },
             "execution_diagnostics": {
                 "attempted_versions": ["4.0.0"],
                 "executed_versions": [],
@@ -567,5 +1313,234 @@ def test_worker_package_diagnostics_fall_back_to_retry_and_group_metadata():
 
     report = generate_report(state)
 
-    assert "| task-2 | express-jwt |" in report
+    assert "Remediation attempt summary." in report
+    assert "Worker remediation attempt summary." not in report
+    assert "No remediation attempt recorded." not in report
+    assert "4.0.0" not in report
     assert "unknown — package missing from trace" not in report
+
+
+def test_follow_up_actions_render_each_attempt_with_the_attempted_version():
+    """Every recorded version attempt is shown with its selected package version."""
+    state = _state()
+    state["initial_valid_groups"][0].update(
+        {
+            "vulnerable_component": "express-jwt",
+            "issues": [
+                {
+                    "package_name": "express-jwt",
+                    "package_version": "5.0.0",
+                    "severity": "high",
+                    "source": "odc",
+                }
+            ],
+        }
+    )
+    state["task_queue"]["task-1"].update({"status": "unfixable", "strategy": "VERSION_BUMP"})
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": f"attempt-{number}",
+            "status": "surrender",
+            "summary": "Attempted a package version update.",
+        }
+        for number in range(1, 5)
+    ]
+    state["attempt_snapshots_by_id"] = {
+        f"attempt-{number}": {
+            "attempt_id": f"attempt-{number}",
+            "task_id": "task-1",
+            "selected_version": version,
+            "instruction": f'Update "express-jwt" in package.json to version "{version}".',
+            "strategy": "CODE_WORKAROUND" if number == 4 else "VERSION_BUMP",
+        }
+        for number, version in enumerate(("6.0.0", "6.1.2", "8.5.1", "8.6.0"), start=1)
+    }
+    state["action_summaries"][-1]["summary"] = "Attempted a code workaround."
+    state["diff"] = "--- a/src/guard.ts\n+++ b/src/guard.ts\n@@\n-unsafe(input)\n+safe(input)\n"
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    for number in range(1, 5):
+        assert f"Attempt {number}" in follow_up
+    assert "Updated express-jwt 5.0.0 → 6.0.0 via dependencies." in follow_up
+    assert "Updated express-jwt 5.0.0 → 6.1.2 via dependencies." in follow_up
+    assert "Updated express-jwt 5.0.0 → 8.5.1 via dependencies." in follow_up
+    assert "```diff\n--- a/src/guard.ts" in follow_up
+    assert "\n   ```diff" not in follow_up
+
+
+def test_successful_pivot_lineage_is_rendered_once():
+    """A successful pivot child does not duplicate its original finding row."""
+    state = _state()
+    state["valid_groups"] = [
+        state["initial_valid_groups"][0],
+        {
+            **state["initial_valid_groups"][0],
+            "group_id": "group-child",
+        },
+    ]
+    state["task_queue"]["task-child"] = {
+        "task_id": "task-child",
+        "parent_group_id": "group-child",
+        "parent_task_id": "task-1",
+        "strategy": "CODE_WORKAROUND",
+        "status": "qa_passed",
+    }
+
+    report = generate_report(state)
+    successful = report.split("## 3. Successful Remediations", 1)[1].split("## 4. References", 1)[0]
+
+    assert "| Total vulnerability groups | 1 |" in report
+    assert "| Successfully remediated vulnerability groups | 1 |" in report
+    assert successful.count("| group-1 |") == 1
+    assert "group-child" not in successful
+
+
+def test_successful_task_only_group_uses_attempt_metadata_for_exact_change():
+    """Successful groups absent from the final group projection remain visible."""
+    state = _state()
+    state["task_queue"]["task-ip"] = {
+        "task_id": "task-ip",
+        "parent_group_id": "group-ip-address",
+        "parent_task_id": None,
+        "strategy": "VERSION_BUMP",
+        "strategy_stage": "package_override",
+        "status": "qa_passed",
+        "target_package_name": "ip-address",
+        "target_dependency_type": "overrides",
+        "parent_package_version": "10.2.0",
+    }
+    state["action_summaries"] = [
+        {
+            "task_id": "task-ip",
+            "attempt_id": "attempt-ip",
+            "status": "success",
+            "summary": (
+                "Completed validated manifest updates for ip-address in package.json; "
+                "changed files: package.json."
+            ),
+        }
+    ]
+    state["worker_results_by_attempt"] = {
+        "attempt-ip": {
+            "attempt_id": "attempt-ip",
+            "task_id": "task-ip",
+            "status": "success",
+            "changed_files": [],
+            "execution_diagnostics": {"validation_passed": True},
+        }
+    }
+    state["attempt_snapshots_by_id"] = {
+        "attempt-ip": {
+            "attempt_id": "attempt-ip",
+            "task_id": "task-ip",
+            "target_package_name": "ip-address",
+            "target_dependency_type": "overrides",
+            "selected_version": "10.3.1",
+            "instruction": ('Add or update "overrides": {"ip-address": "10.3.1"} in package.json.'),
+            "strategy": "VERSION_BUMP",
+        }
+    }
+    state["diff"] = ""
+
+    report = generate_report(state)
+    successful = report.split("## 3. Successful Remediations", 1)[1].split("## 4. References", 1)[0]
+
+    assert (
+        "| group-ip-address | ip-address | UNKNOWN | 10.2.0 → 10.3.1 via overrides | package.json |"
+        in successful
+    )
+    assert "| Successfully remediated vulnerability groups | 2 |" in report
+
+
+def test_package_removal_attempt_includes_manifest_and_source_changes():
+    """Package-removal attempts identify both manifest and source changes."""
+    state = _state()
+    notevil_group = {
+        "group_id": "group-notevil",
+        "vulnerable_component": "notevil",
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": "package.json",
+        "issues": [{"cve_id": "CVE-NOTEVIL", "severity": "medium", "source": "odc"}],
+    }
+    state["initial_valid_groups"] = [notevil_group]
+    state["valid_groups"] = [notevil_group]
+    state["task_queue"] = {
+        "task-notevil": {
+            "task_id": "task-notevil",
+            "parent_group_id": "group-notevil",
+            "parent_task_id": None,
+            "strategy": "CODE_WORKAROUND",
+            "strategy_stage": "code_workaround",
+            "no_fix_stage": "package_removal",
+            "qa_policy": "no_fix_package_removal",
+            "status": "unfixable",
+        }
+    }
+    state["qa_evaluations"] = {}
+    state["action_summaries"] = [
+        {
+            "task_id": "task-notevil",
+            "attempt_id": "attempt-notevil",
+            "status": "success",
+            "summary": (
+                "Completed validated code workaround edits; changed files: "
+                "package-lock.json, package.json, routes/b2bOrder.ts. "
+                "Final note: Removed notevil from package.json and synchronized package-lock.json."
+            ),
+        }
+    ]
+    state["worker_results_by_attempt"] = {
+        "attempt-notevil": {
+            "attempt_id": "attempt-notevil",
+            "task_id": "task-notevil",
+            "status": "success",
+            "changed_files": ["package-lock.json", "package.json", "routes/b2bOrder.ts"],
+            "execution_diagnostics": {"validation_passed": True},
+            "replay_plan": {
+                "pre_attempt_snapshots": {
+                    "package.json": (
+                        '{\n  "dependencies": {\n    "notevil": "^1.3.3",\n'
+                        '    "express": "^4.0.0"\n  }\n}\n'
+                    ),
+                    "package-lock.json": (
+                        '{\n  "packages": {\n    "": {\n      "dependencies": '
+                        '{\n        "notevil": "^1.3.3"\n      }\n    },\n'
+                        '    "node_modules/notevil": {\n      "version": "1.3.3"\n'
+                        "    }\n  }\n}\n"
+                    ),
+                },
+                "successful_edit_sets": [
+                    {
+                        "affected_files": ["routes/b2bOrder.ts"],
+                        "replacements": [
+                            {
+                                "file_path": "routes/b2bOrder.ts",
+                                "old_text": "unsafe()",
+                                "new_text": "safe()",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+    }
+    state["diff"] = ""
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "Removed notevil from package.json and synchronized package-lock.json." in follow_up
+    assert "Attempted a code workaround in routes/b2bOrder.ts." in follow_up
+    assert "Attempted a code workaround in package-lock.json, package.json" not in follow_up
+    assert "```diff\n--- a/routes/b2bOrder.ts" in follow_up
+    assert "--- a/package.json" in follow_up
+    assert "--- a/package-lock.json" in follow_up
+    assert '-    "notevil": "^1.3.3",' in follow_up

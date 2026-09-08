@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - optional runtime fallback
     SemanticVersion = None
 
 from remediation_engine.contracts.schemas import (
+    DependencyParentContext,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -91,13 +92,60 @@ def _sca_key(localized_issue: LocalizedIssue, fix_plan: FixPlan) -> str:
     component = _component_from_issue(issue)
     file_part = localized_issue.manifest_file or issue.file_path or ""
     strategy_part = _fix_strategy_bucket(fix_plan)
-    if localized_issue.parent_package_name:
-        parent_type = localized_issue.parent_declaration_type or "unknown"
-        return (
-            f"sca:{file_part}:{component}:parent={localized_issue.parent_package_name}"
-            f":type={parent_type}:{strategy_part}"
-        )
     return f"sca:{file_part}:{component}:{strategy_part}"
+
+
+def _parent_contexts(
+    localized_issues: list[LocalizedIssue],
+) -> list[DependencyParentContext]:
+    """Return stable, deduplicated parent context for grouped SCA evidence."""
+    contexts: dict[tuple[str, str, str], DependencyParentContext] = {}
+    for localized in localized_issues:
+        name = (localized.parent_package_name or "").strip()
+        if not name:
+            continue
+        context = DependencyParentContext(
+            package_name=name,
+            package_version=localized.parent_package_version
+            or localized.dependency_versions.get(name),
+            declaration_type=localized.parent_declaration_type,
+            manifest_file=localized.manifest_file,
+            manifest_line=localized.parent_manifest_line,
+            manifest_snippet=localized.parent_manifest_snippet,
+            dependency_ancestry=list(localized.dependency_ancestry),
+            dependency_versions=dict(localized.dependency_versions),
+        )
+        key = (
+            context.package_name,
+            context.declaration_type or "",
+            context.manifest_file or "",
+        )
+        existing = contexts.get(key)
+        if existing is None or (
+            (context.package_version and not existing.package_version)
+            or (context.manifest_line is not None and existing.manifest_line is None)
+            or (context.manifest_snippet and not existing.manifest_snippet)
+        ):
+            contexts[key] = context
+    return sorted(
+        contexts.values(),
+        key=lambda context: (
+            context.package_name,
+            context.declaration_type or "",
+            context.package_version or "",
+            context.manifest_file or "",
+        ),
+    )
+
+
+def _merged_dependency_versions(localized_issues: list[LocalizedIssue]) -> dict[str, str]:
+    """Merge resolved dependency versions without discarding populated evidence."""
+    versions: dict[str, str] = {}
+    for localized in localized_issues:
+        for package_name, version in localized.dependency_versions.items():
+            if package_name not in versions or not versions[package_name]:
+                versions[package_name] = version
+    return versions
 
 
 def _sast_key(issue: VulnerabilityIssue) -> str:
@@ -311,6 +359,31 @@ def _group_sca(
             else (localized_members[0].manifest_file or rep.file_path)
         )
         exemplar_localized = localized_members[0] if localized_members else None
+        parent_contexts = _parent_contexts(localized_members)
+        parent_localized = next(
+            (
+                localized
+                for context in parent_contexts
+                for localized in localized_members
+                if localized.parent_package_name == context.package_name
+                and (
+                    localized.parent_package_version
+                    or localized.dependency_versions.get(localized.parent_package_name)
+                    or ""
+                )
+                == (context.package_version or "")
+                and (localized.parent_declaration_type or "") == (context.declaration_type or "")
+                and (localized.manifest_file or "") == (context.manifest_file or "")
+            ),
+            None,
+        )
+        context_localized = parent_localized or exemplar_localized
+        context_parent_name = context_localized.parent_package_name if context_localized else None
+        context_parent_version = context_localized.parent_package_version or (
+            context_localized.dependency_versions.get(context_parent_name)
+            if context_localized and context_parent_name
+            else None
+        )
 
         groups[key] = VulnerabilityGroup(
             group_id=key,
@@ -322,20 +395,17 @@ def _group_sca(
             ghsa_ids=seen_ghsas,
             versions=seen_versions,
             dependency_ancestry=(
-                list(exemplar_localized.dependency_ancestry) if exemplar_localized else []
+                list(context_localized.dependency_ancestry) if context_localized else []
             ),
-            dependency_versions=(
-                dict(exemplar_localized.dependency_versions) if exemplar_localized else {}
-            ),
+            dependency_versions=_merged_dependency_versions(localized_members),
             parent_package_name=(
-                exemplar_localized.parent_package_name if exemplar_localized else None
+                context_localized.parent_package_name if context_localized else None
             ),
-            parent_package_version=(
-                exemplar_localized.parent_package_version if exemplar_localized else None
-            ),
+            parent_package_version=(context_parent_version),
             parent_declaration_type=(
-                exemplar_localized.parent_declaration_type if exemplar_localized else None
+                context_localized.parent_declaration_type if context_localized else None
             ),
+            parent_contexts=parent_contexts,
             sources=list(sources_set),
             representative_issue_id=rep.id,
             issues=member_issues,

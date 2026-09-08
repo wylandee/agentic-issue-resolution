@@ -1,5 +1,7 @@
 """Tests for environment-backed application settings."""
 
+import pytest
+
 from remediation_engine.settings import AppSettings
 
 
@@ -65,3 +67,22 @@ def test_report_llm_model_falls_back_to_legacy_remedy_model(monkeypatch):
     monkeypatch.delenv("REPORT_LLM_MODEL", raising=False)
 
     assert AppSettings.from_env().report_llm_model == "shared-remedy-model"
+
+
+def test_retriage_limit_is_disabled_by_default_and_toggleable(monkeypatch):
+    monkeypatch.delenv("REMEDY_RETRIAGE_LIMIT_ENABLED", raising=False)
+    monkeypatch.delenv("REMEDY_RETRIAGE_LIMIT", raising=False)
+    assert AppSettings.from_env().remedy_retriage_limit_enabled is False
+    assert AppSettings.from_env().remedy_retriage_limit == 3
+
+    monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT_ENABLED", "true")
+    monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT", "7")
+    assert AppSettings.from_env().remedy_retriage_limit_enabled is True
+    assert AppSettings.from_env().remedy_retriage_limit == 7
+
+
+def test_retriage_limit_rejects_invalid_values(monkeypatch):
+    monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT", "not-a-number")
+
+    with pytest.raises(ValueError, match="REMEDY_RETRIAGE_LIMIT must be an integer"):
+        AppSettings.from_env()

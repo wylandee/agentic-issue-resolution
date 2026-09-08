@@ -103,6 +103,7 @@ from remediation_engine.orchestration.qa_critic import (
     _SecurityScanResult,
     _summarize_failed_test_output,
     _validate_qa_path,
+    _workspace_remediation_fingerprint,
     build_qa_review_toolbelt,
     build_qa_toolbelt,
     build_targeted_test_command,
@@ -197,6 +198,53 @@ def test_final_full_scan_converts_docker_api_error_to_scan_failure() -> None:
     assert result["status"] == "final_scan_failed"
     assert result["final_full_scan_result"].status == "scan_failed"
     assert "409" in result["errors"][0]
+
+
+def test_final_full_scan_records_workspace_fingerprint_for_next_validation(tmp_path) -> None:
+    """Final scans retain the prior workspace fingerprint for no-op detection."""
+    group = _make_group()
+    state = {
+        "repo_root": str(tmp_path),
+        "workspace_volume": "agent_workspace_fingerprint",
+        "valid_groups": [group],
+        "changed_files": [],
+    }
+    scan = _SecurityScanResult(
+        ok=True,
+        summary="Dependency-Check found no remaining target vulnerability identifiers.",
+        remaining_identifiers=set(),
+        found_identifiers=set(),
+        new_identifiers=set(),
+    )
+
+    with (
+        patch("remediation_engine.orchestration.qa_critic.DockerSandbox"),
+        patch("remediation_engine.orchestration.qa_critic._run_security_scan", return_value=scan),
+    ):
+        first = run_final_full_scan_node(state)
+        second = run_final_full_scan_node({**state, **first})
+
+    assert first["previous_final_scan_workspace_fingerprint"] is None
+    assert first["final_scan_workspace_fingerprint"]
+    assert (
+        second["previous_final_scan_workspace_fingerprint"]
+        == first["final_scan_workspace_fingerprint"]
+    )
+    assert second["final_scan_workspace_fingerprint"] == first["final_scan_workspace_fingerprint"]
+
+
+def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
+    """The fingerprint reflects content changes, not only candidate file names."""
+    (tmp_path / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = '{"version":"1.0.0"}'
+
+    unchanged = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+
+    sandbox.read_file.return_value = '{"version":"2.0.0"}'
+    changed = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+
+    assert changed != unchanged
 
 
 # ---------------------------------------------------------------------------

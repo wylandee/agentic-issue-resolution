@@ -19,6 +19,7 @@ from .schemas import (
     CVEEnrichment,
     # Sub-models
     CWEEntry,
+    DependencyParentContext,
     EditRequest,
     EditResult,
     EditStatus,
@@ -116,6 +117,7 @@ __all__ = [
     "CommandResult",
     "VulnerabilityIssue",
     "LocalizedIssue",
+    "DependencyParentContext",
     "FixPlan",
     "EditRequest",
     "EditResult",

@@ -116,7 +116,7 @@ def _plan(
 
 
 class TestSCAGrouping:
-    def test_transitive_same_child_with_different_parents_stays_separate(self):
+    def test_transitive_same_child_with_different_parents_retains_all_contexts(self):
         issues = [
             _sca(cve_id="CVE-2026-1001"),
             _sca(cve_id="CVE-2026-1002"),
@@ -147,8 +147,44 @@ class TestSCAGrouping:
             ],
         )
 
-        assert len(groups) == 2
-        assert {group.parent_package_name for group in groups} == {"parent-a", "parent-b"}
+        assert len(groups) == 1
+        group = groups[0]
+        assert {context.package_name for context in group.parent_contexts} == {
+            "parent-a",
+            "parent-b",
+        }
+        assert {localized.parent_package_name for localized in group.localized_issues} == {
+            "parent-a",
+            "parent-b",
+        }
+
+    def test_generic_and_parent_aware_paths_share_one_remediation_group(self):
+        generic = _sca(cve_id="CVE-2026-1003")
+        parent_aware = _sca(cve_id="CVE-2026-1004")
+        groups = group_issues(
+            [generic, parent_aware],
+            sca_issue_plans=[
+                (
+                    _localized(generic, is_direct_dependency=False),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+                ),
+                (
+                    _localized(
+                        parent_aware,
+                        is_direct_dependency=False,
+                        parent_package_name="sanitize-html",
+                        parent_package_version="1.4.2",
+                        parent_declaration_type="dependencies",
+                    ),
+                    _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
+                ),
+            ],
+        )
+
+        assert len(groups) == 1
+        assert groups[0].parent_package_name == "sanitize-html"
+        assert groups[0].parent_package_version == "1.4.2"
+        assert len(groups[0].parent_contexts) == 1
 
     def test_same_package_multiple_cves_become_one_group(self):
         issues = [

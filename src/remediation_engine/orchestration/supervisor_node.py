@@ -2163,8 +2163,10 @@ def _plan_initial_transitive_task(
     ):
         return task
     child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
-    installed_parent_version = task.parent_package_version
-    parent_name, _, parent_type = group_parent_context(group)
+    parent_name, parent_version, parent_type = group_parent_context(group)
+    installed_parent_version = task.parent_package_version or parent_version
+    if installed_parent_version and task.parent_package_version != installed_parent_version:
+        task = task.model_copy(update={"parent_package_version": installed_parent_version})
     if not child_fixed_version or not installed_parent_version or not parent_name:
         stage = SCARemediationStage.PACKAGE_OVERRIDE
         target_type = _override_dependency_type(group)
@@ -3650,6 +3652,22 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
        unfixable marks, new constraints, and materialized spawn requests.
     10. Return state patch.
     """
+    if state.get("post_qa_retriage_limit_reached"):
+        decision = SupervisorDecision(
+            decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
+            next_node="teardown",
+            target_task_ids=[],
+            instructions="Development post-QA re-triage limit reached; proceed to teardown.",
+            decision_reason="The configured development post-QA re-triage limit was reached.",
+        )
+        return {
+            "status": "supervisor_routed",
+            "next_routing_step": "teardown",
+            "active_target_task_ids": [],
+            "decision_code": decision.decision_code,
+            "supervisor_audit": _emit_audit(decision, [], int(state.get("state_revision", 0)) + 1),
+            "supervisor_instructions": decision.instructions,
+        }
     valid_groups: list[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
         if state.get("triage_required") and state.get("status") in {
@@ -5758,6 +5776,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 
 def supervisor_router(state: OrchestratorState) -> str:
     """Return the committed route, recomputing it when state is invalid."""
+    if state.get("post_qa_retriage_limit_reached"):
+        logger.warning("supervisor_router: post-QA re-triage limit reached; routing to teardown.")
+        return "teardown"
     step = state.get("next_routing_step", "")
     task_queue = dict(state.get("task_queue", {}) or {})
     if (

@@ -26,6 +26,7 @@ tools to the update or workaround subagents; they live here only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -2485,6 +2486,54 @@ def _generate_workspace_diff(
         )
 
     return full_diff, changed_files
+
+
+def _workspace_remediation_fingerprint(
+    host_repo_root: str | None,
+    sandbox: DockerSandbox,
+    candidate_changed_files: Sequence[str],
+) -> str:
+    """Return a stable digest of the material workspace change.
+
+    Args:
+        host_repo_root: Repository baseline used for the workspace comparison.
+        sandbox: Active remediation workspace volume.
+        candidate_changed_files: Files reported as candidates by workers.
+
+    Returns:
+        A deterministic SHA-256 digest of the actual changed files and their
+        current unified diff. An empty or unchanged workspace therefore keeps
+        the same digest across final scans.
+
+    Side Effects:
+        Reads the candidate files from the sandbox and the host repository.
+        The helper does not modify either workspace.
+    """
+    candidates = [path for path in candidate_changed_files if isinstance(path, str)]
+    changed_files: list[str]
+    diff_text: str
+    if host_repo_root:
+        try:
+            diff_text, changed_files = _generate_workspace_diff(
+                host_repo_root,
+                sandbox,
+                candidates,
+            )
+        except Exception as exc:  # noqa: BLE001 - fingerprinting must not abort the scan
+            logger.warning("qa_critic: workspace fingerprint failed: %s", exc)
+            diff_text = ""
+            changed_files = sorted(set(candidates))
+    else:
+        diff_text = ""
+        changed_files = sorted(set(candidates))
+
+    payload = {
+        "changed_files": sorted(set(changed_files)),
+        "diff": diff_text,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -6218,6 +6267,7 @@ def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
     groups: list[VulnerabilityGroup] = list(state.get("valid_groups") or [])
     baseline = _collect_baseline_identifiers(state, groups)
     target_identifiers = _collect_target_identifiers(groups)
+    previous_workspace_fingerprint = state.get("final_scan_workspace_fingerprint")
     if not workspace_volume:
         error = "final_full_scan: workspace_volume is missing."
         result = FinalFullScanResult(
@@ -6245,6 +6295,11 @@ def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
                 workspace_volume,
                 target_identifiers,
                 baseline,
+            )
+            workspace_fingerprint = _workspace_remediation_fingerprint(
+                str(state.get("repo_root")) if state.get("repo_root") else None,
+                sandbox,
+                list(state.get("changed_files") or []),
             )
     except Exception as exc:  # noqa: BLE001 - scan failures must reach teardown/report
         error = f"final_full_scan: Docker sandbox unavailable - {exc}"
@@ -6301,6 +6356,8 @@ def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
     return {
         "final_full_scan_result": result,
         "final_full_scan_completed": True,
+        "previous_final_scan_workspace_fingerprint": previous_workspace_fingerprint,
+        "final_scan_workspace_fingerprint": workspace_fingerprint,
         "baseline_scan_identifiers": sorted(baseline),
         "post_remediation_scan_identifiers": found,
         "post_remediation_scan_issues": list(scan.found_issues),

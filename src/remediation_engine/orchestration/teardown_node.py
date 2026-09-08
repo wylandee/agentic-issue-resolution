@@ -34,6 +34,13 @@ _WORKSPACE_VOLUME_CLEANUP_ATTEMPTS = 3
 _WORKSPACE_VOLUME_CLEANUP_RETRY_SECONDS = 0.25
 
 
+def _attempt_value(item: Any, key: str, default: Any = None) -> Any:
+    """Read a worker-attempt field from either a model or a mapping."""
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
 def _close_client(client) -> None:
     """Compatibility wrapper for the shared Docker client boundary."""
     close_docker_client(client)
@@ -350,12 +357,35 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
             errors.append(f"teardown_node: blocked changed-file path '{raw_path}' - {exc}")
             continue
         normalized_changed_files.add(safe_path)
-    candidate_changed_files = sorted(normalized_changed_files)
     client = None
     volume_removed = not bool(workspace_volume)
 
     task_queue = state.get("task_queue", {})
     valid_groups = state.get("valid_groups", [])
+    worker_results_by_attempt = state.get("worker_results_by_attempt", {}) or {}
+    # ``changed_files`` is an accumulated candidate projection, while worker
+    # envelopes are the authoritative per-attempt record of what an accepted
+    # worker actually touched. Include both before reading the final volume;
+    # otherwise manifest-only update attempts can disappear at teardown when
+    # the bridge did not emit a separate changed-file projection.
+    for attempt_res in worker_results_by_attempt.values():
+        for raw_path in _attempt_value(attempt_res, "changed_files", []) or []:
+            if not isinstance(raw_path, str):
+                errors.append(
+                    "teardown_node: blocked worker changed-file path "
+                    f"{raw_path!r} - path must be a string"
+                )
+                continue
+            try:
+                normalized_changed_files.add(
+                    normalize_workspace_path(raw_path, allow_workspace_prefix=False)
+                )
+            except WorkspacePathError as exc:
+                errors.append(
+                    f"teardown_node: blocked worker changed-file path '{raw_path}' - {exc}"
+                )
+    candidate_changed_files = sorted(normalized_changed_files)
+
     # A group can have a pivoted parent and one or more child tasks. Resolve
     # status through task lineage so a failed child cannot be masked by a
     # historical QA-passed parent.
@@ -395,13 +425,13 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
             if getattr(g, "vulnerable_component", None):
                 unfixable_packages.add(g.vulnerable_component)
 
-    worker_results_by_attempt = state.get("worker_results_by_attempt", {})
     for attempt_res in worker_results_by_attempt.values():
-        task = task_queue.get(attempt_res.task_id)
-        if task is not None and attempt_res.changed_files:
+        task = task_queue.get(_attempt_value(attempt_res, "task_id"))
+        attempt_changed_files = _attempt_value(attempt_res, "changed_files", []) or []
+        if task is not None and attempt_changed_files:
             group_status = effective_group_status(task_queue, task.parent_group_id)
             if group_status in {TaskStatus.QA_PASSED.value, TaskStatus.MITIGATED.value}:
-                passed_files.update(attempt_res.changed_files)
+                passed_files.update(attempt_changed_files)
             elif group_status in {
                 TaskStatus.UNFIXABLE.value,
                 TaskStatus.INCONCLUSIVE.value,
@@ -410,7 +440,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                 TaskStatus.OPTIMISTICALLY_FIXED.value,
                 TaskStatus.PIVOTED.value,
             }:
-                unfixable_files.update(attempt_res.changed_files)
+                unfixable_files.update(attempt_changed_files)
                 target_package = getattr(task, "target_package_name", None)
                 if target_package:
                     unfixable_packages.add(target_package)

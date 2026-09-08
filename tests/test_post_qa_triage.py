@@ -5,6 +5,8 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from remediation_engine.contracts.schemas import (
+    DependencyParentContext,
+    FinalFullScanResult,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -26,9 +28,11 @@ from remediation_engine.orchestration.graph import (
 from remediation_engine.orchestration.state import initial_orchestrator_state
 from remediation_engine.orchestration.supervisor_node import (
     _deterministic_routing,
+    run_supervisor_node,
     supervisor_router,
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.settings import AppSettings
 
 
 def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityIssue:
@@ -153,6 +157,306 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     assert result["active_target_task_ids"] == []
 
 
+def test_post_triage_development_limit_uses_configured_pass_count():
+    issue = _issue("CVE-2026-0006")
+    group = _group("sca:package.json:limited:UPDATE_VERSION", issue)
+    state = initial_orchestrator_state(
+        "repo",
+        [group],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "triage_required": True,
+            "new_vulnerability_status": "unresolved",
+            "post_remediation_scan_issues": [issue],
+            "post_qa_retriage_count": 5,
+        }
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.graph.get_runtime_settings",
+            return_value=AppSettings(
+                remedy_retriage_limit_enabled=True,
+                remedy_retriage_limit=5,
+            ),
+        ),
+        patch("remediation_engine.orchestration.graph.run_triage_pipeline") as pipeline,
+    ):
+        result = post_qa_triage_node(state)
+
+    pipeline.assert_not_called()
+    assert result["status"] == "retriage_limit_reached"
+    assert result["triage_required"] is False
+    assert result["post_qa_retriage_count"] == 5
+    assert result["post_qa_retriage_limit_reached"] is True
+    assert "limit reached" in result["errors"][0]
+
+
+def test_post_triage_limit_is_unbounded_when_disabled():
+    issue = _issue("CVE-2026-0007")
+    group = _group("sca:package.json:unlimited:UPDATE_VERSION", issue)
+    state = initial_orchestrator_state(
+        "repo",
+        [group],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "triage_required": True,
+            "new_vulnerability_status": "unresolved",
+            "post_remediation_scan_issues": [issue],
+            "post_qa_retriage_count": 3,
+        }
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.graph.get_runtime_settings",
+            return_value=AppSettings(),
+        ),
+        patch(
+            "remediation_engine.orchestration.graph.run_triage_pipeline",
+            return_value=[(group.model_copy(), _triage_result(group))],
+        ) as pipeline,
+    ):
+        result = post_qa_triage_node(state)
+
+    pipeline.assert_called_once()
+    assert result["post_qa_retriage_count"] == 4
+    assert result.get("post_qa_retriage_limit_reached") is not True
+
+
+def test_post_triage_does_not_reopen_repeated_final_scan_without_material_change():
+    issue = _issue("CVE-2026-0010")
+    group = _group("sca:package.json:unchanged:UPDATE_VERSION", issue)
+    task = build_initial_remediation_task(group, "task-unchanged").model_copy(
+        update={
+            "task_revision": 4,
+            "retry_count": 2,
+            "status": TaskStatus.QA_PASSED,
+        }
+    )
+    final_scan = FinalFullScanResult(
+        remaining_target_identifiers=[issue.cve_id],
+        status="unresolved",
+        triage_required=True,
+    )
+    state = initial_orchestrator_state(
+        "repo",
+        [group],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {task.task_id: task},
+            "qa_evaluations": {group.group_id: QAEvaluation(task_id=group.group_id, passed=True)},
+            "triage_required": True,
+            "new_vulnerability_status": "unresolved",
+            "post_remediation_scan_issues": [issue],
+            "final_full_scan_result": final_scan,
+            "final_full_scan_completed": True,
+            "final_scan_workspace_fingerprint": "same-workspace",
+            "previous_final_scan_workspace_fingerprint": "same-workspace",
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[(group.model_copy(), _triage_result(group))],
+    ):
+        result = post_qa_triage_node(state)
+
+    unchanged = result["task_queue"][task.task_id]
+    assert unchanged is task
+    assert unchanged.status == TaskStatus.QA_PASSED
+    assert unchanged.task_revision == 4
+    assert unchanged.retry_count == 2
+    assert result["final_full_scan_completed"] is True
+    assert result["final_full_scan_result"] is final_scan
+    assert result["triage_required"] is False
+    assert result["triage_reconciliation"]["final_scan_reopened_group_ids"] == [group.group_id]
+    assert result["triage_reconciliation"][
+        "final_scan_reopen_skipped_no_material_change_group_ids"
+    ] == [group.group_id]
+
+
+def test_post_triage_ignores_historical_accepted_attempt_after_noop_retry():
+    """An old accepted attempt cannot reopen a group after a later no-op."""
+    issue = _issue("CVE-2026-0012")
+    group = _group("sca:package.json:historical:UPDATE_VERSION", issue)
+    task = build_initial_remediation_task(group, "task-historical").model_copy(
+        update={
+            "task_revision": 4,
+            "retry_count": 1,
+            "status": TaskStatus.QA_PASSED,
+        }
+    )
+    final_scan = FinalFullScanResult(
+        remaining_target_identifiers=[issue.cve_id],
+        status="unresolved",
+        triage_required=True,
+    )
+    state = initial_orchestrator_state(
+        "repo",
+        [group],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {task.task_id: task},
+            "qa_evaluations": {
+                task.task_id: QAEvaluation(task_id=task.task_id, passed=True),
+            },
+            "worker_results_by_attempt": {
+                "attempt-old": {
+                    "attempt_id": "attempt-old",
+                    "task_id": task.task_id,
+                    "task_revision": 1,
+                    "status": "success",
+                    "changed_files": ["package.json"],
+                },
+                "attempt-noop": {
+                    "attempt_id": "attempt-noop",
+                    "task_id": task.task_id,
+                    "task_revision": 3,
+                    "status": "surrender",
+                    "changed_files": [],
+                },
+            },
+            "triage_required": True,
+            "new_vulnerability_status": "unresolved",
+            "post_remediation_scan_issues": [issue],
+            "final_full_scan_result": final_scan,
+            "final_full_scan_completed": True,
+            "final_scan_workspace_fingerprint": "workspace-after-noop",
+            "previous_final_scan_workspace_fingerprint": "workspace-after-old-fix",
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[(group.model_copy(), _triage_result(group))],
+    ):
+        result = post_qa_triage_node(state)
+
+    assert result["task_queue"][task.task_id] is task
+    assert result["task_queue"][task.task_id].status == TaskStatus.QA_PASSED
+    assert result["triage_reconciliation"][
+        "final_scan_reopen_skipped_no_material_change_group_ids"
+    ] == [group.group_id]
+
+
+def test_post_triage_reopens_final_scan_group_after_material_change():
+    issue = _issue("CVE-2026-0011")
+    group = _group("sca:package.json:changed:UPDATE_VERSION", issue)
+    task = build_initial_remediation_task(group, "task-changed").model_copy(
+        update={
+            "task_revision": 4,
+            "retry_count": 2,
+            "status": TaskStatus.QA_PASSED,
+        }
+    )
+    final_scan = FinalFullScanResult(
+        remaining_target_identifiers=[issue.cve_id],
+        status="unresolved",
+        triage_required=True,
+    )
+    state = initial_orchestrator_state(
+        "repo",
+        [group],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {task.task_id: task},
+            "triage_required": True,
+            "new_vulnerability_status": "unresolved",
+            "post_remediation_scan_issues": [issue],
+            "final_full_scan_result": final_scan,
+            "final_full_scan_completed": True,
+            "final_scan_workspace_fingerprint": "changed-workspace",
+            "previous_final_scan_workspace_fingerprint": "prior-workspace",
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[(group.model_copy(), _triage_result(group))],
+    ):
+        result = post_qa_triage_node(state)
+
+    reopened = result["task_queue"][task.task_id]
+    assert reopened.status == TaskStatus.PENDING
+    assert reopened.task_revision == 5
+    assert reopened.retry_count == 0
+    assert reopened.current_attempt_id is None
+    assert result["final_full_scan_completed"] is False
+    assert result["final_full_scan_result"] is None
+    assert (
+        "final_scan_reopen_skipped_no_material_change_group_ids"
+        not in result["triage_reconciliation"]
+    )
+
+
+def test_post_triage_reopens_group_when_parent_context_becomes_available():
+    """Parent evidence changes group content without changing its canonical ID."""
+    issue = _issue("CVE-2026-0005")
+    previous = _group("sca:package.json:lodash:UPDATE_VERSION", issue)
+    candidate = previous.model_copy(
+        update={
+            "dependency_ancestry": ["sanitize-html", "lodash"],
+            "dependency_versions": {"sanitize-html": "1.4.2", "lodash": "2.4.2"},
+            "parent_package_name": "sanitize-html",
+            "parent_package_version": "1.4.2",
+            "parent_declaration_type": "dependencies",
+            "parent_contexts": [
+                DependencyParentContext(
+                    package_name="sanitize-html",
+                    package_version="1.4.2",
+                    declaration_type="dependencies",
+                    manifest_file="package.json",
+                    dependency_ancestry=["sanitize-html", "lodash"],
+                    dependency_versions={"sanitize-html": "1.4.2", "lodash": "2.4.2"},
+                )
+            ],
+        }
+    )
+    task = build_initial_remediation_task(previous, "task-lodash")
+    state = initial_orchestrator_state(
+        "repo",
+        [previous],
+        issues=[issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {"task-lodash": task},
+            "triage_required": True,
+            "new_vulnerability_status": "detected",
+            "post_remediation_scan_issues": [issue],
+            "active_target_task_ids": ["task-lodash"],
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[(candidate, _triage_result(candidate))],
+    ):
+        result = post_qa_triage_node(state)
+
+    assert result["triage_reconciliation"]["changed_group_ids"] == [previous.group_id]
+    assert result["valid_groups"] == [candidate]
+    assert result["task_queue"]["task-lodash"].status == TaskStatus.PENDING
+    assert result["task_queue"]["task-lodash"].task_revision == 1
+
+
 def test_post_triage_uses_post_scan_odc_issues_and_retains_non_odc_baseline():
     sast_issue = VulnerabilityIssue(
         source=IssueSource.SEMGREP,
@@ -211,6 +515,20 @@ def test_supervisor_routes_parseable_qa_results_to_triage_before_teardown():
 
     assert decision.next_node == "triage"
     assert supervisor_router({"next_routing_step": "triage"}) == "triage"
+
+
+def test_supervisor_routes_to_teardown_after_retriage_limit():
+    state = {
+        "post_qa_retriage_limit_reached": True,
+        "next_routing_step": "triage",
+        "triage_required": True,
+        "state_revision": 4,
+    }
+
+    result = run_supervisor_node(state)
+
+    assert result["next_routing_step"] == "teardown"
+    assert supervisor_router({**state, **result}) == "teardown"
 
 
 def test_graph_contains_separate_initial_and_post_qa_triage_nodes():

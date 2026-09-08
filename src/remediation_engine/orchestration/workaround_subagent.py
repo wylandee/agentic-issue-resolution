@@ -4,11 +4,11 @@ Sequential Workaround Subagent for Phase 5 code-security rewrites.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import logging
 import re
 import shlex
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +95,73 @@ def _clean_prompt_log(value: str, max_chars: int = 1600) -> str:
     if len(cleaned) > max_chars:
         return cleaned[:max_chars].rstrip() + "\n... (truncated)"
     return cleaned
+
+
+def _restore_attempt_file(
+    sandbox: DockerSandbox,
+    file_path: str,
+    plan_state: Mapping[str, Any],
+    *,
+    stage_snapshots: Mapping[str, str] | None = None,
+    stage_absent_paths: Sequence[str] = (),
+    allow_stage_baseline: bool = False,
+) -> None:
+    """Restore one file from the current attempt's recorded pre-edit state.
+
+    The sandbox exposes read, write, and command operations but no generic
+    ``revert_file`` method. Restore from the attempt snapshot first so a
+    failed retry cannot erase another group's accepted edit. The stage
+    baseline is used only for an explicit stage reset or when it is the only
+    compatible anchor available.
+
+    Args:
+        sandbox: Active Docker workspace sandbox.
+        file_path: Workspace-relative file path to restore.
+        plan_state: Workaround execution state containing snapshots.
+        stage_snapshots: Optional pre-stage file contents for compatibility.
+        stage_absent_paths: Optional paths that did not exist at stage start.
+        allow_stage_baseline: Whether the stage baseline may be used.
+
+    Raises:
+        RuntimeError: If no safe pre-edit snapshot is available.
+    """
+    normalized = str(file_path).replace("\\", "/").lstrip("/")
+    attempt_snapshots = plan_state.get("attempt_file_snapshots", {}) or {}
+    if isinstance(attempt_snapshots, Mapping):
+        snapshot = attempt_snapshots.get(normalized)
+        if isinstance(snapshot, str):
+            sandbox.write_file(normalized, snapshot)
+            return
+
+    attempt_absent_paths = {
+        str(path).replace("\\", "/").lstrip("/")
+        for path in plan_state.get("attempt_absent_paths", []) or []
+    }
+    if normalized in attempt_absent_paths:
+        result = sandbox.run(f"rm -f -- {shlex.quote(normalized)}")
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"could not remove newly created file '{normalized}' "
+                f"(exit {result.exit_code}): {result.stderr}"
+            )
+        return
+
+    if allow_stage_baseline:
+        if isinstance(stage_snapshots, Mapping):
+            snapshot = stage_snapshots.get(normalized)
+            if isinstance(snapshot, str):
+                sandbox.write_file(normalized, snapshot)
+                return
+        if normalized in {str(path).replace("\\", "/").lstrip("/") for path in stage_absent_paths}:
+            result = sandbox.run(f"rm -f -- {shlex.quote(normalized)}")
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"could not remove absent stage-baseline file '{normalized}' "
+                    f"(exit {result.exit_code}): {result.stderr}"
+                )
+            return
+
+    raise RuntimeError(f"no pre-edit snapshot recorded for '{normalized}'")
 
 
 def _qa_failure_log_snippet(
@@ -1292,29 +1359,44 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
 
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            # 1. Restore pre-attempt snapshots if replay plan present
-            for rel_p in pre_attempt_absent_paths:
-                try:
-                    sandbox.run(f"rm -f -- {shlex.quote(rel_p)}")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Workaround subagent: failed to remove absent-baseline path %s: %s",
-                        rel_p,
-                        exc,
-                    )
-            if pre_attempt_snapshots:
-                for rel_p, orig_content in pre_attempt_snapshots.items():
+            # A replay plan's stage baseline is task-local. Restoring the
+            # whole file from that baseline on every retry can erase a
+            # different vulnerability group's already-validated edit when
+            # both groups share a source file. Stage resets are explicit; an
+            # ordinary retry rebases on the live cumulative workspace.
+            reset_prior_stage_workspace = bool(
+                reset_context is not None
+                and getattr(reset_context, "reset_prior_stage_workspace", False)
+            )
+            if reset_prior_stage_workspace:
+                for rel_p in pre_attempt_absent_paths:
                     try:
-                        sandbox.write_file(rel_p, orig_content)
+                        sandbox.run(f"rm -f -- {shlex.quote(rel_p)}")
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
-                            "Workaround subagent: failed to restore snapshot for %s: %s", rel_p, exc
+                            "Workaround subagent: failed to remove absent-baseline path %s: %s",
+                            rel_p,
+                            exc,
                         )
+                if pre_attempt_snapshots:
+                    for rel_p, orig_content in pre_attempt_snapshots.items():
+                        try:
+                            sandbox.write_file(rel_p, orig_content)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Workaround subagent: failed to restore snapshot for %s: %s",
+                                rel_p,
+                                exc,
+                            )
 
-            # 2. Replay prior successful edit sets atomically
+            # Replay prior successful edit sets on the live workspace. A
+            # retry may already contain an accepted replacement, so treating
+            # the replacement as idempotent avoids duplicate edits and a
+            # destructive restore to an old task-local baseline.
             replay_failed = False
             replay_error_msg = ""
             for edit_set in replayed_edit_sets:
+                replacements_to_apply: list[Any] = []
                 # Pre-verify all replacements in edit_set
                 for redit in edit_set.replacements:
                     try:
@@ -1332,11 +1414,18 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                             and redit.expected_occurrences > 0
                             else 1
                         )
-                        if count != expected:
+                        new_count = curr_norm.count(_normalise_newlines(redit.new_text))
+                        if count == expected:
+                            replacements_to_apply.append(redit)
+                        elif count == 0 and new_count >= expected:
+                            # The replacement is already present in the
+                            # cumulative workspace.
+                            touched_files.add(redit.file_path)
+                        else:
                             replay_failed = True
                             replay_error_msg = (
                                 f"Replay failed: Occurrence count mismatch for anchor in '{redit.file_path}' "
-                                f"during patch '{edit_set.patch_id}' (expected {expected}, found {count}). Aborting replay."
+                                f"during patch '{edit_set.patch_id}' (expected {expected}, found {count})."
                             )
                             break
                     except Exception as exc:  # noqa: BLE001
@@ -1348,7 +1437,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     break
 
                 # Apply edit set replacements
-                for redit in edit_set.replacements:
+                for redit in replacements_to_apply:
                     curr = sandbox.read_file(redit.file_path)
                     newline_style = _detect_newline_style(curr)
                     curr_norm = _normalise_newlines(curr)
@@ -1479,12 +1568,21 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     "Workaround subagent modified prohibited files %s. Reverting.",
                     prohibited_modified,
                 )
+                restored_prohibited: set[str] = set()
                 for f in prohibited_modified:
                     try:
-                        sandbox.revert_file(f)
+                        _restore_attempt_file(
+                            sandbox,
+                            f,
+                            plan_state,
+                            stage_snapshots=pre_attempt_snapshots,
+                            stage_absent_paths=pre_attempt_absent_paths,
+                            allow_stage_baseline=reset_prior_stage_workspace,
+                        )
+                        restored_prohibited.add(f)
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Failed to revert %s: %s", f, exc)
-                touched_files -= prohibited_modified
+                touched_files -= restored_prohibited
                 runtime = dataclasses.replace(runtime, changed_files=sorted(touched_files))
 
             validation_gate_passed = has_successful_validation_gate(
@@ -1569,14 +1667,21 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     for edit in edit_set.replacements
                 }
                 current_attempt_files = set(runtime.changed_files) - replayed_files
+                restored_files: set[str] = set()
                 for f in current_attempt_files:
-                    if f in pre_attempt_snapshots:
-                        with contextlib.suppress(Exception):
-                            sandbox.write_file(f, pre_attempt_snapshots[f])
-                    else:
-                        with contextlib.suppress(Exception):
-                            sandbox.revert_file(f)
-                touched_files -= current_attempt_files
+                    try:
+                        _restore_attempt_file(
+                            sandbox,
+                            f,
+                            plan_state,
+                            stage_snapshots=pre_attempt_snapshots,
+                            stage_absent_paths=pre_attempt_absent_paths,
+                            allow_stage_baseline=reset_prior_stage_workspace,
+                        )
+                        restored_files.add(f)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Failed to restore failed-attempt file %s: %s", f, exc)
+                touched_files -= restored_files
                 runtime = dataclasses.replace(
                     runtime, changed_files=sorted(replayed_files & set(touched_files))
                 )

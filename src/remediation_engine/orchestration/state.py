@@ -429,7 +429,11 @@ class OrchestratorState(TypedDict, total=False):
     new_vulnerability_status: str
     final_full_scan_result: FinalFullScanResult | None
     final_full_scan_completed: bool
+    final_scan_workspace_fingerprint: str | None
+    previous_final_scan_workspace_fingerprint: str | None
     triage_required: bool
+    post_qa_retriage_count: int
+    post_qa_retriage_limit_reached: bool
     initial_triage_status: str
     initial_triage_executed: bool
     triage_reconciliation: dict[str, list[str]]
@@ -534,7 +538,11 @@ def initial_orchestrator_state(
         "new_vulnerability_status": "not_scanned",
         "final_full_scan_result": None,
         "final_full_scan_completed": False,
+        "final_scan_workspace_fingerprint": None,
+        "previous_final_scan_workspace_fingerprint": None,
         "triage_required": False,
+        "post_qa_retriage_count": 0,
+        "post_qa_retriage_limit_reached": False,
         "initial_triage_status": "pending",
         "initial_triage_executed": False,
         "triage_reconciliation": {},
