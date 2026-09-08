@@ -4,9 +4,9 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "clean_initial_pass_web_assisted",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §194, spans 199, 202, 205, 208, 210, 212, 214, and successful validation span 247. The clean golden preserves the observed local-inspection then web-evidence branch.",
-    "evaluation_note": "Web evidence is optional in general, but when used it must follow local inspection. Expected tool arguments use the current remedy_tools schemas.",
-    "supervisor_instruction": "Implement a code workaround for express-jwt in lib/insecurity.ts that configures an explicit algorithm allowlist for JWT verification.",
-    "completion_task": "Investigate the express-jwt call site, record an evidence-backed plan, apply the minimal source edit, and pass runtime-smoke and targeted-test validation on the first attempt.",
+    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.",
+    "supervisor_instruction": "Migrate the legacy express-jwt default import to the named expressjwt export and configure the middleware with an explicit RS256 algorithm allowlist in lib/insecurity.ts.",
+    "completion_task": "Inspect the express-jwt import and authorization call, record an evidence-backed plan with both source replacements, apply the atomic edit, and follow the committed validation path.",
     "target_package_name": "express-jwt",
     "attempt_id": "attempt-workaround-normal-001",
     "task_revision": 1,
@@ -20,10 +20,10 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "expressJwt",
+          "search_pattern": "express-jwt|expressJwt|expressjwt",
           "target_directory": "lib"
         },
-        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+        "output": "SUCCESS: Found the legacy express-jwt import and authorization call in lib/insecurity.ts."
       },
       {
         "name": "read_workspace_file",
@@ -57,17 +57,23 @@
           "affected_symbols": [
             "isAuthorized"
           ],
-          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
-          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist, allowing algorithm confusion at the authorization boundary.",
+          "security_invariant": "JWT authorization uses the express-jwt named export and accepts only the approved RS256 algorithm.",
+          "causal_hypothesis": "The installed express-jwt API uses the named expressjwt export and requires an explicit algorithm allowlist; the legacy default import and unconstrained middleware call must be migrated.",
           "planned_replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ],
-          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "evidence_source": "workspace:lib/insecurity.ts; package:express-jwt",
           "package_removal_requested": false
         },
         "output": "SUCCESS: Workaround plan recorded successfully."
@@ -78,8 +84,14 @@
           "replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ]
@@ -99,8 +111,8 @@
         "output": "SUCCESS: Workaround validation gate passed."
       }
     ],
-    "final_output": "APPLIED: express-jwt workaround was applied and runtime-smoke plus targeted-test validation passed on the first attempt.",
-    "expected_output": "The worker completes the express-jwt workaround with one evidence-backed source edit and reports validation PASS without claiming unrelated changes.",
+    "final_output": "APPLIED: the legacy express-jwt import was migrated to the named expressjwt export, the middleware was restricted to RS256, and first-attempt validation passed.",
+    "expected_output": "The worker applies the two express-jwt source replacements—named import migration and algorithms: ['RS256']—then reports validation PASS without unrelated changes.",
     "changed_files": [
       "lib/insecurity.ts"
     ],
@@ -410,15 +422,15 @@
   {
     "case_id": "workaround-no-fix-pivot",
     "eval_type": "workaround_subagent",
-    "golden_kind": "no_fix_package_removal_exhausted_then_code_workaround",
-    "provenance": "Historical trajectory phase5_20260819T065848Z_f450504b-6248-4305-8b06-340a73171c96, no-fix package-removal run §59 followed by code-only run §174. The pivot is represented as committed Supervisor context for the child workaround attempt.",
-    "evaluation_note": "This is distinct from the ordinary code pivot: the input states that package removal was attempted and is no longer permitted. The worker must execute the new source-only strategy.",
-    "supervisor_instruction": "The NO_FIX package-removal attempt for swig is exhausted. Pivot to a source-only code workaround in server.js; do not edit package manifests or select another package version.",
-    "completion_task": "Follow the no-fix-to-code pivot, investigate the source-only mitigation, apply the committed edit, and pass validation without touching package manifests.",
-    "target_package_name": "swig",
-    "attempt_id": "attempt-workaround-nofix-pivot-005",
-    "task_revision": 2,
-    "parent_attempt_id": "attempt-swig-nofix-removal-001",
+    "golden_kind": "historical_notevil_no_fix_pivot_with_validation_recovery",
+    "provenance": "Historical trajectory phase5_20260819T052618Z_bc2db34f-0eca-4492-ba6e-4dd2bd4293a8, task-4 initial no_fix_package_removal attempt 88ee0e54-9807-5c50-96a8-017815a12aee (revision 1) pivoted to no_fix_code_removal attempt fd151bb4-674d-597d-945c-c5e16d027308 (revision 4). The source-only worker chain is documented in spans 190-258, including tool spans 202, 205, 207, 210, 217, 219, 222, 224, 230, 232, 234, and 258. The exporter recorded empty inputs/outputs for §222 record_plan, so its plan arguments are reconstructed from the exact edit set in §224.",
+    "evaluation_note": "This replaces the synthetic swig example with the real notevil pivot. The historical trace keeps notevil installed and removes its vulnerable VM execution path from routes/b2bOrder.ts. It also preserves the observed guard and recovery errors: premature web search, compiled-file inspection, compiled test input, phase violation, and wrong test hint. The §222 record_plan payload was not captured by the exporter; this golden reconstructs it from the observed exact §224 edit set and marks the observed erroneous calls separately from the expected correct trace.",
+    "supervisor_instruction": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests.",
+    "completion_task": "Execute the committed source-only notevil pivot, recover from validation-input and phase errors, remove the vulnerable route path, and finish with validation PASS.",
+    "target_package_name": "notevil",
+    "attempt_id": "fd151bb4-674d-597d-945c-c5e16d027308",
+    "task_revision": 4,
+    "parent_attempt_id": "88ee0e54-9807-5c50-96a8-017815a12aee",
     "is_retry": true,
     "tool_calls": [
       {
@@ -427,90 +439,277 @@
         "output": "SUCCESS: Repository structure loaded."
       },
       {
+        "name": "search_web",
+        "args": {
+          "query": "notevil CVE-2021-23771 GHSA-8G4M-CJM2-96WQ No upstream patch or workaround was found installed package source vulnerable API call path"
+        },
+        "output": "ERROR: [INVESTIGATION_REQUIRED] Local codebase investigation must complete using search_codebase_pattern, read_workspace_file, or inspect_ast_symbol before calling search_web."
+      },
+      {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "swig.render|template",
+          "search_pattern": "notevil|CVE-2021-23771|GHSA-8G4M-CJM2-96WQ",
           "target_directory": "."
         },
-        "output": "SUCCESS: Found the swig consumer in server.js."
+        "output": "SUCCESS: Found routes/b2bOrder.ts importing notevil."
       },
       {
         "name": "read_workspace_file",
         "args": {
-          "file_path": "server.js",
-          "start_line": 220,
-          "end_line": 270
+          "end_line": 220,
+          "file_path": "routes/b2bOrder.ts",
+          "start_line": 1
         },
-        "output": "SUCCESS: Read the source-only workaround target."
+        "output": "SUCCESS: Read routes/b2bOrder.ts and confirmed the notevil VM execution path."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "end_line": 120,
+          "file_path": "build/routes/b2bOrder.js",
+          "start_line": 1
+        },
+        "output": "ERROR: Accessing compiled files in 'build/' is strictly forbidden. Please modify the original source files instead."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "b2bOrder\\s*\\(",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found routes/b2bOrder.ts:16:export function b2bOrder ()."
       },
       {
         "name": "record_plan",
         "args": {
           "affected_files": [
-            "server.js"
+            "routes/b2bOrder.ts"
           ],
           "affected_symbols": [
-            "renderTemplate"
+            "b2bOrder"
           ],
-          "security_invariant": "Template rendering must not evaluate untrusted template expressions.",
-          "causal_hypothesis": "The vulnerable swig consumer evaluates attacker-controlled template expressions and package removal is unavailable in this pivot.",
+          "security_invariant": "The vulnerable notevil execution path must be removed while preserving normal B2B order behavior.",
+          "causal_hypothesis": "notevil is directly imported and used by b2bOrder; remove the VM-based evaluation path while keeping normal order responses.",
           "planned_replacements": [
             {
-              "file_path": "server.js",
-              "old_text": "swig.render(template, context)",
-              "new_text": "safeRenderTemplate(template, context)",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import { type Request, type Response, type NextFunction } from 'express'\n",
+              "old_text": "import vm from 'node:vm'\nimport { type Request, type Response, type NextFunction } from 'express'\n// @ts-expect-error FIXME due to non-existing type definitions for notevil\nimport { eval as safeEval } from 'notevil'\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "    res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n",
+              "old_text": "    if (utils.isChallengeEnabled(challenges.rceChallenge) || utils.isChallengeEnabled(challenges.rceOccupyChallenge)) {\n      const orderLinesData = body.orderLinesData || ''\n      try {\n        const sandbox = { safeEval, orderLinesData }\n        vm.createContext(sandbox)\n        vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })\n        res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n      } catch (err) {\n        if (utils.getErrorMessage(err).match(/Script execution timed out.*/) != null) {\n          challengeUtils.solveIf(challenges.rceOccupyChallenge, () => { return true })\n          res.status(503)\n          next(new Error('Sorry, we are temporarily not available! Please try again later.'))\n        } else {\n          challengeUtils.solveIf(challenges.rceChallenge, () => { return utils.getErrorMessage(err) === 'Infinite loop detected - reached max iterations' })\n          next(err)\n        }\n      }\n    } else {\n      res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n    }\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import * as security from '../lib/insecurity'\n",
+              "old_text": "import * as challengeUtils from '../lib/challengeUtils'\nimport { challenges } from '../data/datacache'\nimport * as security from '../lib/insecurity'\nimport * as utils from '../lib/utils'\n"
             }
           ],
-          "evidence_source": "workspace:server.js; supervisor:no-fix-code-pivot",
+          "evidence_source": "workspace:routes/b2bOrder.ts; supervisor:no_fix_code_removal",
           "package_removal_requested": false
         },
-        "output": "SUCCESS: Source-only workaround plan recorded successfully."
+        "output": "SUCCESS: Plan revision 1 recorded successfully. Evidence source: workspace:routes/b2bOrder.ts."
       },
       {
         "name": "deterministic_apply_edit_set",
         "args": {
           "replacements": [
             {
-              "file_path": "server.js",
-              "old_text": "swig.render(template, context)",
-              "new_text": "safeRenderTemplate(template, context)",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import { type Request, type Response, type NextFunction } from 'express'\n",
+              "old_text": "import vm from 'node:vm'\nimport { type Request, type Response, type NextFunction } from 'express'\n// @ts-expect-error FIXME due to non-existing type definitions for notevil\nimport { eval as safeEval } from 'notevil'\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "    res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n",
+              "old_text": "    if (utils.isChallengeEnabled(challenges.rceChallenge) || utils.isChallengeEnabled(challenges.rceOccupyChallenge)) {\n      const orderLinesData = body.orderLinesData || ''\n      try {\n        const sandbox = { safeEval, orderLinesData }\n        vm.createContext(sandbox)\n        vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })\n        res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n      } catch (err) {\n        if (utils.getErrorMessage(err).match(/Script execution timed out.*/) != null) {\n          challengeUtils.solveIf(challenges.rceOccupyChallenge, () => { return true })\n          res.status(503)\n          next(new Error('Sorry, we are temporarily not available! Please try again later.'))\n        } else {\n          challengeUtils.solveIf(challenges.rceChallenge, () => { return utils.getErrorMessage(err) === 'Infinite loop detected - reached max iterations' })\n          next(err)\n        }\n      }\n    } else {\n      res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n    }\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import * as security from '../lib/insecurity'\n",
+              "old_text": "import * as challengeUtils from '../lib/challengeUtils'\nimport { challenges } from '../data/datacache'\nimport * as security from '../lib/insecurity'\nimport * as utils from '../lib/utils'\n"
             }
           ]
         },
-        "output": "SUCCESS: JSON: {\"affected_files\":[\"server.js\"],\"status\":\"applied\"}."
+        "output": "SUCCESS: Atomic edit set \"patch_r1_i1_e96888a0\" applied successfully and is pending validation. JSON: {\"status\":\"SUCCESS\",\"patch_id\":\"patch_r1_i1_e96888a0\",\"affected_files\":[\"routes/b2bOrder.ts\"],\"replacement_count\":3,\"phase_transition\":\"EXECUTE -> VALIDATE\"}"
       },
       {
         "name": "validate_workaround",
         "args": {
           "modified_files": [
-            "server.js"
+            "routes/b2bOrder.ts"
           ],
-          "runtime_smoke_file": "lib/template-policy.js",
-          "targeted_test_file": "test/security/templateSpec.js",
-          "targeted_test_name": "safe template rendering"
+          "runtime_smoke_file": "app.ts",
+          "targeted_test_file": "build/test/server/b2bOrderSpec.js",
+          "targeted_test_name": "b2b order route"
         },
-        "output": "SUCCESS: Workaround validation gate passed."
+        "output": "ERROR: [INVALID_VALIDATION_INPUT] Compiled test path 'build/test/server/b2bOrderSpec.js' is not supported. Use the original source test path under test/, tests/, or the source package directory."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "end_line": 220,
+          "file_path": "test/server/b2bOrderSpec.ts",
+          "start_line": 1
+        },
+        "output": "ERROR: [PHASE_VIOLATION] A source edit must be followed by validate_workaround before further investigation."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "app.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2b order route"
+        },
+        "output": "ERROR: [INVALID_VALIDATION_INPUT] Requested Mocha test hint 'b2b order route' did not match any test in 'test/server/b2bOrderSpec.ts'. Available titles: b2bOrder infinite loop payload does not succeed but solves \"rceChallenge\", b2bOrder timeout after 2 seconds solves \"rceOccupyChallenge\", b2bOrder deserializing JSON as documented in Swagger should not solve \"rceChallenge\", b2bOrder deserializing arbitrary JSON should not solve \"rceChallenge\", b2bOrder deserializing broken JSON should not solve \"rceChallenge\"."
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "app.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2bOrder deserializing arbitrary JSON should not solve \"rceChallenge\""
+        },
+        "output": "SUCCESS: Workaround validation gate passed. Validated files: routes/b2bOrder.ts; runtime smoke: routes/b2bOrder.ts; targeted test: test/server/b2bOrderSpec.ts. JSON: {\"overall_status\":\"PASS\"}."
       }
     ],
-    "final_output": "APPLIED: no-fix package-removal attempt was replaced by a validated source-only swig workaround.",
-    "expected_output": "The worker follows the committed no-fix code pivot, changes only server.js, and reports validation PASS.",
+    "expected_tool_calls": [
+      {
+        "name": "read_repository_map",
+        "args": {},
+        "output": "SUCCESS: Repository structure loaded."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "notevil|CVE-2021-23771|GHSA-8G4M-CJM2-96WQ",
+          "target_directory": "."
+        },
+        "output": "SUCCESS: Found routes/b2bOrder.ts importing notevil."
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "end_line": 220,
+          "file_path": "routes/b2bOrder.ts",
+          "start_line": 1
+        },
+        "output": "SUCCESS: Read routes/b2bOrder.ts and confirmed the notevil VM execution path."
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "b2bOrder\\s*\\(",
+          "target_directory": "routes"
+        },
+        "output": "SUCCESS: Found routes/b2bOrder.ts:16:export function b2bOrder ()."
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "affected_symbols": [
+            "b2bOrder"
+          ],
+          "security_invariant": "The vulnerable notevil execution path must be removed while preserving normal B2B order behavior.",
+          "causal_hypothesis": "notevil is directly imported and used by b2bOrder; remove the VM-based evaluation path while keeping normal order responses.",
+          "planned_replacements": [
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import { type Request, type Response, type NextFunction } from 'express'\n",
+              "old_text": "import vm from 'node:vm'\nimport { type Request, type Response, type NextFunction } from 'express'\n// @ts-expect-error FIXME due to non-existing type definitions for notevil\nimport { eval as safeEval } from 'notevil'\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "    res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n",
+              "old_text": "    if (utils.isChallengeEnabled(challenges.rceChallenge) || utils.isChallengeEnabled(challenges.rceOccupyChallenge)) {\n      const orderLinesData = body.orderLinesData || ''\n      try {\n        const sandbox = { safeEval, orderLinesData }\n        vm.createContext(sandbox)\n        vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })\n        res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n      } catch (err) {\n        if (utils.getErrorMessage(err).match(/Script execution timed out.*/) != null) {\n          challengeUtils.solveIf(challenges.rceOccupyChallenge, () => { return true })\n          res.status(503)\n          next(new Error('Sorry, we are temporarily not available! Please try again later.'))\n        } else {\n          challengeUtils.solveIf(challenges.rceChallenge, () => { return utils.getErrorMessage(err) === 'Infinite loop detected - reached max iterations' })\n          next(err)\n        }\n      }\n    } else {\n      res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n    }\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import * as security from '../lib/insecurity'\n",
+              "old_text": "import * as challengeUtils from '../lib/challengeUtils'\nimport { challenges } from '../data/datacache'\nimport * as security from '../lib/insecurity'\nimport * as utils from '../lib/utils'\n"
+            }
+          ],
+          "evidence_source": "workspace:routes/b2bOrder.ts; supervisor:no_fix_code_removal",
+          "package_removal_requested": false
+        },
+        "output": "SUCCESS: Plan revision 1 recorded successfully. Evidence source: workspace:routes/b2bOrder.ts."
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import { type Request, type Response, type NextFunction } from 'express'\n",
+              "old_text": "import vm from 'node:vm'\nimport { type Request, type Response, type NextFunction } from 'express'\n// @ts-expect-error FIXME due to non-existing type definitions for notevil\nimport { eval as safeEval } from 'notevil'\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "    res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n",
+              "old_text": "    if (utils.isChallengeEnabled(challenges.rceChallenge) || utils.isChallengeEnabled(challenges.rceOccupyChallenge)) {\n      const orderLinesData = body.orderLinesData || ''\n      try {\n        const sandbox = { safeEval, orderLinesData }\n        vm.createContext(sandbox)\n        vm.runInContext('safeEval(orderLinesData)', sandbox, { timeout: 2000 })\n        res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n      } catch (err) {\n        if (utils.getErrorMessage(err).match(/Script execution timed out.*/) != null) {\n          challengeUtils.solveIf(challenges.rceOccupyChallenge, () => { return true })\n          res.status(503)\n          next(new Error('Sorry, we are temporarily not available! Please try again later.'))\n        } else {\n          challengeUtils.solveIf(challenges.rceChallenge, () => { return utils.getErrorMessage(err) === 'Infinite loop detected - reached max iterations' })\n          next(err)\n        }\n      }\n    } else {\n      res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })\n    }\n"
+            },
+            {
+              "expected_occurrences": 1,
+              "file_path": "routes/b2bOrder.ts",
+              "new_text": "import * as security from '../lib/insecurity'\n",
+              "old_text": "import * as challengeUtils from '../lib/challengeUtils'\nimport { challenges } from '../data/datacache'\nimport * as security from '../lib/insecurity'\nimport * as utils from '../lib/utils'\n"
+            }
+          ]
+        },
+        "output": "SUCCESS: Atomic edit set \"patch_r1_i1_e96888a0\" applied successfully and is pending validation. JSON: {\"status\":\"SUCCESS\",\"patch_id\":\"patch_r1_i1_e96888a0\",\"affected_files\":[\"routes/b2bOrder.ts\"],\"replacement_count\":3,\"phase_transition\":\"EXECUTE -> VALIDATE\"}"
+      },
+      {
+        "name": "validate_workaround",
+        "args": {
+          "modified_files": [
+            "routes/b2bOrder.ts"
+          ],
+          "runtime_smoke_file": "app.ts",
+          "targeted_test_file": "test/server/b2bOrderSpec.ts",
+          "targeted_test_name": "b2bOrder deserializing arbitrary JSON should not solve \"rceChallenge\""
+        },
+        "output": "SUCCESS: Workaround validation gate passed. Validated files: routes/b2bOrder.ts; runtime smoke: routes/b2bOrder.ts; targeted test: test/server/b2bOrderSpec.ts. JSON: {\"overall_status\":\"PASS\"}."
+      }
+    ],
+    "final_output": "APPLIED: the notevil package-removal pivot was converted to source-only vulnerable-code removal in routes/b2bOrder.ts; the worker recovered from validation-input errors and finished with validation PASS.",
+    "expected_output": "The worker keeps notevil installed, removes its import and VM-based execution path from routes/b2bOrder.ts, recovers from the observed validation errors, and reports final validation PASS.",
     "changed_files": [
-      "server.js"
+      "routes/b2bOrder.ts"
     ],
     "action_status": "APPLIED",
     "expected_completion_pass": true,
-    "expected_tool_correctness_pass": true
+    "expected_tool_correctness_pass": false
   },
   {
     "case_id": "workaround-retry-after-local-inspection-first-error",
     "eval_type": "workaround_subagent",
     "golden_kind": "search_web_before_local_inspection_then_recovery",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §194, span 197 returned [INVESTIGATION_REQUIRED] before spans 199, 202, and 205 completed local inspection.",
-    "evaluation_note": "This variant uses the search_web-first error. A separate record_plan-before-evidence variant can reuse the same expected recovery suffix.",
-    "supervisor_instruction": "Implement the express-jwt algorithm allowlist workaround in lib/insecurity.ts and validate it.",
-    "completion_task": "Recover from the local-inspection guard, complete local investigation, record a plan, apply the edit, and pass validation.",
+    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.",
+    "supervisor_instruction": "Migrate the legacy express-jwt default import to the named expressjwt export and configure the middleware with an explicit RS256 algorithm allowlist in lib/insecurity.ts.",
+    "completion_task": "Inspect the express-jwt import and authorization call, record an evidence-backed plan with both source replacements, apply the atomic edit, and follow the committed validation path.",
     "target_package_name": "express-jwt",
     "attempt_id": "attempt-workaround-local-guard-006",
     "task_revision": 1,
@@ -531,10 +730,10 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "expressJwt",
+          "search_pattern": "express-jwt|expressJwt|expressjwt",
           "target_directory": "lib"
         },
-        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+        "output": "SUCCESS: Found the legacy express-jwt import and authorization call in lib/insecurity.ts."
       },
       {
         "name": "read_workspace_file",
@@ -568,17 +767,23 @@
           "affected_symbols": [
             "isAuthorized"
           ],
-          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
-          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist.",
+          "security_invariant": "JWT authorization uses the express-jwt named export and accepts only the approved RS256 algorithm.",
+          "causal_hypothesis": "The installed express-jwt API uses the named expressjwt export and requires an explicit algorithm allowlist; the legacy default import and unconstrained middleware call must be migrated.",
           "planned_replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ],
-          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "evidence_source": "workspace:lib/insecurity.ts; package:express-jwt",
           "package_removal_requested": false
         },
         "output": "SUCCESS: Workaround plan recorded successfully."
@@ -589,8 +794,14 @@
           "replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ]
@@ -619,10 +830,10 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "expressJwt",
+          "search_pattern": "express-jwt|expressJwt|expressjwt",
           "target_directory": "lib"
         },
-        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+        "output": "SUCCESS: Found the legacy express-jwt import and authorization call in lib/insecurity.ts."
       },
       {
         "name": "read_workspace_file",
@@ -656,17 +867,23 @@
           "affected_symbols": [
             "isAuthorized"
           ],
-          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
-          "causal_hypothesis": "The express-jwt middleware is configured without an explicit algorithm allowlist.",
+          "security_invariant": "JWT authorization uses the express-jwt named export and accepts only the approved RS256 algorithm.",
+          "causal_hypothesis": "The installed express-jwt API uses the named expressjwt export and requires an explicit algorithm allowlist; the legacy default import and unconstrained middleware call must be migrated.",
           "planned_replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ],
-          "evidence_source": "workspace:lib/insecurity.ts; web:auth0-jwt-guidance",
+          "evidence_source": "workspace:lib/insecurity.ts; package:express-jwt",
           "package_removal_requested": false
         },
         "output": "SUCCESS: Workaround plan recorded successfully."
@@ -677,8 +894,14 @@
           "replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ]
@@ -698,8 +921,8 @@
         "output": "SUCCESS: Workaround validation gate passed."
       }
     ],
-    "final_output": "APPLIED: local investigation guard was recovered from; express-jwt workaround and validation completed.",
-    "expected_output": "The worker recovers from the premature web call, then completes the same validated workaround using the correct local-first sequence.",
+    "final_output": "APPLIED: after the premature web-search guard error, the worker completed local inspection, migrated express-jwt to the named export with an RS256 allowlist, and validation passed.",
+    "expected_output": "The worker recovers from the local-inspection guard, applies both express-jwt source replacements, and reports validation PASS.",
     "changed_files": [
       "lib/insecurity.ts"
     ],
@@ -1079,13 +1302,13 @@
   {
     "case_id": "workaround-retry-after-validation-failure",
     "eval_type": "workaround_subagent",
-    "golden_kind": "valid_validation_code_failure_then_recovery",
-    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §980, first validation failure followed by inspection and a corrected plan. The clean first-attempt case is #3; this case intentionally retains a real validation retry.",
-    "evaluation_note": "This is independent of the clean #3 case. The first validate_workaround call has valid arguments but returns CODE_FAILURE; the worker must inspect, re-plan, edit, and validate again.",
-    "supervisor_instruction": "Implement the verification-handler workaround in routes/verify.ts and validate the security behavior.",
-    "completion_task": "Recover from a valid validation gate that reports a code-level failure, then produce and validate the corrected workaround.",
+    "golden_kind": "historical_jsonwebtoken_typecheck_failure_then_recovery",
+    "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround subagent test run §194. High-level workaround tool spans are §§199, 202, 205, 208, 210, 212, 214, 221, 236, 239, 241, and 247.",
+    "evaluation_note": "The first validate_workaround call uses valid inputs but returns a typecheck CODE_FAILURE: TypeScript's jsonwebtoken SignOptions rejects allowInsecureKeySizes. The worker inspects authorize, replans with the runtime-compatible as any cast, reapplies the edit, and passes validation.",
+    "supervisor_instruction": "Implement the jsonwebtoken v9 RSA-key compatibility workaround in lib/insecurity.ts and validate it.",
+    "completion_task": "Recover from the valid typecheck CODE_FAILURE after adding allowInsecureKeySizes: inspect the authorize symbol, record the corrected typed-cast plan, reapply the edit, and finish with validation PASS.",
     "target_package_name": "jsonwebtoken",
-    "attempt_id": "attempt-workaround-validation-retry-009",
+    "attempt_id": "e06ef47f-2bf1-5f03-9e90-d4b9e4896cee",
     "task_revision": 1,
     "is_retry": true,
     "tool_calls": [
@@ -1097,134 +1320,148 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "jwt.verify",
-          "target_directory": "routes"
+          "search_pattern": "secretOrPrivateKey|authorize\\(|jwt\\.sign|RS256",
+          "target_directory": "lib"
         },
-        "output": "SUCCESS: Found jwt.verify in routes/verify.ts."
+        "output": "SUCCESS: Found lib/insecurity.ts:56:export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })."
       },
       {
         "name": "read_workspace_file",
         "args": {
-          "file_path": "routes/verify.ts",
-          "start_line": 20,
-          "end_line": 65
+          "end_line": 120,
+          "file_path": "lib/insecurity.ts",
+          "start_line": 1
         },
-        "output": "SUCCESS: Read the verification call site."
+        "output": "SUCCESS: Read lib/insecurity.ts and confirmed the authorize signing call."
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "jsonwebtoken v9 minimum key size 2048 bits RS256 migration guide sign private key workaround test failure"
+        },
+        "output": "SUCCESS: Found the official jsonwebtoken v8-to-v9 migration note."
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://github.com/auth0/node-jsonwebtoken/wiki/Migration-Notes:-v8-to-v9"
+        },
+        "output": "SUCCESS: The migration note states that v9 requires RSA keys of at least 2048 bits and supports allowInsecureKeySizes for compatibility."
       },
       {
         "name": "record_plan",
         "args": {
           "affected_files": [
-            "routes/verify.ts"
+            "lib/insecurity.ts"
           ],
           "affected_symbols": [
-            "verifyToken"
+            "authorize"
           ],
-          "security_invariant": "Verification must enforce the approved JWT algorithm.",
-          "causal_hypothesis": "The vulnerable call site lacks an explicit algorithm constraint.",
+          "causal_hypothesis": "jsonwebtoken 9 enforces a minimum RSA key size of 2048 bits; the repository's seeded private key is smaller, so jwt.sign now throws during authorization flows.",
+          "evidence_source": "workspace:lib/insecurity.ts",
           "planned_replacements": [
             {
-              "file_path": "routes/verify.ts",
-              "old_text": "jwt.verify(token, publicKey)",
-              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "lib/insecurity.ts",
+              "new_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256', allowInsecureKeySizes: true })",
+              "old_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })",
+              "symbol_name": "authorize"
             }
           ],
-          "evidence_source": "workspace:routes/verify.ts",
-          "package_removal_requested": false
+          "security_invariant": "JWT-based authentication continues to issue signed tokens for the existing RSA key material so login-dependent API tests remain functional."
         },
-        "output": "SUCCESS: Workaround plan recorded successfully."
+        "output": "SUCCESS: Plan revision 1 recorded successfully. Evidence Source: workspace:lib/insecurity.ts Phase Transition: PLAN -> EXECUTE Planned Targets: lib/insecurity.ts JSON: {\"status\":\"SUCCESS\",\"plan_revision\":1}."
       },
       {
         "name": "deterministic_apply_edit_set",
         "args": {
           "replacements": [
             {
-              "file_path": "routes/verify.ts",
-              "old_text": "jwt.verify(token, publicKey)",
-              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'], complete: true })",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "lib/insecurity.ts",
+              "new_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256', allowInsecureKeySizes: true })",
+              "old_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })",
+              "symbol_name": "authorize"
             }
           ]
         },
-        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+        "output": "SUCCESS: Atomic edit set \"patch_r1_i1_7ecf6e9d\" applied successfully and is pending validation. JSON: {\"status\":\"SUCCESS\",\"patch_id\":\"patch_r1_i1_7ecf6e9d\",\"affected_files\":[\"lib/insecurity.ts\"],\"replacement_count\":1,\"phase_transition\":\"EXECUTE -> VALIDATE\"}"
       },
       {
         "name": "validate_workaround",
         "args": {
           "modified_files": [
-            "routes/verify.ts"
+            "lib/insecurity.ts"
           ],
-          "runtime_smoke_file": "lib/jwt-policy.ts",
-          "targeted_test_file": "test/security/verifySpec.ts",
-          "targeted_test_name": "algorithm allowlist"
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts"
         },
-        "output": "FAILURE: CODE_FAILURE: targeted test assertion failed because the verification result shape changed unexpectedly."
+        "output": "FAILURE: Workaround validation gate 'typecheck' failed.\nFAILURE: TypeScript compilation failed (exit 2).\nlib/insecurity.ts(56,41): error TS2769: No overload matches this call.\n  Overload 1 of 3, '(payload: string | object | Buffer, secretOrPrivateKey: Secret, options?: SignOptions | undefined): string', gave the following error.\n    Object literal may only specify known properties, and 'allowInsecureKeySizes' does not exist in type 'SignOptions'.\n  Overload 2 of 3, '(payload: string | object | Buffer, secretOrPrivateKey: Secret, callback: SignCallback): void', gave the following error.\n    Object literal may only specify known properties, and 'expiresIn' does not exist in type 'SignCallback'.\nJSON: {\"overall_status\":\"CODE_FAILURE\",\"failure_category\":\"breaking_change\"}."
       },
       {
         "name": "inspect_ast_symbol",
         "args": {
-          "file_path": "routes/verify.ts",
-          "symbol_name": "verifyToken",
-          "line_hint": 32
+          "file_path": "lib/insecurity.ts",
+          "line_hint": 56,
+          "symbol_name": "authorize"
         },
-        "output": "SUCCESS: AST inspected: the complete option is not required by the security invariant."
+        "output": "SYMBOL: authorize TYPE : arrow_function LINES : 56-56 FILE : lib/insecurity.ts --- (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })"
       },
       {
         "name": "record_plan",
         "args": {
           "affected_files": [
-            "routes/verify.ts"
+            "lib/insecurity.ts"
           ],
           "affected_symbols": [
-            "verifyToken"
+            "authorize"
           ],
-          "security_invariant": "Verification must enforce the approved JWT algorithm.",
-          "causal_hypothesis": "The first patch added an unnecessary complete-result option that broke the existing response contract.",
+          "causal_hypothesis": "jsonwebtoken v9's TypeScript types reject the newly added allowInsecureKeySizes option even though the runtime supports it; the minimal compatibility fix is to supply a typed options object via an explicit SignOptions-compatible cast while preserving the existing signing behavior.",
+          "evidence_source": "workspace:lib/insecurity.ts",
           "planned_replacements": [
             {
-              "file_path": "routes/verify.ts",
-              "old_text": "jwt.verify(token, publicKey)",
-              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "lib/insecurity.ts",
+              "new_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256', allowInsecureKeySizes: true } as any)",
+              "old_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })",
+              "symbol_name": "authorize"
             }
           ],
-          "evidence_source": "workspace:routes/verify.ts; validation:targeted-test-code-failure",
-          "package_removal_requested": false
+          "security_invariant": "JWT-based authentication continues to issue RS256 tokens using the seeded private key so login and 2FA flows remain available to security tests."
         },
-        "output": "SUCCESS: Corrected workaround plan recorded successfully."
+        "output": "SUCCESS: Plan revision 2 recorded successfully. Evidence Source: workspace:lib/insecurity.ts Phase Transition: PLAN -> EXECUTE Planned Targets: lib/insecurity.ts JSON: {\"status\":\"SUCCESS\",\"plan_revision\":2}."
       },
       {
         "name": "deterministic_apply_edit_set",
         "args": {
           "replacements": [
             {
-              "file_path": "routes/verify.ts",
-              "old_text": "jwt.verify(token, publicKey)",
-              "new_text": "jwt.verify(token, publicKey, { algorithms: ['RS256'] })",
-              "expected_occurrences": 1
+              "expected_occurrences": 1,
+              "file_path": "lib/insecurity.ts",
+              "new_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256', allowInsecureKeySizes: true } as any)",
+              "old_text": "export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })",
+              "symbol_name": "authorize"
             }
           ]
         },
-        "output": "SUCCESS: JSON: {\"affected_files\":[\"routes/verify.ts\"],\"status\":\"applied\"}."
+        "output": "SUCCESS: Atomic edit set \"patch_r2_i2_393df268\" applied successfully and is pending validation. JSON: {\"status\":\"SUCCESS\",\"patch_id\":\"patch_r2_i2_393df268\",\"affected_files\":[\"lib/insecurity.ts\"],\"replacement_count\":1,\"phase_transition\":\"EXECUTE -> VALIDATE\"}"
       },
       {
         "name": "validate_workaround",
         "args": {
           "modified_files": [
-            "routes/verify.ts"
+            "lib/insecurity.ts"
           ],
-          "runtime_smoke_file": "lib/jwt-policy.ts",
-          "targeted_test_file": "test/security/verifySpec.ts",
-          "targeted_test_name": "algorithm allowlist"
+          "runtime_smoke_file": "lib/insecurity.ts",
+          "targeted_test_file": "test/api/2fa.test.ts"
         },
-        "output": "SUCCESS: Workaround validation gate passed."
+        "output": "SUCCESS: Workaround validation gate passed. Validated files: lib/insecurity.ts; runtime smoke: lib/insecurity.ts; targeted test: test/api/2fa.test.ts. JSON: {\"overall_status\":\"PASS\"}."
       }
     ],
-    "final_output": "APPLIED: the valid validation failure was investigated, the workaround was corrected, and the second validation passed.",
-    "expected_output": "The worker treats the first validation result as a code failure, rebuilds the complete planned replacement, and reports final validation PASS.",
+    "final_output": "APPLIED: the first validation failed because jsonwebtoken's TypeScript SignOptions rejected allowInsecureKeySizes; after AST inspection and a corrected as any plan, the second validation passed.",
+    "expected_output": "The worker recognizes the valid typecheck CODE_FAILURE, inspects authorize, preserves the runtime compatibility option through the typed cast, reapplies the edit, and reports final validation PASS.",
     "changed_files": [
-      "routes/verify.ts"
+      "lib/insecurity.ts"
     ],
     "action_status": "APPLIED",
     "expected_completion_pass": true,
@@ -1416,9 +1653,9 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "infra_failure_targeted_test_substitution",
     "provenance": "Historical trajectories phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52 §212 and phase5_20260819T065848Z_f450504b-6248-4305-8b06-340a73171c96 §174 contain infrastructure-like/no-test failures, but their substitutions were rejected because the runtime classified the failures as CODE_FAILURE. The accepted substitution contract is covered by test_workaround_lifecycle_alternative_tests.py.",
-    "evaluation_note": "This is a controlled positive substitution fixture. The first validation result must be INFRA_FAILURE or BLOCKED with infrastructure-only evidence; no source re-edit is allowed before the substitution.",
-    "supervisor_instruction": "Apply the express-jwt workaround in lib/insecurity.ts. If the targeted test fails only because its native test dependency is unavailable, register one existing alternative test and validate it.",
-    "completion_task": "Complete the workaround despite an infrastructure-only targeted-test failure by selecting and registering one valid alternative test, then pass validation.",
+    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.",
+    "supervisor_instruction": "Migrate the legacy express-jwt default import to the named expressjwt export and configure the middleware with an explicit RS256 algorithm allowlist in lib/insecurity.ts.",
+    "completion_task": "Inspect the express-jwt import and authorization call, record an evidence-backed plan with both source replacements, apply the atomic edit, and follow the committed validation path.",
     "target_package_name": "express-jwt",
     "attempt_id": "attempt-workaround-infra-011",
     "task_revision": 1,
@@ -1432,10 +1669,10 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "expressJwt",
+          "search_pattern": "express-jwt|expressJwt|expressjwt",
           "target_directory": "lib"
         },
-        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+        "output": "SUCCESS: Found the legacy express-jwt import and authorization call in lib/insecurity.ts."
       },
       {
         "name": "read_workspace_file",
@@ -1455,17 +1692,23 @@
           "affected_symbols": [
             "isAuthorized"
           ],
-          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
-          "causal_hypothesis": "The express-jwt middleware lacks an explicit algorithm allowlist.",
+          "security_invariant": "JWT authorization uses the express-jwt named export and accepts only the approved RS256 algorithm.",
+          "causal_hypothesis": "The installed express-jwt API uses the named expressjwt export and requires an explicit algorithm allowlist; the legacy default import and unconstrained middleware call must be migrated.",
           "planned_replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ],
-          "evidence_source": "workspace:lib/insecurity.ts",
+          "evidence_source": "workspace:lib/insecurity.ts; package:express-jwt",
           "package_removal_requested": false
         },
         "output": "SUCCESS: Workaround plan recorded successfully."
@@ -1476,8 +1719,14 @@
           "replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ]
@@ -1533,8 +1782,8 @@
         "output": "SUCCESS: Workaround validation gate passed using the registered alternative test."
       }
     ],
-    "final_output": "APPLIED: infrastructure-only targeted-test failure was supported by one evidence-backed substitution and final validation passed.",
-    "expected_output": "The worker does not re-edit after an infrastructure-only failure, registers exactly one valid alternative test with complete evidence, and reports validation PASS.",
+    "final_output": "APPLIED: the express-jwt import and RS256 allowlist workaround was applied; an infrastructure-only test failure was supported by one evidence-backed substitution and final validation passed.",
+    "expected_output": "The worker applies both express-jwt source replacements, uses one evidence-backed alternative test only after the INFRA_FAILURE, and reports validation PASS.",
     "changed_files": [
       "lib/insecurity.ts"
     ],
@@ -2343,9 +2592,9 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "maximum_subagent_rounds",
     "provenance": "Historical trajectory phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52, workaround run §212. The run reached the maximum subagent loop bound and reported 'Subagent exceeded the maximum tool-call rounds without reaching a final answer'; it contained 24 LLM spans and 29 tool spans.",
-    "evaluation_note": "The runtime constant is MAX_SUBAGENT_TOOL_CALL_ROUNDS=24. This case records 24 rounds and 29 raw tool spans; the exact counter is a runtime-boundary assertion, not a ToolCorrectness assertion.",
-    "supervisor_instruction": "Implement the committed workaround for the authentication handler and validate it before returning a final result.",
-    "completion_task": "Do not claim remediation completion when the worker reaches the 24-round execution bound without a final answer; report the bounded surrender.",
+    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.",
+    "supervisor_instruction": "Migrate the legacy express-jwt default import to the named expressjwt export and configure the middleware with an explicit RS256 algorithm allowlist in lib/insecurity.ts.",
+    "completion_task": "Inspect the express-jwt import and authorization call, record an evidence-backed plan with both source replacements, apply the atomic edit, and follow the committed validation path.",
     "target_package_name": "express-jwt",
     "attempt_id": "attempt-workaround-round-limit-016",
     "task_revision": 1,
@@ -2362,10 +2611,10 @@
       {
         "name": "search_codebase_pattern",
         "args": {
-          "search_pattern": "expressJwt",
+          "search_pattern": "express-jwt|expressJwt|expressjwt",
           "target_directory": "lib"
         },
-        "output": "SUCCESS: Found expressJwt usage in lib/insecurity.ts."
+        "output": "SUCCESS: Found the legacy express-jwt import and authorization call in lib/insecurity.ts."
       },
       {
         "name": "record_plan",
@@ -2376,17 +2625,23 @@
           "affected_symbols": [
             "isAuthorized"
           ],
-          "security_invariant": "JWT verification accepts only explicitly approved algorithms.",
-          "causal_hypothesis": "The middleware lacks an explicit algorithm allowlist.",
+          "security_invariant": "JWT authorization uses the express-jwt named export and accepts only the approved RS256 algorithm.",
+          "causal_hypothesis": "The installed express-jwt API uses the named expressjwt export and requires an explicit algorithm allowlist; the legacy default import and unconstrained middleware call must be migrated.",
           "planned_replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ],
-          "evidence_source": "workspace:lib/insecurity.ts",
+          "evidence_source": "workspace:lib/insecurity.ts; package:express-jwt",
           "package_removal_requested": false
         },
         "output": "SUCCESS: Workaround plan recorded successfully."
@@ -2397,8 +2652,14 @@
           "replacements": [
             {
               "file_path": "lib/insecurity.ts",
+              "old_text": "import expressJwt from 'express-jwt'",
+              "new_text": "import { expressjwt } from 'express-jwt'",
+              "expected_occurrences": 1
+            },
+            {
+              "file_path": "lib/insecurity.ts",
               "old_text": "expressJwt({ secret: publicKey })",
-              "new_text": "expressJwt({ secret: publicKey, algorithms: ['HS256', 'RS256'] })",
+              "new_text": "expressjwt({ secret: publicKey, algorithms: ['RS256'] })",
               "expected_occurrences": 1
             }
           ]
@@ -2406,8 +2667,8 @@
         "output": "SUCCESS: JSON: {\"affected_files\":[\"lib/insecurity.ts\"],\"status\":\"applied\"}."
       }
     ],
-    "final_output": "SURRENDER: Subagent exceeded the maximum tool-call rounds without reaching a final answer; remediation is not reported as complete.",
-    "expected_output": "The worker must not claim a completed workaround after the 24-round bound. It reports the bounded execution surrender and leaves completion false.",
+    "final_output": "SURRENDER: the subagent exceeded the maximum tool-call rounds before completing the express-jwt named-import and RS256 workaround; remediation is not reported as complete.",
+    "expected_output": "The worker must not claim a completed express-jwt workaround after the 24-round bound; it reports bounded surrender with completion false.",
     "changed_files": [
       "lib/insecurity.ts"
     ],
