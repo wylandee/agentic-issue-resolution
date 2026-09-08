@@ -421,11 +421,13 @@ def triage_golden_cases(
 def fix_planner_golden_cases(
     load_golden_cases: Callable[[str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Provide curated fix planner evaluation cases from golden/triage_cases.json."""
-    all_cases = load_golden_cases("triage_cases")
+    """Provide curated fix planner cases from golden/fix_planner_cases.json."""
+    all_cases = load_golden_cases("fix_planner_cases")
     cases = [c for c in all_cases if c.get("eval_type") == "fix_planner"]
     if not cases:
-        pytest.skip("No golden fix planner cases found in tests/evals/golden/triage_cases.json")
+        pytest.skip(
+            "No golden fix planner cases found in tests/evals/golden/fix_planner_cases.json"
+        )
     return cases
 
 

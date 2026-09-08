@@ -32,7 +32,7 @@ except ImportError:
 # Golden Dataset Loader for Pytest Parametrization
 # ---------------------------------------------------------------------------
 
-_GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "triage_cases.json"
+_GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "fix_planner_cases.json"
 
 
 def _load_fix_planner_cases() -> list[dict[str, Any]]:

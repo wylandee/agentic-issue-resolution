@@ -1,0 +1,81 @@
+[
+  {
+    "case_id": "case_16_fp_version_bump_github_advisory",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic GitHub security advisory page for cookie out-of-bounds domain validation vulnerability.",
+    "source_page_content": "# GitHub Advisory GHSA-pxg6-pf52-xh8x\n\nCookie package before version 0.7.0 contains an out-of-bounds validation flaw when parsing domain attributes.\n\n### Impact\nAttackers can bypass domain cookie isolation under certain proxy configurations.\n\n### Patched Versions\nUpgrade to version **0.7.0** or later to mitigate this vulnerability.\n\n### References\n- https://github.com/jshttp/cookie/commit/d265330e",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "0.7.0",
+      "workaround_snippets": null,
+      "reasoning": "The advisory explicitly states that the vulnerability is patched in version 0.7.0."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "0.7.0",
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_17_fp_code_workaround_issue_thread",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic GitHub issue thread for deep-extend prototype pollution where maintainer provides code workaround snippet.",
+    "source_page_content": "# Issue #42: Prototype pollution vulnerability in deepExtend\n\n**Reporter**: Calling `deepExtend({}, JSON.parse(userInput))` allows `__proto__` injection.\n\n**Maintainer**: Note that v0.4.x is end-of-life and no upstream version will be released. You can safely mitigate this in application code by checking object keys before invoking deepExtend:\n\n```javascript\nfunction safeExtend(target, source) {\n  for (const key of Object.keys(source)) {\n    if (key === '__proto__' || key === 'constructor') {\n      delete source[key];\n    }\n  }\n  return deepExtend(target, source);\n}\n```",
+    "llm_extraction_result": {
+      "strategy": "CODE_WORKAROUND",
+      "fixed_version": null,
+      "workaround_snippets": [
+        "function safeExtend(target, source) {\n  for (const key of Object.keys(source)) {\n    if (key === '__proto__' || key === 'constructor') {\n      delete source[key];\n    }\n  }\n  return deepExtend(target, source);\n}"
+      ],
+      "reasoning": "No patched version is available for the EOL release, but the maintainer provided a concrete code workaround function to strip __proto__ keys."
+    },
+    "expected_strategy": "CODE_WORKAROUND",
+    "expected_fixed_version": null,
+    "expected_workaround_snippets": [
+      "if (key === '__proto__' || key === 'constructor')"
+    ]
+  },
+  {
+    "case_id": "case_18_fp_no_fix_disputed_wontfix",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic issue thread closed as WONTFIX with no fix and no code workaround.",
+    "source_page_content": "# Issue #104: High CPU usage with malicious regex input\n\n**Maintainer**: This is expected behavior when processing untrusted massive inputs without a payload size limit. We will not be modifying the regex engine as it would break backward compatibility. Closing as intended behavior. No patch or workaround is provided.",
+    "llm_extraction_result": {
+      "strategy": "NO_FIX",
+      "fixed_version": null,
+      "workaround_snippets": null,
+      "reasoning": "Issue closed as intended behavior by maintainers with no patched version or code workaround."
+    },
+    "expected_strategy": "NO_FIX",
+    "expected_fixed_version": null,
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_19_fp_version_semver_prerelease",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic release note page for a security pre-release version with semver prerelease tag.",
+    "source_page_content": "# Release v2.0.0-beta.1\n\nThis pre-release patches CVE-2023-9999 (ReDoS vulnerability in route dispatcher).\n\nUsers affected by the vulnerability should upgrade to `2.0.0-beta.1`.",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "2.0.0-beta.1",
+      "workaround_snippets": null,
+      "reasoning": "Release notes confirm vulnerability is fixed in version 2.0.0-beta.1."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "2.0.0-beta.1",
+    "expected_workaround_snippets": null
+  },
+  {
+    "case_id": "case_20_fp_multiple_versions_picks_latest",
+    "eval_type": "fix_planner",
+    "provenance": "Synthetic multi-branch advisory mentioning patch releases in multiple maintenance branches.",
+    "source_page_content": "# Security Advisory for Package XYZ\n\nMultiple buffer overflow issues were fixed in the following patch releases:\n- Branch 1.x: Fixed in version **1.4.9**\n- Branch 2.x: Fixed in version **2.1.2**\n- Branch 3.x: Fixed in version **3.0.4**\n\nPlease update your dependency to the appropriate patched release for your major version.",
+    "llm_extraction_result": {
+      "strategy": "VERSION_BUMP",
+      "fixed_version": "3.0.4",
+      "workaround_snippets": null,
+      "reasoning": "Advisory lists patched versions 1.4.9, 2.1.2, and 3.0.4. Extracted version 3.0.4 for modern releases."
+    },
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "3.0.4",
+    "expected_workaround_snippets": null
+  }
+]

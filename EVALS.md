@@ -18,7 +18,7 @@ The `remediation_engine` is a multi-agent AppSec remediation service with a hub-
 
 ### Evaluation of the Previous Response
 
-The previous analysis correctly identified the four evaluation axes and mapped them to DeepEval metrics. However, there are several corrections and refinements needed before implementation:
+The previous analysis identified several evaluation axes and mapped them to DeepEval metrics. The implementation keeps the QA Critic scope deliberately narrow: only the two requested DeepEval metrics are run for QA.
 
 1. **DeepEval integration model**: DeepEval provides a native `CallbackHandler` for LangChain/LangGraph that hooks into the existing callback system — no `@observe` decorators required. This aligns perfectly with the engine's existing `TrajectoryRecorder` callback pattern.
 
@@ -32,7 +32,7 @@ The previous analysis correctly identified the four evaluation axes and mapped t
 
 4. **Custom metric corrections**: The `LatencyAndTokenBudgetMetric` example used `additional_metadata` which is not a standard DeepEval `LLMTestCase` field. Should use DeepEval's built-in `cost` and `latency` fields on test cases, or subclass `BaseMetric` with explicit state injection.
 
-5. **Missing evaluation dimension**: The previous response omitted evaluation of the **QA Critic**, which is the most complex LLM component (hybrid deterministic + LLM, with structured output via `emit_qa_evaluation`). It requires both tool correctness (did it use the read-only tools properly?) and classification accuracy (did it correctly categorize failures into `FailureCategory`?).
+5. **QA Critic scope**: The QA Critic is evaluated with `ToolCorrectnessMetric` for its read-only investigation/terminal tool trace and `TaskCompletionMetric` for the evidence-backed structured decision. Failure categorization, semantic review, and attribution remain part of the completion contract and replay evidence, not separate metrics.
 
 ---
 
@@ -142,32 +142,28 @@ Data source: Existing trajectory files that contain report node spans with both 
 
 ---
 
-### Phase 2 — Triage & Fix Planner Evaluation: Classification Accuracy (Week 3)
+### Phase 2 — Triage & Fix Planner Evaluation (Week 3)
 
-> Goal: Evaluate LLM triage decisions and Fix Planner web-extraction against deterministic guardrail baselines and curated ground truth. Both components share a classification structure (enum-based strategy output from vulnerability context).
+> Goal: Evaluate triage task completion and Fix Planner web-extraction against curated, provenance-tracked cases. Triage and Fix Planner use separate golden datasets and evaluation contracts.
 
 ---
 
-#### [NEW] `tests/evals/test_triage_eval.py`
+#### [UPDATED] tests/evals/test_triage_eval.py
 
-Metrics applied:
-- **`GEval("Triage Verdict Accuracy")`** — Criteria: "Given the vulnerability group context (CVE ID, CVSS, EPSS, reachability, ecosystem), evaluate whether the triage verdict (ACTIONABLE/FALSE_POSITIVE/DEFERRED) is correct"
-- **`GEval("Strategy Selection Quality")`** — Criteria: "Evaluate whether the recommended strategy (VERSION_UPDATE vs CODE_WORKAROUND) is appropriate given the available fix data"
-- **Custom `TriageConsistencyMetric(BaseMetric)`** — Deterministic check: LLM triage result must pass the same `_apply_guardrails()` that the engine applies post-LLM. If guardrails override the LLM verdict, that's a quality signal.
+The triage suite uses exactly one metric:
 
-Test structure:
-```python
-@pytest.mark.eval
-class TestTriageEval:
-    def test_triage_accuracy_against_golden_set(self, triage_golden_cases):
-        """LLM triage matches expected verdicts on curated CVE cases."""
-    
-    def test_triage_guardrail_alignment(self, triage_golden_cases):
-        """LLM verdict is not overridden by deterministic guardrails."""
-    
-    def test_triage_false_positive_rate(self, triage_golden_cases):
-        """LLM does not classify actionable CVEs as false positives."""
-```
+- DeepEval TaskCompletionMetric with a 0.70 threshold judges whether the
+  final triage task was completed.
+
+The completion contract is embedded in each golden's completion_task so the
+metric can judge validity, priority, reachability, guardrail recovery, and
+pipeline handoff as one task outcome. The replayed actual_output is the final
+post-guardrail result. No GEval, custom triage metric, schema assertion, or
+separate guardrail-alignment metric is run by this suite.
+
+The cases retain trajectory provenance labels in the golden JSON and in
+docs/triage-eval-mapping.md. Missing historical evidence is explicitly marked
+synthetic rather than being treated as a recorded production outcome.
 
 ---
 
@@ -194,15 +190,17 @@ class TestFixPlannerEval:
 
 ---
 
-#### [NEW] `tests/evals/golden/triage_cases.json`
+#### [UPDATED] `tests/evals/golden/triage_cases.json`
 
-15–20 cases from diverse sources:
+15 curated triage task-completion cases:
 - **Juice Shop derived** (from `triaged_groups_baseline.json`, `triaged_groups_deterministic.json`): Known `CRITICAL` CVEs that must be `ACTIONABLE`, known false-positives (test-only dependencies, suppressed packages) that should be `FALSE_POSITIVE` or `DEFERRED`
 - **Synthetic scenarios**: fabricated transitive conflicts, SAST code injection patterns, disputed CVEs, packages with no upstream fix, reachable vs. unreachable code paths
 - **Additional real-world project scans**: Cases from other npm/Node.js projects with different dependency topologies
-- **Fix Planner cases**: Web page content from GitHub advisories, npm release notes, and issue threads with expected `SerperLLMResult` outputs
+- **Historical mapping**: Each case records whether the trajectories provide an exact match, an analogue, or no evidence.
 
-Each case documents its provenance (source fixture, synthetic rationale, or external project reference).
+The completion contract and replayed final outcome are stored in each case's
+completion_task and actual_output fields. Fix Planner cases live in the
+dedicated tests/evals/golden/fix_planner_cases.json dataset.
 
 ---
 
@@ -269,64 +267,48 @@ of the dedicated worker suites.
 
 ---
 
-### Phase 4 — QA Critic Evaluation: Diagnostic Accuracy (Week 5–6)
+### Phase 4 — QA Critic Evaluation: Task Completion and Tool Correctness (Week 5–6)
 
-> Goal: Evaluate the QA Critic's ability to correctly categorize build/scan/test failures and attribute them to the correct remediation task.
+> Goal: Evaluate the QA Critic only on whether it completes the assigned evidence-backed decision and follows the expected read-only investigation path.
 
 ---
 
-#### [NEW] `tests/evals/test_qa_critic_eval.py`
+#### [UPDATED] `tests/evals/test_qa_critic_eval.py`
 
 Metrics applied:
-- **`ToolCorrectnessMetric(threshold=0.5)`** — Evaluates QA critic ordered tool sequence (`list_changed_files`, `query_qa_logs`, `generate_workspace_diff`, `read_file_context`, `search_codebase_pattern`, `inspect_ast_symbol`) and verifies termination with `emit_qa_evaluation`
-- **`TaskCompletionMetric(threshold=0.7)`** — Evaluates whether the QA Critic successfully completed its diagnostic review, emitted a valid verdict, and provided actionable retry feedback (evaluated via live LLM judge under `--run-eval-live`)
-- **`GEval("Failure Attribution Accuracy")`** — Criteria: "Given the install log, scan diff, and test output, evaluate whether the QA critic correctly attributed the failure to the changed package vs. a pre-existing repo issue"
-- **`GEval("Failure Category Precision")`** — Criteria: "Evaluate whether the assigned FailureCategory (SECURITY_FLAG, PEER_CONFLICT, BREAKING_CHANGE, TEST_REGRESSION, etc.) matches the evidence"
-- **Custom `QAStructuredOutputMetric(BaseMetric)`** — Validates that `QAEvaluation` fields are internally consistent (e.g., `passed=False` must have non-empty `failure_category` and `retry_feedback`)
-- **Custom `QAGuardrailConsistencyMetric(BaseMetric)`** — Evaluates whether deterministic policy guardrails override LLM QA decisions
+- **`ToolCorrectnessMetric(threshold=1.0)`** — Compares the observed QA tool trace with an independently authored `expected_tool_calls` trace, including tool input parameters, order, and the terminal `emit_qa_evaluation` call.
+- **`TaskCompletionMetric(threshold=0.70)`** — Judges whether the Critic completed the assigned QA decision from the deterministic evidence. It runs only with `--run-eval-live`; intentional surrender after the runtime tool-call limit is expected to remain incomplete.
+
+No separate category-accuracy, schema-validity, guardrail, semantic-review, or
+retry-feedback metrics are part of the QA suite. Those details remain evidence
+in the replay prompt and expected QA output used by `TaskCompletionMetric`.
 
 Test structure:
 ```python
 @pytest.mark.eval
 class TestQACriticEval:
-    def test_qa_tool_sequence_correctness(self, case):
-        """QA Critic uses only authorized read-only review tools and terminates with emit_qa_evaluation."""
+    def test_tool_correctness_deepeval(self, case):
+        """DeepEval checks the expected QA tool names, arguments, and ordering."""
 
-    def test_qa_tool_correctness_deepeval(self, case, eval_settings):
-        """DeepEval built-in ToolCorrectnessMetric evaluates QA Critic ordered tool execution."""
-
-    def test_qa_deterministic_task_completion(self, case, eval_settings):
-        """QA Critic produces a complete diagnostic evaluation matching ground truth."""
-
-    def test_qa_live_task_completion_deepeval(self, case, eval_settings):
-        """DeepEval built-in TaskCompletionMetric evaluates QA completion with LLM judge (requires --run-eval-live)."""
-
-    def test_qa_structured_output_validity(self, case, eval_settings):
-        """QACriticLLMOutput conforms to strict Pydantic invariants."""
-
-    def test_qa_failure_category_accuracy(self, case, eval_settings):
-        """LLM assigns the correct failure category (SECURITY_FLAG, PEER_CONFLICT, BREAKING_CHANGE)."""
-
-    def test_qa_guardrail_consistency(self, case, eval_settings):
-        """LLM QA verdict survives deterministic policy guardrails without override."""
-
-    def test_qa_semantic_security_review(self, case, eval_settings):
-        """Semantic security review verdicts and evidence references are sound."""
-
-    def test_qa_retry_feedback_actionability(self, case, eval_settings):
-        """When passed=False, retry feedback provides clear and actionable diagnostic guidance."""
+    def test_task_completion_deepeval(self, case, eval_settings):
+        """DeepEval judges whether the QA decision was completed."""
 ```
 
 ---
 
-#### [NEW] `tests/evals/golden/qa_cases.json`
+#### [UPDATED] `tests/evals/golden/qa_cases.json`
 
-8–10 cases from diverse sources with structured `tool_calls`, `expected_tools`, `expected_output`, and diagnostic logs:
-- **Juice Shop derived**: Clean pass (all gates green), `PEER_CONFLICT` failure from `npm install`
-- **Synthetic scenarios**: `SECURITY_FLAG` — ODC scan finds new/persistent issues, `BREAKING_CHANGE` — test failure attributed to the update, pre-existing test failure misattributed to the remediation (false positive QA failure)
-- **Additional real-world projects**: Cases with ambiguous test output, multi-group shared dependency conflicts
-
-Each case documents its provenance and includes the raw install/scan/test logs fed to the QA Critic along with full tool execution sequences.
+20 cases cover direct update decisions, initial workaround decisions, workaround
+pivots, no-fix package-removal/pivot decisions, and the 24-round surrender
+boundary. The cases include pass and intentional-fail outcomes for install,
+scanner, unit-test, and no-fix dependency-tree gates, plus semantic-review
+branches. Install-gate failures keep post-install graph state unknown, while
+package-removal graph-retention is represented as a separate scanner failure.
+Each case keeps
+observed `tool_calls` separate from independently authored `expected_tool_calls`
+and records historical trajectory provenance and evidence status. The surrender
+boundary is evaluated only by `TaskCompletionMetric`, because its full QA tool
+trace is a runtime-limit observation rather than a complete expected sequence.
 
 ---
 
@@ -446,7 +428,7 @@ When `--run-eval-live` is not set, the DeepEval judge model is mocked with cache
 # Phase 0: Verify adapter parses existing trajectories
 pytest tests/evals/test_adapters.py -v
 
-# Phases 1–4: Offline structural assertions (CI-safe)
+# Phases 1–4: Offline collection and fixture checks (CI-safe)
 pytest -m eval -v
 
 # Phases 1–4: Live judge evaluations (requires OPENAI_API_KEY)
@@ -478,21 +460,22 @@ tests/evals/
 │                                  # EVAL_JUDGE_MODEL env var support
 ├── adapters.py                    # TrajectoryRecorder → DeepEval LLMTestCase bridge
 ├── custom_metrics.py              # ArchitectureBoundaryMetric, ToolEfficiencyMetric,
-│                                  # WorkaroundLifecycleMetric, QAStructuredOutputMetric,
+│                                  # WorkaroundLifecycleMetric,
 │                                  # TokenBudgetMetric, LatencySLAMetric, ToolCallBudgetMetric,
-│                                  # TriageConsistencyMetric, FixPlannerSchemaMetric
+│                                  # FixPlannerSchemaMetric
 ├── test_report_eval.py            # Phase 1: Hallucination, Faithfulness, Summarization
-├── test_triage_eval.py            # Phase 2: Triage classification accuracy
+├── test_triage_eval.py            # Phase 2: Triage TaskCompletionMetric
 ├── test_fix_planner_eval.py       # Phase 2: Fix Planner extraction accuracy
 ├── test_update_subagent_eval.py   # Phase 3: Update worker DeepEval metrics
 ├── test_workaround_subagent_eval.py  # Phase 3: Workaround worker eval
-├── test_qa_critic_eval.py         # Phase 4: QA diagnostic accuracy
+├── test_qa_critic_eval.py         # Phase 4: QA task completion/tool correctness
 ├── test_business_rules.py         # Phase 5: Token/latency/cost SLAs
 └── golden/                        # Curated evaluation datasets (multi-source, provenance-tracked)
     ├── report_cases.json           # 5–8 cases (Juice Shop + synthetic + real-world)
-    ├── triage_cases.json           # 15–20 cases (includes Fix Planner web-extraction)
+    ├── triage_cases.json           # 15 triage TaskCompletionMetric cases
+    ├── fix_planner_cases.json      # Fix Planner web-extraction cases
     ├── update_subagent_cases.json  # 11 update cases (two DeepEval metrics)
     ├── subagent_cases.json         # Legacy shared update/workaround data
     ├── workaround_subagent_cases.json  # 16 workaround cases (two DeepEval metrics)
-    └── qa_cases.json               # 8–10 cases (pass/fail, misattribution edge cases)
+    └── qa_cases.json               # 20 QA cases (two DeepEval metrics)
 ```
