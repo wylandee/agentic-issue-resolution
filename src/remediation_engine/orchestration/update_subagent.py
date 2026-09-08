@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -621,6 +621,7 @@ def _worker_result_map(
     errors: Sequence[str] = (),
     attempted_versions_by_task: dict[str, list[str]] | None = None,
     executed_versions_by_task: dict[str, list[str]] | None = None,
+    changed_files_by_task: Mapping[str, Sequence[str]] | None = None,
     validation_calls: int = 0,
 ) -> dict[str, WorkerAttemptResult]:
     """Build attempt-correlated worker envelopes without changing task state."""
@@ -628,6 +629,7 @@ def _worker_result_map(
     results: dict[str, WorkerAttemptResult] = {}
     attempted_versions_by_task = attempted_versions_by_task or {}
     executed_versions_by_task = executed_versions_by_task or attempted_versions_by_task
+    changed_files_by_task = changed_files_by_task or {}
     for task in target_tasks:
         snapshot = snapshots.get(task.task_id)
         if snapshot is None:
@@ -647,6 +649,7 @@ def _worker_result_map(
                 else AgentActionStatus.SURRENDER
             ),
             executed_versions=executed,
+            changed_files=list(changed_files_by_task.get(task.task_id, [])),
             action_summary=summary,
             execution_diagnostics=WorkerExecutionDiagnostics(
                 attempted_versions=attempted,
@@ -659,6 +662,38 @@ def _worker_result_map(
             errors=list(errors),
         )
     return results
+
+
+def _changed_files_by_task(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    changed_files: Sequence[str],
+) -> dict[str, list[str]]:
+    """Partition committed worker files by task for attempt envelopes.
+
+    The normal Supervisor dispatch contains one task, so that task receives
+    the complete committed file set. Retain a conservative manifest-based
+    partition for legacy batch callers so one task cannot claim another
+    task's package files in its attempt evidence.
+    """
+    normalized_files = list(
+        dict.fromkeys(
+            path.replace("\\", "/").lstrip("/")
+            for path in changed_files
+            if isinstance(path, str) and path.strip()
+        )
+    )
+    if len(resolved_tasks) == 1:
+        return {resolved_tasks[0][0].task_id: normalized_files}
+
+    result: dict[str, list[str]] = {}
+    for task, _group, manifest_paths in resolved_tasks:
+        manifest_set = {
+            path.replace("\\", "/").lstrip("/")
+            for path in manifest_paths
+            if isinstance(path, str) and path.strip()
+        }
+        result[task.task_id] = [path for path in normalized_files if path in manifest_set]
+    return result
 
 
 def _attempted_versions_for_current_run(
@@ -1412,6 +1447,10 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         prior_retry_diagnostics_by_task,
         constraints_ledger=constraints_ledger,
     )
+    changed_files_by_task = _changed_files_by_task(
+        resolved_tasks,
+        committed_changed_files,
+    )
     summaries = _build_action_summaries(
         resolved_tasks,
         committed_changed_files,
@@ -1460,6 +1499,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             errors=runtime.errors,
             attempted_versions_by_task=attempted_by_task,
             executed_versions_by_task=executed_by_task,
+            changed_files_by_task=changed_files_by_task,
             validation_calls=sum(
                 1 for event in runtime.tool_events if event.name == "validate_manifest_sync"
             ),

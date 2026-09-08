@@ -15,6 +15,23 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    """Parse an environment integer and validate an optional lower bound."""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
+
+
 @dataclass(frozen=True)
 class AppSettings:
     """Application settings with the existing environment names preserved."""
@@ -44,6 +61,9 @@ class AppSettings:
     remedy_bypass_workaround_subagent: bool = False
     remedy_disable_post_qa_triage: bool = False
     remedy_disable_retriage: bool = False
+    # Development-only safety valve. Production remains unlimited by default.
+    remedy_retriage_limit_enabled: bool = False
+    remedy_retriage_limit: int = DEFAULT_REMEDY_RETRIAGE_LIMIT
 
     @classmethod
     def from_env(cls) -> AppSettings:
@@ -88,4 +108,10 @@ class AppSettings:
             remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),
             remedy_disable_post_qa_triage=_env_bool("REMEDY_DISABLE_POST_QA_TRIAGE"),
             remedy_disable_retriage=_env_bool("REMEDY_DISABLE_RETRIAGE"),
+            remedy_retriage_limit_enabled=_env_bool("REMEDY_RETRIAGE_LIMIT_ENABLED"),
+            remedy_retriage_limit=_env_int(
+                "REMEDY_RETRIAGE_LIMIT",
+                DEFAULT_REMEDY_RETRIAGE_LIMIT,
+                minimum=0,
+            ),
         )
