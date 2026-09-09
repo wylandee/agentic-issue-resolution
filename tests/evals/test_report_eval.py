@@ -211,22 +211,15 @@ def _build_report_state(case: dict[str, Any]) -> dict[str, Any]:
     changed_files = fixture.get("changed_files")
     if changed_files is None:
         changed_files = sorted(
-            {
-                change["file"]
-                for change in fixture.get("package_changes", [])
-            }
-            | {
-                change["file"]
-                for change in fixture.get("source_changes", [])
-            }
+            {change["file"] for change in fixture.get("package_changes", [])}
+            | {change["file"] for change in fixture.get("source_changes", [])}
         )
     return {
         "run_id": case["case_id"],
         "repo_root": "data/clones/juice-shop",
         "status": fixture.get("status", "completed"),
         "issues": [
-            {"issue_type": "sca", "package_name": package}
-            for package in fixture.get("issues", [])
+            {"issue_type": "sca", "package_name": package} for package in fixture.get("issues", [])
         ],
         "initial_valid_groups": initial_groups,
         "valid_groups": final_groups,
@@ -322,9 +315,9 @@ def validate_report_contract(report: str, contract: dict[str, Any]) -> list[str]
         if expected not in report:
             violations.append(f"missing summary follow-up count: {expected}")
 
-    successful = report.split("## 3. Successful Remediations", 1)[-1].split(
-        "## 4. References", 1
-    )[0]
+    successful = report.split("## 3. Successful Remediations", 1)[-1].split("## 4. References", 1)[
+        0
+    ]
     follow_up = report.split("## 2. Follow up Actions", 1)[-1].split(
         "## 3. Successful Remediations", 1
     )[0]

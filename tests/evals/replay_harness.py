@@ -1,0 +1,616 @@
+"""Deterministic boundaries and production-node adapters for Phase 2 evals.
+
+The live replay suites call the real production node and model, but replace
+only side effects that would make an evaluation nondeterministic or unsafe:
+Docker execution, repository commands, scanner execution, and HTTP advisory
+fetches.  The helper is intentionally test-only and does not change the
+public remediation API.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+import shlex
+from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+from uuid import NAMESPACE_URL, uuid5
+
+from pydantic import BaseModel
+
+from remediation_engine.contracts.schemas import (
+    CommandResult,
+    CVEEnrichment,
+    IssueSource,
+    IssueType,
+    Severity,
+    SystemContext,
+    VulnerabilityGroup,
+    VulnerabilityIssue,
+)
+from remediation_engine.runtime.path_policy import normalize_workspace_path
+
+
+@dataclasses.dataclass
+class ReplayCapture:
+    """Observable result produced by one production replay.
+
+    Attributes:
+        case_id: Golden case identifier.
+        component: Production component that was executed.
+        actual_output: JSON or text representation of the live result.
+        actual_tools: Serialized tool events in execution order.
+        typed_result: Raw production result, when one is available.
+        changed_files: Files reported by the production component.
+        errors: Production and replay-boundary errors.
+        attempt_id: Attempt identity returned by a worker, if applicable.
+        task_revision: Task revision returned by a worker, if applicable.
+        external_calls: Recorded non-model calls made through replay doubles.
+    """
+
+    case_id: str
+    component: str
+    actual_output: str = ""
+    actual_tools: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    typed_result: Any = None
+    changed_files: list[str] = dataclasses.field(default_factory=list)
+    errors: list[str] = dataclasses.field(default_factory=list)
+    attempt_id: str | None = None
+    task_revision: int | None = None
+    external_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+class ReplaySandbox:
+    """In-memory substitute for ``DockerSandbox`` used by eval replays.
+
+    Args:
+        files: Initial repository-relative file contents.
+        command_responses: Optional exact or substring command responses. A
+            value may be a ``CommandResult``, a mapping accepted by
+            ``CommandResult``, or a callable receiving the command string.
+        default_response: Response for commands without a configured route.
+            The default is a deterministic failure so new production commands
+            cannot silently escape the replay contract.
+
+    The sandbox never writes the host repository, starts Docker, or invokes a
+    subprocess.  ``files`` is copied on construction and can be inspected via
+    ``files`` after the context exits.
+    """
+
+    def __init__(
+        self,
+        files: Mapping[str, str] | None = None,
+        *,
+        command_responses: Mapping[str, Any] | None = None,
+        default_response: CommandResult | Mapping[str, Any] | None = None,
+    ) -> None:
+        self.files: dict[str, str] = {}
+        for path, content in dict(files or {}).items():
+            self.files[self._path(path)] = str(content)
+        self.baseline_files = dict(self.files)
+        self.command_responses = dict(command_responses or {})
+        self.default_response = self._coerce_result(
+            default_response
+            or {
+                "exit_code": 127,
+                "stdout": "",
+                "stderr": "ReplaySandbox: command is not registered.",
+                "duration_seconds": 0.0,
+            }
+        )
+        self.commands: list[str] = []
+        self.writes: list[str] = []
+        self.external_calls: list[dict[str, Any]] = []
+        self._alive = False
+
+    @staticmethod
+    def _coerce_result(value: Any) -> CommandResult:
+        """Convert a configured route response to ``CommandResult``."""
+        if isinstance(value, CommandResult):
+            return value
+        if isinstance(value, Mapping):
+            return CommandResult(
+                exit_code=int(value.get("exit_code", 0)),
+                stdout=str(value.get("stdout", "")),
+                stderr=str(value.get("stderr", "")),
+                duration_seconds=float(value.get("duration_seconds", 0.0)),
+            )
+        raise TypeError(f"Unsupported replay command response: {value!r}")
+
+    @staticmethod
+    def _path(path: str) -> str:
+        """Normalize a workspace-relative path using production policy."""
+        return normalize_workspace_path(str(path))
+
+    def __enter__(self) -> ReplaySandbox:
+        """Start the in-memory sandbox context."""
+        self._alive = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        """Close the sandbox without affecting the host filesystem."""
+        del exc_type, exc, traceback
+        self._alive = False
+
+    def restore_baseline(self, paths: Iterable[str] | None = None) -> None:
+        """Rollback selected or all in-memory files to the initial snapshot.
+
+        Args:
+            paths: Optional repository-relative paths to restore.  When omitted,
+                files created during the replay are removed as well.
+
+        Raises:
+            WorkspacePathError: If a selected path is not repository-relative.
+        """
+        if paths is None:
+            self.files = dict(self.baseline_files)
+        else:
+            for file_path in paths:
+                normalized = self._path(file_path)
+                if normalized in self.baseline_files:
+                    self.files[normalized] = self.baseline_files[normalized]
+                else:
+                    self.files.pop(normalized, None)
+        self.writes.clear()
+
+    def read_file(self, file_path: str) -> str | None:
+        """Read a normalized workspace file from memory."""
+        if not self._alive:
+            return None
+        return self.files.get(self._path(file_path))
+
+    def write_file(self, file_path: str, content: str) -> None:
+        """Write a normalized workspace file to memory."""
+        if not self._alive:
+            raise RuntimeError("ReplaySandbox is not running.")
+        path = self._path(file_path)
+        self.files[path] = str(content)
+        if path not in self.writes:
+            self.writes.append(path)
+
+    def run(self, command: str, timeout: int = 300) -> CommandResult:
+        """Return a deterministic response for a registered command.
+
+        ``timeout`` is accepted to match ``DockerSandbox.run`` and recorded in
+        no output because it is not part of the production command result.
+        """
+        del timeout
+        if not self._alive:
+            return CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="ReplaySandbox: sandbox is not running.",
+                duration_seconds=0.0,
+            )
+        self.commands.append(command)
+
+        for matcher, configured in self.command_responses.items():
+            if matcher == "__default__" or matcher in command:
+                response = configured(command) if callable(configured) else configured
+                return self._coerce_result(response)
+
+        if "npm pkg set" in command:
+            return self._apply_npm_pkg_set(command)
+        if "find ." in command:
+            return self._find_files()
+        if "grep -RInE" in command:
+            return self._grep_files(command)
+        if command.lstrip().startswith(("rm -f --", "rm -rf --")):
+            return self._remove_file(command)
+        return self.default_response
+
+    def _workspace_path_from_command(self, command: str, filename: str = "package.json") -> str:
+        """Resolve a command's ``cd /workspace`` directory to a file path."""
+        match = re.search(r"cd\s+/workspace(?:/([^\s&]+))?\s*&&", command)
+        directory = match.group(1) if match else ""
+        return self._path(f"{directory}/{filename}" if directory else filename)
+
+    def _apply_npm_pkg_set(self, command: str) -> CommandResult:
+        """Emulate the narrow ``npm pkg set`` operation used by update tools."""
+        try:
+            tokens = shlex.split(command)
+            start = next(
+                index
+                for index in range(len(tokens) - 2)
+                if tokens[index : index + 3] == ["npm", "pkg", "set"]
+            )
+            expression = tokens[start + 3]
+        except (StopIteration, IndexError, ValueError) as exc:
+            return CommandResult(
+                exit_code=2,
+                stdout="",
+                stderr=f"ReplaySandbox: malformed npm pkg set command: {exc}",
+                duration_seconds=0.0,
+            )
+        if "=" not in expression:
+            return CommandResult(
+                exit_code=2,
+                stdout="",
+                stderr="ReplaySandbox: npm pkg set expression is missing '='.",
+                duration_seconds=0.0,
+            )
+        key, value = expression.rsplit("=", 1)
+        key_match = re.fullmatch(r"([A-Za-z0-9_.-]+)\[(.+)\]", key)
+        if not key_match:
+            return CommandResult(
+                exit_code=2,
+                stdout="",
+                stderr=f"ReplaySandbox: unsupported npm key {key!r}.",
+                duration_seconds=0.0,
+            )
+        section, package_name = key_match.groups()
+        package_name = package_name.strip("'\"")
+        manifest_path = self._workspace_path_from_command(command)
+        content = self.files.get(manifest_path)
+        if content is None:
+            return CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"ReplaySandbox: {manifest_path} does not exist.",
+                duration_seconds=0.0,
+            )
+        try:
+            package_json = json.loads(content)
+        except json.JSONDecodeError as exc:
+            return CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"ReplaySandbox: invalid JSON: {exc}",
+                duration_seconds=0.0,
+            )
+        section_data: dict[str, Any] = package_json
+        for section_part in section.split("."):
+            nested = section_data.setdefault(section_part, {})
+            if not isinstance(nested, dict):
+                return CommandResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"ReplaySandbox: manifest section {section!r} is not an object.",
+                    duration_seconds=0.0,
+                )
+            section_data = nested
+        section_data[package_name] = value
+        self.files[manifest_path] = json.dumps(package_json, indent=2) + "\n"
+        if manifest_path not in self.writes:
+            self.writes.append(manifest_path)
+        return CommandResult(exit_code=0, stdout="", stderr="", duration_seconds=0.0)
+
+    def _find_files(self) -> CommandResult:
+        """Return a deterministic repository map for the current files."""
+        return CommandResult(
+            exit_code=0,
+            stdout="\n".join(sorted(self.files)) + ("\n" if self.files else ""),
+            stderr="",
+            duration_seconds=0.0,
+        )
+
+    def _grep_files(self, command: str) -> CommandResult:
+        """Emulate the source-only grep used by investigation tools."""
+        pattern_match = re.search(r"--\s+'(.+?)'\s+'([^']+)'\s*\|", command)
+        pattern = pattern_match.group(1) if pattern_match else ".*"
+        target = pattern_match.group(2).strip("./") if pattern_match else ""
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            compiled = re.compile(re.escape(pattern))
+        lines: list[str] = []
+        for path, content in sorted(self.files.items()):
+            if target and target != "." and not (path == target or path.startswith(target + "/")):
+                continue
+            if Path(path).suffix.lower() not in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if compiled.search(line):
+                    lines.append(f"{path}:{line_number}:{line}")
+        return CommandResult(
+            exit_code=0 if lines else 1,
+            stdout="\n".join(lines) + ("\n" if lines else ""),
+            stderr="",
+            duration_seconds=0.0,
+        )
+
+    def _remove_file(self, command: str) -> CommandResult:
+        """Emulate the narrowly scoped file removal used by stage resets."""
+        try:
+            tokens = shlex.split(command)
+            path = tokens[-1]
+            normalized = self._path(path)
+        except (ValueError, IndexError) as exc:
+            return CommandResult(
+                exit_code=2,
+                stdout="",
+                stderr=f"ReplaySandbox: invalid rm command: {exc}",
+                duration_seconds=0.0,
+            )
+        recursive = "rm -rf --" in command
+        if recursive:
+            prefix = normalized.rstrip("/") + "/"
+            targets = [
+                candidate
+                for candidate in self.files
+                if candidate == normalized or candidate.startswith(prefix)
+            ]
+        else:
+            targets = [normalized]
+        for target in targets:
+            existed = target in self.files
+            self.files.pop(target, None)
+            if existed and target not in self.writes:
+                self.writes.append(target)
+        return CommandResult(exit_code=0, stdout="", stderr="", duration_seconds=0.0)
+
+
+def serialize_tool_events(events: Iterable[Any]) -> list[dict[str, Any]]:
+    """Serialize runtime tool events into canonical golden records.
+
+    Args:
+        events: Objects exposing ``name``, ``args``, and ``content`` fields.
+
+    Returns:
+        JSON-compatible ordered records with ``name``, ``args``, and ``output``.
+    """
+    serialized: list[dict[str, Any]] = []
+    for event in events:
+        args = getattr(event, "args", {}) or {}
+        serialized.append(
+            {
+                "name": str(getattr(event, "name", "")),
+                "args": dict(args) if isinstance(args, Mapping) else {},
+                "output": str(getattr(event, "content", "") or ""),
+            }
+        )
+    return serialized
+
+
+def serialize_result(value: Any) -> Any:
+    """Convert a Pydantic/dataclass/dict result into JSON-compatible data."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, Mapping):
+        return {str(key): serialize_result(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [serialize_result(item) for item in value]
+    return value
+
+
+def format_tool_trace(tool_calls: Iterable[Mapping[str, Any]], label: str = "Observed") -> str:
+    """Render serialized tool calls for a task-completion judge."""
+    calls = list(tool_calls)
+    if not calls:
+        return f"{label} tool trace: none"
+    lines = [f"{label} tool trace:"]
+    for index, call in enumerate(calls, start=1):
+        args = json.dumps(call.get("args", {}) or {}, sort_keys=True, default=str)
+        output = str(call.get("output", "") or "")
+        lines.append(f"{index}. {call.get('name', '')}({args}) -> {output}")
+    return "\n".join(lines)
+
+
+def cached_replay(
+    cache: dict[tuple[str, str], ReplayCapture],
+    component: str,
+    case_id: str,
+    factory: Callable[[], ReplayCapture],
+) -> ReplayCapture:
+    """Run one replay once per component/case within a pytest process."""
+    key = (component, case_id)
+    if key not in cache:
+        cache[key] = factory()
+    return cache[key]
+
+
+def _first_match(pattern: str, text: str, default: str | None = None) -> str | None:
+    """Return the first regex group from text."""
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1) if match else default
+
+
+def _parse_float(pattern: str, text: str, default: float = 0.0) -> float:
+    """Parse a decimal signal from a scenario string."""
+    value = _first_match(pattern, text)
+    try:
+        return float(value) if value is not None else default
+    except ValueError:
+        return default
+
+
+def build_system_context(case: Mapping[str, Any]) -> SystemContext:
+    """Build ``SystemContext`` from structured replay data and scenario text."""
+    replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
+    raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
+    raw = raw if isinstance(raw, Mapping) else {}
+    scenario = str(case.get("scenario", case.get("input", "")))
+    public_facing: bool | None
+    if "public_facing=false" in scenario.lower() or "internal" in scenario.lower():
+        public_facing = False
+    elif "public-facing" in scenario.lower() or "public facing" in scenario.lower():
+        public_facing = True
+    else:
+        public_facing = None
+    environment = "production" if "production" in scenario.lower() else "dev"
+    deployment_os = "windows" if "windows" in scenario.lower() else "linux"
+    sensitivity = _first_match(r"data sensitivity\s*(?:is|=)\s*([A-Za-z]+)", scenario)
+    if sensitivity is None:
+        sensitivity = "high" if "high data sensitivity" in scenario.lower() else "low"
+    raw_tags = raw.get("tags", {})
+    tags = (
+        {str(key): str(value) for key, value in raw_tags.items()}
+        if isinstance(raw_tags, Mapping)
+        else {}
+    )
+    return SystemContext(
+        repo_url=raw.get("repo_url"),
+        base_ref=raw.get("base_ref"),
+        scanned_at=raw.get("scanned_at", datetime(2026, 1, 1, tzinfo=UTC)),
+        environment=raw.get("environment", environment),
+        deployment_os=raw.get("deployment_os", deployment_os),
+        public_facing=raw.get("public_facing", public_facing),
+        primary_language=raw.get("primary_language", "javascript"),
+        deployment_architecture=raw.get("deployment_architecture", "service"),
+        data_sensitivity=raw.get("data_sensitivity", sensitivity),
+        tags=tags,
+    )
+
+
+def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
+    """Build a valid ``VulnerabilityGroup`` for triage replay.
+
+    The replay payload may provide a complete serialized group.  Otherwise the
+    helper derives a conservative typed group from the existing scenario and
+    domain metadata, which keeps historical goldens backwards compatible while
+    the canonical migration is applied.
+    """
+    replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
+    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    raw_group = replay_input.get("group") if isinstance(replay_input, Mapping) else None
+    if isinstance(raw_group, Mapping) and raw_group.get("group_id"):
+        return VulnerabilityGroup.model_validate(raw_group)
+
+    scenario = str(case.get("scenario", case.get("input", "")))
+    vulnerability = case.get("vulnerability_context", {})
+    vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
+    group_id = str(vulnerability.get("group_id") or case.get("case_id") or "replay-group")
+    package = str(
+        vulnerability.get("vulnerable_component")
+        or _first_match(r"(?:uses|dependency|package)\s+([@\w./-]+)@\d", scenario)
+        or _first_match(r"uses\s+([@\w./-]+)", scenario)
+        or "replay-package"
+    )
+    cves = list(vulnerability.get("cve_ids", []) or [])
+    if not cves:
+        cves = re.findall(r"CVE-\d{4}-\d{4,7}", scenario, flags=re.IGNORECASE)
+    ghsas = list(vulnerability.get("ghsa_ids", []) or [])
+    if not ghsas:
+        ghsas = re.findall(r"GHSA-[0-9A-Z-]+", scenario, flags=re.IGNORECASE)
+    version = _first_match(
+        rf"{re.escape(package)}@(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)", scenario
+    )
+    file_path = str(
+        vulnerability.get("file_path")
+        or _first_match(r"(test(?:/|\\)[^\s,]+|lib(?:/|\\)[^\s,]+\.\w+)", scenario)
+        or "package.json"
+    ).rstrip(".,")
+    severity_name = _first_match(r"original scanner severity\s+([A-Z]+)", scenario, "MEDIUM")
+    try:
+        severity = Severity(str(severity_name).upper())
+    except ValueError:
+        severity = Severity.MEDIUM
+    issue_id = f"{group_id}:issue"
+    issue = VulnerabilityIssue(
+        id=uuid5(NAMESPACE_URL, issue_id),
+        finding_id=issue_id,
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        cve_id=cves[0] if cves else None,
+        ghsa_id=ghsas[0] if ghsas else None,
+        severity=severity,
+        file_path=file_path,
+        package_name=package,
+        package_version=version or "0.0.0",
+        ecosystem="npm",
+        message=scenario,
+    )
+    epss = _parse_float(r"EPSS\s*(?:is|=)?\s*(0?\.\d+)", scenario)
+    enrichment = (
+        CVEEnrichment(
+            cve_id=cves[0],
+            epss=epss,
+            epss_percentile=epss,
+            in_kev="kev" in scenario.lower(),
+            enrichment_source="eval_replay",
+        )
+        if cves
+        else None
+    )
+    reachable = "unreachable" not in scenario.lower()
+    return VulnerabilityGroup(
+        group_id=group_id,
+        issue_type=IssueType.SCA,
+        vulnerable_component=package,
+        file_path=file_path,
+        file_paths=[file_path],
+        cve_ids=cves,
+        ghsa_ids=ghsas,
+        versions=[version] if version else ["0.0.0"],
+        dependency_ancestry=[],
+        dependency_versions={package: version or "0.0.0"},
+        parent_contexts=[],
+        sources=[IssueSource.ODC],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[],
+        enrichment=enrichment,
+        is_reachable=reachable,
+    )
+
+
+def build_command_responses(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Build deterministic command routes from replay fixture metadata."""
+    replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
+    raw = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    configured = raw.get("command_responses", {}) if isinstance(raw, Mapping) else {}
+    responses = dict(configured) if isinstance(configured, Mapping) else {}
+    default = raw.get("default_command_response") if isinstance(raw, Mapping) else None
+    if default is not None:
+        responses["__default__"] = default
+    return responses
+
+
+def seed_replay_files(case: Mapping[str, Any]) -> dict[str, str]:
+    """Return workspace files declared by a case, with a safe default repo."""
+    replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
+    raw = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    files = raw.get("workspace_files", {}) if isinstance(raw, Mapping) else {}
+    if isinstance(files, Mapping) and files:
+        return {str(path): str(content) for path, content in files.items()}
+    return {
+        "package.json": json.dumps(
+            {"name": "eval-replay", "version": "1.0.0", "dependencies": {}},
+            indent=2,
+        )
+        + "\n",
+        "package-lock.json": '{"name":"eval-replay","lockfileVersion":3,"packages":{}}\n',
+        "src/replay.js": "module.exports = function replay() { return true; };\n",
+        "test/replay.test.js": "describe('replay', () => { it('passes', () => {}); });\n",
+    }
+
+
+def workspace_temp_root() -> Path:
+    """Return the ignored workspace-local root used by replay temp repos."""
+    root = Path(__file__).resolve().parents[2] / ".pytest-tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def make_temp_repo(repo_root: Path, files: Mapping[str, str]) -> None:
+    """Seed a workspace-local host baseline for worker revert/map helpers."""
+    for path, content in files.items():
+        target = repo_root / normalize_workspace_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(content), encoding="utf-8")
+
+
+def patch_runtime_loop(module: Any, captures: list[Any]) -> Any:
+    """Return a patch context that records a worker/QA bounded-loop result."""
+    original = module.run_bounded_subagent_loop
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        captures.append(result)
+        return result
+
+    return patch.object(module, "run_bounded_subagent_loop", side_effect=wrapped)
+
+
+def output_with_trace(
+    value: Any, tool_calls: list[dict[str, Any]], *, label: str = "Observed"
+) -> str:
+    """Serialize a production result and append its captured tool trace."""
+    payload = json.dumps(serialize_result(value), indent=2, sort_keys=True, default=str)
+    return f"{payload}\n\n{format_tool_trace(tool_calls, label=label)}"

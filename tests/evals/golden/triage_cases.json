@@ -6,7 +6,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "Production, public-facing service with high data sensitivity uses direct dependency cookie@0.4.1. The finding is a valid domain-validation flaw, CVE-2024-47764, with original scanner severity MEDIUM, EPSS 0.08, and confirmed code reachability. No explicit architectural contradiction is present.",
     "completion_task": "Return the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.",
-    "actual_output": "Final post-guardrail triage: is_valid=true; revised_priority=HIGH; is_unreachable_code=false; remediation handoff preserved; triage_method=llm. No guardrail change was needed because the reachable production finding is actionable.",
     "expected_output": "The actionable direct cookie finding remains valid and is prioritized HIGH for remediation.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -14,7 +13,22 @@
         "trajectory": "data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md",
         "observation": "Root Input State contains a direct cookie group with a domain-isolation flaw, cookie version 0.4.2, GHSA-PXG6-PF52-XH8X, and is_reachable=true. The run finished all_passed, although its triage span was triage_skipped, so this supports the finding context rather than an observed LLM verdict."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.\n\nFinding scenario:\nProduction, public-facing service with high data sensitivity uses direct dependency cookie@0.4.1. The finding is a valid domain-validation flaw, CVE-2024-47764, with original scanner severity MEDIUM, EPSS 0.08, and confirmed code reachability. No explicit architectural contradiction is present.",
+    "context": [
+      "Return the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains a direct cookie group with a domain-isolation flaw, cookie version 0.4.2, GHSA-PXG6-PF52-XH8X, and is_reachable=true. The run finished all_passed, although its triage span was triage_skipped, so this supports the finding context rather than an observed LLM verdict.\",\n    \"trajectory\": \"data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final post-guardrail triage: is_valid=true; revised_priority=HIGH; is_unreachable_code=false; remediation handoff preserved; triage_method=llm. No guardrail change was needed because the reachable production finding is actionable.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-clean-ghsa-without-cve",
@@ -23,7 +37,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "A newly published GitHub Advisory has an advisory identifier in the runtime finding but no assigned CVE ID and no EPSS data yet. Its advisory text describes a medium-impact validator URL-validation bypass in a public production API, and the scanner's original severity is MEDIUM. The advisory identifier is intentionally redacted because the GHSA identifier in the closest historical trace refers to a different package.",
     "completion_task": "Return the final triage decision. Completion requires is_valid=true and revised_priority=MEDIUM. Missing CVE and EPSS data must not cause a crash, UNKNOWN priority, or false-positive classification when the advisory impact and system context support MEDIUM.",
-    "actual_output": "Final triage: is_valid=true; revised_priority=MEDIUM; is_unreachable_code=false; remediation handoff preserved; triage_method=llm. The GHSA-only finding remains actionable and the absent CVE and EPSS values do not invalidate it.",
     "expected_output": "A GHSA-only actionable finding with explicit MEDIUM scanner severity is completed as valid MEDIUM triage.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -31,7 +44,22 @@
         "trajectory": "data/trajectories/phase5_20260804T091138Z_4c1a02d9-8e2f-46a3-8206-f324e7583405.md",
         "observation": "Recorded LLM triage spans for GHSA-only base64url evidence produced valid=true with priority UNKNOWN when context and original severity were insufficient. This supports testing graceful GHSA-only handling, but it does not support MEDIUM unless the golden supplies original severity and impact context explicitly."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision. Completion requires is_valid=true and revised_priority=MEDIUM. Missing CVE and EPSS data must not cause a crash, UNKNOWN priority, or false-positive classification when the advisory impact and system context support MEDIUM.\n\nFinding scenario:\nA newly published GitHub Advisory has an advisory identifier in the runtime finding but no assigned CVE ID and no EPSS data yet. Its advisory text describes a medium-impact validator URL-validation bypass in a public production API, and the scanner's original severity is MEDIUM. The advisory identifier is intentionally redacted because the GHSA identifier in the closest historical trace refers to a different package.",
+    "context": [
+      "Return the final triage decision. Completion requires is_valid=true and revised_priority=MEDIUM. Missing CVE and EPSS data must not cause a crash, UNKNOWN priority, or false-positive classification when the advisory impact and system context support MEDIUM.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Recorded LLM triage spans for GHSA-only base64url evidence produced valid=true with priority UNKNOWN when context and original severity were insufficient. This supports testing graceful GHSA-only handling, but it does not support MEDIUM unless the golden supplies original severity and impact context explicitly.\",\n    \"trajectory\": \"data/trajectories/phase5_20260804T091138Z_4c1a02d9-8e2f-46a3-8206-f324e7583405.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final triage: is_valid=true; revised_priority=MEDIUM; is_unreachable_code=false; remediation handoff preserved; triage_method=llm. The GHSA-only finding remains actionable and the absent CVE and EPSS values do not invalidate it.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-guardrail-drop-everything-kev-override",
@@ -40,7 +68,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "An actively exploited CISA KEV vulnerability in production affects @tootallnate/once, CVE-2022-37601, with EPSS 0.85. The raw model says prototype pollution is difficult to trigger on the observed path and proposes MEDIUM.",
     "completion_task": "Return the final post-guardrail decision, not merely the raw model proposal. Completion requires is_valid=true, revised_priority=CRITICAL, priority_confidence_score=1.0, an audit note for the production KEV Drop Everything rule, and a live remediation handoff.",
-    "actual_output": "Raw model proposal: is_valid=true; revised_priority=MEDIUM; reasoning says the prototype-pollution path is hard to trigger. Final post-guardrail triage: is_valid=true; revised_priority=CRITICAL; priority_confidence_score=1.0; the audit note records the production CISA KEV Drop Everything override; remediation handoff preserved.",
     "expected_output": "The deterministic KEV production guardrail recovers the under-ranked raw verdict and completes CRITICAL triage.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -48,7 +75,22 @@
         "trajectory": "data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md",
         "observation": "Root Input State contains @tootallnate/once, but the historical advisory is CVE-2026-3449 with EPSS 0.00112 and CISA KEV false. There is no trace evidence for the proposed CVE-2022-37601 or KEV/0.85 values; this fixture is therefore a deliberate guardrail policy variant."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail decision, not merely the raw model proposal. Completion requires is_valid=true, revised_priority=CRITICAL, priority_confidence_score=1.0, an audit note for the production KEV Drop Everything rule, and a live remediation handoff.\n\nFinding scenario:\nAn actively exploited CISA KEV vulnerability in production affects @tootallnate/once, CVE-2022-37601, with EPSS 0.85. The raw model says prototype pollution is difficult to trigger on the observed path and proposes MEDIUM.",
+    "context": [
+      "Return the final post-guardrail decision, not merely the raw model proposal. Completion requires is_valid=true, revised_priority=CRITICAL, priority_confidence_score=1.0, an audit note for the production KEV Drop Everything rule, and a live remediation handoff.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains @tootallnate/once, but the historical advisory is CVE-2026-3449 with EPSS 0.00112 and CISA KEV false. There is no trace evidence for the proposed CVE-2022-37601 or KEV/0.85 values; this fixture is therefore a deliberate guardrail policy variant.\",\n    \"trajectory\": \"data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=true; revised_priority=MEDIUM; reasoning says the prototype-pollution path is hard to trigger. Final post-guardrail triage: is_valid=true; revised_priority=CRITICAL; priority_confidence_score=1.0; the audit note records the production CISA KEV Drop Everything override; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-guardrail-imminent-threat-public-escalation",
@@ -57,7 +99,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "A public-facing production service uses express-jwt with CVE-2020-15084. The original scanner severity is MEDIUM and EPSS is 0.45, above the imminent-threat threshold. The raw model anchors to MEDIUM and omits the active remote-exploitation signal.",
     "completion_task": "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=CRITICAL, an audit note explaining the public-service imminent-threat escalation, and a preserved remediation handoff.",
-    "actual_output": "Raw model proposal: is_valid=true; revised_priority=MEDIUM. Final post-guardrail triage: is_valid=true; revised_priority=CRITICAL; the public-facing imminent-threat guardrail is recorded in the reasoning; remediation handoff preserved.",
     "expected_output": "The public-facing EPSS threshold override completes the finding at CRITICAL.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -65,7 +106,22 @@
         "trajectory": "data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md",
         "observation": "Root Input State contains the exact express-jwt CVE-2020-15084 group and confirms reachability, but historical original severity is HIGH, EPSS is 0.01054, and CISA KEV is false. Later LLM triage evidence for express-jwt returned valid=true and HIGH. The proposed MEDIUM/.45 input is a policy-boundary variant."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail decision. Completion requires is_valid=true, revised_priority=CRITICAL, an audit note explaining the public-service imminent-threat escalation, and a preserved remediation handoff.\n\nFinding scenario:\nA public-facing production service uses express-jwt with CVE-2020-15084. The original scanner severity is MEDIUM and EPSS is 0.45, above the imminent-threat threshold. The raw model anchors to MEDIUM and omits the active remote-exploitation signal.",
+    "context": [
+      "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=CRITICAL, an audit note explaining the public-service imminent-threat escalation, and a preserved remediation handoff.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains the exact express-jwt CVE-2020-15084 group and confirms reachability, but historical original severity is HIGH, EPSS is 0.01054, and CISA KEV is false. Later LLM triage evidence for express-jwt returned valid=true and HIGH. The proposed MEDIUM/.45 input is a policy-boundary variant.\",\n    \"trajectory\": \"data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=true; revised_priority=MEDIUM. Final post-guardrail triage: is_valid=true; revised_priority=CRITICAL; the public-facing imminent-threat guardrail is recorded in the reasoning; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-guardrail-imminent-threat-internal-escalation",
@@ -74,7 +130,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "An internal microservice has public_facing=false and low data sensitivity and uses axios with SSRF CVE-2023-45857. The original severity is MEDIUM and EPSS is 0.50. The raw model downgrades the issue to LOW because the service is internal.",
     "completion_task": "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=HIGH or higher, explicit recognition that the internal imminent-threat branch enforces a HIGH floor, and a preserved remediation handoff.",
-    "actual_output": "Raw model proposal: is_valid=true; revised_priority=LOW because the service is internal. Final post-guardrail triage: is_valid=true; revised_priority=HIGH; the internal EPSS imminent-threat floor is recorded; remediation handoff preserved.",
     "expected_output": "The internal high-EPSS branch recovers the downgrade and completes at HIGH.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -82,7 +137,22 @@
         "trajectory": null,
         "observation": "No top-level historical trajectory contains axios with CVE-2023-45857. This is a synthetic test of the deterministic internal imminent-threat branch."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail decision. Completion requires is_valid=true, revised_priority=HIGH or higher, explicit recognition that the internal imminent-threat branch enforces a HIGH floor, and a preserved remediation handoff.\n\nFinding scenario:\nAn internal microservice has public_facing=false and low data sensitivity and uses axios with SSRF CVE-2023-45857. The original severity is MEDIUM and EPSS is 0.50. The raw model downgrades the issue to LOW because the service is internal.",
+    "context": [
+      "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=HIGH or higher, explicit recognition that the internal imminent-threat branch enforces a HIGH floor, and a preserved remediation handoff.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No top-level historical trajectory contains axios with CVE-2023-45857. This is a synthetic test of the deterministic internal imminent-threat branch.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=true; revised_priority=LOW because the service is internal. Final post-guardrail triage: is_valid=true; revised_priority=HIGH; the internal EPSS imminent-threat floor is recorded; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-guardrail-floor-downgrade-internal",
@@ -91,7 +161,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "An internal daemon with public_facing=false uses libxmljs and has original scanner severity HIGH with CVSS 8.5. Historical EPSS is negligible at 0.003, below 0.01, and there is no evidence of public exposure. The raw model retains HIGH or CRITICAL.",
     "completion_task": "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=MEDIUM, and an audit note explaining the low-EPSS internal floor downgrade while keeping the finding visible for remediation prioritization.",
-    "actual_output": "Raw model proposal: is_valid=true; revised_priority=HIGH. Final post-guardrail triage: is_valid=true; revised_priority=MEDIUM; the low-EPSS non-public high-severity floor downgrade is recorded; remediation handoff preserved.",
     "expected_output": "The internal low-EPSS floor downgrade completes at MEDIUM.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -99,7 +168,22 @@
         "trajectory": null,
         "observation": "No top-level historical trajectory contains libxmljs with CVE-2015-1823. This is a synthetic test of the deterministic low-EPSS internal downgrade rule."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail decision. Completion requires is_valid=true, revised_priority=MEDIUM, and an audit note explaining the low-EPSS internal floor downgrade while keeping the finding visible for remediation prioritization.\n\nFinding scenario:\nAn internal daemon with public_facing=false uses libxmljs and has original scanner severity HIGH with CVSS 8.5. Historical EPSS is negligible at 0.003, below 0.01, and there is no evidence of public exposure. The raw model retains HIGH or CRITICAL.",
+    "context": [
+      "Return the final post-guardrail decision. Completion requires is_valid=true, revised_priority=MEDIUM, and an audit note explaining the low-EPSS internal floor downgrade while keeping the finding visible for remediation prioritization.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No top-level historical trajectory contains libxmljs with CVE-2015-1823. This is a synthetic test of the deterministic low-EPSS internal downgrade rule.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=true; revised_priority=HIGH. Final post-guardrail triage: is_valid=true; revised_priority=MEDIUM; the low-EPSS non-public high-severity floor downgrade is recorded; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-guardrail-kev-vetoes-false-positive",
@@ -108,7 +192,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "A production service uses jsonwebtoken and is affected by a critical remote-code-execution CVE, CVE-2022-23529, listed in CISA KEV. The raw model speculates that an internal input-validation layer prevents the payload, marks is_valid=false, and assigns a lower priority.",
     "completion_task": "Return the final post-guardrail decision. Completion requires is_valid=true, false_positive_reason cleared, revised_priority=CRITICAL, priority_confidence_score=1.0, and a preserved remediation handoff. Speculative caller defenses cannot veto a production KEV finding.",
-    "actual_output": "Raw model proposal: is_valid=false with a speculative internal-validation reason and revised_priority=HIGH. Final post-guardrail triage: is_valid=true; false_positive_reason=null; revised_priority=CRITICAL; priority_confidence_score=1.0; the KEV production override is recorded; remediation handoff preserved.",
     "expected_output": "The KEV production guardrail vetoes the speculative false positive and completes at CRITICAL.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -116,7 +199,22 @@
         "trajectory": "data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md",
         "observation": "Historical jsonwebtoken groups are present and reachable, but their CVE set is CVE-2015-9235 plus CVE-2022-23539/23540/23541, with EPSS 0.08655 and CISA KEV false. The proposed CVE-2022-23529 KEV signal is not in the trajectories, so this is a guardrail variant built on a historically observed package."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final post-guardrail decision. Completion requires is_valid=true, false_positive_reason cleared, revised_priority=CRITICAL, priority_confidence_score=1.0, and a preserved remediation handoff. Speculative caller defenses cannot veto a production KEV finding.\n\nFinding scenario:\nA production service uses jsonwebtoken and is affected by a critical remote-code-execution CVE, CVE-2022-23529, listed in CISA KEV. The raw model speculates that an internal input-validation layer prevents the payload, marks is_valid=false, and assigns a lower priority.",
+    "context": [
+      "Return the final post-guardrail decision. Completion requires is_valid=true, false_positive_reason cleared, revised_priority=CRITICAL, priority_confidence_score=1.0, and a preserved remediation handoff. Speculative caller defenses cannot veto a production KEV finding.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Historical jsonwebtoken groups are present and reachable, but their CVE set is CVE-2015-9235 plus CVE-2022-23539/23540/23541, with EPSS 0.08655 and CISA KEV false. The proposed CVE-2022-23529 KEV signal is not in the trajectories, so this is a guardrail variant built on a historically observed package.\",\n    \"trajectory\": \"data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=false with a speculative internal-validation reason and revised_priority=HIGH. Final post-guardrail triage: is_valid=true; false_positive_reason=null; revised_priority=CRITICAL; priority_confidence_score=1.0; the KEV production override is recorded; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-rule-a-scanner-tech-mismatch",
@@ -125,7 +223,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "Dependency-Check maps Java Apache Commons IO RCE CVE-2021-37533 onto an npm JavaScript package named commons-io. The project runtime is Node.js and no Java or JVM execution path is present.",
     "completion_task": "Return the final triage decision under Rule A. Completion requires is_valid=false, a clear technology-mismatch false_positive_reason, revised_priority=LOW, and exclusion from the remediation queue. Do not treat the word RCE or the severity label as proof that the Node.js project is affected.",
-    "actual_output": "Final triage: is_valid=false; false_positive_reason=Rule A technology mismatch: the CVE requires the Java Apache Commons IO runtime, while this project runs Node.js; revised_priority=LOW; remediation queue exclusion completed; is_unreachable_code=false.",
     "expected_output": "The Java-to-Node technology mismatch is completed as a LOW false positive and excluded.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -133,7 +230,22 @@
         "trajectory": "data/trajectories/phase5_20260722T085156Z_6265726c-40d5-4c8e-92f0-73d2f29b0f30.md",
         "observation": "Historical post-scan state contains the Java Maven component commons-io:commons-io with CVE-2021-29425 and CVE-2024-47554, version 2.4, and no fix. The package namespace is useful analogue evidence, but the proposed CVE-2021-37533 and npm/Node mapping are not historical facts."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision under Rule A. Completion requires is_valid=false, a clear technology-mismatch false_positive_reason, revised_priority=LOW, and exclusion from the remediation queue. Do not treat the word RCE or the severity label as proof that the Node.js project is affected.\n\nFinding scenario:\nDependency-Check maps Java Apache Commons IO RCE CVE-2021-37533 onto an npm JavaScript package named commons-io. The project runtime is Node.js and no Java or JVM execution path is present.",
+    "context": [
+      "Return the final triage decision under Rule A. Completion requires is_valid=false, a clear technology-mismatch false_positive_reason, revised_priority=LOW, and exclusion from the remediation queue. Do not treat the word RCE or the severity label as proof that the Node.js project is affected.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Historical post-scan state contains the Java Maven component commons-io:commons-io with CVE-2021-29425 and CVE-2024-47554, version 2.4, and no fix. The package namespace is useful analogue evidence, but the proposed CVE-2021-37533 and npm/Node mapping are not historical facts.\",\n    \"trajectory\": \"data/trajectories/phase5_20260722T085156Z_6265726c-40d5-4c8e-92f0-73d2f29b0f30.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final triage: is_valid=false; false_positive_reason=Rule A technology mismatch: the CVE requires the Java Apache Commons IO runtime, while this project runs Node.js; revised_priority=LOW; remediation queue exclusion completed; is_unreachable_code=false.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-rule-b-contradictory-os",
@@ -142,7 +254,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "A privilege-escalation CVE, CVE-2021-38209, strictly requires Linux kernel epoll syscall emulation. Dependency-Check flags it on a Windows Server deployment with deployment_os=windows.",
     "completion_task": "Return the final triage decision under Rule B. Completion requires is_valid=false, an explicit contradictory-OS false_positive_reason, revised_priority=LOW, and exclusion from remediation. Do not ignore the declared deployment operating system.",
-    "actual_output": "Final triage: is_valid=false; false_positive_reason=Rule B contradictory operating system: the advisory requires Linux kernel epoll behavior but deployment_os is Windows; revised_priority=LOW; remediation queue exclusion completed.",
     "expected_output": "The Linux-only finding on Windows is completed as a LOW false positive and excluded.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -150,7 +261,22 @@
         "trajectory": null,
         "observation": "No historical trajectory contains CVE-2021-38209 or a matching Windows/Linux Rule B decision. This is a synthetic scope-contradiction case."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision under Rule B. Completion requires is_valid=false, an explicit contradictory-OS false_positive_reason, revised_priority=LOW, and exclusion from remediation. Do not ignore the declared deployment operating system.\n\nFinding scenario:\nA privilege-escalation CVE, CVE-2021-38209, strictly requires Linux kernel epoll syscall emulation. Dependency-Check flags it on a Windows Server deployment with deployment_os=windows.",
+    "context": [
+      "Return the final triage decision under Rule B. Completion requires is_valid=false, an explicit contradictory-OS false_positive_reason, revised_priority=LOW, and exclusion from remediation. Do not ignore the declared deployment operating system.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No historical trajectory contains CVE-2021-38209 or a matching Windows/Linux Rule B decision. This is a synthetic scope-contradiction case.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final triage: is_valid=false; false_positive_reason=Rule B contradictory operating system: the advisory requires Linux kernel epoll behavior but deployment_os is Windows; revised_priority=LOW; remediation queue exclusion completed.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-rule-c-dev-test-scope-exclusion",
@@ -159,7 +285,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "A command-injection finding in the mocha test-runner CLI is located at test/helpers/runner.js. The run environment is dev and CI, and every affected path is test-only.",
     "completion_task": "Return the final triage decision under Rule C. Completion requires is_valid=false, revised_priority=LOW, false_positive_reason containing the meaning of Treating as out-of-scope for production remediation, and exclusion from the production remediation queue.",
-    "actual_output": "Final triage: is_valid=false; false_positive_reason=Treating as out-of-scope for production remediation because the command-injection path is test-only and the environment is dev/CI; revised_priority=LOW; remediation queue exclusion completed.",
     "expected_output": "The dev/CI test-runner finding is completed as a LOW out-of-scope false positive.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -167,7 +292,22 @@
         "trajectory": null,
         "observation": "No top-level historical trajectory contains mocha with CVE-2021-99999. This is a synthetic Rule C fixture aligned to the deterministic test-path and dev/CI policy."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision under Rule C. Completion requires is_valid=false, revised_priority=LOW, false_positive_reason containing the meaning of Treating as out-of-scope for production remediation, and exclusion from the production remediation queue.\n\nFinding scenario:\nA command-injection finding in the mocha test-runner CLI is located at test/helpers/runner.js. The run environment is dev and CI, and every affected path is test-only.",
+    "context": [
+      "Return the final triage decision under Rule C. Completion requires is_valid=false, revised_priority=LOW, false_positive_reason containing the meaning of Treating as out-of-scope for production remediation, and exclusion from the production remediation queue.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No top-level historical trajectory contains mocha with CVE-2021-99999. This is a synthetic Rule C fixture aligned to the deterministic test-path and dev/CI policy.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final triage: is_valid=false; false_positive_reason=Treating as out-of-scope for production remediation because the command-injection path is test-only and the environment is dev/CI; revised_priority=LOW; remediation queue exclusion completed.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-rule-d-unreachable-code-preserves-validity",
@@ -176,7 +316,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "sqlite3 is declared in the dependency manifest but AST analysis reports is_reachable=false because application code never imports it. The finding is otherwise a real production dependency vulnerability with original severity HIGH.",
     "completion_task": "Return the final triage decision under Rule D. Completion requires is_valid=true, is_unreachable_code=true, revised_priority=HIGH, and continued remediation visibility. Unreachable code must not be converted into a false positive.",
-    "actual_output": "Final triage: is_valid=true; is_unreachable_code=true; revised_priority=HIGH; no false-positive classification was made; remediation visibility preserved.",
     "expected_output": "The unreachable dependency remains a valid HIGH finding while the reachability flag is retained.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -184,7 +323,22 @@
         "trajectory": "data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md",
         "observation": "Historical root groups record reachability explicitly for dependency findings, including cookie is_reachable=true and other groups with null reachability. No sqlite3 CVE-2022-42915 triage verdict is present, so the invariant test is a synthetic extension of the observed reachability field."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision under Rule D. Completion requires is_valid=true, is_unreachable_code=true, revised_priority=HIGH, and continued remediation visibility. Unreachable code must not be converted into a false positive.\n\nFinding scenario:\nsqlite3 is declared in the dependency manifest but AST analysis reports is_reachable=false because application code never imports it. The finding is otherwise a real production dependency vulnerability with original severity HIGH.",
+    "context": [
+      "Return the final triage decision under Rule D. Completion requires is_valid=true, is_unreachable_code=true, revised_priority=HIGH, and continued remediation visibility. Unreachable code must not be converted into a false positive.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Historical root groups record reachability explicitly for dependency findings, including cookie is_reachable=true and other groups with null reachability. No sqlite3 CVE-2022-42915 triage verdict is present, so the invariant test is a synthetic extension of the observed reachability field.\",\n    \"trajectory\": \"data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final triage: is_valid=true; is_unreachable_code=true; revised_priority=HIGH; no false-positive classification was made; remediation visibility preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-speculative-defense-rejection",
@@ -193,7 +347,6 @@
     "provenance_status": "synthetic_policy_case",
     "scenario": "A production Semgrep finding reports remote property injection on an Express route where req.body is used for an unvalidated property lookup. The raw model speculates that the frontend probably validates the field before sending and marks the finding false positive.",
     "completion_task": "Return the final triage decision. Completion requires is_valid=true, revised_priority=HIGH, no speculative false-positive reason, and a preserved remediation handoff. An unproven frontend or caller defense is not an architectural contradiction under Rules A, B, or C.",
-    "actual_output": "Raw model proposal: is_valid=false because the frontend probably validates the field. Final triage: is_valid=true; false_positive_reason=null; revised_priority=HIGH; speculative defense rejected; remediation handoff preserved.",
     "expected_output": "The production SAST finding remains a valid HIGH item because the proposed defense is unproven.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -201,7 +354,22 @@
         "trajectory": null,
         "observation": "No historical trajectory contains the named Express Semgrep route finding. This is a synthetic positive-validity trap for the triage prompt's explicit speculative-defense rule."
       }
-    ]
+    ],
+    "input": "Triage task:\nReturn the final triage decision. Completion requires is_valid=true, revised_priority=HIGH, no speculative false-positive reason, and a preserved remediation handoff. An unproven frontend or caller defense is not an architectural contradiction under Rules A, B, or C.\n\nFinding scenario:\nA production Semgrep finding reports remote property injection on an Express route where req.body is used for an unvalidated property lookup. The raw model speculates that the frontend probably validates the field before sending and marks the finding false positive.",
+    "context": [
+      "Return the final triage decision. Completion requires is_valid=true, revised_priority=HIGH, no speculative false-positive reason, and a preserved remediation handoff. An unproven frontend or caller defense is not an architectural contradiction under Rules A, B, or C.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No historical trajectory contains the named Express Semgrep route finding. This is a synthetic positive-validity trap for the triage prompt's explicit speculative-defense rule.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw model proposal: is_valid=false because the frontend probably validates the field. Final triage: is_valid=true; false_positive_reason=null; revised_priority=HIGH; speculative defense rejected; remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-fallback-llm-timeout-to-deterministic",
@@ -210,7 +378,6 @@
     "provenance_status": "pipeline_boundary_synthetic",
     "scenario": "The LLM call raises APITimeoutError or a rate-limit exception while triaging an otherwise actionable production finding. The remediation run must continue without an empty vulnerability queue.",
     "completion_task": "Complete the triage task despite the LLM service failure. Completion requires a valid deterministic triage result, triage_method=deterministic, evaluation of the dev/test scope rules and guardrails, and a non-empty remediation handoff. Do not propagate the service exception.",
-    "actual_output": "LLM triage failed with a service exception. Recovery completed through deterministic triage: triage_method=deterministic; is_valid=true; revised_priority=HIGH; guardrails and scope rules evaluated; remediation handoff contains the actionable finding; the overall run did not crash.",
     "expected_output": "The service failure is recovered by deterministic triage and the remediation handoff continues.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -218,7 +385,22 @@
         "trajectory": null,
         "observation": "No historical trajectory records APITimeoutError or rate-limit recovery in a triage span. This is a synthetic operational-fallback case; the behavior is specified by the current triage pipeline implementation."
       }
-    ]
+    ],
+    "input": "Triage task:\nComplete the triage task despite the LLM service failure. Completion requires a valid deterministic triage result, triage_method=deterministic, evaluation of the dev/test scope rules and guardrails, and a non-empty remediation handoff. Do not propagate the service exception.\n\nFinding scenario:\nThe LLM call raises APITimeoutError or a rate-limit exception while triaging an otherwise actionable production finding. The remediation run must continue without an empty vulnerability queue.",
+    "context": [
+      "Complete the triage task despite the LLM service failure. Completion requires a valid deterministic triage result, triage_method=deterministic, evaluation of the dev/test scope rules and guardrails, and a non-empty remediation handoff. Do not propagate the service exception.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No historical trajectory records APITimeoutError or rate-limit recovery in a triage span. This is a synthetic operational-fallback case; the behavior is specified by the current triage pipeline implementation.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "LLM triage failed with a service exception. Recovery completed through deterministic triage: triage_method=deterministic; is_valid=true; revised_priority=HIGH; guardrails and scope rules evaluated; remediation handoff contains the actionable finding; the overall run did not crash.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-pipeline-selection-hallucinated-issue-id",
@@ -227,7 +409,6 @@
     "provenance_status": "pipeline_boundary_synthetic",
     "scenario": "The LLM returns an otherwise valid triage verdict but recommends UUID 00000000-0000-0000-0000-000000000099, which is not in group.issues. The group has representative_issue_id b1a10001-0001-0001-0001-000000000001 and one real issue.",
     "completion_task": "Complete the triage-to-Supervisor handoff. Completion requires detecting that the recommended UUID is absent, falling back to the group's representative issue or first real issue, and dispatching that existing issue without a TriageSelectionError.",
-    "actual_output": "Raw triage recommendation used a missing issue ID: 00000000-0000-0000-0000-000000000099. Selection recovery completed: representative_issue_id b1a10001-0001-0001-0001-000000000001 was selected; the existing issue was dispatched; no TriageSelectionError was raised.",
     "expected_output": "The invalid recommendation is recovered by selecting the group's existing representative issue.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -235,7 +416,22 @@
         "trajectory": null,
         "observation": "No historical trajectory records TriageSelectionError or a hallucinated recommended_issue_id. This is a synthetic pipeline-boundary case based on the current selection fallback."
       }
-    ]
+    ],
+    "input": "Triage task:\nComplete the triage-to-Supervisor handoff. Completion requires detecting that the recommended UUID is absent, falling back to the group's representative issue or first real issue, and dispatching that existing issue without a TriageSelectionError.\n\nFinding scenario:\nThe LLM returns an otherwise valid triage verdict but recommends UUID 00000000-0000-0000-0000-000000000099, which is not in group.issues. The group has representative_issue_id b1a10001-0001-0001-0001-000000000001 and one real issue.",
+    "context": [
+      "Complete the triage-to-Supervisor handoff. Completion requires detecting that the recommended UUID is absent, falling back to the group's representative issue or first real issue, and dispatching that existing issue without a TriageSelectionError.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"No historical trajectory records TriageSelectionError or a hallucinated recommended_issue_id. This is a synthetic pipeline-boundary case based on the current selection fallback.\",\n    \"trajectory\": null\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Raw triage recommendation used a missing issue ID: 00000000-0000-0000-0000-000000000099. Selection recovery completed: representative_issue_id b1a10001-0001-0001-0001-000000000001 was selected; the existing issue was dispatched; no TriageSelectionError was raised.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   },
   {
     "case_id": "triage-multicve-conflict-signal-resolution",
@@ -244,7 +440,6 @@
     "provenance_status": "historical_analogue",
     "scenario": "A grouped package contains two CVEs. CVE-1 is low severity and disputed with EPSS 0.001. CVE-2 is high severity, listed in CISA KEV, and has EPSS 0.75. The group must not average the signals or anchor to the first low-risk member.",
     "completion_task": "Complete grouped triage. Completion requires selecting the high-risk KEV member as the primary threat-intelligence signal, evaluating the highest-risk member, returning is_valid=true and revised_priority=CRITICAL, applying the production Drop Everything override, and preserving the group handoff.",
-    "actual_output": "Grouped triage completed: the high-severity KEV CVE-2 with EPSS 0.75 was selected as the primary signal instead of the disputed low-severity CVE-1; is_valid=true; revised_priority=CRITICAL; production Drop Everything override recorded; group remediation handoff preserved.",
     "expected_output": "The grouped KEV candidate controls triage and completes the package at CRITICAL.",
     "expected_completion_pass": true,
     "historical_evidence": [
@@ -252,6 +447,21 @@
         "trajectory": "data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md",
         "observation": "Historical jsonwebtoken Root Input State demonstrates multi-CVE grouping with CVE-2015-9235 and CVE-2022-23539/23540/23541, and later triage reconciliation changes the grouped state. Historical enrichment is EPSS 0.08655 with KEV false, so the low-disputed versus high-KEV pair is a synthetic signal-resolution variant."
       }
-    ]
+    ],
+    "input": "Triage task:\nComplete grouped triage. Completion requires selecting the high-risk KEV member as the primary threat-intelligence signal, evaluating the highest-risk member, returning is_valid=true and revised_priority=CRITICAL, applying the production Drop Everything override, and preserving the group handoff.\n\nFinding scenario:\nA grouped package contains two CVEs. CVE-1 is low severity and disputed with EPSS 0.001. CVE-2 is high severity, listed in CISA KEV, and has EPSS 0.75. The group must not average the signals or anchor to the first low-risk member.",
+    "context": [
+      "Complete grouped triage. Completion requires selecting the high-risk KEV member as the primary threat-intelligence signal, evaluating the highest-risk member, returning is_valid=true and revised_priority=CRITICAL, applying the production Drop Everything override, and preserving the group handoff.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Historical jsonwebtoken Root Input State demonstrates multi-CVE grouping with CVE-2015-9235 and CVE-2022-23539/23540/23541, and later triage reconciliation changes the grouped state. Historical enrichment is EPSS 0.08655 with KEV false, so the low-disputed versus high-KEV pair is a synthetic signal-resolution variant.\",\n    \"trajectory\": \"data/trajectories/phase5_20260722T063315Z_33cec85b-9906-43bb-9edb-a9a3c7b0ec18.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Grouped triage completed: the high-severity KEV CVE-2 with EPSS 0.75 was selected as the primary signal instead of the disputed low-severity CVE-1; is_valid=true; revised_priority=CRITICAL; production Drop Everything override recorded; group remediation handoff preserved.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "system_context": {}
+      }
+    }
   }
 ]

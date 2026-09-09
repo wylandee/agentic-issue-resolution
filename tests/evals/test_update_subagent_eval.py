@@ -1,35 +1,30 @@
-"""DeepEval evaluation suite for the update subagent.
-
-The update worker is evaluated only on the two requested dimensions:
-
-* ``ToolCorrectnessMetric`` checks the exact ordered combined-tool calls.
-* ``TaskCompletionMetric`` checks whether the worker actually completed the
-  supervisor instruction (or correctly failed to complete it after surrender).
-
-The cases are replay fixtures, not live remediation runs.  The live flag is
-therefore required for the LLM-judged task-completion metric, while tool
-correctness remains deterministic.
-"""
+"""DeepEval evaluation suite for the update subagent."""
 
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.evals.adapters import ToolCall
 from tests.evals.conftest import EvalSettings
+from tests.evals.eval_case_helpers import (
+    as_output_text,
+    case_metadata,
+    context_strings,
+    expected_tools,
+    make_tool_calls,
+    observations,
+)
+from tests.evals.golden_schema import load_golden_dataset
+from tests.evals.replay_adapters import replay_update_case
+from tests.evals.replay_harness import ReplayCapture, cached_replay, format_tool_trace
 
 try:
     from deepeval import assert_test
-    from deepeval.metrics import (
-        TaskCompletionMetric as DeepEvalTaskCompletionMetric,
-    )
-    from deepeval.metrics import (
-        ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric,
-    )
+    from deepeval.metrics import TaskCompletionMetric as DeepEvalTaskCompletionMetric
+    from deepeval.metrics import ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric
     from deepeval.test_case import LLMTestCase, ToolCallParams
 
     HAS_DEEPEVAL = True
@@ -44,237 +39,156 @@ except ImportError:
 
 
 _GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "update_subagent_cases.json"
-
-
-def _load_update_cases() -> list[dict[str, Any]]:
-    """Load the dedicated update-subagent golden dataset.
-
-    Returns:
-        A list of update-subagent case dictionaries.  Malformed or missing
-        datasets produce an empty list so pytest can report the unavailable
-        optional evaluation data without importing unrelated suites.
-    """
-    if not _GOLDEN_FILE.exists():
-        return []
-    try:
-        data = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
-        return []
-    if isinstance(data, list):
-        return [case for case in data if case.get("eval_type") == "update_subagent"]
-    if isinstance(data, dict) and isinstance(data.get("cases"), list):
-        return [case for case in data["cases"] if case.get("eval_type") == "update_subagent"]
-    return []
-
-
-_UPDATE_CASES = _load_update_cases()
-_UPDATE_CASE_IDS = [
-    case.get("case_id", f"case_{index}") for index, case in enumerate(_UPDATE_CASES)
+_UPDATE_CASES = [
+    case
+    for case in load_golden_dataset(_GOLDEN_FILE, dataset_name="update_subagent_cases")
+    if case.get("eval_type") == "update_subagent"
 ]
+_UPDATE_CASE_IDS = [case["case_id"] for case in _UPDATE_CASES]
+_LIVE_CACHE: dict[tuple[str, str], ReplayCapture] = {}
 
 
-def _make_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
-    """Convert serialized tool-call records to DeepEval tool calls."""
-    return [
-        ToolCall(
-            name=str(tool_call.get("name", "")),
-            input_parameters=tool_call.get("args", {}) or {},
-            output=tool_call.get("output", ""),
-        )
-        for tool_call in raw_calls
-    ]
+def _make_tool_calls(raw_calls: list[dict[str, Any]]) -> list[Any]:
+    """Convert canonical update tool records."""
+    return make_tool_calls(raw_calls, component="update")
 
 
 def _format_tool_trace(raw_calls: list[dict[str, Any]]) -> str:
-    """Render the replayed tool trace in the worker's observable outcome."""
-    if not raw_calls:
-        return "Observed tool trace: none"
-    lines = ["Observed tool trace:"]
-    for index, tool_call in enumerate(raw_calls, start=1):
-        args = json.dumps(tool_call.get("args", {}) or {}, sort_keys=True)
-        output = str(tool_call.get("output", ""))
-        lines.append(f"{index}. {tool_call.get('name', '')}({args}) -> {output}")
-    return "\n".join(lines)
+    """Render captured update tools."""
+    return format_tool_trace(raw_calls)
 
 
-def build_update_test_case(case: dict[str, Any]) -> LLMTestCase:
-    """Construct a DeepEval test case from one update golden.
-
-    Args:
-        case: Serialized update golden containing the supervisor instruction,
-            observed tool calls, expected tool calls, and outcome metadata.
-
-    Returns:
-        An ``LLMTestCase`` suitable for both requested DeepEval metrics.
-
-    Raises:
-        TypeError: If the golden's tool-call fields are not lists.
-    """
-    tool_calls_raw = case.get("tool_calls", [])
-    expected_tool_calls_raw = case.get("expected_tool_calls", tool_calls_raw)
-    if not isinstance(tool_calls_raw, list) or not isinstance(expected_tool_calls_raw, list):
-        raise TypeError("Update golden tool_calls and expected_tool_calls must be lists.")
-
-    tools_called = _make_tool_calls(tool_calls_raw)
-    expected_tools = _make_tool_calls(expected_tool_calls_raw)
-    instruction = str(case.get("supervisor_instruction", ""))
+def build_update_test_case(
+    case: dict[str, Any],
+    observed_output: Any | None = None,
+    observed_tools: list[dict[str, Any]] | None = None,
+    *,
+    replay_source: str | None = None,
+    capture: ReplayCapture | None = None,
+) -> LLMTestCase:
+    """Construct an update test case from explicit observations."""
+    if observed_output is None and observed_tools is None:
+        final_output, tool_trace, source = observations(case)
+    else:
+        final_output = as_output_text(observed_output or "")
+        tool_trace = list(observed_tools or [])
+        source = replay_source or "production_live"
     target_package = str(case.get("target_package_name", ""))
-    action_status = str(case.get("action_status", "APPLIED"))
-    changed_files = case.get("changed_files", []) or []
-    final_output = str(case.get("final_output", ""))
-    if not final_output:
-        final_output = (
-            f"Status: {action_status}; package={target_package}; "
-            f"changed_files={', '.join(changed_files) if changed_files else 'none'}."
-        )
-
-    actual_output = f"{final_output}\n\n{_format_tool_trace(tool_calls_raw)}"
-    expected_output = str(
-        case.get(
-            "expected_output",
-            "Report whether the requested npm dependency transaction was actually completed.",
-        )
+    metadata = case_metadata(
+        case,
+        component="update_subagent",
+        replay_source=source,
+        actual_tools=tool_trace,
+        capture=capture,
     )
-    provenance = str(case.get("provenance", ""))
-    evaluation_note = str(case.get("evaluation_note", ""))
-    repository_map = str(case.get("repository_map", "(workspace map unavailable)"))
-    completion_task = str(
-        case.get(
-            "completion_task",
-            "Execute the supervisor instruction and do not claim success unless the dependency transaction completed.",
-        )
+    metadata.update(
+        {
+            "target_package_name": target_package,
+            "selected_version": case.get("selected_version"),
+            "dependency_type": case.get("dependency_type"),
+            "action_status": case.get("action_status", "APPLIED"),
+            "attempt_id": case.get("attempt_id"),
+            "task_revision": case.get("task_revision"),
+        }
     )
-
-    metadata = {
-        "case_id": case.get("case_id"),
-        "eval_type": "update_subagent",
-        "golden_kind": case.get("golden_kind"),
-        "proposal": case.get("proposal"),
-        "provenance": provenance,
-        "is_retry": bool(case.get("is_retry", False)),
-        "target_package_name": target_package,
-        "selected_version": case.get("selected_version"),
-        "dependency_type": case.get("dependency_type"),
-        "manifest_path": case.get("manifest_path", "package.json"),
-        "changed_files": changed_files,
-        "action_status": action_status,
-        "expected_completion_pass": bool(case.get("expected_completion_pass", True)),
-    }
-
     return LLMTestCase(
-        name=f"{case.get('case_id')} [Update Subagent]",
-        input=instruction,
-        actual_output=actual_output,
-        expected_output=expected_output,
-        context=[
-            f"Completion task:\n{completion_task}",
-            f"Golden provenance:\n{provenance}",
-            f"Evaluation note:\n{evaluation_note}",
-            f"Deterministic repository map:\n{repository_map}",
-        ],
-        tools_called=tools_called,
-        expected_tools=expected_tools,
+        name=f"{case['case_id']} [Update Subagent]",
+        input=str(case["input"]),
+        actual_output=f"{final_output}\n\n{_format_tool_trace(tool_trace)}",
+        expected_output=str(case["expected_output"]),
+        context=context_strings(
+            case,
+            f"Supervisor instruction: {case.get('supervisor_instruction', '')}",
+            f"Repository map: {case.get('repository_map', '(workspace map unavailable)')}",
+        ),
+        tools_called=_make_tool_calls(tool_trace),
+        expected_tools=expected_tools(case, component="update"),
         additional_metadata=metadata,
     )
 
 
-def _measure_expected_completion(
+def _measure_expected(
     metric: Any,
     test_case: LLMTestCase,
     *,
     expected_pass: bool,
     case_id: str,
+    label: str,
 ) -> None:
-    """Run TaskCompletionMetric and support intentional surrender goldens."""
+    """Measure an expected-positive or expected-negative metric."""
     if expected_pass:
-        if assert_test:
+        if assert_test is not None:
             assert_test(test_case, [metric], run_async=False)
         else:
             metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} did not complete the task."
-        return
-
-    # A surrender is intentionally not a completed dependency update.  Use
-    # the metric directly so pytest can assert the expected negative outcome
-    # without making an expected failure look like a broken test.
-    metric.measure(test_case)
-    assert not metric.is_successful(), (
-        f"Case {case_id!r} was expected to remain incomplete after surrender, "
-        f"but scored {getattr(metric, 'score', None)}."
-    )
+            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
+    else:
+        metric.measure(test_case)
+        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
 
 
-def _measure_expected_tool_correctness(
-    metric: Any,
-    test_case: LLMTestCase,
-    *,
-    expected_pass: bool,
-    case_id: str,
-) -> None:
-    """Run ToolCorrectnessMetric, including intentional retry-trace failures."""
-    if expected_pass:
-        if assert_test:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} used an incorrect tool trace."
-        return
-
-    # Invalid/repeated calls remain in tools_called so the trace tests the
-    # recovery path, but they are omitted from expected_tools.  The metric
-    # should therefore flag the tool trace while TaskCompletionMetric can
-    # independently verify whether the eventual outcome was recovered.
-    metric.measure(test_case)
-    assert not metric.is_successful(), (
-        f"Case {case_id!r} was expected to expose an incorrect tool call, "
-        f"but scored {getattr(metric, 'score', None)}."
+def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
+    """Run one real update worker replay per process."""
+    return cached_replay(
+        _LIVE_CACHE,
+        "update_subagent",
+        str(case["case_id"]),
+        lambda: replay_update_case(case, settings),
     )
 
 
 @pytest.mark.eval
 class TestUpdateSubagentEval:
-    """Evaluate update-subagent goldens with exactly two DeepEval metrics."""
+    """Evaluate update output and worker tool traces."""
 
-    @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
-    def test_tool_correctness_deepeval(self, case: dict[str, Any]) -> None:
-        """Check exact combined-tool names, arguments, and order."""
-        if not HAS_DEEPEVAL or DeepEvalToolCorrectnessMetric is None:
-            pytest.skip("DeepEval is not installed.")
-
-        test_case = build_update_test_case(case)
-        metric = DeepEvalToolCorrectnessMetric(
-            threshold=1.0,
-            evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
-            should_consider_ordering=True,
-            should_exact_match=True,
-        )
-        _measure_expected_tool_correctness(
-            metric,
-            test_case,
-            expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
-            case_id=str(case.get("case_id", "unknown")),
-        )
-
-    @pytest.mark.parametrize("case", _UPDATE_CASES, ids=_UPDATE_CASE_IDS)
-    def test_task_completion_deepeval(
+    @pytest.mark.parametrize("case", _UPDATE_CASES or [{}], ids=_UPDATE_CASE_IDS or ["no_cases"])
+    def test_update_subagent_live_replay_metrics(
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
     ) -> None:
-        """Judge whether the requested update was completed, live only."""
+        """Run the production worker and judge its captured result."""
+        if not case:
+            pytest.skip("No golden update cases available")
         if not eval_settings.is_live:
-            pytest.skip("DeepEval TaskCompletionMetric requires --run-eval-live.")
-        if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
+            pytest.skip("Live replay requires --run-eval-live.")
+        if not HAS_DEEPEVAL:
             pytest.skip("DeepEval is not installed.")
+        if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
+            pytest.skip("OPENAI_API_KEY is required for live evaluations.")
 
-        test_case = build_update_test_case(case)
-        metric = DeepEvalTaskCompletionMetric(
-            threshold=0.70,
-            model=eval_settings.judge_model,
+        capture = _live_capture(case, eval_settings)
+        test_case = build_update_test_case(
+            case,
+            capture.actual_output,
+            capture.actual_tools,
+            replay_source="production_live",
+            capture=capture,
         )
-        _measure_expected_completion(
-            metric,
-            test_case,
-            expected_pass=bool(case.get("expected_completion_pass", True)),
-            case_id=str(case.get("case_id", "unknown")),
-        )
+        if DeepEvalToolCorrectnessMetric is not None:
+            tool_metric = DeepEvalToolCorrectnessMetric(
+                threshold=1.0,
+                evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
+                should_consider_ordering=True,
+                should_exact_match=True,
+            )
+            _measure_expected(
+                tool_metric,
+                test_case,
+                expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
+                case_id=str(case["case_id"]),
+                label="update tool correctness",
+            )
+        if DeepEvalTaskCompletionMetric is not None:
+            task_metric = DeepEvalTaskCompletionMetric(
+                threshold=0.70,
+                model=eval_settings.judge_model,
+                async_mode=False,
+            )
+            _measure_expected(
+                task_metric,
+                test_case,
+                expected_pass=bool(case.get("expected_completion_pass", True)),
+                case_id=str(case["case_id"]),
+                label="update task completion",
+            )

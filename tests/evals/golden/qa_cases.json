@@ -4,7 +4,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md §494",
+    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
     "historical_evidence": [
       "debug UPDATE_VERSION used version_bump with install, scan, and tests passing; terminal output passed=true."
     ],
@@ -36,21 +36,20 @@
       "package-lock.json"
     ],
     "worker_action_summary": "Updated debug to the committed fixed version and synchronized the lockfile.",
-    "tool_calls": [
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:debug:UPDATE_VERSION",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: emit passed=true because install, scanner clearance, and tests all pass.",
+    "input": "Review one version-bump QA group and emit one evidence-backed evaluation. A clean pass requires install, scanner clearance, and tests to pass.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
+      "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "emit_qa_evaluation",
         "args": {
@@ -63,28 +62,68 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:debug:UPDATE_VERSION",
-      "passed": true,
-      "failure_category": null,
-      "retry_feedback": null,
-      "semantic_security_review": null,
-      "test_attribution": null
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:debug:UPDATE_VERSION",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null,
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:debug:UPDATE_VERSION",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": true,
-      "failure_category": null
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: emit passed=true because install, scanner clearance, and tests all pass."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:debug:UPDATE_VERSION",
+          "vulnerable_component": "debug",
+          "file_path": "package.json",
+          "cve_ids": [],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check completed; no target identifiers remain.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_update_fail_install",
     "eval_type": "qa_critic",
     "golden_kind": "historical_gate_normalized_terminal",
     "evidence_status": "historical_legacy",
-    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md §157",
+    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
     "historical_evidence": [
       "npm install FAILED with EOVERRIDE: the ws@8.21.1 override conflicted with the direct dependency; old trace had no current terminal emit."
     ],
@@ -118,68 +157,109 @@
       "package-lock.json"
     ],
     "worker_action_summary": "Attempted the committed express-jwt version update.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-      "passed": false,
-      "failure_category": "peer_conflict",
-      "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "peer_conflict"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance."
+    "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance.",
+    "input": "Review one version-bump QA group and emit a failure evaluation when dependency installation fails. Use the install log to provide peer-conflict guidance.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+        "passed": false,
+        "failure_category": "peer_conflict",
+        "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+            "passed": false,
+            "failure_category": "peer_conflict",
+            "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null,
+          "package_manifest_state": "present",
+          "package_graph_state": null
+        },
+        "execution_logs": {
+          "install_log": "npm install FAILED (exit 1). EOVERRIDE: Override for ws@8.21.1 conflicts with direct dependency.",
+          "scan_summary": "Security scan not run because installation failed.",
+          "test_output": "Unit tests not run because installation failed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_update_fail_scanner",
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md §§128, 162",
+    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
     "historical_evidence": [
       "fstream UPDATE_VERSION had install=true, scan=false, tests=true; remaining CVE-2019-13173 and GHSA-XF7W-R453-M56C produced a security_flag terminal evaluation."
     ],
@@ -218,68 +298,114 @@
       "package-lock.json"
     ],
     "worker_action_summary": "Updated fstream, but the target scan remained unresolved.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        },
-        "output": "Remaining target identifiers: CVE-2019-13173, GHSA-XF7W-R453-M56C."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:fstream:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:fstream:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:fstream:UPDATE_VERSION",
-      "passed": false,
-      "failure_category": "security_flag",
-      "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "security_flag"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query scan and emit a security_flag failure for the remaining target identifiers."
+    "expected_output": "Complete: query scan and emit a security_flag failure for the remaining target identifiers.",
+    "input": "Review one version-bump QA group and emit a security failure when the scanner still reports target identifiers, even if install and tests pass.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2019-13173\",\n    \"GHSA-XF7W-R453-M56C\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "scan"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "scan"
+          },
+          "output": "Remaining target identifiers: CVE-2019-13173, GHSA-XF7W-R453-M56C."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:fstream:UPDATE_VERSION",
+          "vulnerable_component": "fstream",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2019-13173"
+          ],
+          "ghsa_ids": [
+            "GHSA-XF7W-R453-M56C"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2019-13173",
+            "GHSA-XF7W-R453-M56C"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check found remaining fstream identifiers CVE-2019-13173 and GHSA-XF7W-R453-M56C.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_update_fail_unit_tests",
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427, 473",
+    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
     "historical_evidence": [
       "express-jwt UPDATE_VERSION had install=true, scan=true, tests=false; TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35 was categorized as breaking_change."
     ],
@@ -313,68 +439,109 @@
       "package-lock.json"
     ],
     "worker_action_summary": "Updated express-jwt to v8 without migrating the legacy default import.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        },
-        "output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
-      "passed": false,
-      "failure_category": "breaking_change",
-      "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "breaking_change"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query tests and emit a breaking_change failure tied to the express-jwt v8 import error."
+    "expected_output": "Complete: query tests and emit a breaking_change failure tied to the express-jwt v8 import error.",
+    "input": "Review one version-bump QA group and emit a failure evaluation when the updated package causes a test regression. Cite the exact API diagnostic.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "tests"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check cleared the target identifiers.",
+          "test_output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_initial_pass_semantic_scan_fail",
     "eval_type": "qa_critic",
     "golden_kind": "normalized_initial_semantic_pass",
     "evidence_status": "normalized",
-    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md §508 plus synthetic case_5_initial_workaround_pass.",
+    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
     "historical_evidence": [
       "Historical mitigation_code_workaround evidence had install=true, scan=false, tests=true but no terminal emit; existing initial fixture used scanner not_run. This case normalizes scanner failure as nonblocking under initial_code_workaround."
     ],
@@ -409,49 +576,21 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "Migrated the named express-jwt export and constrained the accepted algorithm.",
-    "tool_calls": [
-      {
-        "name": "generate_workspace_diff",
-        "args": {},
-        "output": "Diff shows the API migration and algorithm allowlist."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "lib/insecurity.ts"
-        },
-        "output": "Authorization call uses the named export and explicit algorithm."
-      },
-      {
-        "name": "search_codebase_pattern",
-        "args": {
-          "search_pattern": "express-jwt|expressJwt|expressjwt",
-          "target_directory": "lib"
-        },
-        "output": "No legacy default-import call site remains."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": {
-            "verdict": "pass",
-            "reasoning": "The source diff and context show that the vulnerable authorization path is blocked while tests pass.",
-            "evidence_refs": [
-              "lib/insecurity.ts diff",
-              "lib/insecurity.ts:50-65",
-              "search_codebase_pattern"
-            ]
-          },
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null,
+      "semantic_security_review": "pass"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: use source/diff evidence and emit passed=true even though the initial-workaround scanner identifier remains nonblocking.",
+    "input": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked and tests must pass before emitting pass.",
+    "context": [
+      "Golden provenance:\nClosest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
+      "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2020-15084\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "generate_workspace_diff",
         "args": {}
@@ -489,30 +628,101 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-      "passed": true,
-      "failure_category": null,
-      "retry_feedback": null,
-      "semantic_security_review": {
-        "verdict": "pass",
-        "reasoning": "The source diff and context show that the vulnerable authorization path is blocked while tests pass.",
-        "evidence_refs": [
-          "lib/insecurity.ts diff",
-          "lib/insecurity.ts:50-65",
-          "search_codebase_pattern"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null,
+        "semantic_security_review": {
+          "verdict": "pass",
+          "reasoning": "The source diff and context show that the vulnerable authorization path is blocked while tests pass.",
+          "evidence_refs": [
+            "lib/insecurity.ts diff",
+            "lib/insecurity.ts:50-65",
+            "search_codebase_pattern"
+          ]
+        },
+        "test_attribution": null
       },
-      "test_attribution": null
+      "actual_tools": [
+        {
+          "name": "generate_workspace_diff",
+          "args": {},
+          "output": "Diff shows the API migration and algorithm allowlist."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "lib/insecurity.ts"
+          },
+          "output": "Authorization call uses the named export and explicit algorithm."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "express-jwt|expressJwt|expressjwt",
+            "target_directory": "lib"
+          },
+          "output": "No legacy default-import call site remains."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": {
+              "verdict": "pass",
+              "reasoning": "The source diff and context show that the vulnerable authorization path is blocked while tests pass.",
+              "evidence_refs": [
+                "lib/insecurity.ts diff",
+                "lib/insecurity.ts:50-65",
+                "search_codebase_pattern"
+              ]
+            },
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": true,
-      "failure_category": null,
-      "semantic_security_review": "pass"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: use source/diff evidence and emit passed=true even though the initial-workaround scanner identifier remains nonblocking."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "vulnerable_component": "express-jwt",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2020-15084"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Target identifier remains; nonblocking under initial_code_workaround.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_initial_fail_install",
@@ -552,61 +762,102 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "Initial code workaround cannot be evaluated because the dependency environment failed to install.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-      "passed": false,
-      "failure_category": "peer_conflict",
-      "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "peer_conflict"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance."
+    "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance.",
+    "input": "Review one initial code-workaround group and emit a failure evaluation when installation fails. Do not claim semantic validation when the environment cannot be installed.",
+    "context": [
+      "Golden provenance:\nSynthetic initial_code_workaround case normalized from the EOVERRIDE install failure in data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "passed": false,
+        "failure_category": "peer_conflict",
+        "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "passed": false,
+            "failure_category": "peer_conflict",
+            "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "vulnerable_component": "express-jwt",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null,
+          "package_manifest_state": "present",
+          "package_graph_state": null
+        },
+        "execution_logs": {
+          "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
+          "scan_summary": "Security scan not run because installation failed.",
+          "test_output": "Unit tests not run because installation failed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_initial_fail_semantic",
@@ -675,49 +926,21 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "The initial workaround changed sanitizeSecure control flow but retained a vulnerable sanitize-html usage/configuration.",
-    "tool_calls": [
-      {
-        "name": "generate_workspace_diff",
-        "args": {},
-        "output": "Diff does not remove the vulnerable execution path."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "lib/insecurity.ts"
-        },
-        "output": "lib/insecurity.ts still exposes a vulnerable sanitize-html sanitizer path."
-      },
-      {
-        "name": "search_codebase_pattern",
-        "args": {
-          "search_pattern": "sanitize-html|sanitizeHtml|sanitizeSecure|transformTags|allowedIframeHostnames",
-          "target_directory": "lib"
-        },
-        "output": "The vulnerable sanitize-html call/configuration remains reachable."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
-          "semantic_security_review": {
-            "verdict": "fail",
-            "reasoning": "The source search and context show that sanitize-html remains used without a complete mitigation for the vulnerable behavior, so the initial workaround does not block the vulnerable path.",
-            "evidence_refs": [
-              "lib/insecurity.ts diff",
-              "lib/insecurity.ts:13-75",
-              "search_codebase_pattern"
-            ]
-          },
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag",
+      "semantic_security_review": "fail"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable.",
+    "input": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked; emit a security failure when semantic review fails.",
+    "context": [
+      "Golden provenance:\nSynthetic initial-code-workaround semantic-failure case recontextualized from the sanitize-html findings in data/trajectories/phase5_20260818T042956Z_c46e0277-fe40-48ab-a91e-fe9041fdcd87.md; the historical run records sanitize-html 1.4.2 and the lib/insecurity.ts sanitizer path.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"fail\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2022-25887\",\n    \"CVE-2016-1000237\",\n    \"CVE-2019-25225\",\n    \"CVE-2021-26540\",\n    \"CVE-2021-26539\",\n    \"CVE-2024-21501\",\n    \"CVE-2017-16016\",\n    \"GHSA-CGFM-XWP7-2CVR\",\n    \"GHSA-3J7M-HMH3-9JMP\",\n    \"GHSA-QHXP-V273-G94H\",\n    \"GHSA-MJXR-4V3X-Q3M4\",\n    \"GHSA-RJQQ-98F6-6J3R\",\n    \"GHSA-RM97-X556-Q36H\",\n    \"GHSA-XC6G-GGRC-QQ4R\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "generate_workspace_diff",
         "args": {}
@@ -755,30 +978,128 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
-      "passed": false,
-      "failure_category": "security_flag",
-      "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
-      "semantic_security_review": {
-        "verdict": "fail",
-        "reasoning": "The source search and context show that sanitize-html remains used without a complete mitigation for the vulnerable behavior, so the initial workaround does not block the vulnerable path.",
-        "evidence_refs": [
-          "lib/insecurity.ts diff",
-          "lib/insecurity.ts:13-75",
-          "search_codebase_pattern"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
+        "semantic_security_review": {
+          "verdict": "fail",
+          "reasoning": "The source search and context show that sanitize-html remains used without a complete mitigation for the vulnerable behavior, so the initial workaround does not block the vulnerable path.",
+          "evidence_refs": [
+            "lib/insecurity.ts diff",
+            "lib/insecurity.ts:13-75",
+            "search_codebase_pattern"
+          ]
+        },
+        "test_attribution": null
       },
-      "test_attribution": null
+      "actual_tools": [
+        {
+          "name": "generate_workspace_diff",
+          "args": {},
+          "output": "Diff does not remove the vulnerable execution path."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "lib/insecurity.ts"
+          },
+          "output": "lib/insecurity.ts still exposes a vulnerable sanitize-html sanitizer path."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "sanitize-html|sanitizeHtml|sanitizeSecure|transformTags|allowedIframeHostnames",
+            "target_directory": "lib"
+          },
+          "output": "The vulnerable sanitize-html call/configuration remains reachable."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
+            "semantic_security_review": {
+              "verdict": "fail",
+              "reasoning": "The source search and context show that sanitize-html remains used without a complete mitigation for the vulnerable behavior, so the initial workaround does not block the vulnerable path.",
+              "evidence_refs": [
+                "lib/insecurity.ts diff",
+                "lib/insecurity.ts:13-75",
+                "search_codebase_pattern"
+              ]
+            },
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": false,
-      "failure_category": "security_flag",
-      "semantic_security_review": "fail"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "vulnerable_component": "sanitize-html",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2022-25887",
+            "CVE-2016-1000237",
+            "CVE-2019-25225",
+            "CVE-2021-26540",
+            "CVE-2021-26539",
+            "CVE-2024-21501",
+            "CVE-2017-16016"
+          ],
+          "ghsa_ids": [
+            "GHSA-CGFM-XWP7-2CVR",
+            "GHSA-3J7M-HMH3-9JMP",
+            "GHSA-QHXP-V273-G94H",
+            "GHSA-MJXR-4V3X-Q3M4",
+            "GHSA-RJQQ-98F6-6J3R",
+            "GHSA-RM97-X556-Q36H",
+            "GHSA-XC6G-GGRC-QQ4R"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2022-25887",
+            "CVE-2016-1000237",
+            "CVE-2019-25225",
+            "CVE-2021-26540",
+            "CVE-2021-26539",
+            "CVE-2024-21501",
+            "CVE-2017-16016",
+            "GHSA-CGFM-XWP7-2CVR",
+            "GHSA-3J7M-HMH3-9JMP",
+            "GHSA-QHXP-V273-G94H",
+            "GHSA-MJXR-4V3X-Q3M4",
+            "GHSA-RJQQ-98F6-6J3R",
+            "GHSA-RM97-X556-Q36H",
+            "GHSA-XC6G-GGRC-QQ4R"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Target identifiers remain; nonblocking under initial_code_workaround.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_initial_fail_unit_tests",
@@ -841,63 +1162,27 @@
     "execution_logs": {
       "install_log": "npm install succeeded.",
       "scan_summary": "Target identifier remains nonblocking under initial_code_workaround.",
-    "test_output": "npm test FAILED (exit 1). insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]. Expected normalized output BlaBlubb, but received escaped nested markup."
+      "test_output": "npm test FAILED (exit 1). insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]. Expected normalized output BlaBlubb, but received escaped nested markup."
     },
     "changed_files": [
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "The initial sanitize-html workaround blocks the vulnerable sanitizer behavior, but the replacement changes required sanitizeSecure behavior.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        },
-        "output": "npm test FAILED (exit 1). insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]. Expected normalized output BlaBlubb, but received escaped nested markup."
-      },
-      {
-        "name": "generate_workspace_diff",
-        "args": {},
-        "output": "Diff shows the sanitize-html workaround and the recursive sanitization change."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "lib/insecurity.ts"
-        },
-        "output": "The sanitizer workaround changes behavior required by the sanitizeSecure regression test."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
-          "semantic_security_review": {
-            "verdict": "pass",
-            "reasoning": "The changed source blocks the vulnerable sanitize-html behavior, but the required sanitizeSecure test demonstrates a functional regression.",
-            "evidence_refs": [
-              "lib/insecurity.ts diff",
-              "lib/insecurity.ts:13-75",
-              "query_qa_logs tests"
-            ]
-          },
-          "test_attribution": {
-            "verdict": "responsible",
-            "responsible_group_ids": [
-              "sca:package.json:sanitize-html:CODE_WORKAROUND"
-            ],
-            "failed_tests": [
-              "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
-            ],
-            "reasoning": "The failing test exercises the changed sanitizeSecure behavior."
-          }
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "breaking_change",
+      "semantic_security_review": "pass"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: query tests, inspect the workaround, and emit a breaking_change failure while preserving the passing semantic review.",
+    "input": "Review one initial code-workaround group and emit failure when the workaround passes semantic review but regresses required behavior.",
+    "context": [
+      "Golden provenance:\nSynthetic initial-code-workaround test-failure case recontextualized from the sanitize-html QA regression in data/trajectories/phase5_20260818T042956Z_c46e0277-fe40-48ab-a91e-fe9041fdcd87.md; the historical run targets sanitize-html 1.4.2 and lib/insecurity.ts.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false,\n  \"semantic_security_review\": \"pass\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2022-25887\",\n    \"CVE-2016-1000237\",\n    \"CVE-2019-25225\",\n    \"CVE-2021-26540\",\n    \"CVE-2021-26539\",\n    \"CVE-2024-21501\",\n    \"CVE-2017-16016\",\n    \"GHSA-CGFM-XWP7-2CVR\",\n    \"GHSA-3J7M-HMH3-9JMP\",\n    \"GHSA-QHXP-V273-G94H\",\n    \"GHSA-MJXR-4V3X-Q3M4\",\n    \"GHSA-RJQQ-98F6-6J3R\",\n    \"GHSA-RM97-X556-Q36H\",\n    \"GHSA-XC6G-GGRC-QQ4R\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": false\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "query_qa_logs",
         "args": {
@@ -943,46 +1228,152 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
-      "passed": false,
-      "failure_category": "breaking_change",
-      "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
-      "semantic_security_review": {
-        "verdict": "pass",
-        "reasoning": "The changed source blocks the vulnerable sanitize-html behavior, but the required sanitizeSecure test demonstrates a functional regression.",
-        "evidence_refs": [
-          "lib/insecurity.ts diff",
-          "lib/insecurity.ts:13-75",
-          "query_qa_logs tests"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
+        "semantic_security_review": {
+          "verdict": "pass",
+          "reasoning": "The changed source blocks the vulnerable sanitize-html behavior, but the required sanitizeSecure test demonstrates a functional regression.",
+          "evidence_refs": [
+            "lib/insecurity.ts diff",
+            "lib/insecurity.ts:13-75",
+            "query_qa_logs tests"
+          ]
+        },
+        "test_attribution": {
+          "verdict": "responsible",
+          "responsible_group_ids": [
+            "sca:package.json:sanitize-html:CODE_WORKAROUND"
+          ],
+          "failed_tests": [
+            "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
+          ],
+          "reasoning": "The failing test exercises the changed sanitizeSecure behavior."
+        }
       },
-      "test_attribution": {
-        "verdict": "responsible",
-        "responsible_group_ids": [
-          "sca:package.json:sanitize-html:CODE_WORKAROUND"
-        ],
-        "failed_tests": [
-          "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
-        ],
-        "reasoning": "The failing test exercises the changed sanitizeSecure behavior."
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "npm test FAILED (exit 1). insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]. Expected normalized output BlaBlubb, but received escaped nested markup."
+        },
+        {
+          "name": "generate_workspace_diff",
+          "args": {},
+          "output": "Diff shows the sanitize-html workaround and the recursive sanitization change."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "lib/insecurity.ts"
+          },
+          "output": "The sanitizer workaround changes behavior required by the sanitizeSecure regression test."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
+            "semantic_security_review": {
+              "verdict": "pass",
+              "reasoning": "The changed source blocks the vulnerable sanitize-html behavior, but the required sanitizeSecure test demonstrates a functional regression.",
+              "evidence_refs": [
+                "lib/insecurity.ts diff",
+                "lib/insecurity.ts:13-75",
+                "query_qa_logs tests"
+              ]
+            },
+            "test_attribution": {
+              "verdict": "responsible",
+              "responsible_group_ids": [
+                "sca:package.json:sanitize-html:CODE_WORKAROUND"
+              ],
+              "failed_tests": [
+                "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
+              ],
+              "reasoning": "The failing test exercises the changed sanitizeSecure behavior."
+            }
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "vulnerable_component": "sanitize-html",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2022-25887",
+            "CVE-2016-1000237",
+            "CVE-2019-25225",
+            "CVE-2021-26540",
+            "CVE-2021-26539",
+            "CVE-2024-21501",
+            "CVE-2017-16016"
+          ],
+          "ghsa_ids": [
+            "GHSA-CGFM-XWP7-2CVR",
+            "GHSA-3J7M-HMH3-9JMP",
+            "GHSA-QHXP-V273-G94H",
+            "GHSA-MJXR-4V3X-Q3M4",
+            "GHSA-RJQQ-98F6-6J3R",
+            "GHSA-RM97-X556-Q36H",
+            "GHSA-XC6G-GGRC-QQ4R"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2022-25887",
+            "CVE-2016-1000237",
+            "CVE-2019-25225",
+            "CVE-2021-26540",
+            "CVE-2021-26539",
+            "CVE-2024-21501",
+            "CVE-2017-16016",
+            "GHSA-CGFM-XWP7-2CVR",
+            "GHSA-3J7M-HMH3-9JMP",
+            "GHSA-QHXP-V273-G94H",
+            "GHSA-MJXR-4V3X-Q3M4",
+            "GHSA-RJQQ-98F6-6J3R",
+            "GHSA-RM97-X556-Q36H",
+            "GHSA-XC6G-GGRC-QQ4R"
+          ],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Target identifier remains nonblocking under initial_code_workaround.",
+          "test_output": "npm test FAILED (exit 1). insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]. Expected normalized output BlaBlubb, but received escaped nested markup."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
       }
-    },
-    "expected_qa_verdict": {
-      "passed": false,
-      "failure_category": "breaking_change",
-      "semantic_security_review": "pass"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query tests, inspect the workaround, and emit a breaking_change failure while preserving the passing semantic review."
+    }
   },
   {
     "case_id": "qa_workaround_pivot_pass_update_api",
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §§891, 918",
+    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
     "historical_evidence": [
       "express-jwt CODE_WORKAROUND used migration_code_workaround with install, scan, and tests passing; terminal output passed=true with semantic review pass."
     ],
@@ -1015,29 +1406,21 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "Migrated the express-jwt API after the update path broke the legacy default import.",
-    "tool_calls": [
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": {
-            "verdict": "pass",
-            "reasoning": "The migration uses the supported express-jwt API, scanner identifiers are cleared, and tests pass.",
-            "evidence_refs": [
-              "lib/insecurity.ts diff",
-              "Dependency-Check scan",
-              "npm test"
-            ]
-          },
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null,
+      "semantic_security_review": "pass"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: emit passed=true with semantic review pass because the migrated API, scanner, and tests are successful.",
+    "input": "Review one migration code-workaround pivot after an update API break and emit pass only when the migrated API, scanner clearance, and tests are all successful.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
+      "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "emit_qa_evaluation",
         "args": {
@@ -1058,30 +1441,79 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-      "passed": true,
-      "failure_category": null,
-      "retry_feedback": null,
-      "semantic_security_review": {
-        "verdict": "pass",
-        "reasoning": "The migration uses the supported express-jwt API, scanner identifiers are cleared, and tests pass.",
-        "evidence_refs": [
-          "lib/insecurity.ts diff",
-          "Dependency-Check scan",
-          "npm test"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null,
+        "semantic_security_review": {
+          "verdict": "pass",
+          "reasoning": "The migration uses the supported express-jwt API, scanner identifiers are cleared, and tests pass.",
+          "evidence_refs": [
+            "lib/insecurity.ts diff",
+            "Dependency-Check scan",
+            "npm test"
+          ]
+        },
+        "test_attribution": null
       },
-      "test_attribution": null
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": {
+              "verdict": "pass",
+              "reasoning": "The migration uses the supported express-jwt API, scanner identifiers are cleared, and tests pass.",
+              "evidence_refs": [
+                "lib/insecurity.ts diff",
+                "Dependency-Check scan",
+                "npm test"
+              ]
+            },
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": true,
-      "failure_category": null,
-      "semantic_security_review": "pass"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: emit passed=true with semantic review pass because the migrated API, scanner, and tests are successful."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "vulnerable_component": "express-jwt",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check cleared the target identifiers.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_pivot_fail_install",
@@ -1121,68 +1553,109 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "Migration pivot was dispatched, but the dependency environment could not be installed.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-      "passed": false,
-      "failure_category": "peer_conflict",
-      "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "peer_conflict"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query install and emit a peer_conflict failure for the unavailable migration environment."
+    "expected_output": "Complete: query install and emit a peer_conflict failure for the unavailable migration environment.",
+    "input": "Review one migration code-workaround pivot and emit a peer-conflict failure when installation fails before the pivot can be validated.",
+    "context": [
+      "Golden provenance:\nSynthetic migration_code_workaround pivot normalized from the EOVERRIDE install gate in data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "passed": false,
+        "failure_category": "peer_conflict",
+        "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "passed": false,
+            "failure_category": "peer_conflict",
+            "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "vulnerable_component": "express-jwt",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null,
+          "package_manifest_state": "present",
+          "package_graph_state": null
+        },
+        "execution_logs": {
+          "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
+          "scan_summary": "Security scan not run because installation failed.",
+          "test_output": "Unit tests not run because installation failed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_pivot_fail_unit_tests",
     "eval_type": "qa_critic",
     "golden_kind": "normalized_pivot_test_failure",
     "evidence_status": "normalized",
-    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §891.",
+    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
     "historical_evidence": [
       "The update trace proves the express-jwt API test break and the pivot trace proves the subsequent migration path; no single exported trace contains this exact pivot plus terminal test-failure pair."
     ],
@@ -1215,68 +1688,109 @@
       "lib/insecurity.ts"
     ],
     "worker_action_summary": "The pivot attempted the express-jwt API migration, but the authorization integration still fails tests.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        },
-        "output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
-      "passed": false,
-      "failure_category": "breaking_change",
-      "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "breaking_change"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query tests and emit a breaking_change failure tied to the API integration error."
+    "expected_output": "Complete: query tests and emit a breaking_change failure tied to the API integration error.",
+    "input": "Review one migration code-workaround pivot and emit a breaking-change failure when the migrated API still causes required tests to fail.",
+    "context": [
+      "Golden provenance:\nComposite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "tests"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "vulnerable_component": "express-jwt",
+          "file_path": "lib/insecurity.ts",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check cleared the target identifiers.",
+          "test_output": "npm test FAILED (exit 1). TypeError: import_express_jwt.default is not a function at lib/insecurity.ts:54:35."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_package_removal_pass",
     "eval_type": "qa_critic",
     "golden_kind": "normalized_nofix_package_removal_pass",
     "evidence_status": "historical_worker_plus_synthetic_qa",
-    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z §23; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
     "historical_evidence": [
       "Worker removed notevil and its consumer and passed cumulative validation. The corresponding QA trace timed out during scanning, so this golden requires authoritative scan clearance rather than treating that trace as a QA pass."
     ],
@@ -1313,74 +1827,117 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "Removed notevil from the manifest and graph and removed its consumer call.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install succeeded after authorized package removal."
-      },
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        },
-        "output": "Dependency-Check completed; target identifiers cleared."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": true,
-      "failure_category": null,
-      "retry_feedback": null,
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": true,
       "failure_category": null
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: confirm install, scan, package absence, and tests before emitting passed=true."
+    "expected_output": "Complete: confirm install, scan, package absence, and tests before emitting passed=true.",
+    "input": "Review one no-fix package-removal group. Confirm install, scanner clearance, package absence from manifest and graph, and tests before emitting pass.",
+    "context": [
+      "Golden provenance:\nWorker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+      "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"absent\",\n  \"package_manifest_state\": \"absent\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "scan"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null,
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install succeeded after authorized package removal."
+        },
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "scan"
+          },
+          "output": "Dependency-Check completed; target identifiers cleared."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "absent",
+          "package_graph_state": "absent"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded after authorized package removal.",
+          "scan_summary": "Dependency-Check completed; target identifiers cleared.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_package_removal_fail_install",
@@ -1424,61 +1981,104 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "Package-removal attempt cannot be validated because installation failed.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "peer_conflict",
-      "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "peer_conflict"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query install and emit a peer_conflict failure without claiming package-removal validation."
+    "expected_output": "Complete: query install and emit a peer_conflict failure without claiming package-removal validation.",
+    "input": "Review one no-fix package-removal group and emit a peer-conflict failure when the install gate fails. Because installation failed, manifest and resolved-graph post-state are unknown; do not claim package-removal validation succeeded.",
+    "context": [
+      "Golden provenance:\nSynthetic no_fix_package_removal case; historical phase5_20260819T030725Z QA evidence had a scan timeout rather than an install failure.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": null,\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "peer_conflict",
+        "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "peer_conflict",
+            "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null,
+          "package_manifest_state": null,
+          "package_graph_state": null
+        },
+        "execution_logs": {
+          "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
+          "scan_summary": "Security scan not run because installation failed.",
+          "test_output": "Unit tests not run because installation failed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_package_removal_fail_dependency_tree",
@@ -1525,61 +2125,107 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "Attempted no-fix package removal, but notevil remains in the authorized manifest and resolved dependency graph.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        },
-        "output": "Dependency-Check reports CVE-2021-23771 and GHSA-8G4M-CJM2-96WQ; the resolved dependency graph still contains notevil."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "scan"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "security_flag",
-      "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "security_flag"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query scan and emit a security_flag failure because notevil remains in the manifest and resolved dependency graph."
+    "expected_output": "Complete: query scan and emit a security_flag failure because notevil remains in the manifest and resolved dependency graph.",
+    "input": "Review one no-fix package-removal group. Installation and tests pass, but package removal fails when the vulnerable package remains in the manifest or resolved dependency graph and the scanner still reports target identifiers. Query the scan log, then emit a security_flag failure.",
+    "context": [
+      "Golden provenance:\nSynthetic no_fix_package_removal graph-retention case derived from the package-removal policy in src/remediation_engine/orchestration/qa_critic.py and the historical no-fix package-removal context in data/trajectories/phase5_20260819T030725Z_340808b8-5eeb-4c4d-a673-8fc737bbe4d6.md.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "scan"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "scan"
+          },
+          "output": "Dependency-Check reports CVE-2021-23771 and GHSA-8G4M-CJM2-96WQ; the resolved dependency graph still contains notevil."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2021-23771",
+            "GHSA-8G4M-CJM2-96WQ"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded after the package-removal attempt.",
+          "scan_summary": "Dependency-Check reports CVE-2021-23771 and GHSA-8G4M-CJM2-96WQ; the resolved dependency graph still contains notevil.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_package_removal_fail_unit_tests",
@@ -1623,108 +2269,151 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "Removed notevil but left a consumer import in routes/b2bOrder.ts.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        },
-        "output": "npm test FAILED (exit 1). Error: Cannot find module notevil from routes/b2bOrder.ts."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        },
-        "output": "routes/b2bOrder.ts still imports notevil."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
-          "semantic_security_review": null,
-          "test_attribution": {
-            "verdict": "responsible",
-            "responsible_group_ids": [
-              "sca:package.json:notevil:NO_FIX"
-            ],
-            "failed_tests": [
-              "Cannot find module notevil from routes/b2bOrder.ts"
-            ],
-            "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
-          }
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        }
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "breaking_change",
-          "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
-          "semantic_security_review": null,
-          "test_attribution": {
-            "verdict": "responsible",
-            "responsible_group_ids": [
-              "sca:package.json:notevil:NO_FIX"
-            ],
-            "failed_tests": [
-              "Cannot find module notevil from routes/b2bOrder.ts"
-            ],
-            "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
-          }
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "breaking_change",
-      "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
-      "semantic_security_review": null,
-      "test_attribution": {
-        "verdict": "responsible",
-        "responsible_group_ids": [
-          "sca:package.json:notevil:NO_FIX"
-        ],
-        "failed_tests": [
-          "Cannot find module notevil from routes/b2bOrder.ts"
-        ],
-        "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
-      }
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "breaking_change"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query tests, confirm the stale consumer import, and emit a breaking_change failure."
+    "expected_output": "Complete: query tests, confirm the stale consumer import, and emit a breaking_change failure.",
+    "input": "Review one no-fix package-removal group and emit a failure when required tests fail after package removal. Use the test log and consumer source to provide actionable feedback.",
+    "context": [
+      "Golden provenance:\nExisting synthetic case_9_no_fix_package_removal_test_fail, with prior package-removal failure context in data/trajectories/phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"absent\",\n  \"package_manifest_state\": \"absent\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "tests"
+        }
+      },
+      {
+        "name": "read_file_context",
+        "args": {
+          "file_path": "routes/b2bOrder.ts"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
+          "semantic_security_review": null,
+          "test_attribution": {
+            "verdict": "responsible",
+            "responsible_group_ids": [
+              "sca:package.json:notevil:NO_FIX"
+            ],
+            "failed_tests": [
+              "Cannot find module notevil from routes/b2bOrder.ts"
+            ],
+            "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
+          }
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
+        "semantic_security_review": null,
+        "test_attribution": {
+          "verdict": "responsible",
+          "responsible_group_ids": [
+            "sca:package.json:notevil:NO_FIX"
+          ],
+          "failed_tests": [
+            "Cannot find module notevil from routes/b2bOrder.ts"
+          ],
+          "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
+        }
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "npm test FAILED (exit 1). Error: Cannot find module notevil from routes/b2bOrder.ts."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "routes/b2bOrder.ts"
+          },
+          "output": "routes/b2bOrder.ts still imports notevil."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
+            "semantic_security_review": null,
+            "test_attribution": {
+              "verdict": "responsible",
+              "responsible_group_ids": [
+                "sca:package.json:notevil:NO_FIX"
+              ],
+              "failed_tests": [
+                "Cannot find module notevil from routes/b2bOrder.ts"
+              ],
+              "reasoning": "The failed test is directly caused by the removed package remaining referenced by the changed consumer."
+            }
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "absent",
+          "package_graph_state": "absent"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded after package removal.",
+          "scan_summary": "Dependency-Check cleared the target identifiers.",
+          "test_output": "npm test FAILED (exit 1). Error: Cannot find module notevil from routes/b2bOrder.ts."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_pivot_pass_semantic_scan",
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_pass",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md §§59,99.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install/tests passing, residual target identifiers as expected/nonblocking, and semantic review pass after removing notevil/node:vm usage from routes/b2bOrder.ts."
     ],
@@ -1762,50 +2451,21 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "After package-removal exhaustion, removed the notevil/node:vm vulnerable path while retaining the package.",
-    "tool_calls": [
-      {
-        "name": "generate_workspace_diff",
-        "args": {},
-        "output": "Diff removes the notevil and node:vm vulnerable execution path."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        },
-        "output": "The changed route no longer imports or invokes the vulnerable evaluator."
-      },
-      {
-        "name": "search_codebase_pattern",
-        "args": {
-          "search_pattern": "notevil|safeEval|vm.runInContext",
-          "target_directory": "."
-        },
-        "output": "No remaining vulnerable call pattern was found."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": true,
-          "failure_category": null,
-          "retry_feedback": null,
-          "semantic_security_review": {
-            "verdict": "pass",
-            "reasoning": "The package remains present as required, but source/diff evidence shows the vulnerable execution path was removed; tests pass and residual target identifiers are expected for this policy.",
-            "evidence_refs": [
-              "routes/b2bOrder.ts diff",
-              "routes/b2bOrder.ts source context",
-              "search_codebase_pattern",
-              "Dependency-Check residual identifiers"
-            ]
-          },
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null,
+      "semantic_security_review": "pass"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: inspect source/diff and emit passed=true because the retained package is allowed and the vulnerable path is removed despite residual scanner identifiers.",
+    "input": "Review one no-fix code-removal pivot after package removal was exhausted. Residual target identifiers are expected and nonblocking; emit pass only when source/diff evidence proves the vulnerable path was removed and tests pass.",
+    "context": [
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
+      "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "generate_workspace_diff",
         "args": {}
@@ -1844,31 +2504,106 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": true,
-      "failure_category": null,
-      "retry_feedback": null,
-      "semantic_security_review": {
-        "verdict": "pass",
-        "reasoning": "The package remains present as required, but source/diff evidence shows the vulnerable execution path was removed; tests pass and residual target identifiers are expected for this policy.",
-        "evidence_refs": [
-          "routes/b2bOrder.ts diff",
-          "routes/b2bOrder.ts source context",
-          "search_codebase_pattern",
-          "Dependency-Check residual identifiers"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null,
+        "semantic_security_review": {
+          "verdict": "pass",
+          "reasoning": "The package remains present as required, but source/diff evidence shows the vulnerable execution path was removed; tests pass and residual target identifiers are expected for this policy.",
+          "evidence_refs": [
+            "routes/b2bOrder.ts diff",
+            "routes/b2bOrder.ts source context",
+            "search_codebase_pattern",
+            "Dependency-Check residual identifiers"
+          ]
+        },
+        "test_attribution": null
       },
-      "test_attribution": null
+      "actual_tools": [
+        {
+          "name": "generate_workspace_diff",
+          "args": {},
+          "output": "Diff removes the notevil and node:vm vulnerable execution path."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "routes/b2bOrder.ts"
+          },
+          "output": "The changed route no longer imports or invokes the vulnerable evaluator."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "notevil|safeEval|vm.runInContext",
+            "target_directory": "."
+          },
+          "output": "No remaining vulnerable call pattern was found."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": {
+              "verdict": "pass",
+              "reasoning": "The package remains present as required, but source/diff evidence shows the vulnerable execution path was removed; tests pass and residual target identifiers are expected for this policy.",
+              "evidence_refs": [
+                "routes/b2bOrder.ts diff",
+                "routes/b2bOrder.ts source context",
+                "search_codebase_pattern",
+                "Dependency-Check residual identifiers"
+              ]
+            },
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": true,
-      "failure_category": null,
-      "semantic_security_review": "pass"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: inspect source/diff and emit passed=true because the retained package is allowed and the vulnerable path is removed despite residual scanner identifiers."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "routes/b2bOrder.ts",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2021-23771",
+            "GHSA-8G4M-CJM2-96WQ"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Target identifiers remain and are nonblocking under no_fix_code_removal.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_pivot_fail_install",
@@ -1910,68 +2645,111 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "No-fix source pivot cannot be evaluated because installation failed.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        },
-        "output": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "install"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "peer_conflict",
-          "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
-          "semantic_security_review": null,
-          "test_attribution": null
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "peer_conflict",
-      "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
-      "semantic_security_review": null,
-      "test_attribution": null
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "peer_conflict"
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query install and emit a peer_conflict failure without claiming semantic validation."
+    "expected_output": "Complete: query install and emit a peer_conflict failure without claiming semantic validation.",
+    "input": "Review one no-fix code-removal pivot and emit a peer-conflict failure when installation fails. Package retention is expected for this policy, but the failed install leaves post-install graph validation and source-level semantic validation incomplete.",
+    "context": [
+      "Golden provenance:\nSynthetic no_fix_code_removal pivot; historical no-fix typed artifacts establish the retained-package policy but not this install-failure outcome.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "install"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "peer_conflict",
+        "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
+        "semantic_security_review": null,
+        "test_attribution": null
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "install"
+          },
+          "output": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "peer_conflict",
+            "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "routes/b2bOrder.ts",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null,
+          "package_manifest_state": "present",
+          "package_graph_state": null
+        },
+        "execution_logs": {
+          "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
+          "scan_summary": "Security scan not run because installation failed.",
+          "test_output": "Unit tests not run because installation failed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_pivot_fail_semantic",
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md §114.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install=true, scanner success with residual identifiers, tests=true, and semantic review fail because notevil remains imported and invoked."
     ],
@@ -2009,49 +2787,21 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "No-fix source pivot retained the vulnerable notevil execution path.",
-    "tool_calls": [
-      {
-        "name": "generate_workspace_diff",
-        "args": {},
-        "output": "Diff does not demonstrate removal of the vulnerable path."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        },
-        "output": "The route still imports and invokes notevil."
-      },
-      {
-        "name": "search_codebase_pattern",
-        "args": {
-          "search_pattern": "notevil|safeEval|vm.runInContext",
-          "target_directory": "."
-        },
-        "output": "The vulnerable call pattern remains reachable."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
-          "semantic_security_review": {
-            "verdict": "fail",
-            "reasoning": "The source context and search show that notevil remains imported and invoked; residual scanner identifiers are expected, but the vulnerable path is not removed.",
-            "evidence_refs": [
-              "routes/b2bOrder.ts diff",
-              "routes/b2bOrder.ts source context",
-              "search_codebase_pattern"
-            ]
-          },
-          "test_attribution": null
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag",
+      "semantic_security_review": "fail"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable.",
+    "input": "Review one no-fix code-removal pivot. Residual target identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is removed; emit a security failure when semantic review fails.",
+    "context": [
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"fail\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
-    "expected_tool_calls": [
+    "expected_tools": [
       {
         "name": "generate_workspace_diff",
         "args": {}
@@ -2089,37 +2839,111 @@
         }
       }
     ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "security_flag",
-      "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
-      "semantic_security_review": {
-        "verdict": "fail",
-        "reasoning": "The source context and search show that notevil remains imported and invoked; residual scanner identifiers are expected, but the vulnerable path is not removed.",
-        "evidence_refs": [
-          "routes/b2bOrder.ts diff",
-          "routes/b2bOrder.ts source context",
-          "search_codebase_pattern"
-        ]
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
+        "semantic_security_review": {
+          "verdict": "fail",
+          "reasoning": "The source context and search show that notevil remains imported and invoked; residual scanner identifiers are expected, but the vulnerable path is not removed.",
+          "evidence_refs": [
+            "routes/b2bOrder.ts diff",
+            "routes/b2bOrder.ts source context",
+            "search_codebase_pattern"
+          ]
+        },
+        "test_attribution": null
       },
-      "test_attribution": null
+      "actual_tools": [
+        {
+          "name": "generate_workspace_diff",
+          "args": {},
+          "output": "Diff does not demonstrate removal of the vulnerable path."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "routes/b2bOrder.ts"
+          },
+          "output": "The route still imports and invokes notevil."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "notevil|safeEval|vm.runInContext",
+            "target_directory": "."
+          },
+          "output": "The vulnerable call pattern remains reachable."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
+            "semantic_security_review": {
+              "verdict": "fail",
+              "reasoning": "The source context and search show that notevil remains imported and invoked; residual scanner identifiers are expected, but the vulnerable path is not removed.",
+              "evidence_refs": [
+                "routes/b2bOrder.ts diff",
+                "routes/b2bOrder.ts source context",
+                "search_codebase_pattern"
+              ]
+            },
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
     },
-    "expected_qa_verdict": {
-      "passed": false,
-      "failure_category": "security_flag",
-      "semantic_security_review": "fail"
-    },
-    "expected_task_completion_pass": true,
-    "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable."
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "routes/b2bOrder.ts",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2021-23771",
+            "GHSA-8G4M-CJM2-96WQ"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Target identifiers remain and are nonblocking under no_fix_code_removal.",
+          "test_output": "npm test passed."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_workaround_nofix_pivot_fail_unit_tests",
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_test_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md §114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
     "historical_evidence": [
       "The no-fix stage-two evaluation records install=true, scanner success, and tests_passed=false; failed tests include /rest/chat and test/api/chat.test.ts, while semantic review was inconclusive."
     ],
@@ -2154,112 +2978,6 @@
       "routes/b2bOrder.ts"
     ],
     "worker_action_summary": "The no-fix source pivot reached QA, but the required test suite failed.",
-    "tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        },
-        "output": "npm test FAILED. Failed tests include /rest/chat and test/api/chat.test.ts with SyntaxError/async activity diagnostics."
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        },
-        "output": "Source context is available, but semantic attribution remains inconclusive."
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
-          "semantic_security_review": {
-            "verdict": "inconclusive",
-            "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
-            "evidence_refs": [
-              "query_qa_logs tests",
-              "routes/b2bOrder.ts source context"
-            ]
-          },
-          "test_attribution": {
-            "verdict": "inconclusive",
-            "responsible_group_ids": [],
-            "failed_tests": [
-              "/rest/chat",
-              "test/api/chat.test.ts"
-            ],
-            "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
-          }
-        },
-        "output": "SUCCESS: Recorded QA evaluation."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "query_qa_logs",
-        "args": {
-          "log_type": "tests"
-        }
-      },
-      {
-        "name": "read_file_context",
-        "args": {
-          "file_path": "routes/b2bOrder.ts"
-        }
-      },
-      {
-        "name": "emit_qa_evaluation",
-        "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
-          "passed": false,
-          "failure_category": "security_flag",
-          "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
-          "semantic_security_review": {
-            "verdict": "inconclusive",
-            "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
-            "evidence_refs": [
-              "query_qa_logs tests",
-              "routes/b2bOrder.ts source context"
-            ]
-          },
-          "test_attribution": {
-            "verdict": "inconclusive",
-            "responsible_group_ids": [],
-            "failed_tests": [
-              "/rest/chat",
-              "test/api/chat.test.ts"
-            ],
-            "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
-          }
-        }
-      }
-    ],
-    "qa_output": {
-      "task_id": "sca:package.json:notevil:NO_FIX",
-      "passed": false,
-      "failure_category": "security_flag",
-      "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
-      "semantic_security_review": {
-        "verdict": "inconclusive",
-        "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
-        "evidence_refs": [
-          "query_qa_logs tests",
-          "routes/b2bOrder.ts source context"
-        ]
-      },
-      "test_attribution": {
-        "verdict": "inconclusive",
-        "responsible_group_ids": [],
-        "failed_tests": [
-          "/rest/chat",
-          "test/api/chat.test.ts"
-        ],
-        "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
-      }
-    },
     "expected_qa_verdict": {
       "passed": false,
       "failure_category": "security_flag",
@@ -2267,14 +2985,163 @@
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "expected_output": "Complete: query tests and emit a security_flag failure while preserving inconclusive semantic and test attribution."
+    "expected_output": "Complete: query tests and emit a security_flag failure while preserving inconclusive semantic and test attribution.",
+    "input": "Review one no-fix code-removal pivot and emit a failure when required unit tests fail. Preserve the historical evidence that semantic review and test attribution were inconclusive.",
+    "context": [
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+      "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"inconclusive\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "tests"
+        }
+      },
+      {
+        "name": "read_file_context",
+        "args": {
+          "file_path": "routes/b2bOrder.ts"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "sca:package.json:notevil:NO_FIX",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
+          "semantic_security_review": {
+            "verdict": "inconclusive",
+            "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
+            "evidence_refs": [
+              "query_qa_logs tests",
+              "routes/b2bOrder.ts source context"
+            ]
+          },
+          "test_attribution": {
+            "verdict": "inconclusive",
+            "responsible_group_ids": [],
+            "failed_tests": [
+              "/rest/chat",
+              "test/api/chat.test.ts"
+            ],
+            "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
+          }
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "sca:package.json:notevil:NO_FIX",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
+        "semantic_security_review": {
+          "verdict": "inconclusive",
+          "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
+          "evidence_refs": [
+            "query_qa_logs tests",
+            "routes/b2bOrder.ts source context"
+          ]
+        },
+        "test_attribution": {
+          "verdict": "inconclusive",
+          "responsible_group_ids": [],
+          "failed_tests": [
+            "/rest/chat",
+            "test/api/chat.test.ts"
+          ],
+          "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
+        }
+      },
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "npm test FAILED. Failed tests include /rest/chat and test/api/chat.test.ts with SyntaxError/async activity diagnostics."
+        },
+        {
+          "name": "read_file_context",
+          "args": {
+            "file_path": "routes/b2bOrder.ts"
+          },
+          "output": "Source context is available, but semantic attribution remains inconclusive."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "sca:package.json:notevil:NO_FIX",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
+            "semantic_security_review": {
+              "verdict": "inconclusive",
+              "reasoning": "The test gate is failed, but the available source evidence does not establish a complete semantic security conclusion.",
+              "evidence_refs": [
+                "query_qa_logs tests",
+                "routes/b2bOrder.ts source context"
+              ]
+            },
+            "test_attribution": {
+              "verdict": "inconclusive",
+              "responsible_group_ids": [],
+              "failed_tests": [
+                "/rest/chat",
+                "test/api/chat.test.ts"
+              ],
+              "reasoning": "The failed tests are recorded, but the historical evidence does not conclusively attribute them to this group."
+            }
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:notevil:NO_FIX",
+          "vulnerable_component": "notevil",
+          "file_path": "routes/b2bOrder.ts",
+          "cve_ids": [
+            "CVE-2021-23771"
+          ],
+          "ghsa_ids": [
+            "GHSA-8G4M-CJM2-96WQ"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present"
+        },
+        "execution_logs": {
+          "install_log": "npm install succeeded.",
+          "scan_summary": "Dependency-Check cleared the target identifiers.",
+          "test_output": "npm test FAILED. Failed tests include /rest/chat and test/api/chat.test.ts with SyntaxError/async activity diagnostics."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   },
   {
     "case_id": "qa_surrender_max_tool_call_rounds",
     "eval_type": "qa_critic",
     "golden_kind": "maximum_subagent_tool_call_rounds",
     "evidence_status": "boundary_only",
-    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md §212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
     "historical_evidence": [
       "MAX_SUBAGENT_TOOL_CALL_ROUNDS is 24; the historical run contained 24 LLM rounds and 29 raw tool spans and ended without a final answer or terminal emit."
     ],
@@ -2303,9 +3170,6 @@
     },
     "changed_files": [],
     "worker_action_summary": "The bounded run surrendered without a final QA evaluation.",
-    "final_output": "Subagent exceeded the maximum tool-call rounds without reaching a final answer. observed_round_count=24; observed_tool_count=29.",
-    "tool_calls": [],
-    "expected_tool_calls": [],
     "expected_qa_verdict": {
       "completed": false,
       "terminal_tool": "emit_qa_evaluation"
@@ -2315,6 +3179,48 @@
     "tool_correctness_applicable": false,
     "observed_round_count": 24,
     "observed_tool_count": 29,
-    "expected_output": "Incomplete: the execution bound was reached without a terminal emit_qa_evaluation call."
+    "expected_output": "Incomplete: the execution bound was reached without a terminal emit_qa_evaluation call.",
+    "input": "Complete the assigned QA evaluation for the vulnerability group. A bounded run that reaches 24 tool-call rounds without emit_qa_evaluation is incomplete and must not claim QA completion.",
+    "context": [
+      "Golden provenance:\ndata/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+      "Expected QA verdict:\n{\n  \"completed\": false,\n  \"terminal_tool\": \"emit_qa_evaluation\"\n}",
+      "Deterministic execution context:\n{\n  \"install_passed\": null,\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Subagent exceeded the maximum tool-call rounds without reaching a final answer. observed_round_count=24; observed_tool_count=29.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "vulnerability_context": {
+          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "cve_ids": [
+            "CVE-2020-15084"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": null,
+          "scanner_execution_status": "not_run",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [],
+          "tests_passed": null
+        },
+        "execution_logs": {
+          "install_log": "Execution ended at the subagent round bound.",
+          "scan_summary": "No terminal QA evaluation was emitted.",
+          "test_output": "No terminal QA evaluation was emitted."
+        },
+        "workspace_files": {
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/eval.ts": "export function evaluate() { return true; }\n",
+          "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
+        }
+      }
+    }
   }
 ]

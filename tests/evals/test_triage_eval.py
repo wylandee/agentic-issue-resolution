@@ -1,21 +1,35 @@
-"""DeepEval TaskCompletionMetric evaluation for the triage subagent.
-
-The fixtures are replayed triage outcomes. The live suite intentionally uses
-one judge metric: TaskCompletionMetric. Scenario-specific expectations are
-part of each case's task input because DeepEval's task-completion metric does
-not consume expected_output or arbitrary metadata when judging.
-"""
+"""DeepEval task-completion evaluation for the triage agent."""
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
+from remediation_engine.settings import AppSettings
+from remediation_engine.triage.agent import run_triage
+from remediation_engine.triage.pipeline import select_issues_for_remediation
 from tests.evals.conftest import EvalSettings
+from tests.evals.eval_case_helpers import (
+    as_output_text,
+    case_metadata,
+    context_strings,
+    observations,
+)
+from tests.evals.golden_schema import load_golden_dataset
+from tests.evals.replay_adapters import replay_triage_case
+from tests.evals.replay_harness import (
+    ReplayCapture,
+    build_system_context,
+    build_vulnerability_group,
+    cached_replay,
+)
 
 try:
     from deepeval import assert_test
@@ -32,132 +46,174 @@ except ImportError:
 
 
 _GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "triage_cases.json"
-
-
-def _load_triage_cases() -> list[dict[str, Any]]:
-    """Load the task-completion-only triage golden dataset.
-
-    Returns:
-        Triage golden dictionaries from the dedicated JSON file. Missing or
-        malformed data is represented by an empty list so the optional live
-        eval can be skipped cleanly.
-    """
-    if not _GOLDEN_FILE.exists():
-        return []
-    try:
-        data = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
-        return []
-    if isinstance(data, list):
-        return [
-            case
-            for case in data
-            if isinstance(case, dict) and case.get("eval_type", "triage") == "triage"
-        ]
-    if isinstance(data, dict) and isinstance(data.get("cases"), list):
-        return [
-            case
-            for case in data["cases"]
-            if isinstance(case, dict) and case.get("eval_type", "triage") == "triage"
-        ]
-    return []
-
-
-_TRIAGE_CASES = _load_triage_cases()
-_TRIAGE_CASE_IDS = [
-    case.get("case_id", f"case_{index}") for index, case in enumerate(_TRIAGE_CASES)
+_TRIAGE_CASES = [
+    case
+    for case in load_golden_dataset(_GOLDEN_FILE, dataset_name="triage_cases")
+    if case.get("eval_type", "triage") == "triage"
 ]
+_TRIAGE_CASE_IDS = [case["case_id"] for case in _TRIAGE_CASES]
+_DETERMINISTIC_ONLY_CASE_IDS = frozenset(
+    {
+        "triage-fallback-llm-timeout-to-deterministic",
+        "triage-pipeline-selection-hallucinated-issue-id",
+    }
+)
+_LIVE_CACHE: dict[tuple[str, str], ReplayCapture] = {}
 
 
 def _as_output_text(value: Any) -> str:
-    """Serialize a replayed outcome for DeepEval."""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, indent=2, sort_keys=True)
+    """Keep the historical helper name while using shared serialization."""
+    return as_output_text(value)
 
 
-def build_triage_test_case(case: dict[str, Any]) -> LLMTestCase:
-    """Build a DeepEval test case from a triage golden.
+def build_triage_test_case(
+    case: dict[str, Any],
+    observed_output: Any | None = None,
+    observed_tools: list[dict[str, Any]] | None = None,
+    *,
+    replay_source: str | None = None,
+    capture: ReplayCapture | None = None,
+) -> LLMTestCase:
+    """Build a task-completion case from explicit observations.
 
     Args:
-        case: Golden dictionary containing scenario, completion_task,
-            actual_output, and optional provenance metadata.
+        case: Canonical triage golden case.
+        observed_output: Production output supplied by a live adapter.  When
+            omitted, the explicit offline fixture branch is used.
+        observed_tools: Production tool events, normally empty for triage.
+        replay_source: Optional observation provenance label.
+        capture: Optional capture used only to enrich metadata.
 
     Returns:
-        An LLMTestCase with no tool calls and the replayed final outcome.
-
-    Raises:
-        ValueError: If the case does not contain a task or observable outcome.
+        A DeepEval-compatible task case.
     """
     case_id = str(case.get("case_id", "unknown"))
-    scenario = str(case.get("scenario", "")).strip()
-    completion_task = str(case.get("completion_task", "")).strip()
-    actual_output = _as_output_text(case.get("actual_output", "")).strip()
-    if not scenario or not completion_task or not actual_output:
-        raise ValueError(
-            f"Golden case {case_id!r} must contain scenario, completion_task, and actual_output."
-        )
+    if observed_output is None and observed_tools is None:
+        actual_output, actual_tools, source = observations(case)
+    else:
+        actual_output = as_output_text(observed_output or "")
+        actual_tools = list(observed_tools or [])
+        source = replay_source or "production_live"
+    if not str(case.get("input", "")).strip() or not str(actual_output).strip():
+        raise ValueError(f"Golden case {case_id!r} must contain input and an observed output.")
 
-    task_input = f"Triage task:\n{completion_task}\n\nFinding scenario:\n{scenario}"
-    expected_output = _as_output_text(case.get("expected_output", "")).strip() or None
-    evidence = case.get("historical_evidence", [])
-    evidence_text = json.dumps(evidence, indent=2, sort_keys=True)
-    metadata = {
-        "case_id": case_id,
-        "eval_type": "triage",
-        "golden_kind": case.get("golden_kind"),
-        "provenance_status": case.get("provenance_status"),
-        "expected_completion_pass": bool(case.get("expected_completion_pass", True)),
-    }
-
+    metadata = case_metadata(
+        case,
+        component="triage",
+        replay_source=source,
+        actual_tools=actual_tools,
+        capture=capture,
+    )
+    metadata.update(
+        {
+            "golden_kind": case.get("golden_kind"),
+            "triage_metadata": case.get("triage_metadata", {}),
+            "expected_negative": not bool(case.get("expected_completion_pass", True)),
+        }
+    )
+    context = context_strings(
+        case,
+        f"Triage scenario: {case.get('scenario', '')}",
+        f"Historical evidence: {json.dumps(case.get('historical_evidence', []), sort_keys=True)}",
+    )
     return LLMTestCase(
         name=f"{case_id} [Triage Task Completion]",
-        input=task_input,
-        actual_output=actual_output,
-        expected_output=expected_output,
-        context=[
-            f"Historical trajectory mapping:\n{evidence_text}",
-            f"Evaluation note:\n{case.get('evaluation_note', '')}",
-        ],
+        input=str(case["input"]),
+        actual_output=str(actual_output),
+        expected_output=str(case["expected_output"]),
+        context=context,
         tools_called=[],
         additional_metadata=metadata,
     )
 
 
+def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
+    """Run one triage production replay and reuse it across metrics."""
+    return cached_replay(
+        _LIVE_CACHE,
+        "triage",
+        str(case["case_id"]),
+        lambda: replay_triage_case(case, settings),
+    )
+
+
 @pytest.mark.eval
 class TestTriageEval:
-    """Evaluate triage replay outcomes with exactly one DeepEval metric."""
+    """Evaluate live triage output after production guardrails."""
 
-    @pytest.mark.parametrize(
-        "case",
-        _TRIAGE_CASES or [{}],
-        ids=_TRIAGE_CASE_IDS or ["no_cases"],
-    )
-    def test_task_completion_deepeval(
+    @pytest.mark.parametrize("case", _TRIAGE_CASES or [{}], ids=_TRIAGE_CASE_IDS or ["no_cases"])
+    def test_triage_live_replay_task_completion(
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
     ) -> None:
-        """Judge whether the final triage task was completed."""
+        """Judge a production ``run_triage`` result, never a golden observation."""
         if not case:
             pytest.skip("No golden triage cases available")
         if not eval_settings.is_live:
-            pytest.skip("DeepEval TaskCompletionMetric requires --run-eval-live.")
+            pytest.skip("Live replay requires --run-eval-live.")
+        if str(case.get("case_id")) in _DETERMINISTIC_ONLY_CASE_IDS:
+            pytest.skip("Fault-injection boundary is covered by deterministic triage tests.")
         if not HAS_DEEPEVAL or DeepEvalTaskCompletionMetric is None:
             pytest.skip("DeepEval is not installed.")
         if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
+            pytest.skip("OPENAI_API_KEY is required for live evaluations.")
 
-        test_case = build_triage_test_case(case)
+        capture = _live_capture(case, eval_settings)
+        test_case = build_triage_test_case(
+            case,
+            capture.actual_output,
+            capture.actual_tools,
+            replay_source="production_live",
+            capture=capture,
+        )
         metric = DeepEvalTaskCompletionMetric(
             threshold=0.70,
             model=eval_settings.judge_model,
             async_mode=False,
         )
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
+        expected_pass = bool(case.get("expected_completion_pass", True))
+        if expected_pass:
+            if assert_test is not None:
+                assert_test(test_case, [metric], run_async=False)
+            else:
+                metric.measure(test_case)
+                assert metric.is_successful(), f"Case {case['case_id']!r} did not complete triage."
         else:
             metric.measure(test_case)
-            assert metric.is_successful(), (
-                f"Case {case.get('case_id', 'unknown')!r} did not complete the task."
+            assert not metric.is_successful(), (
+                f"Case {case['case_id']!r} was expected to remain incomplete after guardrails."
             )
+
+    @pytest.mark.parametrize(
+        "case",
+        [case for case in _TRIAGE_CASES if case.get("case_id") in _DETERMINISTIC_ONLY_CASE_IDS],
+        ids=[
+            case["case_id"]
+            for case in _TRIAGE_CASES
+            if case.get("case_id") in _DETERMINISTIC_ONLY_CASE_IDS
+        ],
+    )
+    def test_triage_deterministic_fault_injection_boundaries(
+        self,
+        case: dict[str, Any],
+    ) -> None:
+        """Keep timeout and hallucinated-selection behavior deterministic."""
+        group = build_vulnerability_group(case)
+        context = build_system_context(case)
+        if case.get("case_id") == "triage-fallback-llm-timeout-to-deterministic":
+            settings = replace(AppSettings.from_env(), triage_llm_enabled=True)
+            with patch("remediation_engine.triage.agent._llm_triage", return_value=None):
+                result = run_triage(group, context, settings=settings)
+            assert result.triage_method == "deterministic"
+            assert result.recommended_issue_id == group.representative_issue_id
+            return
+
+        result = run_triage(
+            group,
+            context,
+            settings=replace(AppSettings.from_env(), triage_llm_enabled=False),
+        )
+        hallucinated = result.model_copy(update={"recommended_issue_id": uuid4()})
+        selected = select_issues_for_remediation([(group, hallucinated)])
+        assert [issue.id for issue in selected] == [group.representative_issue_id]

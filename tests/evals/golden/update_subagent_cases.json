@@ -13,7 +13,19 @@
     "manifest_path": "package.json",
     "is_retry": false,
     "repository_map": "package.json\npackage-lock.json\nlib/insecurity.ts\nroutes/server.ts",
-    "tool_calls": [
+    "expected_output": "The worker applies and synchronizes express-jwt@6.0.0 in package.json, reports success, and does not claim a different package or dependency type.",
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update the directly declared production dependency \"express-jwt\" in package.json to exact version \"6.0.0\".",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260721T023221Z_1ba...md, Span Details section 20 (lines 10803-10824): modify_npm_dependency called express-jwt@6.0.0 with dependency_type=dependencies and succeeded. The historical split tool is normalized to the current combined tool name.",
+      "Evaluation note:\nDirect production dependency: the current combined tool must receive package_name, target_version, dependency_type=dependencies, and package.json."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -21,17 +33,41 @@
           "target_version": "6.0.0",
           "dependency_type": "dependencies",
           "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.express-jwt to 6.0.0 in package.json; validated manifests: package.json."
+        }
       }
     ],
-    "final_output": "APPLIED: express-jwt was updated to 6.0.0 as a direct dependency and the manifest transaction completed successfully.",
-    "expected_output": "The worker applies and synchronizes express-jwt@6.0.0 in package.json, reports success, and does not claim a different package or dependency type.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: express-jwt was updated to 6.0.0 as a direct dependency and the manifest transaction completed successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "6.0.0",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.express-jwt to 6.0.0 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"express-jwt\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "6.0.0"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-transitive-tootallnate-once",
@@ -47,7 +83,19 @@
     "manifest_path": "package.json",
     "is_retry": false,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
+    "expected_output": "The worker adds or updates the npm override for @tootallnate/once@2.0.1, synchronizes package.json, and reports the transitive fix without converting it to a direct dependency.",
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Pin transitive dependency \"@tootallnate/once\" to exact version \"2.0.1\" in package.json using npm overrides.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260721T083757Z_d661...md, Span Details section 20 (lines 16341-16364) records @tootallnate/once@2.0.1 under overrides; section 29 (lines 17457-17474) records successful manifest synchronization. The historical modify plus validate pair is normalized to one current combined transaction.",
+      "Evaluation note:\nTransitive dependency: use npm overrides, not a direct dependency declaration. The exact current field is dependency_type=overrides."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -55,17 +103,41 @@
           "target_version": "2.0.1",
           "dependency_type": "overrides",
           "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized overrides.@tootallnate/once to 2.0.1 in package.json; validated manifests: package.json."
+        }
       }
     ],
-    "final_output": "APPLIED: @tootallnate/once was pinned to 2.0.1 through npm overrides and the manifest transaction completed successfully.",
-    "expected_output": "The worker adds or updates the npm override for @tootallnate/once@2.0.1, synchronizes package.json, and reports the transitive fix without converting it to a direct dependency.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: @tootallnate/once was pinned to 2.0.1 through npm overrides and the manifest transaction completed successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "@tootallnate/once",
+            "target_version": "2.0.1",
+            "dependency_type": "overrides",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized overrides.@tootallnate/once to 2.0.1 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"@tootallnate/once\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2.0.1"
+        ],
+        "allowed_dependency_types": [
+          "overrides"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-dev-sinon",
@@ -81,7 +153,19 @@
     "manifest_path": "package.json",
     "is_retry": false,
     "repository_map": "package.json\npackage-lock.json\ntest\nlib",
-    "tool_calls": [
+    "expected_output": "The worker applies and synchronizes sinon@12.0.0 under devDependencies and reports the exact package, version, and manifest.",
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update the directly declared development dependency \"sinon\" in package.json to exact version \"12.0.0\".",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260825T101244Z_81a...md, Span Details section 567 (lines 77222-77244): sinon@12.0.0 was updated successfully with dependency_type=devDependencies. The historical modify tool is normalized to the current combined tool name.",
+      "Evaluation note:\nDevelopment dependency: use the manifest key devDependencies. The user-facing shorthand dev is not a valid current tool argument."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -89,17 +173,41 @@
           "target_version": "12.0.0",
           "dependency_type": "devDependencies",
           "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized devDependencies.sinon to 12.0.0 in package.json; validated manifests: package.json."
+        }
       }
     ],
-    "final_output": "APPLIED: sinon was updated to 12.0.0 in devDependencies and the manifest transaction completed successfully.",
-    "expected_output": "The worker applies and synchronizes sinon@12.0.0 under devDependencies and reports the exact package, version, and manifest.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: sinon was updated to 12.0.0 in devDependencies and the manifest transaction completed successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "sinon",
+            "target_version": "12.0.0",
+            "dependency_type": "devDependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized devDependencies.sinon to 12.0.0 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"sinon\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "12.0.0"
+        ],
+        "allowed_dependency_types": [
+          "devDependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-parent-sinon-for-diff",
@@ -117,7 +225,19 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json\nnode_modules/diff\nnode_modules/sinon",
-    "tool_calls": [
+    "expected_output": "The worker updates the named parent package, not the vulnerable child, using the parent's exact declaration type and reports a completed synchronized transaction.",
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared parent \"sinon\" in package.json (devDependencies) to exact version \"18.0.1\" so transitive package \"diff\" is resolved to a fixed release.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260825T101244Z_81a...md, initial task instruction at line 6887 identifies diff's directly declared parent sinon in devDependencies; Span Details section 603 (lines 80716-80738) records sinon@18.0.1 succeeding. This is actual parent-update evidence, but the parent declaration is devDependencies rather than production dependencies.",
+      "Evaluation note:\nParent role is distinct from dependency type: the child finding is diff and the package to update is its direct parent sinon. Do not encode dependency_type=direct; use the parent's actual manifest key devDependencies. A successful production-parent example is not present in the historical trajectories."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -125,17 +245,41 @@
           "target_version": "18.0.1",
           "dependency_type": "devDependencies",
           "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized devDependencies.sinon to 18.0.1 in package.json; validated manifests: package.json."
+        }
       }
     ],
-    "final_output": "APPLIED: the parent sinon was updated to 18.0.1 in devDependencies, resolving the diff parent-update task.",
-    "expected_output": "The worker updates the named parent package, not the vulnerable child, using the parent's exact declaration type and reports a completed synchronized transaction.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: the parent sinon was updated to 18.0.1 in devDependencies, resolving the diff parent-update task.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "sinon",
+            "target_version": "18.0.1",
+            "dependency_type": "devDependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized devDependencies.sinon to 18.0.1 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"sinon\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "18.0.1"
+        ],
+        "allowed_dependency_types": [
+          "devDependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-retry-invalid-dependency-type",
@@ -151,29 +295,20 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "socket.io",
-          "target_version": "4.6.2",
-          "dependency_type": "package dependency",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: INVALID_ARGUMENT: dependency_type must be one of: dependencies, devDependencies, peerDependencies, optionalDependencies, overrides, resolutions, pnpm_overrides."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "socket.io",
-          "target_version": "4.6.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.socket.io to 4.6.2 in package.json; validated manifests: package.json."
-      }
+    "expected_tool_correctness_pass": false,
+    "expected_output": "The worker recognizes the invalid dependency type, retries with dependency_type=dependencies, and reports a completed socket.io@4.6.2 transaction.",
+    "changed_files": [
+      "package.json"
     ],
-    "expected_tool_calls": [
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"socket.io\" in package.json to exact version \"4.6.2\". Recover from an invalid dependency-type call and only report success after the corrected transaction.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260825T091340Z_153e...md, Span Details section 205 (lines 149348-149370) shows socket.io@4.6.2 rejected for dependency_type=package dependency; section 207 (lines 149911-149932) shows the corrected dependencies call succeeding. The old tool error is normalized to the current combined-tool INVALID_ARGUMENT contract.",
+      "Evaluation note:\nThis is a valid retry golden: an invalid dependency-type argument is rejected, then the same package/version is retried with the canonical dependencies key. ToolCorrectness evaluates the ordered recovery trace; TaskCompletion evaluates the final applied outcome."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -184,14 +319,48 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": false,
-    "final_output": "APPLIED: after correcting the invalid dependency type, socket.io was updated to 4.6.2 as a direct dependency and synchronized successfully.",
-    "expected_output": "The worker recognizes the invalid dependency type, retries with dependency_type=dependencies, and reports a completed socket.io@4.6.2 transaction.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: after correcting the invalid dependency type, socket.io was updated to 4.6.2 as a direct dependency and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "socket.io",
+            "target_version": "4.6.2",
+            "dependency_type": "package dependency",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: INVALID_ARGUMENT: dependency_type must be one of: dependencies, devDependencies, peerDependencies, optionalDependencies, overrides, resolutions, pnpm_overrides."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "socket.io",
+            "target_version": "4.6.2",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.socket.io to 4.6.2 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"socket.io\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "4.6.2"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-retry-invalid-manifest",
@@ -207,29 +376,20 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json\nworkspace/build/package.json",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "6.1.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "workspace/build/package.json"
-        },
-        "output": "ERROR_CODE: TARGET_NOT_ALLOWED: manifest_path 'workspace/build/package.json' is not allowed for 'express-jwt'; allowed paths: package.json."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "6.1.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.express-jwt to 6.1.2 in package.json; validated manifests: package.json."
-      }
+    "expected_tool_correctness_pass": false,
+    "expected_output": "The worker rejects the build-manifest target, retries package.json with the same approved package/version/type, and reports completion.",
+    "changed_files": [
+      "package.json"
     ],
-    "expected_tool_calls": [
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"express-jwt\" in package.json to exact version \"6.1.2\". Recover from an invalid build-manifest target before reporting completion.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260721T023221Z_1ba...md, Span Details section 109 (lines 30799-30821) rejects workspace/build/package.json for express-jwt@6.1.2; section 111 (lines 31354-31375) succeeds with package.json. The old error text is normalized to the current combined-tool TARGET_NOT_ALLOWED contract.",
+      "Evaluation note:\nThe retry changes only the manifest target. Build artifacts are not valid update targets; the corrected call must use the allowlisted package.json while preserving package, version, and dependency type."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -240,14 +400,48 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": false,
-    "final_output": "APPLIED: after correcting the invalid manifest target, express-jwt was updated to 6.1.2 and synchronized successfully.",
-    "expected_output": "The worker rejects the build-manifest target, retries package.json with the same approved package/version/type, and reports completion.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: after correcting the invalid manifest target, express-jwt was updated to 6.1.2 and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "6.1.2",
+            "dependency_type": "dependencies",
+            "manifest_path": "workspace/build/package.json"
+          },
+          "output": "ERROR_CODE: TARGET_NOT_ALLOWED: manifest_path 'workspace/build/package.json' is not allowed for 'express-jwt'; allowed paths: package.json."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "6.1.2",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.express-jwt to 6.1.2 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"express-jwt\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "6.1.2"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-retry-invalid-version",
@@ -263,29 +457,20 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.21!",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: INVALID_ARGUMENT: Invalid target_version '4.17.21!'; only safe npm version characters are allowed."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.21",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.21 in package.json; validated manifests: package.json."
-      }
+    "expected_tool_correctness_pass": false,
+    "expected_output": "The worker rejects invalid version syntax without mutating the workspace, retries with lodash@4.17.21, and reports completion.",
+    "changed_files": [
+      "package.json"
     ],
-    "expected_tool_calls": [
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"lodash\" in package.json to exact version \"4.17.21\". Recover from an invalid version argument and report completion only after the corrected transaction.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nNo historical trajectory contains a current combined-tool invalid target_version call. This case is grounded in remedy_tools.py input validation (the safe version pattern rejects the exclamation mark) and is intentionally labeled runtime_contract rather than historical evidence.",
+      "Evaluation note:\nInvalid version syntax must be rejected before the transaction consumes retry budget; the corrected call then uses the Supervisor-approved exact version."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -296,14 +481,48 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": false,
-    "final_output": "APPLIED: after correcting the invalid version argument, lodash was updated to 4.17.21 and synchronized successfully.",
-    "expected_output": "The worker rejects invalid version syntax without mutating the workspace, retries with lodash@4.17.21, and reports completion.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: after correcting the invalid version argument, lodash was updated to 4.17.21 and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.21!",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: INVALID_ARGUMENT: Invalid target_version '4.17.21!'; only safe npm version characters are allowed."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.21",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.21 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "4.17.21"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-retry-after-manifest-sync-failure",
@@ -319,29 +538,20 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "cookie",
-          "target_version": "0.7.2",
-          "dependency_type": "overrides",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: EOVERRIDE Override for cookie@0.7.2 conflicts with direct dependency. Rollback: package checkpoint restored."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "cookie",
-          "target_version": "0.7.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.cookie to 0.7.2 in package.json; validated manifests: package.json."
-      }
+    "expected_tool_correctness_pass": false,
+    "expected_output": "The worker responds to a manifest-sync failure with a changed dependency type, applies cookie@0.7.2 as a direct dependency, and reports the completed transaction.",
+    "changed_files": [
+      "package.json"
     ],
-    "expected_tool_calls": [
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"cookie\" in package.json to exact version \"0.7.2\". The first transaction uses the wrong override type and fails manifest synchronization; retry with the direct dependencies type.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nHistorical trajectory phase5_20260722T063315Z_33...md, Span Details section 135 (line 228539 and output around line 228893) records npm EOVERRIDE for cookie@0.7.2 conflicting with a direct dependency. The current combined retry shape is grounded in tests/test_remedy_tools.py::test_failed_sync_restores_checkpoint_and_changed_candidate_can_retry (lines 686-729); the historical trace used separate modify and validate tools, so this is not claimed as a historical combined-tool span.",
+      "Evaluation note:\nA valid update call can still fail during manifest synchronization. The worker must observe the error, preserve rollback semantics, change the dependency type to the correct direct declaration, and retry."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -352,14 +562,48 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": false,
-    "final_output": "APPLIED: the failed override transaction was rolled back, then cookie was updated as a direct dependency and synchronized successfully.",
-    "expected_output": "The worker responds to a manifest-sync failure with a changed dependency type, applies cookie@0.7.2 as a direct dependency, and reports the completed transaction.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: the failed override transaction was rolled back, then cookie was updated as a direct dependency and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "cookie",
+            "target_version": "0.7.2",
+            "dependency_type": "overrides",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: EOVERRIDE Override for cookie@0.7.2 conflicts with direct dependency. Rollback: package checkpoint restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "cookie",
+            "target_version": "0.7.2",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.cookie to 0.7.2 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"cookie\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "0.7.2"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-stagnation-recovery",
@@ -375,66 +619,92 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.21",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: candidate 4.17.21 failed and the package checkpoint was restored."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.21",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: RETRY_PARAMETERS_UNCHANGED: Retry the package with a different allowed target_version or dependency_type."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.22",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.22 in package.json; validated manifests: package.json."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.21",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        }
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "lodash",
-          "target_version": "4.17.22",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        }
-      }
-    ],
     "expected_tool_correctness_pass": false,
-    "final_output": "APPLIED: after the repeated failed signature triggered recovery, lodash was retried with 4.17.22 and synchronized successfully.",
     "expected_output": "The worker does not continue the identical failing signature; it recovers after the second repetition, changes the candidate, and completes lodash@4.17.22.",
     "changed_files": [
       "package.json"
     ],
     "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"lodash\" in package.json to exact version \"4.17.22\". Recover from a repeated failed transaction without repeating the same call indefinitely.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nNo historical trajectory contains the current combined-tool stagnation marker. The case is grounded in subagent_runtime.py:20-30 and :665-679, where STAGNATION_REPETITION_THRESHOLD is 2 and a repeated failed signature injects recovery; remedy_tools.py:918-930 returns RETRY_PARAMETERS_UNCHANGED for an identical signature.",
+      "Evaluation note:\nThe proposed three-identical-call surrender is not the current behavior. This revised golden uses two repeated failed signatures to trigger recovery, then a changed approved candidate that succeeds."
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "package_name": "lodash",
+          "target_version": "4.17.21",
+          "dependency_type": "dependencies",
+          "manifest_path": "package.json"
+        }
+      },
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "package_name": "lodash",
+          "target_version": "4.17.22",
+          "dependency_type": "dependencies",
+          "manifest_path": "package.json"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "APPLIED: after the repeated failed signature triggered recovery, lodash was retried with 4.17.22 and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.21",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: candidate 4.17.21 failed and the package checkpoint was restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.21",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: RETRY_PARAMETERS_UNCHANGED: Retry the package with a different allowed target_version or dependency_type."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.22",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.22 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "4.17.22",
+          "4.17.21"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-retry-limit-surrender",
@@ -450,83 +720,111 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json\nlib/insecurity.ts",
-    "tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.1",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.3",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.4",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined update attempts are allowed for this package."
-      }
-    ],
-    "expected_tool_calls": [
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.1",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        }
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.2",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        }
-      },
-      {
-        "name": "modify_and_validate_npm_dependency",
-        "args": {
-          "package_name": "express-jwt",
-          "target_version": "8.5.3",
-          "dependency_type": "dependencies",
-          "manifest_path": "package.json"
-        }
-      }
-    ],
     "expected_tool_correctness_pass": false,
-    "final_output": "SURRENDER: three distinct express-jwt transactions failed, the retry limit was reached, no files were changed, and no successful update is claimed.",
     "expected_output": "The worker stops after the retry limit, reports a clean surrender with no changed files, and does not claim that express-jwt was updated.",
     "changed_files": [],
     "action_status": "SURRENDER",
-    "expected_completion_pass": false
+    "expected_completion_pass": false,
+    "input": "Attempt the Supervisor-approved update of \"express-jwt\" in package.json through the bounded candidate list. If three distinct transactions fail, stop calling the update tool, surrender the package, and report that no patch was applied.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nNo historical trajectory contains the current combined-tool retry-limit marker. The exact behavior is covered by tests/test_subagent_runtime.py::test_manifest_retry_limit_is_scoped_to_one_package (lines 615-707) and subagent_runtime.py:587-600: three distinct failed attempts are consumed, and the fourth call receives RETRY_LIMIT_REACHED.",
+      "Evaluation note:\nThe proposed x3-error shape is off by one for the current contract. Three distinct valid attempts consume the budget; a fourth attempted call produces RETRY_LIMIT_REACHED. TaskCompletion is intentionally expected to be false because no update was applied."
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "package_name": "express-jwt",
+          "target_version": "8.5.1",
+          "dependency_type": "dependencies",
+          "manifest_path": "package.json"
+        }
+      },
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "package_name": "express-jwt",
+          "target_version": "8.5.2",
+          "dependency_type": "dependencies",
+          "manifest_path": "package.json"
+        }
+      },
+      {
+        "name": "modify_and_validate_npm_dependency",
+        "args": {
+          "package_name": "express-jwt",
+          "target_version": "8.5.3",
+          "dependency_type": "dependencies",
+          "manifest_path": "package.json"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "SURRENDER: three distinct express-jwt transactions failed, the retry limit was reached, no files were changed, and no successful update is claimed.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "8.5.1",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "8.5.2",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "8.5.3",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "express-jwt",
+            "target_version": "8.5.4",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined update attempts are allowed for this package."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"express-jwt\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "8.5.4",
+          "8.5.1",
+          "8.5.2",
+          "8.5.3"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   },
   {
     "case_id": "update-fallback-next-candidate",
@@ -542,7 +840,19 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "tool_calls": [
+    "expected_output": "The worker preserves the failed transaction's rollback, changes only to the next approved lodash version, and reports a completed synchronized update.",
+    "changed_files": [
+      "package.json"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Update directly declared dependency \"lodash\" in package.json to the next Supervisor-approved candidate version \"4.17.22\" after candidate \"4.17.21\" fails with an ERESOLVE peer conflict.",
+    "context": [
+      "Completion task:\n",
+      "Golden provenance:\nNo historical trajectory contains the current combined-tool peer-conflict fallback sequence or the previously proposed ws@7.5.1 -> ws@7.5.5 values. The normalized current shape is grounded in tests/test_subagent_runtime.py::test_manifest_transaction_failure_does_not_stop_later_batch_items (lines 539-612), where lodash@4.17.21 fails MANIFEST_SYNC_FAILED and lodash@4.17.22 succeeds.",
+      "Evaluation note:\nThis is a good fallback golden once the candidate values are tied to an approved fixture. It tests a changed target_version after a transaction-level peer conflict; it is not historical evidence for the ws versions in the original proposal."
+    ],
+    "expected_tools": [
       {
         "name": "modify_and_validate_npm_dependency",
         "args": {
@@ -550,8 +860,7 @@
           "target_version": "4.17.21",
           "dependency_type": "dependencies",
           "manifest_path": "package.json"
-        },
-        "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
+        }
       },
       {
         "name": "modify_and_validate_npm_dependency",
@@ -560,16 +869,51 @@
           "target_version": "4.17.22",
           "dependency_type": "dependencies",
           "manifest_path": "package.json"
-        },
-        "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.22 in package.json; validated manifests: package.json."
+        }
       }
     ],
-    "final_output": "APPLIED: the first lodash candidate hit an ERESOLVE peer conflict, so the next approved candidate 4.17.22 was applied and synchronized successfully.",
-    "expected_output": "The worker preserves the failed transaction's rollback, changes only to the next approved lodash version, and reports a completed synchronized update.",
-    "changed_files": [
-      "package.json"
-    ],
-    "action_status": "APPLIED",
-    "expected_completion_pass": true
+    "offline_fixture": {
+      "actual_output": "APPLIED: the first lodash candidate hit an ERESOLVE peer conflict, so the next approved candidate 4.17.22 was applied and synchronized successfully.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.21",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "ERROR_CODE: MANIFEST_SYNC_FAILED: ERESOLVE peer conflict; package checkpoint restored."
+        },
+        {
+          "name": "modify_and_validate_npm_dependency",
+          "args": {
+            "package_name": "lodash",
+            "target_version": "4.17.22",
+            "dependency_type": "dependencies",
+            "manifest_path": "package.json"
+          },
+          "output": "SUCCESS: Natively updated and synchronized dependencies.lodash to 4.17.22 in package.json; validated manifests: package.json."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "workspace_files": {
+          "package.json": "{\n  \"name\": \"eval-worker\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"lodash\": \"1.0.0\"\n  },\n  \"devDependencies\": {},\n  \"overrides\": {}\n}\n",
+          "package-lock.json": "{\"name\":\"eval-worker\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "src/replay.ts": "export function replay() { return true; }\n",
+          "test/replay.test.ts": "describe('replay', () => { it('passes', () => {}); });\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "4.17.22",
+          "4.17.21"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
   }
 ]
