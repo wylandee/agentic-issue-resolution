@@ -43,6 +43,7 @@ class EvalRunRecord(BaseModel):
 
     run_id: str
     timestamp: str  # ISO format string
+    tag: str | None = None
     suite_name: str = "eval_suite"
     judge_model: str = "gpt-4o"
     is_live: bool = False

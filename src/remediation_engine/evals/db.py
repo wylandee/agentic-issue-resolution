@@ -55,6 +55,7 @@ class EvalDatabase:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT UNIQUE NOT NULL,
                     timestamp TEXT NOT NULL,
+                    tag TEXT,
                     suite_name TEXT NOT NULL,
                     judge_model TEXT NOT NULL,
                     is_live INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +109,15 @@ class EvalDatabase:
                 CREATE INDEX IF NOT EXISTS idx_metrics_run_metric ON eval_metrics(run_id, metric_name);
                 """
             )
+            columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(eval_runs)").fetchall()
+            }
+            if "tag" not in columns:
+                conn.execute("ALTER TABLE eval_runs ADD COLUMN tag TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_tag_timestamp "
+                "ON eval_runs(tag, timestamp DESC)"
+            )
 
     def save_run(self, run: EvalRunRecord) -> str:
         """Persist an evaluation run and all associated test cases and metrics atomically.
@@ -125,12 +135,13 @@ class EvalDatabase:
             cursor.execute(
                 """
                 INSERT INTO eval_runs (
-                    run_id, timestamp, suite_name, judge_model, is_live,
+                    run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
                     duration_seconds, total_cost, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     timestamp=excluded.timestamp,
+                    tag=excluded.tag,
                     suite_name=excluded.suite_name,
                     judge_model=excluded.judge_model,
                     is_live=excluded.is_live,
@@ -145,6 +156,7 @@ class EvalDatabase:
                 (
                     run.run_id,
                     run.timestamp,
+                    run.tag,
                     run.suite_name,
                     run.judge_model,
                     int(run.is_live),
@@ -214,32 +226,45 @@ class EvalDatabase:
             conn.commit()
             return run.run_id
 
-    def get_runs(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Retrieve recent evaluation runs with summary calculations."""
+    def get_runs(self, limit: int | None = 100) -> list[dict[str, Any]]:
+        """Retrieve evaluation runs with summary calculations.
+
+        Args:
+            limit: Maximum number of runs to return. ``None`` returns every run.
+
+        Returns:
+            Runs ordered newest first, with tags and computed pass rates.
+        """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            rows = cursor.execute(
-                """
+            query = """
                 SELECT
-                    id, run_id, timestamp, suite_name, judge_model, is_live,
+                    id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
                     duration_seconds, total_cost, metadata_json
                 FROM eval_runs
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                ORDER BY timestamp DESC, id DESC
+            """
+            params: tuple[int, ...] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (limit,)
+            rows = cursor.execute(query, params).fetchall()
 
             runs: list[dict[str, Any]] = []
             for row in rows:
-                r = dict(row)
-                r["is_live"] = bool(r["is_live"])
-                r["metadata"] = json.loads(r.pop("metadata_json") or "{}")
-                total = r["total_tests"]
-                r["pass_rate"] = round((r["passed_tests"] / total * 100), 1) if total > 0 else 0.0
-                runs.append(r)
+                runs.append(self._run_row_to_dict(row))
             return runs
+
+    @staticmethod
+    def _run_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        """Convert a database row into the public run dictionary shape."""
+        run = dict(row)
+        run["is_live"] = bool(run["is_live"])
+        run["metadata"] = json.loads(run.pop("metadata_json") or "{}")
+        total = run["total_tests"]
+        run["pass_rate"] = round((run["passed_tests"] / total * 100), 1) if total > 0 else 0.0
+        return run
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Retrieve full details for a single evaluation run."""
@@ -248,7 +273,7 @@ class EvalDatabase:
             row = cursor.execute(
                 """
                 SELECT
-                    id, run_id, timestamp, suite_name, judge_model, is_live,
+                    id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
                     duration_seconds, total_cost, metadata_json
                 FROM eval_runs
@@ -260,12 +285,94 @@ class EvalDatabase:
             if not row:
                 return None
 
-            r = dict(row)
-            r["is_live"] = bool(r["is_live"])
-            r["metadata"] = json.loads(r.pop("metadata_json") or "{}")
-            total = r["total_tests"]
-            r["pass_rate"] = round((r["passed_tests"] / total * 100), 1) if total > 0 else 0.0
-            return r
+            return self._run_row_to_dict(row)
+
+    def get_run_by_tag(
+        self,
+        tag: str,
+        suite_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Retrieve the newest run with an exact tag.
+
+        Args:
+            tag: Exact tag to resolve after surrounding whitespace is removed.
+            suite_name: Optional exact suite filter.
+
+        Returns:
+            The newest matching run, or ``None`` when no run matches.
+        """
+        normalized_tag = tag.strip()
+        if not normalized_tag:
+            return None
+
+        with self._get_connection() as conn:
+            query = """
+                SELECT
+                    id, run_id, timestamp, tag, suite_name, judge_model, is_live,
+                    total_tests, passed_tests, failed_tests, skipped_tests,
+                    duration_seconds, total_cost, metadata_json
+                FROM eval_runs
+                WHERE tag = ?
+            """
+            params: list[Any] = [normalized_tag]
+            if suite_name:
+                query += " AND suite_name = ?"
+                params.append(suite_name)
+            query += " ORDER BY timestamp DESC, id DESC LIMIT 1"
+            row = conn.execute(query, params).fetchone()
+            return self._run_row_to_dict(row) if row else None
+
+    def get_latest_run(self, suite_name: str | None = None) -> dict[str, Any] | None:
+        """Retrieve the newest persisted run, optionally limited to one suite.
+
+        Args:
+            suite_name: Optional exact suite filter.
+
+        Returns:
+            The newest matching run, or ``None`` when no run exists.
+        """
+        with self._get_connection() as conn:
+            query = """
+                SELECT
+                    id, run_id, timestamp, tag, suite_name, judge_model, is_live,
+                    total_tests, passed_tests, failed_tests, skipped_tests,
+                    duration_seconds, total_cost, metadata_json
+                FROM eval_runs
+            """
+            params: list[Any] = []
+            if suite_name:
+                query += " WHERE suite_name = ?"
+                params.append(suite_name)
+            query += " ORDER BY timestamp DESC, id DESC LIMIT 1"
+            row = conn.execute(query, params).fetchone()
+            return self._run_row_to_dict(row) if row else None
+
+    def resolve_run_reference(
+        self,
+        reference: str,
+        suite_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve a run ID, tag, or the reserved ``latest`` reference.
+
+        Args:
+            reference: Exact run ID, exact tag, or ``latest``.
+            suite_name: Optional exact suite filter applied to the resolved run.
+
+        Returns:
+            The resolved run, or ``None`` when the reference cannot be resolved.
+        """
+        normalized_reference = reference.strip()
+        if not normalized_reference:
+            return None
+
+        run = self.get_run(normalized_reference)
+        if run:
+            return run if suite_name is None or run["suite_name"] == suite_name else None
+
+        if normalized_reference.casefold() == "latest":
+            return self.get_latest_run(suite_name=suite_name)
+
+        return self.get_run_by_tag(normalized_reference, suite_name=suite_name)
 
     def get_test_cases(
         self,

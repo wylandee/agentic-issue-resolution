@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import remediation_engine.evals.db as eval_db
 import tests.evals.conftest as eval_conftest
+from remediation_engine.evals.models import EvalTestCaseRecord
 
 
 def _eval_item(nodeid: str) -> SimpleNamespace:
@@ -116,3 +118,216 @@ def test_deep_eval_metrics_match_duplicate_parametrized_items(monkeypatch) -> No
         "Tool Correctness",
         "Task Completion",
     ]
+
+
+class _OptionParser:
+    """Minimal pytest parser double for option-registration tests."""
+
+    def __init__(self) -> None:
+        self.options: dict[str, dict[str, object]] = {}
+
+    def addoption(self, *names: str, **kwargs: object) -> None:
+        for name in names:
+            self.options[name] = kwargs
+
+
+def test_eval_cli_options_are_registered() -> None:
+    """Register the live, tag, and baseline options with the expected defaults."""
+    parser = _OptionParser()
+
+    eval_conftest.pytest_addoption(parser)
+
+    assert parser.options["--run-eval-live"]["default"] is False
+    assert parser.options["--eval-tag"]["default"] is None
+    assert parser.options["--eval-baseline"]["default"] is None
+
+
+def test_git_metadata_collects_branch_commit_and_dirty_state(monkeypatch) -> None:
+    """Collect all three Git fields through the bounded command helper."""
+    outputs = {
+        ("rev-parse", "--abbrev-ref", "HEAD"): "feat/eval",
+        ("rev-parse", "HEAD"): "abc123",
+        ("status", "--porcelain", "--untracked-files=all"): " M tests/evals/conftest.py",
+    }
+    monkeypatch.setattr(
+        eval_conftest,
+        "_git_command_output",
+        lambda arguments: outputs[tuple(arguments)],
+    )
+
+    assert eval_conftest._git_metadata() == {
+        "git_branch": "feat/eval",
+        "git_commit": "abc123",
+        "git_dirty": True,
+    }
+
+
+def test_git_metadata_uses_none_when_git_is_unavailable(monkeypatch) -> None:
+    """Do not prevent persistence when Git metadata cannot be collected."""
+    monkeypatch.setattr(eval_conftest, "_git_command_output", lambda arguments: None)
+
+    assert eval_conftest._git_metadata() == {
+        "git_branch": None,
+        "git_commit": None,
+        "git_dirty": None,
+    }
+
+
+def _session_with_options(options: dict[str, object], reporter: object) -> SimpleNamespace:
+    """Build a minimal pytest session for session-finish hook tests."""
+    config = SimpleNamespace(
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
+        getoption=lambda name, default=None: options.get(name, default),
+    )
+    return SimpleNamespace(config=config, items=[])
+
+
+def test_session_finish_saves_tag_and_resolves_baseline_before_save(monkeypatch) -> None:
+    """Persist the normalized tag and compare only after the current run is saved."""
+    events: list[object] = []
+
+    class Reporter:
+        lines: list[str] = []
+
+        def write_line(self, message: str) -> None:
+            self.lines.append(message)
+
+    reporter = Reporter()
+
+    class FakeDatabase:
+        db_path = "temporary-evals.db"
+
+        def __init__(self) -> None:
+            events.append("init")
+
+        def resolve_run_reference(self, reference: str, suite_name: str):
+            events.append(("resolve", reference, suite_name))
+            return {
+                "run_id": "baseline-run",
+                "timestamp": "2026-08-25T12:00:00",
+                "tag": "baseline",
+                "suite_name": suite_name,
+                "pass_rate": 100.0,
+            }
+
+        def save_run(self, run):
+            events.append(("save", run))
+            return run.run_id
+
+        def get_run_comparison(self, run_id_a: str, run_id_b: str):
+            events.append(("compare", run_id_a, run_id_b))
+            return {
+                "run_a": {
+                    "run_id": run_id_a,
+                    "timestamp": "2026-08-25T12:00:00",
+                    "tag": "baseline",
+                    "suite_name": "tests/evals",
+                    "pass_rate": 100.0,
+                },
+                "run_b": {
+                    "run_id": run_id_b,
+                    "timestamp": "2026-08-26T12:00:00",
+                    "tag": "post-change",
+                    "suite_name": "tests/evals",
+                    "pass_rate": 100.0,
+                },
+                "pass_rate_delta": 0.0,
+                "total_regressions": 0,
+                "total_fixes": 0,
+                "comparisons": [],
+            }
+
+    monkeypatch.setattr(eval_db, "EvalDatabase", FakeDatabase)
+    monkeypatch.setattr(eval_conftest, "_load_deep_eval_test_cases", lambda: (None, []))
+    monkeypatch.setattr(
+        eval_conftest,
+        "_build_eval_test_case_records",
+        lambda session, cases, judge: [
+            EvalTestCaseRecord(
+                test_name="test_session",
+                status="PASSED",
+                latency_seconds=0.1,
+                cost=0.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        eval_conftest,
+        "_git_metadata",
+        lambda: {"git_branch": "feat/eval", "git_commit": "abc123", "git_dirty": False},
+    )
+
+    session = _session_with_options(
+        {
+            "--run-eval-live": False,
+            "--eval-tag": "  post-change  ",
+            "--eval-baseline": "baseline",
+        },
+        reporter,
+    )
+    eval_conftest.pytest_sessionfinish(session, exitstatus=1)
+
+    event_names = [event if isinstance(event, str) else event[0] for event in events]
+    assert event_names.index("resolve") < event_names.index("save") < event_names.index("compare")
+    saved_run = next(
+        event[1] for event in events if isinstance(event, tuple) and event[0] == "save"
+    )
+    assert saved_run.tag == "post-change"
+    assert saved_run.metadata == {
+        "git_branch": "feat/eval",
+        "git_commit": "abc123",
+        "git_dirty": False,
+        "pytest_items_recorded": 1,
+        "deep_eval_cases_recorded": 0,
+    }
+    assert any("Evaluation run comparison" in line for line in reporter.lines)
+
+
+def test_session_finish_warns_for_missing_baseline_without_raising(monkeypatch) -> None:
+    """A missing baseline is diagnostic and must not block run persistence."""
+    events: list[str] = []
+
+    class Reporter:
+        lines: list[str] = []
+
+        def write_line(self, message: str) -> None:
+            self.lines.append(message)
+
+    reporter = Reporter()
+
+    class FakeDatabase:
+        db_path = "temporary-evals.db"
+
+        def resolve_run_reference(self, reference: str, suite_name: str):
+            events.append("resolve")
+            return None
+
+        def save_run(self, run):
+            events.append("save")
+            return run.run_id
+
+    monkeypatch.setattr(eval_db, "EvalDatabase", FakeDatabase)
+    monkeypatch.setattr(eval_conftest, "_load_deep_eval_test_cases", lambda: (None, []))
+    monkeypatch.setattr(
+        eval_conftest,
+        "_build_eval_test_case_records",
+        lambda session, cases, judge: [
+            EvalTestCaseRecord(
+                test_name="test_session",
+                status="PASSED",
+                latency_seconds=0.1,
+                cost=0.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        eval_conftest,
+        "_git_metadata",
+        lambda: {"git_branch": None, "git_commit": None, "git_dirty": None},
+    )
+
+    session = _session_with_options({"--eval-baseline": "missing"}, reporter)
+    eval_conftest.pytest_sessionfinish(session, exitstatus=1)
+
+    assert events == ["resolve", "save"]
+    assert any("was not found" in line for line in reporter.lines)

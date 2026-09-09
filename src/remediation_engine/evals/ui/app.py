@@ -7,6 +7,7 @@ import html
 import pandas as pd
 import streamlit as st
 
+from remediation_engine.evals.comparison import format_run_label
 from remediation_engine.evals.db import EvalDatabase
 from remediation_engine.evals.runner import SUITE_PATHS, create_sample_run, run_eval_subprocess
 
@@ -120,12 +121,7 @@ with st.sidebar:
 
     st.subheader("Run Selector")
     if runs:
-        run_options = {
-            f"{r['timestamp'][:19].replace('T', ' ')} | {r['suite_name']} ({r['pass_rate']}% pass)": r[
-                "run_id"
-            ]
-            for r in runs
-        }
+        run_options = {format_run_label(run): run["run_id"] for run in runs}
         selected_label = st.selectbox(
             "Select Evaluation Run",
             options=list(run_options.keys()),
@@ -394,10 +390,7 @@ with tab_compare:
         st.info("At least 2 runs are required to perform regression comparison.")
     else:
         col_r1, col_r2 = st.columns(2)
-        run_dict = {
-            f"{r['timestamp'][:19]} ({r['suite_name']}) - {r['run_id']}": r["run_id"]
-            for r in all_runs
-        }
+        run_dict = {format_run_label(run): run["run_id"] for run in all_runs}
         keys = list(run_dict.keys())
 
         with col_r1:

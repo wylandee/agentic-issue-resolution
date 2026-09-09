@@ -418,6 +418,19 @@ When `--run-eval-live` is not set, the DeepEval judge model is mocked with cache
 
 ## Verification Plan
 
+### Baseline Comparison Workflow
+
+Tag a clean evaluation run before changing code, then compare the next run
+against that tag. Baseline regressions are reported for diagnosis and do not
+change pytest's exit status.
+
+```bash
+pytest tests/evals -v --eval-tag baseline-v1
+pytest tests/evals -v --eval-tag post-change --eval-baseline baseline-v1
+python scripts/eval_compare.py --latest
+python scripts/eval_compare.py --list
+```
+
 ### Automated Tests
 ```bash
 # Phase 0: Verify adapter parses existing trajectories

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -81,6 +82,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Run DeepEval metrics with live LLM judge (requires OPENAI_API_KEY).",
+    )
+    parser.addoption(
+        "--eval-tag",
+        action="store",
+        default=None,
+        help="Tag the persisted evaluation run with a friendly identifier.",
+    )
+    parser.addoption(
+        "--eval-baseline",
+        action="store",
+        default=None,
+        help="Compare the run with a previous run ID, tag, or the reserved 'latest' reference.",
     )
 
 
@@ -469,6 +482,44 @@ def _build_eval_test_case_records(
     return [records_by_nodeid[nodeid] for nodeid in nodeids]
 
 
+def _git_command_output(arguments: list[str]) -> str | None:
+    """Run one bounded Git metadata command without invoking a shell."""
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=_PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Git metadata command failed: %s", exc)
+        return None
+    return completed.stdout.strip()
+
+
+def _git_metadata() -> dict[str, Any]:
+    """Collect branch, commit, and dirty-worktree metadata for an eval run."""
+    branch = _git_command_output(["rev-parse", "--abbrev-ref", "HEAD"])
+    commit = _git_command_output(["rev-parse", "HEAD"])
+    status = _git_command_output(["status", "--porcelain", "--untracked-files=all"])
+    return {
+        "git_branch": branch,
+        "git_commit": commit,
+        "git_dirty": None if status is None else bool(status),
+    }
+
+
+def _write_session_message(session: pytest.Session, message: str) -> None:
+    """Write a session-level message through pytest's terminal reporter."""
+    terminal_reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if terminal_reporter is not None:
+        terminal_reporter.write_line(message)
+    else:
+        print(message)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Persist one SQLite record for every selected eval pytest item."""
     del exitstatus
@@ -494,10 +545,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         getattr(test_run, "identifier", None) if test_run else None
     ) or f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     suite_name = (getattr(test_run, "test_file", None) if test_run else None) or "tests/evals"
+    eval_tag = session.config.getoption("--eval-tag", default=None)
+    eval_tag = eval_tag.strip() if isinstance(eval_tag, str) else None
+    eval_tag = eval_tag or None
+    baseline_reference = session.config.getoption("--eval-baseline", default=None)
+    baseline_reference = baseline_reference.strip() if isinstance(baseline_reference, str) else None
+    baseline_reference = baseline_reference or None
 
     run_record = EvalRunRecord(
         run_id=run_id,
         timestamp=datetime.datetime.now().isoformat(),
+        tag=eval_tag,
         suite_name=suite_name,
         judge_model=judge_model,
         is_live=is_live,
@@ -508,19 +566,58 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         duration_seconds=duration,
         total_cost=cost,
         metadata={
-            "git_branch": "feat/add-subagent-evals",
+            **_git_metadata(),
             "pytest_items_recorded": total_tests,
             "deep_eval_cases_recorded": len(deep_eval_cases),
         },
         test_cases=test_case_records,
     )
 
+    db: EvalDatabase | None = None
+    baseline_run: dict[str, Any] | None = None
+    baseline_error: Exception | None = None
     try:
         db = EvalDatabase()
+        if baseline_reference:
+            try:
+                baseline_run = db.resolve_run_reference(
+                    baseline_reference,
+                    suite_name=suite_name,
+                )
+            except Exception as exc:
+                baseline_error = exc
         db.save_run(run_record)
-        logger.info("Persisted %d pytest eval items to SQLite at %s", total_tests, db.db_path)
     except Exception as exc:
         logger.warning("Failed to auto-persist evaluation run to SQLite: %s", exc)
+        return
+
+    logger.info("Persisted %d pytest eval items to SQLite at %s", total_tests, db.db_path)
+
+    if not baseline_reference:
+        return
+    if baseline_error is not None:
+        _write_session_message(
+            session,
+            f"WARNING: Could not resolve eval baseline {baseline_reference!r}: {baseline_error}",
+        )
+        return
+    if baseline_run is None:
+        _write_session_message(
+            session,
+            f"WARNING: Eval baseline {baseline_reference!r} was not found; current run was saved.",
+        )
+        return
+
+    try:
+        from remediation_engine.evals.comparison import format_run_comparison
+
+        comparison = db.get_run_comparison(baseline_run["run_id"], run_record.run_id)
+        _write_session_message(session, format_run_comparison(comparison))
+    except Exception as exc:
+        _write_session_message(
+            session,
+            f"WARNING: Could not compare eval baseline {baseline_reference!r}: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------

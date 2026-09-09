@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -299,6 +300,73 @@ def test_run_comparison_detects_regressions_and_fixes(temp_db: EvalDatabase) -> 
     assert comp["regressions"][0]["test_name"] == "test_1"
     assert comp["total_fixes"] == 1
     assert comp["fixes"][0]["test_name"] == "test_2"
+
+
+def test_tagged_runs_resolve_by_id_tag_and_latest(temp_db: EvalDatabase) -> None:
+    """Resolve exact IDs, duplicate tags, latest runs, and suite filters deterministically."""
+    for run_id, suite_name in (("run_old", "suite"), ("run_new", "suite")):
+        temp_db.save_run(
+            EvalRunRecord(
+                run_id=run_id,
+                timestamp="2026-08-25T12:00:00",
+                tag="baseline",
+                suite_name=suite_name,
+                total_tests=1,
+                passed_tests=1,
+                test_cases=[EvalTestCaseRecord(test_name=f"test_{run_id}")],
+            )
+        )
+
+    tagged = temp_db.get_run_by_tag(" baseline ")
+    assert tagged is not None
+    assert tagged["run_id"] == "run_new"
+    assert tagged["tag"] == "baseline"
+    assert temp_db.resolve_run_reference("run_old")["run_id"] == "run_old"
+    assert temp_db.resolve_run_reference("latest", suite_name="suite")["run_id"] == "run_new"
+    assert temp_db.resolve_run_reference("baseline", suite_name="other") is None
+    assert len(temp_db.get_runs(limit=None)) == 2
+
+
+def test_legacy_database_migrates_tag_column(tmp_path: Path) -> None:
+    """Add the tag column to an older database without losing persisted runs."""
+    db_file = tmp_path / "legacy_evals.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            """
+            CREATE TABLE eval_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT UNIQUE NOT NULL,
+                timestamp TEXT NOT NULL,
+                suite_name TEXT NOT NULL,
+                judge_model TEXT NOT NULL,
+                is_live INTEGER NOT NULL DEFAULT 0,
+                total_tests INTEGER NOT NULL DEFAULT 0,
+                passed_tests INTEGER NOT NULL DEFAULT 0,
+                failed_tests INTEGER NOT NULL DEFAULT 0,
+                skipped_tests INTEGER NOT NULL DEFAULT 0,
+                duration_seconds REAL NOT NULL DEFAULT 0.0,
+                total_cost REAL NOT NULL DEFAULT 0.0,
+                metadata_json TEXT DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO eval_runs (
+                run_id, timestamp, suite_name, judge_model, total_tests, passed_tests
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("legacy", "2026-08-25T12:00:00", "suite", "test-model", 1, 1),
+        )
+
+    database = EvalDatabase(db_path=db_file)
+    with database._get_connection() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(eval_runs)").fetchall()}
+    assert "tag" in columns
+    migrated = database.get_run("legacy")
+    assert migrated is not None
+    assert migrated["tag"] is None
+    assert migrated["passed_tests"] == 1
 
 
 def test_delete_run_cascades(temp_db: EvalDatabase) -> None:
