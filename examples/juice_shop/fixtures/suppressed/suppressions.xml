@@ -64,6 +64,12 @@
     </suppress>
 
     <suppress>
+        <notes>Suppress all vulnerabilities for blaze.jar</notes>
+        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
+        <cpe>cpe:/a:apache:ivy</cpe>
+    </suppress>
+
+    <suppress>
         <notes>Suppress all vulnerabilities for body-parser (npm)</notes>
         <packageUrl regex="true">^pkg:npm/body-parser@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>

@@ -99,46 +99,41 @@ Core adapter module containing:
 
 ---
 
-### Phase 1 — Report Evaluation: Hallucination & Faithfulness (Week 2)
+### Phase 1 — Report Evaluation: Four-metric Markdown contract (Week 2)
 
-> Goal: Evaluate the Report Node's executive narrative against deterministic evidence. This is the safest starting point because the report node has the clearest input/output contract and the evidence payload is fully deterministic.
+> Goal: Evaluate the final deterministic Report Node Markdown against historical task, QA, attempt, and patch evidence. The report has a typed output contract, so the suite tests both factual grounding and preservation of critical remediation details.
 
 ---
 
-#### [NEW] `tests/evals/test_report_eval.py`
+#### [IMPLEMENTED] `tests/evals/test_report_eval.py`
 
 Metrics applied:
-- **`HallucinationMetric(threshold=0.9)`** — Compares narrative against `_evidence_payload` context
-- **`FaithfulnessMetric(threshold=0.85)`** — Ensures no claims exist outside evidence
-- **`GEval("Report Constraint Adherence")`** — Custom criteria: "The output must not invent CVE IDs, change task statuses, calculate metrics not in the evidence, or recommend actions"
-- **`SummarizationMetric(threshold=0.8)`** — Verifies coverage of key findings
+- **`HallucinationMetric(threshold=0.30)`** — Lower-is-better check for invented facts, packages, versions, files, or statuses
+- **`FaithfulnessMetric(threshold=0.85)`** — Ensures report claims are supported by final task, QA, attempt, and patch evidence
+- **`SummarizationMetric(threshold=0.80)`** — Verifies that the report preserves the important outcome, follow-up, and remediation details
+- **`GEval("Report Constraint Adherence", threshold=0.70)`** — One custom criterion combining aggregate counts, attempted-remediation coverage, version/workaround/pivot rules, transitive-package identity, and no invented claims or recommendations
 
 Test structure:
 ```python
 @pytest.mark.eval
 class TestReportNodeEval:
-    def test_narrative_no_hallucination(self, report_evidence_fixture):
-        """Narrative only contains facts from _evidence_payload."""
-        
-    def test_narrative_covers_key_findings(self, report_evidence_fixture):
-        """Narrative mentions all resolved and unresolved groups."""
-        
-    def test_narrative_respects_negative_constraints(self, report_evidence_fixture):
-        """Narrative does not recommend actions or invent CVEs."""
+    def test_report_uses_only_the_four_requested_metrics(self, report_case):
+        """Run Hallucination, Faithfulness, Summarization, and one GEval."""
 ```
 
-Data source: Existing trajectory files that contain report node spans with both the evidence JSON and the generated narrative text.
+Data source: Ten compact cases mapped to historical trajectories and explicitly marked synthetic cases. The fixture adapter reconstructs a compatible graph state, and `generate_report()` supplies the actual Markdown output. Offline contract checks validate the fixture wiring; only the four DeepEval metrics are recorded as report metrics.
 
 ---
 
-#### [NEW] `tests/evals/golden/report_cases.json`
+#### [IMPLEMENTED] `tests/evals/golden/report_cases.json`
 
-5–8 curated test cases from diverse sources:
-- `evidence_payload`: Deterministic evidence dict (extracted from real runs and synthetic scenarios)
-- `generated_narrative`: The actual LLM output
-- `expected_coverage`: List of CVE IDs, package names, and statuses that must appear
-- `forbidden_claims`: Strings that must NOT appear (hallucinated CVEs, prescriptive language)
-- `provenance`: Source description (Juice Shop run, synthetic multi-group scenario, edge case with zero resolved groups, etc.)
+Ten curated cases from historical trajectories and synthetic coverage fixtures:
+- `fixture_type`: `historical`, `historical_contract_adjusted`, or `synthetic`
+- `fixture`: Compact final task, QA, attempt, package-diff, and source-diff evidence
+- `expected_output`: Canonical summary used by `SummarizationMetric`
+- `expected_contract`: Offline cardinality and evidence-fragment checks
+- `historical_evidence`: Short trace-backed evidence notes
+- `provenance`: Source trace or explicit synthetic-fixture rationale
 
 ---
 

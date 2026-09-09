@@ -1,461 +1,337 @@
 [
   {
-    "case_id": "scenario_1_full_pass",
-    "provenance": "Juice Shop baseline SCA remediation from trajectory data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md (Trace: d661e0c3-2466-4cf0-902a-a3215e3affdd)",
-    "evidence_payload": {
+    "case_id": "all_pass_4_historical",
+    "fixture_type": "historical",
+    "provenance": "Four-pass success trace d661e0c3-2466-4cf0-902a-a3215e3affdd.",
+    "historical_evidence": [
+      "Root Final State records four successful action summaries and package.json as the emitted change.",
+      "Attempt Snapshot Summary records task-1 through task-4 as qa_passed with VERSION_BUMP strategy.",
+      "The final patch contains override entries for @tootallnate/once 2.0.1, base64url 3.0.0, cookie 0.7.0, and nanoid 3.3.8."
+    ],
+    "fixture": {
       "status": "completed",
-      "overall_label": "Successful",
-      "metrics": {
-        "original_scanner_findings": 5,
-        "actionable_groups": 4,
-        "groups_fixed": 4,
-        "groups_unresolved": 0,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:base64url:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:cookie:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:nanoid:UPDATE_VERSION": "qa_passed"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:base64url:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:cookie:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:nanoid:UPDATE_VERSION": "VERSION_BUMP"
-      },
-      "reconciliation": {},
-      "errors": [],
-      "changed_files": [
-        "package.json"
-      ]
+      "issues": ["@tootallnate/once", "base64url", "cookie", "nanoid", "duplicate-scanner-finding"],
+      "groups": [
+        {"id": "g-once", "package": "@tootallnate/once", "version": "1.1.2", "severity": "medium"},
+        {"id": "g-base64url", "package": "base64url", "version": "2.0.0", "severity": "medium"},
+        {"id": "g-cookie", "package": "cookie", "version": "0.6.0", "severity": "low"},
+        {"id": "g-nanoid", "package": "nanoid", "version": "3.3.4", "severity": "low"}
+      ],
+      "tasks": [
+        {"id": "t-once", "group": "g-once", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "@tootallnate/once", "target_dependency_type": "overrides", "qa": true},
+        {"id": "t-base64url", "group": "g-base64url", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "base64url", "target_dependency_type": "overrides", "qa": true},
+        {"id": "t-cookie", "group": "g-cookie", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "cookie", "target_dependency_type": "overrides", "qa": true},
+        {"id": "t-nanoid", "group": "g-nanoid", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "nanoid", "target_dependency_type": "overrides", "qa": true}
+      ],
+      "package_changes": [
+        {"file": "package.json", "name": "@tootallnate/once", "new": "2.0.1", "section": "overrides"},
+        {"file": "package.json", "name": "base64url", "new": "3.0.0", "section": "overrides"},
+        {"file": "package.json", "name": "cookie", "new": "0.7.0", "section": "overrides"},
+        {"file": "package.json", "name": "nanoid", "new": "3.3.8", "section": "overrides"}
+      ],
+      "changed_files": ["package.json"]
     },
-    "expected_output": "The remediation run completed successfully with an overall outcome of Successful. All 4 actionable vulnerability groups identified from the original 5 scanner findings have been resolved.\n\nThe remediation strategy applied was VERSION_BUMP across all target packages, updating overrides for @tootallnate/once (2.0.1), base64url (3.0.0), cookie (0.7.0), and nanoid (3.3.8) in package.json. Each targeted group passed validation gates with qa_passed status.\n\nNo errors or remaining issues were encountered during the run, and 1 file (package.json) was modified to achieve full remediation.",
-    "generated_narrative": "The remediation run completed successfully with an overall outcome of Successful. All 4 actionable vulnerability groups identified from the original 5 scanner findings have been resolved.\n\nThe remediation strategy applied was VERSION_BUMP across all target packages, updating overrides for @tootallnate/once (2.0.1), base64url (3.0.0), cookie (0.7.0), and nanoid (3.3.8) in package.json. Each targeted group passed validation gates with qa_passed status.\n\nNo errors or remaining issues were encountered during the run, and 1 file (package.json) was modified to achieve full remediation.",
-    "semantic_criteria": [
-      "Must state that the run was Successful with all 4 actionable groups resolved.",
-      "Must identify @tootallnate/once, base64url, cookie, and nanoid as the upgraded packages.",
-      "Must state that 0 errors occurred and package.json was modified."
-    ],
-    "expected_coverage": [
-      "Successful",
-      "4",
-      "@tootallnate/once",
-      "base64url",
-      "cookie",
-      "nanoid",
-      "package.json"
-    ],
-    "forbidden_claims": [
-      "CVE-9999-99999",
-      "Failed",
-      "Partial",
-      "recommend that developers",
-      "should immediately deploy",
-      "# Executive Summary"
-    ]
+    "expected_output": "The report states that all 4 of 4 vulnerability groups were successfully remediated, no follow-up review is required, and all four remediations are version-only package changes in package.json.",
+    "expected_contract": {
+      "summary": {"fixed": 4, "follow_up": 0},
+      "successful_packages": ["@tootallnate/once", "base64url", "cookie", "nanoid"],
+      "required_fragments": ["No follow-up actions are required.", "2.0.1", "3.0.0", "0.7.0", "3.3.8"],
+      "forbidden_fragments": ["### Code workaround details"]
+    }
   },
   {
-    "case_id": "scenario_2_partial_errors",
-    "provenance": "Juice Shop partial remediation with planner retry errors from trajectory data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md (Trace: aa632865-4cce-4bec-86ba-8c6dfb526f67)",
-    "evidence_payload": {
+    "case_id": "mixed_pass_fail",
+    "fixture_type": "historical",
+    "provenance": "Partial remediation trace aa632865-4cce-4bec-86ba-8c6dfb526f67.",
+    "historical_evidence": [
+      "Root Final State reconciles one successful @tootallnate/once group and two unresolved groups, express-jwt and ws.",
+      "The report-level result is 1 of 3 successful with two follow-up actions.",
+      "The unresolved groups retain attempted version and workaround histories."
+    ],
+    "fixture": {
       "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 3,
-        "actionable_groups": 3,
-        "groups_fixed": 1,
-        "groups_unresolved": 2,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable",
-        "sca:frontend/package.json:ws:UPDATE_VERSION": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:frontend/package.json:ws:UPDATE_VERSION": "VERSION_BUMP"
-      },
-      "reconciliation": {},
-      "errors": [
-        "supervisor/ERROR: selected version for task-2 was already attempted.",
-        "supervisor/PLANNER_SEMANTIC_VALIDATION: retry_update requires an unattempted exact selected_version"
+      "issues": ["@tootallnate/once", "express-jwt", "ws"],
+      "groups": [
+        {"id": "g-once", "package": "@tootallnate/once", "version": "1.1.2", "severity": "medium"},
+        {"id": "g-express", "package": "express-jwt", "version": "0.1.3", "severity": "high"},
+        {"id": "g-ws", "package": "ws", "version": "8.18.0", "severity": "medium", "file": "frontend/package.json"}
       ],
-      "changed_files": [
-        "frontend/package.json",
-        "package.json"
-      ]
+      "tasks": [
+        {"id": "t-once", "group": "g-once", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "@tootallnate/once", "target_dependency_type": "overrides", "qa": true},
+        {"id": "t-express", "group": "g-express", "status": "unfixable", "strategy": "VERSION_BUMP", "target_package_name": "express-jwt", "target_dependency_type": "dependencies", "parent_package_version": "0.1.3"},
+        {"id": "t-ws", "group": "g-ws", "status": "unfixable", "strategy": "VERSION_BUMP", "target_package_name": "ws", "target_dependency_type": "dependencies", "parent_package_version": "8.18.0"}
+      ],
+      "attempts": [
+        {"id": "a-express-1", "task": "t-express", "status": "failed", "package": "express-jwt", "selected_version": "6.0.0", "instruction": "Update express-jwt in package.json to version 6.0.0.", "files": ["package.json"], "qa": false, "outcome": "Dependency validation failed."},
+        {"id": "a-express-2", "task": "t-express", "status": "failed", "package": "express-jwt", "selected_version": "8.5.1", "instruction": "Update express-jwt in package.json to version 8.5.1.", "files": ["package.json"], "qa": false, "outcome": "Dependency validation failed."},
+        {"id": "a-ws-1", "task": "t-ws", "status": "failed", "package": "ws", "selected_version": "8.20.1", "instruction": "Update ws in frontend/package.json to version 8.20.1.", "files": ["frontend/package.json"], "qa": false, "outcome": "Dependency validation failed."},
+        {"id": "a-ws-2", "task": "t-ws", "status": "failed", "package": "ws", "selected_version": "8.21.1", "instruction": "Update ws in frontend/package.json to version 8.21.1.", "files": ["frontend/package.json"], "qa": false, "outcome": "Dependency validation failed."}
+      ],
+      "package_changes": [
+        {"file": "package.json", "name": "@tootallnate/once", "new": "2.0.1", "section": "overrides"}
+      ],
+      "changed_files": ["frontend/package.json", "package.json"]
     },
-    "expected_output": "The remediation run completed with an overall label of Completed with errors. Out of 3 actionable vulnerability groups, 1 group was successfully fixed while 2 groups remain unresolved.\n\nThe update for @tootallnate/once succeeded via VERSION_BUMP and achieved qa_passed status. However, express-jwt and the frontend ws package concluded as unfixable due to version conflicts and planner validation constraints.\n\nOperational errors were recorded during planner retry scheduling. Modifications were made across 2 manifest files: package.json and frontend/package.json.",
-    "generated_narrative": "The remediation run completed with an overall label of Completed with errors. Out of 3 actionable vulnerability groups, 1 group was successfully fixed while 2 groups remain unresolved.\n\nThe update for @tootallnate/once succeeded via VERSION_BUMP and achieved qa_passed status. However, express-jwt and the frontend ws package concluded as unfixable due to version conflicts and planner validation constraints.\n\nOperational errors were recorded during planner retry scheduling. Modifications were made across 2 manifest files: package.json and frontend/package.json.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must state that 1 group (@tootallnate/once) was fixed and 2 groups remain unresolved.",
-      "Must reference express-jwt, ws, package.json, and frontend/package.json."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "1",
-      "unresolved",
-      "@tootallnate/once",
-      "express-jwt",
-      "ws",
-      "package.json",
-      "frontend/package.json"
-    ],
-    "forbidden_claims": [
-      "all 3 groups fixed",
-      "100% success",
-      "recommend rolling back",
-      "# Report"
-    ]
+    "expected_output": "The report states that 1 of 3 vulnerability groups was successfully remediated and 2 require follow-up. It lists attempted remediations for express-jwt and ws and one successful @tootallnate/once update.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 2},
+      "successful_packages": ["@tootallnate/once"],
+      "follow_up_packages": ["express-jwt", "ws"],
+      "required_fragments": ["Updated express-jwt 0.1.3", "Updated ws 8.18.0", "2.0.1"]
+    }
   },
   {
-    "case_id": "scenario_3_strategy_pivot",
-    "provenance": "Supervisor dynamic strategy pivot from version bump to code workaround from trajectory data/trajectories/phase5_20260721T023221Z_1baafbc7-f9f2-40b1-9f88-1e73aa268467.md (Trace: 1baafbc7-f9f2-40b1-9f88-1e73aa268467)",
-    "evidence_payload": {
+    "case_id": "all_fail_3_unfixable",
+    "fixture_type": "historical",
+    "provenance": "Three-unfixable trace 80e0225f-0ffa-4030-b37a-26cfb063d18b.",
+    "historical_evidence": [
+      "Attempt Snapshot Summary records task-1, task-2, and task-3 as unfixable after version-bump attempts.",
+      "Root Final State has package.json and package-lock.json changes but no QA-passed final task.",
+      "The report-level outcome is 0 of 3 successful with three follow-up actions and no successful-remediation rows."
+    ],
+    "fixture": {
       "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 3,
-        "actionable_groups": 3,
-        "groups_fixed": 1,
-        "groups_unresolved": 2,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable",
-        "sca:frontend/package.json:ws:UPDATE_VERSION": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:CODE_WORKAROUND": "CODE_WORKAROUND",
-        "sca:frontend/package.json:ws:CODE_WORKAROUND": "CODE_WORKAROUND"
-      },
-      "reconciliation": {},
-      "errors": [
-        "supervisor/PLANNER_SEMANTIC_VALIDATION: planner semantic validation: task task-1: retry_update requires an unattempted exact selected_version"
+      "issues": ["@tootallnate/once", "express-jwt", "sanitize-html"],
+      "groups": [
+        {"id": "g-once", "package": "@tootallnate/once", "version": "1.1.2", "severity": "medium"},
+        {"id": "g-express", "package": "express-jwt", "version": "0.1.3", "severity": "high"},
+        {"id": "g-sanitize", "package": "sanitize-html", "version": "1.4.2", "severity": "high"}
       ],
-      "changed_files": [
-        "frontend/package.json",
-        "package.json"
-      ]
+      "tasks": [
+        {"id": "t-once", "group": "g-once", "status": "unfixable", "strategy": "VERSION_BUMP", "target_package_name": "@tootallnate/once", "target_dependency_type": "dependencies", "parent_package_version": "1.1.2"},
+        {"id": "t-express", "group": "g-express", "status": "unfixable", "strategy": "VERSION_BUMP", "target_package_name": "express-jwt", "target_dependency_type": "dependencies", "parent_package_version": "0.1.3"},
+        {"id": "t-sanitize", "group": "g-sanitize", "status": "unfixable", "strategy": "VERSION_BUMP", "target_package_name": "sanitize-html", "target_dependency_type": "dependencies", "parent_package_version": "1.4.2"}
+      ],
+      "attempts": [
+        {"id": "a-once", "task": "t-once", "status": "failed", "package": "@tootallnate/once", "selected_version": "2.0.1", "instruction": "Update @tootallnate/once in package.json to version 2.0.1.", "files": ["package.json"], "qa": false, "outcome": "Dependency validation failed."},
+        {"id": "a-express", "task": "t-express", "status": "failed", "package": "express-jwt", "selected_version": "6.0.0", "instruction": "Update express-jwt in package.json to version 6.0.0.", "files": ["package.json"], "qa": false, "outcome": "Dependency validation failed."},
+        {"id": "a-sanitize", "task": "t-sanitize", "status": "failed", "package": "sanitize-html", "selected_version": "2.12.1", "instruction": "Update sanitize-html in package.json to version 2.12.1.", "files": ["package.json"], "qa": false, "outcome": "Dependency validation failed."}
+      ],
+      "package_changes": [
+        {"file": "package.json", "name": "@tootallnate/once", "old": "1.1.2", "new": "2.0.1", "section": "dependencies"}
+      ],
+      "changed_files": ["package-lock.json", "package.json"]
     },
-    "expected_output": "The remediation run completed with an overall outcome of Completed with errors. A total of 3 actionable vulnerability groups were evaluated across multiple remediation strategies.\n\nThe @tootallnate/once group was successfully remediated via VERSION_BUMP. For express-jwt and ws, initial version bump attempts encountered peer conflicts, prompting the supervisor to pivot to CODE_WORKAROUND tasks; however, both groups ultimately concluded as unfixable.\n\nPlanner semantic validation errors were logged during the strategy pivot workflow. Two files were modified during the attempts: frontend/package.json and package.json.",
-    "generated_narrative": "The remediation run completed with an overall outcome of Completed with errors. A total of 3 actionable vulnerability groups were evaluated across multiple remediation strategies.\n\nThe @tootallnate/once group was successfully remediated via VERSION_BUMP. For express-jwt and ws, initial version bump attempts encountered peer conflicts, prompting the supervisor to pivot to CODE_WORKAROUND tasks; however, both groups ultimately concluded as unfixable.\n\nPlanner semantic validation errors were logged during the strategy pivot workflow. Two files were modified during the attempts: frontend/package.json and package.json.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must mention the strategy pivot from version bump to CODE_WORKAROUND.",
-      "Must state that 1 group was fixed (@tootallnate/once) while 2 groups were unfixable."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "@tootallnate/once",
-      "express-jwt",
-      "ws",
-      "CODE_WORKAROUND",
-      "package.json"
-    ],
-    "forbidden_claims": [
-      "all vulnerabilities resolved",
-      "recommend manual review",
-      "# Executive Summary"
-    ]
+    "expected_output": "The report states that 0 of 3 vulnerability groups were successfully remediated, 3 require follow-up, and no successful-remediation rows were produced. Each follow-up includes a failed version attempt.",
+    "expected_contract": {
+      "summary": {"fixed": 0, "follow_up": 3},
+      "follow_up_packages": ["@tootallnate/once", "express-jwt", "sanitize-html"],
+      "required_fragments": ["Updated @tootallnate/once 1.1.2", "Updated express-jwt 0.1.3", "Updated sanitize-html 1.4.2", "No successful remediations were produced during this run."]
+    }
   },
   {
-    "case_id": "scenario_4_code_workaround",
-    "provenance": "AST code workarounds and manifest updates from trajectory data/trajectories/phase5_20260818T042956Z_c46e0277-fe40-48ab-a91e-fe9041fdcd87.md (Trace: c46e0277-fe40-48ab-a91e-fe9041fdcd87)",
-    "evidence_payload": {
-      "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 14,
-        "actionable_groups": 7,
-        "groups_fixed": 5,
-        "groups_unresolved": 2,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:parent=sqlite3:type=dependencies:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:got:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:notevil:NO_FIX": "qa_passed",
-        "sca:package.json:sanitize-html:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:sanitize-html:CODE_WORKAROUND": "qa_passed",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable",
-        "sca:package.json:express-jwt:CODE_WORKAROUND": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:parent=sqlite3:type=dependencies:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:got:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:notevil:NO_FIX": "CODE_WORKAROUND",
-        "sca:package.json:sanitize-html:CODE_WORKAROUND": "CODE_WORKAROUND",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP"
-      },
-      "reconciliation": {},
-      "errors": [
-        "supervisor/STALE_ATTEMPT_RESULT: ignored revised instruction for task-4 because its current attempt is still active.",
-        "final_full_scan/ODC_TIMEOUT: Dependency-Check timed out after 300s."
-      ],
-      "changed_files": [
-        "lib/insecurity.ts",
-        "package-lock.json",
-        "package.json",
-        "routes/b2bOrder.ts"
-      ]
+    "case_id": "version_bump",
+    "fixture_type": "historical",
+    "provenance": "Version-only row from the four-pass trace d661e0c3-2466-4cf0-902a-a3215e3affdd.",
+    "historical_evidence": [
+      "The selected task is qa_passed with VERSION_BUMP strategy.",
+      "The final patch changes a manifest entry and contains no source-code hunk."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": ["undici"],
+      "groups": [{"id": "g-undici", "package": "undici", "version": "5.0.0", "severity": "high"}],
+      "tasks": [{"id": "t-undici", "group": "g-undici", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "undici", "target_dependency_type": "overrides", "qa": true}],
+      "package_changes": [{"file": "package.json", "name": "undici", "old": "5.0.0", "new": "5.1.0", "section": "overrides"}],
+      "changed_files": ["package.json"]
     },
-    "expected_output": "The remediation run concluded with an overall outcome of Completed with errors. Out of 7 actionable vulnerability groups derived from 14 scanner findings, 5 groups were successfully resolved.\n\nCode-level mitigations and AST sanitization routines were applied for notevil and sanitize-html in lib/insecurity.ts and routes/b2bOrder.ts under a CODE_WORKAROUND strategy, alongside version upgrades for got and @tootallnate/once. However, express-jwt remained unfixable.\n\nA post-remediation Dependency-Check scan timeout occurred during final validation. In total, 4 files were modified across code files and manifests.",
-    "generated_narrative": "The remediation run concluded with an overall outcome of Completed with errors. Out of 7 actionable vulnerability groups derived from 14 scanner findings, 5 groups were successfully resolved.\n\nCode-level mitigations and AST sanitization routines were applied for notevil and sanitize-html in lib/insecurity.ts and routes/b2bOrder.ts under a CODE_WORKAROUND strategy, alongside version upgrades for got and @tootallnate/once. However, express-jwt remained unfixable.\n\nA post-remediation Dependency-Check scan timeout occurred during final validation. In total, 4 files were modified across code files and manifests.",
-    "semantic_criteria": [
-      "Must report the overall label as Completed with errors.",
-      "Must state that 5 groups were fixed and 2 groups remain unresolved.",
-      "Must mention CODE_WORKAROUND mitigations applied in lib/insecurity.ts and routes/b2bOrder.ts."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "5",
-      "notevil",
-      "sanitize-html",
-      "CODE_WORKAROUND",
-      "lib/insecurity.ts",
-      "routes/b2bOrder.ts"
-    ],
-    "forbidden_claims": [
-      "all 7 groups fixed",
-      "recommend manual code audit",
-      "# Executive Summary"
-    ]
+    "expected_output": "The successful remediation row reports a package version transition via overrides and lists package.json, without a source-code workaround or code diff.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["undici"],
+      "required_fragments": ["5.0.0", "5.1.0", "via overrides", "package.json"],
+      "forbidden_fragments": ["### Code workaround details"]
+    }
   },
   {
-    "case_id": "scenario_6_retry_limit",
-    "provenance": "Validation gate retry ceiling reached from trajectory data/trajectories/phase5_20260805T072103Z_60de8d6e-e6ca-494e-95b4-fd5d518a2d43.md (Trace: 60de8d6e-e6ca-494e-95b4-fd5d518a2d43)",
-    "evidence_payload": {
-      "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 8,
-        "actionable_groups": 4,
-        "groups_fixed": 0,
-        "groups_unresolved": 4,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": 0
-      },
-      "group_statuses": {
-        "sca:package.json:ip-address:UPDATE_VERSION": "unfixable",
-        "sca:package.json:sanitize-html:UPDATE_VERSION": "unfixable",
-        "sca:package.json:sanitize-html:CODE_WORKAROUND": "unfixable",
-        "sca:package.json:ip-address:CODE_WORKAROUND": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:ip-address:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:sanitize-html:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:sanitize-html:CODE_WORKAROUND": "CODE_WORKAROUND",
-        "sca:package.json:ip-address:CODE_WORKAROUND": "CODE_WORKAROUND"
-      },
-      "reconciliation": {},
-      "errors": [
-        "run/ERROR: VALIDATION_LIMIT_REACHED: Maximum 3 validation gate attempts reached."
-      ],
-      "changed_files": [
-        "package.json"
-      ]
+    "case_id": "code_workaround_initial",
+    "fixture_type": "synthetic",
+    "provenance": "Synthetic positive fixture for the initial CODE_WORKAROUND shape; closest historical source-only no-fix trace is 4e04f8ff-d8b9-48dc-924c-b1295de20c95.",
+    "historical_evidence": [
+      "The closest historical case proves source-only vulnerable-path removal, but not a clean initial generic workaround.",
+      "This fixture isolates the requested initial code-workaround output shape."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": ["express-jwt"],
+      "groups": [{"id": "g-code", "package": "express-jwt", "version": "5.0.0", "severity": "high"}],
+      "tasks": [{"id": "t-code", "group": "g-code", "status": "qa_passed", "strategy": "CODE_WORKAROUND", "strategy_stage": "code_workaround"}],
+      "attempts": [{"id": "a-code", "task": "t-code", "status": "success", "final_note": "Added a guard before the vulnerable middleware call.", "files": ["src/guard.ts"], "qa": true}],
+      "source_changes": [{"file": "src/guard.ts", "removed": "unsafe(input)", "added": "safe(input)"}],
+      "changed_files": ["src/guard.ts"]
     },
-    "expected_output": "The remediation run concluded with an outcome of Completed with errors. None of the 4 actionable vulnerability groups (ip-address and sanitize-html across version bump and code workaround attempts) could be resolved, leaving 4 groups unresolved.\n\nRepeated candidate patches failed QA gate evaluation, triggering the execution limit: VALIDATION_LIMIT_REACHED (Maximum 3 validation gate attempts reached). Tasks were subsequently marked as unfixable.\n\nOnly package.json was modified during the attempts before tasks reached the terminal limit.",
-    "generated_narrative": "The remediation run concluded with an outcome of Completed with errors. None of the 4 actionable vulnerability groups (ip-address and sanitize-html across version bump and code workaround attempts) could be resolved, leaving 4 groups unresolved.\n\nRepeated candidate patches failed QA gate evaluation, triggering the execution limit: VALIDATION_LIMIT_REACHED (Maximum 3 validation gate attempts reached). Tasks were subsequently marked as unfixable.\n\nOnly package.json was modified during the attempts before tasks reached the terminal limit.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must state that 4 groups remain unresolved.",
-      "Must mention that the validation retry limit (VALIDATION_LIMIT_REACHED) was reached."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "4",
-      "unresolved",
-      "ip-address",
-      "sanitize-html",
-      "VALIDATION_LIMIT_REACHED",
-      "package.json"
-    ],
-    "forbidden_claims": [
-      "partially successful",
-      "2 groups fixed",
-      "recommend changing test thresholds",
-      "# Executive Summary"
-    ]
+    "expected_output": "The successful remediation row reports a specific source-code workaround for the vulnerable path and includes a non-manifest source diff.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["express-jwt"],
+      "required_fragments": ["Code workaround", "src/guard.ts", "unsafe(input)", "safe(input)"],
+      "code_detail_diff_paths": ["src/guard.ts"],
+      "forbidden_code_detail_diff_paths": ["package.json"]
+    }
   },
   {
-    "case_id": "scenario_7_tool_exhaustion",
-    "provenance": "Subagent tool loop round exhaustion from trajectory data/trajectories/phase5_20260728T073955Z_e2b26c6e-b32d-4dd3-9bdc-e73d363a8c00.md (Trace: e2b26c6e-b32d-4dd3-9bdc-e73d363a8c00)",
-    "evidence_payload": {
-      "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 2,
-        "actionable_groups": 2,
-        "groups_fixed": 0,
-        "groups_unresolved": 2,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": 0
-      },
-      "group_statuses": {
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable",
-        "sca:package.json:express-jwt:CODE_WORKAROUND": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:CODE_WORKAROUND": "CODE_WORKAROUND"
-      },
-      "reconciliation": {},
-      "errors": [
-        "run/ERROR: Subagent exceeded the maximum tool-call rounds without reaching a final answer."
+    "case_id": "no_fix_package_removal",
+    "fixture_type": "historical",
+    "provenance": "Package-removal evidence from task-4 in mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
+    "historical_evidence": [
+      "Root Final State task-4 is a no-fix package-removal task with QA-passed evidence.",
+      "The report row removes notevil from dependency manifests and explains removal of application usage.",
+      "The code-detail diff is restricted to routes/b2bOrder.ts while the main row retains manifest files."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": ["notevil"],
+      "groups": [{"id": "g-notevil", "package": "notevil", "version": "1.3.3", "severity": "medium"}],
+      "tasks": [{"id": "t-notevil", "group": "g-notevil", "status": "qa_passed", "strategy": "CODE_WORKAROUND", "strategy_stage": "code_workaround", "no_fix_stage": "package_removal", "qa_policy": "no_fix_package_removal"}],
+      "attempts": [{"id": "a-notevil", "task": "t-notevil", "status": "success", "final_note": "Removed notevil from package.json and eliminated its application usage.", "files": ["package-lock.json", "package.json", "routes/b2bOrder.ts"], "qa": true}],
+      "package_changes": [
+        {"file": "package.json", "name": "notevil", "old": "^1.3.3", "section": "dependencies"},
+        {"file": "package-lock.json", "name": "notevil", "old": "1.3.3"}
       ],
-      "changed_files": [
-        "package.json"
-      ]
+      "source_changes": [{"file": "routes/b2bOrder.ts", "removed": "unsafeOrder()", "added": "safeOrder()"}],
+      "changed_files": ["package-lock.json", "package.json", "routes/b2bOrder.ts"]
     },
-    "expected_output": "The remediation run completed with an overall outcome of Completed with errors. Neither of the 2 targeted tasks for express-jwt (version bump and code workaround) could be completed, leaving 2 groups unresolved.\n\nDuring workaround execution, the subagent worker exceeded the maximum tool-call rounds without producing a valid final answer. The task was aborted and marked unfixable to prevent unconstrained execution.\n\nModifications were limited to package.json, and the original scanner findings remain unaddressed.",
-    "generated_narrative": "The remediation run completed with an overall outcome of Completed with errors. Neither of the 2 targeted tasks for express-jwt (version bump and code workaround) could be completed, leaving 2 groups unresolved.\n\nDuring workaround execution, the subagent worker exceeded the maximum tool-call rounds without producing a valid final answer. The task was aborted and marked unfixable to prevent unconstrained execution.\n\nModifications were limited to package.json, and the original scanner findings remain unaddressed.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must identify that 2 groups remain unresolved for express-jwt.",
-      "Must state that the subagent exceeded maximum tool-call rounds."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "2",
-      "unresolved",
-      "express-jwt",
-      "maximum tool-call rounds",
-      "package.json"
-    ],
-    "forbidden_claims": [
-      "successfully remediated",
-      "all tests passed",
-      "recommend debugging agent prompts",
-      "# Summary"
-    ]
+    "expected_output": "The successful remediation row reports that the vulnerable dependency was removed and its application use removed; it lists package manifests and a source file, with a source-only code diff detail.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["notevil"],
+      "required_fragments": ["removed via dependencies", "Code workaround", "routes/b2bOrder.ts", "unsafeOrder()", "safeOrder()"],
+      "code_detail_diff_paths": ["routes/b2bOrder.ts"],
+      "forbidden_code_detail_diff_paths": ["package.json", "package-lock.json"]
+    }
   },
   {
-    "case_id": "scenario_8_multi_manifest",
-    "provenance": "Multi-manifest modifications touching root and frontend client from trajectory data/trajectories/phase5_20260721T034517Z_395b40db-d6f7-4edd-b619-41d8ba612e00.md (Trace: 395b40db-d6f7-4edd-b619-41d8ba612e00)",
-    "evidence_payload": {
-      "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 3,
-        "actionable_groups": 3,
-        "groups_fixed": 1,
-        "groups_unresolved": 2,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "qa_passed",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable",
-        "sca:frontend/package.json:ws:UPDATE_VERSION": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:frontend/package.json:ws:UPDATE_VERSION": "VERSION_BUMP"
-      },
-      "reconciliation": {},
-      "errors": [
-        "supervisor/ERROR: selected version for task-2 was already attempted."
+    "case_id": "strategy_pivot_version_to_workaround",
+    "fixture_type": "historical",
+    "provenance": "Version-bump to code-workaround pivot in sanitize-html from mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
+    "historical_evidence": [
+      "Attempt Snapshot Summary records the version task as pivoted and the child workaround task as qa_passed.",
+      "The final patch contains a sanitize-html version transition plus a source edit in lib/insecurity.ts.",
+      "The report retains both the package transition and the code workaround details."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": ["sanitize-html"],
+      "groups": [
+        {"id": "g-sanitize", "package": "sanitize-html", "version": "1.4.2", "severity": "high"},
+        {"id": "g-sanitize-child", "package": "sanitize-html", "version": "1.4.2", "severity": "high", "initial": false, "final": true}
       ],
-      "changed_files": [
-        "frontend/package.json",
-        "package.json"
-      ]
+      "tasks": [
+        {"id": "t-sanitize-version", "group": "g-sanitize", "status": "pivoted", "strategy": "VERSION_BUMP", "strategy_stage": "npm_latest", "target_package_name": "sanitize-html", "target_dependency_type": "dependencies", "parent_package_version": "1.4.2"},
+        {"id": "t-sanitize-code", "group": "g-sanitize-child", "parent_task_id": "t-sanitize-version", "status": "qa_passed", "strategy": "CODE_WORKAROUND", "strategy_stage": "code_workaround"}
+      ],
+      "attempts": [
+        {"id": "a-sanitize-version", "task": "t-sanitize-version", "status": "failed", "package": "sanitize-html", "selected_version": "2.17.7", "instruction": "Update sanitize-html in package.json to version 2.17.7.", "files": ["package.json", "package-lock.json"], "qa": false, "outcome": "Version update failed validation."},
+        {"id": "a-sanitize-code", "task": "t-sanitize-code", "status": "success", "final_note": "Added a final cleanup pass after sanitizeSecure.", "files": ["lib/insecurity.ts"], "qa": true}
+      ],
+      "package_changes": [
+        {"file": "package.json", "name": "sanitize-html", "old": "1.4.2", "new": "2.17.7", "section": "dependencies"},
+        {"file": "package-lock.json", "name": "sanitize-html", "old": "1.4.2", "new": "2.17.7"}
+      ],
+      "source_changes": [{"file": "lib/insecurity.ts", "removed": "return sanitizeSecure(value)", "added": "return cleanup(sanitizeSecure(value))"}],
+      "changed_files": ["lib/insecurity.ts", "package-lock.json", "package.json"]
     },
-    "expected_output": "The remediation run completed with an overall outcome of Completed with errors. Out of 3 actionable vulnerability groups, 1 was resolved while 2 remain unresolved.\n\nThe @tootallnate/once group was successfully fixed via VERSION_BUMP. The remaining groups for express-jwt and ws in frontend/package.json concluded as unfixable after encountering dependency conflicts.\n\nRemediation modifications spanned 2 separate manifest files: frontend/package.json and package.json.",
-    "generated_narrative": "The remediation run completed with an overall outcome of Completed with errors. Out of 3 actionable vulnerability groups, 1 was resolved while 2 remain unresolved.\n\nThe @tootallnate/once group was successfully fixed via VERSION_BUMP. The remaining groups for express-jwt and ws in frontend/package.json concluded as unfixable after encountering dependency conflicts.\n\nRemediation modifications spanned 2 separate manifest files: frontend/package.json and package.json.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must state that 1 group was fixed and 2 remain unresolved.",
-      "Must specify changes across both frontend/package.json and package.json."
-    ],
-    "expected_coverage": [
-      "Completed with errors",
-      "1",
-      "@tootallnate/once",
-      "express-jwt",
-      "ws",
-      "frontend/package.json",
-      "package.json"
-    ],
-    "forbidden_claims": [
-      "all 3 groups fixed",
-      "recommend manual review",
-      "# Executive Summary"
-    ]
+    "expected_output": "The successful remediation row retains both the version transition and code workaround explanation, lists manifests and a source file, and includes only the source diff in code details.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["sanitize-html"],
+      "required_fragments": ["1.4.2", "2.17.7", "Code workaround", "lib/insecurity.ts", "cleanup(sanitizeSecure(value))"],
+      "code_detail_diff_paths": ["lib/insecurity.ts"],
+      "forbidden_code_detail_diff_paths": ["package.json", "package-lock.json"]
+    }
   },
   {
-    "case_id": "scenario_9_all_unfixable",
-    "provenance": "All targeted packages unfixable under conflicting overrides from trajectory data/trajectories/phase5_20260728T024805Z_64a0ce97-9d15-4bd4-9e37-bfc6385d2bcd.md (Trace: 64a0ce97-9d15-4bd4-9e37-bfc6385d2bcd)",
-    "evidence_payload": {
-      "status": "completed_with_errors",
-      "overall_label": "Completed with errors",
-      "metrics": {
-        "original_scanner_findings": 5,
-        "actionable_groups": 4,
-        "groups_fixed": 0,
-        "groups_unresolved": 4,
-        "groups_inconclusive": 0,
-        "groups_pending": 0,
-        "groups_retriage_discovered": null
-      },
-      "group_statuses": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "unfixable",
-        "sca:package.json:cookie:UPDATE_VERSION": "unfixable",
-        "sca:package.json:express-jwt:NO_FIX": "unfixable",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "unfixable"
-      },
-      "strategies": {
-        "sca:package.json:@tootallnate/once:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:cookie:UPDATE_VERSION": "VERSION_BUMP",
-        "sca:package.json:express-jwt:UPDATE_VERSION": "VERSION_BUMP"
-      },
-      "reconciliation": {},
-      "errors": [
-        "run/ERROR: Group rejected all candidate version bumps due to lockfile resolution conflicts."
+    "case_id": "strategy_pivot_removal_to_workaround",
+    "fixture_type": "synthetic",
+    "provenance": "Synthetic exact-pivot fixture based on package-removal evidence in c46e0277 and source-only vulnerable-path removal in 4e04f8ff.",
+    "historical_evidence": [
+      "c46e0277 proves package-removal/no-fix evidence with manifest and source changes.",
+      "4e04f8ff proves a successful source-only vulnerable-path removal.",
+      "The exact package-removal to later code-workaround pivot is not present as one historical positive, so this case is explicitly synthetic."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": ["notevil"],
+      "groups": [
+        {"id": "g-removal", "package": "notevil", "version": "1.3.3", "severity": "medium"},
+        {"id": "g-removal-child", "package": "notevil", "version": "1.3.3", "severity": "medium", "initial": false, "final": true}
       ],
-      "changed_files": []
+      "tasks": [
+        {"id": "t-removal", "group": "g-removal", "status": "pivoted", "strategy": "CODE_WORKAROUND", "strategy_stage": "package_removal", "no_fix_stage": "package_removal", "qa_policy": "no_fix_package_removal"},
+        {"id": "t-removal-code", "group": "g-removal-child", "parent_task_id": "t-removal", "status": "qa_passed", "strategy": "CODE_WORKAROUND", "strategy_stage": "code_workaround"}
+      ],
+      "attempts": [
+        {"id": "a-removal", "task": "t-removal", "status": "failed", "summary": "Package removal did not pass validation.", "files": ["package.json", "package-lock.json"], "qa": false, "outcome": "Package removal failed validation."},
+        {"id": "a-removal-code", "task": "t-removal-code", "status": "success", "final_note": "Removed the vulnerable notevil execution path from the application.", "files": ["routes/b2bOrder.ts"], "qa": true}
+      ],
+      "source_changes": [{"file": "routes/b2bOrder.ts", "removed": "unsafeOrder()", "added": "safeOrder()"}],
+      "changed_files": ["routes/b2bOrder.ts"]
     },
-    "expected_output": "The remediation run concluded with an outcome of Completed with errors. None of the 4 actionable vulnerability groups (@tootallnate/once, cookie, and express-jwt) could be resolved, leaving 4 groups unresolved.\n\nAll candidate version bumps and fix attempts were rejected due to lockfile resolution and dependency constraint conflicts across the targeted packages.\n\nZero files were changed, and the 5 original scanner findings remain unresolved in the repository.",
-    "generated_narrative": "The remediation run concluded with an outcome of Completed with errors. None of the 4 actionable vulnerability groups (@tootallnate/once, cookie, and express-jwt) could be resolved, leaving 4 groups unresolved.\n\nAll candidate version bumps and fix attempts were rejected due to lockfile resolution and dependency constraint conflicts across the targeted packages.\n\nZero files were changed, and the 5 original scanner findings remain unresolved in the repository.",
-    "semantic_criteria": [
-      "Must report the overall outcome as Completed with errors.",
-      "Must state that 4 groups remain unresolved.",
-      "Must confirm that zero files were changed."
+    "expected_output": "The successful remediation row describes removal of the vulnerable path through a code workaround and lists the non-manifest source file with its diff.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["notevil"],
+      "required_fragments": ["Code workaround", "Removed the vulnerable notevil execution path", "routes/b2bOrder.ts", "unsafeOrder()", "safeOrder()"],
+      "code_detail_diff_paths": ["routes/b2bOrder.ts"],
+      "forbidden_code_detail_diff_paths": ["package.json", "package-lock.json"]
+    }
+  },
+  {
+    "case_id": "version_bump_multi_manifest",
+    "fixture_type": "synthetic",
+    "provenance": "Synthetic positive multi-manifest fixture based on root/frontend manifest paths observed in partial trace aa632865.",
+    "historical_evidence": [
+      "The historical partial run proves that root package.json and frontend/package.json are distinct report paths.",
+      "The historical run did not have both manifest groups successful, so this positive all-success case is explicitly synthetic."
     ],
-    "expected_coverage": [
-      "Completed with errors",
-      "4",
-      "unresolved",
-      "@tootallnate/once",
-      "cookie",
-      "express-jwt"
+    "fixture": {
+      "status": "completed",
+      "issues": ["lodash", "ws"],
+      "groups": [
+        {"id": "g-root-lodash", "package": "lodash", "version": "4.17.20", "severity": "high", "file": "package.json"},
+        {"id": "g-frontend-ws", "package": "ws", "version": "8.18.0", "severity": "medium", "file": "frontend/package.json"}
+      ],
+      "tasks": [
+        {"id": "t-lodash", "group": "g-root-lodash", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "lodash", "target_dependency_type": "dependencies", "qa": true},
+        {"id": "t-ws", "group": "g-frontend-ws", "status": "qa_passed", "strategy": "VERSION_BUMP", "target_package_name": "ws", "target_dependency_type": "dependencies", "qa": true}
+      ],
+      "package_changes": [
+        {"file": "package.json", "name": "lodash", "old": "4.17.20", "new": "4.17.21", "section": "dependencies"},
+        {"file": "frontend/package.json", "name": "ws", "old": "8.18.0", "new": "8.20.0", "section": "dependencies"}
+      ],
+      "changed_files": ["package.json", "frontend/package.json"]
+    },
+    "expected_output": "The report lists two successful version-only remediations, one in package.json and one in frontend/package.json, with no source-code details.",
+    "expected_contract": {
+      "summary": {"fixed": 2, "follow_up": 0},
+      "successful_packages": ["lodash", "ws"],
+      "required_fragments": ["package.json", "frontend/package.json", "4.17.20", "4.17.21", "8.18.0", "8.20.0"],
+      "forbidden_fragments": ["### Code workaround details"]
+    }
+  },
+  {
+    "case_id": "version_bump_transitive",
+    "fixture_type": "historical_contract_adjusted",
+    "provenance": "Transitive override evidence from task-1 in mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
+    "historical_evidence": [
+      "Task metadata distinguishes parent package sqlite3 from vulnerable target @tootallnate/once.",
+      "The final package change is a successful override in package.json.",
+      "The current report contract labels the finding by vulnerable package and keeps the editable parent as target context."
     ],
-    "forbidden_claims": [
-      "successfully resolved",
-      "1 group fixed",
-      "recommend changing package managers",
-      "# Executive Summary"
-    ]
+    "fixture": {
+      "status": "completed",
+      "issues": ["@tootallnate/once"],
+      "groups": [{"id": "g-transitive", "package": "@tootallnate/once", "version": "1.1.2", "severity": "medium"}],
+      "tasks": [{"id": "t-transitive", "group": "g-transitive", "status": "qa_passed", "strategy": "VERSION_BUMP", "strategy_stage": "package_override", "target_package_name": "@tootallnate/once", "parent_package_name": "sqlite3", "parent_package_version": "5.0.2", "target_dependency_type": "overrides", "selected_version": "2.0.1", "qa": true}],
+      "package_changes": [{"file": "package.json", "name": "@tootallnate/once", "new": "2.0.1", "section": "overrides"}],
+      "changed_files": ["package.json"]
+    },
+    "expected_output": "The report identifies the vulnerable transitive package @tootallnate/once, records its update via overrides in package.json, and keeps sqlite3 as parent context rather than the finding label.",
+    "expected_contract": {
+      "summary": {"fixed": 1, "follow_up": 0},
+      "successful_packages": ["@tootallnate/once"],
+      "required_fragments": ["@tootallnate/once", "2.0.1", "via overrides", "package.json"],
+      "forbidden_fragments": ["### Code workaround details"]
+    }
   }
 ]

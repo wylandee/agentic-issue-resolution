@@ -1,15 +1,15 @@
-"""Phase 1: DeepEval and structural evaluation for Report Node executive narratives."""
+"""DeepEval evaluation of the deterministic Report Node Markdown contract."""
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from remediation_engine.orchestration.report_node import generate_report
 from tests.evals.conftest import EvalSettings
 
 try:
@@ -18,348 +18,423 @@ try:
         FaithfulnessMetric,
         GEval,
         HallucinationMetric,
+        SummarizationMetric,
     )
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
     HAS_DEEPEVAL = True
 except ImportError:
     HAS_DEEPEVAL = False
+    FaithfulnessMetric = None  # type: ignore[assignment,misc]
+    GEval = None  # type: ignore[assignment,misc]
+    HallucinationMetric = None  # type: ignore[assignment,misc]
+    SummarizationMetric = None  # type: ignore[assignment,misc]
     LLMTestCase = None  # type: ignore[assignment,misc]
+    LLMTestCaseParams = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# Golden Dataset Loader for Pytest Parametrization
-# ---------------------------------------------------------------------------
-
 _GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "report_cases.json"
+_REPORT_CASES = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
+_REPORT_CASE_IDS = [case["case_id"] for case in _REPORT_CASES]
+
+_REPORT_GEVAL_CRITERIA = """
+Evaluate the Actual Output as the final Markdown remediation report against the
+deterministic evidence in the Context and Expected Output. The report must
+preserve the evidence-backed outcome and critical report rules:
+
+1. The summary's successful and follow-up counts must match the effective final
+   task statuses. Every successful group must have one successful-remediation
+   row, and every outstanding group must have one follow-up action.
+2. Follow-up actions must retain the attempted-remediation evidence that is
+   present in the context, including package/version attempts and their
+   outcomes. Do not promote a worker claim or a diff into a successful fix
+   without QA-passed final task evidence.
+3. Version-only remediations must report the supported package transition and
+   changed manifest files without inventing source-workaround claims. Code
+   workaround and package-removal rows must preserve the supported explanation,
+   source file paths, and source diff evidence. A strategy pivot must retain
+   both the version transition and the later workaround evidence.
+4. A transitive finding must keep the vulnerable finding package as the report
+   identity while retaining the editable parent/target package as context when
+   the evidence distinguishes them.
+5. Never invent CVE/GHSA IDs, package names, versions, statuses, metrics,
+   changed files, code changes, scan results, or recommendations. Do not turn
+   unavailable evidence into a definitive claim.
+""".strip()
 
 
 def _load_golden_cases() -> list[dict[str, Any]]:
-    if not _GOLDEN_FILE.exists():
-        return []
-    try:
-        data = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    """Load and validate the curated report-evaluation cases."""
+    if not isinstance(_REPORT_CASES, list):
+        raise TypeError("Report golden data must be a JSON list.")
+    if not all(isinstance(case, dict) for case in _REPORT_CASES):
+        raise TypeError("Every report golden case must be an object.")
+    return _REPORT_CASES
 
 
-_REPORT_CASES = _load_golden_cases()
-_REPORT_CASE_IDS = [c.get("case_id", f"case_{i}") for i, c in enumerate(_REPORT_CASES)]
+def _group_state(group: dict[str, Any]) -> dict[str, Any]:
+    """Convert compact golden group data into a graph-state group."""
+    return {
+        "group_id": group["id"],
+        "vulnerable_component": group["package"],
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": group.get("file", "package.json"),
+        "issues": [
+            {
+                "package_name": group["package"],
+                "package_version": group.get("version", ""),
+                "severity": group.get("severity", "high"),
+                "source": "odc",
+            }
+        ],
+    }
 
 
-# ---------------------------------------------------------------------------
-# Prompt & Context Formatting Helpers (Matching Production report_node.py)
-# ---------------------------------------------------------------------------
+def _fixture_diff(fixture: dict[str, Any]) -> str:
+    """Build a compact unified diff from package and source evidence."""
+    blocks: list[str] = []
+    for change in fixture.get("package_changes", []):
+        path = change["file"]
+        name = change["name"]
+        old = change.get("old", "")
+        new = change.get("new", "")
+        if "lock" in path.casefold():
+            context = f'     "node_modules/{name}": {{'
+            old_line = f'      "version": "{old}"' if old else ""
+            new_line = f'      "version": "{new}"' if new else ""
+        else:
+            section = change.get("section", "dependencies")
+            context = f'  "{section}": {{'
+            old_line = f'    "{name}": "{old}"' if old else ""
+            new_line = f'    "{name}": "{new}"' if new else ""
+        lines = [f"--- a/{path}", f"+++ b/{path}", "@@", f" {context}"]
+        if old_line:
+            lines.append(f"-{old_line}")
+        if new_line:
+            lines.append(f"+{new_line}")
+        blocks.append("\n".join(lines))
+
+    for change in fixture.get("source_changes", []):
+        blocks.append(
+            "\n".join(
+                [
+                    f"--- a/{change['file']}",
+                    f"+++ b/{change['file']}",
+                    "@@",
+                    f"-{change['removed']}",
+                    f"+{change['added']}",
+                ]
+            )
+        )
+    return "\n".join(blocks)
 
 
-def build_production_prompt(evidence_payload: dict[str, Any]) -> str:
-    """Build the exact prompt template used by report_node._generate_executive_narrative."""
-    evidence = json.dumps(evidence_payload, sort_keys=True, default=str)
+def _build_report_state(case: dict[str, Any]) -> dict[str, Any]:
+    """Expand compact golden data into the production report state contract."""
+    fixture = case["fixture"]
+    groups = [_group_state(group) for group in fixture.get("groups", [])]
+    initial_groups = [
+        group
+        for group, source in zip(groups, fixture.get("groups", []), strict=True)
+        if source.get("initial", True)
+    ]
+    final_groups = [
+        group
+        for group, source in zip(groups, fixture.get("groups", []), strict=True)
+        if source.get("final", False)
+    ]
+
+    task_queue: dict[str, dict[str, Any]] = {}
+    qa_evaluations: dict[str, dict[str, Any]] = {}
+    for task in fixture.get("tasks", []):
+        task_id = task["id"]
+        record: dict[str, Any] = {
+            "task_id": task_id,
+            "parent_group_id": task["group"],
+            "parent_task_id": task.get("parent_task_id"),
+            "strategy": task.get("strategy", "VERSION_BUMP"),
+            "status": task["status"],
+        }
+        for field in (
+            "strategy_stage",
+            "no_fix_stage",
+            "qa_policy",
+            "target_package_name",
+            "target_dependency_type",
+            "parent_package_name",
+            "parent_package_version",
+            "selected_version",
+            "instruction",
+        ):
+            if field in task:
+                record[field] = task[field]
+        task_queue[task_id] = record
+        if "qa" in task:
+            qa_evaluations[task_id] = {"task_id": task_id, "passed": task["qa"]}
+
+    action_summaries: list[dict[str, Any]] = []
+    qa_results_by_attempt: dict[str, dict[str, Any]] = {}
+    for attempt in fixture.get("attempts", []):
+        task = task_queue[attempt["task"]]
+        summary: dict[str, Any] = {
+            "task_id": attempt["task"],
+            "attempt_id": attempt["id"],
+            "status": attempt["status"],
+            "target_package_name": attempt.get(
+                "package",
+                task.get("target_package_name", ""),
+            ),
+            "changed_files": attempt.get("files", []),
+        }
+        if "selected_version" in attempt:
+            summary["selected_version"] = attempt["selected_version"]
+        if "instruction" in attempt:
+            summary["instruction"] = attempt["instruction"]
+        if "summary" in attempt:
+            summary["summary"] = attempt["summary"]
+        elif "final_note" in attempt:
+            summary["summary"] = f"Final note: {attempt['final_note']}"
+        else:
+            summary["summary"] = "Attempted remediation."
+        if "outcome" in attempt:
+            summary["final_outcome"] = attempt["outcome"]
+        action_summaries.append(summary)
+        if "qa" in attempt:
+            qa_results_by_attempt[attempt["id"]] = {
+                "attempt_id": attempt["id"],
+                "task_id": attempt["task"],
+                "evaluation": {"passed": attempt["qa"]},
+            }
+
+    changed_files = fixture.get("changed_files")
+    if changed_files is None:
+        changed_files = sorted(
+            {
+                change["file"]
+                for change in fixture.get("package_changes", [])
+            }
+            | {
+                change["file"]
+                for change in fixture.get("source_changes", [])
+            }
+        )
+    return {
+        "run_id": case["case_id"],
+        "repo_root": "data/clones/juice-shop",
+        "status": fixture.get("status", "completed"),
+        "issues": [
+            {"issue_type": "sca", "package_name": package}
+            for package in fixture.get("issues", [])
+        ],
+        "initial_valid_groups": initial_groups,
+        "valid_groups": final_groups,
+        "task_queue": task_queue,
+        "qa_evaluations": qa_evaluations,
+        "qa_results_by_attempt": qa_results_by_attempt,
+        "action_summaries": action_summaries,
+        "diff": _fixture_diff(fixture),
+        "changed_files": changed_files,
+        "errors": fixture.get("errors", []),
+    }
+
+
+def build_report_prompt(case: dict[str, Any]) -> str:
+    """Build the input presented to the report evaluator.
+
+    Args:
+        case: Curated report case containing deterministic state and provenance.
+
+    Returns:
+        A bounded JSON prompt describing the report evidence and required output.
+    """
+    evidence = {
+        "provenance": case["provenance"],
+        "historical_evidence": case.get("historical_evidence", []),
+        "report_state": _build_report_state(case),
+        "expected_contract": case["expected_contract"],
+    }
     return (
-        "Write a concise executive narrative for a human reader of a software security remediation run.\n"
-        "Use only the deterministic evidence below. Do not add facts, calculate metrics, change statuses, "
-        "or recommend actions. Do not use a heading. Write 3 to 6 short paragraphs.\n\n"
-        f"Deterministic evidence:\n{evidence[:16000]}"
+        "Review the deterministic remediation evidence and produce the final Markdown report. "
+        "Preserve the report structure and critical rules; do not add facts, recalculate "
+        "metrics, change final task statuses, or recommend actions.\n\n"
+        f"Evidence:\n{json.dumps(evidence, sort_keys=True, default=str)[:30000]}"
     )
 
 
-def build_context_documents(evidence_payload: dict[str, Any]) -> list[str]:
-    """Build ground-truth context documents including structured JSON and factual summary."""
-    evidence_json = json.dumps(evidence_payload, indent=2, sort_keys=True)
-    metrics = evidence_payload.get("metrics", {})
-    changed_files = evidence_payload.get("changed_files", [])
-    errors = evidence_payload.get("errors", [])
-    strategies = evidence_payload.get("strategies", {})
+def build_report_context(case: dict[str, Any]) -> list[str]:
+    """Build structured retrieval context for all four DeepEval metrics.
 
-    summary = (
-        f"Remediation status: {evidence_payload.get('status')}. "
-        f"Overall label: {evidence_payload.get('overall_label')}. "
-        f"Actionable groups: {metrics.get('actionable_groups')}, "
-        f"Fixed: {metrics.get('groups_fixed')}, "
-        f"Unresolved: {metrics.get('groups_unresolved')}, "
-        f"Inconclusive: {metrics.get('groups_inconclusive')}. "
-        f"Strategies: {json.dumps(strategies)}. "
-        f"Errors count: {len(errors)}. Errors list: {errors}. "
-        f"Modified files count: {len(changed_files)}. Modified files list: {changed_files}."
-    )
-    return [summary, evidence_json]
+    Args:
+        case: Curated report case containing deterministic state and provenance.
 
-
-# ---------------------------------------------------------------------------
-# Structural Validation Helpers (Offline-first / Deterministic)
-# ---------------------------------------------------------------------------
-
-_PRESCRIPTIVE_PATTERNS = [
-    re.compile(r"\b(?:we recommend|recommend(?:s|ing)? that|should immediately)\b", re.IGNORECASE),
-    re.compile(r"\b(?:recommend manual review|we suggest reverting)\b", re.IGNORECASE),
-    re.compile(r"\b(?:recommend rolling back|recommend checking)\b", re.IGNORECASE),
-]
-
-_CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+    Returns:
+        Evidence documents containing the historical basis and normalized state.
+    """
+    evidence = {
+        "provenance": case["provenance"],
+        "historical_evidence": case.get("historical_evidence", []),
+        "report_state": _build_report_state(case),
+        "expected_contract": case["expected_contract"],
+    }
+    return [
+        "Final task, QA, attempt, and patch evidence:\n"
+        + json.dumps(evidence, indent=2, sort_keys=True, default=str),
+        case["expected_output"],
+    ]
 
 
-def validate_forbidden_claims(narrative: str, forbidden_claims: list[str]) -> list[str]:
-    """Return a list of forbidden claim strings found in the narrative."""
+def render_report(case: dict[str, Any]) -> str:
+    """Render the production report for one evidence-backed golden case.
+
+    Args:
+        case: Curated report case containing a compatible graph state mapping.
+
+    Returns:
+        The deterministic Markdown report emitted by generate_report().
+    """
+    return generate_report(_build_report_state(case))
+
+
+def validate_report_contract(report: str, contract: dict[str, Any]) -> list[str]:
+    """Return fixture-contract violations without adding another eval metric.
+
+    These checks validate that the curated evidence and production renderer are
+    wired together before an optional LLM judge runs. They are not persisted as
+    a fifth metric and do not replace the four DeepEval metrics.
+
+    Args:
+        report: Rendered production Markdown.
+        contract: Expected cardinalities and evidence fragments for the case.
+
+    Returns:
+        Human-readable contract violations.
+    """
     violations: list[str] = []
-    narrative_lower = narrative.casefold()
-    for claim in forbidden_claims:
-        if claim.casefold() in narrative_lower:
-            violations.append(claim)
+    summary = contract.get("summary", {})
+    if "fixed" in summary:
+        expected = f"| Successfully remediated vulnerability groups | {summary['fixed']} |"
+        if expected not in report:
+            violations.append(f"missing summary fixed count: {expected}")
+    if "follow_up" in summary:
+        expected = f"| Vulnerability groups requiring follow-up | {summary['follow_up']} |"
+        if expected not in report:
+            violations.append(f"missing summary follow-up count: {expected}")
+
+    successful = report.split("## 3. Successful Remediations", 1)[-1].split(
+        "## 4. References", 1
+    )[0]
+    follow_up = report.split("## 2. Follow up Actions", 1)[-1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+    for package in contract.get("successful_packages", []):
+        if f"| {package} |" not in successful:
+            violations.append(f"missing successful package: {package}")
+    for package in contract.get("follow_up_packages", []):
+        if f"— {package} (" not in follow_up:
+            violations.append(f"missing follow-up package: {package}")
+
+    for fragment in contract.get("required_fragments", []):
+        if fragment not in report:
+            violations.append(f"missing required fragment: {fragment}")
+    for fragment in contract.get("forbidden_fragments", []):
+        if fragment in report:
+            violations.append(f"found forbidden fragment: {fragment}")
+
+    code_details = report.split("### Code workaround details", 1)[-1]
+    for path in contract.get("code_detail_diff_paths", []):
+        if f"--- a/{path}" not in code_details:
+            violations.append(f"missing code-detail diff path: {path}")
+    for path in contract.get("forbidden_code_detail_diff_paths", []):
+        if f"--- a/{path}" in code_details:
+            violations.append(f"manifest leaked into code-detail diff: {path}")
     return violations
 
 
-def validate_expected_coverage(narrative: str, expected_coverage: list[str]) -> list[str]:
-    """Return a list of expected coverage terms missing from the narrative."""
-    missing: list[str] = []
-    narrative_lower = narrative.casefold()
-    for item in expected_coverage:
-        if item.casefold() not in narrative_lower:
-            missing.append(item)
-    return missing
-
-
-def validate_negative_constraints(narrative: str, evidence_payload: dict[str, Any]) -> list[str]:
-    """Check negative constraints: headings, ungrounded CVEs, and prescriptive language."""
-    violations: list[str] = []
-
-    # 1. No Markdown headings (# ...)
-    for line_num, line in enumerate(narrative.splitlines(), start=1):
-        if line.lstrip().startswith("#"):
-            violations.append(f"Line {line_num} contains a markdown heading: {line.strip()}")
-
-    # 2. No ungrounded CVEs
-    evidence_text = json.dumps(evidence_payload, default=str)
-    evidence_cves = {cve.upper() for cve in _CVE_PATTERN.findall(evidence_text)}
-    narrative_cves = {cve.upper() for cve in _CVE_PATTERN.findall(narrative)}
-    ungrounded_cves = narrative_cves - evidence_cves
-    if ungrounded_cves:
-        violations.append(f"Narrative contains ungrounded CVEs: {sorted(ungrounded_cves)}")
-
-    # 3. No prescriptive recommendation phrases
-    for pattern in _PRESCRIPTIVE_PATTERNS:
-        match = pattern.search(narrative)
-        if match:
-            violations.append(f"Narrative contains prescriptive language: '{match.group(0)}'")
-
-    return violations
-
-
-# ---------------------------------------------------------------------------
-# Test Suite: TestReportNodeEval (Parametrized by Golden Case)
-# ---------------------------------------------------------------------------
+def _build_metrics(eval_settings: EvalSettings) -> list[Any]:
+    """Construct exactly the four DeepEval metrics for report evaluation."""
+    if not HAS_DEEPEVAL:
+        raise RuntimeError("DeepEval is required for live report evaluation.")
+    return [
+        HallucinationMetric(
+            threshold=0.30,
+            model=eval_settings.judge_model,
+            include_reason=True,
+            verbose_mode=True,
+        ),
+        FaithfulnessMetric(
+            threshold=0.85,
+            model=eval_settings.judge_model,
+            include_reason=True,
+            verbose_mode=True,
+        ),
+        SummarizationMetric(
+            threshold=0.80,
+            model=eval_settings.judge_model,
+            include_reason=True,
+            verbose_mode=True,
+        ),
+        GEval(
+            name="Report Constraint Adherence",
+            criteria=_REPORT_GEVAL_CRITERIA,
+            evaluation_params=[
+                LLMTestCaseParams.INPUT,
+                LLMTestCaseParams.ACTUAL_OUTPUT,
+                LLMTestCaseParams.EXPECTED_OUTPUT,
+                LLMTestCaseParams.CONTEXT,
+            ],
+            threshold=0.70,
+            model=eval_settings.judge_model,
+            verbose_mode=True,
+        ),
+    ]
 
 
 @pytest.mark.eval
 class TestReportNodeEval:
-    """Evaluation suite for Report Node executive narratives."""
+    """Evaluate the final report against historical, typed evidence."""
 
-    @pytest.mark.parametrize(
-        "case",
-        _REPORT_CASES or [{}],
-        ids=_REPORT_CASE_IDS or ["no_cases"],
-    )
-    def test_narrative_no_hallucination(
+    @pytest.mark.parametrize("case", _load_golden_cases(), ids=_REPORT_CASE_IDS)
+    def test_report_uses_only_the_four_requested_metrics(
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
     ) -> None:
-        """Narrative only contains facts from _evidence_payload (no hallucinated claims)."""
-        if not case:
-            pytest.skip("No golden report cases available")
+        """Run Hallucination, Faithfulness, Summarization, and one GEval."""
+        report = render_report(case)
+        violations = validate_report_contract(report, case["expected_contract"])
+        assert not violations, f"Case {case['case_id']} violated its report contract: {violations}"
 
-        case_id = case.get("case_id", "unknown")
-        narrative = case.get("generated_narrative", "")
-        expected_output = case.get("expected_output", "")
-        forbidden = case.get("forbidden_claims", [])
-        evidence = case.get("evidence_payload", {})
+        if not eval_settings.is_live:
+            return
+        if not HAS_DEEPEVAL or assert_test is None or LLMTestCase is None:
+            pytest.skip("deepeval package is required for live evaluations")
+        if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
+            pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
 
-        # 1. Deterministic check: forbidden claims must not appear
-        forbidden_found = validate_forbidden_claims(narrative, forbidden)
-        assert not forbidden_found, f"Case '{case_id}' violated forbidden claims: {forbidden_found}"
-
-        # 2. Live evaluation with DeepEval judge
-        if eval_settings.is_live:
-            if not HAS_DEEPEVAL or assert_test is None:
-                pytest.skip("deepeval package is required for live evaluations")
-            if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
-                pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
-
-            prompt = build_production_prompt(evidence)
-            context = build_context_documents(evidence)
-
-            test_case = LLMTestCase(
-                name=f"{case_id} [Hallucination & Faithfulness]",
-                input=prompt,
-                actual_output=narrative,
-                expected_output=expected_output,
-                context=context,
-                retrieval_context=context,
-            )
-
-            # Hallucination metric: lower is better, threshold <= 0.3
-            hallucination = HallucinationMetric(
-                threshold=0.3,
-                model=eval_settings.judge_model,
-                include_reason=True,
-                verbose_mode=True,
-            )
-
-            # Faithfulness metric: higher is better, threshold >= 0.70
-            faithfulness = FaithfulnessMetric(
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                include_reason=True,
-                verbose_mode=True,
-            )
-
-            assert_test(test_case, [hallucination, faithfulness])
-
-    @pytest.mark.parametrize(
-        "case",
-        _REPORT_CASES or [{}],
-        ids=_REPORT_CASE_IDS or ["no_cases"],
-    )
-    def test_narrative_covers_key_findings(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Narrative covers all key findings, metrics, and packages accurately."""
-        if not case:
-            pytest.skip("No golden report cases available")
-
-        case_id = case.get("case_id", "unknown")
-        narrative = case.get("generated_narrative", "")
-        expected_output = case.get("expected_output", "")
-        expected_coverage = case.get("expected_coverage", [])
-        evidence = case.get("evidence_payload", {})
-
-        # 1. Deterministic check: every expected coverage term must appear
-        missing_terms = validate_expected_coverage(narrative, expected_coverage)
-        assert not missing_terms, (
-            f"Case '{case_id}' missed expected coverage items: {missing_terms}"
+        context = build_report_context(case)
+        test_case = LLMTestCase(
+            name=f"{case['case_id']} [Report Metrics]",
+            input=build_report_prompt(case),
+            actual_output=report,
+            expected_output=case["expected_output"],
+            context=context,
+            retrieval_context=context,
+            additional_metadata={
+                "case_id": case["case_id"],
+                "provenance": case["provenance"],
+                "fixture_type": case.get("fixture_type", "historical"),
+            },
         )
-
-        # 2. Live evaluation with DeepEval GEval
-        if eval_settings.is_live:
-            if not HAS_DEEPEVAL or assert_test is None:
-                pytest.skip("deepeval package is required for live evaluations")
-            if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
-                pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
-
-            prompt = build_production_prompt(evidence)
-
-            test_case = LLMTestCase(
-                name=f"{case_id} [Key Findings Coverage]",
-                input=prompt,
-                actual_output=narrative,
-                expected_output=expected_output,
-            )
-
-            coverage_geval = GEval(
-                name="Finding Coverage & Accuracy",
-                criteria=(
-                    "Evaluate whether the Actual Output accurately covers all key findings, "
-                    "remediation statuses, metrics, and package modifications present in the "
-                    "Expected Output and Input without omitting critical outcomes."
-                ),
-                evaluation_params=[
-                    LLMTestCaseParams.INPUT,
-                    LLMTestCaseParams.ACTUAL_OUTPUT,
-                    LLMTestCaseParams.EXPECTED_OUTPUT,
-                ],
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                verbose_mode=True,
-            )
-
-            assert_test(test_case, [coverage_geval])
-
-    @pytest.mark.parametrize(
-        "case",
-        _REPORT_CASES or [{}],
-        ids=_REPORT_CASE_IDS or ["no_cases"],
-    )
-    def test_narrative_respects_negative_constraints(
-        self,
-        case: dict[str, Any],
-        eval_settings: EvalSettings,
-    ) -> None:
-        """Narrative does not recommend actions, invent CVEs, or use markdown headings."""
-        if not case:
-            pytest.skip("No golden report cases available")
-
-        case_id = case.get("case_id", "unknown")
-        narrative = case.get("generated_narrative", "")
-        evidence = case.get("evidence_payload", {})
-
-        # 1. Deterministic check: negative constraints validation
-        violations = validate_negative_constraints(narrative, evidence)
-        assert not violations, f"Case '{case_id}' violated negative constraints: {violations}"
-
-        # 2. Live evaluation with DeepEval GEval
-        if eval_settings.is_live:
-            if not HAS_DEEPEVAL or assert_test is None:
-                pytest.skip("deepeval package is required for live evaluations")
-            if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
-                pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
-
-            prompt = build_production_prompt(evidence)
-            context = build_context_documents(evidence)
-
-            test_case = LLMTestCase(
-                name=f"{case_id} [Negative Constraints]",
-                input=prompt,
-                actual_output=narrative,
-                context=context,
-            )
-
-            constraint_geval = GEval(
-                name="Report Constraint Adherence",
-                criteria=(
-                    "The output must not invent CVE IDs not in the evidence, "
-                    "change task statuses, calculate metrics not in the evidence, "
-                    "or recommend actions. It must not use markdown headings."
-                ),
-                evaluation_params=[
-                    LLMTestCaseParams.INPUT,
-                    LLMTestCaseParams.ACTUAL_OUTPUT,
-                    LLMTestCaseParams.CONTEXT,
-                ],
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                verbose_mode=True,
-            )
-
-            assert_test(test_case, [constraint_geval])
+        assert_test(test_case, _build_metrics(eval_settings))
 
 
-# ---------------------------------------------------------------------------
-# Unit tests for the evaluation helpers themselves (adversarial validation)
-# ---------------------------------------------------------------------------
-
-
-def test_evaluator_catches_violations() -> None:
-    """Ensure validation helpers correctly catch headings, bad CVEs, and forbidden text."""
-    bad_narrative = (
-        "# Executive Summary\n"
-        "We recommend immediately deploying CVE-9999-99999.\n"
-        "All 100 vulnerabilities are completely fixed."
-    )
-    evidence: dict[str, Any] = {"status": "completed", "errors": []}
-
-    forbidden = ["completely fixed", "CVE-9999-99999"]
-    forbidden_found = validate_forbidden_claims(bad_narrative, forbidden)
-    assert "completely fixed" in forbidden_found
-    assert "CVE-9999-99999" in forbidden_found
-
-    negative_violations = validate_negative_constraints(bad_narrative, evidence)
-    assert any("heading" in v for v in negative_violations)
-    assert any("CVE-9999-99999" in v for v in negative_violations)
-    assert any("prescriptive language" in v for v in negative_violations)
-
-    missing = validate_expected_coverage(bad_narrative, ["missing_pkg", "Successful"])
-    assert "missing_pkg" in missing
-    assert "Successful" in missing
+@pytest.mark.parametrize("case", _load_golden_cases(), ids=_REPORT_CASE_IDS)
+def test_report_goldens_use_current_evidence_contract(case: dict[str, Any]) -> None:
+    """Ensure the replacement dataset no longer carries narrative-era fields."""
+    assert "generated_narrative" not in case
+    assert "evidence_payload" not in case
+    assert isinstance(case.get("fixture"), dict)
+    assert isinstance(case.get("expected_output"), str)
+    assert isinstance(case.get("expected_contract"), dict)

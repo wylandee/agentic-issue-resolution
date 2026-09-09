@@ -114,7 +114,7 @@ def create_sample_run(
             suite="report",
             status="PASSED",
             input_text=(
-                "Write a concise executive narrative for a human reader of a software security remediation run.\n"
+                "Render the final deterministic Markdown remediation report for a human reader.\n"
                 "Deterministic evidence:\n"
                 '{"status": "completed", "overall_label": "success", "metrics": {"actionable_groups": 3, "groups_fixed": 3}}'
             ),
@@ -130,11 +130,27 @@ def create_sample_run(
             cost=0.0032,
             metrics=[
                 MetricRecord(
-                    metric_name="Finding Coverage & Accuracy",
-                    score=0.92,
-                    threshold=0.70,
+                    metric_name="HallucinationMetric",
+                    score=0.02,
+                    threshold=0.30,
                     success=True,
-                    reason="The narrative faithfully includes all 3 fixed groups and mentions passing QA verification without hallucinations.",
+                    reason="The report contains no unsupported package, status, or count claims.",
+                    evaluation_model=judge_model,
+                ),
+                MetricRecord(
+                    metric_name="FaithfulnessMetric",
+                    score=0.96,
+                    threshold=0.85,
+                    success=True,
+                    reason="The report claims are supported by the deterministic evidence.",
+                    evaluation_model=judge_model,
+                ),
+                MetricRecord(
+                    metric_name="SummarizationMetric",
+                    score=0.94,
+                    threshold=0.80,
+                    success=True,
+                    reason="The report preserves the complete remediation outcome and package changes.",
                     evaluation_model=judge_model,
                 ),
                 MetricRecord(
@@ -142,7 +158,7 @@ def create_sample_run(
                     score=0.98,
                     threshold=0.70,
                     success=True,
-                    reason="No invented CVEs, no prescriptive advice, and no Markdown headings were used.",
+                    reason="Counts, statuses, package changes, and no-workaround constraints are preserved.",
                     evaluation_model=judge_model,
                 ),
             ],
@@ -153,7 +169,7 @@ def create_sample_run(
             suite="report",
             status="PASSED",
             input_text=(
-                "Write a concise executive narrative for a human reader of a software security remediation run.\n"
+                "Render the final deterministic Markdown remediation report for a human reader.\n"
                 "Deterministic evidence:\n"
                 '{"status": "partial", "overall_label": "partial_success", "metrics": {"actionable_groups": 4, "groups_fixed": 2, "groups_unresolved": 2}}'
             ),
@@ -167,11 +183,35 @@ def create_sample_run(
             cost=0.0041,
             metrics=[
                 MetricRecord(
+                    metric_name="HallucinationMetric",
+                    score=0.04,
+                    threshold=0.30,
+                    success=True,
+                    reason="The report does not invent unresolved-package outcomes or remediation counts.",
+                    evaluation_model=judge_model,
+                ),
+                MetricRecord(
+                    metric_name="FaithfulnessMetric",
+                    score=0.91,
+                    threshold=0.85,
+                    success=True,
+                    reason="The partial result and unresolved groups are grounded in final evidence.",
+                    evaluation_model=judge_model,
+                ),
+                MetricRecord(
+                    metric_name="SummarizationMetric",
+                    score=0.89,
+                    threshold=0.80,
+                    success=True,
+                    reason="The report retains the one-success/two-follow-up outcome.",
+                    evaluation_model=judge_model,
+                ),
+                MetricRecord(
                     metric_name="Report Constraint Adherence",
-                    score=0.88,
+                    score=0.93,
                     threshold=0.70,
                     success=True,
-                    reason="The actual output strictly aligns with the deterministic metrics and accurately notes unresolved groups.",
+                    reason="The report preserves final statuses and does not add unsupported recommendations.",
                     evaluation_model=judge_model,
                 ),
             ],
