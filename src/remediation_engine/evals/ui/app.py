@@ -199,7 +199,8 @@ with tab_explorer:
             kpi2.metric(
                 "Pass Rate",
                 f"{run_data['pass_rate']}%",
-                f"{run_data['passed_tests']} passed / {run_data['failed_tests']} failed",
+                f"{run_data['passed_tests']} passed / {run_data['failed_tests']} failed / "
+                f"{run_data['skipped_tests']} skipped",
             )
             kpi3.metric("Duration", f"{run_data['duration_seconds']:.2f}s")
             kpi4.metric("Total Cost", f"${run_data['total_cost']:.4f}")
@@ -252,6 +253,13 @@ with tab_explorer:
                         m_col2.write(f"**Status:** `{tc['status']}`")
                         m_col3.write(f"**Latency:** `{tc['latency_seconds']:.2f}s`")
                         m_col4.write(f"**Cost:** `${tc['cost']:.4f}`")
+
+                        if tc.get("error_message"):
+                            message = html.escape(str(tc["error_message"]))
+                            if tc["status"] == "FAILED":
+                                st.error(message)
+                            else:
+                                st.warning(message)
 
                         # Side-by-side Input / Actual Output / Expected Output (fully expanded, no scroll clipping)
                         c_in, c_act, c_exp = st.columns(3)
