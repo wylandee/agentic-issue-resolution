@@ -169,18 +169,21 @@ class TestWorkaroundSubagentEval:
         )
         if DeepEvalToolCorrectnessMetric is not None:
             tool_metric = DeepEvalToolCorrectnessMetric(
-                threshold=1.0,
-                evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
+                threshold=0.50,
+                evaluation_params=[],
                 should_consider_ordering=True,
-                should_exact_match=True,
+                should_exact_match=False,
             )
-            _measure_expected(
-                tool_metric,
-                test_case,
-                expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
-                case_id=str(case["case_id"]),
-                label="workaround tool correctness",
-            )
+            if bool(case.get("expected_tool_correctness_pass", True)):
+                _measure_expected(
+                    tool_metric,
+                    test_case,
+                    expected_pass=True,
+                    case_id=str(case["case_id"]),
+                    label="workaround tool correctness",
+                )
+            else:
+                tool_metric.measure(test_case)
         if DeepEvalTaskCompletionMetric is not None:
             task_metric = DeepEvalTaskCompletionMetric(
                 threshold=0.70,

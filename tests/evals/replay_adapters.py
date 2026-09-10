@@ -328,6 +328,7 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
         "npx --yes esbuild",
         "node --import tsx --input-type=module",
         "node --input-type=module",
+        "npm install --package-lock-only",
     ):
         responses.setdefault(matcher, dict(success))
 
@@ -345,6 +346,7 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     "stats": {"passes": 1, "failures": 0},
                     "tests": [{"fullTitle": title, "title": title, "state": "passed"}],
+                    "passes": [{"fullTitle": title, "title": title, "state": "passed"}],
                     "failures": [],
                 }
             ),
@@ -352,7 +354,13 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
             "duration_seconds": 0.0,
         }
 
-    responses.setdefault("npx --no-install mocha", mocha_response)
+    responses["npx --no-install mocha"] = mocha_response
+    raw_npm_test = responses.get("npm test")
+    if raw_npm_test is None or (
+        isinstance(raw_npm_test, Mapping)
+        and raw_npm_test.get("stdout") == "replay targeted tests passed"
+    ):
+        responses["npm test"] = mocha_response
     case_id = str(case.get("case_id", ""))
     if case_id == "workaround-retry-after-validation-failure":
         attempts = {"count": 0}
@@ -913,7 +921,12 @@ def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> Repla
     events = serialize_tool_events(
         event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
     )
-    payload = {"worker_result": serialize_result(output), "workspace_files": dict(sandbox.files)}
+    payload: dict[str, Any] = {
+        "action_status": "APPLIED" if output.get("changed_files") else "SURRENDER",
+        "worker_result": serialize_result(output),
+    }
+    if output.get("action_summaries"):
+        payload["summary"] = output["action_summaries"][0].summary
     return ReplayCapture(
         case_id=str(case.get("case_id", "unknown")),
         component="workaround_subagent",
