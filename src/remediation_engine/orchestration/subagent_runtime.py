@@ -620,7 +620,6 @@ def run_bounded_subagent_loop(
                             "record_plan",
                             "search_web",
                             "read_web_page",
-                            "read_repository_map",
                         }
                     ):
                         tool_message = ToolMessage(

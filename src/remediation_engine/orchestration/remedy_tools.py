@@ -626,19 +626,6 @@ def _make_read_workspace_file_tool(
             return f"ERROR: {exc}"
 
         if plan_state is not None:
-            phase = plan_state.get("phase")
-            last_result = plan_state.get("last_validation_result")
-            last_status = getattr(last_result, "overall_status", None) or (
-                last_result.get("overall_status") if isinstance(last_result, dict) else None
-            )
-            if phase == WorkaroundExecutionPhase.VALIDATE.value and last_status not in (
-                WorkaroundValidationStatus.INFRA_FAILURE,
-                "INFRA_FAILURE",
-            ):
-                return (
-                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
-                    "validate_workaround before further investigation."
-                )
             plan_state.setdefault("read_files", set()).add(rel_path)
             plan_state.setdefault("inspected_files", set()).add(rel_path)
             plan_state["local_investigation_complete"] = True
@@ -2004,20 +1991,6 @@ def _make_search_codebase_pattern_tool(
     @tool
     def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
         """Lexically search for an extended-regex pattern across workspace source files."""
-        if plan_state is not None:
-            phase = plan_state.get("phase")
-            last_result = plan_state.get("last_validation_result")
-            last_status = getattr(last_result, "overall_status", None) or (
-                last_result.get("overall_status") if isinstance(last_result, dict) else None
-            )
-            if phase == WorkaroundExecutionPhase.VALIDATE.value and last_status not in (
-                WorkaroundValidationStatus.INFRA_FAILURE,
-                "INFRA_FAILURE",
-            ):
-                return (
-                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
-                    "validate_workaround before further investigation."
-                )
         if not search_pattern or not search_pattern.strip():
             return "ERROR: search_pattern is required."
 
@@ -2077,20 +2050,6 @@ def _make_inspect_ast_symbol_tool(
         line_hint: int = 0,
     ) -> str:
         """Extract the full source text of a named function, class, or method from a workspace file."""
-        if plan_state is not None:
-            phase = plan_state.get("phase")
-            last_result = plan_state.get("last_validation_result")
-            last_status = getattr(last_result, "overall_status", None) or (
-                last_result.get("overall_status") if isinstance(last_result, dict) else None
-            )
-            if phase == WorkaroundExecutionPhase.VALIDATE.value and last_status not in (
-                WorkaroundValidationStatus.INFRA_FAILURE,
-                "INFRA_FAILURE",
-            ):
-                return (
-                    "ERROR: [PHASE_VIOLATION] A source edit must be followed by "
-                    "validate_workaround before further investigation."
-                )
         try:
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
