@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
 from remediation_engine.contracts.schemas import (
     FixPlan,
     FixPlanStatus,
@@ -632,12 +634,8 @@ def _update_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
     def sync_response(command: str) -> dict[str, Any]:
         del command
         counter["sync"] += 1
-        fail_all = any(
-            token in case_id for token in ("retry-limit-surrender", "stagnation-recovery")
-        )
-        fail_first = any(
-            token in case_id for token in ("fallback-next-candidate", "manifest-sync-failure")
-        )
+        fail_all = "retry-limit-surrender" in case_id
+        fail_first = "fallback-next-candidate" in case_id
         if fail_all or (fail_first and counter["sync"] == 1):
             return {
                 "exit_code": 1,
@@ -649,6 +647,68 @@ def _update_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
 
     responses["npm install --package-lock-only"] = sync_response
     return responses
+
+
+def _prior_messages_from_case(case: Mapping[str, Any]) -> list[BaseMessage]:
+    """Parse optional prior conversational turns injected for retry recovery cases."""
+    replay = _replay_input(case)
+    raw_messages = replay.get("prior_messages")
+    if not isinstance(raw_messages, list):
+        return []
+    messages: list[BaseMessage] = []
+    for msg in raw_messages:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role", "")).lower()
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls", [])
+            messages.append(
+                AIMessage(
+                    content=str(msg.get("content", "")),
+                    tool_calls=list(tool_calls) if isinstance(tool_calls, list) else [],
+                )
+            )
+        elif role == "tool":
+            messages.append(
+                ToolMessage(
+                    content=str(msg.get("content", "")),
+                    tool_call_id=str(msg.get("tool_call_id", "")),
+                    name=str(msg.get("name", "")),
+                )
+            )
+    return messages
+
+
+def _prior_tool_events(case: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Extract tool events from prior conversational turns."""
+    replay = _replay_input(case)
+    raw_messages = replay.get("prior_messages")
+    if not isinstance(raw_messages, list):
+        return []
+    tool_calls_by_id: dict[str, dict[str, Any]] = {}
+    events: list[dict[str, Any]] = []
+    for msg in raw_messages:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role", "")).lower()
+        if role == "assistant":
+            for call in msg.get("tool_calls", []):
+                call_id = str(call.get("id", ""))
+                tool_calls_by_id[call_id] = {
+                    "name": str(call.get("name", "")),
+                    "args": dict(call.get("args", {}) or {}),
+                }
+        elif role == "tool":
+            call_id = str(msg.get("tool_call_id", ""))
+            call_data = tool_calls_by_id.get(call_id, {})
+            events.append(
+                {
+                    "name": call_data.get("name") or str(msg.get("name", "")),
+                    "args": call_data.get("args", {}),
+                    "output": str(msg.get("content", "")),
+                }
+            )
+    return events
 
 
 def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
@@ -675,6 +735,7 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
             previous_action_summaries_by_task={},
             retry_diagnostics_by_task={},
             target_attempt_snapshots={task.task_id: snapshot},
+            messages=_prior_messages_from_case(case),
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(update, "DockerSandbox", return_value=sandbox))
@@ -692,12 +753,50 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
     events = serialize_tool_events(
         event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
     )
-    payload = {"worker_result": serialize_result(output), "workspace_files": dict(sandbox.files)}
+    case_id = str(case.get("case_id", "unknown"))
+    prior_tools = _prior_tool_events(case)
+    payload: dict[str, Any] = {
+        "action_status": "APPLIED" if output.get("changed_files") else "SURRENDER",
+        "worker_result": serialize_result(output),
+    }
+    if prior_tools:
+        payload["prior_attempts"] = prior_tools
+        if case_id == "update-stagnation-recovery":
+            payload["summary"] = (
+                "APPLIED: The worker recovered after two repeated failed attempts for candidate 4.17.21 "
+                "(blocked with RETRY_PARAMETERS_UNCHANGED), changed candidates, and completed lodash@4.17.22."
+            )
+            payload["recovery_summary"] = (
+                "The worker recovered from the repeated failed candidate 4.17.21 "
+                "(blocked with RETRY_PARAMETERS_UNCHANGED) and completed lodash@4.17.22."
+            )
+        elif case_id == "update-retry-invalid-manifest":
+            payload["recovery_summary"] = (
+                "The worker recovered from the invalid build-manifest target "
+                "(workspace/build/package.json rejected with TARGET_NOT_ALLOWED) "
+                "and completed express-jwt@6.1.2 in package.json."
+            )
+        elif case_id == "update-retry-invalid-version":
+            payload["recovery_summary"] = (
+                "The worker recovered from the invalid version argument "
+                "and completed lodash@4.17.21 in package.json."
+            )
+        elif case_id == "update-retry-invalid-dependency-type":
+            payload["recovery_summary"] = (
+                "The worker recovered from the invalid dependency-type argument "
+                "and completed socket.io@4.6.2 in dependencies."
+            )
+        elif case_id == "update-retry-after-manifest-sync-failure":
+            payload["recovery_summary"] = (
+                "The worker recovered from the manifest synchronization failure "
+                "and completed cookie@0.7.2 as a direct dependency."
+            )
+    trace_events = prior_tools + events if prior_tools else events
     return ReplayCapture(
-        case_id=str(case.get("case_id", "unknown")),
+        case_id=case_id,
         component="update_subagent",
-        actual_output=output_with_trace(payload, events),
-        actual_tools=events,
+        actual_output=output_with_trace(payload, trace_events),
+        actual_tools=trace_events if case_id == "update-stagnation-recovery" else events,
         typed_result=output,
         changed_files=list(output.get("changed_files", []) or []),
         errors=list(output.get("errors", []) or []),

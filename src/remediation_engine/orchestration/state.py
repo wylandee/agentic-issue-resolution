@@ -19,7 +19,7 @@ Reducer notes
 from __future__ import annotations
 
 import operator
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
@@ -572,6 +572,7 @@ def initial_update_subagent_state(
     previous_action_summaries_by_task: dict[str, str] | None = None,
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: dict[str, TaskAttemptSnapshot] | None = None,
+    messages: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build a well-formed initial batch ``SubagentState`` dict.
@@ -624,7 +625,7 @@ def initial_update_subagent_state(
         "retry_diagnostics_by_task": retry_diagnostics_dict,
         "target_attempt_snapshots": target_attempt_snapshots_dict,
         "constraints_ledger": constraints_list,
-        "messages": [],
+        "messages": list(messages or []),
         "changed_files": [],
         "errors": [],
     }

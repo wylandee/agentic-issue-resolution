@@ -944,6 +944,8 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         ),
         HumanMessage(content=prompt),
     ]
+    if state.get("messages"):
+        initial_messages.extend(state["messages"])
 
     override_required_packages: set[str] = set()
     allowed_dependency_types_by_package: dict[str, set[str]] = {}

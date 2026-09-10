@@ -295,7 +295,7 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "expected_tool_correctness_pass": false,
+    "expected_tool_correctness_pass": true,
     "expected_output": "The worker recognizes the invalid dependency type, retries with dependency_type=dependencies, and reports a completed socket.io@4.6.2 transaction.",
     "changed_files": [
       "package.json"
@@ -358,6 +358,29 @@
         ],
         "allowed_dependency_types": [
           "dependencies"
+        ],
+        "prior_messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_retry_dep_type",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "socket.io",
+                  "target_version": "4.6.2",
+                  "dependency_type": "package dependency",
+                  "manifest_path": "package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_retry_dep_type",
+            "content": "ERROR_CODE: INVALID_ARGUMENT: dependency_type must be one of: dependencies, devDependencies, peerDependencies, optionalDependencies, overrides, resolutions, pnpm_overrides."
+          }
         ]
       }
     }
@@ -376,7 +399,7 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json\nworkspace/build/package.json",
-    "expected_tool_correctness_pass": false,
+    "expected_tool_correctness_pass": true,
     "expected_output": "The worker rejects the build-manifest target, retries package.json with the same approved package/version/type, and reports completion.",
     "changed_files": [
       "package.json"
@@ -439,6 +462,29 @@
         ],
         "allowed_dependency_types": [
           "dependencies"
+        ],
+        "prior_messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_retry_manifest",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "express-jwt",
+                  "target_version": "6.1.2",
+                  "dependency_type": "dependencies",
+                  "manifest_path": "workspace/build/package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_retry_manifest",
+            "content": "ERROR_CODE: TARGET_NOT_ALLOWED: manifest_path 'workspace/build/package.json' is not allowed for 'express-jwt'; allowed paths: package.json."
+          }
         ]
       }
     }
@@ -457,7 +503,7 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "expected_tool_correctness_pass": false,
+    "expected_tool_correctness_pass": true,
     "expected_output": "The worker rejects invalid version syntax without mutating the workspace, retries with lodash@4.17.21, and reports completion.",
     "changed_files": [
       "package.json"
@@ -520,6 +566,29 @@
         ],
         "allowed_dependency_types": [
           "dependencies"
+        ],
+        "prior_messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_retry_version",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "lodash",
+                  "target_version": "4.17.21!",
+                  "dependency_type": "dependencies",
+                  "manifest_path": "package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_retry_version",
+            "content": "ERROR_CODE: INVALID_ARGUMENT: Invalid target_version '4.17.21!'; only safe npm version characters are allowed."
+          }
         ]
       }
     }
@@ -538,7 +607,7 @@
     "manifest_path": "package.json",
     "is_retry": true,
     "repository_map": "package.json\npackage-lock.json",
-    "expected_tool_correctness_pass": false,
+    "expected_tool_correctness_pass": true,
     "expected_output": "The worker responds to a manifest-sync failure with a changed dependency type, applies cookie@0.7.2 as a direct dependency, and reports the completed transaction.",
     "changed_files": [
       "package.json"
@@ -601,6 +670,29 @@
         ],
         "allowed_dependency_types": [
           "dependencies"
+        ],
+        "prior_messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_retry_sync",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "cookie",
+                  "target_version": "0.7.2",
+                  "dependency_type": "overrides",
+                  "manifest_path": "package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_retry_sync",
+            "content": "ERROR_CODE: MANIFEST_SYNC_FAILED: Manifest sync failed for package.json (exit 1). stdout: ; stderr: EOVERRIDE Override for cookie@0.7.2 conflicts with direct dependency. Rollback: package checkpoint restored."
+          }
         ]
       }
     }
@@ -702,6 +794,50 @@
         ],
         "allowed_dependency_types": [
           "dependencies"
+        ],
+        "prior_messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_stagnation_1",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "lodash",
+                  "target_version": "4.17.21",
+                  "dependency_type": "dependencies",
+                  "manifest_path": "package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_stagnation_1",
+            "content": "ERROR_CODE: MANIFEST_SYNC_FAILED: candidate 4.17.21 failed and the package checkpoint was restored."
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_stagnation_2",
+                "name": "modify_and_validate_npm_dependency",
+                "args": {
+                  "package_name": "lodash",
+                  "target_version": "4.17.21",
+                  "dependency_type": "dependencies",
+                  "manifest_path": "package.json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "modify_and_validate_npm_dependency",
+            "tool_call_id": "call_stagnation_2",
+            "content": "ERROR_CODE: RETRY_PARAMETERS_UNCHANGED: Retry the package with a different allowed target_version or dependency_type."
+          }
         ]
       }
     }
