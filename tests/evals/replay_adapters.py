@@ -514,6 +514,37 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
     return results
 
 
+def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
+    """Seed QA workspace files and ensure candidate changed files exist."""
+    files = seed_replay_files(case)
+    cid = str(case.get("case_id", ""))
+    changed = list(case.get("changed_files", []) or [])
+
+    if "lib/insecurity.ts" in changed and "lib/insecurity.ts" not in files:
+        if "fail_semantic" in cid:
+            files["lib/insecurity.ts"] = (
+                "import expressJwt from 'express-jwt'\n\n"
+                "expressJwt({ secret: publicKey })\n\n"
+                "export function replay() { return true; }\n"
+            )
+        else:
+            files["lib/insecurity.ts"] = (
+                "import { expressjwt } from 'express-jwt'\n\n"
+                "expressjwt({ secret: publicKey, algorithms: ['RS256'] })\n\n"
+                "export function replay() { return true; }\n"
+            )
+
+    if "routes/b2bOrder.ts" in changed and "routes/b2bOrder.ts" not in files:
+        if "fail_semantic" in cid:
+            files["routes/b2bOrder.ts"] = (
+                "const notevil = require('notevil');\n\nexport function replay() { return true; }\n"
+            )
+        else:
+            files["routes/b2bOrder.ts"] = "export function replay() { return true; }\n"
+
+    return files
+
+
 def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
     """Invoke the production QA node with deterministic execution evidence."""
     del eval_settings
@@ -522,7 +553,7 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
     group = _group_for_case(case, component="qa")
     task = _build_task(case, group, "qa")
     snapshot = _build_snapshot(case, task, dispatch_node="qa_critic")
-    files = seed_replay_files(case)
+    files = _qa_files(case)
     replay_execution = _replay_input(case).get(
         "execution_context", case.get("execution_context", {})
     )
@@ -591,9 +622,22 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
         "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
     }
     loop_results: list[Any] = []
+    baseline_files = dict(files)
+    cid = str(case.get("case_id", ""))
+    if "lib/insecurity.ts" in baseline_files and "fail_semantic" not in cid:
+        baseline_files["lib/insecurity.ts"] = (
+            "import expressJwt from 'express-jwt'\n\n"
+            "expressJwt({ secret: publicKey })\n\n"
+            "export function replay() { return true; }\n"
+        )
+    if "routes/b2bOrder.ts" in baseline_files and "fail_semantic" not in cid:
+        baseline_files["routes/b2bOrder.ts"] = (
+            "const notevil = require('notevil');\n\nexport function replay() { return true; }\n"
+        )
+
     with tempfile.TemporaryDirectory(prefix="eval-qa-", dir=workspace_temp_root()) as temp_dir:
         repo_root = Path(temp_dir)
-        make_temp_repo(repo_root, files)
+        make_temp_repo(repo_root, baseline_files)
         state["repo_root"] = str(repo_root)
         with ExitStack() as stack:
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))

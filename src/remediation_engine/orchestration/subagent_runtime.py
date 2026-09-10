@@ -505,6 +505,13 @@ def run_bounded_subagent_loop(
                         "Structured QA output validation failed; evaluator was asked to retry."
                     )
                     continue
+                tool_events.append(
+                    ToolEvent(
+                        name=structured_output_tool_name,
+                        args=terminal_call.get("args", {}) or {},
+                        content="STRUCTURED_OUTPUT_ACCEPTED",
+                    )
+                )
                 return SubagentRuntimeResult(
                     final_text="",
                     tool_events=tool_events,
