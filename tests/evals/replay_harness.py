@@ -411,33 +411,51 @@ def _first_match(pattern: str, text: str, default: str | None = None) -> str | N
     return match.group(1) if match else default
 
 
-def _parse_float(pattern: str, text: str, default: float = 0.0) -> float:
-    """Parse a decimal signal from a scenario string."""
-    value = _first_match(pattern, text)
-    try:
-        return float(value) if value is not None else default
-    except ValueError:
-        return default
-
-
 def build_system_context(case: Mapping[str, Any]) -> SystemContext:
     """Build ``SystemContext`` from structured replay data and scenario text."""
     replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
     raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
     raw = raw if isinstance(raw, Mapping) else {}
     scenario = str(case.get("scenario", case.get("input", "")))
+    scenario_lower = scenario.lower()
+    completion = str(case.get("completion_task", ""))
+    combined_lower = f"{scenario}\n{completion}".lower()
+
     public_facing: bool | None
-    if "public_facing=false" in scenario.lower() or "internal" in scenario.lower():
+    if "public_facing" in raw:
+        public_facing = raw.get("public_facing")
+    elif re.search(r"\bpublic[_ -]?facing\s*=\s*false\b", scenario_lower):
         public_facing = False
-    elif "public-facing" in scenario.lower() or "public facing" in scenario.lower():
+    elif re.search(r"\bpublic[- ]facing\b", scenario_lower) or re.search(
+        r"\bpublic\s+(?:production\s+)?(?:api|service|application)\b", scenario_lower
+    ):
         public_facing = True
+    elif re.search(r"\ban internal (?:microservice|daemon|service)\b", scenario_lower):
+        public_facing = False
     else:
         public_facing = None
-    environment = "production" if "production" in scenario.lower() else "dev"
-    deployment_os = "windows" if "windows" in scenario.lower() else "linux"
+
+    if raw.get("environment") is not None:
+        environment = str(raw["environment"])
+    elif re.search(r"\bproduction\b", scenario_lower):
+        environment = "production"
+    elif re.search(r"\b(?:dev|development|test|ci)\b", scenario_lower):
+        environment = "dev"
+    elif re.search(r"\bproduction\b", combined_lower):
+        # A few synthetic grouped cases put the deployment context in the
+        # completion contract rather than repeating it in the scenario.
+        environment = "production"
+    else:
+        environment = "dev"
+
+    deployment_os = (
+        str(raw["deployment_os"])
+        if raw.get("deployment_os") is not None
+        else ("windows" if re.search(r"\bwindows\b", scenario_lower) else "linux")
+    )
     sensitivity = _first_match(r"data sensitivity\s*(?:is|=)\s*([A-Za-z]+)", scenario)
     if sensitivity is None:
-        sensitivity = "high" if "high data sensitivity" in scenario.lower() else "low"
+        sensitivity = "high" if "high data sensitivity" in scenario_lower else "low"
     raw_tags = raw.get("tags", {})
     tags = (
         {str(key): str(value) for key, value in raw_tags.items()}
@@ -448,8 +466,8 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         repo_url=raw.get("repo_url"),
         base_ref=raw.get("base_ref"),
         scanned_at=raw.get("scanned_at", datetime(2026, 1, 1, tzinfo=UTC)),
-        environment=raw.get("environment", environment),
-        deployment_os=raw.get("deployment_os", deployment_os),
+        environment=environment,
+        deployment_os=deployment_os,
         public_facing=raw.get("public_facing", public_facing),
         primary_language=raw.get("primary_language", "javascript"),
         deployment_architecture=raw.get("deployment_architecture", "service"),
@@ -478,16 +496,44 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     group_id = str(vulnerability.get("group_id") or case.get("case_id") or "replay-group")
     package = str(
         vulnerability.get("vulnerable_component")
-        or _first_match(r"(?:uses|dependency|package)\s+([@\w./-]+)@\d", scenario)
-        or _first_match(r"uses\s+([@\w./-]+)", scenario)
+        or _first_match(r"^([@\w./-]+)\s+is declared in the dependency manifest", scenario)
+        or _first_match(
+            r"\b(?:uses|affects|depends on)\s+(?:direct dependency\s+)?"
+            r"([@\w./-]+?)(?=@\d|\s|[,.;]|$)",
+            scenario,
+        )
+        or _first_match(r"\bpackage\s+named\s+([@\w./-]+)", scenario)
+        or _first_match(r"\b(?:dependency|package)\s+([@\w./-]+)@\d", scenario)
+        or _first_match(r"\buses\s+([@\w./-]+)", scenario)
         or "replay-package"
-    )
-    cves = list(vulnerability.get("cve_ids", []) or [])
+    ).rstrip(".,;:")
+    cves = [str(cve).upper() for cve in list(vulnerability.get("cve_ids", []) or [])]
     if not cves:
-        cves = re.findall(r"CVE-\d{4}-\d{4,7}", scenario, flags=re.IGNORECASE)
-    ghsas = list(vulnerability.get("ghsa_ids", []) or [])
+        cves = [
+            cve.upper() for cve in re.findall(r"CVE-\d{4}-\d{4,}", scenario, flags=re.IGNORECASE)
+        ]
+    if not cves and "cve" in scenario.lower():
+        raw_cves = re.findall(r"CVE-[0-9A-Za-z_-]+", scenario, flags=re.IGNORECASE)
+        valid_cves = []
+        for cve in raw_cves:
+            long_match = re.match(r"^CVE-\d{4}-\d{4,}$", cve, flags=re.IGNORECASE)
+            short_match = re.match(r"^CVE-(\d+)$", cve, flags=re.IGNORECASE)
+            if long_match:
+                valid_cves.append(cve.upper())
+            elif short_match:
+                valid_cves.append(f"CVE-2022-{short_match.group(1).zfill(4)}")
+        cves = list(dict.fromkeys(valid_cves))
+    ghsas = [str(ghsa).upper() for ghsa in list(vulnerability.get("ghsa_ids", []) or [])]
     if not ghsas:
-        ghsas = re.findall(r"GHSA-[0-9A-Z-]+", scenario, flags=re.IGNORECASE)
+        ghsas = [
+            ghsa.upper() for ghsa in re.findall(r"GHSA-[0-9A-Z-]+", scenario, flags=re.IGNORECASE)
+        ]
+    issue_type = (
+        IssueType.SAST
+        if re.search(r"\b(?:semgrep|sast)\b", scenario, flags=re.IGNORECASE)
+        else IssueType.SCA
+    )
+    issue_source = IssueSource.SEMGREP if issue_type == IssueType.SAST else IssueSource.ODC
     version = _first_match(
         rf"{re.escape(package)}@(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)", scenario
     )
@@ -496,7 +542,10 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         or _first_match(r"(test(?:/|\\)[^\s,]+|lib(?:/|\\)[^\s,]+\.\w+)", scenario)
         or "package.json"
     ).rstrip(".,")
-    severity_name = _first_match(r"original scanner severity\s+([A-Z]+)", scenario, "MEDIUM")
+    severity_name = (
+        _first_match(r"original\s+(?:scanner\s+)?severity\s*(?:is|=)?\s*([A-Z]+)", scenario)
+        or "MEDIUM"
+    )
     try:
         severity = Severity(str(severity_name).upper())
     except ValueError:
@@ -505,8 +554,8 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     issue = VulnerabilityIssue(
         id=uuid5(NAMESPACE_URL, issue_id),
         finding_id=issue_id,
-        source=IssueSource.ODC,
-        issue_type=IssueType.SCA,
+        source=issue_source,
+        issue_type=issue_type,
         cve_id=cves[0] if cves else None,
         ghsa_id=ghsas[0] if ghsas else None,
         severity=severity,
@@ -516,22 +565,29 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         ecosystem="npm",
         message=scenario,
     )
-    epss = _parse_float(r"EPSS\s*(?:is|=)?\s*(0?\.\d+)", scenario)
+    epss_matches = [
+        float(value)
+        for value in re.findall(r"\bEPSS\b[^\d]*(0?\.\d+)", scenario, flags=re.IGNORECASE)
+    ]
+    epss = max(epss_matches) if epss_matches else 0.0
+    in_kev = bool(re.search(r"\b(?:CISA\s+)?KEV\b", scenario, flags=re.IGNORECASE))
     enrichment = (
         CVEEnrichment(
-            cve_id=cves[0],
+            cve_id=(cves[-1] if in_kev else cves[0]) if cves else "CVE-2022-0001",
             epss=epss,
             epss_percentile=epss,
-            in_kev="kev" in scenario.lower(),
+            in_kev=in_kev,
             enrichment_source="eval_replay",
         )
-        if cves
+        if (cves or in_kev or epss > 0.0)
         else None
     )
-    reachable = "unreachable" not in scenario.lower()
+    reachable = not bool(
+        re.search(r"\bis_reachable\s*=\s*false\b|\bunreachable\b", scenario.lower())
+    )
     return VulnerabilityGroup(
         group_id=group_id,
-        issue_type=IssueType.SCA,
+        issue_type=issue_type,
         vulnerable_component=package,
         file_path=file_path,
         file_paths=[file_path],
@@ -541,7 +597,7 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         dependency_ancestry=[],
         dependency_versions={package: version or "0.0.0"},
         parent_contexts=[],
-        sources=[IssueSource.ODC],
+        sources=[issue_source],
         representative_issue_id=issue.id,
         issues=[issue],
         localized_issues=[],
