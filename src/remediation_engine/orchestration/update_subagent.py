@@ -245,10 +245,13 @@ def _has_successful_manifest_transaction_for_package(
 
 
 def _is_executed_manifest_transaction(event: Any) -> bool:
-    """Return whether an update event represents an attempted tool execution."""
-    return getattr(event, "name", "") == _UPDATE_MANIFEST_TOOL_NAME and not str(
-        getattr(event, "content", "")
-    ).lstrip().startswith("DEFERRED:")
+    """Return whether an update event represents an executed transaction."""
+    if getattr(event, "name", "") != _UPDATE_MANIFEST_TOOL_NAME:
+        return False
+    content = str(getattr(event, "content", "")).lstrip()
+    return not content.startswith(
+        ("DEFERRED:", "ERROR_CODE: INVALID_ARGUMENT:", "ERROR_CODE: TARGET_NOT_ALLOWED:")
+    )
 
 
 def _build_update_prompt(

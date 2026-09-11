@@ -164,6 +164,18 @@ def _is_failed_tool_result(content: str) -> bool:
     return lowered.startswith(("error:", "error_code:", "not found:", "failed:", "failure"))
 
 
+def _is_validation_gate_failure(content: str) -> bool:
+    """Return whether a validation tool response requires retry recovery."""
+    normalized = (content or "").lstrip()
+    return normalized.startswith(
+        (
+            "FAILURE:",
+            "ERROR: [SYNTAX_FAILURE]",
+            "ERROR: [WRITE_FAILURE]",
+        )
+    )
+
+
 def _manifest_retry_recovery_instruction(
     tool_event: ToolEvent,
     *,
@@ -564,8 +576,10 @@ def run_bounded_subagent_loop(
                     tool_events.append(event)
                     continue
                 manifest_call_seen = True
-            if call_signature in recovery_signatures:
+            if call_signature in recovery_signatures and tool_name != "validate_workaround":
                 prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
+                # Validation retries have their own bounded gate counter; do not
+                # hide a legitimate gate attempt behind generic stagnation suppression.
                 tool_message = ToolMessage(
                     content=(
                         "ERROR: [REPEATED_INVALID_CALL] Repeated failed tool call suppressed. Choose a different "
@@ -771,12 +785,12 @@ def run_bounded_subagent_loop(
                                 )
                     if (
                         validation_gate_call_count >= MAX_VALIDATION_GATE_ATTEMPTS
-                        and event.content.startswith("FAILURE:")
+                        and _is_validation_gate_failure(event.content)
                     ):
                         validation_limit_error = (
                             "VALIDATION_LIMIT_REACHED: Maximum 3 validation gate attempts reached."
                         )
-                    elif event.content.startswith("FAILURE:"):
+                    elif _is_validation_gate_failure(event.content):
                         consecutive_validation_failures += 1
                         if consecutive_validation_failures >= 3:
                             conversation.append(
@@ -921,7 +935,10 @@ def run_bounded_subagent_loop(
         if recovery_instruction:
             conversation.append(HumanMessage(content=recovery_instruction))
 
-    errors.append("Subagent exceeded the maximum tool-call rounds without reaching a final answer.")
+    errors.append(
+        "MAX_SUBAGENT_TOOL_CALL_ROUNDS: "
+        "Subagent exceeded the maximum tool-call rounds without reaching a final answer."
+    )
     return SubagentRuntimeResult(
         final_text=final_text,
         tool_events=tool_events,

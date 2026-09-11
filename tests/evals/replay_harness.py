@@ -13,13 +13,14 @@ import dataclasses
 import json
 import re
 import shlex
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid5
 
+from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel
 
 from remediation_engine.contracts.schemas import (
@@ -50,6 +51,9 @@ class ReplayCapture:
         attempt_id: Attempt identity returned by a worker, if applicable.
         task_revision: Task revision returned by a worker, if applicable.
         external_calls: Recorded non-model calls made through replay doubles.
+        final_files: Final contents of the adapter-owned in-memory workspace
+            after the production node completes, including rollback decisions.
+            Triage captures use an empty mapping because they have no workspace.
     """
 
     case_id: str
@@ -62,6 +66,200 @@ class ReplayCapture:
     attempt_id: str | None = None
     task_revision: int | None = None
     external_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    final_files: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+class ScriptedReplayModel:
+    """Deterministic test-only LangChain chat-model substitute.
+
+    The model supplies controlled assistant messages at the LLM boundary while
+    production nodes, bounded-loop recovery, tools, and state transitions
+    remain real.  Fixture tool outputs are deliberately ignored.
+    """
+
+    def __init__(
+        self,
+        messages: Sequence[AIMessage] = (),
+        *,
+        structured_result: BaseModel | None = None,
+    ) -> None:
+        """Initialize a scripted model.
+
+        Args:
+            messages: Assistant messages returned by successive ``invoke`` calls.
+            structured_result: Typed result returned by the structured-output
+                wrapper, when configured.
+        """
+        self._messages = list(messages)
+        self._structured_result = structured_result
+        self._next_message = 0
+        self._bound_tool_names: set[str] = set()
+        self.bound_tool_names: list[str] = []
+        self.invocation_count = 0
+        self.consumed_tool_calls: list[dict[str, Any]] = []
+        self.structured_invocation_count = 0
+        self.structured_invocations: list[Any] = []
+        self.structured_schema: type[BaseModel] | None = None
+
+    @classmethod
+    def from_tool_trace(
+        cls,
+        trace: Sequence[Mapping[str, Any]],
+        *,
+        final_text: str | None = None,
+    ) -> ScriptedReplayModel:
+        """Build assistant tool-call messages from a canonical trace.
+
+        Args:
+            trace: Ordered records containing ``name`` and optional ``args``.
+                Any recorded ``output`` values are ignored.
+            final_text: Optional no-tool assistant message appended after the
+                scripted calls.
+
+        Returns:
+            A model that emits one assistant message per trace record.
+
+        Raises:
+            ValueError: If a trace record has an empty tool name or invalid
+                arguments.
+        """
+        messages: list[AIMessage] = []
+        for index, item in enumerate(trace, start=1):
+            name = str(item.get("name", "")).strip()
+            if not name:
+                raise ValueError(f"Scripted replay trace item {index} has no tool name.")
+            raw_args = item.get("args", {})
+            if not isinstance(raw_args, Mapping):
+                raise ValueError(f"Scripted replay trace item {index} has invalid args.")
+            messages.append(
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": name,
+                            "args": dict(raw_args),
+                            "id": f"call-{index}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            )
+        if final_text is not None:
+            messages.append(AIMessage(content=final_text))
+        return cls(messages)
+
+    @classmethod
+    def from_structured_result(cls, result: BaseModel) -> ScriptedReplayModel:
+        """Build a model for one structured-output invocation.
+
+        Args:
+            result: Typed result returned to the production structured-output
+                path.
+
+        Returns:
+            A model configured with the supplied typed result.
+        """
+        return cls(structured_result=result)
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> ScriptedReplayModel:
+        """Record the production tool binding and return this model.
+
+        Args:
+            tools: LangChain tools exposed by the production node.
+            **kwargs: Provider binding options, including
+                ``parallel_tool_calls=False``.
+
+        Returns:
+            This model instance, matching LangChain's binding contract.
+        """
+        del kwargs
+        self.bound_tool_names = [str(getattr(tool, "name", "")) for tool in tools]
+        self._bound_tool_names = set(self.bound_tool_names)
+        return self
+
+    def invoke(self, messages: Sequence[BaseMessage]) -> AIMessage:
+        """Return the next scripted assistant message.
+
+        Args:
+            messages: Current production conversation.  The conversation is
+                accepted to match the chat-model protocol and is not rewritten.
+
+        Returns:
+            The next scripted assistant message.
+
+        Raises:
+            AssertionError: If the production loop consumes too many messages
+                or emits a tool not exposed by the production toolbelt.
+        """
+        del messages
+        if self._next_message >= len(self._messages):
+            raise AssertionError(
+                "Production consumed more scripted replay model responses than provided."
+            )
+        response = self._messages[self._next_message]
+        self._next_message += 1
+        self.invocation_count += 1
+        for tool_call in response.tool_calls:
+            name = str(tool_call.get("name", ""))
+            if name not in self._bound_tool_names:
+                raise AssertionError(
+                    f"Scripted replay tool {name!r} was not bound by the production toolbelt."
+                )
+            self.consumed_tool_calls.append(
+                {
+                    "name": name,
+                    "args": dict(tool_call.get("args", {}) or {}),
+                    "id": str(tool_call.get("id", "")),
+                }
+            )
+        return response
+
+    def with_structured_output(self, schema: type[BaseModel]) -> ScriptedStructuredOutput:
+        """Return a one-shot typed-output wrapper for production triage.
+
+        Args:
+            schema: Pydantic schema requested by the production node.
+
+        Returns:
+            A wrapper implementing the structured-output ``invoke`` contract.
+
+        Raises:
+            AssertionError: If this model was not configured with a typed
+                result or the configured result does not match ``schema``.
+        """
+        if self._structured_result is None:
+            raise AssertionError("Scripted replay model has no structured result.")
+        if not isinstance(self._structured_result, schema):
+            raise AssertionError(
+                f"Scripted structured result is not an instance of {schema.__name__}."
+            )
+        self.structured_schema = schema
+        return ScriptedStructuredOutput(self, schema, self._structured_result)
+
+
+class ScriptedStructuredOutput:
+    """One-shot structured-output wrapper owned by ``ScriptedReplayModel``."""
+
+    def __init__(
+        self,
+        owner: ScriptedReplayModel,
+        schema: type[BaseModel],
+        result: BaseModel,
+    ) -> None:
+        """Initialize the structured-output wrapper."""
+        self._owner = owner
+        self._schema = schema
+        self._result = result
+        self._invoked = False
+
+    def invoke(self, prompt: Any) -> BaseModel:
+        """Return the configured typed result exactly once."""
+        if self._invoked:
+            raise AssertionError("Production invoked scripted structured output more than once.")
+        self._invoked = True
+        self._owner.structured_invocation_count += 1
+        self._owner.structured_invocations.append(prompt)
+        return self._result
 
 
 class ReplaySandbox:

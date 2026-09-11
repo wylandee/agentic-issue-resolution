@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from remediation_engine.contracts.schemas import AgentActionStatus
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -19,7 +21,12 @@ from tests.evals.eval_case_helpers import (
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_workaround_case
-from tests.evals.replay_harness import ReplayCapture, cached_replay, format_tool_trace
+from tests.evals.replay_harness import (
+    ReplayCapture,
+    ScriptedReplayModel,
+    cached_replay,
+    format_tool_trace,
+)
 
 try:
     from deepeval import assert_test
@@ -197,3 +204,121 @@ class TestWorkaroundSubagentEval:
                 case_id=str(case["case_id"]),
                 label="workaround task completion",
             )
+
+
+def _tool_signature(tool_events: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """Return tool names and arguments without fixture output text."""
+    return [
+        (str(event.get("name", "")), dict(event.get("args", {}) or {})) for event in tool_events
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    _WORKAROUND_CASES or [{}],
+    ids=_WORKAROUND_CASE_IDS or ["no_cases"],
+)
+def test_workaround_subagent_offline_production_replay(
+    case: dict[str, Any],
+    eval_settings: EvalSettings,
+) -> None:
+    """Exercise every workaround lifecycle through the real worker and loop."""
+    if not case:
+        pytest.skip("No golden workaround cases available")
+
+    case_id = str(case["case_id"])
+    fixture = case.get("offline_fixture", {})
+    historical_tools = fixture.get("actual_tools", []) if isinstance(fixture, dict) else []
+    assert isinstance(historical_tools, list)
+    if case_id == "workaround-surrender-after-max-tool-round-limit":
+        scripted_tools = [{"name": "read_repository_map", "args": {}} for _ in range(24)]
+        model = ScriptedReplayModel.from_tool_trace(scripted_tools)
+    else:
+        scripted_tools = historical_tools
+        model = ScriptedReplayModel.from_tool_trace(scripted_tools, final_text="")
+
+    capture = replay_workaround_case(case, eval_settings, llm=model)
+
+    assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
+    assert model.invocation_count == len(scripted_tools) + (
+        0
+        if case_id
+        in {
+            "workaround-surrender-after-max-validation-input-limit",
+            "workaround-surrender-after-max-validation-gate-limit",
+            "workaround-surrender-after-max-tool-round-limit",
+        }
+        else 1
+    )
+    assert capture.attempt_id == case.get("attempt_id")
+    assert capture.task_revision == int(case.get("task_revision") or 1)
+    assert all(
+        call.get("kind") == "sandbox_command" or call.get("method") in {"GET", "POST"}
+        for call in capture.external_calls
+    )
+
+    surrender_cases = {
+        "workaround-surrender-after-max-validation-input-limit",
+        "workaround-surrender-after-max-validation-gate-limit",
+        "workaround-surrender-after-max-tool-round-limit",
+    }
+    summary = capture.typed_result["action_summaries"][0]
+    if case_id in surrender_cases:
+        assert summary.status == AgentActionStatus.SURRENDER
+        evidence = "\n".join(
+            [*capture.errors, capture.actual_output]
+            + [str(event.get("output", "")) for event in capture.actual_tools]
+        )
+        terminal_marker = str(case["terminal_error_code"])
+        if terminal_marker == "MAX_SUBAGENT_TOOL_CALL_ROUNDS":
+            assert "maximum tool-call rounds" in evidence
+        else:
+            assert terminal_marker in evidence
+        source_path = next(
+            path for path in case["changed_files"] if not str(path).endswith(".json")
+        )
+        baseline = case["replay"]["input"]["workspace_files"][source_path]
+        assert capture.final_files[source_path] == baseline
+        return
+    assert summary.status == AgentActionStatus.SUCCESS
+    expected_changed_files = set(case["changed_files"])
+    if case_id == "workaround-no-fix-package-removal":
+        expected_changed_files.discard("package-lock.json")
+    assert set(capture.changed_files) == expected_changed_files
+    assert any(
+        event["name"] == "validate_workaround" and event["output"].startswith("SUCCESS:")
+        for event in capture.actual_tools
+    )
+
+    if case_id == "workaround-code-change-initial-normal":
+        content = capture.final_files["lib/insecurity.ts"]
+        assert "expressjwt" in content
+        assert "algorithms: ['RS256']" in content
+    elif case_id == "workaround-code-change-pivot":
+        assert "safeArchiveExtract(archive, input)" in capture.final_files["server.js"]
+    elif case_id == "workaround-code-change-clean-first-attempt":
+        content = capture.final_files["server.ts"]
+        assert "cors" in content
+        assert "allowedOrigins" in content
+    elif case_id == "workaround-no-fix-package-removal":
+        package_json = json.loads(capture.final_files["package.json"])
+        assert all(
+            "notevil" not in section
+            for section in package_json.values()
+            if isinstance(section, dict)
+        )
+        assert "require('notevil')" not in capture.final_files["routes/b2bOrder.ts"]
+    elif case_id == "workaround-no-fix-pivot":
+        actual_package = json.loads(capture.final_files["package.json"])
+        baseline_package = json.loads(case["replay"]["input"]["workspace_files"]["package.json"])
+        assert actual_package.get("dependencies") == baseline_package.get("dependencies")
+        assert actual_package.get("overrides") == baseline_package.get("overrides")
+        assert actual_package.get("scripts", {}).get("test") == "mocha"
+        assert actual_package.get("devDependencies", {}).get("mocha") == "10.0.0"
+        assert "notevil" not in capture.final_files["routes/b2bOrder.ts"]
+    elif case_id == "workaround-retry-after-validation-failure":
+        assert "allowInsecureKeySizes: true } as any" in capture.final_files["lib/insecurity.ts"]
+    elif case_id == "workaround-retry-after-validation-infra-failure":
+        assert any(
+            event["name"] == "record_targeted_test_substitution" for event in capture.actual_tools
+        )

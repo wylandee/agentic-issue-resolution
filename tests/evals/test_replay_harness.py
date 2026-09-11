@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from remediation_engine.runtime.path_policy import WorkspacePathError
 from tests.evals.replay_harness import (
     ReplayCapture,
     ReplaySandbox,
+    ScriptedReplayModel,
     cached_replay,
     serialize_result,
     serialize_tool_events,
@@ -108,3 +110,45 @@ def test_cache_reuses_one_capture() -> None:
     second = cached_replay(cache, "test", "case", factory)
     assert first is second
     assert calls == 1
+
+
+def test_scripted_model_consumes_bound_tool_trace_and_final_response() -> None:
+    """The scripted model validates tools and fails when its script is exhausted."""
+    model = ScriptedReplayModel.from_tool_trace(
+        [{"name": "read_file_context", "args": {"file_path": "src/app.js"}, "output": "ignored"}],
+        final_text="done",
+    )
+    model.bind_tools([SimpleNamespace(name="read_file_context")])
+
+    first = model.invoke([])
+    second = model.invoke([])
+
+    assert first.tool_calls[0]["name"] == "read_file_context"
+    assert second.tool_calls == []
+    assert model.invocation_count == 2
+    assert model.consumed_tool_calls == [
+        {"name": "read_file_context", "args": {"file_path": "src/app.js"}, "id": "call-1"}
+    ]
+    with pytest.raises(AssertionError, match="more scripted"):
+        model.invoke([])
+
+
+def test_scripted_model_rejects_unbound_tools() -> None:
+    """A stale fixture tool fails instead of being silently synthesized."""
+    model = ScriptedReplayModel.from_tool_trace([{"name": "unexpected_tool", "args": {}}])
+    model.bind_tools([SimpleNamespace(name="allowed_tool")])
+
+    with pytest.raises(AssertionError, match="not bound"):
+        model.invoke([])
+
+
+def test_scripted_structured_output_is_one_shot() -> None:
+    """Structured triage responses are returned once and invocation is recorded."""
+    result = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.0)
+    model = ScriptedReplayModel.from_structured_result(result)
+    structured = model.with_structured_output(CommandResult)
+
+    assert structured.invoke("prompt") is result
+    assert model.structured_invocation_count == 1
+    with pytest.raises(AssertionError, match="more than once"):
+        structured.invoke("prompt")

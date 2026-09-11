@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from remediation_engine.contracts.schemas import AgentActionStatus
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -19,7 +21,12 @@ from tests.evals.eval_case_helpers import (
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_update_case
-from tests.evals.replay_harness import ReplayCapture, cached_replay, format_tool_trace
+from tests.evals.replay_harness import (
+    ReplayCapture,
+    ScriptedReplayModel,
+    cached_replay,
+    format_tool_trace,
+)
 
 try:
     from deepeval import assert_test
@@ -192,3 +199,49 @@ class TestUpdateSubagentEval:
                 case_id=str(case["case_id"]),
                 label="update task completion",
             )
+
+
+def _tool_signature(tool_events: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """Return tool names and arguments without fixture output text."""
+    return [
+        (str(event.get("name", "")), dict(event.get("args", {}) or {})) for event in tool_events
+    ]
+
+
+@pytest.mark.parametrize("case", _UPDATE_CASES or [{}], ids=_UPDATE_CASE_IDS or ["no_cases"])
+def test_update_subagent_offline_production_replay(
+    case: dict[str, Any],
+    eval_settings: EvalSettings,
+) -> None:
+    """Exercise every update case through the real worker and bounded loop."""
+    if not case:
+        pytest.skip("No golden update cases available")
+
+    fixture = case.get("offline_fixture", {})
+    scripted_tools = fixture.get("actual_tools", []) if isinstance(fixture, dict) else []
+    assert isinstance(scripted_tools, list)
+    model = ScriptedReplayModel.from_tool_trace(scripted_tools, final_text="")
+    capture = replay_update_case(case, eval_settings, llm=model)
+
+    assert model.invocation_count == len(scripted_tools) + 1
+    assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
+    assert capture.attempt_id
+    assert capture.task_revision == int(case.get("task_revision") or 1)
+    assert all(call.get("kind") == "sandbox_command" for call in capture.external_calls)
+
+    case_id = str(case["case_id"])
+    summary = capture.typed_result["action_summaries"][0]
+    if case_id == "update-retry-limit-surrender":
+        assert summary.status == AgentActionStatus.SURRENDER
+        assert "RETRY_LIMIT_REACHED" in (capture.actual_output + "\n" + "\n".join(capture.errors))
+        baseline = json.loads(str(case["replay"]["input"]["workspace_files"]["package.json"]))
+        final_manifest = json.loads(capture.final_files["package.json"])
+        assert final_manifest == baseline
+        return
+
+    assert summary.status == AgentActionStatus.SUCCESS
+    assert capture.changed_files
+    manifest = json.loads(capture.final_files["package.json"])
+    dependency_section = str(case["dependency_type"])
+    package_name = str(case["target_package_name"])
+    assert manifest[dependency_section][package_name] == case["selected_version"]

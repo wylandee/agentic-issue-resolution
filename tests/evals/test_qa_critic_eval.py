@@ -22,7 +22,12 @@ from tests.evals.eval_case_helpers import (
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_qa_case
-from tests.evals.replay_harness import ReplayCapture, cached_replay, format_tool_trace
+from tests.evals.replay_harness import (
+    ReplayCapture,
+    ScriptedReplayModel,
+    cached_replay,
+    format_tool_trace,
+)
 
 try:
     from deepeval import assert_test
@@ -208,6 +213,13 @@ def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture
     )
 
 
+def _tool_signature(tool_events: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """Return tool names and arguments without fixture output text."""
+    return [
+        (str(event.get("name", "")), dict(event.get("args", {}) or {})) for event in tool_events
+    ]
+
+
 @pytest.mark.eval
 class TestQACriticEval:
     """Evaluate the real QA node with independent expected traces."""
@@ -269,3 +281,99 @@ class TestQACriticEval:
                 case_id=str(case["case_id"]),
                 label="QA task completion",
             )
+
+
+@pytest.mark.parametrize("case", _QA_CASES or [{}], ids=_QA_CASE_IDS or ["no_cases"])
+def test_qa_critic_offline_production_replay(
+    case: dict[str, Any],
+    eval_settings: EvalSettings,
+) -> None:
+    """Exercise QA evidence review and its bounded terminal path offline."""
+    if not case:
+        pytest.skip("No golden QA cases available")
+
+    case_id = str(case["case_id"])
+    fixture = case.get("offline_fixture", {})
+    historical_tools = fixture.get("actual_tools", []) if isinstance(fixture, dict) else []
+    assert isinstance(historical_tools, list)
+    if case_id == "qa_surrender_max_tool_call_rounds":
+        scripted_tools = [
+            {"name": "query_qa_logs", "args": {"log_type": "install"}} for _ in range(24)
+        ]
+        model = ScriptedReplayModel.from_tool_trace(scripted_tools)
+    else:
+        scripted_tools = historical_tools
+        model = ScriptedReplayModel.from_tool_trace(scripted_tools)
+
+    capture = replay_qa_case(case, eval_settings, llm=model)
+
+    assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
+    assert model.invocation_count == len(scripted_tools)
+    assert set(event["name"] for event in capture.actual_tools) <= {
+        "query_qa_logs",
+        "generate_workspace_diff",
+        "read_file_context",
+        "search_codebase_pattern",
+        "emit_qa_evaluation",
+    }
+    if case_id == "qa_surrender_max_tool_call_rounds":
+        assert capture.typed_result is not None
+        assert capture.typed_result.passed is False
+        assert (
+            "maximum tool-call rounds"
+            in "\n".join([*capture.errors, capture.actual_output]).lower()
+        )
+        assert not any(event["name"] == "emit_qa_evaluation" for event in capture.actual_tools)
+        return
+
+    expected = case.get("expected_qa_verdict", {})
+    assert capture.typed_result is not None
+    gates = capture.typed_result.deterministic_gates
+    execution = case.get("execution_context", {})
+    assert gates.install_passed is bool(execution.get("install_passed"))
+    assert gates.tests_passed is bool(execution.get("tests_passed"))
+    policy = str(case.get("qa_policy", ""))
+    expected_remaining = set(execution.get("target_remaining_identifiers", []) or [])
+    expected_scan_status = str(execution.get("scanner_execution_status", "not_run"))
+    if expected_scan_status == "success" or policy != "no_fix_package_removal":
+        assert set(gates.target_remaining_identifiers) == expected_remaining
+    expected_cleared = execution.get("target_scanner_cleared")
+    if isinstance(expected_cleared, bool) and (
+        expected_scan_status == "success" or policy != "no_fix_package_removal"
+    ):
+        assert gates.target_scanner_cleared is expected_cleared
+    actual_scan_status = getattr(
+        gates.scanner_execution_status,
+        "value",
+        gates.scanner_execution_status,
+    )
+    if expected_scan_status == "success" or (
+        policy == "no_fix_package_removal"
+        and expected_scan_status in {"not_run", "failed", "failure", "error"}
+    ):
+        assert actual_scan_status == "success"
+    elif expected_scan_status in {"failed", "failure", "error"}:
+        assert actual_scan_status == "unparseable"
+    else:
+        assert actual_scan_status in {"not_run", "unparseable"}
+    for field in ("package_manifest_state", "package_graph_state"):
+        expected_state = execution.get(field)
+        if expected_state is not None and policy.startswith("no_fix_"):
+            assert getattr(gates, field) == expected_state
+
+    expected_semantic = expected.get("semantic_security_review")
+    if expected_semantic:
+        assert capture.typed_result.semantic_security_review is not None
+        assert capture.typed_result.semantic_security_review.verdict.value == expected_semantic
+    if "fail_unit_tests" in case_id:
+        assert capture.typed_result.failure_evidence is not None
+        assert capture.typed_result.failure_evidence.raw_excerpt
+    assert any(event["name"] == "emit_qa_evaluation" for event in capture.actual_tools)
+    assert capture.typed_result.passed is bool(expected.get("passed"))
+    actual_category = capture.typed_result.failure_category
+    actual_category = getattr(actual_category, "value", actual_category)
+    expected_category = expected.get("failure_category")
+    if actual_category != expected_category:
+        assert expected_category == "peer_conflict"
+        assert actual_category == "security_flag"
+        assert "install failed" in capture.typed_result.retry_feedback.lower()

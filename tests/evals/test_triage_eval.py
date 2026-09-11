@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from remediation_engine.contracts.schemas import Severity, TriageResult
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.agent import run_triage
 from remediation_engine.triage.pipeline import select_issues_for_remediation
@@ -26,6 +27,7 @@ from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_triage_case
 from tests.evals.replay_harness import (
     ReplayCapture,
+    ScriptedReplayModel,
     build_system_context,
     build_vulnerability_group,
     cached_replay,
@@ -217,3 +219,45 @@ class TestTriageEval:
         hallucinated = result.model_copy(update={"recommended_issue_id": uuid4()})
         selected = select_issues_for_remediation([(group, hallucinated)])
         assert [issue.id for issue in selected] == [group.representative_issue_id]
+
+    def test_triage_offline_guardrail_replay(
+        self,
+        eval_settings: EvalSettings,
+    ) -> None:
+        """Replay an under-ranked KEV verdict through the real triage guardrail."""
+        case = next(
+            case
+            for case in _TRIAGE_CASES
+            if case.get("case_id") == "triage-guardrail-drop-everything-kev-override"
+        )
+        group = build_vulnerability_group(case)
+        raw_result = TriageResult(
+            chain_of_thought="The observed prototype-pollution path appears difficult to trigger.",
+            group_id=group.group_id,
+            is_valid=False,
+            false_positive_reason="The vulnerable path appears unreachable in normal traffic.",
+            original_severity=Severity.MEDIUM,
+            revised_priority=Severity.MEDIUM,
+            is_unreachable_code=True,
+            priority_reasoning="The raw model under-ranked the finding.",
+            validity_confidence_score=0.4,
+            priority_confidence_score=0.4,
+            recommended_issue_id=group.representative_issue_id,
+            triage_method="llm",
+        )
+        model = ScriptedReplayModel.from_structured_result(raw_result)
+
+        capture = replay_triage_case(case, eval_settings, llm=model)
+
+        result = capture.typed_result
+        assert capture.actual_tools == []
+        assert capture.external_calls == []
+        assert model.structured_invocation_count == 1
+        assert result is not None
+        assert result.is_valid is True
+        assert result.false_positive_reason is None
+        assert result.revised_priority == Severity.CRITICAL
+        assert result.priority_confidence_score == 1.0
+        assert result.triage_method == "llm"
+        assert result.recommended_issue_id == group.representative_issue_id
+        assert "CISA KEV" in result.priority_reasoning

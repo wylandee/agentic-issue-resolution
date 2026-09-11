@@ -1166,7 +1166,7 @@ def _is_allowlisted_no_fix_package_file(
     rel_path: str,
     plan_state: Mapping[str, Any] | None,
 ) -> bool:
-    """Return whether a manifest/lockfile was changed by scoped NO_FIX removal."""
+    """Return whether a manifest/lockfile is allowed by scoped NO_FIX removal."""
     if (
         not plan_state
         or plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value
@@ -1179,9 +1179,9 @@ def _is_allowlisted_no_fix_package_file(
         str(path).replace("\\", "/").lstrip("/")
         for path in plan_state.get("no_fix_package_files", [])
     }
-    return normalized in allowlisted and normalized in set(
-        plan_state.get("package_removal_files", [])
-    )
+    # The validation contract names the complete manifest/lockfile set even
+    # when npm leaves one of those files byte-for-byte unchanged.
+    return normalized in allowlisted
 
 
 def _remember_stage_baseline(
@@ -1598,6 +1598,10 @@ def _make_deterministic_apply_edit_set_tool(
             if "FAILURE" in syntax_res or "ERROR" in syntax_res:
                 for p, orig in file_snapshots.items():
                     sandbox.write_file(p, orig)
+                if plan_state is not None:
+                    plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
+                    plan_state["edit_failure_requires_replan"] = True
+                    plan_state["validation_passed"] = False
                 return f"ERROR: [SYNTAX_FAILURE] Replacement produced invalid syntax in '{rel_path}'. All files in edit set restored.\n{syntax_res}"
 
         plan_rev = plan_state.get("plan_revision", 1) if plan_state else 1
@@ -2423,7 +2427,8 @@ def _make_run_targeted_test_tool(
                 if not passing and not failing or passing_count == 0 and failing_count == 0:
                     return (
                         f"FAILURE: Targeted test result could not be verified (mocha): {norm_path}\n"
-                        "Diagnostic: Mocha output did not report any executed tests."
+                        "Diagnostic: Mocha output did not report any executed tests.\n"
+                        f"Raw output:\n{output[:1500]}"
                     )
                 if test_name and passing_count == 0:
                     return (
@@ -3137,7 +3142,11 @@ def _make_validate_workaround_tool(
         plan_state["validation_passed"] = True
         if package_removal_mode:
             plan_state["package_removal_sync_succeeded"] = True
-        plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
+        if plan_state.pop("edit_failure_requires_replan", False):
+            plan_state["validation_passed"] = False
+            plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
+        else:
+            plan_state["phase"] = WorkaroundExecutionPhase.VALIDATE.value
 
         pending_edit_set = plan_state.get("pending_edit_set")
         if pending_edit_set is not None:
@@ -3511,6 +3520,7 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         plan_state["recorded"] = True
         plan_state["plan_revision"] = int(plan_state.get("plan_revision", 0)) + 1
         plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
+        plan_state.pop("edit_failure_requires_replan", None)
         plan_state["successful_edit_count_this_iteration"] = 0
 
         plan_state["planned_replacements"] = [r.model_dump() for r in replacements]

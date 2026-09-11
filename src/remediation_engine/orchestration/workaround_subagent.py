@@ -1143,8 +1143,16 @@ def _workaround_attempt_succeeded(
             return False
 
         val_files = set(plan_state.get("validated_files", []))
-        if val_files != set(runtime.changed_files):
-            return False
+        runtime_files = set(runtime.changed_files)
+        if val_files != runtime_files:
+            no_fix_package_files = set(plan_state.get("no_fix_package_files", []))
+            missing_runtime_files = val_files - runtime_files
+            if not (
+                plan_state.get("package_removal_completed")
+                and missing_runtime_files
+                and missing_runtime_files <= no_fix_package_files
+            ):
+                return False
 
         last_val = plan_state.get("last_validation_result")
         if last_val is None:

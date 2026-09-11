@@ -383,7 +383,6 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
         attempts = {"count": 0}
 
         def infra_once(command: str) -> dict[str, Any]:
-            del command
             attempts["count"] += 1
             if attempts["count"] == 1:
                 return {
@@ -392,7 +391,7 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
                     "stderr": "",
                     "duration_seconds": 0.0,
                 }
-            return mocha_response("npx --no-install mocha")
+            return mocha_response(command)
 
         responses["npx --no-install mocha"] = infra_once
         responses["npm test"] = infra_once
@@ -408,8 +407,24 @@ def _workaround_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
     return responses
 
 
-def replay_triage_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
-    """Invoke production triage and capture its typed post-guardrail result."""
+def replay_triage_case(
+    case: Mapping[str, Any],
+    eval_settings: Any,
+    *,
+    llm: Any | None = None,
+) -> ReplayCapture:
+    """Invoke production triage and capture its typed post-guardrail result.
+
+    Args:
+        case: Canonical triage replay case.
+        eval_settings: Evaluation settings used to configure the production
+            triage path.
+        llm: Optional test-only model replacement.  When supplied, only the
+            production ``ChatOpenAI`` lookup is patched for this invocation.
+
+    Returns:
+        The typed triage result and any deterministic selection evidence.
+    """
     from remediation_engine.triage.agent import run_triage
     from remediation_engine.triage.pipeline import select_issues_for_remediation
 
@@ -421,17 +436,25 @@ def replay_triage_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
         openai_api_key=getattr(eval_settings, "openai_api_key", "") or settings.openai_api_key,
         triage_llm_enabled=True,
     )
-    result = run_triage(group, context, settings=settings)
-    payload: dict[str, Any] = {"triage_result": serialize_result(result)}
-    selection_boundary = _replay_input(case).get(
-        "selection_boundary", case.get("selection_boundary")
-    )
-    if (
-        selection_boundary
-        or str(case.get("case_id", "")) == "triage-pipeline-selection-hallucinated-issue-id"
-    ):
-        selected = select_issues_for_remediation([(group, result)])
-        payload["selected_issue_ids"] = [issue.id for issue in selected]
+    with ExitStack() as stack:
+        if llm is not None:
+            stack.enter_context(
+                patch(
+                    "langchain_openai.ChatOpenAI",
+                    side_effect=lambda *_args, **_kwargs: llm,
+                )
+            )
+        result = run_triage(group, context, settings=settings)
+        payload: dict[str, Any] = {"triage_result": serialize_result(result)}
+        selection_boundary = _replay_input(case).get(
+            "selection_boundary", case.get("selection_boundary")
+        )
+        if (
+            selection_boundary
+            or str(case.get("case_id", "")) == "triage-pipeline-selection-hallucinated-issue-id"
+        ):
+            selected = select_issues_for_remediation([(group, result)])
+            payload["selected_issue_ids"] = [issue.id for issue in selected]
     return ReplayCapture(
         case_id=str(case.get("case_id", "unknown")),
         component="triage",
@@ -439,6 +462,7 @@ def replay_triage_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
         actual_tools=[],
         typed_result=result,
         errors=[],
+        final_files={},
     )
 
 
@@ -457,7 +481,11 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
         str(logs.get("install_log", "replay install result")),
     )
     policy = _policy_for_case(case, "qa")
-    if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
+    scanner_status_name = str(execution.get("scanner_execution_status", "not_run")).lower()
+    if (
+        policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL
+        and scanner_status_name != ScannerExecutionStatus.SUCCESS.value
+    ):
         results.scan_skipped = True
         results.scan_skip_reason = "no_fix_package_removal"
     else:
@@ -545,8 +573,22 @@ def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
     return files
 
 
-def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
-    """Invoke the production QA node with deterministic execution evidence."""
+def replay_qa_case(
+    case: Mapping[str, Any],
+    eval_settings: Any,
+    *,
+    llm: Any | None = None,
+) -> ReplayCapture:
+    """Invoke the production QA node with deterministic execution evidence.
+
+    Args:
+        case: Canonical QA replay case.
+        eval_settings: Unused by deterministic QA boundaries.
+        llm: Optional test-only model replacement scoped to this adapter call.
+
+    Returns:
+        The typed QA evaluation and captured in-memory side effects.
+    """
     del eval_settings
     import remediation_engine.orchestration.qa_critic as qa
 
@@ -572,6 +614,15 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
                 ):
                     if isinstance(package_json.get(section), dict):
                         package_json[section].pop(package, None)
+                files["package.json"] = json.dumps(package_json, indent=2) + "\n"
+            except json.JSONDecodeError:
+                pass
+        elif manifest_state == "present" and "package.json" in files:
+            try:
+                package_json = json.loads(files["package.json"])
+                dependencies = package_json.setdefault("dependencies", {})
+                if isinstance(dependencies, dict) and package:
+                    dependencies.setdefault(package, "1.0.0")
                 files["package.json"] = json.dumps(package_json, indent=2) + "\n"
             except json.JSONDecodeError:
                 pass
@@ -622,6 +673,7 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
         "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
     }
     loop_results: list[Any] = []
+    final_files: dict[str, str] = {}
     baseline_files = dict(files)
     cid = str(case.get("case_id", ""))
     if "lib/insecurity.ts" in baseline_files and "fail_semantic" not in cid:
@@ -641,6 +693,13 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
         state["repo_root"] = str(repo_root)
         with ExitStack() as stack:
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))
+            if llm is not None:
+                stack.enter_context(
+                    patch(
+                        "langchain_openai.ChatOpenAI",
+                        side_effect=lambda *_args, **_kwargs: llm,
+                    )
+                )
             stack.enter_context(patch.object(qa, "_run_global_execution", return_value=results))
             original_loop = qa.run_bounded_subagent_loop
 
@@ -653,6 +712,7 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
                 patch.object(qa, "run_bounded_subagent_loop", side_effect=wrapped_loop)
             )
             output = qa.run_qa_critic_node(state)
+            final_files = dict(sandbox.files)
     events = serialize_tool_events(
         event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
     )
@@ -674,6 +734,7 @@ def replay_qa_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture
         external_calls=[
             {"kind": "sandbox_command", "command": command} for command in sandbox.commands
         ],
+        final_files=final_files,
     )
 
 
@@ -763,8 +824,22 @@ def _prior_tool_events(case: Mapping[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
-def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
-    """Invoke the production update worker against the recording sandbox."""
+def replay_update_case(
+    case: Mapping[str, Any],
+    eval_settings: Any,
+    *,
+    llm: Any | None = None,
+) -> ReplayCapture:
+    """Invoke the production update worker against the recording sandbox.
+
+    Args:
+        case: Canonical update replay case.
+        eval_settings: Unused by deterministic worker boundaries.
+        llm: Optional test-only model replacement scoped to this adapter call.
+
+    Returns:
+        The typed worker result and captured in-memory side effects.
+    """
     del eval_settings
     import remediation_engine.orchestration.update_subagent as update
 
@@ -774,6 +849,7 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
     files = _worker_files(case)
     sandbox = ReplaySandbox(files, command_responses=_update_command_routes(case))
     loop_results: list[Any] = []
+    final_files: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="eval-update-", dir=workspace_temp_root()) as temp_dir:
         repo_root = Path(temp_dir)
         make_temp_repo(repo_root, files)
@@ -787,10 +863,18 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
             previous_action_summaries_by_task={},
             retry_diagnostics_by_task={},
             target_attempt_snapshots={task.task_id: snapshot},
-            messages=_prior_messages_from_case(case),
+            messages=_prior_messages_from_case(case) if llm is None else [],
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(update, "DockerSandbox", return_value=sandbox))
+            if llm is not None:
+                stack.enter_context(
+                    patch.object(
+                        update,
+                        "ChatOpenAI",
+                        side_effect=lambda *_args, **_kwargs: llm,
+                    )
+                )
             original_loop = update.run_bounded_subagent_loop
 
             def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
@@ -802,11 +886,12 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
                 patch.object(update, "run_bounded_subagent_loop", side_effect=wrapped_loop)
             )
             output = update.run_update_subagent_node(state)
+            final_files = dict(sandbox.files)
     events = serialize_tool_events(
         event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
     )
     case_id = str(case.get("case_id", "unknown"))
-    prior_tools = _prior_tool_events(case)
+    prior_tools = _prior_tool_events(case) if llm is None else []
     payload: dict[str, Any] = {
         "action_status": "APPLIED" if output.get("changed_files") else "SURRENDER",
         "worker_result": serialize_result(output),
@@ -857,6 +942,7 @@ def replay_update_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCap
         external_calls=[
             {"kind": "sandbox_command", "command": command} for command in sandbox.commands
         ],
+        final_files=final_files,
     )
 
 
@@ -875,8 +961,22 @@ class _ReplayHTTPResponse:
         return dict(self._payload)
 
 
-def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> ReplayCapture:
-    """Invoke the production workaround worker with deterministic boundaries."""
+def replay_workaround_case(
+    case: Mapping[str, Any],
+    eval_settings: Any,
+    *,
+    llm: Any | None = None,
+) -> ReplayCapture:
+    """Invoke the production workaround worker with deterministic boundaries.
+
+    Args:
+        case: Canonical workaround replay case.
+        eval_settings: Unused by deterministic worker boundaries.
+        llm: Optional test-only model replacement scoped to this adapter call.
+
+    Returns:
+        The typed worker result and captured in-memory side effects.
+    """
     del eval_settings
     import remediation_engine.orchestration.remedy_tools as remedy_tools
     import remediation_engine.orchestration.workaround_subagent as workaround
@@ -929,6 +1029,7 @@ def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> Repla
     sandbox = ReplaySandbox(files, command_responses=_workaround_command_routes(case))
     current_replay_plan = _replay_plan_for_case(case, task)
     loop_results: list[Any] = []
+    final_files: dict[str, str] = {}
     with tempfile.TemporaryDirectory(
         prefix="eval-workaround-", dir=workspace_temp_root()
     ) as temp_dir:
@@ -946,6 +1047,14 @@ def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> Repla
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(workaround, "DockerSandbox", return_value=sandbox))
+            if llm is not None:
+                stack.enter_context(
+                    patch.object(
+                        workaround,
+                        "ChatOpenAI",
+                        side_effect=lambda *_args, **_kwargs: llm,
+                    )
+                )
             stack.enter_context(
                 patch.object(remedy_tools, "get_runtime_settings", return_value=tool_settings)
             )
@@ -962,6 +1071,7 @@ def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> Repla
                 patch.object(workaround, "run_bounded_subagent_loop", side_effect=wrapped_loop)
             )
             output = workaround.run_workaround_subagent_node(state)
+            final_files = dict(sandbox.files)
     events = serialize_tool_events(
         event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
     )
@@ -983,4 +1093,5 @@ def replay_workaround_case(case: Mapping[str, Any], eval_settings: Any) -> Repla
         task_revision=snapshot.task_revision,
         external_calls=http_calls
         + [{"kind": "sandbox_command", "command": command} for command in sandbox.commands],
+        final_files=final_files,
     )
