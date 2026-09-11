@@ -161,8 +161,35 @@ def _span_name(serialized: Any, fallback: str) -> str:
 
 
 def _token_usage_from_response(response: Any) -> tuple[int, int, bool]:
-    """Extract prompt/completion token usage from a LangChain LLM response."""
+    """Extract prompt/completion token usage from a LangChain LLM response.
+
+    Args:
+        response: Provider response, LangChain message, or JSON-like mapping
+            containing usage metadata.
+
+    Returns:
+        A tuple of ``(prompt_tokens, completion_tokens, available)``.
+    """
     candidates: list[Any] = []
+    if isinstance(response, Mapping):
+        response_metadata = response.get("response_metadata")
+        if isinstance(response_metadata, Mapping):
+            candidates.extend(
+                [
+                    response_metadata.get("token_usage"),
+                    response_metadata.get("usage"),
+                    response_metadata,
+                ]
+            )
+        candidates.extend(
+            [
+                response.get("usage_metadata"),
+                response.get("token_usage"),
+                response.get("usage"),
+                response,
+            ]
+        )
+
     usage_metadata = getattr(response, "usage_metadata", None)
     if isinstance(usage_metadata, Mapping):
         candidates.append(usage_metadata)
@@ -204,6 +231,55 @@ def _token_usage_from_response(response: Any) -> tuple[int, int, bool]:
     return 0, 0, False
 
 
+def _token_cost_from_response(response: Any) -> float | None:
+    """Extract a provider-reported token cost without guessing model pricing.
+
+    Args:
+        response: Provider response, LangChain message, or JSON-like mapping
+            containing an explicit token-cost field.
+
+    Returns:
+        The non-negative token cost when the provider reported one; otherwise
+        ``None``.
+    """
+    candidates: list[Any] = []
+    if isinstance(response, Mapping):
+        response_metadata = response.get("response_metadata")
+        if isinstance(response_metadata, Mapping):
+            candidates.extend(
+                [
+                    response_metadata.get("token_usage"),
+                    response_metadata.get("usage"),
+                    response_metadata,
+                ]
+            )
+        candidates.extend(
+            [
+                response.get("usage_metadata"),
+                response.get("token_usage"),
+                response.get("usage"),
+                response,
+            ]
+        )
+    for attribute in ("response_metadata", "usage_metadata", "llm_output"):
+        value = getattr(response, attribute, None)
+        if isinstance(value, Mapping):
+            candidates.extend([value.get("token_usage"), value.get("usage"), value])
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in ("token_cost", "token_cost_usd", "cost_usd"):
+            value = candidate.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 class TrajectoryRecorder(BaseCallbackHandler):
     """Capture callback spans for a single Phase 5 invocation.
 
@@ -223,6 +299,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
         self._token_data_available = False
+        self._token_cost: float | None = None
 
     def _start(
         self,
@@ -287,6 +364,20 @@ class TrajectoryRecorder(BaseCallbackHandler):
         except Exception:  # pragma: no cover - telemetry must not interrupt a run
             logger.debug("trajectory recorder failed to finish span", exc_info=True)
 
+    def _record_token_usage(self, response: Any) -> None:
+        """Accumulate token counts and provider-reported cost from one response."""
+        prompt_tokens, completion_tokens, available = _token_usage_from_response(response)
+        token_cost = _token_cost_from_response(response)
+        if not available and token_cost is None:
+            return
+        with self._lock:
+            if available:
+                self._total_prompt_tokens += prompt_tokens
+                self._total_completion_tokens += completion_tokens
+                self._token_data_available = True
+            if token_cost is not None:
+                self._token_cost = (self._token_cost or 0.0) + token_cost
+
     def record_manual(
         self,
         *,
@@ -307,6 +398,11 @@ class TrajectoryRecorder(BaseCallbackHandler):
             inputs=inputs,
         )
         self._end(identifier, outputs=outputs, error=error)
+        if run_type == "llm":
+            try:
+                self._record_token_usage(outputs)
+            except Exception:  # pragma: no cover - telemetry must not interrupt a run
+                logger.debug("trajectory recorder failed to extract token usage", exc_info=True)
         return identifier
 
     def sequence_count(self) -> int:
@@ -403,12 +499,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Record successful completion of an LLM callback."""
         self._end(run_id, outputs=response)
         try:
-            prompt_tokens, completion_tokens, available = _token_usage_from_response(response)
-            if available:
-                with self._lock:
-                    self._total_prompt_tokens += prompt_tokens
-                    self._total_completion_tokens += completion_tokens
-                    self._token_data_available = True
+            self._record_token_usage(response)
         except Exception:  # pragma: no cover - telemetry must not interrupt a run
             logger.debug("trajectory recorder failed to extract token usage", exc_info=True)
 
@@ -435,6 +526,12 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Return whether at least one LLM callback supplied token usage."""
         with self._lock:
             return self._token_data_available
+
+    @property
+    def token_cost(self) -> float | None:
+        """Return accumulated provider-reported token cost, when available."""
+        with self._lock:
+            return self._token_cost
 
     def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
         """Record a failed LLM callback."""

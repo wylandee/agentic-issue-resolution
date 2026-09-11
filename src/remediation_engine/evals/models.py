@@ -33,6 +33,11 @@ class EvalTestCaseRecord(BaseModel):
     retrieval_context: str | None = None
     latency_seconds: float = 0.0
     cost: float = 0.0
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    token_cost: float | None = Field(default=None, ge=0.0)
+    token_usage_available: bool = False
     error_message: str | None = None
     additional_metadata: dict[str, Any] = Field(default_factory=dict)
     metrics: list[MetricRecord] = Field(default_factory=list)
@@ -53,5 +58,10 @@ class EvalRunRecord(BaseModel):
     skipped_tests: int = 0
     duration_seconds: float = 0.0
     total_cost: float = 0.0
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    token_cost: float | None = Field(default=None, ge=0.0)
+    token_usage_complete: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     test_cases: list[EvalTestCaseRecord] = Field(default_factory=list)

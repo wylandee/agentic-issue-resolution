@@ -167,6 +167,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_nonnegative_int(value: Any) -> int | None:
+    """Convert an optional token count while preserving unavailable usage."""
+    if value is None or value == "":
+        return None
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted >= 0 else None
+
+
+def _optional_nonnegative_float(value: Any) -> float | None:
+    """Convert an optional non-negative cost while preserving unavailable cost."""
+    if value is None or value == "":
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted >= 0 else None
+
+
 def _nodeid_parameter_id(nodeid: str) -> str | None:
     """Extract a pytest parameter ID from a node ID when one is present."""
     item_name = nodeid.rsplit("::", 1)[-1]
@@ -270,6 +292,41 @@ def _test_case_metadata(tc: Any) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _token_replay_identity(record: Any) -> tuple[str, str, str] | None:
+    """Return the stable identity of one production replay observation."""
+    metadata = record.additional_metadata
+    metadata = metadata if isinstance(metadata, dict) else {}
+    replay_source = str(metadata.get("replay_source") or "")
+    case_id = str(metadata.get("case_id") or record.case_id or "")
+    component = str(metadata.get("component") or record.suite or "")
+    if replay_source != "production_live" or not case_id or not component:
+        return None
+    return component, case_id, replay_source
+
+
+def _deduplicate_token_records(records: list[Any]) -> list[Any]:
+    """Remove duplicate metric records for the same replay observation."""
+    deduplicated: list[Any] = []
+    seen_signatures: set[tuple[Any, ...]] = set()
+    for record in records:
+        identity = _token_replay_identity(record)
+        if identity is None:
+            deduplicated.append(record)
+            continue
+        signature = (
+            *identity,
+            record.input_tokens,
+            record.output_tokens,
+            record.total_tokens,
+            record.token_cost,
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        deduplicated.append(record)
+    return deduplicated
+
+
 def _metric_names(tc: Any) -> list[str]:
     """Return metric names recorded on a DeepEval test case."""
     return [
@@ -346,6 +403,17 @@ def _record_from_deep_eval_case(
     from remediation_engine.evals.models import EvalTestCaseRecord, MetricRecord
 
     metadata = _test_case_metadata(tc)
+    input_tokens = _optional_nonnegative_int(metadata.get("input_tokens"))
+    output_tokens = _optional_nonnegative_int(metadata.get("output_tokens"))
+    total_tokens = _optional_nonnegative_int(metadata.get("total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    token_cost = _optional_nonnegative_float(getattr(tc, "token_cost", None))
+    if token_cost is None:
+        token_cost = _optional_nonnegative_float(metadata.get("token_cost"))
+    token_usage_available = bool(metadata.get("token_usage_available")) or (
+        total_tokens is not None
+    )
     observation = (
         _pytest_item_observation(nodeid)
         if nodeid
@@ -402,6 +470,11 @@ def _record_from_deep_eval_case(
         latency_seconds=_safe_float(getattr(tc, "run_duration", 0.0))
         or observation["latency_seconds"],
         cost=_safe_float(getattr(tc, "evaluation_cost", 0.0)),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        token_cost=token_cost,
+        token_usage_available=token_usage_available,
         error_message=observation["error_message"],
         additional_metadata=metadata,
         metrics=metrics,
@@ -537,6 +610,38 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     passed_tests = sum(1 for record in test_case_records if record.status == "PASSED")
     failed_tests = sum(1 for record in test_case_records if record.status == "FAILED")
     skipped_tests = sum(1 for record in test_case_records if record.status == "SKIPPED")
+    token_usage_records = _deduplicate_token_records(
+        [record for record in test_case_records if record.token_usage_available]
+    )
+    token_cost_records = _deduplicate_token_records(
+        [record for record in test_case_records if record.token_cost is not None]
+    )
+    token_expected_records = _deduplicate_token_records(
+        [
+            record
+            for record in test_case_records
+            if record.additional_metadata.get("replay_source") == "production_live"
+        ]
+    )
+    token_usage_complete = bool(token_expected_records) and all(
+        record.token_usage_available for record in token_expected_records
+    )
+    input_token_values = [
+        record.input_tokens for record in token_usage_records if record.input_tokens is not None
+    ]
+    output_token_values = [
+        record.output_tokens for record in token_usage_records if record.output_tokens is not None
+    ]
+    total_token_values = [
+        record.total_tokens for record in token_usage_records if record.total_tokens is not None
+    ]
+    token_cost_values = [
+        record.token_cost for record in token_cost_records if record.token_cost is not None
+    ]
+    input_tokens = sum(input_token_values) if input_token_values else None
+    output_tokens = sum(output_token_values) if output_token_values else None
+    total_tokens = sum(total_token_values) if total_token_values else None
+    token_cost = sum(token_cost_values) if token_cost_values else None
     deep_eval_duration = _safe_float(getattr(test_run, "run_duration", 0.0)) if test_run else 0.0
     deep_eval_cost = _safe_float(getattr(test_run, "evaluation_cost", 0.0)) if test_run else 0.0
     duration = deep_eval_duration or sum(record.latency_seconds for record in test_case_records)
@@ -565,10 +670,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         skipped_tests=skipped_tests,
         duration_seconds=duration,
         total_cost=cost,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        token_cost=token_cost,
+        token_usage_complete=token_usage_complete,
         metadata={
             **_git_metadata(),
             "pytest_items_recorded": total_tests,
             "deep_eval_cases_recorded": len(deep_eval_cases),
+            "token_usage_expected_cases": len(token_expected_records),
+            "token_usage_observed_cases": len(token_usage_records),
         },
         test_cases=test_case_records,
     )

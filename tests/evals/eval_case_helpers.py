@@ -118,6 +118,18 @@ def case_metadata(
                 "task_revision": capture.task_revision,
                 "replay_errors": list(capture.errors),
                 "external_call_count": len(capture.external_calls),
+                "input_tokens": capture.input_tokens,
+                "output_tokens": capture.output_tokens,
+                "total_tokens": capture.total_tokens,
+                "token_cost": capture.token_cost,
+                "token_usage_available": any(
+                    value is not None
+                    for value in (
+                        capture.input_tokens,
+                        capture.output_tokens,
+                        capture.total_tokens,
+                    )
+                ),
             }
         )
     return metadata

@@ -54,6 +54,14 @@ class ReplayCapture:
         final_files: Final contents of the adapter-owned in-memory workspace
             after the production node completes, including rollback decisions.
             Triage captures use an empty mapping because they have no workspace.
+        input_tokens: Prompt/input tokens observed from the production model,
+            or ``None`` when the provider did not return usage metadata.
+        output_tokens: Completion/output tokens observed from the production
+            model, or ``None`` when usage metadata was unavailable.
+        total_tokens: Sum of observed input and output tokens, or ``None`` when
+            usage metadata was unavailable.
+        token_cost: Provider-reported token cost in USD, when available. The
+            replay layer never guesses pricing.
     """
 
     case_id: str
@@ -67,6 +75,10 @@ class ReplayCapture:
     task_revision: int | None = None
     external_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     final_files: dict[str, str] = dataclasses.field(default_factory=dict)
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    token_cost: float | None = None
 
 
 class ScriptedReplayModel:

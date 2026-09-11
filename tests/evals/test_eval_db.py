@@ -53,6 +53,11 @@ def test_save_and_get_runs(temp_db: EvalDatabase) -> None:
         skipped_tests=0,
         duration_seconds=3.5,
         total_cost=0.005,
+        input_tokens=100,
+        output_tokens=40,
+        total_tokens=140,
+        token_cost=0.00021,
+        token_usage_complete=True,
         metadata={"git_branch": "feat/add-eval-ui"},
         test_cases=[
             EvalTestCaseRecord(
@@ -66,6 +71,11 @@ def test_save_and_get_runs(temp_db: EvalDatabase) -> None:
                 context_text="Ground truth context document",
                 latency_seconds=1.75,
                 cost=0.0025,
+                input_tokens=60,
+                output_tokens=20,
+                total_tokens=80,
+                token_cost=0.00012,
+                token_usage_available=True,
                 metrics=[
                     MetricRecord(
                         metric_name="Finding Coverage & Accuracy",
@@ -111,6 +121,18 @@ def test_save_and_get_runs(temp_db: EvalDatabase) -> None:
     assert runs[0]["total_tests"] == 2
     assert runs[0]["passed_tests"] == 2
     assert runs[0]["metadata"]["git_branch"] == "feat/add-eval-ui"
+    assert runs[0]["input_tokens"] == 100
+    assert runs[0]["output_tokens"] == 40
+    assert runs[0]["total_tokens"] == 140
+    assert runs[0]["token_cost"] == pytest.approx(0.00021)
+    assert runs[0]["token_usage_complete"] is True
+
+    persisted_cases = temp_db.get_test_cases(run_id="run_001")
+    assert persisted_cases[0]["input_tokens"] == 60
+    assert persisted_cases[0]["output_tokens"] == 20
+    assert persisted_cases[0]["total_tokens"] == 80
+    assert persisted_cases[0]["token_cost"] == pytest.approx(0.00012)
+    assert persisted_cases[0]["token_usage_available"] is True
 
     single_run = temp_db.get_run("run_001")
     assert single_run is not None
@@ -328,7 +350,7 @@ def test_tagged_runs_resolve_by_id_tag_and_latest(temp_db: EvalDatabase) -> None
 
 
 def test_legacy_database_migrates_tag_column(tmp_path: Path) -> None:
-    """Add the tag column to an older database without losing persisted runs."""
+    """Add token columns to older tables without losing persisted records."""
     db_file = tmp_path / "legacy_evals.db"
     with sqlite3.connect(db_file) as conn:
         conn.execute(
@@ -358,15 +380,66 @@ def test_legacy_database_migrates_tag_column(tmp_path: Path) -> None:
             """,
             ("legacy", "2026-08-25T12:00:00", "suite", "test-model", 1, 1),
         )
+        conn.execute(
+            """
+            CREATE TABLE eval_test_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                case_id TEXT,
+                test_name TEXT NOT NULL,
+                suite TEXT NOT NULL DEFAULT 'general',
+                status TEXT NOT NULL DEFAULT 'PASSED',
+                input_text TEXT DEFAULT '',
+                actual_output TEXT DEFAULT '',
+                expected_output TEXT,
+                context_text TEXT,
+                retrieval_context TEXT,
+                latency_seconds REAL DEFAULT 0.0,
+                cost REAL DEFAULT 0.0,
+                error_message TEXT,
+                additional_metadata_json TEXT DEFAULT '{}',
+                FOREIGN KEY (run_id) REFERENCES eval_runs(run_id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO eval_test_cases (run_id, case_id, test_name)
+            VALUES (?, ?, ?)
+            """,
+            ("legacy", "legacy-case", "test_legacy"),
+        )
 
     database = EvalDatabase(db_path=db_file)
     with database._get_connection() as conn:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(eval_runs)").fetchall()}
-    assert "tag" in columns
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(eval_runs)")}
+        test_case_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(eval_test_cases)")
+        }
+    assert "tag" in run_columns
+    assert {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "token_cost",
+        "token_usage_complete",
+    }.issubset(run_columns)
+    assert {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "token_cost",
+        "token_usage_available",
+    }.issubset(test_case_columns)
     migrated = database.get_run("legacy")
     assert migrated is not None
     assert migrated["tag"] is None
     assert migrated["passed_tests"] == 1
+    assert migrated["total_tokens"] is None
+    assert migrated["token_usage_complete"] is False
+    migrated_case = database.get_test_cases(run_id="legacy")[0]
+    assert migrated_case["total_tokens"] is None
+    assert migrated_case["token_usage_available"] is False
 
 
 def test_delete_run_cascades(temp_db: EvalDatabase) -> None:

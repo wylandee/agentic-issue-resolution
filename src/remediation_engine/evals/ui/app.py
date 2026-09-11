@@ -189,8 +189,20 @@ with tab_explorer:
     else:
         run_data = db.get_run(selected_run_id)
         if run_data:
+            token_total = run_data.get("total_tokens")
+            token_status = (
+                "complete"
+                if run_data.get("token_usage_complete")
+                else "unavailable"
+                if token_total is None
+                else "partial"
+            )
+            token_count_label = f"{token_total:,}" if token_total is not None else "Unavailable"
+            token_cost = run_data.get("token_cost")
+            token_cost_label = f"${token_cost:.6f}" if token_cost is not None else "Unavailable"
+
             # Top KPI Metric Row
-            kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+            kpi1, kpi2, kpi3, kpi4, kpi5, kpi6, kpi7 = st.columns(7)
             kpi1.metric("Total Test Cases", run_data["total_tests"])
             kpi2.metric(
                 "Pass Rate",
@@ -199,8 +211,10 @@ with tab_explorer:
                 f"{run_data['skipped_tests']} skipped",
             )
             kpi3.metric("Duration", f"{run_data['duration_seconds']:.2f}s")
-            kpi4.metric("Total Cost", f"${run_data['total_cost']:.4f}")
-            kpi5.metric("Judge Model", run_data["judge_model"])
+            kpi4.metric("Evaluation Cost", f"${run_data['total_cost']:.4f}")
+            kpi5.metric("Tokens", token_count_label, token_status)
+            kpi6.metric("Token Cost", token_cost_label)
+            kpi7.metric("Judge Model", run_data["judge_model"])
 
             st.caption(
                 f"**Run ID:** `{run_data['run_id']}` | **Timestamp:** `{run_data['timestamp']}` | "
@@ -243,12 +257,25 @@ with tab_explorer:
                     with st.expander(
                         expander_title, expanded=(tc["status"] == "FAILED" and idx <= 3)
                     ):
-                        # Top metadata row
-                        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+                        case_token_total = tc.get("total_tokens")
+                        case_token_cost = tc.get("token_cost")
+                        case_token_label = (
+                            f"{case_token_total:,}"
+                            if case_token_total is not None
+                            else "Unavailable"
+                        )
+                        case_token_cost_label = (
+                            f"${case_token_cost:.6f}"
+                            if case_token_cost is not None
+                            else "Unavailable"
+                        )
+                        m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
                         m_col1.write(f"**Suite:** `{tc['suite']}`")
                         m_col2.write(f"**Status:** `{tc['status']}`")
                         m_col3.write(f"**Latency:** `{tc['latency_seconds']:.2f}s`")
-                        m_col4.write(f"**Cost:** `${tc['cost']:.4f}`")
+                        m_col4.write(f"**Eval Cost:** `${tc['cost']:.4f}`")
+                        m_col5.write(f"**Tokens:** `{case_token_label}`")
+                        m_col6.write(f"**Token Cost:** `{case_token_cost_label}`")
 
                         if tc.get("error_message"):
                             message = html.escape(str(tc["error_message"]))
@@ -407,7 +434,23 @@ with tab_compare:
             st.error(comparison["error"])
         else:
             # Comparison KPI cards
-            c1, c2, c3, c4 = st.columns(4)
+            baseline_run = comparison["run_a"]
+            candidate_run = comparison["run_b"]
+            baseline_tokens = baseline_run.get("total_tokens")
+            candidate_tokens = candidate_run.get("total_tokens")
+            token_comparison = (
+                f"{baseline_tokens:,} → {candidate_tokens:,}"
+                if baseline_tokens is not None and candidate_tokens is not None
+                else "Unavailable"
+            )
+            baseline_token_cost = baseline_run.get("token_cost")
+            candidate_token_cost = candidate_run.get("token_cost")
+            token_cost_comparison = (
+                f"${baseline_token_cost:.6f} → ${candidate_token_cost:.6f}"
+                if baseline_token_cost is not None and candidate_token_cost is not None
+                else "Unavailable"
+            )
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Baseline Pass Rate", f"{comparison['run_a']['pass_rate']}%")
             c2.metric(
                 "Candidate Pass Rate",
@@ -426,6 +469,8 @@ with tab_compare:
                 delta=comparison["total_fixes"],
                 delta_color="normal",
             )
+            c5.metric("Tokens (A → B)", token_comparison)
+            c6.metric("Token Cost (A → B)", token_cost_comparison)
 
             # Regressions table
             if comparison["regressions"]:

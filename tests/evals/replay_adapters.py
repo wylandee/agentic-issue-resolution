@@ -37,6 +37,10 @@ from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    use_trajectory_recorder,
+)
 from remediation_engine.settings import AppSettings
 from tests.evals.replay_harness import (
     ReplayCapture,
@@ -59,6 +63,25 @@ def _replay_input(case: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(replay, Mapping) and isinstance(replay.get("input"), Mapping):
         return dict(replay["input"])
     return {}
+
+
+def _recorder_token_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
+    """Return token usage fields captured by a production replay recorder."""
+    fields: dict[str, Any] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "token_cost": recorder.token_cost,
+    }
+    if recorder.token_data_available:
+        fields.update(
+            {
+                "input_tokens": recorder.total_prompt_tokens,
+                "output_tokens": recorder.total_completion_tokens,
+                "total_tokens": recorder.total_tokens,
+            }
+        )
+    return fields
 
 
 def _workaround_context_for_case(case: Mapping[str, Any]) -> WorkaroundContext | None:
@@ -436,7 +459,9 @@ def replay_triage_case(
         openai_api_key=getattr(eval_settings, "openai_api_key", "") or settings.openai_api_key,
         triage_llm_enabled=True,
     )
+    recorder = TrajectoryRecorder()
     with ExitStack() as stack:
+        stack.enter_context(use_trajectory_recorder(recorder))
         if llm is not None:
             stack.enter_context(
                 patch(
@@ -463,6 +488,7 @@ def replay_triage_case(
         typed_result=result,
         errors=[],
         final_files={},
+        **_recorder_token_fields(recorder),
     )
 
 
@@ -674,6 +700,7 @@ def replay_qa_case(
     }
     loop_results: list[Any] = []
     final_files: dict[str, str] = {}
+    recorder = TrajectoryRecorder()
     baseline_files = dict(files)
     cid = str(case.get("case_id", ""))
     if "lib/insecurity.ts" in baseline_files and "fail_semantic" not in cid:
@@ -690,8 +717,8 @@ def replay_qa_case(
     with tempfile.TemporaryDirectory(prefix="eval-qa-", dir=workspace_temp_root()) as temp_dir:
         repo_root = Path(temp_dir)
         make_temp_repo(repo_root, baseline_files)
-        state["repo_root"] = str(repo_root)
         with ExitStack() as stack:
+            stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))
             if llm is not None:
                 stack.enter_context(
@@ -735,6 +762,7 @@ def replay_qa_case(
             {"kind": "sandbox_command", "command": command} for command in sandbox.commands
         ],
         final_files=final_files,
+        **_recorder_token_fields(recorder),
     )
 
 
@@ -850,6 +878,7 @@ def replay_update_case(
     sandbox = ReplaySandbox(files, command_responses=_update_command_routes(case))
     loop_results: list[Any] = []
     final_files: dict[str, str] = {}
+    recorder = TrajectoryRecorder()
     with tempfile.TemporaryDirectory(prefix="eval-update-", dir=workspace_temp_root()) as temp_dir:
         repo_root = Path(temp_dir)
         make_temp_repo(repo_root, files)
@@ -866,6 +895,7 @@ def replay_update_case(
             messages=_prior_messages_from_case(case) if llm is None else [],
         )
         with ExitStack() as stack:
+            stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(update, "DockerSandbox", return_value=sandbox))
             if llm is not None:
                 stack.enter_context(
@@ -943,6 +973,7 @@ def replay_update_case(
             {"kind": "sandbox_command", "command": command} for command in sandbox.commands
         ],
         final_files=final_files,
+        **_recorder_token_fields(recorder),
     )
 
 
@@ -1030,6 +1061,7 @@ def replay_workaround_case(
     current_replay_plan = _replay_plan_for_case(case, task)
     loop_results: list[Any] = []
     final_files: dict[str, str] = {}
+    recorder = TrajectoryRecorder()
     with tempfile.TemporaryDirectory(
         prefix="eval-workaround-", dir=workspace_temp_root()
     ) as temp_dir:
@@ -1046,6 +1078,7 @@ def replay_workaround_case(
             current_replay_plan=current_replay_plan,
         )
         with ExitStack() as stack:
+            stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(workaround, "DockerSandbox", return_value=sandbox))
             if llm is not None:
                 stack.enter_context(
@@ -1094,4 +1127,5 @@ def replay_workaround_case(
         external_calls=http_calls
         + [{"kind": "sandbox_command", "command": command} for command in sandbox.commands],
         final_files=final_files,
+        **_recorder_token_fields(recorder),
     )

@@ -179,6 +179,7 @@ def build_qa_test_case(
         ),
         tools_called=tools_called,
         expected_tools=expected or None,
+        token_cost=capture.token_cost if capture is not None else None,
         additional_metadata=metadata,
     )
 

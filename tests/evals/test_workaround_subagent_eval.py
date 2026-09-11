@@ -108,6 +108,7 @@ def build_workaround_test_case(
         ),
         tools_called=_make_tool_calls(tool_trace),
         expected_tools=expected_tools(case, component="workaround"),
+        token_cost=capture.token_cost if capture is not None else None,
         additional_metadata=metadata,
     )
 

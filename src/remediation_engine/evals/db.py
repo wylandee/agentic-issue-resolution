@@ -65,6 +65,11 @@ class EvalDatabase:
                     skipped_tests INTEGER NOT NULL DEFAULT 0,
                     duration_seconds REAL NOT NULL DEFAULT 0.0,
                     total_cost REAL NOT NULL DEFAULT 0.0,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    token_cost REAL,
+                    token_usage_complete INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT DEFAULT '{}'
                 );
 
@@ -82,6 +87,11 @@ class EvalDatabase:
                     retrieval_context TEXT,
                     latency_seconds REAL DEFAULT 0.0,
                     cost REAL DEFAULT 0.0,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    token_cost REAL,
+                    token_usage_available INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT,
                     additional_metadata_json TEXT DEFAULT '{}',
                     FOREIGN KEY (run_id) REFERENCES eval_runs(run_id) ON DELETE CASCADE
@@ -109,11 +119,36 @@ class EvalDatabase:
                 CREATE INDEX IF NOT EXISTS idx_metrics_run_metric ON eval_metrics(run_id, metric_name);
                 """
             )
-            columns = {
+            run_columns = {
                 str(row["name"]) for row in conn.execute("PRAGMA table_info(eval_runs)").fetchall()
             }
-            if "tag" not in columns:
-                conn.execute("ALTER TABLE eval_runs ADD COLUMN tag TEXT")
+            run_additions = {
+                "tag": "TEXT",
+                "input_tokens": "INTEGER",
+                "output_tokens": "INTEGER",
+                "total_tokens": "INTEGER",
+                "token_cost": "REAL",
+                "token_usage_complete": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in run_additions.items():
+                if column not in run_columns:
+                    conn.execute(f"ALTER TABLE eval_runs ADD COLUMN {column} {definition}")
+
+            test_case_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(eval_test_cases)").fetchall()
+            }
+            test_case_additions = {
+                "input_tokens": "INTEGER",
+                "output_tokens": "INTEGER",
+                "total_tokens": "INTEGER",
+                "token_cost": "REAL",
+                "token_usage_available": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in test_case_additions.items():
+                if column not in test_case_columns:
+                    conn.execute(f"ALTER TABLE eval_test_cases ADD COLUMN {column} {definition}")
+
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_tag_timestamp "
                 "ON eval_runs(tag, timestamp DESC)"
@@ -137,8 +172,9 @@ class EvalDatabase:
                 INSERT INTO eval_runs (
                     run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
-                    duration_seconds, total_cost, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_seconds, total_cost, input_tokens, output_tokens,
+                    total_tokens, token_cost, token_usage_complete, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     timestamp=excluded.timestamp,
                     tag=excluded.tag,
@@ -151,6 +187,11 @@ class EvalDatabase:
                     skipped_tests=excluded.skipped_tests,
                     duration_seconds=excluded.duration_seconds,
                     total_cost=excluded.total_cost,
+                    input_tokens=excluded.input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    total_tokens=excluded.total_tokens,
+                    token_cost=excluded.token_cost,
+                    token_usage_complete=excluded.token_usage_complete,
                     metadata_json=excluded.metadata_json;
                 """,
                 (
@@ -166,6 +207,11 @@ class EvalDatabase:
                     run.skipped_tests,
                     run.duration_seconds,
                     run.total_cost,
+                    run.input_tokens,
+                    run.output_tokens,
+                    run.total_tokens,
+                    run.token_cost,
+                    int(run.token_usage_complete),
                     json.dumps(run.metadata),
                 ),
             )
@@ -179,9 +225,10 @@ class EvalDatabase:
                     INSERT INTO eval_test_cases (
                         run_id, case_id, test_name, suite, status,
                         input_text, actual_output, expected_output, context_text,
-                        retrieval_context, latency_seconds, cost, error_message,
-                        additional_metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        retrieval_context, latency_seconds, cost, input_tokens,
+                        output_tokens, total_tokens, token_cost, token_usage_available,
+                        error_message, additional_metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run.run_id,
@@ -196,6 +243,11 @@ class EvalDatabase:
                         tc.retrieval_context,
                         tc.latency_seconds,
                         tc.cost,
+                        tc.input_tokens,
+                        tc.output_tokens,
+                        tc.total_tokens,
+                        tc.token_cost,
+                        int(tc.token_usage_available),
                         tc.error_message,
                         json.dumps(tc.additional_metadata),
                     ),
@@ -241,7 +293,8 @@ class EvalDatabase:
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
-                    duration_seconds, total_cost, metadata_json
+                    duration_seconds, total_cost, input_tokens, output_tokens,
+                    total_tokens, token_cost, token_usage_complete, metadata_json
                 FROM eval_runs
                 ORDER BY timestamp DESC, id DESC
             """
@@ -261,6 +314,7 @@ class EvalDatabase:
         """Convert a database row into the public run dictionary shape."""
         run = dict(row)
         run["is_live"] = bool(run["is_live"])
+        run["token_usage_complete"] = bool(run["token_usage_complete"])
         run["metadata"] = json.loads(run.pop("metadata_json") or "{}")
         total = run["total_tests"]
         run["pass_rate"] = round((run["passed_tests"] / total * 100), 1) if total > 0 else 0.0
@@ -275,7 +329,8 @@ class EvalDatabase:
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
-                    duration_seconds, total_cost, metadata_json
+                    duration_seconds, total_cost, input_tokens, output_tokens,
+                    total_tokens, token_cost, token_usage_complete, metadata_json
                 FROM eval_runs
                 WHERE run_id = ?
                 """,
@@ -310,7 +365,8 @@ class EvalDatabase:
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
-                    duration_seconds, total_cost, metadata_json
+                    duration_seconds, total_cost, input_tokens, output_tokens,
+                    total_tokens, token_cost, token_usage_complete, metadata_json
                 FROM eval_runs
                 WHERE tag = ?
             """
@@ -336,7 +392,8 @@ class EvalDatabase:
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
                     total_tests, passed_tests, failed_tests, skipped_tests,
-                    duration_seconds, total_cost, metadata_json
+                    duration_seconds, total_cost, input_tokens, output_tokens,
+                    total_tokens, token_cost, token_usage_complete, metadata_json
                 FROM eval_runs
             """
             params: list[Any] = []
@@ -389,7 +446,9 @@ class EvalDatabase:
                 SELECT
                     tc.id, tc.run_id, tc.case_id, tc.test_name, tc.suite, tc.status,
                     tc.input_text, tc.actual_output, tc.expected_output, tc.context_text,
-                    tc.retrieval_context, tc.latency_seconds, tc.cost, tc.error_message,
+                    tc.retrieval_context, tc.latency_seconds, tc.cost, tc.input_tokens,
+                    tc.output_tokens, tc.total_tokens, tc.token_cost,
+                    tc.token_usage_available, tc.error_message,
                     tc.additional_metadata_json, r.timestamp, r.judge_model
                 FROM eval_test_cases tc
                 JOIN eval_runs r ON tc.run_id = r.run_id
@@ -422,9 +481,9 @@ class EvalDatabase:
 
             tc_rows = cursor.execute(query, params).fetchall()
             test_cases: list[dict[str, Any]] = []
-
             for row in tc_rows:
                 tc = dict(row)
+                tc["token_usage_available"] = bool(tc["token_usage_available"])
                 tc["additional_metadata"] = json.loads(tc.pop("additional_metadata_json") or "{}")
 
                 # Fetch associated metrics

@@ -8,8 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.evals.models import EvalTestCaseRecord
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.runtime.path_policy import WorkspacePathError
+from tests.evals.conftest import _deduplicate_token_records
+from tests.evals.eval_case_helpers import case_metadata
 from tests.evals.replay_harness import (
     ReplayCapture,
     ReplaySandbox,
@@ -110,6 +113,71 @@ def test_cache_reuses_one_capture() -> None:
     second = cached_replay(cache, "test", "case", factory)
     assert first is second
     assert calls == 1
+
+
+def test_replay_capture_token_usage_is_added_to_case_metadata() -> None:
+    """Persist provider token usage alongside a live replay observation."""
+    capture = ReplayCapture(
+        case_id="case",
+        component="workaround_subagent",
+        input_tokens=100,
+        output_tokens=25,
+        total_tokens=125,
+        token_cost=0.0003,
+    )
+
+    metadata = case_metadata(
+        {"case_id": "case"},
+        component="workaround_subagent",
+        replay_source="production_live",
+        actual_tools=[],
+        capture=capture,
+    )
+
+    assert metadata["input_tokens"] == 100
+    assert metadata["output_tokens"] == 25
+    assert metadata["total_tokens"] == 125
+    assert metadata["token_cost"] == 0.0003
+    assert metadata["token_usage_available"] is True
+
+
+def test_duplicate_metric_records_count_one_replay_once() -> None:
+    """Deduplicate identical metric records without merging distinct replays."""
+    metadata = {
+        "case_id": "case-1",
+        "component": "workaround_subagent",
+        "replay_source": "production_live",
+    }
+    first = EvalTestCaseRecord(
+        case_id="case-1",
+        test_name="tool-correctness",
+        input_tokens=100,
+        output_tokens=25,
+        total_tokens=125,
+        token_cost=0.0002,
+        token_usage_available=True,
+        additional_metadata=metadata,
+    )
+    duplicate = first.model_copy(update={"test_name": "task-completion"})
+    distinct = EvalTestCaseRecord(
+        case_id="case-1",
+        test_name="separate-replay",
+        input_tokens=110,
+        output_tokens=30,
+        total_tokens=140,
+        token_cost=0.0003,
+        token_usage_available=True,
+        additional_metadata=metadata,
+    )
+
+    deduplicated = _deduplicate_token_records([first, duplicate, distinct])
+
+    assert [record.test_name for record in deduplicated] == [
+        "tool-correctness",
+        "separate-replay",
+    ]
+    assert sum(record.total_tokens or 0 for record in deduplicated) == 265
+    assert sum(record.token_cost or 0.0 for record in deduplicated) == pytest.approx(0.0005)
 
 
 def test_scripted_model_consumes_bound_tool_trace_and_final_response() -> None:

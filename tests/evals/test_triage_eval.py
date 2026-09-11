@@ -125,6 +125,7 @@ def build_triage_test_case(
         expected_output=str(case["expected_output"]),
         context=context,
         tools_called=[],
+        token_cost=capture.token_cost if capture is not None else None,
         additional_metadata=metadata,
     )
 

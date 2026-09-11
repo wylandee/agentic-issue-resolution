@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage
+
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
     _render_markdown,
@@ -162,6 +164,32 @@ def test_local_recorder_captures_llm_and_tool_fallback_events():
     assert [span["name"] for span in spans] == ["test.llm", "test.tool"]
     assert spans[0]["run_type"] == "llm"
     assert spans[1]["run_type"] == "tool"
+
+
+def test_local_recorder_extracts_message_token_usage_and_provider_cost():
+    recorder = TrajectoryRecorder()
+    response = AIMessage(
+        content="done",
+        response_metadata={
+            "token_usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+            },
+            "token_cost_usd": 0.00042,
+        },
+    )
+
+    with use_trajectory_recorder(recorder):
+        assert (
+            invoke_with_trajectory("test.llm", lambda: response, {"messages": ["prompt"]})
+            is response
+        )
+
+    assert recorder.token_data_available is True
+    assert recorder.total_prompt_tokens == 120
+    assert recorder.total_completion_tokens == 30
+    assert recorder.total_tokens == 150
+    assert recorder.token_cost == 0.00042
 
 
 def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():
