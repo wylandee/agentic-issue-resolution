@@ -20,6 +20,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
     WorkaroundContext,
+    WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
 from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
@@ -327,10 +328,51 @@ def test_scoped_package_removal_requires_plan_and_changes_only_authorized_manife
         {"requested_package": "notevil", "manifest_path": "package.json"}
     )
     assert "SUCCESS" in result
+    assert plan_state["phase"] == WorkaroundExecutionPhase.VALIDATE.value
     assert "notevil" not in json.loads(sandbox.files["package.json"]).get("dependencies", {})
     assert any(
         "npm install --package-lock-only --ignore-scripts" in cmd for cmd in sandbox.commands
     )
+
+
+def test_package_removal_with_source_replacements_remains_in_execute():
+    sandbox = _PackageSandbox(
+        {
+            "package.json": json.dumps({"dependencies": {"notevil": "1.0.0"}}),
+            "package-lock.json": '{"packages": {}}',
+        }
+    )
+    plan_state = {
+        "local_investigation_complete": True,
+        "web_search_performed": True,
+        "inspected_files": {"routes/order.ts"},
+    }
+    tools = _package_tool_map(sandbox, plan_state)
+    tools["record_plan"].invoke(
+        {
+            "affected_files": ["package.json", "routes/order.ts"],
+            "affected_symbols": ["notevil"],
+            "security_invariant": "the vulnerable dependency is absent",
+            "causal_hypothesis": "the direct dependency is unused",
+            "planned_replacements": [
+                {
+                    "file_path": "routes/order.ts",
+                    "old_text": "require('notevil')",
+                    "new_text": "require('safe-lib')",
+                    "expected_occurrences": 1,
+                }
+            ],
+            "evidence_source": "workspace:routes/order.ts",
+            "package_removal_requested": True,
+        }
+    )
+
+    result = tools["remove_no_fix_dependency"].invoke(
+        {"requested_package": "notevil", "manifest_path": "package.json"}
+    )
+
+    assert "SUCCESS" in result
+    assert plan_state["phase"] == WorkaroundExecutionPhase.EXECUTE.value
 
 
 def test_scoped_package_removal_rolls_back_manifest_and_lockfile_on_sync_failure():

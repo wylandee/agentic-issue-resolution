@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.remedy_tools import (
     _detect_newline_style,
     _is_allowlisted_no_fix_package_file,
@@ -1556,12 +1557,14 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     )
                 ),
             )
+            context_manager = ContextManager(toolbelt)
             runtime = run_bounded_subagent_loop(
                 llm,
                 toolbelt,
                 initial_messages,
                 touched_files,
                 execution_state=plan_state,
+                context_manager=context_manager,
             )
 
             # Revert any illegally modified manifest files or test files

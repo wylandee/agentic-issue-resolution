@@ -610,14 +610,60 @@ class TestUpdateSubagentWrapper:
             previous_feedback="Fix the broken regex from the previous attempt.",
         )
 
+        replacement = {
+            "file_path": "routes/login.ts",
+            "old_text": "unsafeRender(input)",
+            "new_text": "safeRender(input)",
+            "expected_occurrences": 1,
+        }
         llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="map",
+                tool_calls=[
+                    {
+                        "name": "read_repository_map",
+                        "args": {},
+                        "id": "call-0",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="read",
+                tool_calls=[
+                    {
+                        "name": "read_workspace_file",
+                        "args": {"file_path": "routes/login.ts"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
             AIMessage(
                 content="searching",
                 tool_calls=[
                     {
                         "name": "search_codebase_pattern",
                         "args": {"search_pattern": "unsafeRender"},
-                        "id": "call-0",
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="planning",
+                tool_calls=[
+                    {
+                        "name": "record_plan",
+                        "args": {
+                            "affected_files": ["routes/login.ts"],
+                            "affected_symbols": ["login"],
+                            "security_invariant": "User-controlled HTML is escaped.",
+                            "causal_hypothesis": "The unsafe renderer receives raw login input.",
+                            "planned_replacements": [replacement],
+                            "evidence_source": "workspace:routes/login.ts",
+                        },
+                        "id": "call-3",
                         "type": "tool_call",
                     }
                 ],
@@ -626,13 +672,9 @@ class TestUpdateSubagentWrapper:
                 content="editing",
                 tool_calls=[
                     {
-                        "name": "deterministic_search_replace",
-                        "args": {
-                            "file_path": "routes/login.ts",
-                            "old_text": "unsafeRender(input)",
-                            "new_text": "safeRender(input)",
-                        },
-                        "id": "call-1",
+                        "name": "deterministic_apply_edit_set",
+                        "args": {"replacements": [replacement]},
+                        "id": "call-4",
                         "type": "tool_call",
                     }
                 ],
@@ -646,7 +688,7 @@ class TestUpdateSubagentWrapper:
                             "modified_files": ["routes/login.ts"],
                             "runtime_smoke_file": "routes/login.ts",
                         },
-                        "id": "call-2",
+                        "id": "call-5",
                         "type": "tool_call",
                     }
                 ],
@@ -654,18 +696,89 @@ class TestUpdateSubagentWrapper:
             AIMessage(content="done"),
         )
         sandbox = _sandbox_mock()
-        tool_search = MagicMock()
-        tool_search.name = "search_codebase_pattern"
-        tool_search.invoke.return_value = "routes/login.ts:10: unsafeRender(input)"
-        tool_edit = MagicMock()
-        tool_edit.name = "deterministic_search_replace"
-        tool_edit.invoke.return_value = "SUCCESS: File modified: routes/login.ts"
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_workaround"
-        tool_validate.invoke.return_value = (
-            "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
-            'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}'
-        )
+        plan_state_ref: dict[str, dict] = {}
+
+        def _state() -> dict:
+            return plan_state_ref["state"]
+
+        def _tool(name: str, result: str, mutate=None) -> MagicMock:
+            tool = MagicMock()
+            tool.name = name
+
+            def invoke(args):
+                if mutate is not None:
+                    mutate(args)
+                return result
+
+            tool.invoke.side_effect = invoke
+            return tool
+
+        def _mark_investigated(_args):
+            _state()["local_investigation_complete"] = True
+            _state().setdefault("read_files", set()).add("routes/login.ts")
+
+        def _record(_args):
+            _state().update(
+                {
+                    "recorded": True,
+                    "phase": "EXECUTE",
+                    "planned_replacements": [replacement],
+                    "plan_revision": 1,
+                }
+            )
+
+        def _edit(_args):
+            _state().update(
+                {
+                    "phase": "VALIDATE",
+                    "successful_edit_count_this_iteration": 1,
+                }
+            )
+
+        def _validate(_args):
+            _state().update(
+                {
+                    "phase": "VALIDATE",
+                    "validated_files": ["routes/login.ts"],
+                    "validation_passed": True,
+                    "last_validation_result": {
+                        "overall_status": "PASS",
+                        "validated_files": ["routes/login.ts"],
+                    },
+                }
+            )
+            return (
+                "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
+                'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}'
+            )
+
+        tool_map = [
+            _tool("record_plan", "SUCCESS: Plan recorded.", _record),
+            _tool("read_repository_map", "SUCCESS: Repository map read."),
+            _tool("read_workspace_file", "SUCCESS: routes/login.ts", _mark_investigated),
+            _tool(
+                "search_codebase_pattern",
+                "routes/login.ts:10: unsafeRender(input)",
+                _mark_investigated,
+            ),
+            _tool(
+                "deterministic_apply_edit_set",
+                'SUCCESS: Atomic edit set applied.\nJSON: {"affected_files":["routes/login.ts"]}',
+                _edit,
+            ),
+            _tool(
+                "validate_workaround",
+                "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
+                'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}',
+                _validate,
+            ),
+        ]
+
+        def _build_toolbelt(*_args, **_kwargs):
+            plan_state_ref["state"] = _kwargs["plan_state"]
+            return tool_map
+
+        from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 
         with (
             patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "false"}),
@@ -678,12 +791,17 @@ class TestUpdateSubagentWrapper:
             ),
             patch(
                 "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
-                return_value=[tool_search, tool_edit, tool_validate],
+                side_effect=_build_toolbelt,
             ),
+            patch(
+                "remediation_engine.orchestration.workaround_subagent.run_bounded_subagent_loop",
+                wraps=run_bounded_subagent_loop,
+            ) as loop,
         ):
             result = run_workaround_subagent_node(state)
 
-        assert bound.invoke.call_count == 4
+        assert bound.invoke.call_count == 7
+        assert loop.call_args.kwargs["context_manager"] is not None
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert result["changed_files"] == ["routes/login.ts"]
         assert "messages" not in result
@@ -698,26 +816,136 @@ class TestUpdateSubagentWrapper:
             [],
         )
 
+        replacement = {
+            "file_path": "routes/login.ts",
+            "old_text": "unsafeRender(input)",
+            "new_text": "safeRender(input)",
+            "expected_occurrences": 1,
+        }
         llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="map",
+                tool_calls=[
+                    {
+                        "name": "read_repository_map",
+                        "args": {},
+                        "id": "call-0",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="read",
+                tool_calls=[
+                    {
+                        "name": "read_workspace_file",
+                        "args": {"file_path": "routes/login.ts"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="search",
+                tool_calls=[
+                    {
+                        "name": "search_codebase_pattern",
+                        "args": {"search_pattern": "unsafeRender"},
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="plan",
+                tool_calls=[
+                    {
+                        "name": "record_plan",
+                        "args": {
+                            "affected_files": ["routes/login.ts"],
+                            "affected_symbols": ["login"],
+                            "security_invariant": "User-controlled HTML is escaped.",
+                            "causal_hypothesis": "The unsafe renderer receives raw login input.",
+                            "planned_replacements": [replacement],
+                            "evidence_source": "workspace:routes/login.ts",
+                        },
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="edit",
+                tool_calls=[
+                    {
+                        "name": "deterministic_apply_edit_set",
+                        "args": {"replacements": [replacement]},
+                        "id": "call-4",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
             AIMessage(
                 content="validating",
                 tool_calls=[
                     {
                         "name": "validate_workaround",
                         "args": {"modified_files": ["routes/login.ts"]},
-                        "id": "call-1",
+                        "id": "call-5",
                         "type": "tool_call",
                     }
                 ],
-            )
+            ),
         )
         sandbox = _sandbox_mock()
-        tool_validate = MagicMock()
-        tool_validate.name = "validate_workaround"
-        tool_validate.invoke.return_value = (
-            "FAILURE: Workaround validation gate 'runtime_smoke' failed. Sandbox is not running, "
-            "so validation cannot continue."
-        )
+        plan_state_ref: dict[str, dict] = {}
+
+        def _state() -> dict:
+            return plan_state_ref["state"]
+
+        def _tool(name: str, result: str, mutate=None) -> MagicMock:
+            tool = MagicMock()
+            tool.name = name
+
+            def invoke(args):
+                if mutate is not None:
+                    mutate(args)
+                return result
+
+            tool.invoke.side_effect = invoke
+            return tool
+
+        def _investigate(_args):
+            _state()["local_investigation_complete"] = True
+            _state().setdefault("read_files", set()).add("routes/login.ts")
+
+        def _record(_args):
+            _state().update(
+                {
+                    "recorded": True,
+                    "phase": "EXECUTE",
+                    "planned_replacements": [replacement],
+                }
+            )
+
+        def _edit(_args):
+            _state()["phase"] = "VALIDATE"
+
+        tools = [
+            _tool("read_repository_map", "SUCCESS: Repository map read."),
+            _tool("read_workspace_file", "SUCCESS: routes/login.ts", _investigate),
+            _tool("search_codebase_pattern", "routes/login.ts:10: unsafeRender", _investigate),
+            _tool("record_plan", "SUCCESS: Plan recorded.", _record),
+            _tool("deterministic_apply_edit_set", "SUCCESS: Edit applied.", _edit),
+            _tool(
+                "validate_workaround",
+                "BLOCKED: Sandbox is not running, so validation cannot continue.",
+            ),
+        ]
+
+        def _build_toolbelt(*_args, **_kwargs):
+            plan_state_ref["state"] = _kwargs["plan_state"]
+            return tools
 
         with (
             patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "false"}),
@@ -730,12 +958,12 @@ class TestUpdateSubagentWrapper:
             ),
             patch(
                 "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
-                return_value=[tool_validate],
+                side_effect=_build_toolbelt,
             ),
         ):
             result = run_workaround_subagent_node(state)
 
-        assert bound.invoke.call_count == 1
+        assert bound.invoke.call_count == 6
         assert result["action_summary"].status == AgentActionStatus.SURRENDER
         assert any("Sandbox is not running," in err for err in result["errors"])
 

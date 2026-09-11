@@ -30,8 +30,13 @@ followed immediately by `npm install --package-lock-only --ignore-scripts`;
 failures restore the internal package checkpoint. The worker may choose only a
 target version and dependency type committed in the immutable attempt snapshot.
 After an error-coded transaction, the bounded runtime requests a changed
-approved candidate, up to three calls per package. Workaround workers retain
-their investigation, repository-map, and internal recovery tools.
+approved candidate, up to three calls per package. Workaround workers use
+phase-filtered model tools: local repository inspection and deterministic
+web-evidence gates lead to a committed plan, followed by atomic execution and
+validation. Each bounded workaround node keeps an ephemeral, deterministic
+scratchpad for concise findings and validation outcomes; it never contains
+complete file bodies or credentials. Task and attempt snapshots plus replay
+plans remain authoritative across retries, not the scratchpad or conversation.
 
 The host repository is never edited by the public API or CLI. Results contain a
 unified diff and changed-file list so a caller can review and apply the patch

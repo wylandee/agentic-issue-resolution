@@ -13,6 +13,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, ToolMessage
 from pydantic import BaseModel, ValidationError
 
+from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.trajectory_exporter import (
     invoke_with_trajectory,
 )
@@ -393,6 +394,7 @@ def run_bounded_subagent_loop(
     execution_state: dict[str, Any] | None = None,
     structured_output_model: type[BaseModel] | None = None,
     structured_output_tool_name: str | None = None,
+    context_manager: ContextManager | None = None,
 ) -> SubagentRuntimeResult:
     """Run a bounded tool-calling loop for one specialized subagent.
 
@@ -407,6 +409,8 @@ def run_bounded_subagent_loop(
         structured_output_tool_name: Tool name whose arguments are validated as
             structured_output_model. Both structured arguments are required
             together and the terminal tool body is not executed.
+        context_manager: Optional phase-aware workaround context manager. When
+            absent, the supplied full tool list is bound exactly once.
 
     Returns:
         The bounded run result, including the validated terminal model when
@@ -416,18 +420,26 @@ def run_bounded_subagent_loop(
         ValueError: If structured-output configuration is incomplete or names
             a tool that is not in tools.
     """
-    tool_map = {tool.name: tool for tool in tools}
+    all_tools = tuple(tools)
+    all_tool_map = {str(getattr(tool, "name", "")): tool for tool in all_tools}
     # This is only a provider hint; the runtime barrier below remains
     # authoritative for providers that ignore it or still emit multiple calls.
     if (structured_output_model is None) != (structured_output_tool_name is None):
         raise ValueError(
             "structured_output_model and structured_output_tool_name must be provided together."
         )
-    if structured_output_tool_name is not None and structured_output_tool_name not in tool_map:
+    if structured_output_tool_name is not None and structured_output_tool_name not in all_tool_map:
         raise ValueError(
             f"Structured output tool {structured_output_tool_name!r} is not available."
         )
-    llm_with_tools = llm.bind_tools(list(tools), parallel_tool_calls=False)
+    if context_manager is None:
+        bound_tools = all_tools
+    else:
+        initial_phase = context_manager.phase_from_state(execution_state)
+        bound_tools = tuple(context_manager.get_tools_for_phase(initial_phase))
+    tool_map = {str(getattr(tool, "name", "")): tool for tool in bound_tools}
+    bound_tool_names = tuple(tool_map)
+    llm_with_tools = llm.bind_tools(list(bound_tools), parallel_tool_calls=False)
     conversation = list(initial_messages)
     tool_events: list[ToolEvent] = []
     final_text = ""
@@ -444,12 +456,31 @@ def run_bounded_subagent_loop(
     invalid_validation_signatures: set[str] = set()
     scope_violation_count = 0
 
-    for _ in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
+    for loop_index in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
+        round_number = loop_index + 1
+        if context_manager is not None:
+            turn_phase = context_manager.phase_from_state(execution_state)
+            phase_tools = tuple(context_manager.get_tools_for_phase(turn_phase))
+            phase_tool_names = tuple(str(getattr(tool, "name", "")) for tool in phase_tools)
+            if phase_tool_names != bound_tool_names:
+                bound_tools = phase_tools
+                tool_map = {str(getattr(tool, "name", "")): tool for tool in bound_tools}
+                bound_tool_names = phase_tool_names
+                llm_with_tools = llm.bind_tools(
+                    list(bound_tools),
+                    parallel_tool_calls=False,
+                )
+        else:
+            turn_phase = None
+        turn_tool_map = dict(tool_map)
         try:
+            invoke_messages = list(conversation)
             response = invoke_with_trajectory(
                 "react.llm",
-                lambda: llm_with_tools.invoke(list(conversation)),
-                list(conversation),
+                lambda bound_llm=llm_with_tools, messages=invoke_messages: bound_llm.invoke(
+                    messages
+                ),
+                invoke_messages,
                 run_type="llm",
             )
         except Exception as exc:  # noqa: BLE001
@@ -551,108 +582,138 @@ def run_bounded_subagent_loop(
             if not isinstance(tool_call_id, str) or not tool_call_id.strip():
                 malformed_tool_call = True
                 tool_call_id = "invalid-tool-call-id"
-            if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
-                # Set the barrier before handling suppressed or synthetic
-                # failures as well. Every manifest call in an assistant turn
-                # must be deferred after the first one, regardless of whether
-                # the first call reached the underlying tool.
-                if manifest_call_seen:
-                    deferred_manifest_calls.append(tool_name)
-                    tool_message = ToolMessage(
-                        content=(
-                            "DEFERRED: manifest tools are serialized. This call was not "
-                            "executed; continue it in the next assistant turn after the "
-                            "current package operation has been observed."
-                        ),
-                        tool_call_id=tool_call_id,
-                        name=tool_name,
+            phase_violation = (
+                context_manager is not None
+                and tool_name in all_tool_map
+                and tool_name not in turn_tool_map
+            )
+            if phase_violation:
+                phase_name = getattr(turn_phase, "value", str(turn_phase or "INVESTIGATE"))
+                if phase_name == "VALIDATE" and tool_name in {
+                    "record_plan",
+                    "search_web",
+                    "read_web_page",
+                }:
+                    violation_content = (
+                        "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
+                        "Call validate_workaround before planning or web research."
                     )
-                    conversation.append(tool_message)
-                    event = ToolEvent(
-                        name=tool_name,
-                        args=tool_call.get("args", {}) or {},
-                        content=tool_message.content,
+                else:
+                    violation_content = (
+                        f"ERROR: [PHASE_VIOLATION] Tool '{tool_name}' is not available "
+                        f"in the {phase_name} phase. Follow the phase instructions and "
+                        "use only the currently bound tools."
                     )
-                    tool_events.append(event)
-                    continue
-                manifest_call_seen = True
-            if call_signature in recovery_signatures and tool_name != "validate_workaround":
-                prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
-                # Validation retries have their own bounded gate counter; do not
-                # hide a legitimate gate attempt behind generic stagnation suppression.
                 tool_message = ToolMessage(
-                    content=(
-                        "ERROR: [REPEATED_INVALID_CALL] Repeated failed tool call suppressed. Choose a different "
-                        "tool or argument set; the exact signature has already received a "
-                        f"recovery instruction. Prior failure: {prior_failure}"
-                    ),
+                    content=violation_content,
                     tool_call_id=tool_call_id,
                     name=tool_name,
                 )
             else:
-                if tool_name == _UPDATE_MANIFEST_TOOL_NAME:
-                    # A synthetic retry-limit response is still the one
-                    # serialized manifest call for this assistant turn.
-                    package_name = str(
-                        (tool_call.get("args", {}) or {}).get("package_name", "")
-                    ).strip()
-                    state_attempts = int(
-                        (
-                            (execution_state or {}).get(
-                                "manifest_transaction_attempts_by_package", {}
-                            )
-                        ).get(package_name, 0)
+                if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
+                    # Set the barrier before handling suppressed or synthetic
+                    # failures as well. Every manifest call in an assistant turn
+                    # must be deferred after the first one, regardless of whether
+                    # the first call reached the underlying tool.
+                    if manifest_call_seen:
+                        deferred_manifest_calls.append(tool_name)
+                        tool_message = ToolMessage(
+                            content=(
+                                "DEFERRED: manifest tools are serialized. This call was not "
+                                "executed; continue it in the next assistant turn after the "
+                                "current package operation has been observed."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        )
+                        conversation.append(tool_message)
+                        event = ToolEvent(
+                            name=tool_name,
+                            args=tool_call.get("args", {}) or {},
+                            content=tool_message.content,
+                        )
+                        tool_events.append(event)
+                        if context_manager is not None:
+                            context_manager.update_scratchpad(event, turn_phase, round_number)
+                        continue
+                    manifest_call_seen = True
+                if call_signature in recovery_signatures and tool_name != "validate_workaround":
+                    prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
+                    # Validation retries have their own bounded gate counter; do not
+                    # hide a legitimate gate attempt behind generic stagnation suppression.
+                    tool_message = ToolMessage(
+                        content=(
+                            "ERROR: [REPEATED_INVALID_CALL] Repeated failed tool call suppressed. Choose a different "
+                            "tool or argument set; the exact signature has already received a "
+                            f"recovery instruction. Prior failure: {prior_failure}"
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
                     )
-                    runtime_attempts = manifest_attempts_by_package.get(package_name, 0)
-                    attempts = max(state_attempts, runtime_attempts)
-                    if (
-                        package_name in manifest_retry_exhausted_packages
-                        or attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS
-                    ):
-                        tool_message = ToolMessage(
-                            content=(
-                                "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined "
-                                f"update attempts are allowed for package {package_name or '(unknown)'}."
-                            ),
-                            tool_call_id=tool_call_id,
-                            name=tool_name,
-                        )
-                    else:
-                        tool_message = _invoke_bound_tool(tool_map, tool_call)
-                        manifest_attempts_by_package[package_name] = attempts + 1
-                        if execution_state is not None:
-                            runtime_attempts_by_package = execution_state.setdefault(
-                                "manifest_runtime_attempts_by_package", {}
-                            )
-                            runtime_attempts_by_package[package_name] = max(
-                                int(runtime_attempts_by_package.get(package_name, 0)),
-                                manifest_attempts_by_package[package_name],
-                            )
-                            execution_state["manifest_transaction_attempts"] = max(
-                                int(execution_state.get("manifest_transaction_attempts", 0)),
-                                sum(manifest_attempts_by_package.values()),
-                            )
                 else:
-                    if (
-                        execution_state is not None
-                        and execution_state.get("phase") == "VALIDATE"
-                        and tool_name
-                        in {
-                            "record_plan",
-                            "search_web",
-                            "read_web_page",
-                        }
-                    ):
-                        tool_message = ToolMessage(
-                            content=(
-                                "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
-                                "Call validate_workaround before planning or web research."
-                            ),
-                            tool_call_id=tool_call_id,
-                            name=tool_name,
+                    if tool_name == _UPDATE_MANIFEST_TOOL_NAME:
+                        # A synthetic retry-limit response is still the one
+                        # serialized manifest call for this assistant turn.
+                        package_name = str(
+                            (tool_call.get("args", {}) or {}).get("package_name", "")
+                        ).strip()
+                        state_attempts = int(
+                            (
+                                (execution_state or {}).get(
+                                    "manifest_transaction_attempts_by_package", {}
+                                )
+                            ).get(package_name, 0)
                         )
+                        runtime_attempts = manifest_attempts_by_package.get(package_name, 0)
+                        attempts = max(state_attempts, runtime_attempts)
+                        if (
+                            package_name in manifest_retry_exhausted_packages
+                            or attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS
+                        ):
+                            tool_message = ToolMessage(
+                                content=(
+                                    "ERROR_CODE: RETRY_LIMIT_REACHED: At most three combined "
+                                    f"update attempts are allowed for package {package_name or '(unknown)'}."
+                                ),
+                                tool_call_id=tool_call_id,
+                                name=tool_name,
+                            )
+                        else:
+                            tool_message = _invoke_bound_tool(turn_tool_map, tool_call)
+                            manifest_attempts_by_package[package_name] = attempts + 1
+                            if execution_state is not None:
+                                runtime_attempts_by_package = execution_state.setdefault(
+                                    "manifest_runtime_attempts_by_package", {}
+                                )
+                                runtime_attempts_by_package[package_name] = max(
+                                    int(runtime_attempts_by_package.get(package_name, 0)),
+                                    manifest_attempts_by_package[package_name],
+                                )
+                                execution_state["manifest_transaction_attempts"] = max(
+                                    int(execution_state.get("manifest_transaction_attempts", 0)),
+                                    sum(manifest_attempts_by_package.values()),
+                                )
                     else:
-                        tool_message = _invoke_bound_tool(tool_map, tool_call)
+                        if (
+                            execution_state is not None
+                            and execution_state.get("phase") == "VALIDATE"
+                            and tool_name
+                            in {
+                                "record_plan",
+                                "search_web",
+                                "read_web_page",
+                            }
+                        ):
+                            tool_message = ToolMessage(
+                                content=(
+                                    "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
+                                    "Call validate_workaround before planning or web research."
+                                ),
+                                tool_call_id=tool_call_id,
+                                name=tool_name,
+                            )
+                        else:
+                            tool_message = _invoke_bound_tool(turn_tool_map, tool_call)
             conversation.append(tool_message)
             event = ToolEvent(
                 name=tool_name,
@@ -660,6 +721,8 @@ def run_bounded_subagent_loop(
                 content=tool_message.content,
             )
             tool_events.append(event)
+            if context_manager is not None:
+                context_manager.update_scratchpad(event, turn_phase, round_number)
 
             if (
                 "[PLAN_VIOLATION]" in tool_message.content
@@ -824,7 +887,8 @@ def run_bounded_subagent_loop(
                     observed_changed_files.update(inferred_paths)
 
             if (
-                execution_state is not None
+                context_manager is None
+                and execution_state is not None
                 and event.name
                 in {
                     "deterministic_apply_edit_set",
@@ -861,6 +925,18 @@ def run_bounded_subagent_loop(
 
         for instruction in manifest_retry_instructions.values():
             conversation.append(HumanMessage(content=instruction))
+        if context_manager is not None:
+            if recovery_instruction:
+                conversation.append(HumanMessage(content=recovery_instruction))
+            if execution_state is not None:
+                final_phase = context_manager.maybe_advance_to_plan(execution_state)
+            else:
+                final_phase = turn_phase
+            if final_phase != turn_phase:
+                conversation.append(
+                    HumanMessage(content=context_manager.get_phase_prompt(final_phase))
+                )
+            conversation = context_manager.compact_conversation(conversation, round_number)
 
         if malformed_tool_call:
             errors.append(
@@ -875,7 +951,7 @@ def run_bounded_subagent_loop(
 
         if infrastructure_blocked:
             errors.extend(blocker_errors)
-            revert_tool = tool_map.get("revert_workspace_file")
+            revert_tool = all_tool_map.get("revert_workspace_file")
             for f_path in list(observed_changed_files):
                 if revert_tool and f_path not in touched_files:
                     with contextlib.suppress(Exception):
@@ -932,7 +1008,7 @@ def run_bounded_subagent_loop(
                 errors=list(dict.fromkeys(errors)),
             )
 
-        if recovery_instruction:
+        if recovery_instruction and context_manager is None:
             conversation.append(HumanMessage(content=recovery_instruction))
 
     errors.append(

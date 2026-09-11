@@ -142,6 +142,20 @@ def test_scripted_model_rejects_unbound_tools() -> None:
         model.invoke([])
 
 
+def test_scripted_model_can_opt_out_for_historical_unbound_tool_trace() -> None:
+    """Historical workaround traces may preserve an unbound call as an event."""
+    model = ScriptedReplayModel.from_tool_trace(
+        [{"name": "historical_tool", "args": {}}],
+        enforce_bound_tools=False,
+    )
+    model.bind_tools([SimpleNamespace(name="allowed_tool")])
+
+    response = model.invoke([])
+
+    assert response.tool_calls[0]["name"] == "historical_tool"
+    assert model.consumed_tool_calls[0]["name"] == "historical_tool"
+
+
 def test_scripted_structured_output_is_one_shot() -> None:
     """Structured triage responses are returned once and invocation is recorded."""
     result = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.0)

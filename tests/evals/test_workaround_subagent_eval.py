@@ -232,10 +232,17 @@ def test_workaround_subagent_offline_production_replay(
     assert isinstance(historical_tools, list)
     if case_id == "workaround-surrender-after-max-tool-round-limit":
         scripted_tools = [{"name": "read_repository_map", "args": {}} for _ in range(24)]
-        model = ScriptedReplayModel.from_tool_trace(scripted_tools)
+        model = ScriptedReplayModel.from_tool_trace(
+            scripted_tools,
+            enforce_bound_tools=False,
+        )
     else:
         scripted_tools = historical_tools
-        model = ScriptedReplayModel.from_tool_trace(scripted_tools, final_text="")
+        model = ScriptedReplayModel.from_tool_trace(
+            scripted_tools,
+            final_text="",
+            enforce_bound_tools=False,
+        )
 
     capture = replay_workaround_case(case, eval_settings, llm=model)
 

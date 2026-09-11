@@ -82,6 +82,7 @@ class ScriptedReplayModel:
         messages: Sequence[AIMessage] = (),
         *,
         structured_result: BaseModel | None = None,
+        enforce_bound_tools: bool = True,
     ) -> None:
         """Initialize a scripted model.
 
@@ -89,8 +90,13 @@ class ScriptedReplayModel:
             messages: Assistant messages returned by successive ``invoke`` calls.
             structured_result: Typed result returned by the structured-output
                 wrapper, when configured.
+            enforce_bound_tools: Whether assistant calls must be present in the
+                currently bound tool set. Strict by default; historical
+                workaround replay may opt out so production can record a
+                phase violation.
         """
         self._messages = list(messages)
+        self._enforce_bound_tools = enforce_bound_tools
         self._structured_result = structured_result
         self._next_message = 0
         self._bound_tool_names: set[str] = set()
@@ -99,7 +105,6 @@ class ScriptedReplayModel:
         self.consumed_tool_calls: list[dict[str, Any]] = []
         self.structured_invocation_count = 0
         self.structured_invocations: list[Any] = []
-        self.structured_schema: type[BaseModel] | None = None
 
     @classmethod
     def from_tool_trace(
@@ -107,6 +112,7 @@ class ScriptedReplayModel:
         trace: Sequence[Mapping[str, Any]],
         *,
         final_text: str | None = None,
+        enforce_bound_tools: bool = True,
     ) -> ScriptedReplayModel:
         """Build assistant tool-call messages from a canonical trace.
 
@@ -115,6 +121,8 @@ class ScriptedReplayModel:
                 Any recorded ``output`` values are ignored.
             final_text: Optional no-tool assistant message appended after the
                 scripted calls.
+            enforce_bound_tools: Whether to preserve strict bound-tool
+                assertions for this replay model. Defaults to ``True``.
 
         Returns:
             A model that emits one assistant message per trace record.
@@ -146,7 +154,7 @@ class ScriptedReplayModel:
             )
         if final_text is not None:
             messages.append(AIMessage(content=final_text))
-        return cls(messages)
+        return cls(messages, enforce_bound_tools=enforce_bound_tools)
 
     @classmethod
     def from_structured_result(cls, result: BaseModel) -> ScriptedReplayModel:
@@ -188,8 +196,9 @@ class ScriptedReplayModel:
             The next scripted assistant message.
 
         Raises:
-            AssertionError: If the production loop consumes too many messages
-                or emits a tool not exposed by the production toolbelt.
+            AssertionError: If the production loop consumes too many messages,
+                or, when strict bound checking is enabled, emits a tool not
+                exposed by the production toolbelt.
         """
         del messages
         if self._next_message >= len(self._messages):
@@ -201,7 +210,7 @@ class ScriptedReplayModel:
         self.invocation_count += 1
         for tool_call in response.tool_calls:
             name = str(tool_call.get("name", ""))
-            if name not in self._bound_tool_names:
+            if self._enforce_bound_tools and name not in self._bound_tool_names:
                 raise AssertionError(
                     f"Scripted replay tool {name!r} was not bound by the production toolbelt."
                 )

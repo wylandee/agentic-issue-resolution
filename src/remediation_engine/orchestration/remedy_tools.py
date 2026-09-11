@@ -1362,10 +1362,15 @@ def _make_remove_no_fix_dependency_tool(
             set(plan_state.get("package_removal_files", [])) | set(changed_files)
         )
         plan_state["no_fix_package_removed"] = True
-        # Package removal is part of the current plan, not a standalone source
-        # edit iteration. Keep EXECUTE open so dependent source imports/callers
-        # can be removed before the single cumulative validation call.
-        plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
+        # Package-only plans have no later source edit to advance the
+        # lifecycle, so expose validation immediately. Plans containing
+        # source replacements remain in EXECUTE until those replacements are
+        # applied before the single cumulative validation call.
+        plan_state["phase"] = (
+            WorkaroundExecutionPhase.VALIDATE.value
+            if not plan_state.get("planned_replacements")
+            else WorkaroundExecutionPhase.EXECUTE.value
+        )
         return (
             "SUCCESS: Removed the configured direct dependency through npm and synchronized "
             f"the lockfile without lifecycle scripts. Changed files: {', '.join(changed_files)}."
@@ -1600,8 +1605,10 @@ def _make_deterministic_apply_edit_set_tool(
                     sandbox.write_file(p, orig)
                 if plan_state is not None:
                     plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
+                    plan_state["local_investigation_complete"] = False
                     plan_state["edit_failure_requires_replan"] = True
                     plan_state["validation_passed"] = False
+
                 return f"ERROR: [SYNTAX_FAILURE] Replacement produced invalid syntax in '{rel_path}'. All files in edit set restored.\n{syntax_res}"
 
         plan_rev = plan_state.get("plan_revision", 1) if plan_state else 1
@@ -2564,6 +2571,7 @@ def _revert_current_iteration_edit(
     plan_state["current_iteration_edit"] = None
 
     plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
+    plan_state["local_investigation_complete"] = False
     plan_state["iteration"] = int(plan_state.get("iteration", 1)) + 1
     plan_state["successful_edit_count_this_iteration"] = 0
     plan_state["validated_files"] = []

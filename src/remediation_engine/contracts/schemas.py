@@ -1361,6 +1361,19 @@ class WorkaroundExecutionPhase(StrEnum):
     VALIDATE = "VALIDATE"
 
 
+class ScratchpadEntry(BaseModel):
+    """Bounded deterministic memory captured from one workaround tool round."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: WorkaroundExecutionPhase
+    round_number: int = Field(ge=1)
+    key_findings: list[str] = Field(default_factory=list)
+    files_inspected: list[str] = Field(default_factory=list)
+    plan_summary: str = ""
+    validation_outcome: str = ""
+
+
 class WorkaroundValidationStatus(StrEnum):
     """Outcome status of a workaround validation run."""
 

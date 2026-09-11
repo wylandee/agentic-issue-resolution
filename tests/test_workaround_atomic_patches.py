@@ -364,8 +364,45 @@ def test_multi_file_atomic_patch_and_syntax_failure_rollback():
 
     res = edit_tool.invoke({"replacements": planned_repls})
     assert "ERROR: [SYNTAX_FAILURE]" in res
+    assert plan_state["phase"] == WorkaroundExecutionPhase.INVESTIGATE.value
+    assert plan_state["local_investigation_complete"] is False
     assert files["src/a.js"] == "const a = 1;\n"
     assert files["src/b.js"] == "const b = 1;\n"
+
+
+def test_code_failure_rollback_requires_fresh_investigation():
+    """A code-failing validation restores the edit and clears investigation state."""
+    sandbox, files = _mock_sandbox(
+        {
+            "src/a.ts": "const a = 2;\n",
+            "tsconfig.json": "{}",
+        }
+    )
+    sandbox.run.side_effect = lambda command, **_kwargs: MagicMock(
+        exit_code=1 if "--no-install tsc" in command else 0,
+        stdout="type error" if "--no-install tsc" in command else "",
+        stderr="",
+    )
+    plan_state = {
+        "phase": WorkaroundExecutionPhase.VALIDATE.value,
+        "local_investigation_complete": True,
+        "pending_snapshots": {"src/a.ts": "const a = 1;\n"},
+    }
+    touched = {"src/a.ts"}
+    validate = _make_validate_workaround_tool(sandbox, touched, plan_state, preferred_test_files=[])
+
+    result = validate.invoke(
+        {
+            "modified_files": ["src/a.ts"],
+            "runtime_smoke_file": "src/a.ts",
+        }
+    )
+
+    assert "typecheck" in result
+    assert files["src/a.ts"] == "const a = 1;\n"
+    assert plan_state["phase"] == WorkaroundExecutionPhase.INVESTIGATE.value
+    assert plan_state["local_investigation_complete"] is False
+    assert touched == set()
 
 
 def test_validation_outcomes_commit_and_rollback():
