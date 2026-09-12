@@ -120,6 +120,43 @@ def test_deep_eval_metrics_match_duplicate_parametrized_items(monkeypatch) -> No
     ]
 
 
+def test_duplicate_deepeval_metrics_share_one_pytest_record(monkeypatch) -> None:
+    """Metrics emitted by one pytest item stay together in the dashboard."""
+    case_id = "same-case"
+    live_id = f"tests/evals/test_qa_critic_eval.py::test_qa_critic_live_replay_metrics[{case_id}]"
+    offline_id = (
+        f"tests/evals/test_qa_critic_eval.py::test_qa_critic_offline_production_replay[{case_id}]"
+    )
+    items = [_eval_item(offline_id), _eval_item(live_id)]
+    monkeypatch.setattr(
+        eval_conftest,
+        "_EVAL_TEST_REPORTS",
+        {
+            live_id: {"call": _report(live_id, "passed")},
+            offline_id: {"call": _report(offline_id, "passed")},
+        },
+    )
+    deep_eval_cases = [
+        _deep_eval_case(case_id, "Tool Correctness"),
+        _deep_eval_case(case_id, "Task Completion"),
+    ]
+    for deep_eval_case in deep_eval_cases:
+        deep_eval_case.additional_metadata["replay_source"] = "production_live"
+
+    records = eval_conftest._build_eval_test_case_records(
+        SimpleNamespace(items=items),
+        deep_eval_cases,
+        "test-model",
+    )
+
+    assert [record.test_name for record in records] == [offline_id, live_id]
+    assert records[0].metrics == []
+    assert [metric.metric_name for metric in records[1].metrics] == [
+        "Tool Correctness",
+        "Task Completion",
+    ]
+
+
 class _OptionParser:
     """Minimal pytest parser double for option-registration tests."""
 

@@ -53,6 +53,34 @@ _QA_CASES = [
     if case.get("eval_type") == "qa_critic"
 ]
 _QA_CASE_IDS = [case["case_id"] for case in _QA_CASES]
+
+
+_QA_JUDGE_FEW_SHOT_EXAMPLES = """=== FEW-SHOT CALIBRATION ===
+The candidate remediation verdict and the evaluator-task result are different:
+- `passed` describes whether the candidate remediation passes QA.
+- The audit task is complete when the auditor correctly reports either a pass or a failure.
+- A correct `passed=false` result is a completed audit, not an incomplete evaluator task.
+
+Example 1 — installation failure:
+Task: Installation failed with an npm peer conflict.
+Required audit: query the install evidence and emit passed=false with failure_category=peer_conflict.
+Correct completed audit: {"passed": false, "failure_category": "peer_conflict"}.
+Why complete: the auditor correctly rejected the remediation and identified the actionable cause.
+
+Example 2 — test regression:
+Task: The updated package causes the required tests to fail with an API error.
+Required audit: query the test evidence and emit passed=false with failure_category=breaking_change.
+Correct completed audit: {"passed": false, "failure_category": "breaking_change"}.
+Why complete: reporting a remediation failure is the correct completion of the audit task.
+
+Example 3 — successful code workaround:
+Task: Tests pass and source/diff evidence proves the vulnerable path is blocked; residual scanner identifiers are nonblocking.
+Required audit: emit passed=true.
+Correct completed audit: {"passed": true, "failure_category": null}.
+Why complete: the auditor verified the required evidence and accepted the remediation.
+
+Score the current case against its completion contract. Do not mark an audit incomplete merely because its correct remediation verdict is passed=false.
+"""
 _LIVE_CACHE: dict[tuple[str, str], ReplayCapture] = {}
 
 
@@ -117,6 +145,7 @@ def build_qa_production_prompt(case: dict[str, Any]) -> str:
         "=== QA AUDITOR ROLE & OBJECTIVE ===\n"
         "You are evaluating a QA Auditor subagent. Inspect compact deterministic facts "
         f"and render an honest evaluation verdict. {goal_direction}\n\n"
+        f"{_QA_JUDGE_FEW_SHOT_EXAMPLES}\n"
         "=== QA CRITIC TASK ===\n"
         f"{task}\n\n"
         "=== ASSIGNED GROUP ===\n"

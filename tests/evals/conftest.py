@@ -348,6 +348,11 @@ def _deep_eval_node_score(tc: Any, nodeid: str) -> int:
     elif case_id and case_id.casefold() in normalized_nodeid:
         score += 1_000
 
+    metadata = getattr(tc, "additional_metadata", None)
+    replay_source = str(metadata.get("replay_source") or "") if isinstance(metadata, dict) else ""
+    if replay_source == "production_live" and "live_replay" in normalized_nodeid:
+        score += 100
+
     test_case_name = str(getattr(tc, "name", "") or "")
     for token in re.findall(r"[a-z0-9]+", test_case_name.casefold()):
         if len(token) >= 4 and token in normalized_nodeid:
@@ -377,21 +382,47 @@ def _match_deep_eval_case_to_nodeid(
     nodeids: list[str],
     assigned_nodeids: set[str],
 ) -> str | None:
-    """Match one DeepEval case to an unassigned pytest item."""
+    """Match a DeepEval case to its pytest item, coalescing duplicate metrics."""
     candidates = [
-        nodeid
-        for nodeid in nodeids
-        if nodeid not in assigned_nodeids
-        and _pytest_item_observation(nodeid)["status"] != "SKIPPED"
+        nodeid for nodeid in nodeids if _pytest_item_observation(nodeid)["status"] != "SKIPPED"
     ]
     if not candidates:
         return None
 
-    scored = [(_deep_eval_node_score(tc, nodeid), nodeid) for nodeid in candidates]
-    best_score = max(score for score, _ in scored)
+    case_id = _case_id_from_test_case(tc)
+
+    def is_same_case(nodeid: str) -> bool:
+        """Return whether a pytest parameter identifies this DeepEval case."""
+        parameter_id = _nodeid_parameter_id(nodeid)
+        normalized_nodeid = _normalise_nodeid(nodeid)
+        return bool(
+            case_id
+            and (
+                (parameter_id and parameter_id.casefold() == case_id.casefold())
+                or case_id.casefold() in normalized_nodeid
+            )
+        )
+
+    unassigned = [nodeid for nodeid in candidates if nodeid not in assigned_nodeids]
+    if not unassigned:
+        return None
+
+    unassigned_scored = [(_deep_eval_node_score(tc, nodeid), nodeid) for nodeid in unassigned]
+    same_case_assigned = [
+        (_deep_eval_node_score(tc, nodeid), nodeid)
+        for nodeid in candidates
+        if nodeid in assigned_nodeids and is_same_case(nodeid)
+    ]
+    if same_case_assigned:
+        assigned_score, assigned_nodeid = max(same_case_assigned)
+        unassigned_score = max(score for score, _ in unassigned_scored)
+        if assigned_score >= unassigned_score:
+            return assigned_nodeid
+
+    best_score = max(score for score, _ in unassigned_scored)
     if best_score <= 0:
-        return candidates[0] if len(candidates) == 1 else None
-    return next(nodeid for score, nodeid in scored if score == best_score)
+        return unassigned[0] if len(unassigned) == 1 else None
+    return next(nodeid for score, nodeid in unassigned_scored if score == best_score)
 
 
 def _record_from_deep_eval_case(
@@ -546,7 +577,13 @@ def _build_eval_test_case_records(
                 getattr(tc, "name", None),
             )
             continue
-        records_by_nodeid[nodeid] = _record_from_deep_eval_case(tc, nodeid, judge_model)
+
+        record = _record_from_deep_eval_case(tc, nodeid, judge_model)
+        existing = records_by_nodeid.get(nodeid)
+        if existing is None:
+            records_by_nodeid[nodeid] = record
+        else:
+            existing.metrics.extend(record.metrics)
         assigned_nodeids.add(nodeid)
 
     for nodeid in nodeids:
