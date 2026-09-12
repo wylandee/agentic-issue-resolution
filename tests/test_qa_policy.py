@@ -31,6 +31,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.qa_critic import (
     GroupInvestigation,
+    _apply_guardrails,
     _apply_policy_decision,
     _collect_group_package_state,
     _derive_qa_group_policies,
@@ -75,10 +76,11 @@ def _results(
     install: tuple[bool, str] = (True, "install ok"),
     remaining: set[str] | None = None,
     scanner_status: ScannerExecutionStatus = ScannerExecutionStatus.SUCCESS,
-    tests: tuple[bool, str] = (True, "tests ok"),
+    tests: tuple[bool, str] | None = (True, "tests ok"),
+    install_error_category: str | None = None,
 ) -> _QAExecutionResults:
     remaining = set(remaining or set())
-    return _QAExecutionResults(
+    results = _QAExecutionResults(
         install=install,
         tests=tests,
         scan=_SecurityScanResult(
@@ -90,6 +92,8 @@ def _results(
             execution_status=scanner_status,
         ),
     )
+    results.install_error_category = install_error_category
+    return results
 
 
 def _semantic_review() -> QASemanticSecurityReview:
@@ -307,6 +311,53 @@ def test_shared_install_failure_fails_every_group() -> None:
         evaluation.failure_category == FailureCategory.PEER_CONFLICT
         for evaluation in evaluations.values()
     )
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        QAPolicy.VERSION_BUMP,
+        QAPolicy.INITIAL_CODE_WORKAROUND,
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+        QAPolicy.NO_FIX_CODE_REMOVAL,
+    ],
+)
+def test_dependency_install_conflict_is_terminal(policy: QAPolicy) -> None:
+    """A dependency conflict wins over post-install gates that could not run."""
+    group = _group("g1")
+    results = _results(
+        install=(False, "npm install EOVERRIDE peer conflict"),
+        scanner_status=ScannerExecutionStatus.UNPARSEABLE,
+        tests=None,
+        install_error_category="PEER_CONFLICT",
+    )
+    evaluations, errors = _apply_guardrails(
+        valid_groups=[group],
+        batch_result=BatchQAResult(
+            holistic_report="test",
+            evaluations=[
+                QAEvaluation(
+                    task_id=group.group_id,
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="The evaluator reported a generic failure.",
+                )
+            ],
+        ),
+        results=results,
+        group_strategies={group.group_id: "version_bump"},
+        group_policies={group.group_id: policy},
+    )
+
+    evaluation = evaluations[group.group_id]
+    assert not errors
+    assert evaluation.passed is False
+    assert evaluation.failure_category == FailureCategory.PEER_CONFLICT
+    assert evaluation.semantic_security_review is None
+    assert evaluation.test_attribution is None
+    assert "resolve the dependency conflict" in (evaluation.retry_feedback or "")
+    assert "scanner" not in (evaluation.retry_feedback or "").lower()
+    assert "tests" not in (evaluation.retry_feedback or "").lower()
 
 
 def test_missing_initial_task_policy_is_recoverable_deterministically() -> None:

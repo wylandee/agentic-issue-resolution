@@ -433,7 +433,4 @@ def test_qa_critic_offline_production_replay(
     actual_category = capture.typed_result.failure_category
     actual_category = getattr(actual_category, "value", actual_category)
     expected_category = expected.get("failure_category")
-    if actual_category != expected_category:
-        assert expected_category == "peer_conflict"
-        assert actual_category == "security_flag"
-        assert "install failed" in capture.typed_result.retry_feedback.lower()
+    assert actual_category == expected_category

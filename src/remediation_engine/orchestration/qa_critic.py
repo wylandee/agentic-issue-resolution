@@ -5922,14 +5922,44 @@ def _qa_evaluation_items(
     return list(source.values())
 
 
+def _install_conflict_is_terminal(
+    gates: QADeterministicGates,
+    install_error_category: str | None,
+) -> bool:
+    """Return whether a failed install has a deterministic dependency conflict."""
+    if gates.install_passed:
+        return False
+    if str(install_error_category or "").upper() in {"PEER_CONFLICT", "ENGINE_CONFLICT"}:
+        return True
+    install_summary = gates.diagnostics[0] if gates.diagnostics else ""
+    conflict_markers = (*_PEER_CONFLICT_PATTERNS, *_ENGINE_CONFLICT_PATTERNS)
+    return any(marker.casefold() in install_summary.casefold() for marker in conflict_markers)
+
+
+def _install_conflict_retry_feedback(gates: QADeterministicGates) -> str:
+    """Build retry guidance without claiming unavailable post-install validation."""
+    install_summary = gates.diagnostics[0] if gates.diagnostics else "npm install failed."
+    return (
+        f"{install_summary} Dependency installation failed before post-install QA validation; "
+        "resolve the dependency conflict before retrying."
+    )
+
+
 def _apply_policy_decision(
     valid_groups: list[VulnerabilityGroup],
     batch_result: BatchQAResult | Mapping[str, QAEvaluation],
     gates_by_group: dict[str, QADeterministicGates],
     group_policies: dict[str, QAPolicy | None],
     investigations_by_group: dict[str, GroupInvestigation] | None = None,
+    install_error_category: str | None = None,
+    *,
+    terminal_install_conflict: bool = True,
 ) -> tuple[dict[str, QAEvaluation], list[str]]:
-    """Apply the supervisor-owned policy matrix without LLM hard-gate overrides."""
+    """Apply the supervisor-owned policy matrix without LLM hard-gate overrides.
+
+    Classified dependency-install conflicts terminate policy evaluation before
+    downstream validation gates can mask their category.
+    """
     known_group_ids = {group.group_id for group in valid_groups}
     errors: list[str] = []
     normalized: dict[str, QAEvaluation] = {}
@@ -5978,6 +6008,18 @@ def _apply_policy_decision(
                         "No remediation retry was consumed. Re-run QA after correcting the judge contract."
                     ),
                 }
+            )
+            continue
+
+        if terminal_install_conflict and _install_conflict_is_terminal(
+            gates, install_error_category
+        ):
+            final[group_id] = QAEvaluation(
+                task_id=group_id,
+                passed=False,
+                failure_category=FailureCategory.PEER_CONFLICT,
+                retry_feedback=_install_conflict_retry_feedback(gates),
+                deterministic_gates=gates,
             )
             continue
 
@@ -6188,6 +6230,8 @@ def _apply_guardrails(
         gates,
         policies,
         investigations_by_group,
+        install_error_category=results.install_error_category,
+        terminal_install_conflict=not legacy_strategy_compat,
     )
     errors = gate_errors + decision_errors
     if legacy_strategy_compat:
