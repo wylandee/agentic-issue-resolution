@@ -231,6 +231,46 @@ def _token_usage_from_response(response: Any) -> tuple[int, int, bool]:
     return 0, 0, False
 
 
+def _cached_input_tokens_from_response(response: Any) -> int | None:
+    """Extract OpenAI cached prompt tokens from supported response metadata."""
+    candidates: list[Any] = []
+
+    def add_mapping_candidates(value: Any) -> None:
+        if isinstance(value, Mapping):
+            candidates.extend(
+                [
+                    value.get("token_usage"),
+                    value.get("usage"),
+                    value,
+                ]
+            )
+
+    if isinstance(response, Mapping):
+        add_mapping_candidates(response.get("response_metadata"))
+        add_mapping_candidates(response)
+    add_mapping_candidates(getattr(response, "usage_metadata", None))
+    add_mapping_candidates(getattr(response, "llm_output", None))
+    add_mapping_candidates(getattr(response, "response_metadata", None))
+    for generation_group in getattr(response, "generations", []) or []:
+        for generation in generation_group or []:
+            message = getattr(generation, "message", None)
+            add_mapping_candidates(getattr(message, "usage_metadata", None))
+            add_mapping_candidates(getattr(message, "response_metadata", None))
+
+    for usage in candidates:
+        if not isinstance(usage, Mapping):
+            continue
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, Mapping):
+            continue
+        cached = details.get("cached_tokens")
+        try:
+            return max(0, int(cached)) if cached is not None else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _token_cost_from_response(response: Any) -> float | None:
     """Extract a provider-reported token cost without guessing model pricing.
 
@@ -300,6 +340,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         self._total_completion_tokens = 0
         self._token_data_available = False
         self._token_cost: float | None = None
+        self._cached_input_tokens: int | None = None
 
     def _start(
         self,
@@ -365,16 +406,19 @@ class TrajectoryRecorder(BaseCallbackHandler):
             logger.debug("trajectory recorder failed to finish span", exc_info=True)
 
     def _record_token_usage(self, response: Any) -> None:
-        """Accumulate token counts and provider-reported cost from one response."""
+        """Accumulate token counts, cache hits, and provider-reported cost."""
         prompt_tokens, completion_tokens, available = _token_usage_from_response(response)
+        cached_input_tokens = _cached_input_tokens_from_response(response)
         token_cost = _token_cost_from_response(response)
-        if not available and token_cost is None:
+        if not available and cached_input_tokens is None and token_cost is None:
             return
         with self._lock:
             if available:
                 self._total_prompt_tokens += prompt_tokens
                 self._total_completion_tokens += completion_tokens
                 self._token_data_available = True
+            if cached_input_tokens is not None:
+                self._cached_input_tokens = (self._cached_input_tokens or 0) + cached_input_tokens
             if token_cost is not None:
                 self._token_cost = (self._token_cost or 0.0) + token_cost
 
@@ -526,6 +570,12 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Return whether at least one LLM callback supplied token usage."""
         with self._lock:
             return self._token_data_available
+
+    @property
+    def cached_input_tokens(self) -> int | None:
+        """Return provider-reported cached prompt tokens, when available."""
+        with self._lock:
+            return self._cached_input_tokens
 
     @property
     def token_cost(self) -> float | None:

@@ -746,6 +746,10 @@
     },
     "execution_context": {
       "install_passed": false,
+      "install_exit_code": 1,
+      "install_error_category": "PEER_CONFLICT",
+      "install_raw_stdout": "npm install started",
+      "install_raw_stderr": "EOVERRIDE: ws override conflicts with direct dependency.",
       "scanner_execution_status": "not_run",
       "target_scanner_cleared": null,
       "target_remaining_identifiers": [],
@@ -755,6 +759,8 @@
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
+      "install_stdout": "npm install started",
+      "install_stderr": "EOVERRIDE: ws override conflicts with direct dependency.",
       "scan_summary": "Security scan not run because installation failed.",
       "test_output": "Unit tests not run because installation failed."
     },
@@ -779,7 +785,9 @@
       {
         "name": "query_qa_logs",
         "args": {
-          "log_type": "install"
+          "log_type": "install",
+          "view": "filter",
+          "filter_pattern": "EOVERRIDE"
         }
       },
       {
@@ -807,7 +815,9 @@
         {
           "name": "query_qa_logs",
           "args": {
-            "log_type": "install"
+            "log_type": "install",
+            "view": "filter",
+            "filter_pattern": "EOVERRIDE"
           },
           "output": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency."
         },
@@ -838,6 +848,18 @@
         },
         "execution_context": {
           "install_passed": false,
+          "install_exit_code": 1,
+          "install_error_category": "PEER_CONFLICT",
+          "install_raw_stdout": "npm install started",
+          "install_raw_stderr": "EOVERRIDE: ws override conflicts with direct dependency.",
+          "install_records": [
+            {
+              "label": "npm install",
+              "exit_code": 1,
+              "stdout": "npm install started",
+              "stderr": "EOVERRIDE: ws override conflicts with direct dependency."
+            }
+          ],
           "scanner_execution_status": "not_run",
           "target_scanner_cleared": null,
           "target_remaining_identifiers": [],
@@ -847,6 +869,8 @@
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
+          "install_stdout": "npm install started",
+          "install_stderr": "EOVERRIDE: ws override conflicts with direct dependency.",
           "scan_summary": "Security scan not run because installation failed.",
           "test_output": "Unit tests not run because installation failed."
         },

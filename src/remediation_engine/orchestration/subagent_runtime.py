@@ -395,6 +395,7 @@ def run_bounded_subagent_loop(
     structured_output_model: type[BaseModel] | None = None,
     structured_output_tool_name: str | None = None,
     context_manager: ContextManager | None = None,
+    skip_phase_gating: bool = False,
 ) -> SubagentRuntimeResult:
     """Run a bounded tool-calling loop for one specialized subagent.
 
@@ -407,10 +408,13 @@ def run_bounded_subagent_loop(
         execution_state: Optional mutable validation/execution state.
         structured_output_model: Optional Pydantic model for a terminal result.
         structured_output_tool_name: Tool name whose arguments are validated as
-            structured_output_model. Both structured arguments are required
+            ``structured_output_model``. Both structured arguments are required
             together and the terminal tool body is not executed.
         context_manager: Optional phase-aware workaround context manager. When
             absent, the supplied full tool list is bound exactly once.
+        skip_phase_gating: Bypass manager phase filtering and rebinding for a
+            read-only workflow such as structured QA. A manager's
+            ``skip_phase_gating`` flag also enables this mode.
 
     Returns:
         The bounded run result, including the validated terminal model when
@@ -428,11 +432,10 @@ def run_bounded_subagent_loop(
         raise ValueError(
             "structured_output_model and structured_output_tool_name must be provided together."
         )
-    if structured_output_tool_name is not None and structured_output_tool_name not in all_tool_map:
-        raise ValueError(
-            f"Structured output tool {structured_output_tool_name!r} is not available."
-        )
-    if context_manager is None:
+    phase_gating_bypassed = bool(
+        skip_phase_gating or (context_manager is not None and context_manager.skip_phase_gating)
+    )
+    if context_manager is None or phase_gating_bypassed:
         bound_tools = all_tools
     else:
         initial_phase = context_manager.phase_from_state(execution_state)
@@ -453,23 +456,23 @@ def run_bounded_subagent_loop(
     consecutive_validation_failures = 0
     validation_gate_call_count = int((execution_state or {}).get("validation_calls", 0))
     validation_input_error_count = int((execution_state or {}).get("validation_input_errors", 0))
-    invalid_validation_signatures: set[str] = set()
     scope_violation_count = 0
-
+    invalid_validation_signatures: set[str] = set()
     for loop_index in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
         round_number = loop_index + 1
         if context_manager is not None:
             turn_phase = context_manager.phase_from_state(execution_state)
-            phase_tools = tuple(context_manager.get_tools_for_phase(turn_phase))
-            phase_tool_names = tuple(str(getattr(tool, "name", "")) for tool in phase_tools)
-            if phase_tool_names != bound_tool_names:
-                bound_tools = phase_tools
-                tool_map = {str(getattr(tool, "name", "")): tool for tool in bound_tools}
-                bound_tool_names = phase_tool_names
-                llm_with_tools = llm.bind_tools(
-                    list(bound_tools),
-                    parallel_tool_calls=False,
-                )
+            if not phase_gating_bypassed:
+                phase_tools = tuple(context_manager.get_tools_for_phase(turn_phase))
+                phase_tool_names = tuple(str(getattr(tool, "name", "")) for tool in phase_tools)
+                if phase_tool_names != bound_tool_names:
+                    bound_tools = phase_tools
+                    tool_map = {str(getattr(tool, "name", "")): tool for tool in bound_tools}
+                    bound_tool_names = phase_tool_names
+                    llm_with_tools = llm.bind_tools(
+                        list(bound_tools),
+                        parallel_tool_calls=False,
+                    )
         else:
             turn_phase = None
         turn_tool_map = dict(tool_map)
@@ -548,13 +551,14 @@ def run_bounded_subagent_loop(
                         "Structured QA output validation failed; evaluator was asked to retry."
                     )
                     continue
-                tool_events.append(
-                    ToolEvent(
-                        name=structured_output_tool_name,
-                        args=terminal_call.get("args", {}) or {},
-                        content="STRUCTURED_OUTPUT_ACCEPTED",
-                    )
+                event = ToolEvent(
+                    name=structured_output_tool_name,
+                    args=terminal_call.get("args", {}) or {},
+                    content="STRUCTURED_OUTPUT_ACCEPTED",
                 )
+                tool_events.append(event)
+                if context_manager is not None:
+                    context_manager.update_scratchpad(event, turn_phase, round_number)
                 return SubagentRuntimeResult(
                     final_text="",
                     tool_events=tool_events,
@@ -581,9 +585,9 @@ def run_bounded_subagent_loop(
             tool_call_id = tool_call.get("id")
             if not isinstance(tool_call_id, str) or not tool_call_id.strip():
                 malformed_tool_call = True
-                tool_call_id = "invalid-tool-call-id"
             phase_violation = (
                 context_manager is not None
+                and not phase_gating_bypassed
                 and tool_name in all_tool_map
                 and tool_name not in turn_tool_map
             )
@@ -696,6 +700,7 @@ def run_bounded_subagent_loop(
                     else:
                         if (
                             execution_state is not None
+                            and not phase_gating_bypassed
                             and execution_state.get("phase") == "VALIDATE"
                             and tool_name
                             in {
@@ -928,14 +933,15 @@ def run_bounded_subagent_loop(
         if context_manager is not None:
             if recovery_instruction:
                 conversation.append(HumanMessage(content=recovery_instruction))
-            if execution_state is not None:
-                final_phase = context_manager.maybe_advance_to_plan(execution_state)
-            else:
-                final_phase = turn_phase
-            if final_phase != turn_phase:
-                conversation.append(
-                    HumanMessage(content=context_manager.get_phase_prompt(final_phase))
-                )
+            if not phase_gating_bypassed:
+                if execution_state is not None:
+                    final_phase = context_manager.maybe_advance_to_plan(execution_state)
+                else:
+                    final_phase = turn_phase
+                if final_phase != turn_phase:
+                    conversation.append(
+                        HumanMessage(content=context_manager.get_phase_prompt(final_phase))
+                    )
             conversation = context_manager.compact_conversation(conversation, round_number)
 
         if malformed_tool_call:

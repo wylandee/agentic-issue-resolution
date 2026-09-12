@@ -28,6 +28,7 @@ from remediation_engine.orchestration.state import (
     initial_workaround_subagent_state,
 )
 from remediation_engine.orchestration.update_subagent import (
+    _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
     run_update_subagent_node,
 )
@@ -141,9 +142,9 @@ class TestUpdateSubagentWrapper:
         assert "Why The Previous Attempt Failed" not in prompt
         assert "QA feedback:" in prompt
         assert "Previous outcome:" in prompt
-        assert "4.17.22" in prompt
-        assert "task instruction is authoritative" in prompt
-        assert "execution worker" in prompt
+        assert (
+            "Execute only the Supervisor's task instruction" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
         assert "First-pass mode:" not in prompt
         assert "First-pass planning questions:" not in prompt
         assert "Planning Answers" not in prompt
@@ -204,8 +205,7 @@ class TestUpdateSubagentWrapper:
                 "task-2": "Previous attempt validated the wrong manifest path.",
             },
         )
-
-        assert "execution worker" in prompt
+        assert "execution worker" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
         assert (
             'Exact supervisor instruction: Update "jsonwebtoken" in package.json to version "9.0.0".'
             in prompt
@@ -301,6 +301,11 @@ class TestUpdateSubagentWrapper:
             result = run_update_subagent_node(state)
 
         assert bound.invoke.call_count == 3
+        messages = bound.invoke.call_args_list[0].args[0]
+        assert "dependency-manifest execution worker" in messages[0].content
+        assert "DYNAMIC TASK CONTEXT" in messages[-1].content
+        assert "package.json" in messages[-1].content
+        assert "package.json" not in _UPDATE_WORKER_STATIC_INSTRUCTIONS
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert "messages" not in result
         assert "package.json" in result["changed_files"]

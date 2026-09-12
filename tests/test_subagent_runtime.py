@@ -6,7 +6,12 @@ from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from remediation_engine.contracts.schemas import QACriticLLMOutput
+from remediation_engine.contracts.schemas import (
+    QACriticLLMOutput,
+    ScratchpadScope,
+    WorkaroundExecutionPhase,
+)
+from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.subagent_runtime import (
     ToolEvent,
     _validation_gate_recovery_instruction,
@@ -47,6 +52,53 @@ def test_structured_terminal_output_is_returned_without_free_text() -> None:
     assert result.structured_output.task_id == "g1"
     assert result.final_text == ""
     terminal_tool.invoke.assert_not_called()
+
+
+def test_qa_bypass_binds_all_tools_and_records_terminal_without_invoking_body() -> None:
+    review_tool = MagicMock()
+    review_tool.name = "query_qa_logs"
+    terminal_tool = MagicMock()
+    terminal_tool.name = "emit_qa_evaluation"
+    bound_llm = MagicMock()
+    bound_llm.invoke.return_value = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": terminal_tool.name,
+                "args": {"task_id": "g1", "passed": True},
+                "id": "terminal-1",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    manager = ContextManager(
+        [review_tool, terminal_tool],
+        compaction_interval=3,
+        skip_phase_gating=True,
+        scratchpad_scope=ScratchpadScope.QA,
+    )
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [review_tool, terminal_tool],
+        [HumanMessage(content="Review the task.")],
+        set(),
+        execution_state={"phase": WorkaroundExecutionPhase.VALIDATE.value},
+        structured_output_model=QACriticLLMOutput,
+        structured_output_tool_name=terminal_tool.name,
+        context_manager=manager,
+    )
+
+    assert [tool.name for tool in llm.bind_tools.call_args.args[0]] == [
+        "query_qa_logs",
+        "emit_qa_evaluation",
+    ]
+    assert result.errors == []
+    assert [event.name for event in result.tool_events] == ["emit_qa_evaluation"]
+    assert terminal_tool.invoke.call_count == 0
+    assert manager.scratchpad.entries[-1].scope == ScratchpadScope.QA
+    assert "task_id=g1" in manager.scratchpad.entries[-1].critical_outcome
 
 
 def test_invalid_structured_terminal_output_is_rejected_and_retried() -> None:

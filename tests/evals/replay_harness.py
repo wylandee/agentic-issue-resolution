@@ -60,6 +60,8 @@ class ReplayCapture:
             model, or ``None`` when usage metadata was unavailable.
         total_tokens: Sum of observed input and output tokens, or ``None`` when
             usage metadata was unavailable.
+        cached_input_tokens: Provider-reported cached prompt tokens, or
+            ``None`` when the provider omitted cache metadata.
         token_cost: Provider-reported token cost in USD, when available. The
             replay layer never guesses pricing.
     """
@@ -78,7 +80,29 @@ class ReplayCapture:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_input_tokens: int | None = None
     token_cost: float | None = None
+
+
+def _serialize_invocation_messages(
+    messages: Sequence[BaseMessage],
+) -> list[dict[str, Any]]:
+    """Serialize model invocation messages for structural replay assertions."""
+    serialized: list[dict[str, Any]] = []
+    for message in messages:
+        serialized.append(
+            {
+                "type": str(getattr(message, "type", message.__class__.__name__)),
+                "content": serialize_result(getattr(message, "content", "")),
+                "additional_kwargs": serialize_result(
+                    getattr(message, "additional_kwargs", {}) or {}
+                ),
+                "name": getattr(message, "name", None),
+                "tool_call_id": getattr(message, "tool_call_id", None),
+                "tool_calls": serialize_result(getattr(message, "tool_calls", []) or []),
+            }
+        )
+    return serialized
 
 
 class ScriptedReplayModel:
@@ -115,6 +139,7 @@ class ScriptedReplayModel:
         self.bound_tool_names: list[str] = []
         self.invocation_count = 0
         self.consumed_tool_calls: list[dict[str, Any]] = []
+        self.invocation_messages: list[list[dict[str, Any]]] = []
         self.structured_invocation_count = 0
         self.structured_invocations: list[Any] = []
 
@@ -212,7 +237,7 @@ class ScriptedReplayModel:
                 or, when strict bound checking is enabled, emits a tool not
                 exposed by the production toolbelt.
         """
-        del messages
+        self.invocation_messages.append(_serialize_invocation_messages(messages))
         if self._next_message >= len(self._messages):
             raise AssertionError(
                 "Production consumed more scripted replay model responses than provided."

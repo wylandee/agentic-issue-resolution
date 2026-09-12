@@ -1,4 +1,4 @@
-"""Phase-aware context management for workaround subagents.
+"""Phase-aware context management for specialist subagents.
 
 The manager in this module owns only ephemeral, node-local model context. The
 Supervisor task state, attempt snapshots, and replay plans remain the durable
@@ -14,7 +14,11 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 
-from remediation_engine.contracts.schemas import ScratchpadEntry, WorkaroundExecutionPhase
+from remediation_engine.contracts.schemas import (
+    ScratchpadEntry,
+    ScratchpadScope,
+    WorkaroundExecutionPhase,
+)
 
 DEFAULT_COMPACTION_INTERVAL = 4
 MAX_SCRATCHPAD_CHARS = 4000
@@ -31,6 +35,10 @@ _COMPACTION_TOOLS = frozenset(
         "inspect_ast_symbol",
         "search_web",
         "read_repository_map",
+        "list_changed_files",
+        "generate_workspace_diff",
+        "read_file_context",
+        "query_qa_logs",
     }
 )
 _CRITICAL_SCRATCHPAD_TOOLS = frozenset(
@@ -40,6 +48,7 @@ _CRITICAL_SCRATCHPAD_TOOLS = frozenset(
         "record_targeted_test_substitution",
         "deterministic_apply_edit_set",
         "validate_workaround",
+        "emit_qa_evaluation",
     }
 )
 
@@ -252,10 +261,15 @@ def _unique(values: Sequence[str], seen: set[str], *, normalize_paths: bool = Fa
 
 
 class ScratchpadMemory:
-    """Deterministic, bounded memory for one workaround node invocation."""
+    """Deterministic, bounded memory for one specialist invocation."""
 
-    def __init__(self) -> None:
-        """Initialize empty scratchpad history and deduplication indexes."""
+    def __init__(self, scope: ScratchpadScope | str = ScratchpadScope.WORKAROUND) -> None:
+        """Initialize empty scratchpad history and deduplication indexes.
+
+        Args:
+            scope: Specialist scope whose entries this memory stores.
+        """
+        self.scope = scope if isinstance(scope, ScratchpadScope) else ScratchpadScope(scope)
         self._entries: list[ScratchpadEntry] = []
         self._seen_findings: set[str] = set()
         self._seen_files: set[str] = set()
@@ -273,14 +287,18 @@ class ScratchpadMemory:
         event: Any,
         phase: WorkaroundExecutionPhase | str | None,
         round_number: int,
+        *,
+        scope: ScratchpadScope | str | None = None,
     ) -> None:
         """Extract bounded facts from one tool event.
 
         Args:
             event: Tool-event-like object with ``name``, ``args``, and
                 ``content`` attributes.
-            phase: Phase snapshot used to bind the assistant response.
+            phase: Workaround execution phase, or ``None`` for QA entries.
             round_number: One-based model loop round.
+            scope: Optional entry scope override. The memory's scope is used
+                when omitted.
 
         Returns:
             None. The event is retained only when it adds a deterministic fact.
@@ -290,17 +308,69 @@ class ScratchpadMemory:
         if not isinstance(args, Mapping):
             args = {}
         content = str(getattr(event, "content", "") or "")
-        normalized_phase = normalize_phase(phase)
+        entry_scope = (
+            self.scope
+            if scope is None
+            else (scope if isinstance(scope, ScratchpadScope) else ScratchpadScope(scope))
+        )
+        normalized_phase = (
+            normalize_phase(phase) if entry_scope == ScratchpadScope.WORKAROUND else None
+        )
         key_findings: list[str] = []
         files_inspected: list[str] = []
         plan_summary = ""
         validation_outcome = ""
+        critical_outcome = ""
+        pair_seen = False
+        file_path = ""
+        symbol = ""
 
         if event_name == "read_repository_map":
             status = _first_meaningful_line(content)
             if status:
                 key_findings.append(f"repository map: {status}")
-        elif event_name == "read_workspace_file":
+        elif event_name == "list_changed_files":
+            reported_files = [
+                _normalize_path(line.strip()[2:])
+                for line in content.splitlines()
+                if line.strip().startswith(("-", "*")) and line.strip()[1:].strip()
+            ]
+            files_inspected.extend(value for value in reported_files if value)
+            key_findings.append(
+                f"changed files: {len(reported_files)}"
+                + (
+                    f" ({', '.join(reported_files[:_MAX_FILES_PER_ENTRY])})"
+                    if reported_files
+                    else ""
+                )
+            )
+        elif event_name == "generate_workspace_diff":
+            diff_paths: list[str] = []
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                path: str | None = None
+                if line.startswith("diff --git "):
+                    match = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+                    if match:
+                        path = match.group(2)
+                elif line.startswith("+++ "):
+                    path = line[4:].strip()
+                    if path.startswith("b/"):
+                        path = path[2:]
+                elif line.startswith("--- "):
+                    path = line[4:].strip()
+                    if path.startswith("a/"):
+                        path = path[2:]
+                if path and path != "/dev/null":
+                    normalized_path = _normalize_path(path.split("\t", 1)[0])
+                    if normalized_path and normalized_path not in diff_paths:
+                        diff_paths.append(normalized_path)
+            files_inspected.extend(diff_paths)
+            key_findings.append(
+                f"diff files: {len(diff_paths)}"
+                + (f" ({', '.join(diff_paths[:_MAX_FILES_PER_ENTRY])})" if diff_paths else "")
+            )
+        elif event_name in {"read_workspace_file", "read_file_context"}:
             file_path = _normalize_path(_arg(args, "file_path", "path"))
             if file_path:
                 files_inspected.append(file_path)
@@ -309,7 +379,10 @@ class ScratchpadMemory:
                 range_text = ""
                 if start is not None or end is not None:
                     range_text = f" lines {start or 1}-{end or 'end'}"
-                key_findings.append(f"read {file_path}{range_text}")
+                excerpt = _first_meaningful_line(content, 260)
+                key_findings.append(
+                    f"read {file_path}{range_text}" + (f": {excerpt}" if excerpt else "")
+                )
         elif event_name == "search_codebase_pattern":
             directory = _normalize_path(_arg(args, "directory", "path", "search_directory")) or "."
             pattern = _clean_text(_arg(args, "search_pattern", "pattern", "query"), 220)
@@ -334,6 +407,37 @@ class ScratchpadMemory:
                 key_findings.append(
                     f"AST {file_path or '[file omitted]'}::{symbol or '[symbol omitted]'}"
                 )
+        elif event_name == "query_qa_logs":
+            phase_name = _clean_text(_arg(args, "log_type", "phase") or "unknown", 80)
+            view = _clean_text(_arg(args, "view") or "summary", 80)
+            filter_pattern = _clean_text(_arg(args, "filter_pattern") or "", 160)
+            diagnostic = _first_meaningful_line(content, 320)
+            key_findings.append(
+                f"QA logs phase={phase_name} view={view}"
+                + (f" filter={filter_pattern}" if filter_pattern else "")
+                + (f": {diagnostic}" if diagnostic else "")
+            )
+        elif event_name == "emit_qa_evaluation":
+            semantic = args.get("semantic_security_review")
+            attribution = args.get("test_attribution")
+            semantic_verdict = (
+                semantic.get("verdict", "")
+                if isinstance(semantic, Mapping)
+                else getattr(semantic, "verdict", "")
+            )
+            attribution_verdict = (
+                attribution.get("verdict", "")
+                if isinstance(attribution, Mapping)
+                else getattr(attribution, "verdict", "")
+            )
+            critical_outcome = _clean_text(
+                f"task_id={args.get('task_id', '')}; passed={args.get('passed', '')}; "
+                f"category={args.get('failure_category', '')}; "
+                f"retry_feedback={args.get('retry_feedback', '')}; "
+                f"semantic_review={semantic_verdict}; "
+                f"test_attribution={attribution_verdict}",
+                1250,
+            )
         elif event_name in {"search_web", "read_web_page"}:
             query_or_url = _clean_text(
                 _arg(args, "query", "url", "page_url", "search_query") or "", 260
@@ -455,16 +559,24 @@ class ScratchpadMemory:
             else:
                 self._seen_validation_outcomes.add(validation_outcome)
 
-        if not key_findings and not files_inspected and not plan_summary and not validation_outcome:
+        if (
+            not key_findings
+            and not files_inspected
+            and not plan_summary
+            and not validation_outcome
+            and not critical_outcome
+        ):
             return
         self._entries.append(
             ScratchpadEntry(
+                scope=entry_scope,
                 phase=normalized_phase,
                 round_number=max(1, int(round_number)),
                 key_findings=key_findings[:_MAX_FINDINGS_PER_ENTRY],
                 files_inspected=files_inspected[:_MAX_FILES_PER_ENTRY],
                 plan_summary=plan_summary,
                 validation_outcome=validation_outcome,
+                critical_outcome=critical_outcome,
             )
         )
 
@@ -479,6 +591,8 @@ class ScratchpadMemory:
             facts.append(f"plan: {entry.plan_summary}")
         if entry.validation_outcome:
             facts.append(f"validation: {entry.validation_outcome}")
+        if entry.critical_outcome:
+            facts.append(f"critical: {entry.critical_outcome}")
         return (
             [f"- round {entry.round_number}: {_clean_text(' | '.join(facts), 1500)}"]
             if facts
@@ -486,10 +600,19 @@ class ScratchpadMemory:
         )
 
     def _render_entries(self, entries: Sequence[ScratchpadEntry], truncated: bool = False) -> str:
-        """Render selected entries in fixed phase and chronological order."""
+        """Render selected entries in fixed scope and phase order."""
         lines = ["## Scratchpad Memory"]
+        qa_entries = [entry for entry in entries if entry.scope == ScratchpadScope.QA]
+        if qa_entries:
+            lines.append("### QA_REVIEW")
+            for entry in qa_entries:
+                lines.extend(self._entry_lines(entry))
         for phase in WorkaroundExecutionPhase:
-            phase_entries = [entry for entry in entries if entry.phase == phase]
+            phase_entries = [
+                entry
+                for entry in entries
+                if entry.scope == ScratchpadScope.WORKAROUND and entry.phase == phase
+            ]
             if not phase_entries:
                 continue
             lines.append(f"### {phase.value}")
@@ -511,7 +634,7 @@ class ScratchpadMemory:
         critical_indexes = [
             index
             for index, entry in enumerate(entries)
-            if entry.plan_summary or entry.validation_outcome
+            if entry.plan_summary or entry.validation_outcome or entry.critical_outcome
         ]
         finding_indexes = [
             index for index, entry in enumerate(entries) if index not in critical_indexes
@@ -596,7 +719,7 @@ def compact_conversation(
 
 
 class ContextManager:
-    """Manage phase-filtered bindings and ephemeral workaround context."""
+    """Manage phase-filtered bindings and ephemeral specialist context."""
 
     def __init__(
         self,
@@ -604,22 +727,35 @@ class ContextManager:
         *,
         scratchpad: ScratchpadMemory | None = None,
         compaction_interval: int = DEFAULT_COMPACTION_INTERVAL,
+        skip_phase_gating: bool = False,
+        scratchpad_scope: ScratchpadScope = ScratchpadScope.WORKAROUND,
     ) -> None:
         """Initialize a context manager for one node invocation.
 
         Args:
-            all_tools: Flat toolbelt returned by the workaround builder.
+            all_tools: Flat toolbelt returned by the worker builder.
             scratchpad: Optional memory object shared for this invocation.
             compaction_interval: Positive one-based model-round interval.
+            skip_phase_gating: If true, expose every supplied tool in every
+                phase and keep the initial binding for the whole run.
+            scratchpad_scope: Scope assigned to entries in this manager's
+                ephemeral scratchpad.
 
         Raises:
-            ValueError: If ``compaction_interval`` is not positive.
+            ValueError: If ``compaction_interval`` is not positive or the
+                scratchpad scope is invalid.
         """
         if compaction_interval <= 0:
             raise ValueError("compaction_interval must be positive")
         self._all_tools = tuple(all_tools)
-        self.scratchpad = scratchpad or ScratchpadMemory()
+        self.scratchpad_scope = (
+            scratchpad_scope
+            if isinstance(scratchpad_scope, ScratchpadScope)
+            else ScratchpadScope(scratchpad_scope)
+        )
+        self.scratchpad = scratchpad or ScratchpadMemory(self.scratchpad_scope)
         self.compaction_interval = int(compaction_interval)
+        self.skip_phase_gating = bool(skip_phase_gating)
 
     @property
     def all_tools(self) -> tuple[Any, ...]:
@@ -644,6 +780,8 @@ class ContextManager:
 
     def get_tools_for_phase(self, phase: WorkaroundExecutionPhase | str | None) -> list[Any]:
         """Return the manager's ordered model-visible tool list for a phase."""
+        if self.skip_phase_gating:
+            return list(self._all_tools)
         return get_tools_for_phase(phase, self._all_tools)
 
     def get_phase_prompt(
@@ -658,7 +796,12 @@ class ContextManager:
         self, event: Any, phase: WorkaroundExecutionPhase | str | None, round_number: int
     ) -> None:
         """Record one tool event in the node-local scratchpad."""
-        self.scratchpad.update_from_tool_event(event, phase, round_number)
+        self.scratchpad.update_from_tool_event(
+            event,
+            phase,
+            round_number,
+            scope=self.scratchpad_scope,
+        )
 
     def _with_scratchpad_message(self, conversation: Sequence[BaseMessage]) -> list[BaseMessage]:
         """Replace or insert only this manager's scratchpad system message."""
@@ -697,6 +840,7 @@ __all__ = [
     "PHASE_TOOL_REGISTRY",
     "ContextManager",
     "ScratchpadMemory",
+    "ScratchpadScope",
     "compact_conversation",
     "get_phase_prompt",
     "get_tools_for_phase",

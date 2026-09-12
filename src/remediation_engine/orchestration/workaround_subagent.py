@@ -832,6 +832,81 @@ def _workaround_search_strategy(
     )
 
 
+_WORKAROUND_COMMON_STATIC_INSTRUCTIONS = """You are a code security specialist
+operating inside a shared Docker workspace. Use only the provided scoped workspace
+tools and relative paths. Perform local inspection before external research, and
+use authoritative advisory, maintainer, migration-guide, or source-repository
+guidance when web research is necessary.
+
+Follow Investigate -> Plan -> Execute -> Validate. Record an evidence-backed plan
+before edits. Make one minimal semantic source patch per iteration with
+deterministic_apply_edit_set, and include an import plus all causally related
+call-site changes in the same atomic edit set. Call validate_workaround
+immediately after each edit set. Do not weaken the security invariant or modify
+unrelated code."""
+
+_WORKAROUND_INITIAL_MITIGATION_INSTRUCTIONS = """For INITIAL_MITIGATION, inspect
+local code first, then perform the initial search_web call once and read specific
+authoritative results with read_web_page. Adapt the security invariant to local
+code; do not copy an external patch blindly."""
+
+_WORKAROUND_QA_REGRESSION_REPAIR_INSTRUCTIONS = """For QA_REGRESSION_REPAIR, the
+dependency update and replayed edits are already present. Trace the failure from
+the test evidence to modified source. Use search_web only for migration guidance
+or exact breaking-change diagnostics. If a targeted test has a proven
+infrastructure-only failure, one existing alternative test may be substituted
+once with a recorded mapping; never substitute for an assertion, syntax, type, or
+application-runtime failure."""
+
+_WORKAROUND_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS = """For NO_FIX PACKAGE_REMOVAL,
+record a package-removal plan with the configured authorized manifest paths.
+remove_no_fix_dependency is the only manifest or lockfile operation. Remove
+source imports and dependent usage when local inspection shows them, then
+validate the cumulative source patch. Never manually edit lockfile nodes, bump
+versions, or modify tests. If no removable direct declaration exists, report
+NOT_APPLICABLE and surrender for vulnerable-code removal."""
+
+_WORKAROUND_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS = """For NO_FIX
+VULNERABLE_CODE_REMOVAL, keep the vulnerable package installed and perform a
+source-only removal of the vulnerable API and its callers. Never modify manifests,
+lockfiles, dependency versions, or test files. Validate with runtime smoke and a
+separate targeted test where available."""
+
+_WORKAROUND_EDIT_CHECKPOINT_INSTRUCTIONS = """The workspace is the baseline plus
+previously validated or replayed edit sets. Each deterministic_apply_edit_set is
+provisional until validate_workaround returns PASS. CODE_FAILURE rolls back the
+whole pending set; the next plan must re-include every required change. PASS
+promotes it into the cumulative patch. INFRA_FAILURE or BLOCKED retains the
+pending set for recovery; never re-apply the same patch. Always report
+modified_files cumulatively."""
+
+_WORKAROUND_VALIDATION_INSTRUCTIONS = """Runtime smoke must import a lightweight
+source module, never a test/spec file or build/dist artifact, and remain separate
+from the targeted test. Supply the complete cumulative modified-file list to
+validate_workaround. Resolve infrastructure-only validation failures through the
+permitted alternative targeted-test path; do not edit for infrastructure noise."""
+
+_WORKAROUND_PROHIBITIONS = """Never modify tests to make assertions pass. Never
+manually edit or delete lockfile nodes, bump library versions, or use absolute
+paths. Before source edits or package removal, call record_plan. For ordinary
+workarounds dependency manifests remain prohibited; for NO_FIX PACKAGE_REMOVAL
+only the configured package-removal operation may change its authorized manifest
+and lockfile paths."""
+
+_WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
+    [
+        _WORKAROUND_COMMON_STATIC_INSTRUCTIONS,
+        _WORKAROUND_INITIAL_MITIGATION_INSTRUCTIONS,
+        _WORKAROUND_QA_REGRESSION_REPAIR_INSTRUCTIONS,
+        _WORKAROUND_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS,
+        _WORKAROUND_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS,
+        _WORKAROUND_EDIT_CHECKPOINT_INSTRUCTIONS,
+        _WORKAROUND_VALIDATION_INSTRUCTIONS,
+        _WORKAROUND_PROHIBITIONS,
+    ]
+)
+
+
 def _build_workaround_prompt(
     target_task: Any,  # RemediationTask
     target_group: VulnerabilityGroup | list[str],
@@ -841,6 +916,7 @@ def _build_workaround_prompt(
     vulnerability_mechanism: str | None = None,
     workaround_context: WorkaroundContext | None = None,
 ) -> str:
+    """Build the dynamic human context for one workaround attempt."""
     if isinstance(target_group, list):
         constraints_ledger = list(target_group)
         target_group = target_task
@@ -853,7 +929,6 @@ def _build_workaround_prompt(
         if vulnerability_mechanism
         else _clean_prompt_snippet(_extract_vulnerability_mechanism(target_group), max_chars=600)
     )
-
     phase = (
         workaround_context.phase
         if workaround_context
@@ -882,16 +957,23 @@ def _build_workaround_prompt(
         if getattr(target_group, "cve_ids", None)
         else (target_group.ghsa_ids[0] if getattr(target_group, "ghsa_ids", None) else "")
     )
+    cves = ", ".join(getattr(target_group, "cve_ids", []) or []) or "(none)"
+    ghsas = ", ".join(getattr(target_group, "ghsa_ids", []) or []) or "(none)"
     selected_version = getattr(target_task, "selected_version", None)
     if not selected_version and fix_plan is not None:
         selected_version = getattr(fix_plan, "fixed_version", None)
 
     sections = [
-        "You are a code security specialist operating inside a shared Docker workspace.",
+        "DYNAMIC WORKAROUND CONTEXT (current attempt data):",
         f"WORKFLOW PHASE: {phase.value.upper()}",
         f"NO_FIX MITIGATION STAGE: {no_fix_stage or 'not applicable'}",
         f"Target Package: {comp_name}"
         + (f" (version: {selected_version})" if selected_version else ""),
+        f"CVEs: {cves}",
+        f"GHSAs: {ghsas}",
+        f"Vulnerability Identifier: {cve_label or 'none'}",
+        f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
+        f"Task Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=600)}",
     ]
 
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
@@ -907,119 +989,82 @@ def _build_workaround_prompt(
             ]
             if str(path).strip()
         ]
-        sections.append(
-            "\n".join(
-                [
-                    "=== NO_FIX PACKAGE REMOVAL ===",
-                    "  1. Inspect every authorized manifest path and trace imports and dependent call sites locally.",
-                    f"  2. Authorized manifest paths: {', '.join(manifest_paths) or 'none supplied'}.",
-                    "  3. Call record_plan with package_removal_requested=true and declare the authorized manifest path(s). An empty planned_replacements list is allowed only for this package-removal plan.",
-                    "  4. Call remove_no_fix_dependency for the configured vulnerable package. This is the only operation allowed to change the authorized manifest or lockfile, and it synchronizes through the detected package manager with lifecycle scripts disabled.",
-                    "  5. Remove source imports and dependent application usage with the normal source-edit tools when local inspection shows they exist, then call validate_workaround with the cumulative changed-file list.",
-                    "  6. Do not manually edit or delete lockfile nodes, bump versions, or modify tests. If no removable direct declaration exists, report NOT_APPLICABLE and surrender so the supervisor advances the same task to vulnerable-code removal.",
-                ]
-            )
-        )
-    elif no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
-        sections.append(
-            "\n".join(
-                [
-                    "=== NO_FIX VULNERABLE-CODE REMOVAL ===",
-                    "  1. Keep the vulnerable package installed; do not edit package.json, lockfiles, or dependency versions.",
-                    "  2. Use the CVE/GHSA advisory, scanner evidence, installed-package source, and local call sites to identify the vulnerable API and every direct or indirect caller.",
-                    "  3. Record one complete source-only plan, remove the vulnerable call paths, and clean up dead code without weakening the security invariant.",
-                    "  4. Never modify manifests, lockfiles, or test files. Validate the cumulative source patch with runtime smoke and the targeted QA test where available.",
-                ]
-            )
-        )
-    elif phase == WorkaroundPhase.INITIAL_MITIGATION:
-        sections.append(
-            "\n".join(
-                [
-                    "=== OPERATING PRINCIPLES ===",
-                    "  1. MINIMAL SURGICAL EDITS: Make only the changes necessary to implement a code workaround or isolate the targeted vulnerability. Do not rewrite surrounding unchanged code.",
-                    "  2. NO ASSUMPTIONS: Investigate the codebase using search_codebase_pattern, inspect_ast_symbol, and read_workspace_file BEFORE searching the web.",
-                    "  3. VALIDATION-DRIVEN CONFIRMATION: Verify fixes through validate_workaround.",
-                    "  4. ADAPT, DO NOT COPY: Extract the security invariant and apply it to local workspace code.",
-                    "",
-                    "=== EXECUTION LIFECYCLE ===",
-                    "  1. EXPLORE & INSPECT",
-                    "     - FIRST: Inspect local code files using search_codebase_pattern, inspect_ast_symbol, or read_workspace_file before searching the web.",
-                    "     - THEN: Use search_web for authoritative guidance. Perform the initial web search ONCE. Use read_web_page for specific results.",
-                    "  2. PLAN",
-                    "     - Form a hypothesis and call record_plan before making code edits.",
-                    "  3. IMPLEMENT",
-                    "     - Apply one complete semantic patch per iteration using deterministic_apply_edit_set. An API migration must place its import, declaration, and all causally related call-site replacements in the same edit set.",
-                    "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround to verify. Supply a lightweight source module as runtime_smoke_file; never use a test/spec file or build/dist artifact, and keep it separate from the targeted test.",
-                ]
-            )
-        )
-    else:  # QA_REGRESSION_REPAIR
-        sections.append(
-            "\n".join(
-                [
-                    "=== OPERATING PRINCIPLES ===",
-                    "  1. PRESERVE INTENT: Make only changes necessary to resolve QA regression following dependency update.",
-                    "  2. SEEDED DEPENDENCY: Dependency update is already seeded; do not modify manifests (package.json, etc.).",
-                    "  3. REPLAYED EDITS: Replayed edits from prior attempts are already present in the workspace; inspect workspace files directly.",
-                    "",
-                    "=== EXECUTION LIFECYCLE ===",
-                    "  1. EXPLORE & INSPECT",
-                    "     - Trace failing behavior from test location to modified source using search_codebase_pattern and read_workspace_file.",
-                    "     - Use search_web to check migration guides or exact breaking change diagnostics.",
-                    "  2. PLAN",
-                    "     - Record a complete cumulative plan using record_plan before editing.",
-                    "  3. IMPLEMENT",
-                    "     - Apply one complete semantic patch per iteration using deterministic_apply_edit_set. An API migration must place its import, declaration, and all causally related call-site replacements in the same edit set.",
-                    "  4. VERIFY & ITERATE",
-                    "     - Call validate_workaround with complete modified-file list, a lightweight source-module runtime_smoke_file, and a separate targeted test file.",
-                    "     - If the targeted test returns INFRA_FAILURE or BLOCKED with infrastructure-only evidence, do not edit. Inspect one existing alternative test, call record_targeted_test_substitution with the original-to-alternative mapping and evidence, then retry validate_workaround once. Never substitute for an assertion, syntax, type, or application-runtime failure.",
-                ]
-            )
-        )
-
-    sections.append(
-        "\n".join(
+        sections.extend(
             [
-                "=== EDIT CHECKPOINT CONTRACT ===",
-                "  - The workspace consists of the baseline plus any previously validated or replayed edit sets.",
-                "  - Each deterministic_apply_edit_set creates one pending edit set. It is provisional until validate_workaround returns PASS.",
-                "  - CODE_FAILURE rolls back the entire pending edit set to the pre-iteration checkpoint. The failed changes are no longer present; the next investigation and plan must re-include every required change from that set in one complete semantic patch.",
-                "  - PASS promotes the pending edit set into the validated cumulative patch. Previously validated edits remain in the workspace and do not need to be re-applied.",
-                "  - INFRA_FAILURE or BLOCKED retains the pending edit set for validation recovery. Do not re-apply the same patch; resolve the validation problem or use the permitted alternative targeted test path.",
-                "  - An alternative targeted test is bounded to one per iteration and requires: proven infrastructure-only failure, same behavior/security invariant, no dependency on the unavailable infrastructure, and recorded evidence for the mapping.",
-                "  - Always describe modified_files cumulatively: include every source file changed by the retained validated patch and the current pending edit set.",
+                "=== ACTIVE NO_FIX PACKAGE REMOVAL DATA ===",
+                f"Authorized manifest paths: {', '.join(dict.fromkeys(manifest_paths)) or 'none supplied'}",
+                f"Configured vulnerable package: {comp_name}",
             ]
         )
-    )
+    elif no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+        sections.append("=== ACTIVE NO_FIX VULNERABLE-CODE REMOVAL DATA ===")
 
-    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+    if current_replay_plan is not None:
+        replay_findings = sorted(str(key) for key in current_replay_plan.investigation_findings)
+        replay_lines = [
+            "=== REPLAY PLAN ===",
+            f"Source attempt: {current_replay_plan.source_attempt_id or 'unknown'}",
+            f"Successful edit sets already replayed: {len(current_replay_plan.successful_edit_sets)}",
+            f"Validated files: {', '.join(current_replay_plan.validated_files[:12]) or 'none'}",
+            f"Planned targets: {', '.join(current_replay_plan.planned_targets[:12]) or 'none'}",
+            f"Security invariants: {'; '.join(current_replay_plan.security_invariants[:4]) or 'none'}",
+            f"Diagnosed root causes: {'; '.join(current_replay_plan.diagnosed_root_causes[:4]) or 'none'}",
+            f"Prior finding keys: {', '.join(replay_findings[:12]) or 'none'}",
+            f"Validation calls: {current_replay_plan.validation_calls}",
+        ]
+        if current_replay_plan.final_selected_targeted_test:
+            replay_lines.append(
+                f"Selected targeted test: {current_replay_plan.final_selected_targeted_test}"
+            )
+        sections.append("\n".join(replay_lines))
+
+    if previous_feedback:
+        sections.append(
+            "=== PREVIOUS FEEDBACK ===\n" + _clean_prompt_log(previous_feedback, max_chars=1200)
+        )
+
+    if phase == WorkaroundPhase.QA_REGRESSION_REPAIR:
+        qa_evidence = workaround_context.qa_evidence if workaround_context else None
+        qa_lines = ["=== QA FAILURE EVIDENCE ==="]
+        diagnostic_logs = _qa_failure_log_snippet(qa_evidence, previous_feedback)
+        if diagnostic_logs:
+            qa_lines.append(f"Diagnostic:\n{diagnostic_logs}")
+        primary_sources = _primary_non_test_source_files(qa_evidence)
+        if primary_sources:
+            qa_lines.append("Primary Source Files:")
+            qa_lines.extend(f"  - {path}" for path in primary_sources)
+        preferred_tests = _preferred_targeted_test_files(qa_evidence)[:1]
+        if preferred_tests:
+            qa_lines.append(f"Targeted Test File: {preferred_tests[0]}")
+        tool_events = getattr(workaround_context, "tool_events", []) or []
+        latest_validation = _clean_prompt_snippet(
+            _latest_validation_feedback(tool_events),
+            max_chars=300,
+        )
+        if latest_validation:
+            qa_lines.append(f"Latest Validation Excerpt: {latest_validation}")
+        sections.append("\n".join(qa_lines))
+
+    if fix_plan and getattr(fix_plan, "workaround_snippets", None):
         sections.append(
             "\n".join(
                 [
-                    "=== PROHIBITIONS & ANTI-PATTERNS ===",
-                    "- ❌ NEVER manually edit or delete a lockfile node.",
-                    "- ❌ NEVER bump a dependency version or remove a package outside the configured package-removal tool.",
-                    "- ❌ NEVER modify tests.",
-                    "- ALWAYS use only the exact authorized manifest paths and relative source paths.",
-                    "- MUST call record_plan before source edits or package removal.",
+                    "=== WORKAROUND SNIPPETS ===",
+                    "Reference code patterns from security advisories:",
+                    *[
+                        f"  {index + 1}. {_clean_prompt_snippet(snippet, max_chars=300)}"
+                        for index, snippet in enumerate(fix_plan.workaround_snippets[:3])
+                    ],
                 ]
             )
         )
-    else:
-        sections.append(
-            "\n".join(
-                [
-                    "=== PROHIBITIONS & ANTI-PATTERNS ===",
-                    "- ❌ NEVER modify package.json, package-lock.json, pom.xml, or any dependency manifest.",
-                    "- ❌ NEVER modify test files to make assertions pass.",
-                    "- ❌ NEVER bump library versions.",
-                    "- ALWAYS use relative file paths.",
-                    "- MUST call record_plan before making code edits.",
-                ]
-            )
-        )
+
+    if constraints_ledger:
+        cleaned_constraints = [
+            _clean_prompt_snippet(constraint, max_chars=120)
+            for constraint in constraints_ledger[:5]
+        ]
+        sections.append("Constraints:\n" + "\n".join(f"- {item}" for item in cleaned_constraints))
 
     sections.append(
         _workaround_search_strategy(
@@ -1029,60 +1074,6 @@ def _build_workaround_prompt(
             previous_feedback,
         )
     )
-
-    qa_evidence = workaround_context.qa_evidence if workaround_context else None
-
-    if phase == WorkaroundPhase.QA_REGRESSION_REPAIR:
-        qa_lines = ["=== QA FAILURE EVIDENCE ==="]
-        diagnostic_logs = _qa_failure_log_snippet(qa_evidence, previous_feedback)
-        if diagnostic_logs:
-            qa_lines.append(f"Diagnostic:\n{diagnostic_logs}")
-
-        primary_sources = _primary_non_test_source_files(qa_evidence)
-        if primary_sources:
-            qa_lines.append("Primary Source Files:")
-            for ps in primary_sources:
-                qa_lines.append(f"  - {ps}")
-
-        pref_tests = _preferred_targeted_test_files(qa_evidence)[:1]
-        if pref_tests:
-            qa_lines.append(f"Targeted Test File: {pref_tests[0]}")
-
-        tool_events = getattr(workaround_context, "tool_events", []) or []
-        latest_val = _clean_prompt_snippet(_latest_validation_feedback(tool_events), max_chars=300)
-        if latest_val:
-            qa_lines.append(f"Latest Validation Excerpt: {latest_val}")
-
-        sections.append("\n".join(qa_lines))
-    else:  # INITIAL_MITIGATION
-        target_lines = [
-            "=== TARGET ===",
-            f"Vulnerability Identifier: {cve_label or 'none'}",
-            f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
-            f"Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=300)}",
-        ]
-        sections.append("\n".join(target_lines))
-
-    if fix_plan and getattr(fix_plan, "workaround_snippets", None):
-        sections.append(
-            "\n".join(
-                [
-                    "=== WORKAROUND SNIPPETS ===",
-                    "Reference code patterns from security advisories:",
-                    *[
-                        f"  {i + 1}. {_clean_prompt_snippet(snippet, max_chars=300)}"
-                        for i, snippet in enumerate(fix_plan.workaround_snippets[:3])
-                    ],
-                ]
-            )
-        )
-
-    if constraints_ledger:
-        cleaned_constraints = [
-            _clean_prompt_snippet(c, max_chars=120) for c in constraints_ledger[:5]
-        ]
-        sections.append("Constraints:\n" + "\n".join(f"- {c}" for c in cleaned_constraints))
-
     return "\n\n".join(sections)
 
 
@@ -1492,22 +1483,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 workaround_context=workaround_ctx,
             )
             initial_messages = [
-                SystemMessage(
-                    content=(
-                        "Use only the provided scoped workspace tools. Follow the enforced lifecycle: "
-                        "Investigate -> Plan -> Execute -> Validate. Perform local inspection first. "
-                        "Record an evidence-backed plan before making code edits. "
-                        "Make one minimal semantic source patch per iteration and call "
-                        "validate_workaround immediately. If one API migration requires an "
-                        "import plus multiple call-site changes, include those exact related "
-                        "lines in one atomic replacement before validating. Runtime smoke must "
-                        "import a lightweight source module, never a test/spec file or build/dist "
-                        "artifact, and it must be separate from the targeted test. "
-                        "For NO_FIX PACKAGE_REMOVAL, remove_no_fix_dependency is the only "
-                        "permitted manifest/lockfile operation; for all other stages those "
-                        "files remain prohibited."
-                    )
-                ),
+                SystemMessage(content=_WORKAROUND_STATIC_INSTRUCTIONS),
                 HumanMessage(content=prompt),
             ]
 

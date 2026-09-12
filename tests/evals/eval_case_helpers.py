@@ -121,6 +121,7 @@ def case_metadata(
                 "input_tokens": capture.input_tokens,
                 "output_tokens": capture.output_tokens,
                 "total_tokens": capture.total_tokens,
+                "cached_input_tokens": capture.cached_input_tokens,
                 "token_cost": capture.token_cost,
                 "token_usage_available": any(
                     value is not None
@@ -130,6 +131,7 @@ def case_metadata(
                         capture.total_tokens,
                     )
                 ),
+                "cache_usage_available": capture.cached_input_tokens is not None,
             }
         )
     return metadata

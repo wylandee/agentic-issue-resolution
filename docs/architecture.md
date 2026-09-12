@@ -69,6 +69,21 @@ terminal cycle resets the final-scan gate. Docker volumes and temporary
 targeted artifacts remain owned by the runtime/QA lifecycle and are removed
 on teardown or the targeted-scan cleanup path.
 
+## QA evaluator context
+
+Global QA execution remains deterministic and Supervisor-owned: install, scan, and
+test commands run before any evaluator model call. The active evaluator receives
+only compact status flags, identifiers, package-state facts, bounded action
+summaries, and read-only source-review tools. Raw command streams and ODC
+diagnostics stay private to the QA invocation and are queryable only through the
+bounded `query_qa_logs` tool while that invocation is active.
+
+QA context and its scratchpad are ephemeral review memory, never authoritative
+orchestration state. QA uses compaction interval 3 with a fresh context per group;
+workaround workers retain the default interval 4 and phase-filtered context. The
+legacy investigator/judge path and compatibility QA toolbelt remain frozen for
+older callers.
+
 ## Package boundaries
 
 - `contracts`: Pydantic models shared across boundaries.

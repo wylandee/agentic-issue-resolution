@@ -1361,17 +1361,33 @@ class WorkaroundExecutionPhase(StrEnum):
     VALIDATE = "VALIDATE"
 
 
+class ScratchpadScope(StrEnum):
+    """Scope for ephemeral specialist scratchpad entries."""
+
+    WORKAROUND = "WORKAROUND"
+    QA = "QA"
+
+
 class ScratchpadEntry(BaseModel):
-    """Bounded deterministic memory captured from one workaround tool round."""
+    """Bounded deterministic memory captured from one specialist tool round."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    phase: WorkaroundExecutionPhase
+    scope: ScratchpadScope = ScratchpadScope.WORKAROUND
+    phase: WorkaroundExecutionPhase | None = None
     round_number: int = Field(ge=1)
     key_findings: list[str] = Field(default_factory=list)
     files_inspected: list[str] = Field(default_factory=list)
     plan_summary: str = ""
     validation_outcome: str = ""
+    critical_outcome: str = Field(default="", max_length=1300)
+
+    @model_validator(mode="after")
+    def _require_workaround_phase(self) -> ScratchpadEntry:
+        """Require an execution phase for workaround-scoped entries."""
+        if self.scope == ScratchpadScope.WORKAROUND and self.phase is None:
+            raise ValueError("workaround scratchpad entries require a phase.")
+        return self
 
 
 class WorkaroundValidationStatus(StrEnum):

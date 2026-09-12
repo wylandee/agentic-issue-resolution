@@ -66,11 +66,12 @@ def _replay_input(case: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _recorder_token_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
-    """Return token usage fields captured by a production replay recorder."""
+    """Return token usage and provider cache fields from a replay recorder."""
     fields: dict[str, Any] = {
         "input_tokens": None,
         "output_tokens": None,
         "total_tokens": None,
+        "cached_input_tokens": recorder.cached_input_tokens,
         "token_cost": recorder.token_cost,
     }
     if recorder.token_data_available:
@@ -493,7 +494,7 @@ def replay_triage_case(
 
 
 def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
-    """Build deterministic QA execution results from the golden evidence."""
+    """Build deterministic QA results, including optional execution metadata."""
     import remediation_engine.orchestration.qa_critic as qa
 
     replay = _replay_input(case)
@@ -502,10 +503,102 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
     logs = replay.get("execution_logs", case.get("execution_logs", {}))
     logs = logs if isinstance(logs, Mapping) else {}
     results = qa._QAExecutionResults()
-    results.install = (
-        bool(execution.get("install_passed")),
-        str(logs.get("install_log", "replay install result")),
+
+    def optional_int(*values: Any) -> int | None:
+        for value in values:
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def optional_stream(prefix: str, stream: str) -> str | None:
+        for source in (execution, logs):
+            for key in (
+                f"{prefix}_{stream}",
+                f"{prefix}_raw_{stream}",
+                f"raw_{prefix}_{stream}",
+            ):
+                if key in source and source[key] is not None:
+                    return str(source[key])
+        return None
+
+    def record_from_payload(
+        payload: Mapping[str, Any],
+        phase: str,
+        default_label: str,
+    ) -> qa._QALogRecord:
+        return qa._QALogRecord(
+            phase=phase,
+            label=str(payload.get("label") or default_label),
+            exit_code=optional_int(payload.get("exit_code"), payload.get("returncode")),
+            stdout=str(payload.get("stdout") or ""),
+            stderr=str(payload.get("stderr") or ""),
+            error=str(payload["error"]) if payload.get("error") else None,
+        )
+
+    def fixture_records(phase: str, default_label: str) -> tuple[qa._QALogRecord, ...]:
+        raw_records: Any = None
+        for source in (execution, logs):
+            candidate = source.get(f"{phase}_records")
+            if candidate is not None:
+                raw_records = candidate
+                break
+            all_records = source.get("log_records")
+            if isinstance(all_records, Mapping) and phase in all_records:
+                raw_records = all_records[phase]
+                break
+        if isinstance(raw_records, Mapping):
+            raw_records = [
+                dict(value, label=label)
+                if isinstance(value, Mapping)
+                else {"label": label, "stdout": value}
+                for label, value in raw_records.items()
+            ]
+        if isinstance(raw_records, list):
+            parsed = tuple(
+                record_from_payload(item, phase, default_label)
+                for item in raw_records
+                if isinstance(item, Mapping)
+            )
+            if parsed:
+                return parsed
+        return ()
+
+    install_summary = str(logs.get("install_log", "replay install result"))
+    results.install = (bool(execution.get("install_passed")), install_summary)
+    results.install_exit_code = optional_int(
+        execution.get("install_exit_code"),
+        logs.get("install_exit_code"),
     )
+    results.install_error_category = (
+        str(
+            execution.get(
+                "install_error_category",
+                logs.get("install_error_category"),
+            )
+        )
+        if execution.get("install_error_category", logs.get("install_error_category"))
+        else None
+    )
+    results.install_raw_stdout = optional_stream("install", "stdout")
+    results.install_raw_stderr = optional_stream("install", "stderr")
+    install_records = fixture_records("install", "npm install")
+    if not install_records:
+        install_records = (
+            qa._QALogRecord(
+                phase="install",
+                label="npm install",
+                exit_code=results.install_exit_code,
+                stdout=results.install_raw_stdout or install_summary,
+                stderr=results.install_raw_stderr or "",
+                error=results.install_error_category,
+            ),
+        )
+    results.log_records["install"] = install_records
+
     policy = _policy_for_case(case, "qa")
     scanner_status_name = str(execution.get("scanner_execution_status", "not_run")).lower()
     if (
@@ -514,6 +607,17 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
     ):
         results.scan_skipped = True
         results.scan_skip_reason = "no_fix_package_removal"
+        scan_records = fixture_records("scan", "odc:skipped") or (
+            qa._QALogRecord(
+                phase="scan",
+                label="odc:skipped",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                error=results.scan_skip_reason,
+            ),
+        )
+        results.log_records["scan"] = scan_records
     else:
         raw_remaining = execution.get("target_remaining_identifiers", []) or []
         remaining = {str(value) for value in raw_remaining}
@@ -521,24 +625,67 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
         scan_ok = bool(execution.get("scanner_execution_status") == "success") and bool(
             target_cleared is True
         )
-        status_name = str(execution.get("scanner_execution_status", "not_run")).lower()
-        scan_status = (
-            ScannerExecutionStatus.SUCCESS
-            if status_name == "success"
-            else ScannerExecutionStatus.UNPARSEABLE
-            if status_name in {"failed", "failure", "error"}
-            else ScannerExecutionStatus.NOT_RUN
+        try:
+            scan_status = ScannerExecutionStatus(scanner_status_name)
+        except ValueError:
+            scan_status = (
+                ScannerExecutionStatus.UNPARSEABLE
+                if scanner_status_name in {"failed", "failure", "error"}
+                else ScannerExecutionStatus.NOT_RUN
+            )
+        scan_summary = str(logs.get("scan_summary", "replay scanner result"))
+        scan_stdout = optional_stream("scan", "stdout")
+        scan_stderr = optional_stream("scan", "stderr")
+        scan_exit_code = optional_int(
+            execution.get("scan_exit_code"),
+            execution.get("scanner_exit_code"),
+            logs.get("scan_exit_code"),
         )
+        scan_records = fixture_records("scan", "odc:full")
         results.scan = qa._SecurityScanResult(
             ok=scan_ok,
-            summary=str(logs.get("scan_summary", "replay scanner result")),
+            summary=scan_summary,
             remaining_identifiers=remaining,
             found_identifiers={
                 str(value) for value in execution.get("found_identifiers", []) or []
             },
             new_identifiers={str(value) for value in execution.get("new_identifiers", []) or []},
             execution_status=scan_status,
+            exit_code=scan_exit_code,
+            raw_stdout=scan_stdout,
+            raw_stderr=scan_stderr,
+            diagnostic_log_path=(
+                str(execution["diagnostic_log_path"])
+                if execution.get("diagnostic_log_path")
+                else None
+            ),
+            scan_records=scan_records,
         )
+        if not scan_records:
+            effective_scope = str(execution.get("effective_scope", "full"))
+            scan_label = (
+                "odc:fallback-full"
+                if execution.get("fallback_reason")
+                else "odc:targeted"
+                if effective_scope == ScanScope.TARGETED.value
+                else "odc:full"
+            )
+            results.log_records["scan"] = (
+                qa._QALogRecord(
+                    phase="scan",
+                    label=scan_label,
+                    exit_code=scan_exit_code,
+                    stdout=scan_stdout or scan_summary,
+                    stderr=scan_stderr or "",
+                    error=(
+                        str(results.scan.diagnostic_log_path)
+                        if results.scan.diagnostic_log_path
+                        else None
+                    ),
+                ),
+            )
+        else:
+            results.log_records["scan"] = scan_records
         try:
             requested_scope = ScanScope(str(execution.get("requested_scope", "full")))
             effective_scope = ScanScope(
@@ -561,9 +708,52 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
             )
         except (TypeError, ValueError):
             results.scan_evidence = None
-    results.tests = (
-        bool(execution.get("tests_passed")),
-        str(logs.get("test_output", "replay test result")),
+
+    test_summary = str(logs.get("test_output", "replay test result"))
+    results.tests = (bool(execution.get("tests_passed")), test_summary)
+    results.test_exit_code = optional_int(
+        execution.get("test_exit_code"),
+        logs.get("test_exit_code"),
+    )
+    results.test_failure_count = optional_int(
+        execution.get("test_failure_count"),
+        logs.get("test_failure_count"),
+    )
+    results.test_raw_stdout = optional_stream("test", "stdout")
+    if results.test_raw_stdout is None:
+        results.test_raw_stdout = optional_stream("tests", "stdout")
+    results.test_raw_stderr = optional_stream("test", "stderr")
+    if results.test_raw_stderr is None:
+        results.test_raw_stderr = optional_stream("tests", "stderr")
+    test_records = fixture_records("tests", "npm test") or fixture_records("test", "npm test")
+    if not test_records:
+        test_records = (
+            qa._QALogRecord(
+                phase="tests",
+                label="npm test",
+                exit_code=results.test_exit_code,
+                stdout=results.test_raw_stdout or test_summary,
+                stderr=results.test_raw_stderr or "",
+                error=None,
+            ),
+        )
+    results.log_records["tests"] = test_records
+
+    diagnostics = execution.get("package_state_diagnostics", []) or []
+    if not isinstance(diagnostics, (list, tuple)):
+        diagnostics = [str(diagnostics)]
+    results.package_state_by_group[group.group_id] = qa._QAPackageState(
+        manifest_state=(
+            str(execution["package_manifest_state"])
+            if execution.get("package_manifest_state") is not None
+            else None
+        ),
+        graph_state=(
+            str(execution["package_graph_state"])
+            if execution.get("package_graph_state") is not None
+            else None
+        ),
+        diagnostics=tuple(str(value) for value in diagnostics if value),
     )
     return results
 

@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 from remediation_engine.contracts.schemas import QAFailureEvidence, WorkaroundContext
 from remediation_engine.orchestration.workaround_subagent import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
     WorkaroundPhase,
     _build_workaround_prompt,
     _workaround_search_recommendation,
@@ -71,7 +72,10 @@ def test_compact_qa_regression_repair_prompt():
     )
 
     assert "WORKFLOW PHASE: QA_REGRESSION_REPAIR" in prompt
-    assert "Dependency update is already seeded; do not modify manifests" in prompt
+    assert (
+        "dependency update and replayed edits are already present"
+        in _WORKAROUND_STATIC_INSTRUCTIONS
+    )
     assert "Diagnostic:\n" in prompt
     assert "insecurity jwt middleware rejects an invalid token" in prompt
     assert "expected 401 to equal 500" in prompt

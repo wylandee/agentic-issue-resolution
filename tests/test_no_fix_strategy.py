@@ -36,7 +36,10 @@ from remediation_engine.orchestration.task_utils import (
     build_initial_remediation_task,
     build_no_fix_retry_instruction,
 )
-from remediation_engine.orchestration.workaround_subagent import _build_workaround_prompt
+from remediation_engine.orchestration.workaround_subagent import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
+    _build_workaround_prompt,
+)
 
 
 def _group() -> VulnerabilityGroup:
@@ -248,9 +251,9 @@ def test_no_fix_prompts_do_not_contradict_package_removal_or_stage_two_rules():
             no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
         ),
     )
-    assert "remove_no_fix_dependency" in package_prompt
+    assert "remove_no_fix_dependency is the only manifest" in _WORKAROUND_STATIC_INSTRUCTIONS
     assert "Dependency update is already seeded" not in package_prompt
-    assert "manual" in package_prompt.lower()
+    assert "manual" in _WORKAROUND_STATIC_INSTRUCTIONS.lower()
 
     stage_two_prompt = _build_workaround_prompt(
         task.model_copy(update={"no_fix_stage": NoFixMitigationStage.VULNERABLE_CODE_REMOVAL}),
@@ -260,9 +263,10 @@ def test_no_fix_prompts_do_not_contradict_package_removal_or_stage_two_rules():
             no_fix_stage=NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
         ),
     )
-    assert "Keep the vulnerable package installed" in stage_two_prompt
-    assert "NEVER modify package.json" in stage_two_prompt
-    assert "NEVER modify test files" in stage_two_prompt
+    assert "no_fix mitigation stage: vulnerable_code_removal" in stage_two_prompt.lower()
+    assert "keep the vulnerable package installed" in _WORKAROUND_STATIC_INSTRUCTIONS.lower()
+    assert "manifests remain prohibited" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "Never modify tests to make assertions pass" in _WORKAROUND_STATIC_INSTRUCTIONS
 
 
 class _PackageSandbox:

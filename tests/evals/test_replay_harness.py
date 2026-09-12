@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from remediation_engine.contracts.schemas import CommandResult
 from remediation_engine.evals.models import EvalTestCaseRecord
@@ -123,9 +124,9 @@ def test_replay_capture_token_usage_is_added_to_case_metadata() -> None:
         input_tokens=100,
         output_tokens=25,
         total_tokens=125,
+        cached_input_tokens=80,
         token_cost=0.0003,
     )
-
     metadata = case_metadata(
         {"case_id": "case"},
         component="workaround_subagent",
@@ -139,6 +140,8 @@ def test_replay_capture_token_usage_is_added_to_case_metadata() -> None:
     assert metadata["total_tokens"] == 125
     assert metadata["token_cost"] == 0.0003
     assert metadata["token_usage_available"] is True
+    assert metadata["cached_input_tokens"] == 80
+    assert metadata["cache_usage_available"] is True
 
 
 def test_duplicate_metric_records_count_one_replay_once() -> None:
@@ -188,8 +191,8 @@ def test_scripted_model_consumes_bound_tool_trace_and_final_response() -> None:
     )
     model.bind_tools([SimpleNamespace(name="read_file_context")])
 
-    first = model.invoke([])
-    second = model.invoke([])
+    first = model.invoke([SystemMessage(content="static")])
+    second = model.invoke([SystemMessage(content="static"), HumanMessage(content="dynamic")])
 
     assert first.tool_calls[0]["name"] == "read_file_context"
     assert second.tool_calls == []
@@ -197,6 +200,9 @@ def test_scripted_model_consumes_bound_tool_trace_and_final_response() -> None:
     assert model.consumed_tool_calls == [
         {"name": "read_file_context", "args": {"file_path": "src/app.js"}, "id": "call-1"}
     ]
+    assert model.invocation_messages[0][0]["type"] == "system"
+    assert model.invocation_messages[0][0]["content"] == "static"
+    assert model.invocation_messages[1][-1]["content"] == "dynamic"
     with pytest.raises(AssertionError, match="more scripted"):
         model.invoke([])
 

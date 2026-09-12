@@ -12,6 +12,9 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.qa_critic import (
     QAScanTarget,
+    _QAInstallOutcome,
+    _QALogRecord,
+    _QATestExecutionOutcome,
     _run_global_execution,
     _SecurityScanResult,
 )
@@ -43,6 +46,46 @@ def _lockfile() -> str:
     )
 
 
+def _install_outcome(ok: bool = True) -> _QAInstallOutcome:
+    """Build a typed install fixture for global execution tests."""
+    return _QAInstallOutcome(
+        ok=ok,
+        summary="ok" if ok else "install failed",
+        exit_code=0 if ok else 1,
+        error_category=None if ok else "PEER_CONFLICT",
+        raw_stdout="",
+        raw_stderr="",
+        log_record=_QALogRecord(
+            phase="install",
+            label="npm install",
+            exit_code=0 if ok else 1,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+
+def _test_outcome(ok: bool = True) -> _QATestExecutionOutcome:
+    """Build a typed test fixture for global execution tests."""
+    return _QATestExecutionOutcome(
+        ok=ok,
+        summary="ok" if ok else "tests failed",
+        exit_code=0 if ok else 1,
+        failure_count=0 if ok else None,
+        raw_stdout="",
+        raw_stderr="",
+        log_records=(
+            _QALogRecord(
+                phase="tests",
+                label="npm test",
+                exit_code=0 if ok else 1,
+                stdout="",
+                stderr="",
+            ),
+        ),
+    )
+
+
 def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     sandbox = MagicMock()
     sandbox.read_file.return_value = _lockfile()
@@ -55,14 +98,18 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
         [],
     )
     with (
-        patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")),
+        patch(
+            "remediation_engine.orchestration.qa_critic._run_install",
+            return_value=_install_outcome(),
+        ),
         patch(
             "remediation_engine.orchestration.qa_critic._run_targeted_security_scan",
             return_value=targeted_result,
         ) as targeted_scan,
         patch("remediation_engine.orchestration.qa_critic._run_security_scan") as full_scan,
         patch(
-            "remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")
+            "remediation_engine.orchestration.qa_critic._run_unit_tests",
+            return_value=_test_outcome(),
         ),
     ):
         results = _run_global_execution(
@@ -75,7 +122,9 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
 
     targeted_scan.assert_called_once()
     full_scan.assert_not_called()
-    assert results.scan == targeted_result
+    assert results.scan is not None
+    assert results.scan.ok is True
+    assert [record.label for record in results.scan.scan_records] == ["odc:targeted"]
     assert results.scan_evidence is not None
     assert results.scan_evidence.effective_scope == ScanScope.TARGETED
     assert results.scan_evidence.authoritative is False
@@ -101,7 +150,10 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
     )
     full_result = _SecurityScanResult(True, "full", set(), set(), set(), [])
     with (
-        patch("remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")),
+        patch(
+            "remediation_engine.orchestration.qa_critic._run_install",
+            return_value=_install_outcome(),
+        ),
         patch(
             "remediation_engine.orchestration.qa_critic._run_targeted_security_scan"
         ) as targeted_scan,
@@ -110,7 +162,8 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
             return_value=full_result,
         ) as full_scan,
         patch(
-            "remediation_engine.orchestration.qa_critic._run_unit_tests", return_value=(True, "ok")
+            "remediation_engine.orchestration.qa_critic._run_unit_tests",
+            return_value=_test_outcome(),
         ),
     ):
         results = _run_global_execution(
@@ -121,6 +174,8 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
             scan_targets=[_target()],
         )
 
+    assert results.scan is not None
+    assert [record.label for record in results.scan.scan_records] == ["odc:fallback-full"]
     targeted_scan.assert_not_called()
     full_scan.assert_called_once()
     evidence: ODCScanEvidence = results.scan_evidence

@@ -174,6 +174,7 @@ def test_local_recorder_extracts_message_token_usage_and_provider_cost():
             "token_usage": {
                 "prompt_tokens": 120,
                 "completion_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 95},
             },
             "token_cost_usd": 0.00042,
         },
@@ -190,6 +191,7 @@ def test_local_recorder_extracts_message_token_usage_and_provider_cost():
     assert recorder.total_completion_tokens == 30
     assert recorder.total_tokens == 150
     assert recorder.token_cost == 0.00042
+    assert recorder.cached_input_tokens == 95
 
 
 def test_attempt_snapshot_summary_renders_correlated_worker_and_qa_state():

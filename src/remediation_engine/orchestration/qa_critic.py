@@ -35,7 +35,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -64,11 +64,13 @@ from remediation_engine.contracts.schemas import (
     ScanFallbackReason,
     ScannerExecutionStatus,
     ScanScope,
+    ScratchpadScope,
     SecurityReviewVerdict,
     TestAttributionVerdict,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
@@ -117,6 +119,7 @@ _LOG_QUERY_MAX_CHARS = 6_000
 _TEST_FAILURE_MAX_ITEMS = 8
 _TEST_FAILURE_CONTEXT_LINES = 12
 _TEST_FAILURE_EXCERPT_CHARS = 500
+_QA_ACTION_SUMMARY_MAX_CHARS = 1_200
 _LOCAL_NPM_TEST_RUNNERS = frozenset({"jest", "mocha", "vitest"})
 
 # Exclusion patterns for workspace diff
@@ -134,7 +137,8 @@ _DIFF_EXCLUDE_SUFFIXES = frozenset({".map", ".lock"})
 _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 
 # Install error patterns that indicate peer/engine conflicts
-_PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EBADENGINE", "peer dep", "peer tree")
+_PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EOVERRIDE", "peer dep", "peer tree")
+_ENGINE_CONFLICT_PATTERNS = ("EBADENGINE",)
 
 
 @dataclass(frozen=True)
@@ -729,29 +733,190 @@ def _run_targeted_odc(
 # ---------------------------------------------------------------------------
 
 
-def _run_install(sandbox: DockerSandbox) -> tuple[bool, str]:
-    """
-    Run ``npm install --package-lock=true`` inside the workspace.
+@dataclass(frozen=True)
+class _QALogRecord:
+    """Private raw execution evidence for one QA command or suite."""
+
+    phase: str
+    label: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _QAInstallOutcome:
+    """Structured outcome of the deterministic npm install command."""
+
+    ok: bool
+    summary: str
+    exit_code: int | None
+    error_category: str | None
+    raw_stdout: str | None
+    raw_stderr: str | None
+    log_record: _QALogRecord
+
+
+@dataclass(frozen=True)
+class _QATestExecutionOutcome:
+    """Structured outcome of all deterministic test-suite commands."""
+
+    ok: bool
+    summary: str
+    exit_code: int | None
+    failure_count: int | None
+    raw_stdout: str | None
+    raw_stderr: str | None
+    log_records: tuple[_QALogRecord, ...]
+
+
+def _exception_stream(error: BaseException, name: str) -> str:
+    """Read a text stream attached to a command exception."""
+    return _subprocess_text(getattr(error, name, None))
+
+
+def _install_error_category(stdout: str, stderr: str, exit_code: int) -> str:
+    """Classify a failed npm install for deterministic retry routing."""
+    combined = f"{stdout}\n{stderr}".lower()
+    if any(marker.lower() in combined for marker in _ENGINE_CONFLICT_PATTERNS):
+        return "ENGINE_CONFLICT"
+    if any(marker.lower() in combined for marker in _PEER_CONFLICT_PATTERNS):
+        return "PEER_CONFLICT"
+    return "INSTALL_FAILURE"
+
+
+def _append_qa_log_records(
+    results: _QAExecutionResults,
+    phase: str,
+    records: Sequence[_QALogRecord],
+) -> None:
+    """Append immutable command records to one phase of the results cache."""
+    if not records:
+        return
+    current = results.log_records.get(phase, ())
+    results.log_records[phase] = (*current, *tuple(records))
+
+
+def _store_install_outcome(results: _QAExecutionResults, outcome: _QAInstallOutcome) -> None:
+    """Store install projections and its private raw evidence."""
+    results.install = (outcome.ok, outcome.summary)
+    results.install_exit_code = outcome.exit_code
+    results.install_error_category = outcome.error_category
+    results.install_raw_stdout = outcome.raw_stdout
+    results.install_raw_stderr = outcome.raw_stderr
+    _append_qa_log_records(results, "install", (outcome.log_record,))
+
+
+def _store_test_outcome(results: _QAExecutionResults, outcome: _QATestExecutionOutcome) -> None:
+    """Store test projections and private suite evidence."""
+    results.tests = (outcome.ok, outcome.summary)
+    results.test_exit_code = outcome.exit_code
+    results.test_failure_count = outcome.failure_count
+    results.test_raw_stdout = outcome.raw_stdout
+    results.test_raw_stderr = outcome.raw_stderr
+    _append_qa_log_records(results, "tests", outcome.log_records)
+
+
+def _label_scan_records(
+    records: Sequence[_QALogRecord],
+    label: str | None,
+) -> tuple[_QALogRecord, ...]:
+    """Apply a deterministic display label to scan records when requested."""
+    if not label:
+        return tuple(records)
+    return tuple(
+        record if record.label == label else replace(record, label=label) for record in records
+    )
+
+
+def _store_scan_outcome(
+    results: _QAExecutionResults,
+    scan_result: _SecurityScanResult,
+    *,
+    label: str | None = None,
+) -> None:
+    records = tuple(scan_result.scan_records)
+    if records:
+        if label:
+            records = _label_scan_records(records, label)
+    else:
+        records = (
+            _QALogRecord(
+                phase="scan",
+                label=label or "odc:full",
+                exit_code=scan_result.exit_code,
+                stdout=scan_result.raw_stdout or scan_result.summary,
+                stderr=scan_result.raw_stderr or "",
+                error=scan_result.diagnostic_log_path,
+            ),
+        )
+    if records != scan_result.scan_records:
+        scan_result = replace(scan_result, scan_records=records)
+    results.scan = scan_result
+    _append_qa_log_records(results, "scan", records)
+
+
+def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
+    """Run npm install and retain bounded and raw deterministic evidence.
+
+    Args:
+        sandbox: Active QA sandbox in which npm should run.
 
     Returns:
-        (success, summary_text)
+        A structured install outcome. Raw streams remain private to the
+        invocation and are also represented by one immutable log record.
     """
-    result = sandbox.run(
-        "npm install --package-lock=true",
-        timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
-    )
-    if result.exit_code == 0:
-        return True, "npm install succeeded."
+    error: BaseException | None = None
+    try:
+        result = sandbox.run(
+            "npm install --package-lock=true",
+            timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
+        )
+        exit_code = int(getattr(result, "exit_code", 1))
+        stdout = _subprocess_text(getattr(result, "stdout", ""))
+        stderr = _subprocess_text(getattr(result, "stderr", ""))
+    except Exception as exc:  # noqa: BLE001
+        error = exc
+        raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
+        try:
+            exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+        except (TypeError, ValueError):
+            exit_code = None
+        stdout = _exception_stream(exc, "stdout")
+        stderr = _exception_stream(exc, "stderr")
 
-    # Surface the tail of the output so the LLM context stays bounded.
-    stdout_tail = "\n".join(result.stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
-    stderr_tail = "\n".join(result.stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
-    summary = (
-        f"npm install FAILED (exit {result.exit_code}).\n"
-        f"stdout tail:\n{stdout_tail}\n"
-        f"stderr tail:\n{stderr_tail}"
+    if exit_code == 0:
+        summary = "npm install succeeded."
+        category = None
+    else:
+        category = _install_error_category(stdout, stderr, exit_code or 1)
+        stdout_tail = "\n".join(stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
+        stderr_tail = "\n".join(stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
+        summary = (
+            f"npm install FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
+            f"stdout tail:\n{stdout_tail}\n"
+            f"stderr tail:\n{stderr_tail}"
+        )
+        if error is not None:
+            summary += f"\nerror: {error}"
+
+    return _QAInstallOutcome(
+        ok=exit_code == 0,
+        summary=summary,
+        exit_code=exit_code,
+        error_category=category,
+        raw_stdout=stdout,
+        raw_stderr=stderr,
+        log_record=_QALogRecord(
+            phase="install",
+            label="npm install",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            error=str(error) if error is not None else None,
+        ),
     )
-    return False, summary
 
 
 @dataclass(frozen=True, eq=False)
@@ -771,6 +936,11 @@ class _SecurityScanResult:
     new_identifiers: set[str]
     found_issues: list[VulnerabilityIssue] = field(default_factory=list)
     execution_status: ScannerExecutionStatus = ScannerExecutionStatus.NOT_RUN
+    exit_code: int | None = None
+    raw_stdout: str | None = None
+    raw_stderr: str | None = None
+    diagnostic_log_path: str | None = None
+    scan_records: tuple[_QALogRecord, ...] = ()
 
     def _legacy_projection(self) -> tuple[bool, str, set[str]]:
         return self.ok, self.summary, self.remaining_identifiers
@@ -791,10 +961,47 @@ class _SecurityScanResult:
                 and self.new_identifiers == other.new_identifiers
                 and self.found_issues == other.found_issues
                 and self.execution_status == other.execution_status
+                and self.exit_code == other.exit_code
+                and self.raw_stdout == other.raw_stdout
+                and self.raw_stderr == other.raw_stderr
+                and self.diagnostic_log_path == other.diagnostic_log_path
+                and self.scan_records == other.scan_records
             )
         if isinstance(other, tuple):
             return self._legacy_projection() == other
         return NotImplemented
+
+
+def _record_scan_result(
+    result: _SecurityScanResult,
+    *,
+    label: str,
+    exit_code: int | None,
+    stdout: str | None,
+    stderr: str | None,
+    diagnostic_log_path: Any = None,
+    error: str | None = None,
+) -> _SecurityScanResult:
+    """Attach private process metadata and one immutable scan log record."""
+    raw_stdout = _subprocess_text(stdout)
+    raw_stderr = _subprocess_text(stderr)
+    path = str(diagnostic_log_path) if diagnostic_log_path else None
+    record = _QALogRecord(
+        phase="scan",
+        label=label,
+        exit_code=exit_code,
+        stdout=raw_stdout,
+        stderr=raw_stderr,
+        error=error,
+    )
+    return replace(
+        result,
+        exit_code=exit_code,
+        raw_stdout=raw_stdout,
+        raw_stderr=raw_stderr,
+        diagnostic_log_path=path,
+        scan_records=(record,),
+    )
 
 
 def _run_security_scan(
@@ -803,17 +1010,19 @@ def _run_security_scan(
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
 ) -> _SecurityScanResult:
-    """
-    Run OWASP Dependency-Check and classify the complete identifier snapshot.
+    """Run ODC and classify the complete identifier snapshot.
+
+    Args:
+        sandbox: Active QA sandbox containing the post-remediation workspace.
+        workspace_volume: Docker volume mounted into Dependency-Check.
+        target_identifiers: Vulnerability identifiers owned by the active QA
+            attempt.
+        baseline_identifiers: Optional pre-remediation identifier snapshot used
+            to identify newly introduced findings.
 
     Returns:
-        A ``_SecurityScanResult`` containing the complete post-remediation
-        identifier set, unresolved target identifiers, and newly introduced
-        identifiers.  Iteration remains backward-compatible with the legacy
-        ``(success, summary_text, remaining_identifiers)`` shape.
-        ``success=False`` when Docker is absent, ODC times out, or no
-        parseable report is produced.
-        ``remaining_identifiers`` is empty on success or on hard failure.
+        A scan result with the historical three-value projection plus private
+        process streams, exit status, diagnostics path, and one scan record.
     """
     baseline = {
         identifier.upper().strip()
@@ -823,16 +1032,38 @@ def _run_security_scan(
         if identifier and identifier.strip()
     }
 
+    def finish(
+        result: _SecurityScanResult,
+        *,
+        exit_code: int | None = None,
+        stdout: str | None = None,
+        stderr: str | None = None,
+        diagnostic_log_path: Any = None,
+        error: str | None = None,
+    ) -> _SecurityScanResult:
+        return _record_scan_result(
+            result,
+            label="odc:full",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=error,
+        )
+
     if shutil.which("docker") is None:
         msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
         logger.warning("qa_critic: %s", msg)
-        return _SecurityScanResult(
-            False,
-            msg,
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+            ),
+            error=msg,
         )
 
     try:
@@ -842,25 +1073,60 @@ def _run_security_scan(
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
             + _odc_exception_log_note(exc)
         )
-        return _SecurityScanResult(
-            False,
-            msg,
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "odc_log_path", None),
+            error=str(exc),
         )
     except subprocess.TimeoutExpired as exc:
         msg = _odc_timeout_summary(exc)
-        return _SecurityScanResult(
-            False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.TIMEOUT
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.TIMEOUT,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "log_path", None),
+            error=str(exc),
         )
     except Exception as exc:  # noqa: BLE001
-        msg = f"FAILURE: Dependency-Check subprocess error â€” {exc}"
-        return _SecurityScanResult(
-            False, msg, set(), set(), set(), execution_status=ScannerExecutionStatus.UNPARSEABLE
+        msg = f"FAILURE: Dependency-Check subprocess error — {exc}"
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "odc_log_path", None),
+            error=str(exc),
         )
 
+    try:
+        exit_code = int(getattr(proc, "returncode", 1))
+    except (TypeError, ValueError):
+        exit_code = None
+    stdout = _subprocess_text(getattr(proc, "stdout", ""))
+    stderr = _subprocess_text(getattr(proc, "stderr", ""))
+    diagnostic_log_path = _odc_process_metadata(proc, "odc_log_path")
     saved_html_report = _persist_workspace_report_to_host(
         sandbox,
         _ODC_HTML_REPORT_NAME,
@@ -886,27 +1152,51 @@ def _run_security_scan(
     if found_issues is None and found_identifiers is not None:
         found_issues = []
 
-    if proc.returncode != 0 and (found_identifiers is None or found_issues is None):
+    if exit_code != 0 and (found_identifiers is None or found_issues is None):
         summary = (
-            f"FAILURE: Dependency-Check exited {proc.returncode} and produced "
+            f"FAILURE: Dependency-Check exited {exit_code} and produced "
             "no parseable report.\n"
-            f"stdout:\n{proc.stdout[:2000]}\n"
-            f"stderr:\n{proc.stderr[:2000]}"
+            f"stdout:\n{stdout[:2000]}\n"
+            f"stderr:\n{stderr[:2000]}"
         )
         summary += report_location_note
-        return _SecurityScanResult(
-            False, summary, set(), set(), set(), execution_status=ScannerExecutionStatus.UNPARSEABLE
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
         )
 
     if found_identifiers is None or found_issues is None:
         summary = (
-            f"FAILURE: Dependency-Check report was not parseable "
-            f"(exit {proc.returncode}).\n"
-            f"stderr:\n{proc.stderr[:2000]}"
+            "FAILURE: Dependency-Check report was not parseable "
+            f"(exit {exit_code}).\n"
+            f"stderr:\n{stderr[:2000]}"
         )
         summary += report_location_note
-        return _SecurityScanResult(
-            False, summary, set(), set(), set(), execution_status=ScannerExecutionStatus.UNPARSEABLE
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
         )
 
     found_identifiers = {
@@ -925,28 +1215,40 @@ def _run_security_scan(
         if new_identifiers:
             summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
         summary += report_location_note
-        return _SecurityScanResult(
-            False,
-            summary,
-            remaining,
-            found_identifiers,
-            new_identifiers,
-            found_issues,
-            execution_status=ScannerExecutionStatus.SUCCESS,
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary,
+                remaining,
+                found_identifiers,
+                new_identifiers,
+                found_issues,
+                execution_status=ScannerExecutionStatus.SUCCESS,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
         )
 
     summary = "Dependency-Check found no remaining target vulnerability identifiers."
     if new_identifiers:
         summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
     summary += report_location_note
-    return _SecurityScanResult(
-        True,
-        summary,
-        set(),
-        found_identifiers,
-        new_identifiers,
-        found_issues,
-        execution_status=ScannerExecutionStatus.SUCCESS,
+    return finish(
+        _SecurityScanResult(
+            True,
+            summary,
+            set(),
+            found_identifiers,
+            new_identifiers,
+            found_issues,
+            execution_status=ScannerExecutionStatus.SUCCESS,
+        ),
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        diagnostic_log_path=diagnostic_log_path,
     )
 
 
@@ -969,47 +1271,101 @@ def _run_targeted_security_scan(
         for identifier in baseline_identifiers
         if identifier and identifier.strip()
     }
+
+    def finish(
+        result: _SecurityScanResult,
+        *,
+        exit_code: int | None = None,
+        stdout: str | None = None,
+        stderr: str | None = None,
+        diagnostic_log_path: Any = None,
+        error: str | None = None,
+    ) -> _SecurityScanResult:
+        return _record_scan_result(
+            result,
+            label="odc:targeted",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=error,
+        )
+
     if shutil.which("docker") is None:
-        return _SecurityScanResult(
-            False,
-            "FAILURE: docker is not available on PATH; Dependency-Check cannot run.",
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+        msg = "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+            ),
+            error=msg,
         )
 
     try:
         proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
     except FileNotFoundError as exc:
-        return _SecurityScanResult(
-            False,
+        msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
-            + _odc_exception_log_note(exc),
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+            + _odc_exception_log_note(exc)
+        )
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.DOCKER_UNAVAILABLE,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "odc_log_path", None),
+            error=str(exc),
         )
     except subprocess.TimeoutExpired as exc:
-        return _SecurityScanResult(
-            False,
-            _odc_timeout_summary(exc),
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.TIMEOUT,
+        msg = _odc_timeout_summary(exc)
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.TIMEOUT,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "log_path", None),
+            error=str(exc),
         )
     except Exception as exc:  # noqa: BLE001
-        return _SecurityScanResult(
-            False,
-            f"FAILURE: Dependency-Check subprocess error — {exc}",
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.UNPARSEABLE,
+        msg = f"FAILURE: Dependency-Check subprocess error — {exc}"
+        return finish(
+            _SecurityScanResult(
+                False,
+                msg,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            stdout=_exception_stream(exc, "stdout"),
+            stderr=_exception_stream(exc, "stderr"),
+            diagnostic_log_path=getattr(exc, "odc_log_path", None),
+            error=str(exc),
         )
 
+    try:
+        exit_code = int(getattr(proc, "returncode", 1))
+    except (TypeError, ValueError):
+        exit_code = None
+    stdout = _subprocess_text(getattr(proc, "stdout", ""))
+    stderr = _subprocess_text(getattr(proc, "stderr", ""))
+    diagnostic_log_path = _odc_process_metadata(proc, "odc_log_path")
     report_dir = _validate_qa_path(targeted_subdir)
     report_json = f"{report_dir}/{_ODC_REPORT_NAME}"
     report_html = f"{report_dir}/{_ODC_HTML_REPORT_NAME}"
@@ -1034,45 +1390,66 @@ def _run_targeted_security_scan(
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
     if found_issues is None and found_identifiers is not None:
         found_issues = []
-    if proc.returncode != 0 and (found_identifiers is None or found_issues is None):
+    if exit_code != 0 and (found_identifiers is None or found_issues is None):
         summary = (
-            f"FAILURE: Dependency-Check exited {proc.returncode} and produced no parseable report.\n"
-            f"stdout:\n{proc.stdout[:2000]}\n"
-            f"stderr:\n{proc.stderr[:2000]}"
+            f"FAILURE: Dependency-Check exited {exit_code} and produced no parseable report.\n"
+            f"stdout:\n{stdout[:2000]}\n"
+            f"stderr:\n{stderr[:2000]}"
         )
-        return _SecurityScanResult(
-            False,
-            summary + report_location_note,
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.UNPARSEABLE,
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary + report_location_note,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
         )
     if found_identifiers is None or found_issues is None:
         summary = (
-            f"FAILURE: Dependency-Check report was not parseable (exit {proc.returncode}).\n"
-            f"stderr:\n{proc.stderr[:2000]}"
+            "FAILURE: Dependency-Check report was not parseable "
+            f"(exit {exit_code}).\n"
+            f"stderr:\n{stderr[:2000]}"
         )
-        return _SecurityScanResult(
-            False,
-            summary + report_location_note,
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.UNPARSEABLE,
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary + report_location_note,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
         )
-    if proc.returncode != 0:
+    if exit_code != 0:
         summary = (
-            f"FAILURE: targeted Dependency-Check exited {proc.returncode}.\n"
-            f"stderr:\n{proc.stderr[:2000]}"
+            f"FAILURE: targeted Dependency-Check exited {exit_code}.\nstderr:\n{stderr[:2000]}"
         )
-        return _SecurityScanResult(
-            False,
-            summary + report_location_note,
-            set(),
-            set(),
-            set(),
-            execution_status=ScannerExecutionStatus.UNPARSEABLE,
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary + report_location_note,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
         )
 
     found = {identifier.upper().strip() for identifier in found_identifiers if identifier}
@@ -1087,27 +1464,39 @@ def _run_targeted_security_scan(
         )
         if new_identifiers:
             summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
-        return _SecurityScanResult(
-            False,
-            summary + report_location_note,
-            remaining,
-            found,
-            new_identifiers,
-            found_issues,
-            execution_status=ScannerExecutionStatus.SUCCESS,
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary + report_location_note,
+                remaining,
+                found,
+                new_identifiers,
+                found_issues,
+                execution_status=ScannerExecutionStatus.SUCCESS,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
         )
 
     summary = "Dependency-Check found no remaining target vulnerability identifiers."
     if new_identifiers:
         summary += f" Newly introduced identifiers: {', '.join(sorted(new_identifiers))}."
-    return _SecurityScanResult(
-        True,
-        summary + report_location_note,
-        set(),
-        found,
-        new_identifiers,
-        found_issues,
-        execution_status=ScannerExecutionStatus.SUCCESS,
+    return finish(
+        _SecurityScanResult(
+            True,
+            summary + report_location_note,
+            set(),
+            found,
+            new_identifiers,
+            found_issues,
+            execution_status=ScannerExecutionStatus.SUCCESS,
+        ),
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        diagnostic_log_path=diagnostic_log_path,
     )
 
 
@@ -1384,7 +1773,9 @@ def _summarize_failed_test_output(exit_code: int, stdout: str, stderr: str) -> s
 
 
 _QA_ERROR_MARKER = re.compile(
-    r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
+    r"(?:error|exception|failed|failure|fatal|eresolve|eoverride|ebadengine|"
+    r"timeout|timed\s+out|diagnostic|not\s+a\s+function|undefined|cannot|"
+    r"invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
     re.IGNORECASE,
 )
 _QA_SOURCE_LOCATION = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?::(?P<column>\d+))?$")
@@ -2334,40 +2725,136 @@ def _format_normalized_test_summary(suites: list[_NormalizedSuiteResult]) -> str
 def _run_detected_test_suites(
     sandbox: DockerSandbox,
     plans: list[_TestSuitePlan],
-) -> tuple[bool, str]:
-    """Run every detected child suite and aggregate all failure evidence."""
+) -> _QATestExecutionOutcome:
+    """Run every detected child suite and aggregate raw and parsed evidence."""
     suite_results: list[_NormalizedSuiteResult] = []
+    records: list[_QALogRecord] = []
     for plan in plans:
         command = _structured_command_for_plan(plan)
-        result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
-        suite_result = _normalize_suite_result(plan, result, command=command)
+        try:
+            result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
+            exit_code = int(getattr(result, "exit_code", 1))
+            stdout = _subprocess_text(getattr(result, "stdout", ""))
+            stderr = _subprocess_text(getattr(result, "stderr", ""))
+            suite_result = _normalize_suite_result(plan, result, command=command)
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            exit_code = None
+            stdout = _exception_stream(exc, "stdout")
+            stderr = _exception_stream(exc, "stderr")
+            suite_result = _NormalizedSuiteResult(
+                name=plan.name,
+                runner=plan.runner,
+                command=command,
+                exit_code=1,
+                failed_tests=[],
+                diagnostics=[],
+                fallback_summary=f"tests:{plan.name} failed before producing a result: {exc}",
+            )
+            error = str(exc)
         suite_results.append(suite_result)
-    if any(suite.exit_code != 0 for suite in suite_results):
-        return False, _format_normalized_test_summary(suite_results)
-    return True, _format_normalized_test_summary(suite_results)
+        records.append(
+            _QALogRecord(
+                phase="tests",
+                label=f"tests:{plan.name}",
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                error=error,
+            )
+        )
+
+    failed_suites = [suite for suite in suite_results if suite.exit_code != 0]
+    failure_count: int | None = sum(len(suite.failed_tests) for suite in suite_results)
+    if any(not suite.failed_tests and suite.exit_code != 0 for suite in failed_suites):
+        failure_count = None
+    ok = not failed_suites
+    exit_code = (
+        next(
+            (record.exit_code for record in reversed(records) if record.exit_code not in (None, 0)),
+            0,
+        )
+        if ok
+        else next(
+            (
+                record.exit_code
+                for record in reversed(records)
+                if record.exit_code is not None and record.exit_code != 0
+            ),
+            None,
+        )
+    )
+
+    def combined_stream(stream_name: str) -> str:
+        values = [getattr(record, stream_name) for record in records]
+        if len(values) == 1:
+            return values[0]
+        return "\n\n".join(
+            f"[{record.label} {stream_name}]\n{getattr(record, stream_name)}"
+            for record in records
+            if getattr(record, stream_name)
+        )
+
+    return _QATestExecutionOutcome(
+        ok=ok,
+        summary=_format_normalized_test_summary(suite_results),
+        exit_code=exit_code,
+        failure_count=failure_count if not ok or records else 0,
+        raw_stdout=combined_stream("stdout"),
+        raw_stderr=combined_stream("stderr"),
+        log_records=tuple(records),
+    )
 
 
-def _run_unit_tests(sandbox: DockerSandbox) -> tuple[bool, str]:
-    """
-    Run workspace unit tests, preferring structured child-suite summaries.
-
-    Returns:
-        (success, summary_text)
-    """
+def _run_unit_tests(sandbox: DockerSandbox) -> _QATestExecutionOutcome:
+    """Run workspace tests and retain raw, suite, and normalized evidence."""
     plans = _detect_test_suite_plans(sandbox)
     if plans and any(plan.runner != "npm_text_fallback" for plan in plans):
         return _run_detected_test_suites(sandbox, plans)
 
-    result = sandbox.run("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
-    if result.exit_code == 0:
-        return True, "npm test passed."
+    error: BaseException | None = None
+    try:
+        result = sandbox.run("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
+        exit_code = int(getattr(result, "exit_code", 1))
+        stdout = _subprocess_text(getattr(result, "stdout", ""))
+        stderr = _subprocess_text(getattr(result, "stderr", ""))
+    except Exception as exc:  # noqa: BLE001
+        error = exc
+        raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
+        try:
+            exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+        except (TypeError, ValueError):
+            exit_code = None
+        stdout = _exception_stream(exc, "stdout")
+        stderr = _exception_stream(exc, "stderr")
 
-    summary = _summarize_failed_test_output(
-        result.exit_code,
-        result.stdout,
-        result.stderr,
+    if exit_code == 0:
+        summary = "npm test passed."
+        failure_count = 0
+    else:
+        summary = _summarize_failed_test_output(exit_code or 1, stdout, stderr)
+        evidence = extract_qa_failure_evidence(exit_code or 1, stdout, stderr)
+        failure_count = len(evidence.failed_tests) if evidence.failed_tests else None
+        if error is not None:
+            summary += f"\nerror: {error}"
+
+    record = _QALogRecord(
+        phase="tests",
+        label="npm test",
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        error=str(error) if error is not None else None,
     )
-    return False, summary
+    return _QATestExecutionOutcome(
+        ok=exit_code == 0,
+        summary=summary,
+        exit_code=exit_code,
+        failure_count=failure_count,
+        raw_stdout=stdout,
+        raw_stderr=stderr,
+        log_records=(record,),
+    )
 
 
 def _generate_workspace_diff(
@@ -2767,6 +3254,15 @@ class _QAExecutionResults:
     install: tuple[bool, str] | None = None  # (ok, summary)
     scan: Any | None = None  # _SecurityScanResult or legacy tuple
     tests: tuple[bool, str] | None = None  # (ok, summary)
+    install_exit_code: int | None = None
+    install_error_category: str | None = None
+    install_raw_stdout: str | None = None
+    install_raw_stderr: str | None = None
+    test_exit_code: int | None = None
+    test_failure_count: int | None = None
+    test_raw_stdout: str | None = None
+    test_raw_stderr: str | None = None
+    log_records: dict[str, tuple[_QALogRecord, ...]] = field(default_factory=dict)
     scan_evidence: ODCScanEvidence | None = None
     package_state_by_group: dict[str, _QAPackageState] = field(default_factory=dict)
     scan_skipped: bool = False
@@ -3233,6 +3729,15 @@ def _trim_action_summary_text(summary_text: str, group: VulnerabilityGroup) -> s
             trimmed_lines.append(line)
 
     return "\n".join(trimmed_lines)
+
+
+def _bounded_qa_action_summary(summary_text: str, group: VulnerabilityGroup) -> str:
+    """Trim one active evaluator action summary to a bounded context budget."""
+    summary = _trim_action_summary_text(summary_text, group)
+    if len(summary) <= _QA_ACTION_SUMMARY_MAX_CHARS:
+        return summary
+    marker = "... (summary truncated)"
+    return summary[: _QA_ACTION_SUMMARY_MAX_CHARS - len(marker)].rstrip() + marker
 
 
 def _parse_report_bullets(block_text: str) -> dict[str, str]:
@@ -3818,12 +4323,27 @@ def _run_global_execution(
     results = _QAExecutionResults()
 
     logger.info("qa_critic: [Step 0] running npm install.")
-    results.install = _run_install(sandbox)
-    install_ok, _ = results.install
+    install_outcome = _run_install(sandbox)
+    _store_install_outcome(results, install_outcome)
+    install_ok = results.install[0]
 
     if skip_scan:
         results.scan_skipped = True
         results.scan_skip_reason = scan_skip_reason or "explicitly skipped by QA policy"
+        _append_qa_log_records(
+            results,
+            "scan",
+            (
+                _QALogRecord(
+                    phase="scan",
+                    label="odc:skipped",
+                    exit_code=None,
+                    stdout="",
+                    stderr="",
+                    error=results.scan_skip_reason,
+                ),
+            ),
+        )
         logger.info(
             "qa_critic: [Step 0] skipping security scan (%s); install_ok=%s.",
             results.scan_skip_reason,
@@ -3836,13 +4356,19 @@ def _run_global_execution(
         if baseline_identifiers is None:
             # Preserve the legacy helper call shape for direct callers that do not
             # provide a pre-remediation baseline.
-            results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+            _store_scan_outcome(
+                results,
+                _run_security_scan(sandbox, workspace_volume, target_identifiers),
+            )
         else:
-            results.scan = _run_security_scan(
-                sandbox,
-                workspace_volume,
-                target_identifiers,
-                baseline_identifiers,
+            _store_scan_outcome(
+                results,
+                _run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline_identifiers,
+                ),
             )
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
@@ -3874,13 +4400,14 @@ def _run_global_execution(
                     and not targeted_result.found_identifiers
                     and not targeted_result.remaining_identifiers
                 ):
+                    _append_qa_log_records(results, "scan", targeted_result.scan_records)
                     fallback_reason = (
                         ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
                         if "report" in targeted_result.summary.lower()
                         else ScanFallbackReason.TARGETED_SCAN_FAILED
                     )
                 else:
-                    results.scan = targeted_result
+                    _store_scan_outcome(results, targeted_result, label="odc:targeted")
                     results.scan_evidence = _scan_evidence(
                         targets=scan_targets,
                         scan_result=targeted_result,
@@ -3897,14 +4424,19 @@ def _run_global_execution(
 
         if fallback_reason is not None:
             if baseline_identifiers is None:
-                results.scan = _run_security_scan(sandbox, workspace_volume, target_identifiers)
+                fallback_result = _run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                )
             else:
-                results.scan = _run_security_scan(
+                fallback_result = _run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
                     baseline,
                 )
+            _store_scan_outcome(results, fallback_result, label="odc:fallback-full")
             results.scan_evidence = _scan_evidence(
                 targets=scan_targets,
                 scan_result=results.scan,
@@ -3942,7 +4474,8 @@ def _run_global_execution(
         )
 
     logger.info("qa_critic: [Step 0] running unit tests.")
-    results.tests = _run_unit_tests(sandbox)
+    test_outcome = _run_unit_tests(sandbox)
+    _store_test_outcome(results, test_outcome)
 
     return results
 
@@ -4005,9 +4538,9 @@ def build_qa_toolbelt(
         if results.install is not None:
             _, summary = results.install
             return f"[CACHED â€” already run] {summary}"
-        ok, summary = _run_install(sandbox)
-        results.install = (ok, summary)
-        return summary
+        install_outcome = _run_install(sandbox)
+        _store_install_outcome(results, install_outcome)
+        return install_outcome.summary
 
     @tool
     def run_security_scan() -> str:
@@ -4025,6 +4558,20 @@ def build_qa_toolbelt(
         if skip_scan:
             results.scan_skipped = True
             results.scan_skip_reason = scan_skip_reason or "explicitly skipped by QA policy"
+            _append_qa_log_records(
+                results,
+                "scan",
+                (
+                    _QALogRecord(
+                        phase="scan",
+                        label="odc:skipped",
+                        exit_code=None,
+                        stdout="",
+                        stderr="",
+                        error=results.scan_skip_reason,
+                    ),
+                ),
+            )
             return f"[SKIPPED] {results.scan_skip_reason}"
         if baseline_identifiers is None:
             scan_result = _run_security_scan(
@@ -4039,7 +4586,7 @@ def build_qa_toolbelt(
                 target_identifiers,
                 baseline_identifiers,
             )
-        results.scan = scan_result
+        _store_scan_outcome(results, scan_result)
         return scan_result.summary
 
     @tool
@@ -4055,9 +4602,9 @@ def build_qa_toolbelt(
             return f"[CACHED â€” already run] {summary}"
         if results.scan is None and not results.scan_skipped:
             return "ERROR: run_unit_tests must be called after run_security_scan."
-        ok, summary = _run_unit_tests(sandbox)
-        results.tests = (ok, summary)
-        return summary
+        test_outcome = _run_unit_tests(sandbox)
+        _store_test_outcome(results, test_outcome)
+        return test_outcome.summary
 
     # ------------------------------------------------------------------
     # Review tools (read-only, always callable)
@@ -4182,6 +4729,196 @@ def build_qa_toolbelt(
 # ---------------------------------------------------------------------------
 
 
+_QA_LOG_DEFAULT_TAIL_LINES = {"install": 80, "scan": 30, "tests": 60}
+_QA_LOG_VIEWS = {"summary", "tail", "errors", "full", "filter"}
+
+
+def _qa_log_records_for_phase(
+    results: _QAExecutionResults,
+    log_type: str,
+) -> tuple[_QALogRecord, ...]:
+    """Return captured records, synthesizing one from legacy cache fields."""
+    records = results.log_records.get(log_type, ())
+    if records:
+        return records
+    if log_type == "install" and results.install is not None:
+        return (
+            _QALogRecord(
+                phase=log_type,
+                label="npm install",
+                exit_code=results.install_exit_code,
+                stdout=results.install_raw_stdout or results.install[1],
+                stderr=results.install_raw_stderr or "",
+                error=results.install_error_category,
+            ),
+        )
+    if log_type == "scan":
+        if results.scan_skipped:
+            return (
+                _QALogRecord(
+                    phase=log_type,
+                    label="odc:skipped",
+                    exit_code=None,
+                    stdout="",
+                    stderr="",
+                    error=results.scan_skip_reason or "scan skipped",
+                ),
+            )
+        if results.scan is not None:
+            return (
+                _QALogRecord(
+                    phase=log_type,
+                    label="odc:full",
+                    exit_code=getattr(results.scan, "exit_code", None),
+                    stdout=getattr(results.scan, "raw_stdout", None)
+                    or _scan_result_value(results.scan, "summary", "scan completed"),
+                    stderr=getattr(results.scan, "raw_stderr", None) or "",
+                    error=getattr(results.scan, "diagnostic_log_path", None),
+                ),
+            )
+    if log_type == "tests" and results.tests is not None:
+        return (
+            _QALogRecord(
+                phase=log_type,
+                label="npm test",
+                exit_code=results.test_exit_code,
+                stdout=results.test_raw_stdout or results.tests[1],
+                stderr=results.test_raw_stderr or "",
+                error=None,
+            ),
+        )
+    return ()
+
+
+def _qa_log_record_text(record: _QALogRecord) -> str:
+    """Render one private log record with stream and lifecycle metadata."""
+    lines = [
+        f"=== {record.label} (exit_code={record.exit_code}) ===",
+    ]
+    if record.stdout:
+        lines.extend([f"[{record.label} stdout]", record.stdout.rstrip()])
+    if record.stderr:
+        lines.extend([f"[{record.label} stderr]", record.stderr.rstrip()])
+    if record.error:
+        lines.extend([f"[error] {record.error}"])
+    return "\n".join(lines)
+
+
+def _qa_log_summary(results: _QAExecutionResults, log_type: str) -> str:
+    """Return a bounded metadata-rich summary for one QA phase."""
+    if log_type == "install":
+        if results.install is None:
+            return "ERROR: run_dependency_install has not been called yet."
+        details = [results.install[1]]
+        if results.install_exit_code is not None:
+            details.append(f"exit_code={results.install_exit_code}")
+        if results.install_error_category:
+            details.append(f"error_category={results.install_error_category}")
+        return "\n".join(details)
+    if log_type == "scan":
+        if results.scan_skipped:
+            return f"[SKIPPED] {results.scan_skip_reason or 'scan skipped'}"
+        if results.scan is None:
+            return "ERROR: run_security_scan has not been called yet."
+        details = [_scan_result_value(results.scan, "summary", "scan completed")]
+        execution_status = getattr(results.scan, "execution_status", None)
+        if execution_status:
+            details.append(f"execution_status={execution_status}")
+        exit_code = getattr(results.scan, "exit_code", None)
+        if exit_code is not None:
+            details.append(f"exit_code={exit_code}")
+        diagnostic_log_path = getattr(results.scan, "diagnostic_log_path", None)
+        if diagnostic_log_path:
+            details.append(f"diagnostic_log_path={diagnostic_log_path}")
+        return "\n".join(details)
+    if log_type == "tests":
+        if results.tests is None:
+            return "ERROR: run_unit_tests has not been called yet."
+        details = [results.tests[1]]
+        if results.test_exit_code is not None:
+            details.append(f"exit_code={results.test_exit_code}")
+        if results.test_failure_count is not None:
+            details.append(f"failure_count={results.test_failure_count}")
+        return "\n".join(details)
+    return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
+
+
+def _qa_log_stream_text(record: _QALogRecord) -> str:
+    """Render only captured stdout/stderr lines for tail and error views."""
+    sections: list[str] = []
+    if record.stdout:
+        sections.append(f"[{record.label} stdout]\n{record.stdout}")
+    if record.stderr:
+        sections.append(f"[{record.label} stderr]\n{record.stderr}")
+    return "\n\n".join(sections)
+
+
+def _query_qa_logs(
+    results: _QAExecutionResults,
+    log_type: str,
+    *,
+    view: str = "summary",
+    filter_pattern: str = "",
+    tail_lines: int = 0,
+) -> str:
+    """Query bounded structured QA execution evidence for one phase."""
+    if log_type not in {"install", "scan", "tests"}:
+        return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
+    if view not in _QA_LOG_VIEWS:
+        return "ERROR: view must be one of: 'summary', 'tail', 'errors', 'full', 'filter'."
+    if not isinstance(tail_lines, int) or isinstance(tail_lines, bool) or tail_lines < 0:
+        return "ERROR: tail_lines must be a non-negative integer."
+    if view == "filter" and not filter_pattern:
+        return "ERROR: filter_pattern is required when view='filter'."
+    try:
+        filter_re = re.compile(filter_pattern, re.IGNORECASE) if filter_pattern else None
+    except re.error as exc:
+        return f"ERROR: filter_pattern is not a valid regular expression: {exc}"
+
+    summary = _qa_log_summary(results, log_type)
+    if summary.startswith("ERROR:") or summary.startswith("[SKIPPED]") or view == "summary":
+        selected = summary
+    else:
+        records = _qa_log_records_for_phase(results, log_type)
+        stream_rendered = "\n\n".join(_qa_log_stream_text(record) for record in records)
+        if view == "errors":
+            seen_error_lines: set[str] = set()
+            error_lines: list[str] = []
+            error_rendered = "\n\n".join(
+                part
+                for part in [
+                    stream_rendered,
+                    *(
+                        f"[{record.label} error]\n{record.error}"
+                        for record in records
+                        if record.error
+                    ),
+                ]
+                if part
+            )
+            for line in error_rendered.splitlines():
+                if _QA_ERROR_MARKER.search(line) and line not in seen_error_lines:
+                    seen_error_lines.add(line)
+                    error_lines.append(line)
+            selected = "\n".join(error_lines)
+            if not selected:
+                selected = "(no error lines captured)"
+        elif view == "tail":
+            count = tail_lines or _QA_LOG_DEFAULT_TAIL_LINES[log_type]
+            selected = "\n".join(stream_rendered.splitlines()[-count:])
+        else:
+            selected = "\n\n".join(_qa_log_record_text(record) for record in records)
+    if filter_re is not None:
+        selected = "\n".join(line for line in selected.splitlines() if filter_re.search(line))
+        if not selected:
+            selected = "(no matching log lines)"
+    if len(selected) > _LOG_QUERY_MAX_CHARS:
+        marker = "\n... (log output truncated)"
+        selected = selected[: max(0, _LOG_QUERY_MAX_CHARS - len(marker))].rstrip()
+        selected += marker
+    return selected
+
+
 def build_qa_review_toolbelt(
     sandbox: DockerSandbox,
     candidate_changed_files: list[str],
@@ -4251,31 +4988,32 @@ def build_qa_review_toolbelt(
         return content
 
     @tool
-    def query_qa_logs(log_type: str) -> str:
+    def query_qa_logs(
+        log_type: str,
+        view: str = "summary",
+        filter_pattern: str = "",
+        tail_lines: int = 0,
+    ) -> str:
         """
-        Return cached QA log output. log_type: 'install', 'scan', or 'tests'.
+        Query bounded QA evidence.
+
+        Args:
+            log_type: QA phase: ``install``, ``scan``, or ``tests``.
+            view: ``summary``, ``tail``, ``errors``, ``full``, or ``filter``.
+            filter_pattern: Optional case-insensitive regular expression applied
+                to the selected view.
+            tail_lines: Number of lines for ``tail``; zero uses a phase default.
         """
         review_error = _review_ready_error(results)
         if review_error:
             return review_error
-        if log_type == "install":
-            if results.install is None:
-                return "ERROR: run_dependency_install has not been called yet."
-            _, summary = results.install
-            return summary[:_LOG_QUERY_MAX_CHARS]
-        if log_type == "scan":
-            if results.scan_skipped:
-                return f"[SKIPPED] {results.scan_skip_reason or 'scan skipped'}"
-            if results.scan is None:
-                return "ERROR: run_security_scan has not been called yet."
-            summary = _scan_result_value(results.scan, "summary", "scan completed")
-            return summary[:_LOG_QUERY_MAX_CHARS]
-        if log_type == "tests":
-            if results.tests is None:
-                return "ERROR: run_unit_tests has not been called yet."
-            _, summary = results.tests
-            return summary[:_LOG_QUERY_MAX_CHARS]
-        return "ERROR: log_type must be one of: 'install', 'scan', 'tests'."
+        return _query_qa_logs(
+            results,
+            log_type,
+            view=view,
+            filter_pattern=filter_pattern,
+            tail_lines=tail_lines,
+        )
 
     @tool
     def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
@@ -4325,6 +5063,9 @@ def _build_qa_terminal_tool() -> StructuredTool:
         name="emit_qa_evaluation",
         description=(
             "Return the final structured QA evaluation for the assigned task. "
+            f"Use exact serialized enum values: failure_category={_QA_FAILURE_CATEGORY_VALUES}; "
+            f"semantic_security_review.verdict={_QA_SECURITY_REVIEW_VALUES}; "
+            f"test_attribution.verdict={_QA_TEST_ATTRIBUTION_VALUES}. "
             "Do not write a narrative response."
         ),
         args_schema=QACriticLLMOutput,
@@ -4401,6 +5142,170 @@ def _format_deterministic_test_failure_ledger(
     return "\n".join(lines)
 
 
+_QA_FAILURE_CATEGORY_VALUES = ", ".join(f"`{category.value}`" for category in FailureCategory)
+_QA_SECURITY_REVIEW_VALUES = ", ".join(f"`{verdict.value}`" for verdict in SecurityReviewVerdict)
+_QA_TEST_ATTRIBUTION_VALUES = ", ".join(f"`{verdict.value}`" for verdict in TestAttributionVerdict)
+
+
+_QA_EVALUATOR_STATIC_PREAMBLE = f"""You are a task-scoped QA evaluator. Review exactly
+one vulnerability group using deterministic evidence and read-only workspace tools.
+The global install, scanner, and test commands have already run; never execute them
+again. Do not infer ownership from a shared failure without exact evidence.
+
+Use only these read-only tools as needed:
+list_changed_files, generate_workspace_diff, read_file_context,
+search_codebase_pattern, inspect_ast_symbol, query_qa_logs.
+Do not edit files, mutate packages, browse the registry, or rerun commands.
+
+Classify the assigned group only. A group passes only when its policy is satisfied,
+the vulnerable path is addressed where required, and the evidence supports the
+decision. Use test attribution only when the evidence supports one of
+{_QA_TEST_ATTRIBUTION_VALUES}; use
+`{TestAttributionVerdict.INCONCLUSIVE.value}` when exact failed-test evidence and
+causal or exonerating source evidence are insufficient.
+
+Completion is terminal-only: call emit_qa_evaluation exactly once and emit no
+free-form final answer. Allowed failure_category values are exactly:
+{_QA_FAILURE_CATEGORY_VALUES}. Python owns deterministic gates, failure
+evidence, scan evidence, and contract/provenance fields; do not fill those fields.
+"""
+
+
+def _qa_status(
+    result: Any,
+    *,
+    skipped: bool = False,
+) -> str:
+    """Return the compact status token used in the evaluator context."""
+    if skipped:
+        return "SKIPPED"
+    if result is None:
+        return "NOT_RUN"
+    execution_status = getattr(result, "execution_status", None)
+    status_value = getattr(execution_status, "value", execution_status)
+    if str(status_value).lower() == "not_run":
+        return "NOT_RUN"
+    return "PASS" if bool(_scan_result_value(result, "ok", False)) else "FAIL"
+
+
+def _build_qa_dynamic_context(
+    group: VulnerabilityGroup,
+    strategy: str,
+    results: _QAExecutionResults,
+    group_remaining_ids: list[str],
+    candidate_changed_files: list[str],
+    action_summaries: list[AgentActionSummary],
+    qa_policy: QAPolicy | None = None,
+) -> str:
+    """Build the per-group facts appended to the static evaluator prompt."""
+    fix_plan = group.fix_plan
+    fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+    fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+    cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
+    ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
+    install_status = _qa_status(results.install)
+    scan_status = _qa_status(results.scan, skipped=results.scan_skipped)
+    tests_status = _qa_status(results.tests)
+    scan_execution_status = getattr(results.scan, "execution_status", None)
+    if hasattr(scan_execution_status, "value"):
+        scan_execution_status = scan_execution_status.value
+    if scan_execution_status is None and results.scan is not None:
+        scan_execution_status = (
+            ScannerExecutionStatus.SUCCESS.value
+            if bool(_scan_result_value(results.scan, "ok", False))
+            else ScannerExecutionStatus.UNPARSEABLE.value
+        )
+    scan_execution_status = scan_execution_status or (
+        "SKIPPED" if results.scan_skipped else "NOT_RUN"
+    )
+    install_exit_code = (
+        str(results.install_exit_code) if results.install_exit_code is not None else "unknown"
+    )
+    install_category = results.install_error_category or "none"
+    test_failure_count = (
+        str(results.test_failure_count) if results.test_failure_count is not None else "unknown"
+    )
+    package_state = results.package_state_by_group.get(group.group_id)
+    if package_state is None:
+        package_state_text = "manifest=unknown; graph=unknown; diagnostics=none"
+    else:
+        package_state_text = (
+            f"manifest={package_state.manifest_state or 'unknown'}; "
+            f"graph={package_state.graph_state or 'unknown'}; "
+            f"diagnostics={'; '.join(package_state.diagnostics[:3]) or 'none'}"
+        )
+    remaining_text = (
+        ", ".join(group_remaining_ids)
+        if group_remaining_ids
+        else "(none - scanner cleared this group)"
+    )
+    target_identifiers = sorted(_group_target_identifiers(group))
+    post_scan_identifiers = sorted(
+        _scan_result_value(results.scan, "found_identifiers", set()) or set()
+    )
+    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
+    summaries_text = (
+        "\n".join(
+            f"  - {summary.status.value}: {_bounded_qa_action_summary(summary.summary, group)}"
+            for summary in action_summaries
+        )
+        or "  (none)"
+    )
+    changed_files_text = ", ".join(candidate_changed_files) or "(none reported)"
+    policy_block = _qa_policy_prompt_block(qa_policy)
+
+    return f"""{policy_block}
+
+## Assigned Group
+- Group ID: {group.group_id}
+- Component: {group.vulnerable_component or "(unknown)"}
+- Issue type: {group.issue_type.value}
+- Routing strategy: {strategy}
+- CVEs: {cves}
+- GHSAs: {ghsas}
+- Target scanner identifiers: {", ".join(target_identifiers) or "(none)"}
+- Fix-plan status: {fix_plan_status}
+- Fix instruction: {fix_instruction}
+
+## Deterministic Status Flags
+- Install: {install_status}
+- Security scan: {scan_status}
+- Unit tests: {tests_status}
+- Install exit code: {install_exit_code}
+- Install error category: {install_category}
+- Scanner execution status: {scan_execution_status}
+- Remaining identifiers for this group: {remaining_text}
+- Remaining identifier count: {len(group_remaining_ids)}
+- Test failure count: {test_failure_count}
+- Package state: {package_state_text}
+
+## Identifiers and Files
+- Changed files reported by the worker: {changed_files_text}
+- All post-remediation scanner identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
+- New baseline-absent scanner identifiers: {", ".join(new_identifiers) if new_identifiers else "(none)"}
+
+New identifiers are graph-level findings for later triage. Do not attribute them
+to this group without direct deterministic evidence.
+
+## Action Summaries
+{summaries_text}
+
+## Terminal Requirements
+Review only group {group.group_id}. Do not emit Markdown, prose, or a free-form
+final answer. Finish with exactly one call to emit_qa_evaluation:
+- task_id: exactly "{group.group_id}"
+- passed: true or false
+- failure_category: null when passed=true; otherwise one of {_QA_FAILURE_CATEGORY_VALUES}
+- retry_feedback: null when passed=true; otherwise concise guidance with exact evidence
+- semantic_security_review: include a verdict from {_QA_SECURITY_REVIEW_VALUES},
+  reasoning, and concrete evidence_refs when the assigned policy requires semantic review
+- test_attribution: include only when shared tests failed; use one of
+  {_QA_TEST_ATTRIBUTION_VALUES} with exact evidence
+
+Python owns deterministic_gates, failure_evidence, scan_evidence, and
+contract/provenance fields. Do not fill those fields."""
+
+
 def _build_individual_investigator_prompt(
     group: VulnerabilityGroup,
     strategy: str,
@@ -4410,98 +5315,20 @@ def _build_individual_investigator_prompt(
     action_summaries: list[AgentActionSummary],
     qa_policy: QAPolicy | None = None,
 ) -> str:
-    """Build the structured-output prompt for one task-scoped QA evaluator."""
-    fix_plan = group.fix_plan
-    fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
-    fix_instruction = fix_plan.instruction if fix_plan else "(none)"
-    cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
-    ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
-
-    install_ok, install_summary = results.install or (False, "not run")
-    if results.scan_skipped:
-        scan_ok = True
-        scan_summary = f"scan skipped: {results.scan_skip_reason or 'policy'}"
-    else:
-        scan_ok, scan_summary, _ = results.scan or (False, "not run", set())
-    tests_ok, tests_summary = results.tests or (False, "not run")
-    post_scan_identifiers = sorted(
-        _scan_result_value(results.scan, "found_identifiers", set()) or set()
-    )
-    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
-
-    summaries_text = (
-        "\n".join(
-            f"  - {s.status.value}: {_trim_action_summary_text(s.summary, group)}"
-            for s in action_summaries
+    """Build the lean static-plus-dynamic prompt for one QA evaluator."""
+    return (
+        _QA_EVALUATOR_STATIC_PREAMBLE
+        + "\n\n"
+        + _build_qa_dynamic_context(
+            group=group,
+            strategy=strategy,
+            results=results,
+            group_remaining_ids=group_remaining_ids,
+            candidate_changed_files=candidate_changed_files,
+            action_summaries=action_summaries,
+            qa_policy=qa_policy,
         )
-        or "  (none)"
     )
-    remaining_text = (
-        ", ".join(group_remaining_ids)
-        if group_remaining_ids
-        else "(none - scanner cleared this group)"
-    )
-    changed_files_text = ", ".join(candidate_changed_files) or "(none reported)"
-    policy_block = _qa_policy_prompt_block(qa_policy)
-
-    return f"""You are the task-scoped QA evaluator for exactly one vulnerability group.
-
-## Assigned Group
-- Group ID: {group.group_id}
-- Component: {group.vulnerable_component or "(unknown)"}
-- Issue type: {group.issue_type.value}
-- Routing strategy: {strategy}
-- CVEs: {cves}
-- GHSAs: {ghsas}
-- Fix-plan status: {fix_plan_status}
-- Fix instruction: {fix_instruction}
-
-{policy_block}
-
-## Deterministic QA Evidence
-- Install passed: {install_ok}
-- Install summary: {install_summary[:2000]}
-- Security scan passed: {scan_ok}
-- Security scan summary: {scan_summary[:2000]}
-- Remaining identifiers for this group: {remaining_text}
-- Unit tests passed: {tests_ok}
-- Unit-test summary: {tests_summary[:3000]}
-- Changed files reported by the worker: {changed_files_text}
-- All post-remediation identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
-- New baseline-absent identifiers: {", ".join(new_identifiers) if new_identifiers else "(none)"}
-
-New identifiers are graph-level findings for later triage. Do not attribute them
-to this group without direct deterministic evidence.
-
-## Action Summaries
-{summaries_text}
-
-## Review Procedure
-All deterministic execution tools have already run globally. Do not attempt to
-run install, security scan, or unit-test tools. Use only the read-only review
-tools as needed:
-list_changed_files, generate_workspace_diff, read_file_context,
-search_codebase_pattern, inspect_ast_symbol, and query_qa_logs.
-
-Investigate only group {group.group_id}. Determine whether shared failures are
-caused by this remediation, whether the target scanner identifiers remain, and
-whether any required workaround actually blocks the vulnerable path. For shared
-test failures, use structured test_attribution only when exact failed tests and
-positive causal or exonerating evidence support it. Otherwise use INCONCLUSIVE.
-
-## Required Final Response
-Do not emit Markdown, prose, or a free-form final answer. Your only accepted
-final response is one call to the emit_qa_evaluation tool with these fields:
-
-- task_id: exactly "{group.group_id}"
-- passed: true or false
-- failure_category: null when passed=true; otherwise PEER_CONFLICT, BREAKING_CHANGE, or SECURITY_FLAG
-- retry_feedback: null when passed=true; otherwise concise, actionable guidance with exact test, scanner, or install evidence
-- semantic_security_review: required by the policy when applicable; include verdict, reasoning, and concrete evidence_refs from successful source/diff review tools
-- test_attribution: include only when shared tests failed; use RESPONSIBLE, EXONERATED, or INCONCLUSIVE with evidence
-
-Python owns deterministic_gates, failure_evidence, scan_evidence, and contract/provenance fields. Do not attempt to fill those fields.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -4559,7 +5386,7 @@ def _run_individual_investigations(
         relevant_summaries = _relevant_action_summaries(
             action_summaries, group.group_id, known_group_ids
         )
-        system_prompt = _build_individual_investigator_prompt(
+        dynamic_context = _build_qa_dynamic_context(
             group=group,
             strategy=strategy,
             results=results,
@@ -4578,11 +5405,18 @@ def _run_individual_investigations(
             ),
             terminal_tool,
         ]
+        qa_context_manager = ContextManager(
+            review_tools,
+            compaction_interval=3,
+            skip_phase_gating=True,
+            scratchpad_scope=ScratchpadScope.QA,
+        )
         llm = ChatOpenAI(model=model_name, temperature=0)
         initial_messages = [
-            SystemMessage(content=system_prompt),
+            SystemMessage(content=_QA_EVALUATOR_STATIC_PREAMBLE),
             HumanMessage(
                 content=(
+                    f"{dynamic_context}\n\n"
                     f"Review group '{group.group_id}' with the read-only tools, then "
                     "call emit_qa_evaluation. Do not emit any narrative response."
                 )
@@ -4598,7 +5432,10 @@ def _run_individual_investigations(
                 touched_files=set(),
                 structured_output_model=QACriticLLMOutput,
                 structured_output_tool_name=terminal_tool.name,
+                context_manager=qa_context_manager,
+                skip_phase_gating=True,
             )
+
             tool_transcript = json.dumps(
                 [
                     {
@@ -5394,6 +6231,29 @@ def _apply_guardrails(
     return evaluations, errors
 
 
+def _extract_deterministic_test_evidence(
+    results: _QAExecutionResults,
+    *,
+    sandbox: DockerSandbox | None = None,
+) -> QAFailureEvidence | None:
+    """Extract failure evidence from the captured test process streams."""
+    if results.tests is None or results.tests[0]:
+        return None
+    exit_code = results.test_exit_code
+    stdout = results.test_raw_stdout
+    stderr = results.test_raw_stderr
+    if stdout is None:
+        stdout = results.tests[1]
+    if stderr is None:
+        stderr = ""
+    return extract_qa_failure_evidence(
+        exit_code if exit_code is not None else 1,
+        stdout,
+        stderr,
+        sandbox=sandbox,
+    )
+
+
 def _attach_failure_evidence_to_evaluations(
     evaluations: dict[str, QAEvaluation],
     results: _QAExecutionResults,
@@ -5422,13 +6282,8 @@ def _attach_failure_evidence_to_evaluations(
         Evaluations enriched with authoritative evidence and provenance.
     """
     test_evidence = deterministic_evidence
-    if test_evidence is None and results.tests and not results.tests[0]:
-        test_evidence = extract_qa_failure_evidence(
-            1,
-            results.tests[1],
-            "",
-            sandbox=sandbox,
-        )
+    if test_evidence is None:
+        test_evidence = _extract_deterministic_test_evidence(results, sandbox=sandbox)
 
     task_queue = state.get("task_queue", {}) or {}
     tasks_by_group = {
@@ -6150,10 +7005,8 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 }
 
             if results.tests and not results.tests[0]:
-                deterministic_test_evidence = extract_qa_failure_evidence(
-                    1,
-                    results.tests[1],
-                    "",
+                deterministic_test_evidence = _extract_deterministic_test_evidence(
+                    results,
                     sandbox=sandbox,
                 )
 

@@ -43,6 +43,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _qa_failure_evidence_for_workaround_retry,
 )
 from remediation_engine.orchestration.workaround_subagent import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
     _build_workaround_prompt,
     _preferred_targeted_test_files,
     _workaround_attempt_succeeded,
@@ -417,11 +418,12 @@ def test_build_workaround_prompt_biphasic():
     ctx_initial = WorkaroundContext(phase=WorkaroundPhase.INITIAL_MITIGATION)
     prompt_initial = _build_workaround_prompt(task, group, workaround_context=ctx_initial)
     assert "WORKFLOW PHASE: INITIAL_MITIGATION" in prompt_initial
-    assert "=== OPERATING PRINCIPLES ===" in prompt_initial
-    assert "=== EDIT CHECKPOINT CONTRACT ===" in prompt_initial
-    assert "CODE_FAILURE rolls back the entire pending edit set" in prompt_initial
-    assert "re-include every required change" in prompt_initial
-    assert "INFRA_FAILURE or BLOCKED retains the pending edit set" in prompt_initial
+    assert "Follow Investigate -> Plan -> Execute -> Validate" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "CODE_FAILURE rolls back" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "whole pending set" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "re-include every required change" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "INFRA_FAILURE or BLOCKED retains" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "pending set for recovery" in _WORKAROUND_STATIC_INSTRUCTIONS
 
     evidence = QAFailureEvidence(
         exact_diagnostics=["(0, import_express_jwt.default) is not a function"],
@@ -436,7 +438,10 @@ def test_build_workaround_prompt_biphasic():
     assert "WORKFLOW PHASE: QA_REGRESSION_REPAIR" in prompt_repair
     assert "=== QA FAILURE EVIDENCE ===" in prompt_repair
     assert "(0, import_express_jwt.default) is not a function" in prompt_repair
-    assert "Previously validated edits remain" in prompt_repair
+    assert (
+        "dependency update and replayed edits are already present"
+        in _WORKAROUND_STATIC_INSTRUCTIONS
+    )
 
 
 def test_workaround_toolbelt_ast_gate_and_search_enrichment():
@@ -651,3 +656,7 @@ def test_express_jwt_mocked_end_to_end_scenario():
         assert attempt_res.status == AgentActionStatus.SUCCESS
         assert attempt_res.replay_plan is not None
         assert attempt_res.replay_plan.security_invariants == ["JWT auth must be enforced"]
+        messages = mock_llm.bind_tools.return_value.invoke.call_args_list[0].args[0]
+        assert "code security specialist" in messages[0].content
+        assert "DYNAMIC WORKAROUND CONTEXT" in messages[-1].content
+        assert "routes/auth.js" not in _WORKAROUND_STATIC_INSTRUCTIONS

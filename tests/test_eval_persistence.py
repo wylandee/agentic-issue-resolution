@@ -279,6 +279,8 @@ def test_session_finish_saves_tag_and_resolves_baseline_before_save(monkeypatch)
         "git_dirty": False,
         "pytest_items_recorded": 1,
         "deep_eval_cases_recorded": 0,
+        "token_usage_expected_cases": 0,
+        "token_usage_observed_cases": 0,
     }
     assert any("Evaluation run comparison" in line for line in reporter.lines)
 

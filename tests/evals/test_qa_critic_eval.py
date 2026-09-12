@@ -76,13 +76,11 @@ def _format_provenance(case: dict[str, Any]) -> str:
 
 
 def build_qa_production_prompt(case: dict[str, Any]) -> str:
-    """Build the deterministic QA prompt used by the evaluation judge."""
+    """Build compact deterministic input used by the evaluation judge."""
     vulnerability = case.get("vulnerability_context", {})
     execution = case.get("execution_context", {})
-    logs = case.get("execution_logs", {})
     vulnerability = vulnerability if isinstance(vulnerability, dict) else {}
     execution = execution if isinstance(execution, dict) else {}
-    logs = logs if isinstance(logs, dict) else {}
     cves = vulnerability.get("cve_ids", []) or []
     ghsas = vulnerability.get("ghsa_ids", []) or []
     task = case.get(
@@ -97,10 +95,28 @@ def build_qa_production_prompt(case: dict[str, Any]) -> str:
         if expected_passed is False
         else "The required auditor task is to verify the candidate change and emit passed=true."
     )
+
+    def status(value: Any, *, skipped: bool = False) -> str:
+        if skipped:
+            return "SKIPPED"
+        if value is None:
+            return "NOT_RUN"
+        return "PASS" if bool(value) else "FAIL"
+
+    scanner_status = str(execution.get("scanner_execution_status", "not_run")).lower()
+    scan_status = (
+        "SKIPPED"
+        if scanner_status == "not_run" and case.get("qa_policy") == "no_fix_package_removal"
+        else "PASS"
+        if scanner_status == "success" and execution.get("target_scanner_cleared") is True
+        else "FAIL"
+        if scanner_status in {"success", "failed", "failure", "error", "unparseable"}
+        else "NOT_RUN"
+    )
     return (
         "=== QA AUDITOR ROLE & OBJECTIVE ===\n"
-        "You are evaluating a QA Auditor subagent. The auditor's job is to inspect the evidence "
-        f"and render an honest, accurate evaluation verdict. {goal_direction}\n\n"
+        "You are evaluating a QA Auditor subagent. Inspect compact deterministic facts "
+        f"and render an honest evaluation verdict. {goal_direction}\n\n"
         "=== QA CRITIC TASK ===\n"
         f"{task}\n\n"
         "=== ASSIGNED GROUP ===\n"
@@ -111,15 +127,18 @@ def build_qa_production_prompt(case: dict[str, Any]) -> str:
         f"- GHSA IDs: {', '.join(ghsas) if ghsas else 'none'}\n"
         f"- QA policy: {case.get('qa_policy')}\n"
         f"- Changed files: {', '.join(case.get('changed_files', []) or []) or 'none'}\n\n"
-        "=== DETERMINISTIC QA EVIDENCE ===\n"
-        f"- Install passed: {execution.get('install_passed')}\n"
-        f"Install log:\n{logs.get('install_log', 'none')}\n\n"
-        f"- Scanner execution status: {execution.get('scanner_execution_status')}\n"
-        f"- Target scanner cleared: {execution.get('target_scanner_cleared')}\n"
+        "=== DETERMINISTIC QA FACTS ===\n"
+        f"- Install: {status(execution.get('install_passed'))}\n"
+        f"- Security scan: {scan_status}\n"
+        f"- Unit tests: {status(execution.get('tests_passed'))}\n"
+        f"- Install exit code: {execution.get('install_exit_code', 'unknown')}\n"
+        f"- Install error category: {execution.get('install_error_category', 'none')}\n"
+        f"- Scanner execution status: {execution.get('scanner_execution_status', 'not_run')}\n"
         f"- Remaining target identifiers: {execution.get('target_remaining_identifiers', [])}\n"
-        f"Scan log:\n{logs.get('scan_summary', 'none')}\n\n"
-        f"- Tests passed: {execution.get('tests_passed')}\n"
-        f"Test log:\n{logs.get('test_output', 'none')}\n\n"
+        f"- Remaining identifier count: {len(execution.get('target_remaining_identifiers', []) or [])}\n"
+        f"- Test failure count: {execution.get('test_failure_count', 'unknown')}\n"
+        f"- Package manifest state: {execution.get('package_manifest_state', 'unknown')}\n"
+        f"- Package graph state: {execution.get('package_graph_state', 'unknown')}\n\n"
         "=== EXPECTED COMPLETION CONTRACT ===\n"
         f"{case['expected_output']}\n"
     )
@@ -310,11 +329,22 @@ def test_qa_critic_offline_production_replay(
 
     assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
     assert model.invocation_count == len(scripted_tools)
+    if case_id == "qa_surrender_max_tool_call_rounds":
+        assert len(model.invocation_messages) >= 4
+        fourth_messages = model.invocation_messages[3]
+        scratchpads = [
+            message["content"]
+            for message in fourth_messages
+            if message["additional_kwargs"].get("remediation_engine_scratchpad")
+        ]
+        assert scratchpads
+        assert "QA_REVIEW" in scratchpads[-1]
     assert set(event["name"] for event in capture.actual_tools) <= {
         "query_qa_logs",
         "generate_workspace_diff",
         "read_file_context",
         "search_codebase_pattern",
+        "inspect_ast_symbol",
         "emit_qa_evaluation",
     }
     if case_id == "qa_surrender_max_tool_call_rounds":

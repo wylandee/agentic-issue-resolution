@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from remediation_engine.contracts.schemas import ScratchpadEntry, WorkaroundExecutionPhase
+from remediation_engine.contracts.schemas import (
+    ScratchpadEntry,
+    ScratchpadScope,
+    WorkaroundExecutionPhase,
+)
 from remediation_engine.orchestration.context_manager import (
     DEFAULT_COMPACTION_INTERVAL,
     MAX_SCRATCHPAD_CHARS,
@@ -87,6 +91,135 @@ def test_scratchpad_entry_is_frozen_and_has_safe_defaults() -> None:
         ScratchpadEntry.model_validate(
             {"phase": "INVESTIGATE", "round_number": 1, "unexpected": True}
         )
+
+
+def test_qa_scratchpad_is_phase_free_and_retains_terminal_evidence() -> None:
+    memory = ScratchpadMemory(ScratchpadScope.QA)
+    memory.update_from_tool_event(
+        ToolEvent(
+            "query_qa_logs",
+            {"log_type": "install", "view": "errors"},
+            "ERESOLVE peer conflict",
+        ),
+        WorkaroundExecutionPhase.INVESTIGATE,
+        1,
+    )
+    memory.update_from_tool_event(
+        ToolEvent(
+            "emit_qa_evaluation",
+            {
+                "task_id": "task-1",
+                "passed": False,
+                "failure_category": "INSTALL_FAILURE",
+                "retry_feedback": "peer conflict",
+                "semantic_security_review": None,
+                "test_attribution": None,
+            },
+            (
+                "QA evaluation: task=task-1 passed=False "
+                "category=INSTALL_FAILURE retry_required=True"
+            ),
+        ),
+        WorkaroundExecutionPhase.INVESTIGATE,
+        2,
+    )
+
+    assert len(memory.entries) == 2
+    assert all(entry.scope == ScratchpadScope.QA for entry in memory.entries)
+    assert all(entry.phase is None for entry in memory.entries)
+    assert "QA_REVIEW" in memory.render()
+    assert "INSTALL_FAILURE" in memory.render()
+
+
+def test_qa_context_manager_bypasses_workaround_phase_gating() -> None:
+    tools = _toolbelt(
+        _FakeTool("record_plan", "plan"),
+        _FakeTool("read_repository_map", "map"),
+        _FakeTool("emit_qa_evaluation", "evaluation"),
+    )
+    manager = ContextManager(
+        tools,
+        compaction_interval=3,
+        skip_phase_gating=True,
+        scratchpad_scope=ScratchpadScope.QA,
+    )
+
+    assert manager.skip_phase_gating is True
+    assert [tool.name for tool in manager.get_tools_for_phase(WorkaroundExecutionPhase.PLAN)] == [
+        "record_plan",
+        "read_repository_map",
+        "emit_qa_evaluation",
+    ]
+
+
+def test_qa_compaction_occurs_at_round_three_and_preserves_scratchpad() -> None:
+    tool = _FakeTool("query_qa_logs", "ERESOLVE peer conflict")
+    manager = ContextManager(
+        [tool],
+        compaction_interval=3,
+        skip_phase_gating=True,
+        scratchpad_scope=ScratchpadScope.QA,
+    )
+    conversation = [
+        SystemMessage(content="static"),
+        HumanMessage(content="review"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "query_qa_logs",
+                    "args": {"log_type": "install"},
+                    "id": "qa-call",
+                }
+            ],
+        ),
+        ToolMessage(content="ERESOLVE peer conflict", name="query_qa_logs", tool_call_id="qa-call"),
+    ]
+    manager.update_scratchpad(
+        ToolEvent("query_qa_logs", {"log_type": "install"}, "ERESOLVE peer conflict"),
+        WorkaroundExecutionPhase.INVESTIGATE,
+        1,
+    )
+
+    before_boundary = manager.compact_conversation(conversation, 2)
+    at_boundary = manager.compact_conversation(conversation, 3)
+    assert at_boundary[4].content.startswith("[COMPACTED] query_qa_logs:")
+    assert before_boundary[3].content == conversation[3].content
+    assert at_boundary[1].additional_kwargs["remediation_engine_scratchpad"] is True
+    assert "QA_REVIEW" in at_boundary[1].content
+    at_round_six = manager.compact_conversation(at_boundary, 6)
+    assert at_round_six[1].content == at_boundary[1].content
+    assert at_round_six[4].content == at_boundary[4].content
+
+
+def test_qa_scratchpad_extracts_bounded_file_diff_and_log_facts() -> None:
+    memory = ScratchpadMemory(ScratchpadScope.QA)
+    events = [
+        ToolEvent(
+            "list_changed_files",
+            {},
+            "- package.json\n- src/auth.ts\n",
+        ),
+        ToolEvent(
+            "generate_workspace_diff",
+            {},
+            "diff --git a/src/auth.ts b/src/auth.ts\n--- a/src/auth.ts\n+++ b/src/auth.ts",
+        ),
+        ToolEvent(
+            "read_file_context",
+            {"file_path": "src/auth.ts", "start_line": 1, "end_line": 8},
+            "const secret = 'do-not-retain'\nexport function auth() {}",
+        ),
+    ]
+    for round_number, event in enumerate(events, start=1):
+        memory.update_from_tool_event(event, None, round_number)
+
+    rendered = memory.render()
+
+    assert "package.json" in rendered
+    assert "src/auth.ts" in rendered
+    assert "do-not-retain" not in rendered
+    assert "read src/auth.ts lines 1-8" in rendered
 
 
 def test_registry_filters_in_builder_order_and_missing_optional_tools() -> None:

@@ -254,6 +254,29 @@ def _is_executed_manifest_transaction(event: Any) -> bool:
     )
 
 
+_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manifest execution worker.
+The Supervisor owns candidate generation, version selection, retry planning, and
+task routing. Execute only the Supervisor's task instruction.
+
+Do not search the NPM registry or perform retry planning. Use only
+modify_and_validate_npm_dependency for manifest changes. Each call edits the
+manifest and immediately synchronizes package manifests before returning.
+Transactions are serialized per package. Keep package_name and manifest_path
+within the committed task allowlists.
+
+If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that
+package with a different Supervisor-approved target_version or dependency_type.
+A package may receive at most three combined transaction attempts. Failed
+transactions roll back automatically. Continue with the next independent package
+after a package succeeds or exhausts its attempts.
+
+Never edit source-code files in this worker. Supervisor-owned dependency-type
+candidates are the only permitted strategy alternatives.
+
+Return control only after every package has one successful combined transaction or
+has exhausted its three attempts and been surrendered."""
+
+
 def _build_update_prompt(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
@@ -264,24 +287,12 @@ def _build_update_prompt(
     allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
     allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
-    """Build an execution-only prompt; strategy selection belongs to Supervisor."""
+    """Build the dynamic execution context for the static worker instructions."""
     allowed_target_versions_by_task = allowed_target_versions_by_task or {}
     allowed_dependency_types_by_task = allowed_dependency_types_by_task or {}
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
     sections = [
-        "You are a dependency-manifest execution worker.",
-        "The Supervisor's task instruction is authoritative. Execute it exactly.",
-        "Do not search the NPM registry or perform retry planning.",
-        "Use only modify_and_validate_npm_dependency for manifest changes.",
-        "The repository map below is deterministic read-only context.",
-        "Each modify_and_validate_npm_dependency call edits the manifest and immediately synchronizes its package manifests before returning.",
-        "Transactions are serialized per-package; call the tool with that package_name fixed while changing only an approved retry candidate.",
-        "If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that package with a different Supervisor-approved target_version or dependency_type.",
-        "Keep package_name and manifest_path within the committed task allowlists, and never invent a candidate or query the registry.",
-        "A package may receive at most three combined transaction attempts. After its limit is exhausted, continue with the next independent package.",
-        "A failed transaction is rolled back automatically; continue using the same transaction protocol.",
-        "Never edit source-code files in this worker.",
-        "The Supervisor-owned dependency-type candidates are the only permitted strategy alternatives.",
+        "DYNAMIC TASK CONTEXT (Supervisor-owned and authoritative):",
         "",
         "Deterministic repository map:",
         repository_map,
@@ -332,13 +343,6 @@ def _build_update_prompt(
                 f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
             ]
         )
-    sections.extend(
-        [
-            "",
-            "Completion rule:",
-            "Return control only after every package has one successful combined transaction or has exhausted its three attempts and been surrendered.",
-        ]
-    )
     return "\n".join(sections)
 
 
@@ -937,18 +941,10 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         allowed_target_versions_by_task=allowed_target_versions_by_task,
         allowed_dependency_types_by_task=allowed_dependency_types_by_task,
     )
-    initial_messages = [
-        SystemMessage(
-            content=(
-                "You are an execution-only dependency worker. The Supervisor owns candidate generation. "
-                "Use only the combined manifest transaction tool, retry failed transactions with a different "
-                "Supervisor-approved candidate, and do not query registries."
-            )
-        ),
-        HumanMessage(content=prompt),
-    ]
+    initial_messages = [SystemMessage(content=_UPDATE_WORKER_STATIC_INSTRUCTIONS)]
     if state.get("messages"):
         initial_messages.extend(state["messages"])
+    initial_messages.append(HumanMessage(content=prompt))
 
     override_required_packages: set[str] = set()
     allowed_dependency_types_by_package: dict[str, set[str]] = {}

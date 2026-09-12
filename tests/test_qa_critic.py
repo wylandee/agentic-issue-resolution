@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
+    AgentActionSummary,
     BatchQAResult,
     CommandResult,
     FailureCategory,
@@ -54,15 +55,19 @@ from remediation_engine.contracts.schemas import (
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
+    ScratchpadScope,
+    SecurityReviewVerdict,
     Severity,
     TaskAttemptSnapshot,
     TaskStatus,
+    TestAttributionVerdict,
     VulnerabilityGroup,
     VulnerabilityIssue,
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.orchestration.qa_critic import (
+    _LOG_QUERY_MAX_CHARS,
     _NPM_INSTALL_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
     _ODC_CACHE_VOLUME,
@@ -76,6 +81,7 @@ from remediation_engine.orchestration.qa_critic import (
     _build_fallback_investigation_report,
     _build_individual_investigator_prompt,
     _build_qa_scan_targets,
+    _build_qa_terminal_tool,
     _collect_baseline_identifiers,
     _collect_target_identifiers,
     _derive_qa_group_strategies,
@@ -88,7 +94,11 @@ from remediation_engine.orchestration.qa_critic import (
     _parse_investigation_report,
     _parse_report_identifiers,
     _QAExecutionResults,
+    _QAInstallOutcome,
+    _QALogRecord,
     _QAPackageState,
+    _QATestExecutionOutcome,
+    _query_qa_logs,
     _read_report_from_workspace,
     _run_batch_judge,
     _run_global_execution,
@@ -171,6 +181,78 @@ def _make_sandbox(
         )
     sandbox.read_file.return_value = read_file_return
     return sandbox
+
+
+def _install_outcome(
+    ok: bool = True,
+    summary: str = "ok",
+    *,
+    exit_code: int | None = 0,
+    stdout: str = "",
+    stderr: str = "",
+    error_category: str | None = None,
+) -> _QAInstallOutcome:
+    """Build a typed install outcome for global-execution tests."""
+    return _QAInstallOutcome(
+        ok=ok,
+        summary=summary,
+        exit_code=exit_code,
+        error_category=error_category,
+        raw_stdout=stdout,
+        raw_stderr=stderr,
+        log_record=_QALogRecord(
+            phase="install",
+            label="npm install",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+
+
+def _test_outcome(
+    ok: bool = True,
+    summary: str = "ok",
+    *,
+    exit_code: int | None = 0,
+    failure_count: int | None = 0,
+    stdout: str = "",
+    stderr: str = "",
+) -> _QATestExecutionOutcome:
+    """Build a typed test outcome for global-execution tests."""
+    return _QATestExecutionOutcome(
+        ok=ok,
+        summary=summary,
+        exit_code=exit_code,
+        failure_count=failure_count,
+        raw_stdout=stdout,
+        raw_stderr=stderr,
+        log_records=(
+            _QALogRecord(
+                phase="tests",
+                label="npm test",
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+            ),
+        ),
+    )
+
+
+def _scan_outcome(
+    ok: bool = True,
+    summary: str = "ok",
+    *,
+    remaining: set[str] | None = None,
+) -> _SecurityScanResult:
+    """Build a typed scanner outcome for global-execution tests."""
+    return _SecurityScanResult(
+        ok=ok,
+        summary=summary,
+        remaining_identifiers=remaining or set(),
+        found_identifiers=set(),
+        new_identifiers=set(),
+    )
 
 
 def _make_workspace_tmpdir() -> Path:
@@ -297,6 +379,7 @@ def test_qa_target_uses_attempt_execution_version_when_task_selection_was_cleare
         }
     )
     instruction = "Update sanitize-html in package.json to exact version 2.17.7."
+
     task = RemediationTask(
         task_id="task-update",
         parent_group_id=group.group_id,
@@ -350,10 +433,10 @@ def test_qa_target_uses_attempt_execution_version_when_task_selection_was_cleare
 class TestRunInstall:
     def test_success_returns_true_and_message(self):
         sandbox = _make_sandbox()
-        ok, summary = _run_install(sandbox)
+        outcome = _run_install(sandbox)
 
-        assert ok is True
-        assert "succeeded" in summary.lower()
+        assert outcome.ok is True
+        assert "succeeded" in outcome.summary.lower()
         sandbox.run.assert_called_once_with(
             "npm install --package-lock=true",
             timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
@@ -370,12 +453,49 @@ class TestRunInstall:
                 )
             ]
         )
-        ok, summary = _run_install(sandbox)
+        outcome = _run_install(sandbox)
 
-        assert ok is False
-        assert "FAILED" in summary
-        assert "1" in summary  # exit code
-        assert "ERESOLVE" in summary
+        assert outcome.ok is False
+        assert "FAILED" in outcome.summary
+        assert "1" in outcome.summary  # exit code
+        assert "ERESOLVE" in outcome.summary
+        assert outcome.exit_code == 1
+        assert outcome.error_category == "PEER_CONFLICT"
+        assert outcome.raw_stdout == "some stdout"
+        assert outcome.raw_stderr == "ERESOLVE unable to resolve"
+        assert outcome.log_record.label == "npm install"
+
+    def test_eoverride_is_classified_as_peer_conflict(self):
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="EOVERRIDE Override conflicts with direct dependency",
+                    duration_seconds=0.1,
+                )
+            ]
+        )
+
+        outcome = _run_install(sandbox)
+
+        assert outcome.error_category == "PEER_CONFLICT"
+
+    def test_ebadengine_is_classified_as_engine_conflict(self):
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="EBADENGINE Unsupported engine",
+                    duration_seconds=0.1,
+                )
+            ]
+        )
+
+        outcome = _run_install(sandbox)
+
+        assert outcome.error_category == "ENGINE_CONFLICT"
 
 
 # ---------------------------------------------------------------------------
@@ -386,10 +506,10 @@ class TestRunInstall:
 class TestRunUnitTests:
     def test_success_returns_true(self):
         sandbox = _make_sandbox()
-        ok, summary = _run_unit_tests(sandbox)
+        outcome = _run_unit_tests(sandbox)
 
-        assert ok is True
-        assert "passed" in summary.lower()
+        assert outcome.ok is True
+        assert "passed" in outcome.summary.lower()
         sandbox.run.assert_called_once_with("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
 
     def test_failure_returns_condensed_detected_failures(self):
@@ -411,13 +531,18 @@ class TestRunUnitTests:
                 )
             ]
         )
-        ok, summary = _run_unit_tests(sandbox)
+        outcome = _run_unit_tests(sandbox)
 
-        assert ok is False
-        assert "FAILED" in summary
-        assert "Failing Tests:" in summary
-        assert "verify jwtChallenges challenge tracking" in summary
-        assert "AssertionError" in summary
+        assert outcome.ok is False
+        assert "FAILED" in outcome.summary
+        assert "Failing Tests:" in outcome.summary
+        assert "verify jwtChallenges challenge tracking" in outcome.summary
+        assert "AssertionError" in outcome.summary
+        assert outcome.exit_code == 1
+        assert outcome.failure_count == 1
+        assert outcome.raw_stdout == stdout
+        assert outcome.raw_stderr == "some error"
+        assert outcome.log_records[0].label == "npm test"
 
     def test_uses_npm_test_timeout(self):
         sandbox = _make_sandbox()
@@ -465,13 +590,20 @@ class TestRunUnitTests:
             json.dumps(root_package) if path == "package.json" else None
         )
 
-        ok, summary = _run_unit_tests(sandbox)
+        outcome = _run_unit_tests(sandbox)
 
-        assert ok is False
-        assert "Failed Tests: 1" in summary
-        assert "server rejects bad token" in summary
-        assert "- api: passed" in summary
+        assert outcome.ok is False
+        assert "Failed Tests: 1" in outcome.summary
+        assert "server rejects bad token" in outcome.summary
+        assert "- api: passed" in outcome.summary
         assert sandbox.run.call_count == 2
+        assert outcome.failure_count == 1
+        assert [record.label for record in outcome.log_records] == [
+            "tests:server",
+            "tests:api",
+        ]
+        assert "server rejects bad token" in outcome.raw_stdout
+        assert outcome.raw_stderr == ""
         sandbox.run.assert_any_call(
             "npm run test:server -- --reporter json",
             timeout=_NPM_TEST_TIMEOUT_SECONDS,
@@ -499,13 +631,18 @@ class TestRunUnitTests:
             json.dumps(root_package) if path == "package.json" else None
         )
 
-        ok, summary = _run_unit_tests(sandbox)
+        outcome = _run_unit_tests(sandbox)
 
-        assert ok is True
-        assert summary.startswith("npm test passed.")
-        assert "- server: passed" in summary
-        assert "- api: passed" in summary
+        assert outcome.ok is True
+        assert outcome.summary.startswith("npm test passed.")
+        assert "- server: passed" in outcome.summary
+        assert "- api: passed" in outcome.summary
         assert sandbox.run.call_count == 2
+        assert outcome.failure_count == 0
+        assert [record.label for record in outcome.log_records] == [
+            "tests:server",
+            "tests:api",
+        ]
 
     def test_unknown_project_uses_legacy_npm_test_text_parser(self):
         root_package = {"scripts": {"test": "custom-test-runner --plain"}}
@@ -523,10 +660,10 @@ class TestRunUnitTests:
             json.dumps(root_package) if path == "package.json" else None
         )
 
-        ok, summary = _run_unit_tests(sandbox)
+        outcome = _run_unit_tests(sandbox)
 
-        assert ok is False
-        assert "Detected Failures:" in summary
+        assert outcome.ok is False
+        assert "Detected Failures:" in outcome.summary
         sandbox.run.assert_called_once_with("npm test", timeout=_NPM_TEST_TIMEOUT_SECONDS)
 
 
@@ -987,6 +1124,10 @@ class TestRunSecurityScan:
         assert result.found_identifiers == found
         assert result.new_identifiers == found
         assert "Newly introduced identifiers" in result.summary
+        assert result.exit_code == 0
+        assert result.raw_stdout == ""
+        assert result.raw_stderr == ""
+        assert [record.label for record in result.scan_records] == ["odc:full"]
 
     def test_preexisting_identifier_is_not_classified_as_new(self):
         sandbox = MagicMock()
@@ -2591,15 +2732,16 @@ class TestRunGlobalExecution:
         target_ids = {"CVE-2021-0001"}
         with (
             patch(
-                "remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")
+                "remediation_engine.orchestration.qa_critic._run_install",
+                return_value=_install_outcome(True, "ok"),
             ) as mi,
             patch(
                 "remediation_engine.orchestration.qa_critic._run_security_scan",
-                return_value=(True, "ok", set()),
+                return_value=_scan_outcome(True, "ok"),
             ) as ms,
             patch(
                 "remediation_engine.orchestration.qa_critic._run_unit_tests",
-                return_value=(True, "ok"),
+                return_value=_test_outcome(True, "ok"),
             ) as mt,
         ):
             results = _run_global_execution(sandbox, "vol", target_ids)
@@ -2615,15 +2757,15 @@ class TestRunGlobalExecution:
         with (
             patch(
                 "remediation_engine.orchestration.qa_critic._run_install",
-                return_value=(False, "fail"),
+                return_value=_install_outcome(False, "fail", exit_code=1),
             ),
             patch(
                 "remediation_engine.orchestration.qa_critic._run_security_scan",
-                return_value=(False, "fail", set()),
+                return_value=_scan_outcome(False, "fail"),
             ),
             patch(
                 "remediation_engine.orchestration.qa_critic._run_unit_tests",
-                return_value=(False, "fail"),
+                return_value=_test_outcome(False, "fail", exit_code=1, failure_count=None),
             ),
         ):
             results = _run_global_execution(sandbox, "vol", set())
@@ -2637,7 +2779,8 @@ class TestRunGlobalExecution:
         baseline_ids = {"CVE-2021-0001", "CVE-2020-0001"}
         with (
             patch(
-                "remediation_engine.orchestration.qa_critic._run_install", return_value=(True, "ok")
+                "remediation_engine.orchestration.qa_critic._run_install",
+                return_value=_install_outcome(True, "ok"),
             ),
             patch(
                 "remediation_engine.orchestration.qa_critic._run_security_scan",
@@ -2645,7 +2788,7 @@ class TestRunGlobalExecution:
             ) as scan,
             patch(
                 "remediation_engine.orchestration.qa_critic._run_unit_tests",
-                return_value=(True, "ok"),
+                return_value=_test_outcome(True, "ok"),
             ),
         ):
             _run_global_execution(sandbox, "vol", target_ids, baseline_ids)
@@ -2657,15 +2800,15 @@ class TestRunGlobalExecution:
         with (
             patch(
                 "remediation_engine.orchestration.qa_critic._run_install",
-                return_value=(False, "FAILED"),
+                return_value=_install_outcome(False, "FAILED", exit_code=1),
             ),
             patch(
                 "remediation_engine.orchestration.qa_critic._run_security_scan",
-                return_value=(False, "fail", set()),
+                return_value=_scan_outcome(False, "fail"),
             ),
             patch(
                 "remediation_engine.orchestration.qa_critic._run_unit_tests",
-                return_value=(True, "passed."),
+                return_value=_test_outcome(True, "passed."),
             ) as mt,
         ):
             results = _run_global_execution(sandbox, "vol", set())
@@ -2678,14 +2821,14 @@ class TestRunGlobalExecution:
         with (
             patch(
                 "remediation_engine.orchestration.qa_critic._run_install",
-                return_value=(True, "install ok"),
+                return_value=_install_outcome(True, "install ok"),
             ) as install,
             patch(
                 "remediation_engine.orchestration.qa_critic._run_security_scan",
             ) as scan,
             patch(
                 "remediation_engine.orchestration.qa_critic._run_unit_tests",
-                return_value=(True, "tests ok"),
+                return_value=_test_outcome(True, "tests ok"),
             ) as tests,
         ):
             results = _run_global_execution(
@@ -2802,6 +2945,80 @@ class TestBuildQaReviewToolbelt:
         assert "Detected Failures: 1" in result
         assert "jwt challenge" in result
 
+    def test_query_qa_logs_supports_tail_errors_and_filter_views(self):
+        tools, results = self._build(prepopulate=True)
+        record = _QALogRecord(
+            phase="install",
+            label="npm install",
+            exit_code=1,
+            stdout="first stdout line\nsecond stdout line",
+            stderr="ERESOLVE peer conflict\nsecondary diagnostic",
+            error="install failed",
+        )
+        results.install = (False, "install failed")
+        results.log_records["install"] = (record,)
+        tool = next(t for t in tools if t.name == "query_qa_logs")
+
+        tail = tool.invoke({"log_type": "install", "view": "tail", "tail_lines": 1})
+        errors = tool.invoke({"log_type": "install", "view": "errors"})
+        filtered = tool.invoke(
+            {
+                "log_type": "install",
+                "view": "filter",
+                "filter_pattern": "secondary diagnostic",
+            }
+        )
+        full = tool.invoke({"log_type": "install", "view": "full"})
+
+        assert "[npm install stdout]" in full
+        assert "exit_code=1" in full
+        assert "ERESOLVE peer conflict" in full
+        assert "secondary diagnostic" in tail
+        assert "first stdout line" not in tail
+        assert "ERESOLVE peer conflict" in errors
+        assert "install failed" in errors
+        assert "secondary diagnostic" in filtered
+        assert "first stdout line" not in filtered
+
+    def test_query_qa_logs_caps_full_output_and_validates_view(self):
+        results = _QAExecutionResults(
+            install=(True, "install ok"),
+            log_records={
+                "install": (
+                    _QALogRecord(
+                        phase="install",
+                        label="npm install",
+                        exit_code=0,
+                        stdout="x" * (_LOG_QUERY_MAX_CHARS + 100),
+                        stderr="",
+                    ),
+                )
+            },
+        )
+
+        capped = _query_qa_logs(results, "install", view="full")
+        invalid = _query_qa_logs(results, "install", view="unknown")
+        missing = _query_qa_logs(_QAExecutionResults(), "install", view="tail")
+
+        assert len(capped) <= _LOG_QUERY_MAX_CHARS
+        assert capped.endswith("(log output truncated)")
+        assert invalid.startswith("ERROR: view")
+        assert missing.startswith("ERROR: run_dependency_install")
+
+    def test_query_qa_logs_rejects_invalid_filter_regex(self):
+        tools, _ = self._build(prepopulate=True)
+        tool = next(t for t in tools if t.name == "query_qa_logs")
+
+        result = tool.invoke(
+            {
+                "log_type": "install",
+                "view": "filter",
+                "filter_pattern": "[unterminated",
+            }
+        )
+
+        assert result.startswith("ERROR:")
+
     def test_search_codebase_pattern_forwards_shared_argument_contract(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
@@ -2864,9 +3081,68 @@ class TestBuildIndividualInvestigatorPrompt:
 
     def test_instructs_not_to_call_execution_tools(self):
         lower = self._prompt().lower()
-        assert "not available to you" in lower or "do not attempt" in lower
+        assert "never execute" in lower
         assert "free-form" in lower
         assert "emit_qa_evaluation" in lower
+
+    def test_terminal_instructions_use_schema_enum_values(self):
+        prompt = self._prompt()
+        for enum_type in (FailureCategory, SecurityReviewVerdict, TestAttributionVerdict):
+            for member in enum_type:
+                assert f"`{member.value}`" in prompt
+
+        assert "otherwise PEER_CONFLICT, BREAKING_CHANGE, or SECURITY_FLAG" not in prompt
+        assert "use RESPONSIBLE, EXONERATED, or INCONCLUSIVE" not in prompt
+
+        description = _build_qa_terminal_tool().description
+        for enum_type in (FailureCategory, SecurityReviewVerdict, TestAttributionVerdict):
+            for member in enum_type:
+                assert member.value in description
+
+    def test_prompt_uses_status_metadata_without_raw_log_bodies(self):
+        results = _QAExecutionResults(
+            install=(False, "install failed"),
+            tests=None,
+        )
+        results.install_exit_code = 1
+        results.install_error_category = "PEER_CONFLICT"
+        results.install_raw_stdout = "RAW INSTALL STDOUT " * 100
+        results.install_raw_stderr = "RAW INSTALL STDERR " * 100
+        prompt = _build_individual_investigator_prompt(
+            group=_make_group(),
+            strategy="version_bump",
+            results=results,
+            group_remaining_ids=["CVE-2021-23337"],
+            candidate_changed_files=["package.json"],
+            action_summaries=[],
+        )
+
+        assert "- Install: FAIL" in prompt
+        assert "- Security scan: NOT_RUN" in prompt
+        assert "- Unit tests: NOT_RUN" in prompt
+        assert "- Install exit code: 1" in prompt
+        assert "- Install error category: PEER_CONFLICT" in prompt
+        assert "RAW INSTALL STDOUT" not in prompt
+        assert "RAW INSTALL STDERR" not in prompt
+
+    def test_action_summaries_are_bounded(self):
+        summary = AgentActionSummary(
+            task_id=_make_group().group_id,
+            status=AgentActionStatus.SUCCESS,
+            summary="large action summary " * 500,
+        )
+        prompt = self._prompt()
+        bounded_prompt = _build_individual_investigator_prompt(
+            group=_make_group(),
+            strategy="version_bump",
+            results=_make_fully_populated_results(ok=True),
+            group_remaining_ids=[],
+            candidate_changed_files=["package.json"],
+            action_summaries=[summary],
+        )
+
+        assert "summary truncated" in bounded_prompt
+        assert len(bounded_prompt) < len(prompt) + 2_000
 
 
 # ---------------------------------------------------------------------------
@@ -2915,6 +3191,13 @@ class TestRunIndividualInvestigations:
         assert ml.call_count == 2
         assert all(
             call.kwargs["structured_output_model"] is QACriticLLMOutput
+            for call in ml.call_args_list
+        )
+        assert all(call.kwargs["skip_phase_gating"] is True for call in ml.call_args_list)
+        assert all(
+            call.kwargs["context_manager"].compaction_interval == 3
+            and call.kwargs["context_manager"].scratchpad_scope == ScratchpadScope.QA
+            and call.kwargs["context_manager"].skip_phase_gating is True
             for call in ml.call_args_list
         )
         assert "g1" in invs and "g2" in invs

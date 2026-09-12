@@ -30,6 +30,7 @@ from remediation_engine.orchestration.supervisor_node import (
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.orchestration.update_subagent import (
+    _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_retry_diagnostics,
     _build_update_prompt,
 )
@@ -491,12 +492,12 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
         {},
     )
 
-    assert "execution worker" in prompt
+    assert "execution worker" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
     assert "exact version 4.18.0" in prompt
     assert "view_npm_package_versions" not in prompt
     assert "Planning Answers" not in prompt
-    assert "per-package" in prompt
-    assert "with that package_name" in prompt
+    assert "per package" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
+    assert "package_name and manifest_path" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
     assert "exactly once for the final batch state" not in prompt
 
 
@@ -559,6 +560,7 @@ def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():
         task_id="task-1",
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
         status=TaskStatus.OPTIMISTICALLY_FIXED,
     )
     result = run_supervisor_node(
