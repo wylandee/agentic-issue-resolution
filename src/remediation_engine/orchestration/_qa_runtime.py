@@ -608,9 +608,10 @@ def _dependency_tree_versions(value: Any, package: str) -> set[str]:
                 version = _normalise_dependency_version(package_node.get("version"))
                 if version:
                     versions.add(version)
-            versions.update(_dependency_tree_versions(package_node, package))
-        for child in value.values():
-            if child is dependencies:
+            for child in dependencies.values():
+                versions.update(_dependency_tree_versions(child, package))
+        for key, child in value.items():
+            if key == "dependencies":
                 continue
             versions.update(_dependency_tree_versions(child, package))
     elif isinstance(value, list):

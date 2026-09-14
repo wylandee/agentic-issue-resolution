@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,6 +40,7 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.orchestration._qa_runtime import (
     _attempt_version_evidence,
     _collect_group_package_state,
+    _dependency_tree_versions,
     _derive_qa_task_policies,
 )
 from remediation_engine.orchestration.qa_evaluator import GroupInvestigation
@@ -362,6 +364,67 @@ def test_version_bump_collects_task_keyed_dependency_evidence() -> None:
     assert package_state.dependency_evidence.lockfile_versions == ["2.0.0"]
     assert package_state.dependency_evidence.manifest_paths == ["package.json"]
     sandbox.run.assert_called_once()
+
+
+def test_version_bump_collects_deeply_nested_npm_dependency_evidence() -> None:
+    """Nested npm dependency nodes contribute to resolved graph evidence."""
+    nested_tree = {
+        "name": "workspace",
+        "dependencies": {
+            "sqlite3": {
+                "version": "5.1.7",
+                "dependencies": {
+                    "node-gyp": {
+                        "version": "8.4.1",
+                        "dependencies": {
+                            "make-fetch-happen": {
+                                "version": "9.1.0",
+                                "dependencies": {
+                                    "http-proxy-agent": {
+                                        "version": "4.0.1",
+                                        "dependencies": {
+                                            "@tootallnate/once": {
+                                                "version": "2.0.1",
+                                                "overridden": True,
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+
+    assert _dependency_tree_versions(nested_tree, "@tootallnate/once") == {"2.0.1"}
+
+    sandbox = MagicMock()
+    manifest_payload = '{"overrides":{"@tootallnate/once":"2.0.1"}}'
+    lockfile_payload = (
+        '{"lockfileVersion":3,"packages":{"node_modules/@tootallnate/once":{"version":"2.0.1"}}}'
+    )
+    sandbox.read_file.side_effect = lambda path: (
+        manifest_payload if str(path).endswith("package.json") else lockfile_payload
+    )
+    sandbox.run.return_value.exit_code = 0
+    sandbox.run.return_value.stdout = json.dumps(nested_tree)
+    group = _group("g1").model_copy(update={"vulnerable_component": "@tootallnate/once"})
+
+    package_state = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.VERSION_BUMP,
+        task=_task_context(group),
+        expected_version="2.0.1",
+    )
+
+    evidence = package_state.dependency_evidence
+    assert evidence is not None
+    assert evidence.status == DependencyEvidenceStatus.VERIFIED
+    assert evidence.resolved_versions == ["2.0.1"]
+    assert evidence.lockfile_versions == ["2.0.1"]
 
 
 def test_version_bump_missing_lockfile_is_inconclusive() -> None:
