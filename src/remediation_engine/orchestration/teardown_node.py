@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from remediation_engine.contracts.accessors import model_or_dict_value
 from remediation_engine.orchestration.state import ChangedFilesProjection, OrchestratorState
 from remediation_engine.orchestration.task_utils import (
     effective_group_status,
@@ -34,11 +35,7 @@ _WORKSPACE_VOLUME_CLEANUP_ATTEMPTS = 3
 _WORKSPACE_VOLUME_CLEANUP_RETRY_SECONDS = 0.25
 
 
-def _attempt_value(item: Any, key: str, default: Any = None) -> Any:
-    """Read a worker-attempt field from either a model or a mapping."""
-    if isinstance(item, dict):
-        return item.get(key, default)
-    return getattr(item, key, default)
+_attempt_value = model_or_dict_value
 
 
 def _close_client(client) -> None:
@@ -407,7 +404,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
 
         group_tasks = task_group_lineage(task_queue, g.group_id)
         group_status = effective_group_status(task_queue, g.group_id)
-        if group_status in {TaskStatus.QA_PASSED.value, TaskStatus.MITIGATED.value}:
+        if group_status == TaskStatus.QA_PASSED.value:
             passed_files.update(files)
         elif group_status in {
             TaskStatus.UNFIXABLE.value,
@@ -430,7 +427,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
         attempt_changed_files = _attempt_value(attempt_res, "changed_files", []) or []
         if task is not None and attempt_changed_files:
             group_status = effective_group_status(task_queue, task.parent_group_id)
-            if group_status in {TaskStatus.QA_PASSED.value, TaskStatus.MITIGATED.value}:
+            if group_status == TaskStatus.QA_PASSED.value:
                 passed_files.update(attempt_changed_files)
             elif group_status in {
                 TaskStatus.UNFIXABLE.value,

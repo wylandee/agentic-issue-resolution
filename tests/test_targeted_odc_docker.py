@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from remediation_engine.orchestration.qa_critic import _run_targeted_odc
+from remediation_engine.orchestration.qa_odc import _run_targeted_odc
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 from remediation_engine.tools.lockfile_closure import (
     build_sliced_lockfile_artifacts,

@@ -1,4 +1,4 @@
-"""Contract tests for the canonical Phase 2 golden-case envelope."""
+"""Contract tests for the canonical golden-case envelope."""
 
 from __future__ import annotations
 

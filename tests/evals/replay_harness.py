@@ -1,4 +1,4 @@
-"""Deterministic boundaries and production-node adapters for Phase 2 evals.
+"""Deterministic boundaries and production-node adapters for Phase 5 evals.
 
 The live replay suites call the real production node and model, but replace
 only side effects that would make an evaluation nondeterministic or unsafe:
@@ -46,11 +46,12 @@ class ReplayCapture:
         actual_output: JSON or text representation of the live result.
         actual_tools: Serialized tool events in execution order.
         typed_result: Raw production result, when one is available.
+        attempt_result: Attempt-correlated production envelope, when one is
+            available for a worker or QA replay.
         changed_files: Files reported by the production component.
         errors: Production and replay-boundary errors.
         attempt_id: Attempt identity returned by a worker, if applicable.
         task_revision: Task revision returned by a worker, if applicable.
-        external_calls: Recorded non-model calls made through replay doubles.
         final_files: Final contents of the adapter-owned in-memory workspace
             after the production node completes, including rollback decisions.
             Triage captures use an empty mapping because they have no workspace.
@@ -71,6 +72,7 @@ class ReplayCapture:
     actual_output: str = ""
     actual_tools: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     typed_result: Any = None
+    attempt_result: Any = None
     changed_files: list[str] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
     attempt_id: str | None = None
@@ -349,6 +351,7 @@ class ReplaySandbox:
         self.commands: list[str] = []
         self.writes: list[str] = []
         self.external_calls: list[dict[str, Any]] = []
+        self._workspace_snapshots: dict[str, dict[str, str]] = {}
         self._alive = False
 
     @staticmethod
@@ -400,6 +403,21 @@ class ReplaySandbox:
                 else:
                     self.files.pop(normalized, None)
         self.writes.clear()
+
+    def create_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Capture the current in-memory files under a workspace snapshot ID."""
+        self._workspace_snapshots[str(snapshot_id)] = dict(self.files)
+
+    def restore_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Restore files from a previously captured workspace snapshot."""
+        try:
+            self.files = dict(self._workspace_snapshots[str(snapshot_id)])
+        except KeyError as exc:
+            raise RuntimeError(f"ReplaySandbox snapshot {snapshot_id!r} is missing.") from exc
+
+    def remove_workspace_snapshot(self, snapshot_id: str) -> None:
+        """Delete a workspace snapshot after its attempt is finalized."""
+        self._workspace_snapshots.pop(str(snapshot_id), None)
 
     def read_file(self, file_path: str) -> str | None:
         """Read a normalized workspace file from memory."""

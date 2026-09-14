@@ -88,10 +88,10 @@ class TestTokenBudgetMetricUnit:
     @pytest.mark.asyncio
     async def test_async_measure(self) -> None:
         """Async measure delegates correctly to synchronous measurement."""
-        metric = TokenBudgetMetric(agent_type="report")
+        metric = TokenBudgetMetric(agent_type="qa_critic")
         tc = LLMTestCase(
-            input="report input",
-            actual_output="report text",
+            input="QA critic input",
+            actual_output="QA evaluation",
             additional_metadata={"prompt_tokens": 2000, "completion_tokens": 500},
         )
         score = await metric.a_measure(tc)
@@ -134,8 +134,8 @@ class TestLatencySLAMetricUnit:
     @pytest.mark.asyncio
     async def test_async_measure(self) -> None:
         """Async measure delegates correctly."""
-        metric = LatencySLAMetric(agent_type="report", max_latency_seconds=15.0)
-        tc = LLMTestCase(input="report", actual_output="done", completion_time=5.0)
+        metric = LatencySLAMetric(agent_type="qa_critic", max_latency_seconds=15.0)
+        tc = LLMTestCase(input="QA critic", actual_output="done", completion_time=5.0)
         score = await metric.a_measure(tc)
         assert score == 1.0
 
@@ -212,7 +212,7 @@ class TestBusinessRules:
 
     @pytest.mark.parametrize(
         "agent_type",
-        ["triage", "update_subagent", "workaround_subagent", "qa_critic", "report"],
+        ["triage", "update_subagent", "workaround_subagent", "qa_critic"],
     )
     def test_token_budgets(
         self,
@@ -274,7 +274,7 @@ class TestBusinessRules:
 
     @pytest.mark.parametrize(
         "agent_type",
-        ["triage", "update_subagent", "workaround_subagent", "qa_critic", "report"],
+        ["triage", "update_subagent", "workaround_subagent", "qa_critic"],
     )
     def test_latency_sla(
         self,

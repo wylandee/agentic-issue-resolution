@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from remediation_engine.contracts.accessors import model_or_dict_value
 from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     NoFixMitigationStage,
@@ -34,7 +35,6 @@ TERMINAL_TASK_STATUSES = frozenset(
         TaskStatus.QA_PASSED,
         TaskStatus.UNFIXABLE,
         TaskStatus.INCONCLUSIVE,
-        TaskStatus.MITIGATED,
         TaskStatus.PIVOTED,
     }
 )
@@ -50,11 +50,7 @@ _UNRESOLVED_GROUP_STATUSES = frozenset(
 )
 
 
-def _task_value(task: Any, field: str, default: Any = None) -> Any:
-    """Read a task field from either a Pydantic task or a mapping."""
-    if isinstance(task, Mapping):
-        return task.get(field, default)
-    return getattr(task, field, default)
+_task_value = model_or_dict_value
 
 
 def _task_status_name(task: Any) -> str:
@@ -123,18 +119,18 @@ def effective_group_status(
     task_queue: Mapping[str, Any],
     group_id: str,
 ) -> str:
-    """Collapse a group and all pivot descendants using failure-first rules.
+    """Compute a reader-facing outcome from one group's task lineage.
 
-    ``PIVOTED`` is an audit status, not a remediation outcome. It is ignored
-    when a child exists. Failed or incomplete descendants always outrank a
-    historical ``QA_PASSED`` status on the parent task.
+    Pivot markers are audit state rather than remediation outcomes. Once a
+    child exists, failed or incomplete descendants take precedence over a
+    parent that previously passed QA.
 
     Args:
-        task_queue: Task ID to task mapping.
-        group_id: Initial or pivot group identifier.
+        task_queue: Authoritative task-ID to task mapping.
+        group_id: Initial vulnerability-group identifier.
 
     Returns:
-        The effective group status as a string value.
+        The effective lifecycle status as a string value.
     """
     statuses = [_task_status_name(task) for task in task_group_lineage(task_queue, group_id)]
     if not statuses:
@@ -155,25 +151,22 @@ def effective_group_status(
         return TaskStatus.OPTIMISTICALLY_FIXED.value
     if TaskStatus.QA_PASSED.value in active_statuses:
         return TaskStatus.QA_PASSED.value
-    if TaskStatus.MITIGATED.value in active_statuses:
-        return TaskStatus.MITIGATED.value
     return active_statuses[0]
 
 
 def terminal_outcome_issues(state: Mapping[str, Any]) -> list[str]:
     """Return deterministic reasons the final run cannot be successful.
 
-    This is deliberately independent of the Supervisor LLM and is shared by
-    teardown, report generation, and the public API. Historical worker
-    success cannot override an unfixable task, incomplete task, or an
-    authoritative final scan that still contains findings.
+    This pure projection is shared by teardown, report generation, and the
+    public API. A worker success cannot override an unfixable or incomplete
+    task, and the authoritative final scan must not contain blocking findings.
 
     Args:
         state: Current or final orchestration state.
 
     Returns:
-        Deduplicated human-readable failure reasons. An empty list means that
-        this helper found no terminal contradiction.
+        Deduplicated human-readable failure reasons; an empty list means no
+        terminal contradiction was found.
     """
     task_queue = {
         str(task_id): task for task_id, task in (state.get("task_queue", {}) or {}).items()
@@ -489,20 +482,19 @@ def derive_missing_task_qa_policy(
     task: RemediationTask,
     group: VulnerabilityGroup | None,
 ) -> QAPolicy | None:
-    """Derive a safe QA policy for an uncommitted legacy task.
+    """Derive a safe QA policy when a task lacks committed policy provenance.
 
-    This helper is intentionally narrower than the initial-task factory.  It
-    repairs state created before ``qa_policy`` became mandatory while refusing
-    to guess the policy for a pivoted child task whose policy provenance has
-    been lost.
+    Only evidence that is deterministic from the task and its current
+    vulnerability group is accepted. A pivoted child whose policy cannot be
+    reconstructed returns ``None`` so the caller can fail closed.
 
     Args:
-        task: Existing task whose policy may be missing.
-        group: Current vulnerability group, when still available.
+        task: Existing task whose policy may be absent.
+        group: Current vulnerability group, when available.
 
     Returns:
         A deterministically recoverable policy, or ``None`` when provenance is
-        ambiguous and the caller must fail closed.
+        ambiguous.
     """
     if task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
         return QAPolicy.NO_FIX_PACKAGE_REMOVAL

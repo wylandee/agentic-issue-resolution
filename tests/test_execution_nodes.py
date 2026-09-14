@@ -21,7 +21,7 @@ from remediation_engine.orchestration.state import (
     initial_orchestrator_state,
     merge_changed_files_reducer,
 )
-from remediation_engine.orchestration.supervisor_node import _instruction_digest
+from remediation_engine.orchestration.supervisor_node import instruction_digest
 from remediation_engine.orchestration.teardown_node import _build_diff, run_teardown_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
@@ -174,7 +174,7 @@ class TestTeardownNode:
             task_revision=1,
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
             instruction=instruction,
-            instruction_digest=_instruction_digest(instruction),
+            instruction_digest=instruction_digest(instruction),
             dispatch_node="workaround_subagent",
         )
         state = initial_orchestrator_state(str(tmp_path), [])

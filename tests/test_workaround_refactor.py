@@ -15,6 +15,7 @@ from remediation_engine.contracts.schemas import (
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     TaskAttemptSnapshot,
@@ -23,14 +24,16 @@ from remediation_engine.contracts.schemas import (
     WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
-from remediation_engine.orchestration.qa_critic import (
+from remediation_engine.orchestration.qa_policy_engine import (
     _attach_failure_evidence_to_evaluations,
+)
+from remediation_engine.orchestration.qa_test_parsing import (
     _detect_targeted_test_context,
-    _QAExecutionResults,
     build_targeted_test_command,
     detect_test_runner,
     extract_qa_failure_evidence,
 )
+from remediation_engine.orchestration.qa_types import _QAExecutionResults
 from remediation_engine.orchestration.remedy_tools import (
     _is_prohibited_target,
     build_workaround_toolbelt,
@@ -49,6 +52,17 @@ from remediation_engine.orchestration.workaround_subagent import (
     _workaround_attempt_succeeded,
     run_workaround_subagent_node,
 )
+
+
+def _attempt_snapshot(task: RemediationTask) -> TaskAttemptSnapshot:
+    return TaskAttemptSnapshot(
+        attempt_id=task.current_attempt_id or "attempt-missing",
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        instruction=task.instruction,
+        instruction_digest="test-digest",
+        dispatch_node="workaround_subagent",
+    )
 
 
 def test_extract_qa_failure_evidence_exact_diagnostics():
@@ -85,8 +99,8 @@ def test_failed_qa_evidence_is_correlated_to_committed_attempt():
         task_revision=4,
     )
     evaluations = {
-        "group-1": QAEvaluation(
-            task_id="group-1",
+        "task-1": QAEvaluation(
+            task_id="task-1",
             passed=False,
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="Repair the regression.",
@@ -99,14 +113,60 @@ def test_failed_qa_evidence_is_correlated_to_committed_attempt():
     enriched = _attach_failure_evidence_to_evaluations(
         evaluations,
         results,
-        {"task_queue": {task.task_id: task}},
+        {
+            "task_queue": {task.task_id: task},
+            "attempt_snapshots_by_id": {
+                task.current_attempt_id: _attempt_snapshot(task),
+            },
+        },
     )
 
-    evidence = enriched["group-1"].failure_evidence
+    evidence = enriched["task-1"].failure_evidence
     assert evidence is not None
     assert evidence.attempt_id == "attempt-7"
     assert evidence.task_revision == 4
     assert any("algorithms is a required option" in d for d in evidence.exact_diagnostics)
+
+
+def test_failure_evidence_is_dropped_for_task_without_current_snapshot():
+    """Do not attach one task's deterministic failure output to another task."""
+    task_one = RemediationTask(
+        task_id="task-1",
+        parent_group_id="group-1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        instruction="Apply workaround one.",
+        current_attempt_id="attempt-1",
+        task_revision=1,
+    )
+    task_two = task_one.model_copy(
+        update={
+            "task_id": "task-2",
+            "current_attempt_id": "attempt-2",
+            "instruction": "Apply workaround two.",
+        }
+    )
+    evaluations = {
+        task.task_id: QAEvaluation(
+            task_id=task.task_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="Retry the task.",
+        )
+        for task in (task_one, task_two)
+    }
+    results = _QAExecutionResults(tests=(False, "TypeError at src/one.test.ts:4:2"))
+    state = {
+        "task_queue": {task.task_id: task for task in (task_one, task_two)},
+        "attempt_snapshots_by_id": {
+            task_one.current_attempt_id: _attempt_snapshot(task_one),
+        },
+    }
+
+    enriched = _attach_failure_evidence_to_evaluations(evaluations, results, state)
+
+    assert enriched["task-1"].failure_evidence is not None
+    assert enriched["task-1"].failure_evidence.attempt_id == "attempt-1"
+    assert enriched["task-2"].failure_evidence is None
 
 
 def test_deterministic_qa_evidence_replaces_llm_source_locations():
@@ -120,8 +180,8 @@ def test_deterministic_qa_evidence_replaces_llm_source_locations():
         task_revision=4,
     )
     evaluations = {
-        "group-1": QAEvaluation(
-            task_id="group-1",
+        "task-1": QAEvaluation(
+            task_id="task-1",
             passed=False,
             failure_category=FailureCategory.SECURITY_FLAG,
             retry_feedback="Repair the regression.",
@@ -141,11 +201,16 @@ def test_deterministic_qa_evidence_replaces_llm_source_locations():
     enriched = _attach_failure_evidence_to_evaluations(
         evaluations,
         results,
-        {"task_queue": {task.task_id: task}},
+        {
+            "task_queue": {task.task_id: task},
+            "attempt_snapshots_by_id": {
+                task.current_attempt_id: _attempt_snapshot(task),
+            },
+        },
         sandbox=sandbox,
     )
 
-    evidence = enriched["group-1"].failure_evidence
+    evidence = enriched["task-1"].failure_evidence
     assert evidence is not None
     assert evidence.source_locations == ["test/server/insecuritySpec.ts:184:7"]
     assert evidence.affected_files == ["test/server/insecuritySpec.ts"]
@@ -164,8 +229,8 @@ def test_invalid_deterministic_qa_source_locations_are_discarded():
         task_revision=4,
     )
     evaluations = {
-        "group-1": QAEvaluation(
-            task_id="group-1",
+        "task-1": QAEvaluation(
+            task_id="task-1",
             passed=False,
             failure_category=FailureCategory.SECURITY_FLAG,
             retry_feedback="Repair the regression.",
@@ -180,11 +245,16 @@ def test_invalid_deterministic_qa_source_locations_are_discarded():
     enriched = _attach_failure_evidence_to_evaluations(
         evaluations,
         results,
-        {"task_queue": {task.task_id: task}},
+        {
+            "task_queue": {task.task_id: task},
+            "attempt_snapshots_by_id": {
+                task.current_attempt_id: _attempt_snapshot(task),
+            },
+        },
         sandbox=sandbox,
     )
 
-    evidence = enriched["group-1"].failure_evidence
+    evidence = enriched["task-1"].failure_evidence
     assert evidence is not None
     assert evidence.source_locations == []
     assert evidence.affected_files == []
@@ -312,12 +382,13 @@ def test_qa_evidence_is_reused_after_failed_attempt_is_closed():
         attempt_id="attempt-1",
         task_id="task-1",
         task_revision=2,
+        qa_policy=QAPolicy.INITIAL_CODE_WORKAROUND,
+        qa_policy_source="attempt_snapshot",
         evaluation=evaluation,
     )
 
     resolved = _qa_failure_evidence_for_workaround_retry(
         "task-1",
-        "group-1",
         {"task-1": evaluation},
         {"attempt-1": qa_result},
     )
@@ -343,16 +414,16 @@ def test_qa_evidence_is_inherited_by_workaround_child_from_parent_attempt():
         attempt_id="update-attempt-1",
         task_id="task-1",
         task_revision=3,
+        qa_policy=QAPolicy.INITIAL_CODE_WORKAROUND,
+        qa_policy_source="attempt_snapshot",
         evaluation=evaluation,
     )
 
     resolved = _qa_failure_evidence_for_workaround_retry(
         "task-2",
-        "group-workaround",
         {"task-1": evaluation},
         {"update-attempt-1": qa_result},
         related_task_ids=["task-1"],
-        related_group_ids=["group-update"],
     )
 
     assert resolved == evidence

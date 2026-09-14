@@ -24,7 +24,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_update_pass"
+      ],
+      "closure_package_names": [
+        "debug"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -53,7 +64,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:debug:UPDATE_VERSION",
+          "task_id": "qa_update_pass",
           "passed": true,
           "failure_category": null,
           "retry_feedback": null,
@@ -64,7 +75,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:debug:UPDATE_VERSION",
+        "task_id": "qa_update_pass",
         "passed": true,
         "failure_category": null,
         "retry_feedback": null,
@@ -75,7 +86,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:debug:UPDATE_VERSION",
+            "task_id": "qa_update_pass",
             "passed": true,
             "failure_category": null,
             "retry_feedback": null,
@@ -102,7 +113,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_update_pass"
+          ],
+          "closure_package_names": [
+            "debug"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -145,7 +167,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": null,
       "package_manifest_state": "present",
-      "package_graph_state": null
+      "package_graph_state": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_update_fail_install"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: Override for ws@8.21.1 conflicts with direct dependency.",
@@ -180,7 +213,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "task_id": "qa_update_fail_install",
           "passed": false,
           "failure_category": "peer_conflict",
           "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
@@ -191,7 +224,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+        "task_id": "qa_update_fail_install",
         "passed": false,
         "failure_category": "peer_conflict",
         "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
@@ -209,7 +242,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+            "task_id": "qa_update_fail_install",
             "passed": false,
             "failure_category": "peer_conflict",
             "retry_feedback": "npm install failed with EOVERRIDE because the ws override conflicts with the direct dependency. Resolve the manifest conflict before retrying.",
@@ -238,7 +271,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": null,
           "package_manifest_state": "present",
-          "package_graph_state": null
+          "package_graph_state": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_update_fail_install"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: Override for ws@8.21.1 conflicts with direct dependency.",
@@ -286,7 +330,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_update_fail_scanner"
+      ],
+      "closure_package_names": [
+        "fstream"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -321,7 +376,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+          "task_id": "qa_update_fail_scanner",
           "passed": false,
           "failure_category": "security_flag",
           "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
@@ -332,7 +387,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+        "task_id": "qa_update_fail_scanner",
         "passed": false,
         "failure_category": "security_flag",
         "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
@@ -350,7 +405,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:fstream:UPDATE_VERSION",
+            "task_id": "qa_update_fail_scanner",
             "passed": false,
             "failure_category": "security_flag",
             "retry_feedback": "The security scan still reports CVE-2019-13173 and GHSA-XF7W-R453-M56C for fstream. Validate a remediation that clears them before retrying.",
@@ -384,7 +439,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_update_fail_scanner"
+          ],
+          "closure_package_names": [
+            "fstream"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -427,7 +493,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": false,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_update_fail_unit_tests"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -462,7 +539,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "task_id": "qa_update_fail_unit_tests",
           "passed": false,
           "failure_category": "breaking_change",
           "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
@@ -473,7 +550,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+        "task_id": "qa_update_fail_unit_tests",
         "passed": false,
         "failure_category": "breaking_change",
         "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
@@ -491,7 +568,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+            "task_id": "qa_update_fail_unit_tests",
             "passed": false,
             "failure_category": "breaking_change",
             "retry_feedback": "npm test failed because express-jwt v8 rejects the legacy default import: TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Migrate the import and call pattern before retrying.",
@@ -520,7 +597,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": false,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_update_fail_unit_tests"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -565,7 +653,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_initial_pass_semantic_scan_fail"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -611,7 +710,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "task_id": "qa_workaround_initial_pass_semantic_scan_fail",
           "passed": true,
           "failure_category": null,
           "retry_feedback": null,
@@ -630,7 +729,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "task_id": "qa_workaround_initial_pass_semantic_scan_fail",
         "passed": true,
         "failure_category": null,
         "retry_feedback": null,
@@ -669,7 +768,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "task_id": "qa_workaround_initial_pass_semantic_scan_fail",
             "passed": true,
             "failure_category": null,
             "retry_feedback": null,
@@ -708,7 +807,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_initial_pass_semantic_scan_fail"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -755,7 +865,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": null,
       "package_manifest_state": "present",
-      "package_graph_state": null
+      "package_graph_state": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_workaround_initial_fail_install"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
@@ -793,7 +914,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "task_id": "qa_workaround_initial_fail_install",
           "passed": false,
           "failure_category": "peer_conflict",
           "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
@@ -804,7 +925,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "task_id": "qa_workaround_initial_fail_install",
         "passed": false,
         "failure_category": "peer_conflict",
         "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
@@ -824,7 +945,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "task_id": "qa_workaround_initial_fail_install",
             "passed": false,
             "failure_category": "peer_conflict",
             "retry_feedback": "Installation failed with EOVERRIDE because the ws override conflicts with the direct dependency. Repair the dependency graph before evaluating the workaround.",
@@ -865,7 +986,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": null,
           "package_manifest_state": "present",
-          "package_graph_state": null
+          "package_graph_state": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_workaround_initial_fail_install"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
@@ -939,7 +1071,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_initial_fail_semantic"
+      ],
+      "closure_package_names": [
+        "sanitize-html"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -985,7 +1128,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "task_id": "qa_workaround_initial_fail_semantic",
           "passed": false,
           "failure_category": "security_flag",
           "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
@@ -1004,7 +1147,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+        "task_id": "qa_workaround_initial_fail_semantic",
         "passed": false,
         "failure_category": "security_flag",
         "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
@@ -1043,7 +1186,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+            "task_id": "qa_workaround_initial_fail_semantic",
             "passed": false,
             "failure_category": "security_flag",
             "retry_feedback": "Semantic review found that lib/insecurity.ts still exposes vulnerable sanitize-html behavior. Block or safely configure the vulnerable sanitizer path and provide source/diff evidence before retrying.",
@@ -1109,7 +1252,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_initial_fail_semantic"
+          ],
+          "closure_package_names": [
+            "sanitize-html"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -1181,7 +1335,18 @@
       ],
       "tests_passed": false,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_initial_fail_unit_tests"
+      ],
+      "closure_package_names": [
+        "sanitize-html"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -1226,7 +1391,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "task_id": "qa_workaround_initial_fail_unit_tests",
           "passed": false,
           "failure_category": "breaking_change",
           "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
@@ -1254,7 +1419,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+        "task_id": "qa_workaround_initial_fail_unit_tests",
         "passed": false,
         "failure_category": "breaking_change",
         "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
@@ -1301,7 +1466,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+            "task_id": "qa_workaround_initial_fail_unit_tests",
             "passed": false,
             "failure_category": "breaking_change",
             "retry_feedback": "The initial sanitize-html workaround passes semantic review, but npm test fails in the sanitizeSecure recursive-sanitization regression. Restore the expected normalization behavior while preserving the security invariant.",
@@ -1376,7 +1541,18 @@
           ],
           "tests_passed": false,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_initial_fail_unit_tests"
+          ],
+          "closure_package_names": [
+            "sanitize-html"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -1419,7 +1595,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_pivot_pass_update_api"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -1448,7 +1635,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "task_id": "qa_workaround_pivot_pass_update_api",
           "passed": true,
           "failure_category": null,
           "retry_feedback": null,
@@ -1467,7 +1654,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "task_id": "qa_workaround_pivot_pass_update_api",
         "passed": true,
         "failure_category": null,
         "retry_feedback": null,
@@ -1486,7 +1673,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "task_id": "qa_workaround_pivot_pass_update_api",
             "passed": true,
             "failure_category": null,
             "retry_feedback": null,
@@ -1523,7 +1710,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_pivot_pass_update_api"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -1566,7 +1764,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": null,
       "package_manifest_state": "present",
-      "package_graph_state": null
+      "package_graph_state": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_workaround_pivot_fail_install"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
@@ -1600,7 +1809,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "task_id": "qa_workaround_pivot_fail_install",
           "passed": false,
           "failure_category": "peer_conflict",
           "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
@@ -1611,7 +1820,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "task_id": "qa_workaround_pivot_fail_install",
         "passed": false,
         "failure_category": "peer_conflict",
         "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
@@ -1629,7 +1838,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "task_id": "qa_workaround_pivot_fail_install",
             "passed": false,
             "failure_category": "peer_conflict",
             "retry_feedback": "The migration pivot cannot be validated because npm install failed with EOVERRIDE. Resolve the dependency conflict before retrying.",
@@ -1658,7 +1867,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": null,
           "package_manifest_state": "present",
-          "package_graph_state": null
+          "package_graph_state": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_workaround_pivot_fail_install"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: ws override conflicts with direct dependency.",
@@ -1701,7 +1921,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": false,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_pivot_fail_unit_tests"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -1735,7 +1966,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "task_id": "qa_workaround_pivot_fail_unit_tests",
           "passed": false,
           "failure_category": "breaking_change",
           "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
@@ -1746,7 +1977,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+        "task_id": "qa_workaround_pivot_fail_unit_tests",
         "passed": false,
         "failure_category": "breaking_change",
         "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
@@ -1764,7 +1995,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+            "task_id": "qa_workaround_pivot_fail_unit_tests",
             "passed": false,
             "failure_category": "breaking_change",
             "retry_feedback": "The migration pivot still fails tests with import_express_jwt.default is not a function at lib/insecurity.ts:54:35. Correct the API integration before retrying.",
@@ -1793,7 +2024,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": false,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_pivot_fail_unit_tests"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -1838,7 +2080,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": true,
       "package_manifest_state": "absent",
-      "package_graph_state": "absent"
+      "package_graph_state": "absent",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_package_removal_pass"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded after authorized package removal.",
@@ -1880,7 +2133,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_package_removal_pass",
           "passed": true,
           "failure_category": null,
           "retry_feedback": null,
@@ -1891,7 +2144,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_package_removal_pass",
         "passed": true,
         "failure_category": null,
         "retry_feedback": null,
@@ -1916,7 +2169,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_package_removal_pass",
             "passed": true,
             "failure_category": null,
             "retry_feedback": null,
@@ -1947,7 +2200,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": true,
           "package_manifest_state": "absent",
-          "package_graph_state": "absent"
+          "package_graph_state": "absent",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_package_removal_pass"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded after authorized package removal.",
@@ -1992,7 +2256,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": null,
       "package_manifest_state": null,
-      "package_graph_state": null
+      "package_graph_state": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_workaround_nofix_package_removal_fail_install"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
@@ -2028,7 +2303,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_package_removal_fail_install",
           "passed": false,
           "failure_category": "peer_conflict",
           "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
@@ -2039,7 +2314,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_package_removal_fail_install",
         "passed": false,
         "failure_category": "peer_conflict",
         "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
@@ -2057,7 +2332,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_package_removal_fail_install",
             "passed": false,
             "failure_category": "peer_conflict",
             "retry_feedback": "The package-removal attempt cannot be validated because npm install failed with an override conflict. Repair the dependency graph before retrying.",
@@ -2088,7 +2363,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": null,
           "package_manifest_state": null,
-          "package_graph_state": null
+          "package_graph_state": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_workaround_nofix_package_removal_fail_install"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
@@ -2136,7 +2422,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_package_removal_fail_dependency_tree"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded after the package-removal attempt.",
@@ -2172,7 +2469,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_package_removal_fail_dependency_tree",
           "passed": false,
           "failure_category": "security_flag",
           "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
@@ -2183,7 +2480,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_package_removal_fail_dependency_tree",
         "passed": false,
         "failure_category": "security_flag",
         "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
@@ -2201,7 +2498,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_package_removal_fail_dependency_tree",
             "passed": false,
             "failure_category": "security_flag",
             "retry_feedback": "Installation completed, but no-fix package removal is invalid because notevil remains in the authorized manifest and resolved dependency graph and the target identifiers remain. Remove the package and its consumer, then rerun the scan.",
@@ -2235,7 +2532,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_package_removal_fail_dependency_tree"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded after the package-removal attempt.",
@@ -2280,7 +2588,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": false,
       "package_manifest_state": "absent",
-      "package_graph_state": "absent"
+      "package_graph_state": "absent",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_package_removal_fail_unit_tests"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded after package removal.",
@@ -2322,7 +2641,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_package_removal_fail_unit_tests",
           "passed": false,
           "failure_category": "breaking_change",
           "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
@@ -2342,7 +2661,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_package_removal_fail_unit_tests",
         "passed": false,
         "failure_category": "breaking_change",
         "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
@@ -2376,7 +2695,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_package_removal_fail_unit_tests",
             "passed": false,
             "failure_category": "breaking_change",
             "retry_feedback": "npm test fails because routes/b2bOrder.ts still imports notevil after package removal. Remove or replace the consumer and rerun the required tests.",
@@ -2416,7 +2735,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": false,
           "package_manifest_state": "absent",
-          "package_graph_state": "absent"
+          "package_graph_state": "absent",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_package_removal_fail_unit_tests"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded after package removal.",
@@ -2464,7 +2794,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_pivot_pass_semantic_scan"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -2510,7 +2851,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_pivot_pass_semantic_scan",
           "passed": true,
           "failure_category": null,
           "retry_feedback": null,
@@ -2530,7 +2871,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_pivot_pass_semantic_scan",
         "passed": true,
         "failure_category": null,
         "retry_feedback": null,
@@ -2570,7 +2911,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_pivot_pass_semantic_scan",
             "passed": true,
             "failure_category": null,
             "retry_feedback": null,
@@ -2613,7 +2954,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_pivot_pass_semantic_scan"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -2658,7 +3010,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": null,
       "package_manifest_state": "present",
-      "package_graph_state": null
+      "package_graph_state": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_workaround_nofix_pivot_fail_install"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
@@ -2692,7 +3055,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_pivot_fail_install",
           "passed": false,
           "failure_category": "peer_conflict",
           "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
@@ -2703,7 +3066,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_pivot_fail_install",
         "passed": false,
         "failure_category": "peer_conflict",
         "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
@@ -2721,7 +3084,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_pivot_fail_install",
             "passed": false,
             "failure_category": "peer_conflict",
             "retry_feedback": "Installation failed with EOVERRIDE, so the no-fix source pivot cannot be validated. Repair the dependency environment before retrying.",
@@ -2752,7 +3115,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": null,
           "package_manifest_state": "present",
-          "package_graph_state": null
+          "package_graph_state": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_workaround_nofix_pivot_fail_install"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install FAILED (exit 1). EOVERRIDE: dependency override conflicts with the direct dependency.",
@@ -2800,7 +3174,18 @@
       ],
       "tests_passed": true,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_pivot_fail_semantic"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -2846,7 +3231,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_pivot_fail_semantic",
           "passed": false,
           "failure_category": "security_flag",
           "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
@@ -2865,7 +3250,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_pivot_fail_semantic",
         "passed": false,
         "failure_category": "security_flag",
         "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
@@ -2904,7 +3289,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_pivot_fail_semantic",
             "passed": false,
             "failure_category": "security_flag",
             "retry_feedback": "Semantic review found that the retained notevil package is still used in the vulnerable route. Remove or gate the vulnerable execution path and provide source/diff evidence before retrying.",
@@ -2946,7 +3331,18 @@
           ],
           "tests_passed": true,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_pivot_fail_semantic"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -2991,7 +3387,18 @@
       "target_remaining_identifiers": [],
       "tests_passed": false,
       "package_manifest_state": "present",
-      "package_graph_state": "present"
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_workaround_nofix_pivot_fail_unit_tests"
+      ],
+      "closure_package_names": [
+        "notevil"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "npm install succeeded.",
@@ -3032,7 +3439,7 @@
       {
         "name": "emit_qa_evaluation",
         "args": {
-          "task_id": "sca:package.json:notevil:NO_FIX",
+          "task_id": "qa_workaround_nofix_pivot_fail_unit_tests",
           "passed": false,
           "failure_category": "security_flag",
           "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
@@ -3058,7 +3465,7 @@
     ],
     "offline_fixture": {
       "actual_output": {
-        "task_id": "sca:package.json:notevil:NO_FIX",
+        "task_id": "qa_workaround_nofix_pivot_fail_unit_tests",
         "passed": false,
         "failure_category": "security_flag",
         "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
@@ -3098,7 +3505,7 @@
         {
           "name": "emit_qa_evaluation",
           "args": {
-            "task_id": "sca:package.json:notevil:NO_FIX",
+            "task_id": "qa_workaround_nofix_pivot_fail_unit_tests",
             "passed": false,
             "failure_category": "security_flag",
             "retry_feedback": "The no-fix pivot failed required tests: /rest/chat and test/api/chat.test.ts report SyntaxError/async activity diagnostics. Investigate the regression and provide conclusive semantic evidence before retrying.",
@@ -3144,7 +3551,18 @@
           "target_remaining_identifiers": [],
           "tests_passed": false,
           "package_manifest_state": "present",
-          "package_graph_state": "present"
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_workaround_nofix_pivot_fail_unit_tests"
+          ],
+          "closure_package_names": [
+            "notevil"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "npm install succeeded.",
@@ -3185,7 +3603,18 @@
       "scanner_execution_status": "not_run",
       "target_scanner_cleared": null,
       "target_remaining_identifiers": [],
-      "tests_passed": null
+      "tests_passed": null,
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "qa_surrender_max_tool_call_rounds"
+      ],
+      "closure_package_names": [
+        "express-jwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
     },
     "execution_logs": {
       "install_log": "Execution ended at the subagent round bound.",
@@ -3231,7 +3660,18 @@
           "scanner_execution_status": "not_run",
           "target_scanner_cleared": null,
           "target_remaining_identifiers": [],
-          "tests_passed": null
+          "tests_passed": null,
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "qa_surrender_max_tool_call_rounds"
+          ],
+          "closure_package_names": [
+            "express-jwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
         },
         "execution_logs": {
           "install_log": "Execution ended at the subagent round bound.",

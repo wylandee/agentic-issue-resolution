@@ -19,6 +19,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     NoFixMitigationStage,
+    RemediationTask,
     VulnerabilityGroup,
     WorkaroundContext,
     WorkaroundEditSet,
@@ -28,17 +29,15 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
-from remediation_engine.orchestration.context_manager import ContextManager
-from remediation_engine.orchestration.remedy_tools import (
+from remediation_engine.orchestration._tool_support import (
     _detect_newline_style,
-    _is_allowlisted_no_fix_package_file,
-    _is_prohibited_target,
     _normalise_newlines,
     _restore_newlines,
-    build_workaround_toolbelt,
 )
+from remediation_engine.orchestration.context_manager import ContextManager
+from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
-from remediation_engine.orchestration.state import SubagentState, _derive_legacy_task_from_group
+from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import (
     has_successful_validation_gate,
     has_tool_call_before_first_successful_edit,
@@ -47,6 +46,10 @@ from remediation_engine.orchestration.subagent_runtime import (
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
+)
+from remediation_engine.orchestration.tools_manifest import (
+    _is_allowlisted_no_fix_package_file,
+    _is_prohibited_target,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
@@ -190,46 +193,6 @@ def _qa_failure_log_snippet(
             return _clean_prompt_log(fallback, max_chars=max_chars)
 
     return _clean_prompt_log(previous_feedback or "", max_chars=max_chars)
-
-
-def _extract_qa_error_snippet(previous_feedback: str) -> str:
-    """Extract the most diagnostic error text from QA feedback for web search."""
-    feedback = str(previous_feedback or "")
-
-    explicit_error = re.search(
-        r"\b[A-Za-z_][\w.]*(?:Error|Exception)\s*:\s*[^;\n]{1,240}",
-        feedback,
-        re.IGNORECASE,
-    )
-    if explicit_error:
-        return _clean_prompt_snippet(explicit_error.group(0))
-
-    package_diagnostic = re.search(
-        r"\b[A-Za-z][\w-]*[.-][\w.-]*:\s*(?:[^\n]{1,240}?\b(?:required\s+option|not\s+exported|not\s+a\s+function|cannot\s+find|undefined|invalid)\b[^\n]{0,160})",
-        feedback,
-        re.IGNORECASE,
-    )
-    if package_diagnostic:
-        return _clean_prompt_snippet(package_diagnostic.group(0))
-
-    for match in re.finditer(r"`([^`\n]{1,240})`|\"([^\"\n]{1,240})\"", feedback):
-        candidate = match.group(1) or match.group(2) or ""
-        if _QA_ERROR_MARKER.search(candidate):
-            return _clean_prompt_snippet(candidate)
-
-    not_a_function = re.search(
-        r"\([^\n)]{1,240}\)\s+is\s+not\s+a\s+function",
-        feedback,
-        re.IGNORECASE,
-    )
-    if not_a_function:
-        return _clean_prompt_snippet(not_a_function.group(0))
-
-    for line in feedback.splitlines():
-        if _QA_ERROR_MARKER.search(line):
-            return _clean_prompt_snippet(line)
-
-    return _clean_prompt_snippet(feedback, max_chars=240)
 
 
 _QA_GENERIC_STATUS_RE = re.compile(
@@ -379,182 +342,6 @@ def _has_test_failure_evidence(
             "typeerror",
             "exception",
         )
-    )
-
-
-def _workaround_search_recommendation(
-    target_task: Any,
-    target_group: VulnerabilityGroup,
-    workaround_context: WorkaroundContext | None,
-    previous_feedback: str | None,
-) -> _SearchQueryRecommendation:
-    """Build a first web query from the current remediation evidence.
-
-    Scanner failures need advisory and source-level mitigation research, while
-    test failures need package migration and compatibility research.  Keeping
-    this classification deterministic gives the LLM a useful first query
-    without preventing it from refining that query after inspecting the code.
-    """
-    fix_plan = getattr(target_group, "fix_plan", None)
-    plan_status = getattr(getattr(fix_plan, "status", None), "value", "")
-    evidence_text = _workaround_evidence_text(workaround_context, previous_feedback)
-    scanner_failure = any(
-        marker in evidence_text
-        for marker in (
-            "scanner",
-            "remaining findings",
-            "remaining scanner",
-            "unresolved identifier",
-            "still vulnerable",
-            "security scan",
-            "dependency-check",
-            "semgrep",
-        )
-    )
-    test_failure = _has_test_failure_evidence(workaround_context, previous_feedback)
-
-    component = _search_query_term(
-        getattr(target_group, "vulnerable_component", "") or "component",
-        max_chars=100,
-    )
-    identifiers = [
-        *(getattr(target_group, "cve_ids", []) or [])[:1],
-        *(getattr(target_group, "ghsa_ids", []) or [])[:1],
-    ]
-    identifier_terms = " ".join(
-        _search_query_term(identifier, max_chars=80) for identifier in identifiers
-    )
-    mechanism = _search_query_term(
-        _extract_vulnerability_mechanism(target_group),
-        max_chars=140,
-    )
-    diagnostic = _extract_qa_search_diagnostic(workaround_context, previous_feedback)
-    diagnostic_term = _search_query_term(diagnostic, max_chars=180)
-
-    selected_version = getattr(target_task, "selected_version", None)
-    if not selected_version and fix_plan is not None:
-        selected_version = getattr(fix_plan, "fixed_version", None)
-    version_term = f"version {selected_version}" if selected_version else ""
-
-    no_fix_stage = getattr(workaround_context, "no_fix_stage", None)
-    if isinstance(no_fix_stage, NoFixMitigationStage):
-        no_fix_stage = no_fix_stage.value
-    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
-        return _SearchQueryRecommendation(
-            scenario="no_fix_package_removal",
-            initial_query=_query_parts(
-                component,
-                "package.json manifest imports call sites",
-                "package removal",
-            ),
-            rationale=(
-                "Prioritize local manifests, imports, and call sites so the worker can "
-                "remove only the authorized direct declaration and its dependent usage."
-            ),
-            follow_up_query="",
-        )
-    if no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
-        return _SearchQueryRecommendation(
-            scenario="no_fix_vulnerable_code_removal",
-            initial_query=_query_parts(
-                component,
-                identifier_terms,
-                mechanism,
-                "installed package source vulnerable API call path",
-            ),
-            rationale=(
-                "Use the advisory identifiers, vulnerable mechanism, and installed-package "
-                "source evidence to trace and remove direct and indirect vulnerable call paths."
-            ),
-            follow_up_query=diagnostic_term,
-        )
-
-    if scanner_failure:
-        return _SearchQueryRecommendation(
-            scenario="update_does_not_resolve_scanner_findings",
-            initial_query=_query_parts(
-                component,
-                identifier_terms,
-                "still vulnerable",
-                "scanner remediation",
-                mechanism,
-            ),
-            rationale=(
-                "Lead with the advisory identifier and vulnerable mechanism so the worker "
-                "can determine why the scanner still flags the package."
-            ),
-            follow_up_query=_query_parts(
-                component,
-                identifier_terms,
-                "source-level mitigation",
-                "maintainer advisory",
-            ),
-        )
-
-    if test_failure or (
-        workaround_context and workaround_context.phase == WorkaroundPhase.QA_REGRESSION_REPAIR
-    ):
-        return _SearchQueryRecommendation(
-            scenario="update_mitigates_cve_but_breaks_tests",
-            initial_query=_query_parts(
-                component,
-                version_term,
-                diagnostic_term,
-                "migration breaking changes compatibility",
-            ),
-            rationale=(
-                "Lead with the exact QA diagnostic and attempted version so the worker "
-                "finds the package migration or API compatibility guidance."
-            ),
-            follow_up_query=_query_parts(
-                component,
-                version_term,
-                "migration guide",
-                "breaking changes",
-            ),
-        )
-
-    if plan_status in {"no_fix", "workaround_found"}:
-        return _SearchQueryRecommendation(
-            scenario="no_update_available_to_resolve_cve",
-            initial_query=_query_parts(
-                component,
-                identifier_terms,
-                "no upstream fix",
-                "compensating control",
-                mechanism,
-            ),
-            rationale=(
-                "Search for a defensible source-level isolation or compensating control "
-                "because the planner has no usable upstream version."
-            ),
-            follow_up_query=_query_parts(
-                component,
-                identifier_terms,
-                "source-level mitigation",
-                "security advisory",
-            ),
-        )
-
-    return _SearchQueryRecommendation(
-        scenario="initial_code_workaround_or_isolation",
-        initial_query=_query_parts(
-            component,
-            identifier_terms,
-            mechanism,
-            "security advisory",
-            "mitigation",
-        ),
-        rationale=(
-            "Start with the vulnerability identifier and mechanism, then adapt the "
-            "advisory guidance to the local source code."
-        ),
-        follow_up_query=_query_parts(
-            component,
-            identifier_terms,
-            "maintainer guidance",
-            "workaround",
-        ),
     )
 
 
@@ -908,8 +695,8 @@ _WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
 
 
 def _build_workaround_prompt(
-    target_task: Any,  # RemediationTask
-    target_group: VulnerabilityGroup | list[str],
+    target_task: RemediationTask,
+    target_group: VulnerabilityGroup,
     constraints_ledger: list[str] | None = None,
     previous_feedback: str | None = None,
     current_replay_plan: WorkaroundReplayPlan | None = None,
@@ -917,11 +704,6 @@ def _build_workaround_prompt(
     workaround_context: WorkaroundContext | None = None,
 ) -> str:
     """Build the dynamic human context for one workaround attempt."""
-    if isinstance(target_group, list):
-        constraints_ledger = list(target_group)
-        target_group = target_task
-        target_task = _derive_legacy_task_from_group(target_group)
-
     constraints_ledger = list(constraints_ledger or [])
     fix_plan = getattr(target_group, "fix_plan", None)
     vulnerability_mechanism = (

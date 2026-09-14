@@ -20,7 +20,6 @@ from remediation_engine.contracts import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
-    is_version_space_exhausted,
     select_version,
     validate_transition,
 )
@@ -288,7 +287,6 @@ def test_version_policy_is_deterministic_and_skips_attempts():
     assert select_version(candidates, SCARemediationStage.OSV_MINIMUM, set()) == "1.2.3"
     assert select_version(candidates, SCARemediationStage.NPM_SAME_MAJOR, set()) == "1.4.0"
     assert select_version(candidates, SCARemediationStage.NPM_LATEST, {"2.0.0"}) == "1.4.0"
-    assert is_version_space_exhausted(candidates, SCARemediationStage.CODE_WORKAROUND, set())
 
 
 def test_deterministic_retry_planner_preserves_committed_stage(monkeypatch):
@@ -308,7 +306,7 @@ def test_deterministic_retry_planner_preserves_committed_stage(monkeypatch):
         )
     ]
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
         lambda *args, **kwargs: candidates,
     )
     plan = _build_deterministic_retry_plan(task, diagnostics, group)
@@ -331,7 +329,7 @@ def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch
         already_attempted=True,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
         lambda *args, **kwargs: [candidate],
     )
     plan = _build_deterministic_retry_plan(task, diagnostics, group)

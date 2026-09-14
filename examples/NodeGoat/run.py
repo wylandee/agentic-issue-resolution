@@ -14,7 +14,7 @@ from remediation_engine import RemediationRequest, run_remediation
 from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_REPO = _PROJECT_ROOT / "data" / "clones" / "nodegoat"
+_DEFAULT_REPO = _PROJECT_ROOT / "data" / "clones" / "NodeGoat"
 _DEFAULT_ISSUES = (
     Path(__file__).resolve().parent / "fixtures" / "suppressed" / "odc_suppressed_issues.jsonl"
 )
@@ -23,11 +23,8 @@ _DEFAULT_PATCH = _PROJECT_ROOT / "data" / "trajectories" / "nodegoat.patch"
 
 
 def _load_issues(path: Path) -> list[VulnerabilityIssue]:
-    """Load canonical JSONL issues, including legacy array-shaped fixtures."""
+    """Load canonical JSONL issues."""
     text = path.read_text(encoding="utf-8")
-    if text.lstrip().startswith("["):
-        payload = json.loads(text)
-        return [VulnerabilityIssue.model_validate(item) for item in payload]
     return [
         VulnerabilityIssue.model_validate_json(line) for line in text.splitlines() if line.strip()
     ]

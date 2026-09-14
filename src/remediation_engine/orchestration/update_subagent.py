@@ -1,7 +1,8 @@
-"""Dependency Update Subagent for Phase 5 dependency resolution.
+"""Dependency-update worker for Supervisor-committed Phase 5 attempts.
 
-The Supervisor normally dispatches one task per invocation, while this module
-retains batch-capable helpers for direct callers and future explicit batch mode.
+The worker receives one task and its immutable attempt inputs, executes the
+focused manifest transaction toolbelt in the Docker workspace, and returns
+typed attempt diagnostics for QA and Supervisor reconciliation.
 """
 
 from __future__ import annotations
@@ -26,10 +27,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
-from remediation_engine.orchestration.remedy_tools import (
-    build_update_toolbelt,
-    rollback_pending_package_updates,
-)
+from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
@@ -38,6 +36,7 @@ from remediation_engine.orchestration.task_utils import (
     filter_constraints_ledger,
     is_transitive_group,
 )
+from remediation_engine.orchestration.tools_manifest import rollback_pending_package_updates
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
     resolve_repository_path,
@@ -469,10 +468,10 @@ def _changed_files_by_task(
 ) -> dict[str, list[str]]:
     """Partition committed worker files by task for attempt envelopes.
 
-    The normal Supervisor dispatch contains one task, so that task receives
-    the complete committed file set. Retain a conservative manifest-based
-    partition for legacy batch callers so one task cannot claim another
-    task's package files in its attempt evidence.
+    A normal Supervisor dispatch contains one task and receives the complete
+    committed file set. When multiple task records are present, manifest
+    ownership provides a conservative deterministic partition so a task cannot
+    claim another task's package files.
     """
     normalized_files = list(
         dict.fromkeys(
@@ -744,11 +743,11 @@ def _build_retry_diagnostics(
 
 @traceable(name="Update_Subagent_Test_Run")  # for langsmith testing
 def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
-    """Run the dependency update subagent for one or more committed tasks.
+    """Run the dependency-update worker for Supervisor-committed targets.
 
-    The Supervisor currently supplies one task per invocation. Direct callers
-    may still provide multiple compatible tasks, subject to the existing
-    first-pass/retry batch safeguards and per-package rollback behavior.
+    The Supervisor normally supplies one task per invocation. Results are
+    correlated to each task's immutable attempt snapshot and include typed
+    execution diagnostics for subsequent QA and retry planning.
     """
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")

@@ -58,10 +58,13 @@ def load_baseline_issues(path: Path) -> list[VulnerabilityIssue]:
     """
     text = path.read_text(encoding="utf-8")
     if text.lstrip().startswith("["):
-        payload = json.loads(text)
-        return [VulnerabilityIssue.model_validate(item) for item in payload]
+        raise ValueError(
+            "NodeGoat baseline issues must use canonical JSONL; JSON arrays are unsupported."
+        )
     return [
-        VulnerabilityIssue.model_validate_json(line) for line in text.splitlines() if line.strip()
+        VulnerabilityIssue.model_validate_json(line)
+        for line in text.splitlines()
+        if line.strip()
     ]
 
 
@@ -435,6 +438,11 @@ def run_batch(
     Returns:
         List of IterationSummary objects for all completed iterations.
     """
+    repo_root = repo_root.expanduser().resolve()
+    baseline_path = baseline_path.expanduser().resolve()
+    suppressed_issues_path = suppressed_issues_path.expanduser().resolve()
+    suppressions_xml_path = suppressions_xml_path.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
     if not repo_root.is_dir():
         raise FileNotFoundError(f"Target repository not found: {repo_root}")
     if not baseline_path.is_file():

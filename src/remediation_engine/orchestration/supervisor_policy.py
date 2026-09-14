@@ -183,9 +183,7 @@ def _parent_status_for_strategy_pivot(
     qa_evaluations: dict[str, QAEvaluation],
 ) -> TaskStatus:
     """Choose the terminal parent status when a pivot creates a child task."""
-    evaluation = qa_evaluations.get(parent_task.task_id) or qa_evaluations.get(
-        parent_task.parent_group_id
-    )
+    evaluation = qa_evaluations.get(parent_task.task_id)
     if (
         parent_task.strategy == RoutingStrategy.VERSION_BUMP
         and new_strategy == RoutingStrategy.CODE_WORKAROUND

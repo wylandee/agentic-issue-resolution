@@ -44,12 +44,9 @@ def isolate_external_runtime_environment(monkeypatch: pytest.MonkeyPatch) -> Non
         "REMEDIATION_REPORT_DIR",
         "REMEDY_LLM_MODEL",
         "TRIAGE_LLM_MODEL",
-        "SUPERVISOR_LLM_MODEL",
         "UPDATE_LLM_MODEL",
         "WORKAROUND_LLM_MODEL",
         "QA_LLM_MODEL",
-        "REPORT_LLM_ENABLED",
-        "REPORT_LLM_MODEL",
         "REMEDY_BYPASS_WORKAROUND_SUBAGENT",
         "REMEDY_RETRIAGE_LIMIT_ENABLED",
         "REMEDY_RETRIAGE_LIMIT",
@@ -60,5 +57,4 @@ def isolate_external_runtime_environment(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
     monkeypatch.setenv("TRIAGE_LLM_ENABLED", "false")
     monkeypatch.setenv("REMEDY_DISABLE_POST_QA_TRIAGE", "false")
-    monkeypatch.setenv("REMEDY_DISABLE_RETRIAGE", "false")
     monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT_ENABLED", "false")

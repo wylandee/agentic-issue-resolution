@@ -1,4 +1,4 @@
-"""Shared case and DeepEval conversion helpers for Phase 2 evals.
+"""Shared case and DeepEval conversion helpers for the evaluation suites.
 
 The helpers deliberately keep fixture observations and live observations on
 separate paths.  A builder receives a ``ReplayCapture`` when a production

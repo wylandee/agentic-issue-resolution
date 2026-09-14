@@ -114,8 +114,8 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
                 "task-unchanged": unchanged_task,
             },
             "qa_evaluations": {
-                changed.group_id: QAEvaluation(task_id=changed.group_id, passed=True),
-                unchanged.group_id: QAEvaluation(task_id=unchanged.group_id, passed=True),
+                "task-changed": QAEvaluation(task_id="task-changed", passed=True),
+                "task-unchanged": QAEvaluation(task_id="task-unchanged", passed=True),
             },
             "triage_required": True,
             "new_vulnerability_status": "detected",
@@ -152,7 +152,7 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     assert reopened.retry_count == 0
     assert reopened.current_attempt_id is None
     assert reopened.qa_policy == changed_task.qa_policy
-    assert changed.group_id not in result["qa_evaluations"]
+    assert "task-changed" not in result["qa_evaluations"]
     assert result["task_queue"]["task-unchanged"] is unchanged_task
     assert result["active_target_task_ids"] == []
 

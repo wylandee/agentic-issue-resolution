@@ -2,62 +2,115 @@
 
 `remediation-engine` is an agentic AppSec workflow that ingests Dependency-Check
 or Semgrep findings, triages them, and produces a proposed remediation patch.
-The host repository is never edited by the engine.
+The host repository is never edited: work happens in temporary Docker volumes,
+which are cleaned up during teardown.
 
 ## Install
 
-```text
+```bash
 python -m pip install -e ".[dev]"
 ```
 
-Docker is required for workspace isolation and QA. Set `OPENAI_API_KEY` before
-running an LLM-backed worker or triage step. Copy `.env.example` to `.env` and
-adjust the scanner, model, tracing, and cache settings as needed.
+Python 3.11 or newer and Docker are required. Copy `.env.example` to `.env`.
+Set `OPENAI_API_KEY` when using LLM-backed triage or workers; the Supervisor
+route, version selection, retry/pivot decisions, and task creation are
+deterministic.
 
-`TRIAGE_LLM_MODEL` selects the triage model. `REMEDY_LLM_MODEL` remains the
-backward-compatible default for the remediation pipeline; optionally override
-the LLM-backed worker nodes with `UPDATE_LLM_MODEL`, `WORKAROUND_LLM_MODEL`,
-and `QA_LLM_MODEL`. `SUPERVISOR_LLM_MODEL` is still accepted for configuration
-compatibility, but Supervisor routing and retry planning are deterministic.
+The runtime reads these environment names:
+
+* **Provider and node models:** `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`,
+  `TRIAGE_LLM_ENABLED`, `TRIAGE_LLM_MODEL`, `UPDATE_LLM_MODEL`,
+  `WORKAROUND_LLM_MODEL`, `QA_LLM_MODEL`, `SERPER_API_KEY`, and
+  `GITHUB_TOKEN`.
+* **Scanning and workflow controls:** `ODC_EXTRA_ARGS`,
+  `REMEDY_BYPASS_WORKAROUND_SUBAGENT`, `REMEDY_DISABLE_POST_QA_TRIAGE`,
+  `REMEDY_RETRIAGE_LIMIT_ENABLED`, and `REMEDY_RETRIAGE_LIMIT`.
+* **Caching, reports, and tracing:** `TRIAGE_CACHE_DIR`,
+  `REMEDIATION_TRAJECTORY_DIR`, `REMEDIATION_REPORT_DIR`,
+  `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and
+  `LANGSMITH_ENDPOINT`.
+
+Unset node-specific model values use `REMEDY_LLM_MODEL`. The retriage limit is
+a development guard and is unlimited by default.
 
 ## CLI
 
-```text
-remedy ingest data/sample_odc_report.json --format odc-json --output findings.jsonl
-remedy triage findings.jsonl --repo data/clones/juice-shop --output groups.json
-remedy run findings.jsonl --format jsonl --repo data/clones/juice-shop \
-  --output remediation.json --patch-out remediation.patch
+The canonical issue interchange format is JSONL: one validated issue object per
+line. `ingest` accepts `odc-json`, `semgrep-json`, or canonical `jsonl` input
+(`--format auto` detects `.jsonl` and `.ndjson`; use an explicit format for
+scanner reports) and writes canonical JSONL. `triage` consumes canonical JSONL
+and writes its JSON group result. `run` consumes canonical JSONL and writes a
+typed result JSON, with an optional reviewable unified diff and Markdown
+report.
+
+After cloning a target repository, run the maintained Juice Shop fixture
+through the complete flow:
+
+```bash
+git clone https://github.com/juice-shop/juice-shop.git data/clones/juice-shop
+REPO_ROOT="$(pwd)/data/clones/juice-shop"
+remedy ingest examples/juice_shop/fixtures/dependency-check-report-baseline.json \
+  --format odc-json --output /tmp/remediation-findings.jsonl
+remedy triage /tmp/remediation-findings.jsonl --repo "$REPO_ROOT" \
+  --output /tmp/remediation-groups.json
+remedy run /tmp/remediation-findings.jsonl --format jsonl --repo "$REPO_ROOT" \
+  --output /tmp/remediation-result.json \
+  --patch-out /tmp/remediation.patch \
+  --report-out /tmp/remediation-report.md
 ```
 
-`ingest` normalizes scanner output into canonical JSONL (one issue object per
-line; legacy JSON-array exports are accepted as input). `triage` produces
-actionable groups.
-`run` performs triage when groups are not supplied, executes the Phase 5 task
-queue, and writes a typed result plus unified patch. Exit code 1 means the run
-completed with remediation errors or unfixable tasks; exit code 2 means invalid
-input or missing prerequisites.
+`run` executes the Phase 5 task queue. Update and workaround workers execute
+Supervisor-committed attempts in isolation. QA runs deterministic install,
+security-scan, and test gates, then performs a bounded read-only evaluation
+for each task. QA results remain keyed to their task, and Supervisor requires
+the authoritative final full scan before teardown.
+
+The CLI exits with `0` for a completed run without errors, `1` for a completed
+run with remediation errors or unfixable tasks, and `2` for invalid input or
+missing prerequisites. `--output` and `--patch-out` write files; without an
+output path, serialized output is written to stdout.
 
 ## Python API
 
+The public package exports `RemediationRequest`, `RemediationResult`,
+`run_remediation`, and `triage_issues`:
+
 ```python
 from pathlib import Path
+
 from remediation_engine import RemediationRequest, run_remediation
 
-result = run_remediation(RemediationRequest(repo_root=Path("target"), issues=[]))
-print(result.status, result.diff)
+# Run this after cloning the target in the Install/CLI example.
+repo_root = (Path.cwd() / "data/clones/juice-shop").resolve()
+request = RemediationRequest(repo_root=repo_root, issues=[])
+result = run_remediation(request)
+
+print(result.status)
+print(result.diff)  # reviewable unified diff; may be empty
+print(result.errors)
 ```
 
-Use `remediation_engine.triage_issues` to create groups explicitly. Internal
-LangGraph state, workers, and Docker clients are not public API.
+`repo_root` must resolve to an existing absolute directory. The typed
+`RemediationResult` includes `status`, `changed_files`, `diff`, `errors`, and
+optional trajectory/report paths. The API and CLI never apply changes to the
+host repository. Use `triage_issues` when callers need to create actionable
+groups explicitly; internal graph state, workers, and Docker clients are not
+public API.
 
-## Development
+## Development and evaluation
 
-```text
+```bash
 python -m pytest
 ruff check .
 ruff format --check .
+python -m compileall -q src
+remedy --help
+python scripts/eval_compare.py --help
 ```
 
-The maintained end-to-end workflow is documented in `examples/juice_shop`.
-Unit tests mock Docker, LLM, registry, and subprocess boundaries. Runtime
-clones, caches, trajectories, reports, and credentials are ignored by Git.
+Evaluation tests and their registered datasets are documented in `EVALS.md`.
+For maintained end-to-end workflows, see
+[`examples/juice_shop/README.md`](examples/juice_shop/README.md) and
+[`examples/NodeGoat/README.md`](examples/NodeGoat/README.md). NodeGoat is a
+secondary fixture set; architecture and package-boundary details are in
+[`docs/architecture.md`](docs/architecture.md).

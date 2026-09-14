@@ -1,42 +1,73 @@
-# NodeGoat Remediation Example
+# NodeGoat remediation example
 
-This directory contains a maintained end-to-end example for remediating OWASP
-NodeGoat findings with `remediation_engine`.
+This directory is a maintained secondary test and evaluation fixture set for
+OWASP NodeGoat. It exercises the public `remediation_engine` API with a
+repository clone, canonical scanner findings, and the current task/attempt
+workflow.
 
-All commands below assume they are run from the repository root. The runner
-resolves the default NodeGoat clone and explicit `--repo` values to absolute
-paths before constructing the public API request. The host clone is never
-modified by the engine; execution happens in isolated Docker volumes.
+Commands below are run from the repository root. Clone paths are resolved to
+absolute paths by the runners before they are passed to the API. A normal
+single run copies the clone into a temporary Docker workspace; the host clone
+is not edited by the engine. The result is a typed status/changed-files/error
+projection and a unified diff, both written only to the paths selected by the
+runner.
 
 ## Prerequisites
 
-1. Clone NodeGoat into `data/clones/nodegoat`:
+1. Clone NodeGoat at the path used by the default runner:
 
    ```bash
-   git clone https://github.com/OWASP/NodeGoat.git data/clones/nodegoat
+   git clone https://github.com/OWASP/NodeGoat.git data/clones/NodeGoat
    ```
 
-2. Configure environment variables in `.env` (Docker and an
-   `OPENAI_API_KEY` are required for LLM-backed workers).
+   Use `--repo /absolute/path/to/NodeGoat` when the clone is elsewhere.
 
-The raw baseline reports in this directory are retained as scan provenance.
-The runnable fixture intentionally uses five representative findings so the
-example remains practical to inspect and replay.
+2. Copy `.env.example` to `.env` and set the credentials needed by the
+   execution path. Live remediation requires Docker. Worker execution uses
+   the configured LLM model and normally requires `OPENAI_API_KEY`; a dry run
+   does not start Docker or call the engine.
 
-## Example Scenarios
+The raw Dependency-Check reports are retained as scan provenance. The checked-
+in suppressed fixture contains five representative findings so a run is small
+enough to inspect and replay.
 
-### Whole-pipeline execution
+## Single-run workflow
 
-Runs the task-queue workflow against the five-finding suppressed fixture. The
-runner performs initial triage before Supervisor routing, worker execution, and
-QA evaluation:
+`run.py` loads the suppressed canonical issue fixture by default, then sends
+those findings to the public API. The graph performs initial triage when no
+pre-triaged groups are supplied; Supervisor then creates and routes committed
+remediation tasks, records attempt snapshots, and owns version/retry decisions.
+Update/workaround workers execute the selected attempt, and QA evaluates the
+same task against its committed QA policy with deterministic install, scan, and
+test evidence.
 
 ```bash
 python examples/NodeGoat/run.py
 ```
 
-`run.py` accepts any canonical JSONL issue fixture through `--issues`, so a
-larger normalized report can be supplied without changing the runner:
+The default inputs and outputs are:
+
+```text
+Input:  examples/NodeGoat/fixtures/suppressed/odc_suppressed_issues.jsonl
+Result: data/trajectories/nodegoat-result.json
+Patch:  data/trajectories/nodegoat.patch
+```
+
+Issue input is canonical JSONL: one `VulnerabilityIssue` object per line. Use
+`--issues` for another JSONL fixture and `--output` or `--patch-out` to choose
+absolute or relative output paths (the runner resolves them before writing):
+
+```bash
+python examples/NodeGoat/run.py \
+  --repo "$(pwd)/data/clones/NodeGoat" \
+  --issues examples/NodeGoat/fixtures/baseline_issues.jsonl \
+  --output /tmp/nodegoat-result.json \
+  --patch-out /tmp/nodegoat.patch
+```
+
+To normalize a raw Dependency-Check report before running it, use the CLI
+boundary. The output of `ingest` is canonical JSONL and is suitable for
+`run.py`:
 
 ```bash
 remedy ingest examples/NodeGoat/dependency-check-report-baseline.json \
@@ -44,29 +75,48 @@ remedy ingest examples/NodeGoat/dependency-check-report-baseline.json \
 python examples/NodeGoat/run.py --issues /tmp/nodegoat-issues.jsonl
 ```
 
-The output result and unified patch default to:
+The single-run script exits `0` only for `completed` with no errors. A
+completed run with recorded errors exits `1`; missing repository or fixture
+paths exit `2`. Inspect the JSON result and patch before applying any change to
+a separate checkout. No runner applies the emitted patch to the host clone.
 
-```text
-data/trajectories/nodegoat-result.json
-data/trajectories/nodegoat.patch
+## Batch fixture preparation
+
+`run_batch.py` samples distinct package batches from the read-only
+`fixtures/baseline_issues.jsonl`, writes each selected subset as canonical
+JSONL, and records per-iteration result/patch paths under
+`data/trajectories/`. Use a seed for reproducible selection:
+
+```bash
+python examples/NodeGoat/run_batch.py \
+  --iterations 2 --batch-size 3 --seed 7
 ```
 
-## Suppressed Fixture
+Use `--dry-run` to prepare the sampled JSONL and suppression rules without
+calling `run_remediation`; this is the deterministic, no-Docker/no-LLM mode:
 
-`fixtures/suppressed/odc_suppressed_issues.jsonl` contains one canonical ODC
-record for each of five distinct NodeGoat packages. The selection does not
-overlap with the Juice Shop suppressed package set (`@tootallnate/once`,
-`express-jwt`, `got`, `notevil`, or `sanitize-html`).
+```bash
+python examples/NodeGoat/run_batch.py \
+  --iterations 2 --batch-size 3 --seed 7 --dry-run
+```
 
-| Package | Version | Advisory | Severity | Representative risk |
-| --- | ---: | --- | --- | --- |
-| `growl` | `1.9.2` | `CVE-2017-16042` / `GHSA-QH2H-CHJ9-JFFQ` | Critical | Command injection through unsanitized notification input |
-| `mongodb` | `2.2.36` | `CVE-2021-32036` | High | Resource exhaustion through repeated feature requests |
-| `marked` | `0.3.5` | `CVE-2017-1000427` | Medium | XSS through the `data:` URI parser |
-| `adm-zip` | `0.4.4` | `CVE-2018-1002204` | Medium | Zip archive path traversal and arbitrary file write |
-| `ini` | `1.3.4` | `CVE-2020-7788` | Critical | Prototype pollution while parsing attacker-controlled INI data |
+The batch helper updates the checked-in suppressed JSONL and XML paths and
+copies the selected `suppressions.xml` into the clone before each iteration,
+including dry runs. Run it only against a disposable clone and fixture copy if
+the source checkout must remain untouched. Its aggregate summary is
+`data/trajectories/nodegoat-batch-runs-summary.json`; live iteration files are
+`nodegoat-run-01-result.json` and `nodegoat-run-01.patch` (with the iteration
+number substituted).
 
-`suppressions.xml` records the package-level suppression scope associated with
-the selected subset. The JSONL file retains the source findings so the public
-remediation API can triage and process them.
+## Suppressed fixture
 
+`fixtures/suppressed/odc_suppressed_issues.jsonl` is the runnable five-finding
+canonical input. `fixtures/suppressed/suppressions.xml` records the associated
+package-level Dependency-Check suppression scope. The full
+`fixtures/baseline_issues.jsonl` and raw JSON/HTML reports remain provenance
+and are not modified by a single run.
+
+NodeGoat fixtures are intentionally retained as a secondary test/evaluation
+set. Refresh or generate issue subsets with `remedy ingest`; do not replace
+JSONL issue files with a JSON array or pass a raw scanner report directly to
+`run.py`.

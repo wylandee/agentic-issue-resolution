@@ -11,21 +11,26 @@ from remediation_engine.contracts import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    QAAttemptResult,
     QAEvaluation,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
+    TaskAttemptSnapshot,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.version_policy import select_version
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _build_high_level_retry_instruction,
     _next_sca_stage,
     _plan_initial_transitive_task,
+    instruction_digest,
     run_supervisor_node,
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
@@ -40,8 +45,8 @@ from remediation_engine.tools.fix_planner import (
     plan_fix,
 )
 from remediation_engine.tools.registry_tools import (
+    fetch_registry_candidates,
     plan_npm_parent_version,
-    plan_npm_version,
     select_npm_parent_version,
 )
 from remediation_engine.triage.grouper import group_issues
@@ -206,7 +211,7 @@ def test_same_package_findings_are_separated_by_strategy_and_update_floor_is_agg
     assert len(by_strategy["NO_FIX"].localized_issues) == 1
 
 
-def test_supervisor_npm_tool_selects_same_major_then_latest(monkeypatch):
+def test_supervisor_typed_registry_candidates_select_same_major_then_latest(monkeypatch):
     registry_data = {
         "versions": {
             "4.17.21": {},
@@ -220,52 +225,41 @@ def test_supervisor_npm_tool_selects_same_major_then_latest(monkeypatch):
         lambda package: registry_data,
     )
 
-    same_major = plan_npm_version.invoke(
-        {
-            "package_name": "lodash",
-            "security_floor": "4.17.21",
-            "selection": "same_major",
-            "attempted_versions": "4.18.0",
-        }
+    candidates = fetch_registry_candidates(
+        "lodash",
+        "4.17.21",
+        {"4.18.0"},
     )
-    latest = plan_npm_version.invoke(
-        {
-            "package_name": "lodash",
-            "security_floor": "4.17.21",
-            "selection": "latest",
-            "attempted_versions": "4.18.0",
-        }
+    same_major = select_version(
+        candidates,
+        SCARemediationStage.NPM_SAME_MAJOR,
+        {"4.18.0"},
+    )
+    latest = select_version(
+        candidates,
+        SCARemediationStage.NPM_LATEST,
+        {"4.18.0"},
     )
 
-    assert "Selected Version: 4.17.21" in same_major
-    assert "Selected Version: 5.0.0" in latest
-    assert "6.1.0-beta.1" not in latest
+    assert same_major == "4.17.21"
+    assert latest == "5.0.0"
+    assert all("beta" not in candidate.version for candidate in candidates)
 
 
-def test_supervisor_npm_tool_skips_same_major_when_it_equals_latest(monkeypatch):
+def test_supervisor_typed_registry_candidates_share_latest_when_same_major_is_latest(
+    monkeypatch,
+):
     monkeypatch.setattr(
         "remediation_engine.tools.registry_tools._fetch_package_data",
         lambda package: {"versions": {"4.18.0": {}, "4.17.21": {}}},
     )
 
-    same_major = plan_npm_version.invoke(
-        {
-            "package_name": "lodash",
-            "security_floor": "4.17.21",
-            "selection": "same_major",
-        }
-    )
-    latest = plan_npm_version.invoke(
-        {
-            "package_name": "lodash",
-            "security_floor": "4.17.21",
-            "selection": "latest",
-        }
-    )
+    candidates = fetch_registry_candidates("lodash", "4.17.21")
+    same_major = select_version(candidates, SCARemediationStage.NPM_SAME_MAJOR, set())
+    latest = select_version(candidates, SCARemediationStage.NPM_LATEST, set())
 
-    assert "Selected Version: 4.18.0" in same_major
-    assert "Same-Major Stage: SKIPPED" in same_major
-    assert "Selected Version: 4.18.0" in latest
+    assert same_major == "4.18.0"
+    assert latest == "4.18.0"
 
 
 def test_parent_selector_orders_stable_compatible_releases_by_stage():
@@ -448,7 +442,7 @@ def test_transitive_initial_planner_recovers_parent_version_from_group_evidence(
     task = build_initial_remediation_task(group, "task-1")
 
     with patch(
-        "remediation_engine.orchestration.supervisor_node.plan_npm_parent_version"
+        "remediation_engine.orchestration.supervisor_spawn.plan_npm_parent_version"
     ) as parent_planner:
         parent_planner.invoke.return_value = "- Selected Version: 1.0.1"
         planned = _plan_initial_transitive_task(task, group)
@@ -494,7 +488,6 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
 
     assert "execution worker" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
     assert "exact version 4.18.0" in prompt
-    assert "view_npm_package_versions" not in prompt
     assert "Planning Answers" not in prompt
     assert "per package" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
     assert "package_name and manifest_path" in _UPDATE_WORKER_STATIC_INSTRUCTIONS
@@ -556,24 +549,51 @@ def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():
             (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
         ],
     )[0]
+    instruction = "Update lodash to the committed security floor."
+    attempt_id = "attempt-task-1"
     task = RemediationTask(
         task_id="task-1",
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.VERSION_BUMP,
         strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
         status=TaskStatus.OPTIMISTICALLY_FIXED,
+        task_revision=1,
+        current_attempt_id=attempt_id,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        instruction=instruction,
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=task.strategy_stage,
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    evaluation = QAEvaluation(
+        task_id=task.task_id,
+        passed=False,
+        failure_category=FailureCategory.SECURITY_FLAG,
+        retry_feedback="the OSV version did not clear the finding",
     )
     result = run_supervisor_node(
         {
             "valid_groups": [group],
             "task_queue": {task.task_id: task},
             "status": "qa_completed",
-            "qa_evaluations": {
-                task.task_id: QAEvaluation(
+            "active_target_task_ids": [task.task_id],
+            "attempt_snapshots_by_id": {attempt_id: snapshot},
+            "qa_evaluations": {task.task_id: evaluation},
+            "qa_results_by_attempt": {
+                attempt_id: QAAttemptResult(
+                    attempt_id=attempt_id,
                     task_id=task.task_id,
-                    passed=False,
-                    failure_category=FailureCategory.SECURITY_FLAG,
-                    retry_feedback="the OSV version did not clear the finding",
+                    task_revision=task.task_revision,
+                    qa_policy=QAPolicy.VERSION_BUMP,
+                    qa_policy_source="attempt_snapshot",
+                    evaluation=evaluation,
                 )
             },
         }

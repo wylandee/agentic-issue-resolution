@@ -21,11 +21,8 @@ _DEFAULT_PATCH = _PROJECT_ROOT / "data" / "trajectories" / "juice-shop.patch"
 
 
 def _load_issues(path: Path) -> list[VulnerabilityIssue]:
-    """Load canonical JSONL issues, including legacy array-shaped fixtures."""
+    """Load canonical JSONL issues."""
     text = path.read_text(encoding="utf-8")
-    if text.lstrip().startswith("["):
-        payload = json.loads(text)
-        return [VulnerabilityIssue.model_validate(item) for item in payload]
     return [
         VulnerabilityIssue.model_validate_json(line) for line in text.splitlines() if line.strip()
     ]

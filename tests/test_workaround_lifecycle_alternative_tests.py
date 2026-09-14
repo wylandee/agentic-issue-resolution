@@ -208,9 +208,6 @@ def test_validation_failure_resets_execution_to_investigate():
         "current_iteration_edit": MagicMock(
             file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;"
         ),
-        "successful_edits": [
-            MagicMock(file_path="src/index.js", old_text="const x = 1;", new_text="const x = 2;")
-        ],
     }
     sandbox.run.side_effect = lambda cmd, timeout=60: MagicMock(
         exit_code=1, stdout="", stderr="Syntax error"

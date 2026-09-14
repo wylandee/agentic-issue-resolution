@@ -1,187 +1,241 @@
-# Juice Shop Remediation Example
+# Juice Shop remediation example
 
-This directory contains the maintained end-to-end examples for remediating OWASP Juice Shop findings with `remediation_engine`.
+This directory contains the maintained end-to-end examples for remediating OWASP
+Juice Shop findings with `remediation_engine`.
 
-All commands below assume they are run from the repository root. The maintained
-runners resolve the default Juice Shop clone and explicit `--repo` values to
-absolute paths before constructing the public API request. This is required by
-the current repository-boundary validation.
+Commands below are run from the repository root. The main runners resolve
+repository and issue paths before invoking the public API; fixture runners also
+resolve their repository and input paths and create output parents as needed. A
+normal single run gives the engine an immutable host clone as its source and
+performs execution in temporary Docker storage. The API returns a typed result
+with status, changed files, errors, and a unified diff; it does not apply that
+diff to the host repository.
 
 ## Prerequisites
 
-1. Clone Juice Shop into `data/clones/juice-shop`:
+1. Clone Juice Shop at the default path:
+
    ```bash
    git clone https://github.com/juice-shop/juice-shop.git data/clones/juice-shop
    ```
-2. Configure environment variables in `.env` (requires Docker and an `OPENAI_API_KEY` for LLM workers).
 
-Note: All execution scripts run against isolated Docker volumes. The host clone is never edited.
+   Pass `--repo /absolute/path/to/juice-shop` to any runner to use another
+   clone.
 
-The manual replay fixtures also store the Supervisor-owned `qa_policy` on each
-synthetic task. Their runners copy that policy into the committed attempt
-snapshot; removing it will cause the current fail-closed dispatch validation to
-reject the replay.
+2. Copy `.env.example` to `.env` and configure the credentials needed by the
+   selected path. Live remediation and the replay scenarios require Docker.
+   Worker execution normally requires `OPENAI_API_KEY`; deterministic fixture
+   loading and batch preparation can be run without making LLM calls.
 
-### QA scan behavior
+Temporary Docker volumes are cleaned up during teardown. A final full scan is
+Supervisor-owned and runs before teardown for a terminal remediation cycle.
+The task queue and committed attempt snapshots are authoritative: Supervisor
+creates tasks, selects versions, owns retries and pivots, and carries each
+attempt's QA policy into QA. Update/workaround workers execute committed
+attempts; QA records task-keyed evidence from install, scan, tests, and bounded
+read-only evaluation.
 
-During normal task QA, the engine keeps `npm install` and the full test phase
-unchanged. Supported npm lockfiles may use a temporary task-targeted ODC
-closure read from the live Docker workspace after install. Yarn, pnpm,
-ambiguous or incomplete npm closures, and targeted ODC/report failures use the
-existing full-scan fallback. Targeted evidence is attempt-local; it does not
-represent the repository-wide security state.
+## Single-run workflow
 
-Every terminal remediation cycle with a workspace then runs one authoritative
-full ODC scan before teardown. Findings from that scan can route the workflow
-back through Supervisor-owned post-QA triage. Temporary targeted files are
-removed before tests/final scanning, and Docker volume cleanup remains part of
-teardown.
-
----
-
-## Example Scenarios
-
-### 1. Whole-pipeline execution
-
-Runs the full remediation workflow from the canonical baseline issue fixture. This runner supplies the Juice Shop production/container context, so the graph performs initial triage before version selection, subagent execution, and QA evaluation:
+`run.py` loads `fixtures/baseline_issues.jsonl` by default and performs initial
+triage before task creation and routing:
 
 ```bash
 python examples/juice_shop/run.py
 ```
 
-`run.py` accepts any canonical JSONL issue fixture through `--issues`, so a different static subset can be selected without changing the runner. Its default clone path is resolved to an absolute path automatically:
+The result and patch default to:
 
-```bash
-python examples/juice_shop/run.py --issues examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl
+```text
+data/trajectories/juice-shop-result.json
+data/trajectories/juice-shop.patch
 ```
 
-### 2. Suppressed post-triage execution
+Use another canonical JSONL issue fixture with `--issues`; the runner does not
+accept a JSON array or a raw scanner report:
 
-Loads the pre-triaged groups from `fixtures/suppressed/triaged_groups_suppressed.json`, bypasses the initial triage node, and runs the post-triage workflow directly against the workspace:
+```bash
+python examples/juice_shop/run.py \
+  --repo "$(pwd)/data/clones/juice-shop" \
+  --issues examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
+  --output /tmp/juice-shop-result.json \
+  --patch-out /tmp/juice-shop.patch
+```
+
+To convert a raw Dependency-Check report at the supported boundary, normalize
+it first and then pass the resulting JSONL file to the runner:
+
+```bash
+remedy ingest examples/juice_shop/dependency-check-report-baseline.json \
+  --format odc-json --output /tmp/juice-shop-issues.jsonl
+python examples/juice_shop/run.py --issues /tmp/juice-shop-issues.jsonl
+```
+
+The script exits `0` only for `completed` with no errors, `1` when the run
+records remediation errors, and `2` when a repository or issue fixture path is
+missing. Review the result and unified diff before applying changes to any
+separate checkout.
+
+## Pre-triaged and replay scenarios
+
+Pre-triaged runners load structured group fixtures and derive their canonical
+issue baseline from the issues embedded in those groups. They bypass initial
+triage but still invoke the current task/attempt graph and therefore are live
+runs, not offline simulations.
+
+### Suppressed post-triage run
 
 ```bash
 python examples/juice_shop/fixtures/suppressed/run_post_triage.py
 ```
 
-### 3. Workaround subagent replay
+The runner reads `fixtures/suppressed/triaged_groups_suppressed.json`, emits a
+result at `data/trajectories/juice-shop-suppressed-result.json`, and emits a
+unified patch at `data/trajectories/juice-shop-suppressed.patch`.
 
-Runs the isolated `express-jwt` workaround replay from its pre-seeded fixture, followed by QA validation. The Workspace Builder initializes the baseline codebase; the replay runner then seeds the recorded post-update `express-jwt` state:
+### Retriage run
+
+```bash
+python examples/juice_shop/fixtures/retriage/run_retriage.py
+```
+
+This fixture exercises the Supervisor-owned post-QA retriage path for the
+pre-triaged `sanitize-html` group. Its output is written under
+`data/trajectories/` as `juice-shop-retriage-result.json` and
+`juice-shop-retriage.patch`.
+
+### Workaround replay
+
+The Express-JWT replay is a private, opt-in execution path. It loads an
+explicit task with its `qa_policy` and prior attempt evidence, seeds the
+post-update state inside a temporary Docker volume, dispatches the workaround
+worker, and runs QA against that same volume. It is intended for live
+Docker/LLM or LangSmith trials, not for the public API workflow:
 
 ```bash
 python examples/juice_shop/fixtures/workaround_replay/run_workaround_replay.py
 ```
 
-### 4. NO_FIX workaround retry
+The timestamped JSON result and unified patch are written under
+`data/trajectories/` unless `--output` and `--patch-output` are provided. The
+host clone is used only as the immutable source and diff baseline.
 
-Runs the `notevil` vulnerable-code-removal retry fixture through the Supervisor and workaround worker. The Workspace Builder initializes the baseline codebase before dispatch:
+### NO_FIX package-removal retry
+
+This opt-in fixture loads a committed retry task with the
+`no_fix_code_removal` QA policy and exercises workaround-worker, Supervisor,
+and QA routing against a temporary Docker volume:
 
 ```bash
 python examples/juice_shop/fixtures/workaround_nofix/run_workaround_nofix.py
 ```
 
-### 5. Parent-first transitive dependency remediation
+It is a live Docker/LLM script, not an offline check. Its runner prints the
+result and QA status and cleans up the temporary volume; inspect the generated
+result and diff before any manual application.
 
-Runs three pre-triaged transitive findings—`@tootallnate/once`, `got`, and
-`crypto-js`—whose direct parents are `sqlite3`, `download`, and `pdfkit`.
-The fixture exercises parent updates before child overrides:
+## Deterministic routing and shared closures
 
-```bash
-python examples/juice_shop/fixtures/transitive_parent_first/run_parent_first.py
-```
+### Deterministic Supervisor routing
 
-### 6. Deterministic Supervisor routing
-
-Runs a five-finding pre-triaged fixture containing one NO_FIX group and four
-version-bump groups. The runner persists the final decision code, route, audit
-record, task statuses, trajectory, and patch for routing-focused review:
+The deterministic fixture contains five pre-triaged groups: one `NO_FIX` group
+and four version-bump groups. Because initial triage is bypassed, group order,
+task creation, and Supervisor route decisions can be inspected without an
+initial-triage model decision. Worker execution and QA still run through the
+live graph, so Docker and the configured worker credentials are required for a
+full run:
 
 ```bash
 python examples/juice_shop/fixtures/deterministic_routing/run_deterministic_routing.py
 ```
 
-### 7. Shared dependency closures
+The runner validates the five-group fixture, persists a routing summary with
+final decision code, next route, Supervisor audit, and task-keyed statuses, and
+writes the result and patch to `data/trajectories/`:
 
-Runs two pre-triaged update tasks for `express-jwt` and its nested
-`jsonwebtoken` dependency. Their lockfile closures overlap, so the fixture is
-useful for validating targeted closure union and duplicate-safe lockfile-key
-provenance:
+```text
+data/trajectories/juice-shop-deterministic-routing-result.json
+data/trajectories/juice-shop-deterministic-routing.patch
+```
+
+A graph result of `completed` or `completed_with_errors` is a successful process
+exit for this routing-focused runner; remediation or QA failures remain in the
+result.
+
+### Shared dependency closures
+
+This fixture runs two pre-triaged update groups whose npm dependency closures
+overlap. The runner validates the five matching canonical JSONL issue records,
+then checks that task-keyed attempts and QA evidence preserve each task's
+identity even when lockfile keys are shared:
 
 ```bash
 python examples/juice_shop/fixtures/shared_dependencies/run_shared_dependencies.py
 ```
 
----
+It writes `data/trajectories/juice-shop-shared-dependencies-result.json` and
+`data/trajectories/juice-shop-shared-dependencies.patch`. See the fixture README
+for the exact components and closure coverage.
 
-## Fixture layout
+## Batch fixture preparation
 
-The fixture directory contains both runnable inputs and scanner/triage provenance:
-
-* **`baseline_issues.jsonl`**: Canonical ODC-derived issues consumed by `run.py` by default.
-* **`dependency-check-report-baseline.json`**: Baseline raw ODC JSON report retained as scan provenance.
-* **`dependency-check-report-baseline.html`**: Human-readable baseline ODC report.
-* **`triaged_groups_baseline.json`**: Precomputed baseline triage output retained for inspection; `run.py` performs triage itself.
-
-The `fixtures/suppressed/` scenario contains:
-
-* **`suppressions.xml`**: ODC suppression rules associated with the selected subset.
-* **`odc_suppressed_issues.jsonl`**: Canonical issue subset used when selecting suppressed findings with `run.py --issues`.
-* **`triaged_groups_suppressed.json`**: Pre-triaged groups consumed by `run_post_triage.py`.
-* **`run_post_triage.py`**: Runner for the post-triage scenario.
-* **`extract_suppressed.py`**: Helper script to extract target package issues from `baseline_issues.jsonl` into `odc_suppressed_issues.jsonl`.
-
-The raw suppressed ODC report is not currently included in this directory. The checked-in suppressed issue and group files are static fixtures; changing the suppression rules requires producing a new ODC report externally and refreshing those derived files.
-
-The workaround scenarios are self-contained under `fixtures/`:
-
-* **`fixtures/workaround_replay/run_workaround_replay.py`**: Express-JWT workaround-only replay runner.
-* **`fixtures/workaround_replay/express_jwt_workaround_replay.json`**: Express-JWT replay state, task, and QA evidence.
-* **`fixtures/workaround_nofix/run_workaround_nofix.py`**: `notevil` NO_FIX retry runner.
-* **`fixtures/workaround_nofix/notevil_workaround_nofix.json`**: `notevil` Stage 2 retry state, task, and prior QA evidence.
-* **`fixtures/transitive_parent_first/run_parent_first.py`**: Parent-first runner for three transitive SCA findings.
-* **`fixtures/transitive_parent_first/triaged_groups_transitive_parent_first.json`**: Pre-triaged groups with dependency ancestry and direct-parent targets.
-
-Both workaround runners use the Workspace Builder for initial npm dependency installation. The Express-JWT replay additionally applies the target dependency update inside the isolated volume so it can reproduce the failed update state; the NO_FIX retry starts from the unchanged baseline workspace.
-
-The `fixtures/deterministic_routing/` scenario contains:
-
-* **`triaged_groups_deterministic.json`**: Exactly five findings across five pre-triaged groups.
-* **`run_deterministic_routing.py`**: Runner that validates the issue limit and persists routing evidence.
-* **`README.md`**: Expected deterministic decision checkpoints and coverage notes.
-
-The `fixtures/shared_dependencies/` scenario contains:
-
-* **`triaged_groups_shared_dependencies.json`**: Two extracted pre-triaged groups with overlapping npm closures.
-* **`baseline_issues_shared_dependencies.jsonl`**: The five matching canonical baseline issue records.
-* **`run_shared_dependencies.py`**: Runner that validates the group/issue correspondence and executes the post-triage workflow.
-* **`README.md`**: Shared-closure coverage and expected usage.
-
-### Refreshing derived fixtures manually
-
-To extract target package entries directly from `baseline_issues.jsonl` into `fixtures/suppressed/odc_suppressed_issues.jsonl`:
+`run_batch.py` samples distinct package batches from the read-only baseline
+JSONL, writes each selected subset as canonical JSONL, and stores per-iteration
+results and patches under `data/trajectories/`:
 
 ```bash
-python examples/juice_shop/fixtures/suppressed/extract_suppressed.py @angular/common
+python examples/juice_shop/run_batch.py \
+  --iterations 2 --batch-size 3 --seed 7
 ```
 
-You can pass multiple package names or specify custom `--input` and `--output` paths:
+`--dry-run` prepares the sampled issue and suppression fixtures without calling
+the remediation engine, Docker, or LLMs:
 
 ```bash
-python examples/juice_shop/fixtures/suppressed/extract_suppressed.py @angular/common @angular/compiler --output custom_issues.jsonl
+python examples/juice_shop/run_batch.py \
+  --iterations 2 --batch-size 3 --seed 7 --dry-run
 ```
 
-After producing an ODC JSON report with the desired suppression rules, normalize and triage it with the `remedy` CLI:
+The batch helper rewrites the suppressed JSONL/XML fixture paths and copies the
+selected suppression file into the clone before each iteration, including dry
+runs. Use a disposable clone and fixture copy when preserving the source
+checkout matters. The aggregate summary is
+`data/trajectories/juice-shop-batch-runs-summary.json`; live iteration files are
+`juice-shop-run-01-result.json` and `juice-shop-run-01.patch`.
 
-1. **Ingest the report into canonical JSONL issues:**
+## Fixture layout and refresh
 
-   ```bash
-   remedy ingest path/to/dependency-check-report.json \
-     --output examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl
-   ```
+* `fixtures/baseline_issues.jsonl` is the canonical baseline issue input for
+  `run.py`.
+* `fixtures/suppressed/odc_suppressed_issues.jsonl` is a canonical JSONL subset
+  for selected suppressed findings.
+* `dependency-check-report-baseline.json` and `.html` are retained raw scan
+  provenance, not runner inputs.
+* `triaged_groups_baseline.json` and the scenario `triaged_groups_*.json` files
+  are pre-triaged group/task planning fixtures. They are not substitutes for
+  canonical JSONL issue interchange.
+* `fixtures/suppressed/suppressions.xml` contains the selected ODC suppression
+  rules.
 
-2. **Triage the selected issues into groups:**
+To refresh a suppressed issue subset, use the maintained extractor with a
+canonical JSONL input:
 
-   ```bash
-   remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
-     --repo "$(pwd)/data/clones/juice-shop" \
-     --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
-   ```
+```bash
+python examples/juice_shop/fixtures/suppressed/extract_suppressed.py \
+  @angular/common @angular/compiler \
+  --output examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl
+```
+
+To normalize a newly produced ODC report and derive groups, use the CLI:
+
+```bash
+remedy ingest path/to/dependency-check-report.json \
+  --format odc-json \
+  --output examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl
+remedy triage examples/juice_shop/fixtures/suppressed/odc_suppressed_issues.jsonl \
+  --repo "$(pwd)/data/clones/juice-shop" \
+  --output examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json
+```
+
+Keep issue files newline-delimited and preserve task, attempt, and QA-policy
+fields when maintaining a pre-triaged or replay fixture.

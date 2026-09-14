@@ -48,14 +48,4 @@ def select_version(
     return eligible[0].version if eligible else None
 
 
-def is_version_space_exhausted(
-    candidates: list[RegistryCandidate],
-    stage: SCARemediationStage,
-    attempted: set[str],
-) -> bool:
-    """Return whether no unattempted candidate remains for ``stage``."""
-
-    return select_version(candidates, stage, attempted) is None
-
-
-__all__ = ["RegistryCandidate", "select_version", "is_version_space_exhausted"]
+__all__ = ["RegistryCandidate", "select_version"]

@@ -143,15 +143,13 @@ def test_cli_auto_loads_canonical_jsonl(tmp_path: Path) -> None:
     assert issues[0].rule_id == "javascript.test"
 
 
-def test_cli_loads_legacy_json_array_with_jsonl_format(tmp_path: Path) -> None:
-    """Legacy pretty-printed arrays remain readable as canonical findings."""
-    path = tmp_path / "legacy.jsonl"
+def test_cli_rejects_json_array_with_jsonl_format(tmp_path: Path) -> None:
+    """JSON arrays are rejected when jsonl format is specified."""
+    path = tmp_path / "array.jsonl"
     path.write_text(json.dumps([_issue().model_dump(mode="json")], indent=2), encoding="utf-8")
 
-    issues = _load_issues(path, "jsonl")
-
-    assert len(issues) == 1
-    assert issues[0].rule_id == "javascript.test"
+    with pytest.raises(ValueError):
+        _load_issues(path, "jsonl")
 
 
 def test_cli_ingest_writes_one_json_object_per_line(tmp_path: Path) -> None:

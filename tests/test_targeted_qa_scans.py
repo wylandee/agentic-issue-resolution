@@ -10,12 +10,14 @@ from remediation_engine.contracts.schemas import (
     ScanFallbackReason,
     ScanScope,
 )
-from remediation_engine.orchestration.qa_critic import (
-    QAScanTarget,
+from remediation_engine.orchestration.qa_critic import _run_global_execution
+from remediation_engine.orchestration.qa_test_parsing import (
     _QAInstallOutcome,
-    _QALogRecord,
     _QATestExecutionOutcome,
-    _run_global_execution,
+)
+from remediation_engine.orchestration.qa_types import (
+    QAScanTarget,
+    _QALogRecord,
     _SecurityScanResult,
 )
 
@@ -99,16 +101,16 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     )
     with (
         patch(
-            "remediation_engine.orchestration.qa_critic._run_install",
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
             return_value=_install_outcome(),
         ),
         patch(
-            "remediation_engine.orchestration.qa_critic._run_targeted_security_scan",
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
             return_value=targeted_result,
         ) as targeted_scan,
-        patch("remediation_engine.orchestration.qa_critic._run_security_scan") as full_scan,
+        patch("remediation_engine.orchestration.qa_odc._run_security_scan") as full_scan,
         patch(
-            "remediation_engine.orchestration.qa_critic._run_unit_tests",
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
             return_value=_test_outcome(),
         ),
     ):
@@ -151,18 +153,18 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
     full_result = _SecurityScanResult(True, "full", set(), set(), set(), [])
     with (
         patch(
-            "remediation_engine.orchestration.qa_critic._run_install",
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
             return_value=_install_outcome(),
         ),
         patch(
-            "remediation_engine.orchestration.qa_critic._run_targeted_security_scan"
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan"
         ) as targeted_scan,
         patch(
-            "remediation_engine.orchestration.qa_critic._run_security_scan",
+            "remediation_engine.orchestration.qa_odc._run_security_scan",
             return_value=full_result,
         ) as full_scan,
         patch(
-            "remediation_engine.orchestration.qa_critic._run_unit_tests",
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
             return_value=_test_outcome(),
         ),
     ):

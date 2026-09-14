@@ -44,8 +44,10 @@ class ToolEvent:
 class SubagentRuntimeResult:
     """Summarize a bounded worker run and its observable side effects.
 
-    structured_output is populated only when a caller configures a typed
-    terminal tool; final_text remains available for legacy free-form workers.
+    ``structured_output`` contains the typed terminal result when a worker
+    configures a terminal tool. ``final_text`` records the terminal textual
+    response for diagnostics and callers that do not request a typed payload.
+    ``changed_files`` and ``errors`` are collected from observed tool events.
     """
 
     final_text: str
@@ -109,12 +111,6 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
             return [file_path.replace("\\", "/")]
 
     return []
-
-
-def _infer_changed_file(tool_event: ToolEvent) -> str | None:
-    """Infer a single changed file path for backwards compatibility."""
-    files = _infer_changed_files(tool_event)
-    return files[0] if files else None
 
 
 def _invoke_bound_tool(tool_map: dict[str, Any], tool_call: dict[str, Any]) -> ToolMessage:
@@ -304,10 +300,10 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
 def _is_invalid_validation_request(tool_content: str) -> bool:
     """Return whether validation stopped during deterministic request preflight.
 
-    These responses indicate that no syntax, typecheck, lint, runtime-smoke, or
-    targeted-test gate ran. They must not consume the executed-validation budget.
-    The legacy text checks keep replayed or mocked tool responses compatible with
-    the new structured marker.
+    These responses indicate that no syntax, typecheck, lint, runtime-smoke,
+    or targeted-test gate ran, so they do not consume the executed-validation
+    budget. The marker and text checks recognize the structured preflight
+    errors emitted by the validation tools.
     """
     content = str(tool_content or "")
     if "[INVALID_VALIDATION_INPUT]" in content:

@@ -1,4 +1,4 @@
-"""Unit tests for the deterministic Phase 2 replay harness."""
+"""Unit tests for the deterministic Phase 5 replay harness."""
 
 from __future__ import annotations
 

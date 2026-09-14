@@ -1,4 +1,4 @@
-"""Production-node replay adapters for the Phase 2 evaluation suites."""
+"""Production-node replay adapters for the Phase 5 evaluation suites."""
 
 from __future__ import annotations
 
@@ -16,10 +16,13 @@ from unittest.mock import patch
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 from remediation_engine.contracts.schemas import (
+    AgentActionStatus,
+    AgentActionSummary,
     FixPlan,
     FixPlanStatus,
     LocalizedIssue,
     NoFixMitigationStage,
+    ODCScanEvidence,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
@@ -32,6 +35,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     WorkaroundContext,
     WorkaroundReplayPlan,
+    WorkerAttemptResult,
 )
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
@@ -493,9 +497,9 @@ def replay_triage_case(
     )
 
 
-def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
+def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str) -> Any:
     """Build deterministic QA results, including optional execution metadata."""
-    import remediation_engine.orchestration.qa_critic as qa
+    import remediation_engine.orchestration.qa_types as qa
 
     replay = _replay_input(case)
     execution = replay.get("execution_context", case.get("execution_context", {}))
@@ -692,13 +696,26 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
                 str(execution.get("effective_scope", requested_scope.value))
             )
             fallback = execution.get("fallback_reason")
-            results.scan_evidence = qa.ODCScanEvidence(
+
+            def typed_strings(field: str, fallback_values: list[str]) -> list[str]:
+                value = execution.get(field)
+                if not isinstance(value, list):
+                    return list(fallback_values)
+                return [str(item) for item in value if str(item).strip()]
+
+            covered_task_ids = typed_strings("covered_task_ids", [task_id])
+            if covered_task_ids != [task_id]:
+                raise ValueError("Replay QA scan evidence must cover exactly its assigned task.")
+            results.scan_evidence = ODCScanEvidence(
                 requested_scope=requested_scope,
                 effective_scope=effective_scope,
                 authoritative=False,
-                covered_task_ids=[str(case.get("case_id"))],
-                closure_package_names=[str(group.vulnerable_component or "")],
-                closure_lockfile_keys=[],
+                covered_task_ids=covered_task_ids,
+                closure_package_names=typed_strings(
+                    "closure_package_names",
+                    [str(group.vulnerable_component or "")],
+                ),
+                closure_lockfile_keys=typed_strings("closure_lockfile_keys", []),
                 found_identifiers=sorted(
                     {str(value) for value in execution.get("found_identifiers", []) or []}
                 ),
@@ -739,22 +756,26 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup) -> Any:
         )
     results.log_records["tests"] = test_records
 
-    diagnostics = execution.get("package_state_diagnostics", []) or []
-    if not isinstance(diagnostics, (list, tuple)):
-        diagnostics = [str(diagnostics)]
-    results.package_state_by_group[group.group_id] = qa._QAPackageState(
-        manifest_state=(
-            str(execution["package_manifest_state"])
-            if execution.get("package_manifest_state") is not None
-            else None
-        ),
-        graph_state=(
-            str(execution["package_graph_state"])
-            if execution.get("package_graph_state") is not None
-            else None
-        ),
-        diagnostics=tuple(str(value) for value in diagnostics if value),
-    )
+    if policy in {
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+        QAPolicy.NO_FIX_CODE_REMOVAL,
+    }:
+        diagnostics = execution.get("package_state_diagnostics", []) or []
+        if not isinstance(diagnostics, (list, tuple)):
+            diagnostics = [str(diagnostics)]
+        results.package_state_by_task[task_id] = qa._QAPackageState(
+            manifest_state=(
+                str(execution["package_manifest_state"])
+                if execution.get("package_manifest_state") is not None
+                else None
+            ),
+            graph_state=(
+                str(execution["package_graph_state"])
+                if execution.get("package_graph_state") is not None
+                else None
+            ),
+            diagnostics=tuple(str(value) for value in diagnostics if value),
+        )
     return results
 
 
@@ -805,11 +826,14 @@ def replay_qa_case(
     Returns:
         The typed QA evaluation and captured in-memory side effects.
     """
-    del eval_settings
     import remediation_engine.orchestration.qa_critic as qa
+    import remediation_engine.orchestration.qa_evaluator as qa_evaluator
+    from remediation_engine.orchestration.graph_wrappers import run_qa_critic_from_orchestrator
 
     group = _group_for_case(case, component="qa")
     task = _build_task(case, group, "qa")
+    if task.qa_policy == QAPolicy.VERSION_BUMP and not task.selected_version:
+        task = task.model_copy(update={"selected_version": "1.0.0"})
     snapshot = _build_snapshot(case, task, dispatch_node="qa_critic")
     files = _qa_files(case)
     replay_execution = _replay_input(case).get(
@@ -847,6 +871,20 @@ def replay_qa_case(
         if isinstance(execution, Mapping)
         else "absent"
     )
+    if (
+        task.qa_policy == QAPolicy.VERSION_BUMP
+        and expected_graph == "present"
+        and "package-lock.json" in files
+    ):
+        files["package-lock.json"] = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {str(group.vulnerable_component): "1.0.0"}},
+                    f"node_modules/{group.vulnerable_component}": {"version": "1.0.0"},
+                },
+            }
+        )
 
     def npm_ls_response(command: str) -> dict[str, Any]:
         del command
@@ -868,27 +906,46 @@ def replay_qa_case(
         }
 
     sandbox = ReplaySandbox(files, command_responses={"npm ls": npm_ls_response})
-    results = _qa_results(case, group)
+    results = _qa_results(case, group, task.task_id)
+    worker_summary = None
+    raw_worker_summary = case.get("worker_action_summary")
+    if isinstance(raw_worker_summary, str) and raw_worker_summary.strip():
+        worker_summary = AgentActionSummary(
+            task_id=task.task_id,
+            attempt_id=snapshot.attempt_id,
+            task_revision=snapshot.task_revision,
+            instruction_digest=snapshot.instruction_digest,
+            status=(
+                AgentActionStatus.SURRENDER
+                if "surrender" in str(case.get("case_id", "")).casefold()
+                else AgentActionStatus.SUCCESS
+            ),
+            summary=raw_worker_summary,
+        )
     state = {
         "valid_groups": [group],
         "workspace_volume": f"replay-{case.get('case_id', 'qa')}",
         "repo_root": "",
-        "action_summaries": [],
-        "group_strategies": {
-            group.group_id: (
-                "no_fix_package_removal"
-                if task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL
-                else "code_workaround"
-                if task.strategy == RoutingStrategy.CODE_WORKAROUND
-                else "version_bump"
-            )
-        },
+        "action_summaries": [worker_summary] if worker_summary is not None else [],
         "changed_files": list(case.get("changed_files", []) or []),
         "task_queue": {task.task_id: task},
         "active_target_task_ids": [task.task_id],
         "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+        "worker_results_by_attempt": {
+            snapshot.attempt_id: WorkerAttemptResult(
+                attempt_id=snapshot.attempt_id,
+                task_id=task.task_id,
+                task_revision=snapshot.task_revision,
+                status=worker_summary.status
+                if worker_summary is not None
+                else AgentActionStatus.SUCCESS,
+                action_summary=worker_summary,
+                changed_files=list(case.get("changed_files", []) or []),
+                instruction_digest=snapshot.instruction_digest,
+            )
+        },
     }
-    loop_results: list[Any] = []
+    loop_outputs: list[Any] = []
     final_files: dict[str, str] = {}
     recorder = TrajectoryRecorder()
     baseline_files = dict(files)
@@ -910,6 +967,9 @@ def replay_qa_case(
         with ExitStack() as stack:
             stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))
+            stack.enter_context(
+                patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox)
+            )
             if llm is not None:
                 stack.enter_context(
                     patch(
@@ -918,22 +978,22 @@ def replay_qa_case(
                     )
                 )
             stack.enter_context(patch.object(qa, "_run_global_execution", return_value=results))
-            original_loop = qa.run_bounded_subagent_loop
+            original_loop = qa_evaluator.run_bounded_subagent_loop
 
             def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
                 value = original_loop(*args, **kwargs)
-                loop_results.append(value)
+                loop_outputs.append(value)
                 return value
 
             stack.enter_context(
-                patch.object(qa, "run_bounded_subagent_loop", side_effect=wrapped_loop)
+                patch.object(qa_evaluator, "run_bounded_subagent_loop", side_effect=wrapped_loop)
             )
-            output = qa.run_qa_critic_node(state)
+            output = run_qa_critic_from_orchestrator(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
-        event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
+        event for runtime in loop_outputs for event in getattr(runtime, "tool_events", [])
     )
-    evaluation = output.get("qa_evaluations", {}).get(group.group_id)
+    evaluation = output.get("qa_evaluations", {}).get(task.task_id)
     payload = {
         "qa_evaluation": serialize_result(evaluation),
         "node_result": serialize_result(output),
@@ -944,6 +1004,11 @@ def replay_qa_case(
         actual_output=output_with_trace(payload, events),
         actual_tools=events,
         typed_result=evaluation,
+        attempt_result=(
+            output.get("qa_results_by_attempt", {}).get(snapshot.attempt_id)
+            if isinstance(output.get("qa_results_by_attempt"), Mapping)
+            else None
+        ),
         changed_files=list(output.get("changed_files", []) or []),
         errors=list(output.get("errors", []) or []),
         attempt_id=snapshot.attempt_id,
@@ -1066,7 +1131,7 @@ def replay_update_case(
     snapshot = _build_snapshot(case, task, dispatch_node="update_subagent")
     files = _worker_files(case)
     sandbox = ReplaySandbox(files, command_responses=_update_command_routes(case))
-    loop_results: list[Any] = []
+    loop_outputs: list[Any] = []
     final_files: dict[str, str] = {}
     recorder = TrajectoryRecorder()
     with tempfile.TemporaryDirectory(prefix="eval-update-", dir=workspace_temp_root()) as temp_dir:
@@ -1099,7 +1164,7 @@ def replay_update_case(
 
             def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
                 value = original_loop(*args, **kwargs)
-                loop_results.append(value)
+                loop_outputs.append(value)
                 return value
 
             stack.enter_context(
@@ -1108,7 +1173,7 @@ def replay_update_case(
             output = update.run_update_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
-        event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
+        event for runtime in loop_outputs for event in getattr(runtime, "tool_events", [])
     )
     case_id = str(case.get("case_id", "unknown"))
     prior_tools = _prior_tool_events(case) if llm is None else []
@@ -1249,7 +1314,7 @@ def replay_workaround_case(
     tool_settings = dataclasses.replace(base_settings, serper_api_key="replay-serper-key")
     sandbox = ReplaySandbox(files, command_responses=_workaround_command_routes(case))
     current_replay_plan = _replay_plan_for_case(case, task)
-    loop_results: list[Any] = []
+    loop_outputs: list[Any] = []
     final_files: dict[str, str] = {}
     recorder = TrajectoryRecorder()
     with tempfile.TemporaryDirectory(
@@ -1287,7 +1352,7 @@ def replay_workaround_case(
 
             def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
                 value = original_loop(*args, **kwargs)
-                loop_results.append(value)
+                loop_outputs.append(value)
                 return value
 
             stack.enter_context(
@@ -1296,7 +1361,7 @@ def replay_workaround_case(
             output = workaround.run_workaround_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
-        event for runtime in loop_results for event in getattr(runtime, "tool_events", [])
+        event for runtime in loop_outputs for event in getattr(runtime, "tool_events", [])
     )
     payload: dict[str, Any] = {
         "action_status": "APPLIED" if output.get("changed_files") else "SURRENDER",

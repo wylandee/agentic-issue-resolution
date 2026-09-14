@@ -1003,17 +1003,6 @@ def fix_planner_golden_cases(
 
 
 @pytest.fixture
-def subagent_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated subagent evaluation cases from golden/subagent_cases.json."""
-    cases = load_golden_cases("subagent_cases")
-    if not cases:
-        pytest.skip("No golden subagent cases found in tests/evals/golden/subagent_cases.json")
-    return cases
-
-
-@pytest.fixture
 def update_subagent_golden_cases(
     load_golden_cases: Callable[[str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:

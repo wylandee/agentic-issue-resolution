@@ -20,12 +20,11 @@ log = logging.getLogger(__name__)
 
 
 def _load_issues(path: Path, input_format: str) -> list[VulnerabilityIssue]:
-    """Load canonical findings or a scanner JSON report.
+    """Load typed issues from one supported local scanner input format.
 
-    Canonical findings are normally newline-delimited JSON objects.  For
-    compatibility with older exports, a file containing one JSON array of
-    canonical objects is accepted as well; both forms produce the same typed
-    issue list.
+    JSONL is the canonical issue interchange format. ODC and Semgrep JSON are
+    accepted at the ingestion boundary and normalized to
+    ``VulnerabilityIssue`` models.
     """
     if input_format == "auto":
         input_format = "jsonl" if path.suffix.lower() in {".jsonl", ".ndjson"} else "odc-json"
@@ -33,14 +32,6 @@ def _load_issues(path: Path, input_format: str) -> list[VulnerabilityIssue]:
         text = path.read_text(encoding="utf-8")
         if not text.strip():
             return []
-        # A previous version wrote ``.jsonl`` files as pretty-printed arrays.
-        # Detect that shape before attempting line-by-line parsing so those
-        # fixtures remain ingestible while all output is canonical JSONL.
-        if text.lstrip().startswith("["):
-            payload = json.loads(text)
-            if not isinstance(payload, list):
-                raise ValueError("Canonical JSONL array payload must be a list.")
-            return [VulnerabilityIssue.model_validate(item) for item in payload]
         return [
             VulnerabilityIssue.model_validate_json(line)
             for line in text.splitlines()
@@ -121,7 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Execute a CLI command and return a process exit code."""
+    """Execute a CLI command and return its process exit code.
+
+    The command reads local input, loads environment-backed settings, and
+    writes requested JSON, JSONL, patch, or report outputs. Remediation runs
+    use an isolated workspace and do not modify the supplied host repository.
+    Input or filesystem validation errors are logged and return exit code 2;
+    a completed run with remediation errors returns 1, otherwise 0.
+    """
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = build_parser().parse_args(argv)

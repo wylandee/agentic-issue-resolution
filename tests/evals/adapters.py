@@ -95,9 +95,7 @@ _KNOWN_LLM_SPAN_NAMES = frozenset(
     {
         "triage.llm",
         "react.llm",
-        "qa_critic.batch_judge",
         "ChatOpenAI",
-        "report.narrative",
         "fix_planner.llm",
     }
 )
@@ -113,7 +111,7 @@ _KNOWN_TOOL_NAMES = frozenset(
         "generate_workspace_diff",
         "revert_workspace_file",
         "read_repository_map",
-        "plan_npm_version",
+        "plan_npm_parent_version",
         "docker_sandbox.run",
         "docker_sandbox.start",
         "docker_sandbox.read_file",

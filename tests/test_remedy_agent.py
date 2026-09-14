@@ -16,6 +16,9 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    QAPolicy,
+    RemediationTask,
+    RoutingStrategy,
     Severity,
     TaskStatus,
     VulnerabilityGroup,
@@ -23,7 +26,6 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.graph import post_qa_triage_node
 from remediation_engine.orchestration.state import (
-    _derive_legacy_task_from_group,
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
@@ -124,11 +126,43 @@ def _repo_root() -> str:
     return str(Path(__file__).resolve().parents[1])
 
 
+def _task_for_group(group: VulnerabilityGroup, **overrides) -> RemediationTask:
+    strategy = (
+        RoutingStrategy.VERSION_BUMP
+        if group.issue_type == IssueType.SCA
+        and (group.fix_plan is None or group.fix_plan.status == FixPlanStatus.VERSION_FOUND)
+        else RoutingStrategy.CODE_WORKAROUND
+    )
+    qa_policy = (
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL
+        if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+        else (
+            QAPolicy.VERSION_BUMP
+            if strategy == RoutingStrategy.VERSION_BUMP
+            else QAPolicy.INITIAL_CODE_WORKAROUND
+        )
+    )
+    kwargs = {
+        "task_id": group.group_id,
+        "parent_group_id": group.group_id,
+        "strategy": strategy,
+        "qa_policy": qa_policy,
+        "instruction": getattr(group.fix_plan, "instruction", "") if group.fix_plan else "",
+    }
+    kwargs.update(overrides)
+    return RemediationTask(**kwargs)
+
+
 class TestUpdateSubagentWrapper:
     def test_update_prompt_prioritizes_task_instruction_and_retry_context(self):
         group = _sca_group()
-        task = _derive_legacy_task_from_group(group)
-        task.instruction = 'Add or update "overrides": {"lodash": "4.17.22"} in package.json.'
+        task = RemediationTask(
+            task_id=group.group_id,
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            instruction='Add or update "overrides": {"lodash": "4.17.22"} in package.json.',
+        )
         prompt = _build_update_prompt(
             [(task, group, ["package.json"])],
             ["lodash must remain >= 4.17.21"],
@@ -157,11 +191,13 @@ class TestUpdateSubagentWrapper:
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
         group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        task_a = _task_for_group(group_a)
+        task_b = _task_for_group(group_b)
         state = initial_update_subagent_state(
             _repo_root(),
             "agent_workspace_deadbeef",
+            [task_a, task_b],
             [group_a, group_b],
-            [],
         )
         state["target_tasks"][0] = state["target_tasks"][0].model_copy(
             update={"retry_count": 1, "status": TaskStatus.NEEDS_RETRY}
@@ -182,14 +218,22 @@ class TestUpdateSubagentWrapper:
     def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
         group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")
         group_b = _sca_group("sca:frontend/package.json:ws", "frontend/package.json")
-        task_a = _derive_legacy_task_from_group(group_a)
-        task_b = _derive_legacy_task_from_group(group_b)
-        task_a.task_id = "task-1"
-        task_b.task_id = "task-2"
-        task_a.retry_count = 1
-        task_b.retry_count = 1
-        task_a.instruction = 'Update "jsonwebtoken" in package.json to version "9.0.0".'
-        task_b.instruction = 'Add or update "overrides": {"ws": "8.20.1"} in package.json.'
+        task_a = RemediationTask(
+            task_id="task-1",
+            parent_group_id=group_a.group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            retry_count=1,
+            instruction='Update "jsonwebtoken" in package.json to version "9.0.0".',
+        )
+        task_b = RemediationTask(
+            task_id="task-2",
+            parent_group_id=group_b.group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            retry_count=1,
+            instruction='Add or update "overrides": {"ws": "8.20.1"} in package.json.',
+        )
         prompt = _build_update_prompt(
             [
                 (task_a, group_a, ["package.json"]),
@@ -219,7 +263,6 @@ class TestUpdateSubagentWrapper:
             "QA feedback: Retry with npm overrides instead of a direct dependency edit." in prompt
         )
         assert "Previous outcome: Previous attempt hit an ERESOLVE conflict." in prompt
-        assert "view_npm_package_versions" not in prompt
         assert "## Task task-1" in prompt
         assert "## Task task-2" in prompt
         assert "Planning Answers" not in prompt
@@ -229,12 +272,15 @@ class TestUpdateSubagentWrapper:
         group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
         group_b.vulnerable_component = "axios"
         repo_root = _repo_root()
+        task_a = _task_for_group(group_a)
+        task_b = _task_for_group(group_b)
         state = initial_update_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            [task_a, task_b],
             [group_a, group_b],
-            ["lodash must remain >= 4.17.21"],
-            {group_a.group_id: "Retry with an override if needed."},
+            constraints_ledger=["lodash must remain >= 4.17.21"],
+            feedback_by_task={group_a.group_id: "Retry with an override if needed."},
         )
 
         llm, bound = _mock_llm_with_responses(
@@ -322,11 +368,12 @@ class TestUpdateSubagentWrapper:
     def test_no_validation_success_becomes_surrender(self):
         group = _sca_group()
         repo_root = _repo_root()
+        task = _task_for_group(group)
         state = initial_update_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            [task],
             [group],
-            [],
         )
 
         llm, _bound = _mock_llm_with_responses(AIMessage(content="done"))
@@ -357,13 +404,13 @@ class TestUpdateSubagentWrapper:
     def test_retry_diagnostics_capture_reasoning_summary(self):
         group = _sca_group()
         repo_root = _repo_root()
+        task = _task_for_group(group, retry_count=1)
         state = initial_update_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            [task],
             [group],
-            [],
         )
-        state["target_tasks"][0].retry_count = 1
 
         llm, _bound = _mock_llm_with_responses(
             AIMessage(
@@ -420,6 +467,7 @@ class TestUpdateSubagentWrapper:
     def test_reverted_package_update_status_becomes_surrender(self):
         from remediation_engine.contracts.schemas import (
             AgentActionStatus,
+            QAPolicy,
             RemediationTask,
             RoutingStrategy,
         )
@@ -431,6 +479,7 @@ class TestUpdateSubagentWrapper:
             task_id=group.group_id,
             parent_group_id=group.group_id,
             strategy=RoutingStrategy.VERSION_BUMP,
+            qa_policy=QAPolicy.VERSION_BUMP,
             instruction="Bump version",
         )
         tool_events = [
@@ -453,16 +502,20 @@ class TestUpdateSubagentWrapper:
     def test_update_subagent_passes_override_required_packages_to_toolbelt(self):
         group = _sca_group()
         repo_root = _repo_root()
+        task = _task_for_group(
+            group,
+            retry_count=1,
+            instruction='Add or update "overrides": {"lodash": "4.17.22"} in package.json.',
+        )
         state = initial_update_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            [task],
             [group],
-            [],
             feedback_by_task={
                 group.group_id: "Retry with npm overrides instead of a direct dependency edit.",
             },
         )
-        state["target_tasks"][0].retry_count = 1
         state["target_tasks"][
             0
         ].instruction = 'Add or update "overrides": {"lodash": "4.17.22"} in package.json.'
@@ -594,7 +647,9 @@ class TestUpdateSubagentWrapper:
 
     def test_workaround_prompt_includes_snippets(self):
         group = _sast_group()
+        task = _task_for_group(group)
         prompt = _build_workaround_prompt(
+            task,
             group,
             ["express must remain >= 4.22.1"],
             previous_feedback="Keep the change narrow.",
@@ -607,11 +662,13 @@ class TestUpdateSubagentWrapper:
     def test_success_requires_validation_after_code_edit(self):
         group = _sast_group()
         repo_root = _repo_root()
+        task = _task_for_group(group)
         state = initial_workaround_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            task,
             group,
-            ["express must remain >= 4.22.1"],
+            constraints_ledger=["express must remain >= 4.22.1"],
             previous_feedback="Fix the broken regex from the previous attempt.",
         )
 
@@ -814,11 +871,12 @@ class TestUpdateSubagentWrapper:
     def test_circuit_breaker_surfaces_as_surrender_with_errors(self):
         group = _sast_group()
         repo_root = _repo_root()
+        task = _task_for_group(group)
         state = initial_workaround_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            task,
             group,
-            [],
         )
 
         replacement = {
@@ -975,11 +1033,12 @@ class TestUpdateSubagentWrapper:
     def test_workaround_subagent_bypass_mode(self):
         group = _sast_group()
         repo_root = _repo_root()
+        task = _task_for_group(group)
         state = initial_workaround_subagent_state(
             repo_root,
             "agent_workspace_deadbeef",
+            task,
             group,
-            [],
         )
         with patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "true"}):
             result = run_workaround_subagent_node(state)
@@ -989,9 +1048,5 @@ class TestUpdateSubagentWrapper:
     def test_post_qa_triage_env_var_disable(self):
         state = {"triage_required": True}
         with patch.dict(os.environ, {"REMEDY_DISABLE_POST_QA_TRIAGE": "true"}):
-            res = post_qa_triage_node(state)
-        assert res["status"] == "triage_skipped"
-
-        with patch.dict(os.environ, {"REMEDY_DISABLE_RETRIAGE": "1"}):
             res = post_qa_triage_node(state)
         assert res["status"] == "triage_skipped"

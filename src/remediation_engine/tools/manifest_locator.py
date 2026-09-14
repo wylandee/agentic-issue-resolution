@@ -24,8 +24,6 @@ Key capabilities preserved
 * ``_find_nearest_manifest`` â€” walks up from the ODC file path to the closest
   ``package.json`` still inside the repo root.
 * ``detect_package_manager`` â€” npm / yarn / pnpm heuristic.
-* ``_run_package_lock_generation`` â€” generates a lockfile when absent so that
-  transitive paths can be resolved.
 * Line-number and snippet extraction for direct dependencies.
 """
 
@@ -33,10 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote  # noqa: F401 â€” kept for callers that may use it
@@ -419,26 +414,6 @@ def _build_snippet(lines: list[str], line_number: int, context: int = 1) -> str:
     start = max(1, line_number - context)
     end = min(len(lines), line_number + context)
     return "\n".join(lines[start - 1 : end])
-
-
-def _run_package_lock_generation(repo_path: Path) -> None:
-    log.info("Running npm install --package-lock-only in %s", repo_path)
-    npm_executable = shutil.which("npm") or "npm"
-    is_windows = os.name == "nt"
-    try:
-        subprocess.run(
-            [npm_executable, "install", "--package-lock-only"],
-            cwd=str(repo_path),
-            check=True,
-            capture_output=True,
-            text=True,
-            shell=is_windows,
-        )
-        log.info("package-lock.json generation completed")
-    except subprocess.CalledProcessError as e:
-        log.error("npm install --package-lock-only failed: %s", (e.stderr or "").strip())
-    except FileNotFoundError:
-        log.error("npm not found on PATH")
 
 
 def _lockfile_dependency_edges(metadata: dict[str, Any]) -> list[tuple[str, str, str]]:

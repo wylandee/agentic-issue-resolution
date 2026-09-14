@@ -2,7 +2,7 @@
 Tests for the Phase 5 Supervisor Node.
 
 Tests have been updated to use the task-centric architecture:
-- task_queue (Dict[str, RemediationTask]) replaces group_statuses/group_strategies/retry_counts
+- task_queue (Dict[str, RemediationTask]) replaces aggregate status and retry projections
 - target_task_ids replaces target_group_ids in SupervisorDecision
 - AgentActionSummary.task_id replaces .group_id
 - QAEvaluation.task_id replaces .group_id
@@ -45,19 +45,15 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.contracts.version_policy import RegistryCandidate
-from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _create_attempt_snapshot,
     _deterministic_routing,
-    _instruction_digest,
     _materialize_spawn_requests,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
-    _parse_planner_retry_plans,
-    _planner_plan_violations,
-    _reconcile_registry_plan_evidence,
     _repair_invalid_planner_plans,
+    instruction_digest,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
     supervisor_router,
@@ -141,7 +137,6 @@ def _base_state(groups, **overrides) -> dict:
         "valid_groups": groups,
         "task_queue": {},
         "active_target_task_ids": [],
-        "active_target_group_ids": [],
         "qa_evaluations": {},
         "action_summaries": [],
         "constraints_ledger": [],
@@ -151,6 +146,70 @@ def _base_state(groups, **overrides) -> dict:
         "status": "supervisor_entered",
     }
     state.update(overrides)
+
+    # Test fixtures emit the same committed attempt envelope as graph
+    # dispatch.  Production no longer accepts uncorrelated summaries.
+    task_queue = dict(state.get("task_queue") or {})
+    snapshots = dict(state.get("attempt_snapshots_by_id") or {})
+    worker_results = dict(state.get("worker_results_by_attempt") or {})
+    summaries = list(state.get("action_summaries") or [])
+    normalized_summaries: list[AgentActionSummary] = []
+    for summary in summaries:
+        task = task_queue.get(summary.task_id)
+        if task is None or summary.attempt_id is not None:
+            normalized_summaries.append(summary)
+            continue
+        attempt_id = f"test-attempt-{summary.task_id}"
+        task_revision = max(1, task.task_revision)
+        task = task.model_copy(
+            update={
+                "current_attempt_id": attempt_id,
+                "task_revision": task_revision,
+                "instruction": task.instruction or "test worker instruction",
+            }
+        )
+        task_queue[task.task_id] = task
+        digest = instruction_digest(task.instruction)
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task_revision,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            instruction=task.instruction,
+            instruction_digest=digest,
+            dispatch_node=(
+                "workaround_subagent"
+                if task.strategy == RoutingStrategy.CODE_WORKAROUND
+                else "update_subagent"
+            ),
+        )
+        tagged_summary = summary.model_copy(
+            update={
+                "attempt_id": attempt_id,
+                "task_revision": task_revision,
+                "instruction_digest": digest,
+            }
+        )
+        normalized_summaries.append(tagged_summary)
+        snapshots[attempt_id] = snapshot
+        worker_results[attempt_id] = WorkerAttemptResult(
+            attempt_id=attempt_id,
+            task_id=task.task_id,
+            task_revision=task_revision,
+            status=summary.status,
+            action_summary=tagged_summary,
+            changed_files=[],
+            instruction_digest=digest,
+        )
+    state["task_queue"] = task_queue
+    state["action_summaries"] = normalized_summaries
+    if snapshots:
+        state["attempt_snapshots_by_id"] = snapshots
+    if worker_results:
+        state["worker_results_by_attempt"] = worker_results
     return state
 
 
@@ -171,7 +230,7 @@ def _mock_deterministic_registry(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
         candidates,
     )
 
@@ -273,7 +332,7 @@ def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
     snapshot = TaskAttemptSnapshot(
         task_id="task-1",
         instruction="Update test-pkg.",
-        instruction_digest=_instruction_digest("Update test-pkg."),
+        instruction_digest=instruction_digest("Update test-pkg."),
         dispatch_node="update_subagent",
     )
 
@@ -683,6 +742,7 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={
                 "task-1": QAEvaluation(
                     task_id="task-1",
@@ -707,9 +767,36 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
         )
         result = run_supervisor_node(state)
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+
+    def test_no_fix_package_removal_pass_reaches_qa_passed(self):
+        group = _sca_group("g1", FixPlanStatus.NO_FIX)
+        task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+        ).model_copy(
+            update={
+                "qa_policy": QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+                "no_fix_stage": "package_removal",
+                "instruction": "Remove test-pkg from the dependency manifests.",
+            }
+        )
+        state = _base_state(
+            [group],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
+        )
+
+        result = run_supervisor_node(state)
+
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
 
     def test_qa_terminalization_clears_attempt_projection_without_repair_events(self):
@@ -724,7 +811,7 @@ class TestRunSupervisorNodeQAUpdates:
             target_package_name="test-pkg",
             target_dependency_type="overrides",
             instruction=instruction,
-            instruction_digest=_instruction_digest(instruction),
+            instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
@@ -749,6 +836,8 @@ class TestRunSupervisorNodeQAUpdates:
                     attempt_id=snapshot.attempt_id,
                     task_id="task-1",
                     task_revision=1,
+                    qa_policy=QAPolicy.VERSION_BUMP,
+                    qa_policy_source="attempt_snapshot",
                     evaluation=QAEvaluation(task_id="task-1", passed=True),
                 )
             },
@@ -782,6 +871,129 @@ class TestRunSupervisorNodeQAUpdates:
             for event in result["consistency_events"]
         )
 
+    def test_inconclusive_qa_requeues_same_attempt_without_worker_retry(self):
+        """Missing deterministic evidence reruns QA without consuming a retry."""
+        group = _sca_group("g1")
+        instruction = "Pin test-pkg through the package manager."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa-inconclusive",
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+            qa_policy=QAPolicy.VERSION_BUMP,
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "instruction": instruction,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Dependency evidence was unavailable.",
+            evidence_inconclusive=True,
+        )
+        state = _base_state(
+            [group],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            qa_results_by_attempt={
+                snapshot.attempt_id: QAAttemptResult(
+                    attempt_id=snapshot.attempt_id,
+                    task_id="task-1",
+                    task_revision=1,
+                    qa_policy=QAPolicy.VERSION_BUMP,
+                    qa_policy_source="attempt_snapshot",
+                    evaluation=evaluation,
+                )
+            },
+        )
+
+        result = run_supervisor_node(state)
+
+        requeued = result["task_queue"]["task-1"]
+        assert requeued.status == TaskStatus.OPTIMISTICALLY_FIXED
+        assert requeued.current_attempt_id == snapshot.attempt_id
+        assert requeued.retry_count == 0
+        assert result["processed_qa_attempt_ids"] == []
+        assert result["next_routing_step"] == "qa_critic"
+
+    def test_contract_error_qa_failed_requeues_same_attempt_without_worker_retry(self):
+        """QA contract failures rerun the current attempt, including qa_failed results."""
+        group = _sca_group("g1")
+        instruction = "Pin test-pkg through the package manager."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa-contract",
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+            qa_policy=QAPolicy.VERSION_BUMP,
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "instruction": instruction,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            contract_error=True,
+            contract_error_reason="Structured evaluator output was missing.",
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="QA contract must be corrected.",
+        )
+        state = _base_state(
+            [group],
+            status="qa_failed",
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            qa_results_by_attempt={
+                snapshot.attempt_id: QAAttemptResult(
+                    attempt_id=snapshot.attempt_id,
+                    task_id="task-1",
+                    task_revision=1,
+                    qa_policy=QAPolicy.VERSION_BUMP,
+                    qa_policy_source="attempt_snapshot",
+                    evaluation=evaluation,
+                )
+            },
+        )
+
+        result = run_supervisor_node(state)
+
+        requeued = result["task_queue"]["task-1"]
+        assert requeued.status == TaskStatus.OPTIMISTICALLY_FIXED
+        assert requeued.current_attempt_id == snapshot.attempt_id
+        assert requeued.retry_count == 0
+        assert result["processed_qa_attempt_ids"] == []
+        assert result["next_routing_step"] == "qa_critic"
+
     def test_qa_completed_passed_adds_constraint(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -789,6 +1001,7 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
         )
         result = run_supervisor_node(state)
@@ -806,6 +1019,7 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
         )
         result = run_supervisor_node(state)
@@ -819,6 +1033,7 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
             constraints_ledger=["test-pkg: keep resolved version at 1.2.3"],
         )
@@ -832,6 +1047,7 @@ class TestRunSupervisorNodeQAUpdates:
             [g1],
             status="qa_completed",
             task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
             qa_evaluations={
                 "task-1": QAEvaluation(
                     task_id="task-1",
@@ -859,7 +1075,7 @@ class TestRunSupervisorNodeQAUpdates:
         # It will route to qa_critic since task is OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
 
-    def test_failed_group_keyed_qa_eval_replans_active_child_task(self):
+    def test_failed_task_keyed_qa_eval_replans_active_child_task(self):
         g1 = _sca_group("g1")
         parent = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
         child = _make_task("task-2", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -872,8 +1088,8 @@ class TestRunSupervisorNodeQAUpdates:
             },
             active_target_task_ids=["task-2"],
             qa_evaluations={
-                "g1": QAEvaluation(
-                    task_id="g1",
+                "task-2": QAEvaluation(
+                    task_id="task-2",
                     passed=False,
                     failure_category=FailureCategory.SECURITY_FLAG,
                     retry_feedback="retry the active child task",
@@ -950,158 +1166,6 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["task_queue"]["task-1"].instruction == "test"
 
 
-def test_planner_none_clears_stale_selection_and_marks_latest_path_exhausted():
-    group = _sca_group("g1")
-    task = _make_task(
-        "task-1",
-        "g1",
-        status=TaskStatus.NEEDS_RETRY,
-        retry_count=3,
-    ).model_copy(
-        update={
-            "strategy_stage": SCARemediationStage.NPM_LATEST,
-            "instruction": "Update package.json to exact version 1.2.3.",
-        }
-    )
-    diagnostics = UpdateRetryDiagnostics(
-        task_id="task-1",
-        strategy_stage=SCARemediationStage.NPM_LATEST,
-        selected_version="1.2.3",
-        attempted_versions=["1.2.3"],
-        latest_version_seen="1.2.3",
-    )
-
-    updated, plans = _parse_planner_retry_plans(
-        """
-TASK: task-1
-SELECTED_VERSION: NONE
-ACTION: pivot_workaround
-The only candidate has already been attempted; pivot to a workaround child.
-""",
-        {"task-1": task},
-        {"task-1": diagnostics},
-        {"g1": group},
-    )
-
-    assert updated["task-1"].selected_version is None
-    assert updated["task-1"].exhausted_update_path is True
-    assert plans["task-1"].action == "pivot_workaround"
-    assert "1.2.3" not in plans["task-1"].exact_instruction
-
-
-def test_planner_rejects_a_retry_for_an_already_attempted_version():
-    group = _sca_group("g1")
-    task = _make_task(
-        "task-1",
-        "g1",
-        status=TaskStatus.NEEDS_RETRY,
-    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
-    diagnostics = UpdateRetryDiagnostics(
-        task_id="task-1",
-        strategy_stage=SCARemediationStage.NPM_LATEST,
-        attempted_versions=["6.0.0", "6.1.2"],
-        latest_version_seen="8.5.1",
-    )
-
-    updated, plans = _parse_planner_retry_plans(
-        """
-TASK: task-1, SELECTED_VERSION: 6.1.2, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update
-The same-major latest version 6.1.2 is already attempted, but retry it.
-""",
-        {"task-1": task},
-        {"task-1": diagnostics},
-        {"g1": group},
-    )
-
-    violations = _planner_plan_violations(plans, {"task-1": task}, updated)
-    assert any(
-        "6.1.2" in violation and "already attempted" in violation for violation in violations
-    )
-
-
-def test_planner_rejects_stage_regression_from_code_workaround_to_update():
-    group = _sca_group("g1")
-    task = _make_task(
-        "task-1",
-        "g1",
-        status=TaskStatus.NEEDS_RETRY,
-    ).model_copy(
-        update={
-            "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
-            "selected_version": "6.1.1",
-            "instruction": "stale update instruction",
-        }
-    )
-
-    updated, plans = _parse_planner_retry_plans(
-        """
-TASK: task-1, SELECTED_VERSION: 6.1.1, EFFECTIVE_STAGE: same_major, ACTION: retry_update
-The same-major candidate has not been attempted yet; retry it.
-""",
-        {"task-1": task},
-        {
-            "task-1": UpdateRetryDiagnostics(
-                task_id="task-1",
-                strategy_stage=SCARemediationStage.CODE_WORKAROUND,
-                attempted_versions=["6.0.0", "6.1.2", "8.5.1"],
-                latest_version_seen="8.5.1",
-            )
-        },
-        {"g1": group},
-    )
-
-    violations = _planner_plan_violations(plans, {"task-1": task}, updated)
-
-    assert plans["task-1"].strategy_stage == SCARemediationStage.NPM_SAME_MAJOR
-    assert any("stage npm_same_major regresses" in violation for violation in violations)
-
-
-def test_unknown_planner_stage_is_fail_closed():
-    group = _sca_group("g1")
-    task = _make_task("task-1", "g1", status=TaskStatus.NEEDS_RETRY)
-    updated, plans = _parse_planner_retry_plans(
-        "TASK: task-1, SELECTED_VERSION: 1.2.4, EFFECTIVE_STAGE: invented_stage, ACTION: retry_update",
-        {"task-1": task},
-        {"task-1": UpdateRetryDiagnostics(task_id="task-1")},
-        {"g1": group},
-    )
-
-    violations = _planner_plan_violations(plans, {"task-1": task}, updated)
-
-    assert plans["task-1"].strategy_stage == SCARemediationStage.CODE_WORKAROUND
-    assert any(
-        "retry_update cannot use code_workaround stage" in violation for violation in violations
-    )
-
-
-def test_same_major_latest_equal_latest_forces_workaround_pivot_even_if_llm_says_retry():
-    group = _sca_group("g1")
-    task = _make_task(
-        "task-1",
-        "g1",
-        status=TaskStatus.NEEDS_RETRY,
-    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
-    updated, plans = _parse_planner_retry_plans(
-        """
-TASK: task-1, SELECTED_VERSION: NONE, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update
-The same-major latest version (8.21.1) is equal to the latest stable version.
-The same-major latest version (8.21.1) is already attempted, so retry it.
-""",
-        {"task-1": task},
-        {
-            "task-1": UpdateRetryDiagnostics(
-                task_id="task-1",
-                strategy_stage=SCARemediationStage.NPM_LATEST,
-                attempted_versions=["8.21.1"],
-            )
-        },
-        {"g1": group},
-    )
-
-    assert updated["task-1"].exhausted_update_path is True
-    assert plans["task-1"].action == "pivot_workaround"
-
-
 def test_invalid_latest_repair_pivots_instead_of_reusing_stale_candidate():
     """An exhausted latest stage must not create an update attempt without a version."""
     group = _sca_group("g1")
@@ -1149,56 +1213,6 @@ def test_invalid_latest_repair_pivots_instead_of_reusing_stale_candidate():
     assert repaired_diagnostics[task.task_id].exhausted_update_path is True
 
 
-def test_registry_tool_result_overrides_free_form_selected_version():
-    group = _sca_group("g1")
-    task = _make_task(
-        "task-1",
-        "g1",
-        status=TaskStatus.NEEDS_RETRY,
-    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
-    diagnostics = UpdateRetryDiagnostics(
-        task_id="task-1",
-        strategy_stage=SCARemediationStage.NPM_LATEST,
-        attempted_versions=["6.1.2"],
-    )
-    parsed_diagnostics, parsed_plans = _parse_planner_retry_plans(
-        "TASK: task-1, SELECTED_VERSION: 6.1.2, EFFECTIVE_STAGE: npm_latest, ACTION: retry_update",
-        {"task-1": task},
-        {"task-1": diagnostics},
-        {"g1": group},
-    )
-
-    tool_event = ToolEvent(
-        name="plan_npm_version",
-        args={
-            "package_name": "test-pkg",
-            "selection": "latest",
-            "security_floor": "1.2.3",
-            "attempted_versions": "6.1.2",
-        },
-        content=(
-            "# NPM Version Plan: test-pkg\n"
-            "- Selection: latest\n"
-            "- Selected Version: 8.5.1\n"
-            "- Same-Major Latest: 6.1.2\n"
-            "- Latest Stable: 8.5.1\n"
-            "- Same-Major Stage: APPLICABLE\n"
-            "- Eligible Candidates: 8.5.1, 6.1.2"
-        ),
-    )
-    updated, plans = _reconcile_registry_plan_evidence(
-        parsed_plans,
-        parsed_diagnostics,
-        {"task-1": task},
-        {"g1": group},
-        [tool_event],
-    )
-
-    assert updated["task-1"].selected_version == "8.5.1"
-    assert plans["task-1"].selected_version == "8.5.1"
-    assert not _planner_plan_violations(plans, {"task-1": task}, updated)
-
-
 def test_exhausted_deterministic_guardrail_routes_workaround_child():
     group = _sca_group("g1")
     task = _make_task(
@@ -1229,6 +1243,8 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
                 attempt_id="update-attempt-1",
                 task_id="task-1",
                 task_revision=1,
+                qa_policy=QAPolicy.VERSION_BUMP,
+                qa_policy_source="attempt_snapshot",
                 evaluation=QAEvaluation(
                     task_id="task-1",
                     passed=False,
@@ -1335,7 +1351,7 @@ def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(
         already_attempted=True,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.fetch_registry_candidates",
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
         lambda *_args, **_kwargs: [attempted_candidate],
     )
     state = _base_state(
@@ -1373,7 +1389,7 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
         selected_version="1.0.0",
         instruction="Update test-pkg to 1.0.0.",
-        instruction_digest=_instruction_digest("Update test-pkg to 1.0.0."),
+        instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
         dispatch_node="update_subagent",
     )
     new_snapshot = TaskAttemptSnapshot(
@@ -1384,7 +1400,7 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         strategy_stage=SCARemediationStage.NPM_LATEST,
         selected_version="2.0.0",
         instruction="Update test-pkg to 2.0.0.",
-        instruction_digest=_instruction_digest("Update test-pkg to 2.0.0."),
+        instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
     )
     task = _make_task(
@@ -1445,7 +1461,7 @@ def test_worker_result_persists_attempts_by_target_and_override_usage():
         target_package_name="test-pkg",
         target_dependency_type="overrides",
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
     )
     task = _make_task("task-1", "g1").model_copy(
@@ -1507,7 +1523,7 @@ def test_allowlisted_alternate_update_candidate_is_reconciled_as_effective():
         target_dependency_type="dependencies",
         allowed_dependency_types=["dependencies", "devDependencies"],
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
@@ -1579,7 +1595,7 @@ def test_unallowlisted_effective_update_candidate_is_rejected(
         target_dependency_type="dependencies",
         allowed_dependency_types=["dependencies"],
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
@@ -1634,7 +1650,7 @@ def test_successful_no_fix_package_removal_routes_to_qa_without_odc(mock_chat):
         strategy_stage=SCARemediationStage.CODE_WORKAROUND,
         no_fix_stage="package_removal",
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
     )
     task = _make_task(
@@ -1693,7 +1709,7 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
         strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
         selected_version="1.0.0",
         instruction=old_instruction,
-        instruction_digest=_instruction_digest(old_instruction),
+        instruction_digest=instruction_digest(old_instruction),
         dispatch_node="update_subagent",
     )
     task = _make_task(
@@ -1763,13 +1779,15 @@ def test_stale_qa_result_does_not_increment_retry_count():
         strategy_stage=SCARemediationStage.NPM_LATEST,
         selected_version="2.0.0",
         instruction="Update test-pkg to 2.0.0.",
-        instruction_digest=_instruction_digest("Update test-pkg to 2.0.0."),
+        instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
     )
     stale_qa = QAAttemptResult(
         attempt_id="attempt-old",
         task_id="task-1",
         task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
         evaluation=QAEvaluation(
             task_id="task-1",
             passed=False,
@@ -1843,7 +1861,7 @@ def test_teardown_barrier_detaches_terminal_attempt_and_is_idempotent():
         strategy_stage=SCARemediationStage.CODE_WORKAROUND,
         selected_version=None,
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
     )
     task = _make_task(
@@ -1940,7 +1958,7 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
         strategy_stage=SCARemediationStage.NPM_LATEST,
         selected_version="8.5.1",
         instruction=instruction,
-        instruction_digest=_instruction_digest(instruction),
+        instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
     )
     task = _make_task(
@@ -2810,6 +2828,7 @@ class TestBugFixes:
                     retry_feedback="The update introduced a breaking runtime regression.",
                 )
             },
+            active_target_task_ids=["task-1"],
             retry_diagnostics_by_task={
                 "task-1": UpdateRetryDiagnostics(
                     task_id="task-1",
@@ -2975,13 +2994,13 @@ class TestBugFixes:
                 "system_context": MagicMock(),
                 "constraints_ledger": [],
                 "retry_counts": {},
-                "group_statuses": {},
                 "group_strategies": {},
                 "action_summaries": [],
                 "retry_plans_by_task": {},
                 "task_queue": task_queue,
                 "valid_groups": [g],
                 "qa_evaluations": qa_evaluations,
+                "active_target_task_ids": ["task-2"],
                 "retry_diagnostics_by_task": {},
             }
         )

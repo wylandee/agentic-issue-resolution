@@ -76,6 +76,15 @@ def test_load_baseline_issues(tmp_path: Path) -> None:
     assert issues[1].package_name == "growl"
 
 
+def test_load_baseline_issues_rejects_json_array(tmp_path: Path) -> None:
+    """Reject legacy array-shaped issue fixtures at the NodeGoat boundary."""
+    fixture_path = tmp_path / "legacy-baseline.json"
+    fixture_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical JSONL"):
+        load_baseline_issues(fixture_path)
+
+
 def test_get_unique_packages() -> None:
     """Test extracting unique package names."""
     issues = [

@@ -148,8 +148,9 @@ def build_qa_production_prompt(case: dict[str, Any]) -> str:
         f"{_QA_JUDGE_FEW_SHOT_EXAMPLES}\n"
         "=== QA CRITIC TASK ===\n"
         f"{task}\n\n"
-        "=== ASSIGNED GROUP ===\n"
-        f"- Group ID: {vulnerability.get('group_id')}\n"
+        "=== ASSIGNED TASK ===\n"
+        f"- Task ID: {case.get('case_id')}\n"
+        f"- Parent Group ID: {vulnerability.get('group_id')}\n"
         f"- Component: {vulnerability.get('vulnerable_component')}\n"
         f"- Target file: {vulnerability.get('file_path')}\n"
         f"- CVE IDs: {', '.join(cves) if cves else 'none'}\n"
@@ -388,6 +389,16 @@ def test_qa_critic_offline_production_replay(
 
     expected = case.get("expected_qa_verdict", {})
     assert capture.typed_result is not None
+    assert capture.attempt_id == f"attempt-{case_id}"
+    assert capture.task_revision == 1
+    assert capture.attempt_result is not None
+    assert capture.attempt_result.task_id == case_id
+    assert capture.attempt_result.attempt_id == capture.attempt_id
+    assert capture.attempt_result.task_revision == capture.task_revision
+    scan_evidence = capture.typed_result.scan_evidence
+    if scan_evidence is not None:
+        assert scan_evidence.covered_task_ids == [case_id]
+        assert scan_evidence.authoritative is False
     gates = capture.typed_result.deterministic_gates
     execution = case.get("execution_context", {})
     assert gates.install_passed is bool(execution.get("install_passed"))

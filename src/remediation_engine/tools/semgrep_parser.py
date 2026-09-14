@@ -1,19 +1,9 @@
-"""
-Semgrep Parser - typed ingestion layer for local Semgrep JSON output.
+"""Typed Semgrep ingestion and canonical issue interchange helpers.
 
-Reads findings from ``data/semgrep.json``, normalizes each raw dict into a
-typed ``VulnerabilityIssue`` Pydantic model, and exports both JSONL
-(canonical agent input) and CSV (human inspection).
-
-Public API
-----------
-``setup_session(api_token) -> None``
-``load_findings_from_json(json_path) -> List[Dict]``
-``fetch_findings(session=None, deployment_slug=None, json_path=None) -> List[Dict]``
-``normalize_finding(finding) -> Optional[VulnerabilityIssue]``
-``export_to_jsonl(issues, output_path) -> None``
-``export_to_csv(issues, output_path) -> None``
-``main() -> None``
+Raw Semgrep JSON is normalized into ``VulnerabilityIssue`` models. Exported
+JSONL is the canonical issue interchange format for remediation boundaries;
+CSV remains a human-inspection export. The parser performs local file I/O only
+and does not modify the source repository.
 """
 
 from __future__ import annotations
@@ -76,12 +66,6 @@ def _default_input_json_path() -> Path:
     return project_root / "data" / "semgrep.json"
 
 
-def setup_session(api_token: str) -> None:
-    """Compatibility helper retained for callers from the old API-based flow."""
-    del api_token
-    return None
-
-
 def _extract_findings_page(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract a list of findings from known Semgrep response shapes."""
     if isinstance(payload.get("findings"), list):
@@ -94,7 +78,7 @@ def _extract_findings_page(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def load_findings_from_json(json_path: Path | str) -> list[dict[str, Any]]:
-    """Load findings from a local Semgrep JSON file."""
+    """Load raw Semgrep findings from a local JSON report."""
     path = Path(json_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(payload, list):
@@ -102,17 +86,6 @@ def load_findings_from_json(json_path: Path | str) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         return _extract_findings_page(payload)
     return []
-
-
-def fetch_findings(
-    session: Any = None,
-    deployment_slug: str | None = None,
-    json_path: Path | str | None = None,
-) -> list[dict[str, Any]]:
-    """Compatibility wrapper that now loads findings from local JSON."""
-    del session, deployment_slug
-    input_path = Path(json_path) if json_path is not None else _default_input_json_path()
-    return load_findings_from_json(input_path)
 
 
 def _parse_cwe_entries(values: Any) -> list[CWEEntry]:

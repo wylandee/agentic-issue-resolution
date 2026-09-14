@@ -271,14 +271,15 @@ class FixPlannerSchemaMetric(BaseMetric):
 
 
 class ArchitectureBoundaryMetric(BaseMetric):
-    """Metric verifying architectural boundary compliance for update and workaround workers.
+    """Metric verifying architecture boundaries for execution workers.
 
     Core Invariant:
-      - The Update Worker is strictly an execution worker. It must NOT select versions
-        or query external registries/web during first-pass executions.
-      - Version discovery tools (search_web, read_web_page, view_npm_package_versions) are prohibited for update workers.
+      - The Update Worker is strictly an execution worker. It must not select
+        versions or query external registries/web during first-pass execution.
+      - Registry and web discovery are Supervisor-owned and prohibited for
+        update workers.
       - Update manifest mutations use only modify_and_validate_npm_dependency.
-      - Workaround workers must NOT call update-only manifest modification tools.
+      - Workaround workers must not call update-only manifest modification tools.
     """
 
     def __init__(
@@ -324,10 +325,6 @@ class ArchitectureBoundaryMetric(BaseMetric):
                 if name in ("search_web", "read_web_page"):
                     violations.append(
                         f"Update worker illegally invoked research tool '{name}' (version hunting prohibited)."
-                    )
-                elif name == "view_npm_package_versions":
-                    violations.append(
-                        "Update worker called prohibited registry tool 'view_npm_package_versions'."
                     )
                 elif name in (
                     "modify_npm_dependency",
@@ -676,10 +673,6 @@ class DeterministicTaskCompletionMetric(BaseMetric):
         return bool(self.success)
 
 
-# Backwards compatibility alias
-TaskCompletionMetric = DeterministicTaskCompletionMetric
-
-
 # ---------------------------------------------------------------------------
 # Phase 5: Token Budget Metric
 # ---------------------------------------------------------------------------
@@ -693,7 +686,6 @@ class TokenBudgetMetric(BaseMetric):
       - update_subagent: max prompt 8,000 (per call) / 35,000 (loop), max completion 500
       - workaround_subagent: max prompt 25,000 (per call) / 350,000 (loop), max completion 1,000
       - qa_critic: max prompt 12,000 (per call) / 75,000 (loop), max completion 1,500
-      - report: max prompt 5,000, max completion 1,500
     """
 
     _DEFAULT_BUDGETS: dict[str, dict[str, int]] = {
@@ -701,7 +693,6 @@ class TokenBudgetMetric(BaseMetric):
         "update_subagent": {"max_prompt": 35_000, "max_completion": 8_000},
         "workaround_subagent": {"max_prompt": 350_000, "max_completion": 15_000},
         "qa_critic": {"max_prompt": 60_000, "max_completion": 5_000},
-        "report": {"max_prompt": 5_000, "max_completion": 1_500},
     }
 
     def __init__(
@@ -715,7 +706,7 @@ class TokenBudgetMetric(BaseMetric):
         """Initialize the TokenBudgetMetric.
 
         Args:
-            agent_type: Agent category ('triage', 'update_subagent', 'workaround_subagent', 'qa_critic', 'report').
+            agent_type: Agent category ('triage', 'update_subagent', 'workaround_subagent', 'qa_critic').
             max_prompt_tokens: Optional prompt token override.
             max_completion_tokens: Optional completion token override.
             threshold: Minimum score required for success (default 1.0).
@@ -800,7 +791,6 @@ class LatencySLAMetric(BaseMetric):
       - update_subagent: 60.0s (full worker loop)
       - workaround_subagent: 120.0s (full worker loop)
       - qa_critic: 45.0s (LLM review phase) / 300.0s (full Docker container loop)
-      - report: 15.0s (LLM narrative synthesis)
     """
 
     _DEFAULT_SLAS: dict[str, float] = {
@@ -808,7 +798,6 @@ class LatencySLAMetric(BaseMetric):
         "update_subagent": 60.0,
         "workaround_subagent": 120.0,
         "qa_critic": 45.0,
-        "report": 15.0,
     }
 
     def __init__(

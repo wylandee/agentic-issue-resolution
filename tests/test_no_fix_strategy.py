@@ -224,17 +224,17 @@ def test_attempt_snapshot_preserves_no_fix_stage_and_revision():
 
 
 def test_qa_normalization_keeps_failure_evidence():
+    task = _task(NoFixMitigationStage.PACKAGE_REMOVAL)
     evidence = QAFailureEvidence(exact_diagnostics=["diagnostic"])
     evaluation = QAEvaluation(
-        task_id="group-id",
+        task_id=task.task_id,
         passed=False,
         failure_category=FailureCategory.BREAKING_CHANGE,
         retry_feedback="retry",
         failure_evidence=evidence,
     )
-    task = _task(NoFixMitigationStage.PACKAGE_REMOVAL)
     normalized = _normalize_qa_evaluations_for_tasks(
-        {task.parent_group_id: evaluation},
+        {task.task_id: evaluation},
         {task.task_id: task},
         [task.task_id],
     )

@@ -17,6 +17,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
     WorkaroundEdit,
+    WorkaroundEditSet,
     WorkaroundExecutionPhase,
     WorkaroundReplayPlan,
     WorkerAttemptResult,
@@ -49,14 +50,19 @@ def test_workaround_schemas_and_serialization() -> None:
     assert edit1.file_path == "lib/insecurity.ts"
     assert edit1.edit_index == 1
 
+    edit_set = WorkaroundEditSet(
+        patch_id="patch-1",
+        affected_files=["lib/insecurity.ts"],
+        replacements=[edit1],
+    )
     plan = WorkaroundReplayPlan(
         task_id="task-1",
         pre_attempt_snapshots={"lib/insecurity.ts": "const x = 1;"},
-        successful_edits=[edit1],
+        successful_edit_sets=[edit_set],
         source_attempt_id="att-100",
     )
     assert plan.task_id == "task-1"
-    assert len(plan.successful_edits) == 1
+    assert len(plan.successful_edit_sets) == 1
     assert plan.pre_attempt_snapshots["lib/insecurity.ts"] == "const x = 1;"
 
     worker_result = WorkerAttemptResult(
@@ -159,15 +165,20 @@ def test_supervisor_commits_matching_replay_plan_and_ignores_stale() -> None:
         instruction_digest="digest-1",
         dispatch_node="workaround_subagent",
     )
+    edit_obj = WorkaroundEdit(
+        file_path="file.js",
+        old_text="const orig = 1;",
+        new_text="const orig = 2;",
+        edit_index=1,
+    )
     replay_plan = WorkaroundReplayPlan(
         task_id="task-1",
         pre_attempt_snapshots={"file.js": "const orig = 1;"},
-        successful_edits=[
-            WorkaroundEdit(
-                file_path="file.js",
-                old_text="const orig = 1;",
-                new_text="const orig = 2;",
-                edit_index=1,
+        successful_edit_sets=[
+            WorkaroundEditSet(
+                patch_id="patch-1",
+                affected_files=["file.js"],
+                replacements=[edit_obj],
             )
         ],
         source_attempt_id="att-1",
@@ -202,8 +213,8 @@ def test_supervisor_commits_matching_replay_plan_and_ignores_stale() -> None:
     assert "workaround_replay_plans_by_task" in out
     assert "task-1" in out["workaround_replay_plans_by_task"]
     committed_plan = out["workaround_replay_plans_by_task"]["task-1"]
-    assert len(committed_plan.successful_edits) == 1
-    assert committed_plan.successful_edits[0].new_text == "const orig = 2;"
+    assert len(committed_plan.successful_edit_sets) == 1
+    assert committed_plan.successful_edit_sets[0].replacements[0].new_text == "const orig = 2;"
 
     # Stale result test: mismatch in instruction_digest
     stale_result = WorkerAttemptResult(

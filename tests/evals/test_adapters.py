@@ -235,8 +235,8 @@ def test_spans_to_test_cases_filtering() -> None:
         ),
         TrajectorySpan(
             run_id="s3",
-            name="qa_critic.batch_judge",
-            run_type="llm",
+            name="qa_critic",
+            run_type="chain",
             inputs="qa prompt",
             outputs={"evaluations": []},
         ),

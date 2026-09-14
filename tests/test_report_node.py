@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from remediation_engine.orchestration.graph import build_orchestrator_graph
 from remediation_engine.orchestration.report_node import (
-    _full_text,
     finalize_report,
     generate_report,
     run_report_node,
@@ -278,7 +277,7 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
     assert result["report_error"] is None
 
 
-def test_follow_up_consolidates_new_and_reappeared_group_statuses():
+def test_follow_up_consolidates_new_and_reappeared_status_entries():
     """New and reappeared groups are shown with the same follow-up format."""
     state = _state()
     new_groups = [
@@ -524,6 +523,7 @@ def test_failed_pivot_child_overrides_historical_parent_qa_success():
         "triage_required": True,
     }
     state["new_vulnerability_status"] = "unresolved"
+    state["triage_reconciliation"] = {}
     state["status"] = "completed"
 
     report = generate_report(state)
@@ -531,6 +531,7 @@ def test_failed_pivot_child_overrides_historical_parent_qa_success():
     assert "1/1 actionable groups fixed" not in report
     assert "| Successfully remediated vulnerability groups | 0 |" in report
     assert "| Vulnerability groups requiring follow-up | 2 |" in report
+    assert "group-child" in report
     assert "completed_with_errors" not in report
     assert "1 target identifiers remain" not in report
 
@@ -573,13 +574,6 @@ def test_report_omits_retry_history_for_successful_findings():
     assert "Earlier attempt summary." not in report
     assert "Latest attempt summary with the final worker conclusion." not in report
     assert "attempt-2" not in report
-
-
-def test_report_text_preserves_full_text_without_truncation():
-    """Report prose retains line breaks and the complete source text."""
-    text = "A completed remediation attempt.\nThe full conclusion remains available."
-
-    assert _full_text(text) == text
 
 
 def test_follow_up_actions_include_only_remediation_attempt_prose():
@@ -753,13 +747,11 @@ def test_final_change_pairs_lockfile_version_with_package_from_resolved_url():
     assert "got: 8.3.2 → removed via lockfile" not in report
 
 
-def test_finalize_report_is_deterministic_when_report_llm_is_enabled(tmp_path: Path):
-    """Report settings cannot cause model calls or model-written report prose."""
+def test_finalize_report_is_deterministic(tmp_path: Path):
+    """Report generation is deterministic and never invokes ChatOpenAI."""
     state = _state()
     settings = AppSettings(
         remediation_report_dir=tmp_path,
-        report_llm_enabled=True,
-        report_llm_model="test-report-model",
     )
     with patch("langchain_openai.ChatOpenAI") as chat_openai:
         report, _ = finalize_report(

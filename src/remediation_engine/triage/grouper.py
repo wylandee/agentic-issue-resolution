@@ -6,8 +6,6 @@ Public API
 group_issues(issues)          â†’ List[VulnerabilityGroup]
     Primary entry point.  Groups both SAST and SCA issues.
 
-group_sca_issues(issues)      â†’ List[VulnerabilityGroup]
-    Backwards-compatible alias â€” filters to SCA only then delegates.
 
 Design
 ------
@@ -540,20 +538,3 @@ def group_issues(
     result = sorted(all_groups.values(), key=lambda g: g.group_id)
     logger.debug("Produced %d groups.", len(result))
     return result
-
-
-def group_sca_issues(
-    issues: list[VulnerabilityIssue],
-    sca_issue_plans: list[tuple[LocalizedIssue, FixPlan]] | None = None,
-) -> list[VulnerabilityGroup]:
-    """
-    Backwards-compatible alias that groups only SCA issues.
-
-    Equivalent to calling ``group_issues`` on a pre-filtered SCA-only list.
-    """
-    sca_only = [i for i in issues if i.issue_type == IssueType.SCA]
-    filtered_pairs = sca_issue_plans
-    if filtered_pairs is not None:
-        sca_issue_ids = {issue.id for issue in sca_only}
-        filtered_pairs = [pair for pair in filtered_pairs if pair[0].issue.id in sca_issue_ids]
-    return group_issues(sca_only, sca_issue_plans=filtered_pairs)

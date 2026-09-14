@@ -1,13 +1,8 @@
-"""
-tests/test_triage_grouper.py â€” Unit tests for remediation_engine.triage.grouper.
+"""Tests for typed vulnerability grouping.
 
-Covers:
-- Same package/file with multiple distinct CVEs â†’ one group, both CVE IDs
-- Duplicate CVE on same component/file â†’ deduplicated in group
-- Semgrep SCA + ODC SCA for same CVE/component/file â†’ merged, two sources
-- SAST issues â†’ singleton groups
-- Mixed SAST+SCA list â†’ correct counts and types
-- group_sca_issues compatibility alias
+Coverage includes:
+- Mixed SAST+SCA lists produce correct counts and types.
+- Findings are grouped by the canonical vulnerability identity.
 """
 
 from __future__ import annotations
@@ -22,7 +17,7 @@ from remediation_engine.contracts.schemas import (
     Severity,
     VulnerabilityIssue,
 )
-from remediation_engine.triage.grouper import group_issues, group_sca_issues
+from remediation_engine.triage.grouper import group_issues
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -503,40 +498,3 @@ class TestMixedGrouping:
 
     def test_empty_input_returns_empty_list(self):
         assert group_issues([]) == []
-
-
-# ---------------------------------------------------------------------------
-# group_sca_issues alias
-# ---------------------------------------------------------------------------
-
-
-class TestGroupSCAAlias:
-    def test_alias_excludes_sast(self):
-        issues = [_sca(), _sast()]
-        sca_groups = group_sca_issues(
-            issues,
-            sca_issue_plans=[
-                (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none"))
-            ],
-        )
-        assert all(g.issue_type == IssueType.SCA for g in sca_groups)
-
-    def test_alias_matches_group_issues_on_sca_only_input(self):
-        # Create one shared list so both calls operate on the same issue objects
-        issues = [_sca(cve_id="CVE-2021-23337"), _sca(cve_id="CVE-2020-28500")]
-        pairs = [
-            (
-                _localized(issues[0]),
-                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
-            ),
-            (
-                _localized(issues[1]),
-                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22"),
-            ),
-        ]
-        alias_result = group_sca_issues(issues, sca_issue_plans=pairs)
-        direct_result = group_issues(issues, sca_issue_plans=pairs)
-        assert len(alias_result) == len(direct_result)
-        alias_ids = {g.group_id for g in alias_result}
-        direct_ids = {g.group_id for g in direct_result}
-        assert alias_ids == direct_ids

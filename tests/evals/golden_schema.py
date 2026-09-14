@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from remediation_engine.contracts.schemas import ScanFallbackReason, ScanScope
+
 REQUIRED_CASE_FIELDS = ("case_id", "input", "context", "expected_output", "expected_tools")
 LIVE_REPLAY_EVAL_TYPES = frozenset(
     {"triage", "qa_critic", "update_subagent", "workaround_subagent"}
@@ -160,6 +162,57 @@ def validate_golden_case(
                     ):
                         violations.append(
                             f"{label}.replay.input.{replay_field} must be a list of strings"
+                        )
+            if eval_type == "qa_critic":
+                execution_context = replay_input.get("execution_context")
+                if isinstance(execution_context, Mapping):
+                    for scan_field in (
+                        "requested_scope",
+                        "effective_scope",
+                        "scan_complete",
+                        "covered_task_ids",
+                        "closure_package_names",
+                        "closure_lockfile_keys",
+                        "fallback_reason",
+                    ):
+                        if scan_field not in execution_context:
+                            violations.append(
+                                f"{label}.replay.input.execution_context is missing "
+                                f"typed scan field {scan_field!r}"
+                            )
+                    for scope_field in ("requested_scope", "effective_scope"):
+                        scope = execution_context.get(scope_field)
+                        if scope not in {item.value for item in ScanScope}:
+                            violations.append(
+                                f"{label}.replay.input.execution_context.{scope_field} "
+                                "must be 'targeted' or 'full'"
+                            )
+                    if not isinstance(execution_context.get("scan_complete"), bool):
+                        violations.append(
+                            f"{label}.replay.input.execution_context.scan_complete "
+                            "must be a boolean"
+                        )
+                    for list_field in (
+                        "covered_task_ids",
+                        "closure_package_names",
+                        "closure_lockfile_keys",
+                    ):
+                        value = execution_context.get(list_field)
+                        if not isinstance(value, list) or not all(
+                            isinstance(item, str) for item in value
+                        ):
+                            violations.append(
+                                f"{label}.replay.input.execution_context.{list_field} "
+                                "must be a list of strings"
+                            )
+                    fallback_reason = execution_context.get("fallback_reason")
+                    if fallback_reason is not None and (
+                        not isinstance(fallback_reason, str)
+                        or fallback_reason not in {item.value for item in ScanFallbackReason}
+                    ):
+                        violations.append(
+                            f"{label}.replay.input.execution_context.fallback_reason "
+                            "must be a valid scan fallback reason or null"
                         )
             workspace_files = replay_input.get("workspace_files")
             if workspace_files is not None and (

@@ -75,38 +75,6 @@ class ASTNodeType(StrEnum):
     UNKNOWN = "unknown"
 
 
-class EditStatus(StrEnum):
-    """Outcome of an attempted file edit."""
-
-    APPLIED = "applied"  # Patch applied successfully
-    DRY_RUN = "dry_run"  # Validated only; no disk write
-    REJECTED = "rejected"  # Validation failed before write
-    ERROR = "error"  # Unexpected error during application
-
-
-class ValidationStatus(StrEnum):
-    """Outcome of a sandbox validation run."""
-
-    PASSED = "passed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    TIMEOUT = "timeout"
-    ERROR = "error"
-
-
-class TrajectoryEventKind(StrEnum):
-    """Discrete steps recorded in a remediation trajectory."""
-
-    INGEST = "ingest"
-    LOCALIZE = "localize"
-    PLAN = "plan"
-    APPLY_EDIT = "apply_edit"
-    VALIDATE = "validate"
-    RETRY = "retry"
-    DELIVER = "deliver"
-    ABORT = "abort"
-
-
 class FixPlanStatus(StrEnum):
     """Outcome of the fix-planner waterfall for one SCA finding."""
 
@@ -171,6 +139,14 @@ class ScannerExecutionStatus(StrEnum):
     NOT_RUN = "not_run"
 
 
+class DependencyEvidenceStatus(StrEnum):
+    """Deterministic status of dependency manifest and graph evidence."""
+
+    VERIFIED = "verified"
+    MISMATCH = "mismatch"
+    INCONCLUSIVE = "inconclusive"
+
+
 class SecurityReviewVerdict(StrEnum):
     """Verdict emitted by the semantic security review."""
 
@@ -228,16 +204,6 @@ class AgentActionStatus(StrEnum):
     SURRENDER = "surrender"
 
 
-class GroupRemediationStatus(StrEnum):
-    """Lifecycle status for one vulnerability group in the remediation pipeline."""
-
-    PENDING = "pending"  # Not yet touched by any subagent
-    OPTIMISTICALLY_FIXED = "optimistically_fixed"  # Subagent succeeded; awaiting QA
-    QA_PASSED = "qa_passed"  # QA explicitly passed; terminal success
-    NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed
-    UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
-
-
 class TaskStatus(StrEnum):
     """Lifecycle status for one RemediationTask in the task queue."""
 
@@ -247,7 +213,6 @@ class TaskStatus(StrEnum):
     NEEDS_RETRY = "needs_retry"  # QA failed; will be re-routed by supervisor
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
     INCONCLUSIVE = "inconclusive"  # Evidence was invalid or could not be classified
-    MITIGATED = "mitigated"  # Legacy terminal status; new package removals still run QA
     PIVOTED = "pivoted"  # Parent attempt was superseded by a spawned child task
 
 
@@ -744,232 +709,6 @@ class DependencyParentContext(BaseModel):
 # ---------------------------------------------------------------------------
 # EditRequest / EditResult
 # ---------------------------------------------------------------------------
-
-
-class EditRequest(BaseModel):
-    """
-    A structured, agent-proposed file mutation.
-
-    Agents MUST supply ``old_text`` as an exact-match anchor. The editor
-    tool rejects requests where the old text is absent, ambiguous, or stale.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    # Target
-    repo_root: str = Field(..., description="Absolute path to the repository workspace root.")
-    file_path: str = Field(..., description="Repo-relative path to the file to be edited.")
-
-    # Edit specification
-    old_text: str = Field(
-        ...,
-        min_length=1,
-        description="The exact text block to be replaced (must match uniquely).",
-    )
-    new_text: str = Field(..., description="Replacement text for the matched block.")
-
-    # Safety controls
-    dry_run: bool = Field(
-        default=False,
-        description="If True, validate only; do not write to disk.",
-    )
-    max_deletion_lines: int = Field(
-        default=200,
-        ge=1,
-        description="Reject edits that delete more than this many lines.",
-    )
-
-    # Traceability
-    issue_id: UUID | None = Field(
-        None, description="UUID of the ``VulnerabilityIssue`` this edit addresses."
-    )
-    rationale: str | None = Field(None, description="Agent-provided explanation for the change.")
-
-    @field_validator("file_path", mode="before")
-    @classmethod
-    def _no_traversal(cls, v: Any) -> str:
-        path = str(v)
-        if ".." in path.split("/") or ".." in path.split("\\"):
-            raise ValueError("Path traversal detected in file_path.")
-        return path
-
-
-class EditResult(BaseModel):
-    """
-    The outcome of applying (or dry-running) an ``EditRequest``.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    request: EditRequest
-    status: EditStatus
-    unified_diff: str | None = Field(
-        None, description="Unified diff of the change (populated on APPLIED/DRY_RUN)."
-    )
-    lines_added: int = Field(default=0, ge=0)
-    lines_removed: int = Field(default=0, ge=0)
-    rejection_reason: str | None = Field(
-        None, description="Human-readable reason for REJECTED / ERROR status."
-    )
-    applied_at: datetime | None = Field(
-        None, description="UTC timestamp of the write (None for dry-run/rejected)."
-    )
-
-
-# ---------------------------------------------------------------------------
-# ValidationResult
-# ---------------------------------------------------------------------------
-
-
-class FailingTest(BaseModel):
-    """Details of a single failing test case."""
-
-    model_config = ConfigDict(frozen=True)
-
-    name: str
-    file: str | None = None
-    line: int | None = Field(None, ge=1)
-    message: str | None = None
-
-
-class ValidationResult(BaseModel):
-    """
-    Structured outcome of a sandbox validation run (tests, security scans, etc.).
-
-    The Feedback Loop agent parses this to decide whether to retry or deliver.
-    """
-
-    model_config = ConfigDict(frozen=False)
-
-    # Identity
-    patch_attempt_id: UUID | None = Field(
-        None, description="UUID of the ``PatchAttempt`` this validates."
-    )
-    phase: str = Field(
-        ...,
-        description="Phase label from the validation profile (install/unit/security_scan).",
-    )
-
-    # Result
-    status: ValidationStatus
-    exit_code: int | None = None
-    command: list[str] = Field(
-        default_factory=list,
-        description="The command array that was executed.",
-    )
-    stdout_tail: str | None = Field(
-        None, description="Last N lines of stdout (truncated for context)."
-    )
-    stderr_tail: str | None = Field(None, description="Last N lines of stderr.")
-
-    # Structured failure analysis
-    failing_tests: list[FailingTest] = Field(default_factory=list)
-    dependency_conflict_hints: list[str] = Field(
-        default_factory=list,
-        description="Extracted dependency conflict messages for retry planning.",
-    )
-    changed_files: list[str] = Field(
-        default_factory=list,
-        description="Repo-relative paths of files modified during validation.",
-    )
-
-    duration_seconds: float | None = Field(None, ge=0.0)
-    validated_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC),
-    )
-
-
-# ---------------------------------------------------------------------------
-# PatchAttempt
-# ---------------------------------------------------------------------------
-
-
-class PatchAttempt(BaseModel):
-    """
-    A single end-to-end attempt to remediate one ``VulnerabilityIssue``.
-
-    Bundles the edit(s) applied and the validation results for that attempt.
-    The Remedy agent uses this to decide whether to retry (max 2â€“3 retries).
-    """
-
-    model_config = ConfigDict(frozen=False)
-
-    id: UUID = Field(default_factory=uuid4)
-    issue_id: UUID = Field(..., description="UUID of the ``VulnerabilityIssue`` being remediated.")
-    attempt_number: int = Field(..., ge=1, description="1-indexed attempt counter.")
-
-    edits: list[EditResult] = Field(
-        default_factory=list,
-        description="All file edits applied in this attempt.",
-    )
-    validations: list[ValidationResult] = Field(
-        default_factory=list,
-        description="Ordered validation results for this attempt.",
-    )
-
-    # Summary
-    succeeded: bool | None = Field(
-        None,
-        description="True if all validation phases passed; False if any failed; None if still running.",
-    )
-    failure_summary: str | None = Field(
-        None,
-        description="Natural-language summary of why this attempt failed (for the next retry prompt).",
-    )
-
-    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    completed_at: datetime | None = None
-
-    @property
-    def all_validations_passed(self) -> bool:
-        """Return whether at least one validation ran and every validation passed."""
-        return bool(self.validations) and all(
-            v.status == ValidationStatus.PASSED for v in self.validations
-        )
-
-
-# ---------------------------------------------------------------------------
-# TrajectoryEvent
-# ---------------------------------------------------------------------------
-
-
-class TrajectoryEvent(BaseModel):
-    """
-    A single step in the remediation trajectory / audit log.
-
-    Written by every agent node in the LangGraph StateGraph so the full
-    execution can be replayed, evaluated, and billed.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    id: UUID = Field(default_factory=uuid4)
-    issue_id: UUID | None = Field(None, description="Related ``VulnerabilityIssue`` UUID.")
-    patch_attempt_id: UUID | None = Field(None)
-
-    kind: TrajectoryEventKind
-    agent: str | None = Field(None, description="Agent node name (e.g. 'remedy_agent').")
-
-    # Payload
-    summary: str = Field(..., description="Short human-readable description of the step.")
-    detail: dict[str, Any] | None = Field(
-        None,
-        description="Structured detail payload (tool call args, diff stats, etc.).",
-    )
-
-    # Cost tracking
-    input_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    duration_seconds: float | None = Field(None, ge=0.0)
-
-    occurred_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC),
-    )
-
-    @property
-    def total_tokens(self) -> int:
-        """Return the total input and output token count for the event."""
-        return self.input_tokens + self.output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1471,6 +1210,23 @@ class QATestAttribution(BaseModel):
         return self
 
 
+class QADependencyEvidence(BaseModel):
+    """Compact Python-owned evidence for one task's dependency state."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: DependencyEvidenceStatus
+    target_package: str = Field(default="")
+    expected_version: str | None = None
+    manifest_paths: list[str] = Field(default_factory=list)
+    lockfile_paths: list[str] = Field(default_factory=list)
+    declarations: dict[str, str] = Field(default_factory=dict)
+    resolved_versions: list[str] = Field(default_factory=list)
+    lockfile_versions: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
+
+
 class QADeterministicGates(BaseModel):
     """Raw Python-owned QA evidence before policy-specific decision rules."""
 
@@ -1485,6 +1241,13 @@ class QADeterministicGates(BaseModel):
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
     diagnostics: list[str] = Field(default_factory=list)
+    dependency_evidence: QADependencyEvidence | None = Field(
+        default=None,
+        description=(
+            "Python-owned manifest and resolved dependency evidence. "
+            "Raw file contents are not required for the QA decision."
+        ),
+    )
 
 
 class ODCScanEvidence(BaseModel):
@@ -1607,6 +1370,13 @@ class QAEvaluation(BaseModel):
         ),
     )
     contract_error_reason: str = Field(default="")
+    evidence_inconclusive: bool = Field(
+        default=False,
+        description=(
+            "True when deterministic evidence collection was unavailable. "
+            "This must be rechecked without consuming a remediation retry."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_contract_error(self) -> QAEvaluation:
@@ -1632,9 +1402,11 @@ class QAEvaluation(BaseModel):
                 self.failure_category is not None
                 or self.retry_feedback is not None
                 or self.failure_evidence is not None
+                or self.evidence_inconclusive
             ):
                 raise ValueError(
-                    "passed=True requires failure_category=None, retry_feedback=None, and failure_evidence=None."
+                    "passed=True requires failure_category=None, retry_feedback=None, "
+                    "failure_evidence=None, and evidence_inconclusive=False."
                 )
             return self
 
@@ -1646,26 +1418,6 @@ class QAEvaluation(BaseModel):
         if not self.retry_feedback or not self.retry_feedback.strip():
             raise ValueError("passed=False requires a non-empty retry_feedback.")
         return self
-
-
-class BatchQAResult(BaseModel):
-    """Structured output from the map-reduce batch judge phase."""
-
-    model_config = ConfigDict(frozen=True)
-
-    holistic_report: str = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Free-form markdown holistic report synthesizing all individual "
-            "investigations into a unified narrative, listing responsible, "
-            "possibly responsible, and exonerated groups."
-        ),
-    )
-    evaluations: list[QAEvaluation] = Field(
-        default_factory=list,
-        description="Exactly one QAEvaluation per vulnerability group in the batch.",
-    )
 
 
 class AgentActionSummary(BaseModel):
@@ -1950,42 +1702,6 @@ class WorkaroundReplayPlan(BaseModel):
     alternative_test_mapping_details: dict[str, dict[str, str]] = Field(default_factory=dict)
     infrastructure_failure_details: str | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_successful_edits(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            data_copy = dict(data)
-            legacy_edits = data_copy.pop("successful_edits", None)
-            if legacy_edits and not data_copy.get("successful_edit_sets"):
-                sets: list[dict[str, Any]] = []
-                for idx, item in enumerate(legacy_edits):
-                    edit_dict = (
-                        item.model_dump()
-                        if isinstance(item, BaseModel)
-                        else dict(item)
-                        if isinstance(item, dict)
-                        else {}
-                    )
-                    if edit_dict:
-                        p_id = edit_dict.get("patch_id") or f"patch_legacy_{idx}"
-                        sets.append(
-                            {
-                                "patch_id": p_id,
-                                "plan_revision": 1,
-                                "iteration": idx + 1,
-                                "affected_files": [edit_dict.get("file_path", "")],
-                                "replacements": [edit_dict],
-                            }
-                        )
-                data_copy["successful_edit_sets"] = sets
-            return data_copy
-        return data
-
-    @property
-    def successful_edits(self) -> list[WorkaroundEdit]:
-        """Return all replacement records across successful edit sets."""
-        return [edit for edit_set in self.successful_edit_sets for edit in edit_set.replacements]
-
 
 class WorkerAttemptResult(BaseModel):
     """Worker result correlated to the supervisor's committed attempt."""
@@ -2015,41 +1731,17 @@ class QAAttemptResult(BaseModel):
     attempt_id: str = Field(..., min_length=1)
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
-    qa_policy: QAPolicy | None = Field(
-        default=None,
-        description=(
-            "Supervisor-owned policy copied from the committed attempt. None is "
-            "retained only for legacy results and must not be produced by the "
-            "current graph dispatch path."
-        ),
+    qa_policy: QAPolicy = Field(
+        ...,
+        description="Supervisor-owned policy copied from the immutable attempt snapshot.",
     )
-    qa_policy_source: Literal["attempt_snapshot", "task_queue", "missing"] = Field(
-        default="missing",
-        description="Provenance source for qa_policy in this attempt result.",
+    qa_policy_source: Literal["attempt_snapshot"] = Field(
+        ...,
+        description="Policy provenance must be the immutable attempt snapshot.",
     )
     evaluation: QAEvaluation
     investigation_report: str = ""
     errors: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _validate_qa_policy_provenance(self) -> QAAttemptResult:
-        """Keep the optional legacy policy state internally consistent.
-
-        The current graph must populate both fields. Legacy direct callers
-        may still omit the policy, but a present policy must identify its
-        source and a non-missing source must carry a policy value.
-
-        Returns:
-            This validated QA attempt result.
-
-        Raises:
-            ValueError: If the policy and provenance fields disagree.
-        """
-        if self.qa_policy is None and self.qa_policy_source != "missing":
-            raise ValueError("qa_policy_source must be 'missing' when qa_policy is absent.")
-        if self.qa_policy is not None and self.qa_policy_source == "missing":
-            raise ValueError("qa_policy_source must identify the source when qa_policy is present.")
-        return self
 
 
 class StateConsistencyEvent(BaseModel):

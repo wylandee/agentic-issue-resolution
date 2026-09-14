@@ -164,7 +164,6 @@ class TestTriageNodeIntegration:
             mock_supervisor.return_value = {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
-                "active_target_group_ids": [],
                 "feedback_by_group": {},
                 "supervisor_instructions": "done",
             }

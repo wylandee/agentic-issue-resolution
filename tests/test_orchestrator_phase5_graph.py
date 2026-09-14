@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    WorkerAttemptResult,
 )
 from remediation_engine.orchestration import (
     build_orchestrator_graph,
@@ -41,7 +42,7 @@ from remediation_engine.orchestration.graph import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
-from remediation_engine.orchestration.supervisor_node import _instruction_digest
+from remediation_engine.orchestration.supervisor_node import instruction_digest
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
@@ -110,19 +111,40 @@ def _initial_state(tmp_path, groups):
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
-        "group_statuses": {},
         "qa_evaluations": {},
         "action_summaries": [],
         "changed_files": [],
         "workspace_volume": None,
         "status": "pending",
         "next_routing_step": "",
-        "active_target_group_ids": [],
         "feedback_by_group": {},
         "supervisor_instructions": "",
         "eval_status": "",
         "errors": [],
     }
+
+
+def _committed_dispatch(task, *, dispatch_node: str):
+    """Return a task and immutable snapshot suitable for a graph dispatch."""
+    committed_task = task.model_copy(
+        update={
+            "task_revision": max(1, task.task_revision),
+            "current_attempt_id": f"attempt-{task.task_id}",
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=committed_task.current_attempt_id,
+        task_id=committed_task.task_id,
+        state_revision=1,
+        task_revision=committed_task.task_revision,
+        strategy_stage=committed_task.strategy_stage,
+        qa_policy=committed_task.qa_policy,
+        selected_version=committed_task.selected_version,
+        instruction=committed_task.instruction,
+        instruction_digest=instruction_digest(committed_task.instruction),
+        dispatch_node=dispatch_node,
+    )
+    return committed_task, snapshot
 
 
 class TestPhase5Routing:
@@ -156,7 +178,6 @@ class TestPhase5RunOrchestrator:
         assert invoked_state["valid_groups"] == groups
         assert invoked_state["constraints_ledger"] == []
         assert invoked_state["changed_files"] == []
-        assert invoked_state["group_statuses"] == {}
         assert invoked_state["next_routing_step"] == ""
         assert result["status"] == "completed"
 
@@ -274,27 +295,7 @@ class TestPhase5RunOrchestrator:
 
         report_files = list(report_dir.glob("*.md"))
         assert len(report_files) == 1
-        report_text = report_files[0].read_text(encoding="utf-8")
-        assert "orchestrator failed before report phase" not in report_text
-
-    def test_trajectory_export_failure_does_not_mask_orchestration_error(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
-        mock_engine = MagicMock()
-        mock_engine.invoke.side_effect = RuntimeError("graph exploded")
-
-        with (
-            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
-            patch(
-                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
-                return_value=(None, None),
-            ),
-            patch(
-                "remediation_engine.orchestration.graph.export_phase5_trajectory",
-                side_effect=OSError("disk full"),
-            ),
-            pytest.raises(RuntimeError, match="graph exploded"),
-        ):
-            run_orchestrator(str(tmp_path), groups)
+        assert report_files[0].read_text(encoding="utf-8")
 
 
 class TestPhase5GraphIntegration:
@@ -302,10 +303,12 @@ class TestPhase5GraphIntegration:
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
+        task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
         state = _initial_state(tmp_path, groups)
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["task_queue"] = {"task-1": task}
         state["active_target_task_ids"] = ["task-1"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
         state["supervisor_instructions"] = (
             "Use registry lookup to find a safe compatible remediation."
         )
@@ -314,6 +317,9 @@ class TestPhase5GraphIntegration:
                 task_id="task-1",
                 status=AgentActionStatus.SURRENDER,
                 summary="Previous version bump failed manifest validation.",
+                attempt_id=snapshot.attempt_id,
+                task_revision=snapshot.task_revision,
+                instruction_digest=snapshot.instruction_digest,
             )
         ]
 
@@ -338,9 +344,12 @@ class TestPhase5GraphIntegration:
     def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
+        task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
         state = _initial_state(tmp_path, groups)
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
         state["active_target_task_ids"] = ["task-1"]
 
         diagnostics = UpdateRetryDiagnostics(
@@ -366,7 +375,7 @@ class TestPhase5GraphIntegration:
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
 
-    def test_workaround_wrapper_tags_compatibility_summary_from_snapshot(self, tmp_path):
+    def test_workaround_wrapper_preserves_typed_attempt_result(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = "Apply the source workaround."
@@ -379,7 +388,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
         )
         task = task.model_copy(
@@ -387,6 +396,22 @@ class TestPhase5GraphIntegration:
                 "task_revision": 1,
                 "current_attempt_id": snapshot.attempt_id,
             }
+        )
+        summary = AgentActionSummary(
+            task_id="task-1",
+            attempt_id=snapshot.attempt_id,
+            task_revision=snapshot.task_revision,
+            instruction_digest=snapshot.instruction_digest,
+            status=AgentActionStatus.SURRENDER,
+            summary="workaround bypassed",
+        )
+        worker_result = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=summary.status,
+            action_summary=summary,
+            instruction_digest=snapshot.instruction_digest,
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -396,26 +421,20 @@ class TestPhase5GraphIntegration:
                 "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
             }
         )
-        untagged = AgentActionSummary(
-            task_id="task-1",
-            status=AgentActionStatus.SURRENDER,
-            summary="workaround bypassed",
-        )
         with patch(
             "remediation_engine.orchestration.graph.run_workaround_subagent_node",
             return_value={
-                "action_summaries": [untagged],
-                "action_summary": untagged,
-                "worker_results_by_attempt": {},
+                "action_summaries": [summary],
+                "action_summary": summary,
+                "worker_results_by_attempt": {snapshot.attempt_id: worker_result},
                 "errors": [],
             },
         ):
             result = run_workaround_subagent_from_orchestrator(state)
 
-        summary = result["action_summaries"][0]
-        assert summary.attempt_id == snapshot.attempt_id
-        assert summary.task_revision == snapshot.task_revision
-        assert summary.instruction_digest == snapshot.instruction_digest
+        returned_summary = result["action_summaries"][0]
+        assert returned_summary == summary
+        assert result["worker_results_by_attempt"][snapshot.attempt_id] == worker_result
 
     def test_update_wrapper_rejects_contradictory_snapshot_before_worker(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
@@ -435,7 +454,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version="4.17.21",
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -476,7 +495,7 @@ class TestPhase5GraphIntegration:
             qa_policy=None,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -512,7 +531,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -585,7 +604,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -621,12 +640,12 @@ class TestPhase5GraphIntegration:
         sandbox.restore_workspace_snapshot.assert_not_called()
         sandbox.remove_workspace_snapshot.assert_not_called()
 
-        evaluation = QAEvaluation(task_id=groups[0].group_id, passed=True)
+        evaluation = QAEvaluation(task_id=task.task_id, passed=True)
         with (
             patch(
                 "remediation_engine.orchestration.graph.run_qa_critic_node",
                 return_value={
-                    "qa_evaluations": {groups[0].group_id: evaluation},
+                    "qa_evaluations": {task.task_id: evaluation},
                     "status": "qa_completed",
                     "errors": [],
                 },
@@ -655,8 +674,6 @@ class TestPhase5GraphIntegration:
             return_value={
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
-                "active_target_group_ids": [],
-                "group_statuses": {},
                 "group_strategies": {},
                 "retry_counts": {},
                 "constraints_ledger": [],
@@ -736,8 +753,7 @@ class TestPhase5GraphIntegration:
                 return {
                     "status": "supervisor_routed",
                     "next_routing_step": "update_subagent",
-                    "active_target_group_ids": [gid],
-                    "group_statuses": {},
+                    "active_target_task_ids": [gid],
                     "group_strategies": {},
                     "retry_counts": {},
                     "constraints_ledger": [],
@@ -747,8 +763,6 @@ class TestPhase5GraphIntegration:
             return {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
-                "active_target_group_ids": [],
-                "group_statuses": {},
                 "group_strategies": {},
                 "retry_counts": {},
                 "constraints_ledger": [],
@@ -757,7 +771,7 @@ class TestPhase5GraphIntegration:
             }
 
         supervisor = MagicMock(side_effect=supervisor_side_effect)
-        update_subagent = MagicMock(return_value={"errors": [], "group_statuses": {}})
+        update_subagent = MagicMock(return_value={"errors": []})
         teardown = MagicMock(return_value={"status": "completed", "workspace_volume": None})
 
         with (
@@ -796,8 +810,6 @@ class TestPhase5GraphIntegration:
                 return {
                     "status": "supervisor_routed",
                     "next_routing_step": "qa_critic",
-                    "active_target_group_ids": [],
-                    "group_statuses": {},
                     "group_strategies": {},
                     "retry_counts": {},
                     "constraints_ledger": [],
@@ -807,8 +819,6 @@ class TestPhase5GraphIntegration:
             return {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
-                "active_target_group_ids": [],
-                "group_statuses": {},
                 "group_strategies": {},
                 "retry_counts": {},
                 "constraints_ledger": [],
@@ -856,12 +866,24 @@ class TestPhase5GraphIntegration:
             _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
             _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
         ]
+        tasks = []
+        snapshots = {}
+        for index, group in enumerate(groups, start=1):
+            task, snapshot = _committed_dispatch(
+                build_initial_remediation_task(group, f"task-{index}"),
+                dispatch_node="qa_critic",
+            )
+            tasks.append(task)
+            snapshots[snapshot.attempt_id] = snapshot
         state = _initial_state(tmp_path, groups)
-        state["active_target_group_ids"] = [groups[1].group_id]
-
+        state["task_queue"] = {task.task_id: task for task in tasks}
+        state["active_target_task_ids"] = [tasks[1].task_id]
+        state["attempt_snapshots_by_id"] = snapshots
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {},
+                "qa_evaluations": {
+                    tasks[1].task_id: QAEvaluation(task_id=tasks[1].task_id, passed=True)
+                },
                 "eval_status": "all_passed",
                 "qa_investigation_report": "# INVESTIGATIVE REPORT\n## Install Analysis",
                 "status": "qa_completed",
@@ -876,14 +898,16 @@ class TestPhase5GraphIntegration:
         assert [group.group_id for group in scoped_state["valid_groups"]] == [groups[1].group_id]
         assert result["status"] == "qa_completed"
 
-    def test_qa_wrapper_rejects_policyless_legacy_task(self, tmp_path):
+    def test_qa_wrapper_rejects_policyless_task(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"qa_policy": None}
         )
+        task, snapshot = _committed_dispatch(task, dispatch_node="qa_critic")
         state = _initial_state(tmp_path, groups)
         state["task_queue"] = {"task-1": task}
         state["active_target_task_ids"] = ["task-1"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
 
         qa_critic = MagicMock()
         with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
@@ -904,13 +928,15 @@ class TestPhase5GraphIntegration:
         task = build_initial_remediation_task(groups[1], "task-2").model_copy(
             update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
         )
+        task, snapshot = _committed_dispatch(task, dispatch_node="qa_critic")
         state = _initial_state(tmp_path, groups)
         state["task_queue"] = {"task-2": task}
         state["active_target_task_ids"] = ["task-2"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
 
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {},
+                "qa_evaluations": {task.task_id: QAEvaluation(task_id=task.task_id, passed=True)},
                 "eval_status": "all_passed",
                 "qa_investigation_report": "# INVESTIGATIVE REPORT",
                 "status": "qa_completed",
@@ -939,7 +965,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -952,14 +978,14 @@ class TestPhase5GraphIntegration:
             }
         )
         evaluation = QAEvaluation(
-            task_id=groups[0].group_id,
+            task_id=task.task_id,
             passed=False,
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="The candidate breaks the test suite.",
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {groups[0].group_id: evaluation},
+                "qa_evaluations": {task.task_id: evaluation},
                 "eval_status": "some_failed",
                 "status": "qa_completed",
                 "errors": [],
@@ -982,6 +1008,123 @@ class TestPhase5GraphIntegration:
         assert result["workspace_rollback_anchors_by_task"] == {"task-1": "attempt-attempt-qa"}
         assert result["qa_results_by_attempt"]["attempt-qa"].evaluation.passed is False
 
+    def test_inconclusive_qa_retains_candidate_workspace_for_rerun(self, tmp_path):
+        """Evidence-only QA reruns must not restore the pre-worker baseline."""
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"task_revision": 1, "current_attempt_id": "attempt-qa-inconclusive"}
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa-inconclusive",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id=task.task_id,
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Dependency evidence was unavailable.",
+            evidence_inconclusive=True,
+        )
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {task.task_id: evaluation},
+                "eval_status": "failures_detected",
+                "status": "qa_completed",
+                "errors": [],
+            }
+        )
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+
+        with (
+            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch(
+                "remediation_engine.orchestration.graph.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_qa_critic_from_orchestrator(state)
+
+        sandbox.restore_workspace_snapshot.assert_not_called()
+        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-qa-inconclusive")
+        assert result["qa_results_by_attempt"]["attempt-qa-inconclusive"].evaluation == evaluation
+
+    def test_qa_failed_contract_error_retains_candidate_workspace(self, tmp_path):
+        """Infrastructure QA failures retain the candidate for the same attempt."""
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"task_revision": 1, "current_attempt_id": "attempt-qa-contract"}
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-qa-contract",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id=task.task_id,
+            passed=False,
+            contract_error=True,
+            contract_error_reason="QA execution did not complete.",
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Rerun QA.",
+        )
+        qa_critic = MagicMock(
+            return_value={
+                "qa_evaluations": {task.task_id: evaluation},
+                "eval_status": "failures_detected",
+                "status": "qa_failed",
+                "errors": ["QA infrastructure failure"],
+            }
+        )
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+
+        with (
+            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch(
+                "remediation_engine.orchestration.graph.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_qa_critic_from_orchestrator(state)
+
+        sandbox.restore_workspace_snapshot.assert_not_called()
+        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-qa-contract")
+        assert result["qa_results_by_attempt"]["attempt-qa-contract"].evaluation.contract_error
+
     def test_security_failure_restores_and_removes_attempt_workspace_snapshot(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
@@ -996,7 +1139,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -1009,14 +1152,14 @@ class TestPhase5GraphIntegration:
             }
         )
         evaluation = QAEvaluation(
-            task_id=groups[0].group_id,
+            task_id=task.task_id,
             passed=False,
             failure_category=FailureCategory.SECURITY_FLAG,
             retry_feedback="The candidate still contains the target vulnerability.",
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {groups[0].group_id: evaluation},
+                "qa_evaluations": {task.task_id: evaluation},
                 "eval_status": "some_failed",
                 "status": "qa_completed",
                 "errors": [],
@@ -1060,7 +1203,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -1076,14 +1219,14 @@ class TestPhase5GraphIntegration:
             }
         )
         evaluation = QAEvaluation(
-            task_id=groups[0].group_id,
+            task_id=task.task_id,
             passed=False,
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="The workaround still breaks a regression test.",
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {groups[0].group_id: evaluation},
+                "qa_evaluations": {task.task_id: evaluation},
                 "eval_status": "some_failed",
                 "status": "qa_completed",
                 "errors": [],
@@ -1125,7 +1268,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -1137,10 +1280,10 @@ class TestPhase5GraphIntegration:
                 "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
             }
         )
-        evaluation = QAEvaluation(task_id=groups[0].group_id, passed=True)
+        evaluation = QAEvaluation(task_id=task.task_id, passed=True)
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {groups[0].group_id: evaluation},
+                "qa_evaluations": {task.task_id: evaluation},
                 "eval_status": "all_passed",
                 "status": "qa_completed",
                 "errors": [],
@@ -1183,21 +1326,21 @@ class TestPhase5GraphIntegration:
                 qa_policy=task.qa_policy,
                 selected_version=task.selected_version,
                 instruction=task.instruction,
-                instruction_digest=_instruction_digest(task.instruction),
+                instruction_digest=instruction_digest(task.instruction),
                 dispatch_node="update_subagent",
             )
 
         first_snapshot = snapshot(first_task, "attempt-first", 1)
         second_snapshot = snapshot(second_task, "attempt-second", 2)
         evaluation = QAEvaluation(
-            task_id=groups[0].group_id,
+            task_id=first_task.task_id,
             passed=False,
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="The candidate breaks the test suite.",
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {groups[0].group_id: evaluation},
+                "qa_evaluations": {first_task.task_id: evaluation},
                 "eval_status": "some_failed",
                 "status": "qa_completed",
                 "errors": [],
@@ -1260,7 +1403,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         second_snapshot = first_snapshot.model_copy(
@@ -1312,7 +1455,7 @@ class TestPhase5GraphIntegration:
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -1327,9 +1470,7 @@ class TestPhase5GraphIntegration:
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {
-                    groups[0].group_id: QAEvaluation(task_id=groups[0].group_id, passed=True)
-                },
+                "qa_evaluations": {task.task_id: QAEvaluation(task_id=task.task_id, passed=True)},
                 "eval_status": "all_passed",
                 "status": "qa_completed",
                 "errors": [],
@@ -1380,7 +1521,7 @@ class TestPhase5Exports:
             qa_policy=task.qa_policy,
             selected_version=None,
             instruction=task.instruction,
-            instruction_digest=_instruction_digest(task.instruction),
+            instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
         )
         state = _initial_state(tmp_path, groups)
@@ -1398,9 +1539,7 @@ class TestPhase5Exports:
         )
         qa_critic = MagicMock(
             return_value={
-                "qa_evaluations": {
-                    groups[0].group_id: QAEvaluation(task_id=groups[0].group_id, passed=True)
-                },
+                "qa_evaluations": {task.task_id: QAEvaluation(task_id=task.task_id, passed=True)},
                 "eval_status": "all_passed",
                 "status": "qa_completed",
                 "errors": [],

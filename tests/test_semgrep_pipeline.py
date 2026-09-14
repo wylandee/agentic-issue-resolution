@@ -16,7 +16,6 @@ from remediation_engine.tools.semgrep_parser import (
     _extract_findings_page,
     export_to_csv,
     export_to_jsonl,
-    fetch_findings,
     load_findings_from_json,
     main,
     normalize_finding,
@@ -119,14 +118,6 @@ class TestLoadFindingsFromJson:
 
         assert len(findings) == 2
         assert findings[0]["check_id"] == "javascript.crypto.weak-hash"
-
-    def test_fetch_findings_compat_wrapper_uses_json_file(self, tmp_path):
-        json_path = tmp_path / "semgrep.json"
-        json_path.write_text(json.dumps({"results": [_cli_sast_raw()]}), encoding="utf-8")
-
-        findings = fetch_findings(None, None, json_path=json_path)
-
-        assert len(findings) == 1
 
 
 class TestNormalizeFinding:

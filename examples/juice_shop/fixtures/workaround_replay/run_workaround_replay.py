@@ -178,7 +178,6 @@ def _build_replay_state(repo_root: Path, fixture: dict[str, Any]) -> dict[str, A
             "state_revision": snapshot.state_revision,
             "task_queue": {task.task_id: task},
             "active_target_task_ids": [task.task_id],
-            "active_target_group_ids": [],
             "feedback_by_task": {task.task_id: retry_feedback},
             "feedback_by_group": {},
             "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
