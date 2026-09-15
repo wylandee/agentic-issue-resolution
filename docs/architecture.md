@@ -50,6 +50,10 @@ are graph-level operations rather than task dispatches.
   ingestion, triage, orchestration, workers, QA, and the public result
   boundary. `contracts/accessors.py` provides the typed accessor used where
   orchestration accepts model or mapping state.
+- Phase 1 tactical action, task-cluster, dependency, and multi-package
+  envelopes are proposal contracts only. They do not change routing or grant
+  worker permissions; they become authoritative only when a future verifier
+  validates and seals them into a `TaskAttemptSnapshot`.
 - `triage` owns scanner normalization, enrichment, reachability analysis,
   grouping, and the initial/post-QA triage pipeline.
 - `orchestration/graph.py` builds the LangGraph and owns graph-level triage,

@@ -118,6 +118,14 @@ class RoutingStrategy(StrEnum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class TacticalStrategy(StrEnum):
+    """Action strategies proposed by the tactical Supervisor."""
+
+    VERSION_BUMP = "version_bump"
+    PACKAGE_OVERRIDE = "package_override"
+    CODE_WORKAROUND = "code_workaround"
+
+
 class QAPolicy(StrEnum):
     """Supervisor-owned policy that defines the QA gates for an attempt."""
 
@@ -195,6 +203,7 @@ class NoFixMitigationStage(StrEnum):
 
 MAX_ANCESTRY_DEPTH: int = 3
 MAX_TASK_QUEUE_SIZE: int = 20
+MAX_MULTI_PACKAGE_ACTION_SIZE: int = 10
 
 
 class AgentActionStatus(StrEnum):
@@ -214,6 +223,91 @@ class TaskStatus(StrEnum):
     UNFIXABLE = "unfixable"  # Max retries exhausted; terminal failure
     INCONCLUSIVE = "inconclusive"  # Evidence was invalid or could not be classified
     PIVOTED = "pivoted"  # Parent attempt was superseded by a spawned child task
+
+
+class TaskDependencyKind(StrEnum):
+    """Relationship types used by strategic task clusters."""
+
+    PEER = "peer"
+    WORKSPACE = "workspace"
+    RUNTIME = "runtime"
+
+
+def _trim_required_contract_text(value: Any, field_name: str) -> str:
+    """Return a trimmed non-empty contract string.
+
+    Args:
+        value: Candidate value supplied to a contract field.
+        field_name: Field name used in validation errors.
+
+    Returns:
+        The trimmed string.
+
+    Raises:
+        ValueError: If ``value`` is not a non-empty string.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} must be non-empty.")
+    return normalized
+
+
+def _trim_optional_contract_text(value: Any, field_name: str) -> str | None:
+    """Return a trimmed optional contract string, treating blank as absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string when provided.")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_contract_string_list(
+    value: Any,
+    field_name: str,
+    *,
+    reject_duplicates: bool = True,
+) -> list[str]:
+    """Normalize a list of non-empty strings while preserving input order."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of strings.")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalized = _trim_required_contract_text(item, field_name)
+        if normalized in seen:
+            if reject_duplicates:
+                raise ValueError(f"{field_name} must not contain duplicates: {normalized!r}.")
+            result.append(normalized)
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _normalize_relative_file_hint(value: Any) -> str:
+    """Normalize and validate one relative POSIX-style file hint.
+
+    File hints are deliberately validated only as safe relative paths.  They
+    do not authorize a worker to access or mutate a file.
+    """
+    normalized = _trim_required_contract_text(value, "target_files_hint")
+    normalized = normalized.replace("\\", "/")
+    if "\x00" in normalized:
+        raise ValueError("target_files_hint must not contain NUL bytes.")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError("target_files_hint must contain relative paths only.")
+    segments = normalized.split("/")
+    if ".." in segments:
+        raise ValueError("target_files_hint must not contain parent traversal.")
+    segments = [segment for segment in segments if segment not in {"", "."}]
+    if not segments:
+        raise ValueError("target_files_hint must contain a non-empty relative path.")
+    return "/".join(segments)
 
 
 # ---------------------------------------------------------------------------
@@ -1157,18 +1251,114 @@ class WorkaroundValidationResult(BaseModel):
     infrastructure_diagnostics: str | None = None
 
 
+class TacticalSupervisorAction(BaseModel):
+    """Proposal envelope for one tactical remediation action.
+
+    The envelope describes a proposal only.  It does not identify the active
+    task or authorize file access; task identity and provenance remain owned by
+    the committed ``TaskAttemptSnapshot`` and its surrounding orchestration
+    state.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    selected_strategy: TacticalStrategy
+    target_version: str | None = None
+    workaround_hypothesis: str | None = None
+    target_files_hint: list[str] = Field(
+        default_factory=list,
+        description="Normalized relative path hints, not worker authorization.",
+    )
+    rationale: str = Field(..., min_length=1)
+
+    @field_validator("selected_strategy", mode="before")
+    @classmethod
+    def _normalize_tactical_strategy(cls, value: Any) -> Any:
+        """Trim a tactical strategy string before enum validation."""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("target_version", "workaround_hypothesis", mode="before")
+    @classmethod
+    def _normalize_tactical_optional_text(cls, value: Any, info: Any) -> str | None:
+        """Normalize optional tactical action text fields."""
+        return _trim_optional_contract_text(value, info.field_name)
+
+    @field_validator("target_files_hint", mode="before")
+    @classmethod
+    def _normalize_tactical_file_hints(cls, value: Any) -> list[str]:
+        """Normalize safe relative file hints and reject duplicates."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("target_files_hint must be a list of relative paths.")
+        result = [_normalize_relative_file_hint(item) for item in value]
+        if len(result) != len(set(result)):
+            raise ValueError("target_files_hint must not contain duplicates.")
+        return result
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def _normalize_tactical_rationale(cls, value: Any) -> str:
+        """Require a trimmed tactical rationale."""
+        return _trim_required_contract_text(value, "rationale")
+
+    @model_validator(mode="after")
+    def _validate_tactical_strategy_fields(self) -> TacticalSupervisorAction:
+        """Reject strategy fields that contradict the selected action."""
+        if self.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
+            if self.target_version is not None:
+                raise ValueError("code_workaround actions must not specify target_version.")
+            if self.workaround_hypothesis is None:
+                raise ValueError("code_workaround actions require workaround_hypothesis.")
+        else:
+            if self.target_version is None:
+                raise ValueError(f"{self.selected_strategy.value} actions require target_version.")
+            if self.workaround_hypothesis is not None:
+                raise ValueError(
+                    f"{self.selected_strategy.value} actions must not specify "
+                    "workaround_hypothesis."
+                )
+        return self
+
+
 class QAFailureEvidence(BaseModel):
     """Exact diagnostic evidence extracted from a failed QA evaluation."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    exact_diagnostics: list[str] = Field(default_factory=list)
-    failed_tests: list[str] = Field(default_factory=list)
-    source_locations: list[str] = Field(default_factory=list)
-    affected_files: list[str] = Field(default_factory=list)
-    raw_excerpt: str = Field(default="")
+    exact_diagnostics: list[str] = Field(default_factory=list, max_length=15)
+    failed_tests: list[str] = Field(default_factory=list, max_length=10)
+    source_locations: list[str] = Field(default_factory=list, max_length=10)
+    affected_files: list[str] = Field(default_factory=list, max_length=10)
+    raw_excerpt: str = Field(default="", max_length=2000)
     attempt_id: str = Field(default="")
     task_revision: int = Field(default=0, ge=0)
+
+    @field_validator(
+        "exact_diagnostics",
+        "failed_tests",
+        "source_locations",
+        "affected_files",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_failure_evidence_lists(cls, value: Any, info: Any) -> list[str]:
+        """Trim diagnostic entries and preserve their evidence order."""
+        return _normalize_contract_string_list(
+            value,
+            info.field_name,
+            reject_duplicates=False,
+        )
+
+    @field_validator("raw_excerpt", "attempt_id", mode="before")
+    @classmethod
+    def _normalize_failure_evidence_text(cls, value: Any, info: Any) -> str:
+        """Trim bounded failure excerpts and attempt identifiers."""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(f"{info.field_name} must be a string.")
+        return value.strip()
 
 
 class QASemanticSecurityReview(BaseModel):
@@ -1190,6 +1380,29 @@ class QATestAttribution(BaseModel):
     responsible_group_ids: list[str] = Field(default_factory=list)
     failed_tests: list[str] = Field(default_factory=list)
     reasoning: str = ""
+
+    @field_validator("responsible_group_ids", "failed_tests", mode="before")
+    @classmethod
+    def _normalize_attribution_lists(cls, value: Any) -> list[str]:
+        """Trim attribution evidence without weakening fail-closed checks."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("attribution evidence fields must be lists of strings.")
+        result: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("attribution evidence fields must contain only strings.")
+            result.append(item.strip())
+        return result
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def _normalize_attribution_reasoning(cls, value: Any) -> str:
+        """Trim attribution reasoning while preserving empty reasoning as invalid evidence."""
+        if not isinstance(value, str):
+            raise ValueError("reasoning must be a string.")
+        return value.strip()
 
     @model_validator(mode="after")
     def _check_attribution_evidence(self) -> QATestAttribution:
@@ -1840,6 +2053,186 @@ class SupervisorRetryPlan(BaseModel):
         return normalized
 
 
+class TaskDependency(BaseModel):
+    """One directed prerequisite edge in a strategic task cluster.
+
+    ``upstream_task_id`` is the prerequisite and
+    ``downstream_task_id`` is the task that depends on it.  An upstream task
+    may belong to another cluster; cluster membership is required only for the
+    downstream task.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    upstream_task_id: str = Field(..., min_length=1)
+    downstream_task_id: str = Field(..., min_length=1)
+    edge_type: TaskDependencyKind
+    version_constraint: str | None = None
+
+    @field_validator("upstream_task_id", "downstream_task_id", mode="before")
+    @classmethod
+    def _normalize_dependency_task_id(cls, value: Any, info: Any) -> str:
+        """Require trimmed task identifiers."""
+        return _trim_required_contract_text(value, info.field_name)
+
+    @field_validator("edge_type", mode="before")
+    @classmethod
+    def _normalize_dependency_kind(cls, value: Any) -> Any:
+        """Trim dependency-kind strings before enum validation."""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("version_constraint", mode="before")
+    @classmethod
+    def _normalize_dependency_constraint(cls, value: Any) -> str | None:
+        """Normalize an optional version constraint."""
+        return _trim_optional_contract_text(value, "version_constraint")
+
+    @model_validator(mode="after")
+    def _reject_self_dependency(self) -> TaskDependency:
+        """Reject an edge whose prerequisite and dependent are identical."""
+        if self.upstream_task_id == self.downstream_task_id:
+            raise ValueError("task dependency endpoints must be distinct.")
+        return self
+
+
+class TaskCluster(BaseModel):
+    """Bounded group of tasks that may be planned as one strategic unit.
+
+    Dependency validation checks local membership and duplicate edges only.
+    It intentionally does not detect cycles because peer relationships can be
+    bidirectional and the Phase 3 graph solver owns cycle handling.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cluster_id: str = Field(..., min_length=1)
+    task_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_MULTI_PACKAGE_ACTION_SIZE,
+    )
+    dependencies: list[TaskDependency] = Field(default_factory=list)
+    reason: str = Field(..., min_length=1)
+
+    @field_validator("cluster_id", "reason", mode="before")
+    @classmethod
+    def _normalize_cluster_text(cls, value: Any, info: Any) -> str:
+        """Require trimmed cluster identity and formation reason."""
+        return _trim_required_contract_text(value, info.field_name)
+
+    @field_validator("task_ids", mode="before")
+    @classmethod
+    def _normalize_cluster_task_ids(cls, value: Any) -> list[str]:
+        """Normalize unique task identifiers while preserving their order."""
+        return _normalize_contract_string_list(value, "task_ids")
+
+    @model_validator(mode="after")
+    def _validate_cluster_dependencies(self) -> TaskCluster:
+        """Require local downstream endpoints and unique directed edges."""
+        task_ids = set(self.task_ids)
+        seen_edges: set[tuple[str, str]] = set()
+        for dependency in self.dependencies:
+            if dependency.downstream_task_id not in task_ids:
+                raise ValueError(
+                    "dependency downstream_task_id must belong to the cluster: "
+                    f"{dependency.downstream_task_id!r}."
+                )
+            edge_key = (
+                dependency.upstream_task_id,
+                dependency.downstream_task_id,
+            )
+            if edge_key in seen_edges:
+                raise ValueError(f"duplicate dependency edge: {edge_key!r}.")
+            seen_edges.add(edge_key)
+        return self
+
+
+class PackageMutation(BaseModel):
+    """One package/version mutation within a multi-package proposal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(..., min_length=1)
+    package_name: str = Field(..., min_length=1)
+    target_version: str = Field(..., min_length=1)
+    dependency_type: Literal[
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+        "overrides",
+        "resolutions",
+        "pnpm_overrides",
+    ]
+
+    @field_validator("task_id", "package_name", "target_version", mode="before")
+    @classmethod
+    def _normalize_package_mutation_text(cls, value: Any, info: Any) -> str:
+        """Require trimmed package mutation text fields."""
+        return _trim_required_contract_text(value, info.field_name)
+
+    @field_validator("dependency_type", mode="before")
+    @classmethod
+    def _normalize_package_dependency_type(cls, value: Any) -> Any:
+        """Trim dependency labels before literal validation."""
+        return value.strip() if isinstance(value, str) else value
+
+
+class MultiPackageAction(BaseModel):
+    """Atomic proposal for one to ten package version mutations."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cluster_id: str | None = None
+    selected_strategy: TacticalStrategy
+    package_mutations: list[PackageMutation] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_MULTI_PACKAGE_ACTION_SIZE,
+    )
+    rationale: str = Field(..., min_length=1)
+
+    @field_validator("cluster_id", mode="before")
+    @classmethod
+    def _normalize_action_cluster_id(cls, value: Any) -> str | None:
+        """Normalize an optional cluster identifier."""
+        return _trim_optional_contract_text(value, "cluster_id")
+
+    @field_validator("selected_strategy", mode="before")
+    @classmethod
+    def _normalize_action_strategy(cls, value: Any) -> Any:
+        """Trim the tactical strategy before enum validation."""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("package_mutations", mode="before")
+    @classmethod
+    def _require_mutation_list(cls, value: Any) -> Any:
+        """Require an explicit list so the batch boundary stays unambiguous."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("package_mutations must be a list.")
+        return value
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def _normalize_action_rationale(cls, value: Any) -> str:
+        """Require a trimmed action rationale."""
+        return _trim_required_contract_text(value, "rationale")
+
+    @model_validator(mode="after")
+    def _validate_multi_package_action(self) -> MultiPackageAction:
+        """Enforce strategy, package uniqueness, and cluster invariants."""
+        if self.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
+            raise ValueError("MultiPackageAction supports only version_bump or package_override.")
+        package_names = [mutation.package_name for mutation in self.package_mutations]
+        if len(package_names) != len(set(package_names)):
+            raise ValueError("package_mutations must contain unique package names.")
+        if len(self.package_mutations) > 1 and self.cluster_id is None:
+            raise ValueError("cluster_id is required for multi-package actions.")
+        return self
+
+
 class SupervisorDecision(BaseModel):
     """
     Typed transition decision produced by the deterministic Supervisor.
@@ -1957,9 +2350,10 @@ class SupervisorDecision(BaseModel):
             )
         if node == "update_subagent" and len(targets) < 1:
             raise ValueError("update_subagent requires at least 1 target_task_id.")
-        if node == "update_subagent" and len(targets) > 10:
+        if node == "update_subagent" and len(targets) > MAX_MULTI_PACKAGE_ACTION_SIZE:
             raise ValueError(
-                f"update_subagent supports at most 10 target_task_ids, got {len(targets)}."
+                "update_subagent supports at most "
+                f"{MAX_MULTI_PACKAGE_ACTION_SIZE} target_task_ids, got {len(targets)}."
             )
         if node == "qa_critic" and len(targets) < 1:
             raise ValueError("qa_critic requires at least 1 target_task_id.")

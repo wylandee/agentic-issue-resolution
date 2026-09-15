@@ -391,10 +391,18 @@ class TestTriageResult:
 
 
 def test_re_exported_from_contracts_init():
-    """All four new models must be importable from remediation_engine.contracts directly."""
+    """Phase 1 and triage models are importable from the public package."""
     from remediation_engine.contracts import (  # noqa: F401
+        MAX_MULTI_PACKAGE_ACTION_SIZE,
         CVEEnrichment,
+        MultiPackageAction,
+        PackageMutation,
         SystemContext,
+        TacticalStrategy,
+        TacticalSupervisorAction,
+        TaskCluster,
+        TaskDependency,
+        TaskDependencyKind,
         TriageResult,
         VulnerabilityGroup,
     )

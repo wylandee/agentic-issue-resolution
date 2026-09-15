@@ -19,6 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from remediation_engine.contracts import (
+    MAX_MULTI_PACKAGE_ACTION_SIZE,
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
@@ -29,11 +30,21 @@ from remediation_engine.contracts import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    MultiPackageAction,
     ODCScanEvidence,
+    PackageMutation,
     QAEvaluation,
+    QAFailureEvidence,
+    QATestAttribution,
     RoutingStrategy,
     ScanScope,
     Severity,
+    TacticalStrategy,
+    TacticalSupervisorAction,
+    TaskCluster,
+    TaskDependency,
+    TaskDependencyKind,
+    TestAttributionVerdict,
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.schemas import (
@@ -551,3 +562,298 @@ class TestFixPlan:
                 instruction="No fix available",
                 strategy_used="none",
             )
+
+
+# ===========================================================================
+# Phase 1 contracts and action envelopes
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("strategy", "fields"),
+    [
+        (
+            TacticalStrategy.VERSION_BUMP,
+            {"target_version": " 1.2.3 ", "target_files_hint": [r" src\\package.json "]},
+        ),
+        (
+            TacticalStrategy.PACKAGE_OVERRIDE,
+            {"target_version": " 2.0.0 "},
+        ),
+        (
+            TacticalStrategy.CODE_WORKAROUND,
+            {"workaround_hypothesis": " Add input validation ", "target_version": None},
+        ),
+    ],
+)
+def test_tactical_supervisor_action_strategies_normalize_and_round_trip(strategy, fields):
+    action = TacticalSupervisorAction(
+        selected_strategy=strategy,
+        rationale=" Explain the evidence ",
+        **fields,
+    )
+
+    assert action.rationale == "Explain the evidence"
+    if action.target_version is not None:
+        assert action.target_version in {"1.2.3", "2.0.0"}
+    if action.workaround_hypothesis is not None:
+        assert action.workaround_hypothesis == "Add input validation"
+    assert (
+        action.target_files_hint == ["src/package.json"]
+        if strategy == TacticalStrategy.VERSION_BUMP
+        else True
+    )
+    assert TacticalSupervisorAction.model_validate_json(action.model_dump_json()) == action
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"selected_strategy": TacticalStrategy.VERSION_BUMP},
+        {
+            "selected_strategy": TacticalStrategy.PACKAGE_OVERRIDE,
+            "target_version": "1.2.3",
+            "workaround_hypothesis": "also change code",
+        },
+        {
+            "selected_strategy": TacticalStrategy.CODE_WORKAROUND,
+            "target_version": "1.2.3",
+            "workaround_hypothesis": "change call site",
+        },
+        {"selected_strategy": TacticalStrategy.CODE_WORKAROUND},
+    ],
+)
+def test_tactical_supervisor_action_rejects_invalid_strategy_fields(fields):
+    with pytest.raises(ValidationError):
+        TacticalSupervisorAction(rationale="reason", **fields)
+
+
+def test_tactical_supervisor_action_rejects_unsafe_or_duplicate_file_hints():
+    for hint in ("/absolute/file.js", r"..\secret.js", "C:/absolute/file.js"):
+        with pytest.raises(ValidationError):
+            TacticalSupervisorAction(
+                selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+                workaround_hypothesis="sanitize input",
+                target_files_hint=[hint],
+                rationale="reason",
+            )
+    with pytest.raises(ValidationError):
+        TacticalSupervisorAction(
+            selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+            workaround_hypothesis="sanitize input",
+            target_files_hint=["src/app.js", r"src\app.js"],
+            rationale="reason",
+        )
+
+
+def test_phase1_models_are_frozen_and_forbid_extra_fields():
+    action = TacticalSupervisorAction(
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        target_version="1.2.3",
+        rationale="reason",
+    )
+    with pytest.raises(ValidationError):
+        action.rationale = "changed"
+    with pytest.raises(ValidationError):
+        TacticalSupervisorAction(
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            target_version="1.2.3",
+            rationale="reason",
+            unexpected="rejected",
+        )
+
+
+def test_task_dependency_direction_and_bidirectional_peer_edges_are_supported():
+    upstream = TaskDependency(
+        upstream_task_id=" external-task ",
+        downstream_task_id=" task-a ",
+        edge_type=" workspace ",
+        version_constraint=" ^1.2 ",
+    )
+    peer_forward = TaskDependency(
+        upstream_task_id="task-a",
+        downstream_task_id="task-b",
+        edge_type=TaskDependencyKind.PEER,
+    )
+    peer_reverse = TaskDependency(
+        upstream_task_id="task-b",
+        downstream_task_id="task-a",
+        edge_type=TaskDependencyKind.PEER,
+    )
+    cluster = TaskCluster(
+        cluster_id=" cluster-1 ",
+        task_ids=[" task-a ", "task-b"],
+        dependencies=[upstream, peer_forward, peer_reverse],
+        reason=" peer packages must move together ",
+    )
+
+    assert upstream.upstream_task_id == "external-task"
+    assert upstream.downstream_task_id == "task-a"
+    assert upstream.version_constraint == "^1.2"
+    assert cluster.cluster_id == "cluster-1"
+    assert cluster.reason == "peer packages must move together"
+    assert TaskCluster.model_validate_json(cluster.model_dump_json()) == cluster
+
+
+@pytest.mark.parametrize(
+    "cluster_kwargs",
+    [
+        {"task_ids": [], "dependencies": []},
+        {"task_ids": ["task-a", " task-a "], "dependencies": []},
+        {
+            "task_ids": ["task-a"],
+            "dependencies": [
+                {
+                    "upstream_task_id": "external",
+                    "downstream_task_id": "unknown",
+                    "edge_type": "runtime",
+                }
+            ],
+        },
+        {
+            "task_ids": ["task-a"],
+            "dependencies": [
+                {
+                    "upstream_task_id": "external",
+                    "downstream_task_id": "task-a",
+                    "edge_type": "runtime",
+                },
+                {
+                    "upstream_task_id": "external",
+                    "downstream_task_id": "task-a",
+                    "edge_type": "runtime",
+                },
+            ],
+        },
+    ],
+)
+def test_task_cluster_rejects_invalid_membership_or_edges(cluster_kwargs):
+    with pytest.raises(ValidationError):
+        TaskCluster(cluster_id="cluster-1", reason="reason", **cluster_kwargs)
+
+
+def test_task_cluster_rejects_self_edges_and_more_than_ten_tasks():
+    with pytest.raises(ValidationError):
+        TaskDependency(
+            upstream_task_id="task-a",
+            downstream_task_id="task-a",
+            edge_type=TaskDependencyKind.PEER,
+        )
+    with pytest.raises(ValidationError):
+        TaskCluster(
+            cluster_id="cluster-1",
+            task_ids=[f"task-{index}" for index in range(MAX_MULTI_PACKAGE_ACTION_SIZE + 1)],
+            reason="reason",
+        )
+
+
+def _package_mutation(index: int) -> PackageMutation:
+    """Build one valid package mutation for Phase 1 tests."""
+    return PackageMutation(
+        task_id=f"task-{index}",
+        package_name=f"package-{index}",
+        target_version=f"{index}.0.0",
+        dependency_type=" dependencies ",
+    )
+
+
+def test_multi_package_action_accepts_single_and_clustered_batches():
+    single = MultiPackageAction(
+        selected_strategy=" package_override ",
+        package_mutations=[_package_mutation(1)],
+        rationale=" override one transitive dependency ",
+    )
+    batch = MultiPackageAction(
+        cluster_id=" cluster-1 ",
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        package_mutations=[_package_mutation(1), _package_mutation(2)],
+        rationale=" co-upgrade peer packages ",
+    )
+
+    assert single.cluster_id is None
+    assert single.rationale == "override one transitive dependency"
+    assert single.package_mutations[0].dependency_type == "dependencies"
+    assert batch.cluster_id == "cluster-1"
+    assert MultiPackageAction.model_validate_json(batch.model_dump_json()) == batch
+
+
+def test_multi_package_action_rejects_unsupported_strategy_and_invalid_batches():
+    with pytest.raises(ValidationError):
+        MultiPackageAction(
+            selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+            package_mutations=[_package_mutation(1)],
+            rationale="reason",
+        )
+    with pytest.raises(ValidationError):
+        MultiPackageAction(
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[_package_mutation(1), _package_mutation(1)],
+            rationale="reason",
+        )
+    with pytest.raises(ValidationError):
+        MultiPackageAction(
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[_package_mutation(1), _package_mutation(2)],
+            rationale="reason",
+        )
+    with pytest.raises(ValidationError):
+        MultiPackageAction(
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[],
+            rationale="reason",
+        )
+    with pytest.raises(ValidationError):
+        MultiPackageAction(
+            cluster_id="cluster-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                _package_mutation(index) for index in range(MAX_MULTI_PACKAGE_ACTION_SIZE + 1)
+            ],
+            rationale="reason",
+        )
+    with pytest.raises(ValidationError):
+        PackageMutation(
+            task_id="task-1",
+            package_name="package-1",
+            target_version="1.0.0",
+            dependency_type="unsupported",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "limit"),
+    [
+        ("exact_diagnostics", 15),
+        ("failed_tests", 10),
+        ("source_locations", 10),
+        ("affected_files", 10),
+    ],
+)
+def test_qa_failure_evidence_bounds_and_normalization(field_name, limit):
+    values = [f" evidence-{index} " for index in range(limit)]
+    evidence = QAFailureEvidence(**{field_name: values, "raw_excerpt": " excerpt "})
+    assert getattr(evidence, field_name)[0] == "evidence-0"
+    assert len(getattr(evidence, field_name)) == limit
+    assert evidence.raw_excerpt == "excerpt"
+    assert QAFailureEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+    with pytest.raises(ValidationError):
+        QAFailureEvidence(**{field_name: [f"evidence-{index}" for index in range(limit + 1)]})
+
+
+def test_qa_failure_evidence_rejects_overlong_raw_excerpt():
+    with pytest.raises(ValidationError):
+        QAFailureEvidence(raw_excerpt="x" * 2001)
+
+
+def test_qa_test_attribution_remains_fail_closed():
+    for verdict in (TestAttributionVerdict.RESPONSIBLE, TestAttributionVerdict.EXONERATED):
+        with pytest.raises(ValidationError):
+            QATestAttribution(verdict=verdict)
+
+    inconclusive = QATestAttribution(
+        verdict=TestAttributionVerdict.INCONCLUSIVE,
+        reasoning="   ",
+    )
+    assert inconclusive.verdict == TestAttributionVerdict.INCONCLUSIVE
+    assert inconclusive.reasoning == ""

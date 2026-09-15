@@ -157,6 +157,13 @@ def test_decision_codes_cover_fixed_priority_routes():
     )
 
 
+def test_phase1_decision_codes_are_reserved_and_routing_remains_additive():
+    assert DecisionCode.TACTICAL_ACTION_REJECTED.value == "TACTICAL_ACTION_REJECTED"
+    assert DecisionCode.PEER_CONFLICT_ESCALATION.value == "PEER_CONFLICT_ESCALATION"
+    assert DecisionCode.ATOMIC_CLUSTER_DISPATCH.value == "ATOMIC_CLUSTER_DISPATCH"
+    assert _route({}, [], triage_required=False).decision_code == DecisionCode.NO_VALID_GROUPS
+
+
 def test_stable_sort_uses_severity_then_task_id():
     groups = [_group("low", Severity.LOW), _group("critical", Severity.CRITICAL)]
     tasks = {
