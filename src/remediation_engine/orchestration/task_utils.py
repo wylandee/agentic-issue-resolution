@@ -15,10 +15,17 @@ build_initial_remediation_task(group, task_id) -> RemediationTask
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
+
+try:
+    from semantic_version import Version as SemanticVersion
+except ImportError:  # pragma: no cover - optional runtime fallback
+    SemanticVersion = None
 
 from remediation_engine.contracts.accessors import model_or_dict_value
 from remediation_engine.contracts.schemas import (
+    FixPlan,
     FixPlanStatus,
     NoFixMitigationStage,
     QAEvaluation,
@@ -53,6 +60,145 @@ _UNRESOLVED_GROUP_STATUSES = frozenset(
 _task_value = model_or_dict_value
 
 
+@dataclass(frozen=True)
+class PackageFixPlanSelection:
+    """Supervisor-owned selection from plans retained by one package group."""
+
+    plan: FixPlan | None
+    issue_ids: tuple[str, ...] = ()
+
+
+def _candidate_pairs(group: VulnerabilityGroup) -> list[tuple[str, FixPlan]]:
+    """Return retained package plans, with a legacy summary fallback."""
+    candidates = getattr(group, "fix_plan_candidates", None) or []
+    pairs: list[tuple[str, FixPlan]] = []
+    if not isinstance(candidates, (list, tuple)):
+        candidates = []
+    for candidate in candidates:
+        issue_id = str(_task_value(candidate, "issue_id", ""))
+        plan = _task_value(candidate, "plan")
+        if issue_id and plan is not None:
+            pairs.append((issue_id, plan))
+    if pairs:
+        return sorted(pairs, key=lambda pair: pair[0])
+    legacy_plan = getattr(group, "fix_plan", None)
+    return (
+        [(str(getattr(group, "representative_issue_id", "")), legacy_plan)] if legacy_plan else []
+    )
+
+
+def _has_plan_status(plan: Any, status: FixPlanStatus) -> bool:
+    """Compare typed or compatibility fix-plan statuses safely."""
+    raw_status = _task_value(plan, "status")
+    value = getattr(raw_status, "value", raw_status)
+    return value == status or str(value).casefold() == status.value.casefold()
+
+
+def _copy_selected_plan(plan: Any, **updates: Any) -> Any:
+    """Copy a typed plan while preserving compatibility projections."""
+    if isinstance(plan, FixPlan):
+        return plan.model_copy(update=updates)
+    return plan
+
+
+def _plan_version_key(version: str) -> tuple[int, object]:
+    """Return a stable comparison key for a fixed-version candidate."""
+    if SemanticVersion is not None:
+        try:
+            return (2, SemanticVersion.coerce(version))
+        except ValueError:
+            pass
+    parts: list[int] = []
+    for token in version.lstrip("vV").split(".")[:3]:
+        digits = "".join(character for character in token if character.isdigit())
+        parts.append(int(digits or "0"))
+    return (1, tuple(parts + [0] * (3 - len(parts))))
+
+
+def select_package_fix_plan(
+    group: VulnerabilityGroup,
+    current_strategy: RoutingStrategy | None = None,
+) -> PackageFixPlanSelection:
+    """Select one active plan while retaining every package candidate.
+
+    Version candidates are preferred for initial package remediation and the
+    highest fixed version is selected. Workaround candidates are merged only
+    with other workaround candidates. ``current_strategy`` allows retry and
+    pivot routing to select a retained alternative without creating a second
+    triage group.
+    """
+    pairs = _candidate_pairs(group)
+    if not pairs:
+        return PackageFixPlanSelection(plan=None)
+
+    if current_strategy == RoutingStrategy.CODE_WORKAROUND:
+        selected_pairs = [
+            pair for pair in pairs if _has_plan_status(pair[1], FixPlanStatus.WORKAROUND_FOUND)
+        ]
+        if not selected_pairs:
+            selected_pairs = [
+                pair for pair in pairs if _has_plan_status(pair[1], FixPlanStatus.NO_FIX)
+            ]
+    else:
+        selected_pairs = [
+            pair for pair in pairs if _has_plan_status(pair[1], FixPlanStatus.VERSION_FOUND)
+        ]
+        if not selected_pairs:
+            selected_pairs = [
+                pair for pair in pairs if _has_plan_status(pair[1], FixPlanStatus.WORKAROUND_FOUND)
+            ]
+        if not selected_pairs:
+            selected_pairs = [
+                pair for pair in pairs if _has_plan_status(pair[1], FixPlanStatus.NO_FIX)
+            ]
+
+    if not selected_pairs:
+        return PackageFixPlanSelection(plan=None)
+
+    selected_ids = tuple(issue_id for issue_id, _ in selected_pairs)
+    if _has_plan_status(selected_pairs[0][1], FixPlanStatus.VERSION_FOUND):
+        version, source_plan = max(
+            ((_task_value(plan, "fixed_version") or "", plan) for _, plan in selected_pairs),
+            key=lambda item: _plan_version_key(item[0]),
+        )
+        return PackageFixPlanSelection(
+            plan=_copy_selected_plan(
+                source_plan,
+                fixed_version=version,
+                workaround_snippets=None,
+                strategy_used="UPDATE_VERSION",
+            ),
+            issue_ids=selected_ids,
+        )
+
+    if _has_plan_status(selected_pairs[0][1], FixPlanStatus.WORKAROUND_FOUND):
+        snippets: list[str] = []
+        for _, plan in selected_pairs:
+            for snippet in _task_value(plan, "workaround_snippets", []) or []:
+                if snippet not in snippets:
+                    snippets.append(snippet)
+        source_plan = selected_pairs[0][1]
+        return PackageFixPlanSelection(
+            plan=_copy_selected_plan(
+                source_plan,
+                fixed_version=None,
+                workaround_snippets=snippets or None,
+                strategy_used="WORKAROUND",
+            ),
+            issue_ids=selected_ids,
+        )
+
+    return PackageFixPlanSelection(
+        plan=_copy_selected_plan(
+            selected_pairs[0][1],
+            fixed_version=None,
+            workaround_snippets=None,
+            strategy_used="NO_FIX",
+        ),
+        issue_ids=selected_ids,
+    )
+
+
 def _task_status_name(task: Any) -> str:
     """Return a task status as its stable string value."""
     status = _task_value(task, "status", TaskStatus.PENDING)
@@ -65,16 +211,14 @@ def task_group_lineage(
 ) -> list[Any]:
     """Return the root task and all pivot descendants for one group.
 
-    Pivot children intentionally receive a new ``parent_group_id``.  A
-    projection that filters only on that field therefore loses the child and
-    can report a failed remediation as successful.  The task's
+    Pivot children retain the package group's ``parent_group_id``. The task's
     ``parent_task_id`` is the authoritative lineage relationship, so this
-    helper starts at the requested group's task and follows descendants
-    across group boundaries.
+    helper follows descendants while portfolio planning collapses the chain
+    to one active leaf.
 
     Args:
         task_queue: Task ID to task mapping.
-        group_id: Initial or pivot group identifier.
+        group_id: Package-group identifier shared by initial and pivot tasks.
 
     Returns:
         Tasks in deterministic breadth-first lineage order. An empty list is
@@ -249,8 +393,14 @@ def is_no_fix_package_removal_task(task: RemediationTask) -> bool:
 
 
 def is_no_fix_group(group: VulnerabilityGroup) -> bool:
-    """Return whether ``group`` has an explicit ``NO_FIX`` plan."""
-    return group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+    """Return whether no usable version or workaround plan remains."""
+    candidates = getattr(group, "fix_plan_candidates", None) or []
+    if isinstance(candidates, (list, tuple)) and candidates:
+        return all(
+            _has_plan_status(candidate.plan, FixPlanStatus.NO_FIX) for candidate in candidates
+        )
+    plan = select_package_fix_plan(group).plan
+    return plan is not None and _has_plan_status(plan, FixPlanStatus.NO_FIX)
 
 
 def is_transitive_group(group: VulnerabilityGroup) -> bool:
@@ -456,7 +606,7 @@ def derive_initial_strategy(group: VulnerabilityGroup) -> RoutingStrategy:
     (i.e. a safe pinned version is available).  All other plans â€” workaround,
     no-fix, or absent â€” map to ``CODE_WORKAROUND``.
     """
-    fix_plan = group.fix_plan
+    fix_plan = select_package_fix_plan(group).plan
     if fix_plan is not None and fix_plan.status == FixPlanStatus.VERSION_FOUND:
         return RoutingStrategy.VERSION_BUMP
     return RoutingStrategy.CODE_WORKAROUND
@@ -473,7 +623,10 @@ def derive_initial_qa_policy(group: VulnerabilityGroup) -> QAPolicy:
     """
     if is_no_fix_group(group):
         return QAPolicy.NO_FIX_PACKAGE_REMOVAL
-    if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.VERSION_FOUND:
+    if (
+        select_package_fix_plan(group).plan is not None
+        and derive_initial_strategy(group) == RoutingStrategy.VERSION_BUMP
+    ):
         return QAPolicy.VERSION_BUMP
     return QAPolicy.INITIAL_CODE_WORKAROUND
 
@@ -536,6 +689,8 @@ def build_initial_remediation_task(
     RemediationTask
         A freshly created task ready to be added to ``task_queue``.
     """
+    selection = select_package_fix_plan(group)
+    fix_plan = selection.plan
     strategy = derive_initial_strategy(group)
     qa_policy = derive_initial_qa_policy(group)
     no_fix_stage: NoFixMitigationStage | None = None
@@ -544,8 +699,8 @@ def build_initial_remediation_task(
         instruction = build_no_fix_package_removal_instruction(group)
     else:
         instruction = ""
-        if group.fix_plan is not None and group.fix_plan.instruction:
-            instruction = group.fix_plan.instruction
+        if fix_plan is not None and fix_plan.instruction:
+            instruction = fix_plan.instruction
 
     transitive = is_transitive_group(group)
     parent_name, parent_version, parent_type = group_parent_context(group)
@@ -575,7 +730,7 @@ def build_initial_remediation_task(
         )
     )
     if has_parent_target:
-        child_version = group.fix_plan.fixed_version if group.fix_plan else None
+        child_version = fix_plan.fixed_version if fix_plan else None
         declaration = parent_type or "dependencies"
         instruction = (
             f'Update directly declared parent "{parent_name}" in {declaration} '
@@ -597,6 +752,7 @@ def build_initial_remediation_task(
     return RemediationTask(
         task_id=task_id,
         parent_group_id=group.group_id,
+        is_synthetic=bool(getattr(group, "is_synthetic", False)),
         qa_policy=qa_policy,
         strategy=strategy,
         strategy_stage=initial_stage,
@@ -609,8 +765,9 @@ def build_initial_remediation_task(
         selected_version=(
             None
             if no_fix_stage is not None or has_parent_target
-            else (group.fix_plan.fixed_version if group.fix_plan is not None else None)
+            else (fix_plan.fixed_version if fix_plan is not None else None)
         ),
+        selected_plan_issue_ids=list(selection.issue_ids),
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,

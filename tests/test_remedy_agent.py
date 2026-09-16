@@ -16,10 +16,14 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    MultiPackageAction,
+    PackageMutation,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
     Severity,
+    TacticalStrategy,
+    TaskAttemptSnapshot,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -365,6 +369,140 @@ class TestUpdateSubagentWrapper:
         assert "Final note:" not in summary_by_task[group_a.group_id]
         assert "frontend/package.json" in summary_by_task[group_b.group_id]
 
+    def test_multi_package_cluster_uses_llm_committed_action_tool(self):
+        from remediation_engine.orchestration.supervisor_planner import instruction_digest
+
+        group_a = _sca_group("sca:package.json:lodash", "package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        group_b.vulnerable_component = "axios"
+        task_a = _task_for_group(group_a).model_copy(
+            update={
+                "selected_version": "4.17.21",
+                "target_package_name": "lodash",
+                "target_dependency_type": "dependencies",
+                "current_attempt_id": "attempt-1",
+            }
+        )
+        task_b = _task_for_group(group_b).model_copy(
+            update={
+                "selected_version": "1.7.4",
+                "target_package_name": "axios",
+                "target_dependency_type": "dependencies",
+                "current_attempt_id": "attempt-2",
+            }
+        )
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_a.task_id,
+                    package_name="lodash",
+                    manifest_path="package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id=task_b.task_id,
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep the package cluster atomic.",
+        )
+        action_digest = instruction_digest(action.model_dump_json())
+        snapshots = {
+            task_a.task_id: TaskAttemptSnapshot(
+                attempt_id="attempt-1",
+                task_id=task_a.task_id,
+                cluster_id="cluster-1",
+                dispatch_batch_id="batch-1",
+                action_digest=action_digest,
+                manifest_path="package.json",
+                selected_version="4.17.21",
+                allowed_target_versions=["4.17.21"],
+                target_package_name="lodash",
+                target_dependency_type="dependencies",
+                allowed_dependency_types=["dependencies"],
+                instruction=task_a.instruction,
+                instruction_digest=instruction_digest(task_a.instruction),
+                dispatch_node="update_subagent",
+            ),
+            task_b.task_id: TaskAttemptSnapshot(
+                attempt_id="attempt-2",
+                task_id=task_b.task_id,
+                cluster_id="cluster-1",
+                dispatch_batch_id="batch-1",
+                action_digest=action_digest,
+                manifest_path="frontend/package.json",
+                selected_version="1.7.4",
+                allowed_target_versions=["1.7.4"],
+                target_package_name="axios",
+                target_dependency_type="dependencies",
+                allowed_dependency_types=["dependencies"],
+                instruction=task_b.instruction,
+                instruction_digest=instruction_digest(task_b.instruction),
+                dispatch_node="update_subagent",
+            ),
+        }
+        state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task_a, task_b],
+            [group_a, group_b],
+            target_attempt_snapshots=snapshots,
+            active_cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            multi_package_action=action,
+        )
+        llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="execute the committed action",
+                tool_calls=[
+                    {
+                        "name": "apply_committed_multi_package_action",
+                        "args": {},
+                        "id": "cluster-call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="cluster action completed"),
+        )
+        sandbox = _sandbox_mock()
+
+        with (
+            patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
+            patch(
+                "remediation_engine.orchestration.update_subagent.DockerSandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
+                side_effect=[(["package.json"], []), (["frontend/package.json"], [])],
+            ),
+            patch(
+                "remediation_engine.orchestration.tools_manifest.apply_multi_package_action",
+                return_value=(True, ""),
+            ) as apply_action,
+        ):
+            result = run_update_subagent_node(state)
+
+        assert bound.invoke.call_count == 2
+        bound_tools = llm.bind_tools.call_args.args[0]
+        assert [tool.name for tool in bound_tools] == ["apply_committed_multi_package_action"]
+        first_prompt = bound.invoke.call_args_list[0].args[0]
+        assert "MULTI-PACKAGE CLUSTER EXECUTION" in first_prompt[-1].content
+        assert "apply_committed_multi_package_action" in first_prompt[-1].content
+        assert '"package_name":"lodash"' in first_prompt[-1].content
+        assert result["action_summary"].status == AgentActionStatus.SUCCESS
+        assert len(result["worker_results_by_attempt"]) == 2
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[1] == action
+
     def test_no_validation_success_becomes_surrender(self):
         group = _sca_group()
         repo_root = _repo_root()
@@ -566,7 +704,7 @@ class TestUpdateSubagentWrapper:
 
         group1 = _sca_group()
         group2 = _sca_group()
-        group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
+        group2.group_id = "sca:package.json:ws"
         group2.vulnerable_component = "ws"
         tool_events = [
             ToolEvent(
@@ -600,7 +738,7 @@ class TestUpdateSubagentWrapper:
 
         group1 = _sca_group()
         group2 = _sca_group()
-        group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
+        group2.group_id = "sca:package.json:ws"
         group2.vulnerable_component = "ws"
 
         tool_events = [

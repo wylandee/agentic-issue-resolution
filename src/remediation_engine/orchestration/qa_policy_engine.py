@@ -258,6 +258,8 @@ def _evaluate_policy_gates(
             tests_passed=tests_passed,
             package_manifest_state=package_state.manifest_state,
             package_graph_state=package_state.graph_state,
+            install_error_category=results.install_error_category,
+            peer_conflicts=list(results.peer_conflicts),
             diagnostics=diagnostics,
         )
     return gates_by_task, errors

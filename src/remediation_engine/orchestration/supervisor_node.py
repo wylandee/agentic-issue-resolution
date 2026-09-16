@@ -24,6 +24,8 @@ supervisor_router(state) -> str
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import uuid
@@ -38,7 +40,11 @@ from remediation_engine.contracts.decision_codes import (
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    FailureCategory,
+    IssueType,
+    MultiPackageAction,
     NoFixMitigationStage,
+    PackageMutation,
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
@@ -48,6 +54,7 @@ from remediation_engine.contracts.schemas import (
     StateConsistencyEvent,
     SupervisorDecision,
     SupervisorRetryPlan,
+    TacticalStrategy,
     TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
@@ -59,6 +66,11 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
+from remediation_engine.orchestration.portfolio_orchestrator import (
+    active_leaf_task_ids,
+    materialize_synthetic_dependency_tasks,
+    repository_fingerprint,
+)
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
     _OVERRIDE_DEPENDENCY_TYPES,
@@ -115,6 +127,7 @@ from remediation_engine.orchestration.task_utils import (
     group_parent_context,
     is_no_fix_group,
     is_transitive_group,
+    select_package_fix_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +136,7 @@ logger = logging.getLogger(__name__)
 # boundaries consume only the typed task/attempt envelopes.
 
 _VALID_NEXT_NODES: set[str] = {
+    "portfolio",
     "update_subagent",
     "workaround_subagent",
     "qa_critic",
@@ -284,7 +298,7 @@ def _extract_workaround_vulnerability_mechanism(group: VulnerabilityGroup) -> st
         if mechanism:
             return mechanism[:1200]
 
-    fix_plan = getattr(group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(group).plan
     instruction = getattr(fix_plan, "instruction", None)
     if isinstance(instruction, str) and instruction.strip():
         return re.sub(r"\s+", " ", instruction).strip()[:1200]
@@ -301,6 +315,10 @@ def _create_attempt_snapshot(
     workaround_context: WorkaroundContext | None = None,
     allowed_target_versions: Iterable[str] = (),
     allowed_dependency_types: Iterable[str] = (),
+    cluster_id: str | None = None,
+    dispatch_batch_id: str | None = None,
+    action_digest: str | None = None,
+    manifest_path: str | None = None,
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
     """Commit the exact worker input and return the revised task projection."""
     task_revision = task.task_revision + 1
@@ -317,9 +335,15 @@ def _create_attempt_snapshot(
     snapshot = TaskAttemptSnapshot(
         attempt_id=attempt_id,
         task_id=task.task_id,
+        is_synthetic=task.is_synthetic,
         state_revision=state_revision,
         task_revision=task_revision,
         attempt_number=len(_attempts_for_task(snapshots_by_id, task.task_id)) + 1,
+        cluster_id=cluster_id,
+        dispatch_batch_id=dispatch_batch_id,
+        action_digest=action_digest,
+        manifest_path=manifest_path,
+        selected_plan_issue_ids=list(task.selected_plan_issue_ids),
         qa_policy=task.qa_policy,
         strategy_stage=task.strategy_stage,
         no_fix_stage=task.no_fix_stage,
@@ -354,6 +378,206 @@ def _create_attempt_snapshot(
         }
     )
     return updated_task, snapshot
+
+
+def _cluster_dispatch_batch_id(
+    cluster_id: str,
+    task_ids: Iterable[str],
+    state_revision: int,
+) -> str:
+    """Return a deterministic identifier shared by one cluster dispatch."""
+    payload = f"{cluster_id}:{state_revision}:{','.join(sorted(task_ids))}"
+    return f"batch-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _portfolio_plan_is_stale(
+    plan: Any,
+    task_queue: dict[str, RemediationTask],
+    valid_groups: list[VulnerabilityGroup],
+    repo_root: str | None,
+) -> bool:
+    """Return whether a committed portfolio plan no longer matches state."""
+    if plan is None:
+        return True
+    group_ids = {group.group_id for group in valid_groups if group.issue_type == IssueType.SCA}
+    if set(active_leaf_task_ids(task_queue, group_ids)) != set(plan.task_ids):
+        return True
+    planned_group_ids = {
+        task_queue[task_id].parent_group_id for task_id in plan.task_ids if task_id in task_queue
+    }
+    if planned_group_ids != group_ids:
+        return True
+    if any(task_id not in task_queue for task_id in plan.task_ids):
+        return True
+    if any(
+        task_queue[task_id].task_revision != revision
+        for task_id, revision in plan.task_revisions.items()
+        if task_id in task_queue
+    ):
+        return True
+    if any(
+        task_queue[task_id].strategy != strategy
+        for task_id, strategy in plan.task_strategies.items()
+        if task_id in task_queue
+    ):
+        return True
+    if repo_root:
+        try:
+            if repository_fingerprint(repo_root) != plan.repository_fingerprint:
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _build_multi_package_action(
+    cluster_id: str,
+    target_task_ids: Iterable[str],
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+) -> MultiPackageAction | None:
+    """Build an exact atomic action from Supervisor-committed task inputs."""
+    mutations: list[PackageMutation] = []
+    for task_id in target_task_ids:
+        task = task_queue.get(task_id)
+        group = group_by_id.get(task.parent_group_id) if task else None
+        if task is None or group is None or task.strategy != RoutingStrategy.VERSION_BUMP:
+            return None
+        package_name = (task.target_package_name or group.vulnerable_component or "").strip()
+        target_version = (task.selected_version or "").strip()
+        manifest_path = _group_manifest_path(group) or ""
+        dependency_type = task.target_dependency_type or "dependencies"
+        if (
+            not package_name
+            or not target_version
+            or not manifest_path
+            or manifest_path.split("/")[-1] != "package.json"
+        ):
+            return None
+        mutations.append(
+            PackageMutation(
+                task_id=task_id,
+                package_name=package_name,
+                manifest_path=manifest_path,
+                target_version=target_version,
+                dependency_type=dependency_type,
+            )
+        )
+    if not mutations:
+        return None
+    selected_strategy = (
+        TacticalStrategy.PACKAGE_OVERRIDE
+        if all(
+            mutation.dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
+            for mutation in mutations
+        )
+        else TacticalStrategy.VERSION_BUMP
+    )
+    try:
+        return MultiPackageAction(
+            cluster_id=cluster_id,
+            selected_strategy=selected_strategy,
+            package_mutations=mutations,
+            rationale="Supervisor-committed atomic package-group update.",
+        )
+    except ValueError:
+        return None
+
+
+def _group_manifest_path(group: VulnerabilityGroup) -> str | None:
+    """Return the one canonical package.json path committed for a group."""
+    manifest_paths = sorted(
+        {
+            (localized.manifest_file or "").replace("\\", "/").lstrip("/")
+            for localized in group.localized_issues
+            if localized.manifest_file
+        }
+        | {path.replace("\\", "/").lstrip("/") for path in group.file_paths if path}
+        | ({group.file_path.replace("\\", "/").lstrip("/")} if group.file_path else set())
+    )
+    if len(manifest_paths) != 1 or manifest_paths[0].split("/")[-1] != "package.json":
+        return None
+    return manifest_paths[0]
+
+
+def _peer_conflict_escalation(
+    task_id: str,
+    evaluation: QAEvaluation,
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve deterministic peer evidence to active package-task pairs.
+
+    Only active, non-terminal npm version-bump tasks may be added to a
+    portfolio escalation. Missing or unsupported peer tasks are reported and
+    left on the normal compatible-version retry path.
+    """
+    gates = evaluation.deterministic_gates
+    if evaluation.failure_category != FailureCategory.PEER_CONFLICT or gates is None:
+        return None, []
+    leaf_ids = set(active_leaf_task_ids(task_queue))
+    package_to_task: dict[str, str] = {}
+    for candidate_id in sorted(leaf_ids):
+        candidate = task_queue.get(candidate_id)
+        if candidate is None or candidate.status in _TERMINAL_STATUSES:
+            continue
+        if candidate.strategy != RoutingStrategy.VERSION_BUMP:
+            continue
+        group = group_by_id.get(candidate.parent_group_id)
+        if group is None:
+            continue
+        manager_values = {
+            (localized.package_manager or "").strip().lower()
+            for localized in group.localized_issues
+            if localized.package_manager
+        }
+        if manager_values and manager_values != {"npm"}:
+            continue
+        manifest_paths = {
+            (localized.manifest_file or "").replace("\\", "/").lstrip("/")
+            for localized in group.localized_issues
+            if localized.manifest_file
+        }
+        manifest_paths.update(
+            path.replace("\\", "/").lstrip("/") for path in group.file_paths if path
+        )
+        if len(manifest_paths) != 1 or next(iter(manifest_paths)).split("/")[-1] != "package.json":
+            continue
+        package_name = (candidate.target_package_name or group.vulnerable_component or "").strip()
+        if package_name:
+            package_to_task.setdefault(package_name, candidate_id)
+
+    pairs: set[tuple[str, str]] = set()
+    unresolved: list[str] = []
+    for evidence in gates.peer_conflicts:
+        requester = evidence.requester_package.strip()
+        peer = evidence.peer_package.strip()
+        requester_id = package_to_task.get(requester)
+        if requester_id is None and task_id in leaf_ids:
+            current = task_queue.get(task_id)
+            current_group = group_by_id.get(current.parent_group_id) if current else None
+            current_package = (
+                (current.target_package_name if current else None)
+                or (current_group.vulnerable_component if current_group else None)
+                or ""
+            ).strip()
+            if current_package == requester:
+                requester_id = task_id
+        peer_id = package_to_task.get(peer)
+        if requester_id and peer_id and requester_id != peer_id:
+            pairs.add(tuple(sorted((requester_id, peer_id))))
+        else:
+            unresolved.append(
+                f"peer escalation for {requester or '<unknown>'} -> {peer or '<unknown>'} "
+                "has no existing eligible active package task"
+            )
+    if not pairs:
+        return None, unresolved
+    return {
+        "reason": "PEER_CONFLICT_ESCALATION",
+        "peer_conflict_pairs": sorted(pairs),
+        "evidence": [evidence.model_dump(mode="json") for evidence in gates.peer_conflicts],
+    }, unresolved
 
 
 def _qa_failure_evidence_for_workaround_retry(
@@ -564,6 +788,7 @@ def _normalize_target_task_ids_for_node(
     task_queue: dict[str, RemediationTask],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     group_by_id: dict[str, VulnerabilityGroup] | None = None,
+    allow_cluster: bool = False,
 ) -> list[str]:
     with _supervisor_execution_helpers._bind_dependencies(
         _qa_ready_task_ids=_qa_ready_task_ids,
@@ -579,6 +804,7 @@ def _normalize_target_task_ids_for_node(
             task_queue,
             retry_diagnostics_by_task,
             group_by_id,
+            allow_cluster,
         )
 
 
@@ -811,18 +1037,47 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         tid: t.model_copy() for tid, t in raw_task_queue.items()
     }
     existing_group_ids = {t.parent_group_id for t in task_queue.values()}
-    next_task_index = len(task_queue) + 1
+    next_task_index = 1
     for group in valid_groups:
         if group.group_id not in existing_group_ids:
+            while f"task-{next_task_index}" in task_queue:
+                next_task_index += 1
             task_id = f"task-{next_task_index}"
             task_queue[task_id] = build_initial_remediation_task(group, task_id)
+            existing_group_ids.add(group.group_id)
             next_task_index += 1
+
+    # The scanner only creates groups for findings. The portfolio also needs
+    # directly declared dependencies without CVEs so every package occurrence
+    # is represented in the dependency graph. Materialize those
+    # coordination-only groups after the finding-backed tasks have their
+    # Supervisor-selected versions. This is copy-on-write and never performs
+    # registry or network work.
+    valid_groups, task_queue, synthetic_diagnostics = materialize_synthetic_dependency_tasks(
+        state.get("repo_root", ""),
+        valid_groups,
+        task_queue,
+    )
+    if synthetic_diagnostics:
+        logger.info(
+            "supervisor: synthetic dependency discovery diagnostics: %s",
+            synthetic_diagnostics,
+        )
+    group_by_id = {g.group_id: g for g in valid_groups}
 
     # Keep task-owned planner fields synchronized with the initial OSV plan.
     # Later planner commits are the only source allowed to change these fields.
     for task_id, task in list(task_queue.items()):
         group = group_by_id.get(task.parent_group_id)
+        selection = select_package_fix_plan(group, task.strategy) if group is not None else None
+        selected_plan = selection.plan if selection is not None else None
         task_updates: dict[str, Any] = {}
+        if (
+            selection is not None
+            and task.current_attempt_id is None
+            and list(selection.issue_ids) != list(task.selected_plan_issue_ids)
+        ):
+            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
         if task.qa_policy is None and task.current_attempt_id is None:
             recovered_policy = derive_missing_task_qa_policy(task, group)
             if recovered_policy is not None:
@@ -863,10 +1118,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and task.current_attempt_id is None
             and not task.instruction
             and group is not None
-            and group.fix_plan is not None
-            and group.fix_plan.instruction
+            and selected_plan is not None
+            and selected_plan.instruction
         ):
-            task_updates["instruction"] = group.fix_plan.instruction
+            task_updates["instruction"] = selected_plan.instruction
+            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
         if (
             task.task_revision == 0
             and task.current_attempt_id is None
@@ -875,10 +1131,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and task.strategy == RoutingStrategy.VERSION_BUMP
             and not task.parent_package_name
             and group is not None
-            and group.fix_plan is not None
-            and group.fix_plan.fixed_version
+            and selected_plan is not None
+            and selected_plan.fixed_version
         ):
-            task_updates["selected_version"] = group.fix_plan.fixed_version
+            task_updates["selected_version"] = selected_plan.fixed_version
+            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
         if (
             task.task_revision == 0
             and task.current_attempt_id is None
@@ -894,7 +1151,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_updates["target_package_name"] = parent_name
                 task_updates["target_dependency_type"] = task.target_dependency_type or parent_type
         if task_updates:
-            if "qa_policy" in task_updates:
+            if "qa_policy" in task_updates or "selected_plan_issue_ids" in task_updates:
                 task_updates["task_revision"] = task.task_revision + 1
             task_queue[task_id] = task.model_copy(update=task_updates)
 
@@ -927,8 +1184,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 update={
                     "strategy_stage": planned_task.strategy_stage,
                     "security_floor": (
-                        group.fix_plan.fixed_version
-                        if group.fix_plan is not None
+                        select_package_fix_plan(group, task.strategy).plan.fixed_version
+                        if select_package_fix_plan(group, task.strategy).plan is not None
                         else initial_diagnostics.security_floor
                     ),
                     "selected_version": planned_task.selected_version,
@@ -957,12 +1214,58 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 }
             )
 
+    active_target_task_ids = list(state.get("active_target_task_ids") or [])
+    if (
+        not active_target_task_ids
+        and any(task.status not in _TERMINAL_STATUSES for task in task_queue.values())
+        and any(group.issue_type == IssueType.SCA for group in valid_groups)
+        and ("portfolio_dirty" in state or "portfolio_plan" in state)
+        and (
+            state.get("portfolio_dirty", False)
+            or _portfolio_plan_is_stale(
+                state.get("portfolio_plan"),
+                task_queue,
+                valid_groups,
+                state.get("repo_root"),
+            )
+        )
+    ):
+        decision = SupervisorDecision(
+            decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+            next_node="portfolio",
+            target_task_ids=[],
+            instructions="Build the deterministic package-group portfolio plan before dispatch.",
+            decision_reason="The package-group portfolio plan is missing or stale.",
+        )
+        return {
+            "status": "supervisor_routed",
+            "next_routing_step": "portfolio",
+            "active_target_task_ids": [],
+            "decision_code": decision.decision_code,
+            "supervisor_audit": _emit_audit(decision, [], state_revision),
+            "supervisor_instructions": decision.instructions,
+            "task_queue": task_queue,
+            "valid_groups": valid_groups,
+            "state_revision": state_revision,
+        }
+
     # ------------------------------------------------------------------
     # 2. Ingest attempt-tagged worker results (active targets only)
     # ------------------------------------------------------------------
-    active_target_task_ids = list(state.get("active_target_task_ids") or [])
     action_summaries: list[AgentActionSummary] = state.get("action_summaries") or []
     new_worker_attempt_ids: list[str] = []
+    atomic_cluster_task_ids = [
+        task_id
+        for task_id in active_target_task_ids
+        if (
+            (task := task_queue.get(task_id)) is not None
+            and task.current_attempt_id
+            and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id)) is not None
+            and snapshot.cluster_id
+            and snapshot.dispatch_node == "update_subagent"
+        )
+    ]
+    atomic_cluster_task_ids = atomic_cluster_task_ids if len(atomic_cluster_task_ids) > 1 else []
 
     for task_id in active_target_task_ids:
         task = task_queue.get(task_id)
@@ -971,6 +1274,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         current_attempt_id = task.current_attempt_id
         snapshot = attempt_snapshots_by_id.get(current_attempt_id) if current_attempt_id else None
         result = worker_results_by_attempt.get(current_attempt_id) if current_attempt_id else None
+        snapshot_batch_id = (
+            snapshot.dispatch_batch_id
+            if snapshot is not None and isinstance(snapshot.dispatch_batch_id, str)
+            else None
+        )
+        snapshot_cluster_id = (
+            snapshot.cluster_id
+            if snapshot is not None and isinstance(snapshot.cluster_id, str)
+            else None
+        )
+        snapshot_action_digest = (
+            snapshot.action_digest
+            if snapshot is not None and isinstance(snapshot.action_digest, str)
+            else None
+        )
         for stale_result in worker_results_by_attempt.values():
             if (
                 stale_result.task_id == task_id
@@ -1010,6 +1328,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 or result.task_revision != task.task_revision
                 or snapshot is None
                 or result.instruction_digest != snapshot.instruction_digest
+                or (snapshot_cluster_id is not None and result.cluster_id != snapshot_cluster_id)
+                or (snapshot_batch_id is not None and result.dispatch_batch_id != snapshot_batch_id)
+                or (
+                    snapshot_action_digest is not None
+                    and result.action_digest != snapshot_action_digest
+                )
             ):
                 consistency_events.append(
                     _build_consistency_event(
@@ -1336,8 +1660,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                 "target_package_name": failed_group.vulnerable_component,
                                 "target_dependency_type": _override_dependency_type(failed_group),
                                 "selected_version": (
-                                    failed_group.fix_plan.fixed_version
-                                    if failed_group.fix_plan
+                                    select_package_fix_plan(
+                                        failed_group, task.strategy
+                                    ).plan.fixed_version
+                                    if select_package_fix_plan(failed_group, task.strategy).plan
                                     else None
                                 ),
                             }
@@ -1372,6 +1698,45 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             processed_worker_attempt_ids.add(current_attempt_id)
             new_worker_attempt_ids.append(current_attempt_id)
             continue
+
+    if atomic_cluster_task_ids:
+        cluster_worker_results = [
+            worker_results_by_attempt.get(task_queue[task_id].current_attempt_id)
+            for task_id in atomic_cluster_task_ids
+        ]
+        worker_batch_succeeded = bool(cluster_worker_results) and all(
+            result is not None
+            and result.status == AgentActionStatus.SUCCESS
+            and result.execution_diagnostics.validation_passed
+            for result in cluster_worker_results
+        )
+        if worker_batch_succeeded:
+            for task_id in atomic_cluster_task_ids:
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
+                )
+        else:
+            for task_id in atomic_cluster_task_ids:
+                task = task_queue[task_id]
+                baseline = raw_task_queue.get(task_id)
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": max(
+                            task.retry_count,
+                            (baseline.retry_count if baseline is not None else task.retry_count)
+                            + 1,
+                        ),
+                    },
+                    close_attempt=True,
+                )
+            errors.append(
+                "supervisor: atomic package-cluster worker failure restored the complete batch."
+            )
 
     # ------------------------------------------------------------------
     # 3. Ingest QA results (active targets only, when qa_completed)
@@ -1424,10 +1789,31 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             continue
         snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
         qa_requires_rerun = False
+        snapshot_batch_id = (
+            snapshot.dispatch_batch_id
+            if snapshot is not None and isinstance(snapshot.dispatch_batch_id, str)
+            else None
+        )
+        snapshot_cluster_id = (
+            snapshot.cluster_id
+            if snapshot is not None and isinstance(snapshot.cluster_id, str)
+            else None
+        )
+        snapshot_action_digest = (
+            snapshot.action_digest
+            if snapshot is not None and isinstance(snapshot.action_digest, str)
+            else None
+        )
         if (
             qa_result.task_id != task_id
             or qa_result.task_revision != task.task_revision
             or snapshot is None
+            or (snapshot_cluster_id is not None and qa_result.cluster_id != snapshot_cluster_id)
+            or (snapshot_batch_id is not None and qa_result.dispatch_batch_id != snapshot_batch_id)
+            or (
+                snapshot_action_digest is not None
+                and qa_result.action_digest != snapshot_action_digest
+            )
         ):
             consistency_events.append(
                 _build_consistency_event(
@@ -1452,7 +1838,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             qa_requires_rerun = (
                 qa_result.evaluation.evidence_inconclusive or qa_result.evaluation.contract_error
             )
-            if not qa_requires_rerun:
+            if not qa_requires_rerun and not atomic_cluster_task_ids:
                 # QA closes the worker attempt before any status or stage
                 # change. The next planner proposal must observe a task with
                 # no active worker input; otherwise it can see the new retry
@@ -1474,9 +1860,90 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if not qa_requires_rerun:
             processed_qa_attempt_ids.add(task.current_attempt_id)
             new_qa_attempt_ids.append(task.current_attempt_id)
+    portfolio_escalation = state.get("portfolio_escalation")
+    if atomic_cluster_task_ids and state.get("status") in {"qa_completed", "qa_failed"}:
+        cluster_evaluations = {
+            task_id: qa_evaluations.get(task_id) for task_id in atomic_cluster_task_ids
+        }
+        all_evaluations_present = all(
+            evaluation is not None for evaluation in cluster_evaluations.values()
+        )
+        has_inconclusive = any(
+            evaluation is not None
+            and (evaluation.contract_error or evaluation.evidence_inconclusive)
+            for evaluation in cluster_evaluations.values()
+        )
+        has_real_failure = not all_evaluations_present or any(
+            evaluation is not None
+            and not evaluation.passed
+            and not evaluation.contract_error
+            and not evaluation.evidence_inconclusive
+            for evaluation in cluster_evaluations.values()
+        )
+        if not has_real_failure and has_inconclusive:
+            for task_id in atomic_cluster_task_ids:
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
+                )
+        elif not has_real_failure:
+            for task_id in atomic_cluster_task_ids:
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={},
+                    close_attempt=True,
+                )
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.QA_PASSED},
+                )
+        else:
+            peer_pairs: set[tuple[str, str]] = set()
+            peer_evidence: dict[str, dict[str, Any]] = {}
+            unresolved_peer_diagnostics: list[str] = []
+            for task_id, evaluation in cluster_evaluations.items():
+                if evaluation is None:
+                    continue
+                escalation, unresolved = _peer_conflict_escalation(
+                    task_id,
+                    evaluation,
+                    task_queue,
+                    group_by_id,
+                )
+                unresolved_peer_diagnostics.extend(unresolved)
+                if escalation is None:
+                    continue
+                peer_pairs.update(tuple(pair) for pair in escalation["peer_conflict_pairs"])
+                for evidence in escalation.get("evidence", []):
+                    peer_evidence[json.dumps(evidence, sort_keys=True)] = evidence
+            errors.extend(unresolved_peer_diagnostics)
+            if peer_pairs:
+                portfolio_escalation = {
+                    "reason": "PEER_CONFLICT_ESCALATION",
+                    "peer_conflict_pairs": sorted(peer_pairs),
+                    "evidence": [peer_evidence[key] for key in sorted(peer_evidence)],
+                }
+            for task_id in atomic_cluster_task_ids:
+                task = task_queue[task_id]
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    },
+                    close_attempt=True,
+                )
+            errors.append(
+                "supervisor: atomic package-cluster QA failure kept every member non-passed."
+            )
+
     auto_new_constraints: list[str] = []
 
-    if state.get("status") in {"qa_completed", "qa_failed"}:
+    if not atomic_cluster_task_ids and state.get("status") in {"qa_completed", "qa_failed"}:
         for resolved_t_id, evaluation in qa_evaluations.items():
             task_for_result = task_queue.get(resolved_t_id)
             if (
@@ -1531,6 +1998,29 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     ):
                         auto_new_constraints.append(constraint)
             else:
+                peer_escalation, unresolved_peer_diagnostics = _peer_conflict_escalation(
+                    resolved_t_id,
+                    evaluation,
+                    task_queue,
+                    group_by_id,
+                )
+                if unresolved_peer_diagnostics:
+                    errors.extend(unresolved_peer_diagnostics)
+                if peer_escalation is not None:
+                    portfolio_escalation = peer_escalation
+                    _commit_task_transition(
+                        task_queue,
+                        resolved_t_id,
+                        updates={
+                            "status": TaskStatus.NEEDS_RETRY,
+                            "retry_count": task.retry_count + 1,
+                        },
+                        close_attempt=True,
+                    )
+                    errors.append(
+                        f"supervisor: peer conflict expanded the package portfolio for {resolved_t_id}."
+                    )
+                    continue
                 if task.no_fix_stage is not None:
                     no_fix_updates, reset_workspace = _no_fix_failure_transition(
                         task,
@@ -1572,8 +2062,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                 ),
                                 "target_dependency_type": _override_dependency_type(group),
                                 "selected_version": (
-                                    group.fix_plan.fixed_version
-                                    if group and group.fix_plan
+                                    select_package_fix_plan(group, task.strategy).plan.fixed_version
+                                    if group and select_package_fix_plan(group, task.strategy).plan
                                     else task.selected_version
                                 ),
                             }
@@ -1604,7 +2094,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task_id=resolved_t_id,
                             strategy_stage=next_stage,
                             security_floor=(
-                                group.fix_plan.fixed_version if group and group.fix_plan else None
+                                select_package_fix_plan(group, task.strategy).plan.fixed_version
+                                if group and select_package_fix_plan(group, task.strategy).plan
+                                else None
                             ),
                             exhausted_update_path=(
                                 next_stage == SCARemediationStage.CODE_WORKAROUND
@@ -1621,8 +2113,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                                 "strategy_stage": next_stage,
                                 "security_floor": prior_diag.security_floor
                                 or (
-                                    group.fix_plan.fixed_version
-                                    if group and group.fix_plan
+                                    select_package_fix_plan(group, task.strategy).plan.fixed_version
+                                    if group and select_package_fix_plan(group, task.strategy).plan
                                     else None
                                 ),
                                 "exhausted_update_path": next_stage
@@ -1821,6 +2313,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
+                    portfolio_plan=state.get("portfolio_plan"),
                 )
 
     # Deterministic retry planning above is the only Supervisor planning path.
@@ -1845,20 +2338,61 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # 6b. Deterministic authority boundary
     # ------------------------------------------------------------------
-    deterministic_decision = _deterministic_routing(
-        task_queue,
-        group_by_id,
-        qa_evaluations,
-        retry_diagnostics_by_task,
-        action_summaries=action_summaries,
-        active_target_task_ids=active_target_task_ids,
-        current_status=str(state.get("status") or ""),
-        triage_required=bool(state.get("triage_required")),
+    active_attempt_is_open = any(
+        (task_queue.get(task_id) is not None)
+        and task_queue[task_id].current_attempt_id is not None
+        and task_queue[task_id].status not in _TERMINAL_STATUSES
+        for task_id in active_target_task_ids
     )
+    portfolio_replan_required = bool(
+        state.get("portfolio_plan") is not None
+        and not active_attempt_is_open
+        and _portfolio_plan_is_stale(
+            state.get("portfolio_plan"),
+            task_queue,
+            valid_groups,
+            state.get("repo_root"),
+        )
+    )
+    if portfolio_replan_required:
+        deterministic_decision = SupervisorDecision(
+            decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+            next_node="portfolio",
+            target_task_ids=[],
+            instructions="Rebuild the package-group portfolio plan after task reconciliation.",
+            decision_reason="The committed portfolio plan is stale after a completed attempt.",
+        )
+    else:
+        deterministic_decision = _deterministic_routing(
+            task_queue,
+            group_by_id,
+            qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
+            active_target_task_ids=active_target_task_ids,
+            current_status=str(state.get("status") or ""),
+            triage_required=bool(state.get("triage_required")),
+            portfolio_plan=state.get("portfolio_plan"),
+        )
     # The deterministic decision is authoritative. QA feedback below is
     # carried only when Python produced it for the selected task; no model
     # can add worker feedback or constraints to this projection.
     decision = deterministic_decision
+    if portfolio_escalation and portfolio_escalation.get("reason") in {
+        "PEER_CONFLICT_ESCALATION",
+        "DELTA_ISOLATION_ATTRIBUTION",
+    }:
+        decision = SupervisorDecision(
+            decision_code=(
+                DecisionCode.PEER_CONFLICT_ESCALATION
+                if portfolio_escalation.get("reason") == "PEER_CONFLICT_ESCALATION"
+                else DecisionCode.PORTFOLIO_PLAN_REQUIRED
+            ),
+            next_node="portfolio",
+            target_task_ids=[],
+            instructions="Recompute package portfolio membership from the validated QA delta.",
+            decision_reason="QA produced a portfolio-affecting cluster attribution.",
+        )
 
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
@@ -1882,6 +2416,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             action_summaries=action_summaries,
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
+            portfolio_plan=state.get("portfolio_plan"),
         )
         logger.info("supervisor: deterministic fallback â†’ next_node=%s", decision.next_node)
         fallback_pivot_strategy_by_parent = {
@@ -2020,6 +2555,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 action_summaries=action_summaries,
                 active_target_task_ids=active_target_task_ids,
                 current_status=str(state.get("status") or ""),
+                portfolio_plan=state.get("portfolio_plan"),
             )
             fallback_pivot_strategy_by_parent = {
                 req.parent_task_id: req.strategy
@@ -2133,6 +2669,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                     triage_required=bool(state.get("triage_required")),
+                    portfolio_plan=state.get("portfolio_plan"),
                 )
                 valid_target_ids = list(decision.target_task_ids)
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
@@ -2241,6 +2778,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
+                    portfolio_plan=state.get("portfolio_plan"),
                 )
                 valid_target_ids = list(decision.target_task_ids)
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
@@ -2279,6 +2817,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     revised_instructions=clean_revised_instructions,
                     spawn_requests=clean_spawn_requests,
                     task_status_updates=clean_status_updates,
+                    cluster_id=decision.cluster_id,
+                    multi_package_action=decision.multi_package_action,
                     instructions=decision.instructions,
                     decision_reason=decision.decision_reason,
                 )
@@ -2479,6 +3019,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             triage_required=bool(state.get("triage_required")),
             workspace_volume=state.get("workspace_volume"),
             final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+            portfolio_plan=state.get("portfolio_plan"),
         )
         resolved_next_node = decision.next_node
         resolved_target_task_ids = list(decision.target_task_ids)
@@ -2488,6 +3029,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task_queue,
         retry_diagnostics_by_task,
         group_by_id,
+        allow_cluster=bool(decision.cluster_id),
     )
     # Status overrides and parent terminalization above are also untrusted
     # router requests. Re-clamp after those mutations so a task that became
@@ -2498,6 +3040,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task_queue,
         retry_diagnostics_by_task,
         group_by_id,
+        allow_cluster=bool(decision.cluster_id),
     )
     remapped_feedback_by_task = {
         task_id: feedback
@@ -2536,6 +3079,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             triage_required=bool(state.get("triage_required")),
             workspace_volume=state.get("workspace_volume"),
             final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+            portfolio_plan=state.get("portfolio_plan"),
         )
         resolved_next_node = decision.next_node
         resolved_target_task_ids = _normalize_target_task_ids_for_node(
@@ -2544,6 +3088,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             task_queue,
             retry_diagnostics_by_task,
             group_by_id,
+            allow_cluster=bool(decision.cluster_id),
         )
         remapped_feedback_by_task = {
             task_id: feedback
@@ -2604,6 +3149,46 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # Commit the exact input snapshot before exposing worker targets to the
     # graph. QA reuses the current worker attempt; update/workaround dispatches
     # always receive a new attempt identity.
+    active_cluster_id: str | None = None
+    active_dispatch_batch_id: str | None = None
+    active_multi_package_action: MultiPackageAction | None = None
+    if resolved_next_node == "update_subagent" and decision.cluster_id:
+        action = _build_multi_package_action(
+            decision.cluster_id,
+            resolved_target_task_ids,
+            task_queue,
+            group_by_id,
+        )
+        if action is None or len(resolved_target_task_ids) < 2:
+            errors.append(
+                "supervisor: rejected atomic cluster dispatch because its committed action "
+                "could not be represented exactly; falling back to singleton routing."
+            )
+            first_target = resolved_target_task_ids[:1]
+            resolved_target_task_ids = first_target
+            decision = decision.model_copy(
+                update={
+                    "cluster_id": None,
+                    "multi_package_action": None,
+                    "target_task_ids": first_target,
+                    "decision_code": DecisionCode.NEW_VERSION_BUMP,
+                }
+            )
+        else:
+            active_cluster_id = decision.cluster_id
+            active_dispatch_batch_id = _cluster_dispatch_batch_id(
+                active_cluster_id,
+                resolved_target_task_ids,
+                state_revision,
+            )
+            action = action.model_copy(update={"dispatch_batch_id": active_dispatch_batch_id})
+            active_multi_package_action = action
+            decision = decision.model_copy(update={"multi_package_action": action})
+    elif resolved_next_node == "qa_critic" and decision.cluster_id:
+        active_cluster_id = decision.cluster_id
+        active_dispatch_batch_id = state.get("active_dispatch_batch_id")
+        active_multi_package_action = state.get("active_multi_package_action")
+
     if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}:
         for task_id in list(resolved_target_task_ids):
             task = task_queue.get(task_id)
@@ -2680,6 +3265,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     if resolved_next_node == "update_subagent"
                     else []
                 ),
+                cluster_id=active_cluster_id,
+                dispatch_batch_id=active_dispatch_batch_id,
+                action_digest=(
+                    instruction_digest(active_multi_package_action.model_dump_json())
+                    if active_multi_package_action is not None
+                    else None
+                ),
+                manifest_path=_group_manifest_path(group_by_id[task.parent_group_id])
+                if task.parent_group_id in group_by_id
+                else None,
             )
             task_queue[task_id] = task
             prior = retry_diagnostics_by_task.get(task_id)
@@ -2752,6 +3347,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # attempt-correlated audit record.
     errors = list(dict.fromkeys(error for error in errors if error not in prior_error_messages))
 
+    portfolio_dirty = bool(state.get("portfolio_dirty", False))
+    if state.get("portfolio_plan") is not None:
+        portfolio_dirty = portfolio_dirty or _portfolio_plan_is_stale(
+            state.get("portfolio_plan"),
+            task_queue,
+            valid_groups,
+            state.get("repo_root"),
+        )
+
     # ------------------------------------------------------------------
     # 9. Return state patch
     # ------------------------------------------------------------------
@@ -2761,6 +3365,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         "decision_code": decision.decision_code,
         "supervisor_audit": _emit_audit(decision, consistency_events, state_revision),
         "active_target_task_ids": resolved_target_task_ids,
+        "active_cluster_id": active_cluster_id,
+        "active_dispatch_batch_id": active_dispatch_batch_id,
+        "active_multi_package_action": active_multi_package_action,
+        "portfolio_dirty": portfolio_dirty,
+        "portfolio_escalation": portfolio_escalation,
         "feedback_by_task": feedback_by_task,
         "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
@@ -2846,6 +3455,7 @@ def supervisor_router(state: OrchestratorState) -> str:
         triage_required=bool(state.get("triage_required")),
         workspace_volume=state.get("workspace_volume"),
         final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+        portfolio_plan=state.get("portfolio_plan"),
     )
     if decision.next_node not in _VALID_NEXT_NODES:
         logger.critical(

@@ -31,7 +31,9 @@ from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FinalFullScanResult,
+    MultiPackageAction,
     ODCScanEvidence,
+    PortfolioPlan,
     QAAttemptResult,
     QAEvaluation,
     RemediationTask,
@@ -239,13 +241,35 @@ def normalize_group_paths(
         for old, new in replacements.items():
             group_id = group_id.replace(str(old).replace("\\", "/"), new)
         fix_plan = group.fix_plan
-        if fix_plan is not None and replacements:
-            instruction = fix_plan.instruction or ""
-            for old, new in replacements.items():
-                instruction = instruction.replace(str(old), new).replace(
-                    str(old).replace("\\", "/"), new
+        fix_plan_candidates = list(group.fix_plan_candidates or [])
+        if replacements:
+            replacement_items = tuple(replacements.items())
+
+            def _rewrite_instruction(
+                instruction: str,
+                replacement_items: tuple[tuple[str, str], ...] = replacement_items,
+            ) -> str:
+                rewritten = instruction or ""
+                for old, new in replacement_items:
+                    rewritten = rewritten.replace(str(old), new).replace(
+                        str(old).replace("\\", "/"), new
+                    )
+                return rewritten
+
+            if fix_plan is not None:
+                fix_plan = fix_plan.model_copy(
+                    update={"instruction": _rewrite_instruction(fix_plan.instruction)}
                 )
-            fix_plan = fix_plan.model_copy(update={"instruction": instruction})
+            fix_plan_candidates = [
+                candidate.model_copy(
+                    update={
+                        "plan": candidate.plan.model_copy(
+                            update={"instruction": _rewrite_instruction(candidate.plan.instruction)}
+                        )
+                    }
+                )
+                for candidate in fix_plan_candidates
+            ]
         if (
             group_id == group.group_id
             and file_path == group.file_path
@@ -254,6 +278,7 @@ def normalize_group_paths(
             and expanded_group_ancestry == list(group.dependency_ancestry)
             and expanded_group_versions == dict(group.dependency_versions)
             and fix_plan is group.fix_plan
+            and fix_plan_candidates == list(group.fix_plan_candidates or [])
         ):
             # Keep object identity for already-canonical groups.  Some graph
             # reconciliation paths deliberately reuse unchanged group objects.
@@ -269,6 +294,7 @@ def normalize_group_paths(
                     "dependency_ancestry": expanded_group_ancestry,
                     "dependency_versions": expanded_group_versions,
                     "fix_plan": fix_plan,
+                    "fix_plan_candidates": fix_plan_candidates,
                 }
             )
         )
@@ -355,6 +381,13 @@ class OrchestratorState(TypedDict, total=False):
     # Phase 5 Task Queue (primary orchestration unit)
     task_queue: Annotated[dict[str, RemediationTask], replace_dict_reducer]
     active_target_task_ids: list[str]
+    portfolio_plan: PortfolioPlan | None
+    portfolio_dirty: bool
+    portfolio_escalation: dict[str, Any] | None
+    active_cluster_id: str | None
+    active_dispatch_batch_id: str | None
+    active_multi_package_action: MultiPackageAction | None
+    delta_isolation_by_cluster: Annotated[dict[str, Any], merge_dict_reducer]
 
     workspace_volume: str | None
 
@@ -406,6 +439,9 @@ class SubagentState(TypedDict, total=False):
     workspace_volume: str
 
     target_tasks: list[RemediationTask]
+    active_cluster_id: str | None
+    dispatch_batch_id: str | None
+    multi_package_action: MultiPackageAction | None
     target_groups: list[VulnerabilityGroup]
     feedback_by_group: dict[str, str]
     feedback_by_task: dict[str, str]
@@ -466,6 +502,13 @@ def initial_orchestrator_state(
         "changed_files": [],
         "task_queue": {},
         "active_target_task_ids": [],
+        "portfolio_plan": None,
+        "portfolio_dirty": True,
+        "portfolio_escalation": None,
+        "active_cluster_id": None,
+        "active_dispatch_batch_id": None,
+        "active_multi_package_action": None,
+        "delta_isolation_by_cluster": {},
         "workspace_volume": None,
         "status": "pending",
         "next_routing_step": "",
@@ -515,6 +558,9 @@ def initial_update_subagent_state(
     previous_action_summaries_by_task: Mapping[str, str] | None = None,
     retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot] | None = None,
+    active_cluster_id: str | None = None,
+    dispatch_batch_id: str | None = None,
+    multi_package_action: MultiPackageAction | None = None,
     messages: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Build the initial update-worker state from committed task inputs."""
@@ -544,6 +590,9 @@ def initial_update_subagent_state(
         "previous_action_summaries_by_task": previous_summaries_dict,
         "retry_diagnostics_by_task": retry_diagnostics_dict,
         "target_attempt_snapshots": target_attempt_snapshots_dict,
+        "active_cluster_id": active_cluster_id,
+        "dispatch_batch_id": dispatch_batch_id,
+        "multi_package_action": multi_package_action,
         "constraints_ledger": constraints_list,
         "messages": list(messages or []),
         "changed_files": [],

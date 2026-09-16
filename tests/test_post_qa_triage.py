@@ -84,13 +84,13 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     unchanged_issue = _issue("CVE-2021-0001")
     changed_issue = _issue("CVE-2021-0002")
     new_issue = _issue("CVE-2026-0003", source=IssueSource.ODC)
-    unchanged = _group("sca:package.json:unchanged:UPDATE_VERSION", unchanged_issue)
-    changed = _group("sca:package.json:changed:UPDATE_VERSION", changed_issue)
+    unchanged = _group("sca:package.json:unchanged", unchanged_issue)
+    changed = _group("sca:package.json:changed", changed_issue)
     changed_candidate = _group(
         changed.group_id,
         _issue("CVE-2026-0004", source=IssueSource.ODC),
     )
-    new_group = _group("sca:package.json:new:UPDATE_VERSION", new_issue)
+    new_group = _group("sca:package.json:new", new_issue)
     candidate_unchanged = unchanged.model_copy()
 
     changed_task = build_initial_remediation_task(changed, "task-changed").model_copy(
@@ -159,7 +159,7 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
 
 def test_post_triage_development_limit_uses_configured_pass_count():
     issue = _issue("CVE-2026-0006")
-    group = _group("sca:package.json:limited:UPDATE_VERSION", issue)
+    group = _group("sca:package.json:limited", issue)
     state = initial_orchestrator_state(
         "repo",
         [group],
@@ -197,7 +197,7 @@ def test_post_triage_development_limit_uses_configured_pass_count():
 
 def test_post_triage_limit_is_unbounded_when_disabled():
     issue = _issue("CVE-2026-0007")
-    group = _group("sca:package.json:unlimited:UPDATE_VERSION", issue)
+    group = _group("sca:package.json:unlimited", issue)
     state = initial_orchestrator_state(
         "repo",
         [group],
@@ -232,7 +232,7 @@ def test_post_triage_limit_is_unbounded_when_disabled():
 
 def test_post_triage_does_not_reopen_repeated_final_scan_without_material_change():
     issue = _issue("CVE-2026-0010")
-    group = _group("sca:package.json:unchanged:UPDATE_VERSION", issue)
+    group = _group("sca:package.json:unchanged", issue)
     task = build_initial_remediation_task(group, "task-unchanged").model_copy(
         update={
             "task_revision": 4,
@@ -288,7 +288,7 @@ def test_post_triage_does_not_reopen_repeated_final_scan_without_material_change
 def test_post_triage_ignores_historical_accepted_attempt_after_noop_retry():
     """An old accepted attempt cannot reopen a group after a later no-op."""
     issue = _issue("CVE-2026-0012")
-    group = _group("sca:package.json:historical:UPDATE_VERSION", issue)
+    group = _group("sca:package.json:historical", issue)
     task = build_initial_remediation_task(group, "task-historical").model_copy(
         update={
             "task_revision": 4,
@@ -354,7 +354,7 @@ def test_post_triage_ignores_historical_accepted_attempt_after_noop_retry():
 
 def test_post_triage_reopens_final_scan_group_after_material_change():
     issue = _issue("CVE-2026-0011")
-    group = _group("sca:package.json:changed:UPDATE_VERSION", issue)
+    group = _group("sca:package.json:changed", issue)
     task = build_initial_remediation_task(group, "task-changed").model_copy(
         update={
             "task_revision": 4,
@@ -408,7 +408,7 @@ def test_post_triage_reopens_final_scan_group_after_material_change():
 def test_post_triage_reopens_group_when_parent_context_becomes_available():
     """Parent evidence changes group content without changing its canonical ID."""
     issue = _issue("CVE-2026-0005")
-    previous = _group("sca:package.json:lodash:UPDATE_VERSION", issue)
+    previous = _group("sca:package.json:lodash", issue)
     candidate = previous.model_copy(
         update={
             "dependency_ancestry": ["sanitize-html", "lodash"],

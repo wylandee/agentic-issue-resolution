@@ -2646,7 +2646,7 @@ class TestRunSupervisorDeterministicRouting:
 
 class TestBugFixes:
     def test_bug1_deterministic_pivot_populates_feedback_by_task(self):
-        group_id = "sca:package.json:express:UPDATE_VERSION"
+        group_id = "sca:package.json:express"
         g = _sca_group(group_id)
         task = RemediationTask(
             task_id="task-1",
@@ -2687,7 +2687,7 @@ class TestBugFixes:
         )
 
     def test_bug2_materialize_spawn_requests_replaces_triage_strategy_bucket(self):
-        group_id = "sca:package.json:express:UPDATE_VERSION"
+        group_id = "sca:package.json:express"
         parent_task = RemediationTask(
             task_id="task-1",
             parent_group_id=group_id,
@@ -2722,7 +2722,7 @@ class TestBugFixes:
 
         assert len(new_tasks) == 1
         child_task = next(iter(new_tasks.values()))
-        assert child_task.parent_group_id == "sca:package.json:express:CODE_WORKAROUND"
+        assert child_task.parent_group_id == "sca:package.json:express"
         assert child_task.strategy == RoutingStrategy.CODE_WORKAROUND
         assert len(errors) == 0
 
@@ -2730,7 +2730,7 @@ class TestBugFixes:
         """A replayed pivot must not create a second workaround sibling."""
         parent_task = RemediationTask(
             task_id="task-1",
-            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            parent_group_id="sca:package.json:express",
             qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
@@ -2738,7 +2738,7 @@ class TestBugFixes:
         )
         existing_child = RemediationTask(
             task_id="task-2",
-            parent_group_id="sca:package.json:express:CODE_WORKAROUND",
+            parent_group_id="sca:package.json:express",
             parent_task_id="task-1",
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.PENDING,
@@ -2767,7 +2767,7 @@ class TestBugFixes:
     def test_materialize_spawn_requests_deduplicates_requests_in_one_decision(self):
         parent_task = RemediationTask(
             task_id="task-1",
-            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            parent_group_id="sca:package.json:express",
             qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
@@ -2966,7 +2966,7 @@ class TestBugFixes:
         mock_llm.with_structured_output.return_value = mock_structured
         mock_chat_openai.return_value = mock_llm
 
-        group_id = "sca:package.json:express:CODE_WORKAROUND"
+        group_id = "sca:package.json:express"
         g = _sca_group(group_id)
         task = RemediationTask(
             task_id="task-2",

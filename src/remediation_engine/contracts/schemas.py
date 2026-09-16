@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
+from pathlib import PureWindowsPath
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -899,6 +900,15 @@ class CVEEnrichment(BaseModel):
     )
 
 
+class PackageFixPlanCandidate(BaseModel):
+    """One issue-level fix plan retained inside a package-centric group."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    issue_id: UUID = Field(..., description="Issue whose planner produced this candidate.")
+    plan: FixPlan = Field(..., description="Issue-level remediation plan.")
+
+
 class VulnerabilityGroup(BaseModel):
     """
     A set of ``VulnerabilityIssue`` records that share the same vulnerable
@@ -906,7 +916,9 @@ class VulnerabilityGroup(BaseModel):
 
     Produced by ``remediation_engine.triage.grouper``.  The grouper deduplicates
     cross-tool findings and merges overlapping CVE/component/file triples into
-    a single authoritative group for downstream triage.
+    a single authoritative group for downstream triage. The Supervisor may
+    additionally create an ``is_synthetic`` coordination group for a direct
+    dependency occurrence that has no active scanner finding.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -916,7 +928,7 @@ class VulnerabilityGroup(BaseModel):
         ...,
         description=(
             "Deterministic group key.  "
-            "SCA: 'sca:{manifest_file}:{package_name}:{fix_strategy}'. Parent "
+            "SCA: 'sca:{manifest_file}:{package_name}'. Parent "
             "contexts are retained as evidence, not included in the identity. "
             "SAST: 'sast:{file_path}:{rule_id}:{line_start}-{line_end}'."
         ),
@@ -939,6 +951,14 @@ class VulnerabilityGroup(BaseModel):
             "Deduplicated repo-relative file paths associated with this group. "
             "For SCA groups this is the set of resolved manifest paths; for SAST "
             "groups this is typically a singleton list containing file_path."
+        ),
+    )
+    is_synthetic: bool = Field(
+        default=False,
+        description=(
+            "True for a Supervisor-generated coordination group representing a "
+            "package with no active scanner finding. Synthetic groups are included "
+            "in portfolio actions but are not security findings."
         ),
     )
 
@@ -1010,11 +1030,19 @@ class VulnerabilityGroup(BaseModel):
             "Primarily populated for SCA groups in the shift-left flow."
         ),
     )
+    fix_plan_candidates: list[PackageFixPlanCandidate] = Field(
+        default_factory=list,
+        description=(
+            "All issue-level remediation plans retained for this package group. "
+            "The Supervisor selects the active candidate; grouping does not discard "
+            "alternative strategies."
+        ),
+    )
     fix_plan: FixPlan | None = Field(
         None,
         description=(
-            "Unified remediation plan for the group. For SCA groups this is the "
-            "group-level plan derived from member issue fix plans."
+            "Compatibility summary of the package plans. New orchestration code "
+            "must use fix_plan_candidates for strategy selection."
         ),
     )
 
@@ -1440,6 +1468,34 @@ class QADependencyEvidence(BaseModel):
     diagnostics: list[str] = Field(default_factory=list)
 
 
+class PeerConflictEvidence(BaseModel):
+    """Deterministic npm peer-conflict evidence used for cluster expansion."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    requester_package: str = ""
+    peer_package: str = ""
+    required_range: str | None = None
+    observed_version: str | None = None
+    evidence: str = Field(default="", max_length=2000)
+
+    @field_validator(
+        "requester_package",
+        "peer_package",
+        "required_range",
+        "observed_version",
+        "evidence",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_peer_evidence_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("peer conflict evidence fields must be strings.")
+        return value.strip()
+
+
 class QADeterministicGates(BaseModel):
     """Raw Python-owned QA evidence before policy-specific decision rules."""
 
@@ -1453,6 +1509,8 @@ class QADeterministicGates(BaseModel):
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
+    install_error_category: str | None = None
+    peer_conflicts: list[PeerConflictEvidence] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
     dependency_evidence: QADependencyEvidence | None = Field(
         default=None,
@@ -1661,9 +1719,18 @@ class TaskAttemptSnapshot(BaseModel):
 
     attempt_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
     task_id: str = Field(..., min_length=1)
+    is_synthetic: bool = Field(
+        default=False,
+        description="Whether the committed attempt belongs to a no-CVE coordination task.",
+    )
     state_revision: int = Field(default=0, ge=0)
     task_revision: int = Field(default=0, ge=0)
     attempt_number: int = Field(default=1, ge=1)
+    cluster_id: str | None = Field(default=None)
+    dispatch_batch_id: str | None = Field(default=None)
+    action_digest: str | None = Field(default=None)
+    manifest_path: str | None = Field(default=None)
+    selected_plan_issue_ids: list[str] = Field(default_factory=list)
     qa_policy: QAPolicy | None = Field(default=None)
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
@@ -1679,6 +1746,24 @@ class TaskAttemptSnapshot(BaseModel):
     plan_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     workaround_context: WorkaroundContext | None = Field(default=None)
+
+    @field_validator("manifest_path", mode="before")
+    @classmethod
+    def _normalize_snapshot_manifest_path(cls, value: Any) -> str | None:
+        """Keep the committed manifest target repository-relative and safe."""
+        if value is None:
+            return None
+        normalized = _trim_optional_contract_text(value, "manifest_path")
+        if normalized is None:
+            return None
+        normalized = normalized.replace("\\", "/")
+        if (
+            normalized.startswith("/")
+            or PureWindowsPath(normalized).drive
+            or ".." in normalized.split("/")
+        ):
+            raise ValueError("manifest_path must be repository-relative and traversal-free.")
+        return normalized
 
 
 class UpdateRetryDiagnostics(BaseModel):
@@ -1924,6 +2009,9 @@ class WorkerAttemptResult(BaseModel):
     attempt_id: str = Field(..., min_length=1)
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
+    cluster_id: str | None = Field(default=None)
+    dispatch_batch_id: str | None = Field(default=None)
+    action_digest: str | None = Field(default=None)
     status: AgentActionStatus
     executed_versions: list[str] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)
@@ -1944,6 +2032,9 @@ class QAAttemptResult(BaseModel):
     attempt_id: str = Field(..., min_length=1)
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
+    cluster_id: str | None = Field(default=None)
+    dispatch_batch_id: str | None = Field(default=None)
+    action_digest: str | None = Field(default=None)
     qa_policy: QAPolicy = Field(
         ...,
         description="Supervisor-owned policy copied from the immutable attempt snapshot.",
@@ -2147,6 +2238,67 @@ class TaskCluster(BaseModel):
         return self
 
 
+class PortfolioPlan(BaseModel):
+    """Deterministic package-group ordering and cluster membership plan."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    plan_id: str = Field(..., min_length=1)
+    repository_fingerprint: str = Field(..., min_length=1)
+    graph_digest: str = Field(..., min_length=1)
+    plan_digest: str = Field(..., min_length=1)
+    task_ids: list[str] = Field(..., min_length=1)
+    clusters: list[TaskCluster] = Field(..., min_length=1)
+    cluster_order: list[str] = Field(..., min_length=1)
+    task_order: list[str] = Field(..., min_length=1)
+    task_to_cluster: dict[str, str] = Field(default_factory=dict)
+    task_revisions: dict[str, int] = Field(default_factory=dict)
+    task_strategies: dict[str, RoutingStrategy] = Field(default_factory=dict)
+    diagnostics: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "plan_id",
+        "repository_fingerprint",
+        "graph_digest",
+        "plan_digest",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_plan_text(cls, value: Any, info: Any) -> str:
+        return _trim_required_contract_text(value, info.field_name)
+
+    @field_validator("task_ids", "cluster_order", "task_order", mode="before")
+    @classmethod
+    def _normalize_plan_lists(cls, value: Any, info: Any) -> list[str]:
+        return _normalize_contract_string_list(value, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_plan_membership(self) -> PortfolioPlan:
+        task_ids = set(self.task_ids)
+        clusters_by_id = {cluster.cluster_id: cluster for cluster in self.clusters}
+        if len(clusters_by_id) != len(self.clusters):
+            raise ValueError("PortfolioPlan cluster IDs must be unique.")
+        if set(self.cluster_order) != set(clusters_by_id):
+            raise ValueError("cluster_order must contain every cluster exactly once.")
+        if set(self.task_order) != task_ids or len(self.task_order) != len(task_ids):
+            raise ValueError("task_order must contain every task exactly once.")
+        members: dict[str, str] = {}
+        for cluster in self.clusters:
+            for task_id in cluster.task_ids:
+                if task_id in members:
+                    raise ValueError(f"task {task_id!r} belongs to multiple clusters.")
+                members[task_id] = cluster.cluster_id
+        if set(members) != task_ids:
+            raise ValueError("clusters must cover every planned task exactly once.")
+        if self.task_to_cluster != members:
+            raise ValueError("task_to_cluster must match cluster membership.")
+        if set(self.task_revisions) != task_ids:
+            raise ValueError("task_revisions must cover every planned task.")
+        if set(self.task_strategies) != task_ids:
+            raise ValueError("task_strategies must cover every planned task.")
+        return self
+
+
 class PackageMutation(BaseModel):
     """One package/version mutation within a multi-package proposal."""
 
@@ -2154,6 +2306,11 @@ class PackageMutation(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     package_name: str = Field(..., min_length=1)
+    manifest_path: str = Field(
+        default="package.json",
+        min_length=1,
+        description="Repository-relative package manifest containing the mutation.",
+    )
     target_version: str = Field(..., min_length=1)
     dependency_type: Literal[
         "dependencies",
@@ -2165,11 +2322,20 @@ class PackageMutation(BaseModel):
         "pnpm_overrides",
     ]
 
-    @field_validator("task_id", "package_name", "target_version", mode="before")
+    @field_validator("task_id", "package_name", "manifest_path", "target_version", mode="before")
     @classmethod
     def _normalize_package_mutation_text(cls, value: Any, info: Any) -> str:
         """Require trimmed package mutation text fields."""
-        return _trim_required_contract_text(value, info.field_name)
+        normalized = _trim_required_contract_text(value, info.field_name)
+        if info.field_name == "manifest_path":
+            normalized = normalized.replace("\\", "/")
+            if (
+                normalized.startswith("/")
+                or PureWindowsPath(normalized).drive
+                or ".." in normalized.split("/")
+            ):
+                raise ValueError("manifest_path must be repository-relative and traversal-free.")
+        return normalized
 
     @field_validator("dependency_type", mode="before")
     @classmethod
@@ -2184,6 +2350,7 @@ class MultiPackageAction(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     cluster_id: str | None = None
+    dispatch_batch_id: str | None = None
     selected_strategy: TacticalStrategy
     package_mutations: list[PackageMutation] = Field(
         ...,
@@ -2192,11 +2359,11 @@ class MultiPackageAction(BaseModel):
     )
     rationale: str = Field(..., min_length=1)
 
-    @field_validator("cluster_id", mode="before")
+    @field_validator("cluster_id", "dispatch_batch_id", mode="before")
     @classmethod
-    def _normalize_action_cluster_id(cls, value: Any) -> str | None:
-        """Normalize an optional cluster identifier."""
-        return _trim_optional_contract_text(value, "cluster_id")
+    def _normalize_action_provenance(cls, value: Any, info: Any) -> str | None:
+        """Normalize optional cluster and dispatch-batch provenance."""
+        return _trim_optional_contract_text(value, info.field_name)
 
     @field_validator("selected_strategy", mode="before")
     @classmethod
@@ -2262,6 +2429,7 @@ class SupervisorDecision(BaseModel):
     )
 
     next_node: Literal[
+        "portfolio",
         "update_subagent",
         "workaround_subagent",
         "qa_critic",
@@ -2289,6 +2457,8 @@ class SupervisorDecision(BaseModel):
             "One to ten entries for direct/batch update_subagent callers; Supervisor routing currently sends one."
         ),
     )
+    cluster_id: str | None = Field(default=None)
+    multi_package_action: MultiPackageAction | None = Field(default=None)
     unfixable_task_ids: list[str] = Field(
         default_factory=list,
         description="Task IDs that have hit MAX_RETRIES and should be marked unfixable.",
@@ -2355,6 +2525,22 @@ class SupervisorDecision(BaseModel):
                 "update_subagent supports at most "
                 f"{MAX_MULTI_PACKAGE_ACTION_SIZE} target_task_ids, got {len(targets)}."
             )
+        if node == "portfolio" and (targets or self.cluster_id or self.multi_package_action):
+            raise ValueError("portfolio decisions must not carry dispatch targets or actions.")
+        if self.multi_package_action is not None:
+            if node != "update_subagent":
+                raise ValueError("multi_package_action is only valid for update_subagent.")
+            if self.multi_package_action.cluster_id is None:
+                raise ValueError("multi_package_action.cluster_id is required.")
+            if self.cluster_id != self.multi_package_action.cluster_id:
+                raise ValueError("cluster_id must match multi_package_action.cluster_id.")
+            action_task_ids = {
+                mutation.task_id for mutation in self.multi_package_action.package_mutations
+            }
+            if action_task_ids != set(targets):
+                raise ValueError("multi_package_action must cover exactly target_task_ids.")
+        if self.cluster_id is not None and node not in {"update_subagent", "qa_critic"}:
+            raise ValueError("cluster_id is only valid for update_subagent or qa_critic.")
         if node == "qa_critic" and len(targets) < 1:
             raise ValueError("qa_critic requires at least 1 target_task_id.")
         if node in {"final_full_scan", "teardown"} and targets:
@@ -2430,8 +2616,10 @@ class RemediationTask(BaseModel):
     A single unit of work in the Phase 5 task queue.
 
     Created by the supervisor from a ``VulnerabilityGroup`` and carried
-    through the orchestrator lifecycle.  Tasks are the primary key for
-    supervisor decisions, QA evaluations, and action summaries.
+    through the orchestrator lifecycle. Synthetic coordination tasks use the
+    same lifecycle while representing a related package without an active CVE.
+    Tasks are the primary key for supervisor decisions, QA evaluations, and
+    action summaries.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -2454,6 +2642,14 @@ class RemediationTask(BaseModel):
         ...,
         min_length=1,
         description="The ``VulnerabilityGroup.group_id`` this task remediates.",
+    )
+    is_synthetic: bool = Field(
+        default=False,
+        description=(
+            "True when this is a Supervisor-generated coordination task for a "
+            "package with no active CVE. Synthetic tasks retain the same audit and "
+            "atomic-dispatch lifecycle as finding-backed tasks."
+        ),
     )
     parent_task_id: str | None = Field(
         default=None,
@@ -2512,6 +2708,10 @@ class RemediationTask(BaseModel):
     selected_version: str | None = Field(
         default=None,
         description="Supervisor-selected version for the current update stage.",
+    )
+    selected_plan_issue_ids: list[str] = Field(
+        default_factory=list,
+        description="Issue IDs whose retained fix plans support the active strategy.",
     )
     exhausted_update_path: bool = Field(
         default=False,

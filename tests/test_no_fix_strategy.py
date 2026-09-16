@@ -44,7 +44,7 @@ from remediation_engine.orchestration.workaround_subagent import (
 
 def _group() -> VulnerabilityGroup:
     return VulnerabilityGroup(
-        group_id="sca:package.json:notevil:NO_FIX",
+        group_id="sca:package.json:notevil",
         issue_type=IssueType.SCA,
         vulnerable_component="notevil",
         file_path="package.json",

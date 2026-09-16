@@ -202,7 +202,7 @@ def test_trajectory_to_test_case_conversion() -> None:
 
     doc = TrajectoryDocument(
         trace_id="trace-abc",
-        initial_state={"valid_groups": [{"group_id": "sca:lodash:UPDATE_VERSION"}]},
+        initial_state={"valid_groups": [{"group_id": "sca:lodash"}]},
         spans=[span],
     )
 
@@ -211,7 +211,7 @@ def test_trajectory_to_test_case_conversion() -> None:
     assert "ACTIONABLE" in test_case.actual_output
     assert test_case.completion_time == 1.25
     assert test_case.context is not None
-    assert "sca:lodash:UPDATE_VERSION" in test_case.context[0]
+    assert "sca:lodash" in test_case.context[0]
     assert test_case.additional_metadata is not None
     assert test_case.additional_metadata["run_id"] == "triage-1"
 

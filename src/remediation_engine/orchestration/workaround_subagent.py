@@ -46,6 +46,7 @@ from remediation_engine.orchestration.subagent_runtime import (
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
+    select_package_fix_plan,
 )
 from remediation_engine.orchestration.tools_manifest import (
     _is_allowlisted_no_fix_package_file,
@@ -434,7 +435,7 @@ def _extract_vulnerability_mechanism(group: VulnerabilityGroup) -> str:
         if mechanism:
             return mechanism
 
-    fix_plan = getattr(group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(group).plan
     instruction = getattr(fix_plan, "instruction", None)
     if isinstance(instruction, str) and instruction.strip():
         return _clean_prompt_snippet(instruction, max_chars=600)
@@ -448,7 +449,7 @@ def _workaround_search_recommendation(
     previous_feedback: str | None,
 ) -> _SearchQueryRecommendation:
     """Build a first web query from the current remediation evidence."""
-    fix_plan = getattr(target_group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(target_group, target_task.strategy).plan
     plan_status = getattr(getattr(fix_plan, "status", None), "value", "")
     evidence_text = _workaround_evidence_text(workaround_context, previous_feedback)
     scanner_failure = any(
@@ -705,7 +706,7 @@ def _build_workaround_prompt(
 ) -> str:
     """Build the dynamic human context for one workaround attempt."""
     constraints_ledger = list(constraints_ledger or [])
-    fix_plan = getattr(target_group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(target_group, target_task.strategy).plan
     vulnerability_mechanism = (
         _clean_prompt_snippet(vulnerability_mechanism, max_chars=600)
         if vulnerability_mechanism
@@ -1021,6 +1022,9 @@ def _build_attempt_result(
             attempt_id=snapshot.attempt_id,
             task_id=snapshot.task_id,
             task_revision=snapshot.task_revision,
+            cluster_id=snapshot.cluster_id,
+            dispatch_batch_id=snapshot.dispatch_batch_id,
+            action_digest=snapshot.action_digest,
             status=tagged_summary.status,
             changed_files=changed_files,
             action_summary=tagged_summary,

@@ -37,10 +37,12 @@ from .tools_edit import (
 from .tools_manifest import (
     _is_allowlisted_no_fix_package_file,
     _is_prohibited_target,
+    _make_apply_committed_multi_package_action_tool,
     _make_modify_and_validate_npm_dependency_tool,
     _make_remove_no_fix_dependency_tool,
     _package_checkpoint_paths,
     _PackageCheckpoint,
+    apply_multi_package_action,
     rollback_pending_package_updates,
 )
 from .tools_validation import (
@@ -92,6 +94,41 @@ def build_update_toolbelt(
         ),
     ]
     return toolbelt
+
+
+def build_multi_package_update_toolbelt(
+    sandbox: DockerSandbox,
+    touched_files: set[str],
+    action: Any,
+    execution_state: dict[str, Any] | None = None,
+    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+) -> list:
+    """Build the single committed-action toolbelt for a package cluster.
+
+    The returned tool exposes no mutation arguments to the LLM. It closes over
+    the already validated ``MultiPackageAction`` and delegates to the
+    deterministic atomic executor when called.
+
+    Args:
+        sandbox: Running Docker workspace sandbox.
+        touched_files: Mutable changed-file projection for the worker result.
+        action: Supervisor-validated multi-package action.
+        execution_state: Mutable per-worker execution state.
+        package_checkpoints: Optional store retaining the successful union
+            checkpoint until the worker result is accepted.
+
+    Returns:
+        A one-tool list for the bounded update-subagent loop.
+    """
+    return [
+        _make_apply_committed_multi_package_action_tool(
+            sandbox,
+            action,
+            touched_files,
+            execution_state=execution_state,
+            package_checkpoints=package_checkpoints,
+        )
+    ]
 
 
 def build_workaround_toolbelt(
@@ -209,7 +246,9 @@ def build_workaround_toolbelt(
 
 __all__ = [
     "build_update_toolbelt",
+    "build_multi_package_update_toolbelt",
     "build_workaround_toolbelt",
+    "apply_multi_package_action",
     "_apply_replacements_to_content",
     "_make_deterministic_apply_edit_set_tool",
     "_make_deterministic_replace_ast_symbol_tool",

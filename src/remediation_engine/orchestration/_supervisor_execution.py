@@ -65,6 +65,9 @@ from remediation_engine.orchestration.task_utils import (
 from remediation_engine.orchestration.task_utils import (
     build_no_fix_retry_instruction as _default_build_no_fix_retry_instruction,
 )
+from remediation_engine.orchestration.task_utils import (
+    select_package_fix_plan as _default_select_package_fix_plan,
+)
 
 _logger = logging.getLogger(__name__)
 _dependencies: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
@@ -337,6 +340,7 @@ def _impl__validate_committed_state(
             and snapshot.target_package_name == task.target_package_name
             and snapshot.target_dependency_type == task.target_dependency_type
             and snapshot.parent_minimum_version == task.parent_minimum_version
+            and snapshot.selected_plan_issue_ids == task.selected_plan_issue_ids
             and snapshot.instruction == task.instruction
             and snapshot.instruction_digest == _instruction_digest(task.instruction)
             and (
@@ -365,6 +369,7 @@ def _impl__validate_committed_state(
                 "target_package_name": snapshot.target_package_name,
                 "target_dependency_type": snapshot.target_dependency_type,
                 "parent_minimum_version": snapshot.parent_minimum_version,
+                "selected_plan_issue_ids": list(snapshot.selected_plan_issue_ids),
                 "instruction": snapshot.instruction,
             }
         )
@@ -490,6 +495,7 @@ def _impl__validate_committed_state(
             or snapshot.no_fix_stage != task.no_fix_stage
             or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
+            or snapshot.selected_plan_issue_ids != task.selected_plan_issue_ids
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
         ):
@@ -658,6 +664,7 @@ def _impl__normalize_target_task_ids_for_node(
     task_queue: dict[str, RemediationTask],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     group_by_id: dict[str, VulnerabilityGroup] | None = None,
+    allow_cluster: bool = False,
 ) -> list[str]:
     """Clamp returned active targets to the lifecycle state accepted by next_node."""
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
@@ -666,14 +673,22 @@ def _impl__normalize_target_task_ids_for_node(
             task_queue,
             preferred_ids=target_task_ids,
             group_by_id=group_by_id,
-            limit=_dependency("QA_DISPATCH_LIMIT", _DEFAULT_QA_DISPATCH_LIMIT),
+            limit=(
+                None
+                if allow_cluster
+                else _dependency("QA_DISPATCH_LIMIT", _DEFAULT_QA_DISPATCH_LIMIT)
+            ),
         )
     if next_node == "update_subagent":
         return _proxy_update_worker_task_ids(
             task_queue,
             retry_diagnostics_by_task,
             preferred_ids=target_task_ids,
-            limit=_dependency("UPDATE_DISPATCH_LIMIT", _DEFAULT_UPDATE_DISPATCH_LIMIT),
+            limit=(
+                None
+                if allow_cluster
+                else _dependency("UPDATE_DISPATCH_LIMIT", _DEFAULT_UPDATE_DISPATCH_LIMIT)
+            ),
             group_by_id=group_by_id,
         )
     if next_node == "workaround_subagent":
@@ -728,7 +743,7 @@ def _impl__constraint_entry_for_task(
 ) -> str:
     """Build a deterministic constraints-ledger entry for a QA-passed task."""
     component = (group.vulnerable_component or task.parent_group_id).strip()
-    fix_plan = group.fix_plan
+    fix_plan = _default_select_package_fix_plan(group, task.strategy).plan
 
     if task.strategy == RoutingStrategy.VERSION_BUMP:
         fixed_version = (fix_plan.fixed_version if fix_plan else None) or "unknown"

@@ -9,9 +9,10 @@ group_issues(issues)          â†’ List[VulnerabilityGroup]
 
 Design
 ------
-SCA grouping key: "sca:{manifest_file}:{package_name or purl}:{fix_strategy}"
-    * Multiple CVEs affecting the same component are grouped only when the
-      remediation strategy also matches (UPDATE_VERSION / WORKAROUND / NO_FIX).
+SCA grouping key: "sca:{manifest_file}:{package_name or purl}"
+    * Multiple CVEs affecting the same package occurrence are grouped together;
+      remediation strategy is retained as per-issue evidence rather than group
+      identity.
     * Duplicate CVE on the same component â†’ deduplicated.
     * Cross-tool duplicates (Semgrep SCA + ODC) with the same CVE + package +
       file â†’ merged into one group; sources list is unioned.
@@ -41,6 +42,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    PackageFixPlanCandidate,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -75,22 +77,12 @@ def _component_from_issue(issue: VulnerabilityIssue) -> str:
     return issue.package_name or package_name_from_purl(issue.purl) or "unknown"
 
 
-def _fix_strategy_bucket(fix_plan: FixPlan) -> str:
-    """Collapse planner outcomes into the grouping strategies used by SCA buckets."""
-    if fix_plan.status == FixPlanStatus.VERSION_FOUND:
-        return "UPDATE_VERSION"
-    if fix_plan.status == FixPlanStatus.WORKAROUND_FOUND:
-        return "WORKAROUND"
-    return "NO_FIX"
-
-
-def _sca_key(localized_issue: LocalizedIssue, fix_plan: FixPlan) -> str:
-    """Return the normalised grouping key for an SCA issue + plan pair."""
+def _sca_key(localized_issue: LocalizedIssue) -> str:
+    """Return the normalised package-occurrence key for an SCA issue."""
     issue = localized_issue.issue
     component = _component_from_issue(issue)
     file_part = localized_issue.manifest_file or issue.file_path or ""
-    strategy_part = _fix_strategy_bucket(fix_plan)
-    return f"sca:{file_part}:{component}:{strategy_part}"
+    return f"sca:{file_part}:{component}"
 
 
 def _parent_contexts(
@@ -262,40 +254,62 @@ def _merge_workaround_snippets(
 def _build_group_fix_plan(
     pairs: list[tuple[LocalizedIssue, FixPlan]],
 ) -> FixPlan | None:
-    """Create the unified group-level FixPlan for one SCA bucket."""
+    """Create a compatibility summary for one package-level SCA bucket.
+
+    The complete issue-level plans are retained separately in
+    ``VulnerabilityGroup.fix_plan_candidates``.  This summary is intentionally
+    kept for older consumers that still display ``group.fix_plan``; Supervisor
+    strategy selection must use the retained candidates instead.
+    """
     if not pairs:
         return None
 
-    strategy_bucket = _fix_strategy_bucket(pairs[0][1])
-    exemplar_plan = pairs[0][1]
+    version_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.VERSION_FOUND]
+    workaround_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.WORKAROUND_FOUND]
 
-    if strategy_bucket == "UPDATE_VERSION":
-        best_version, best_plan = _highest_fixed_version(pairs)
-        plan_source = best_plan or exemplar_plan
+    if version_pairs:
+        best_version, best_plan = _highest_fixed_version(version_pairs)
+        plan_source = best_plan or version_pairs[0][1]
         return plan_source.model_copy(
             update={
                 "fixed_version": best_version,
                 "workaround_snippets": None,
-                "strategy_used": strategy_bucket,
+                "strategy_used": "UPDATE_VERSION",
             }
         )
 
-    if strategy_bucket == "WORKAROUND":
+    if workaround_pairs:
+        exemplar_plan = workaround_pairs[0][1]
         return exemplar_plan.model_copy(
             update={
                 "fixed_version": None,
-                "workaround_snippets": _merge_workaround_snippets(pairs),
-                "strategy_used": strategy_bucket,
+                "workaround_snippets": _merge_workaround_snippets(workaround_pairs),
+                "strategy_used": "WORKAROUND",
             }
         )
 
-    return exemplar_plan.model_copy(
+    return pairs[0][1].model_copy(
         update={
             "fixed_version": None,
             "workaround_snippets": None,
-            "strategy_used": strategy_bucket,
+            "strategy_used": "NO_FIX",
         }
     )
+
+
+def _build_fix_plan_candidates(
+    pairs: list[tuple[LocalizedIssue, FixPlan]],
+) -> list[PackageFixPlanCandidate]:
+    """Retain unique issue-level plans in deterministic order."""
+    candidates: dict[tuple[str, str], PackageFixPlanCandidate] = {}
+    for localized_issue, plan in pairs:
+        issue_id = localized_issue.issue.id
+        key = (str(issue_id), plan.model_dump_json())
+        candidates.setdefault(
+            key,
+            PackageFixPlanCandidate(issue_id=issue_id, plan=plan),
+        )
+    return [candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1]))]
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +323,8 @@ def _group_sca(
     """Return a dict of group_id â†’ VulnerabilityGroup for SCA issue + plan pairs."""
     buckets: dict[str, list[tuple[LocalizedIssue, FixPlan]]] = defaultdict(list)
     for pair in issue_plans:
-        localized_issue, fix_plan = pair
-        key = _sca_key(localized_issue, fix_plan)
+        localized_issue, _ = pair
+        key = _sca_key(localized_issue)
         buckets[key].append(pair)
 
     groups: dict[str, VulnerabilityGroup] = {}
@@ -345,6 +359,7 @@ def _group_sca(
         rep = _choose_representative_from_pairs(members)
         component = _component_from_issue(rep)
         group_fix_plan = _build_group_fix_plan(members)
+        fix_plan_candidates = _build_fix_plan_candidates(members)
         group_file_paths = _dedupe_paths(
             [
                 localized_issue.manifest_file or localized_issue.issue.file_path
@@ -408,6 +423,7 @@ def _group_sca(
             representative_issue_id=rep.id,
             issues=member_issues,
             localized_issues=localized_members,
+            fix_plan_candidates=fix_plan_candidates,
             fix_plan=group_fix_plan,
         )
 

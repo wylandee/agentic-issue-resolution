@@ -567,10 +567,22 @@ def _build_context(
     run_ended_at: datetime | None = None,
 ) -> ReportContext:
     """Normalize graph state into the renderer's evidence contract."""
-    initial_groups = _items(state.get("initial_valid_groups"))
+    initial_groups = [
+        group
+        for group in _items(state.get("initial_valid_groups"))
+        if not bool(_value(group, "is_synthetic"))
+    ]
     if not initial_groups:
-        initial_groups = _items(state.get("valid_groups"))
-    final_groups = _items(state.get("valid_groups"))
+        initial_groups = [
+            group
+            for group in _items(state.get("valid_groups"))
+            if not bool(_value(group, "is_synthetic"))
+        ]
+    final_groups = [
+        group
+        for group in _items(state.get("valid_groups"))
+        if not bool(_value(group, "is_synthetic"))
+    ]
     task_queue = _mapping(state.get("task_queue"))
     initial_group_ids = {_text(_value(group, "group_id")) for group in initial_groups}
     all_groups = initial_groups + [

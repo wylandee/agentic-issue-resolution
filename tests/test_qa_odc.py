@@ -131,7 +131,7 @@ def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp
 def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
     """Workaround QA must not inherit a stale baseline group version."""
     group = _make_group(
-        group_id="sca:package.json:express-jwt:code_workaround",
+        group_id="sca:package.json:express-jwt",
     ).model_copy(
         update={
             "vulnerable_component": "express-jwt",
@@ -163,7 +163,7 @@ def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
 def test_qa_target_uses_attempt_execution_version_when_task_selection_was_cleared() -> None:
     """QA must not revert a successful update attempt to the original baseline version."""
     group = _make_group(
-        group_id="sca:package.json:sanitize-html:version_bump",
+        group_id="sca:package.json:sanitize-html",
     ).model_copy(
         update={
             "vulnerable_component": "sanitize-html",

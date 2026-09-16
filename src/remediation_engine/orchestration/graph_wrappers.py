@@ -11,22 +11,26 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, Literal
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     FailureCategory,
+    MultiPackageAction,
     QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     StateConsistencyEvent,
 )
+from remediation_engine.orchestration import qa_test_parsing as _qa_test_parsing
+from remediation_engine.orchestration.portfolio_orchestrator import isolate_delta_failure
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
     initial_workaround_subagent_state,
 )
+from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +82,67 @@ def _dispatch_boundary_rejection(
     snapshots = state.get("attempt_snapshots_by_id") or {}
     errors: list[str] = []
     events: list[StateConsistencyEvent] = []
+    active_cluster_id = state.get("active_cluster_id")
+    active_batch_id = state.get("active_dispatch_batch_id")
+    active_action = state.get("active_multi_package_action")
+    active_action_digest = (
+        _graph_module().instruction_digest(active_action.model_dump_json())
+        if isinstance(active_action, MultiPackageAction)
+        else None
+    )
+    if active_cluster_id and len(target_tasks) < 2:
+        details = "An atomic cluster dispatch must contain every active leaf task."
+        errors.append(f"graph: rejected {expected_node} dispatch: {details}")
+        events.append(
+            StateConsistencyEvent(
+                error_code="CLUSTER_TARGET_SET_INCOMPLETE",
+                action="rejected",
+                details=details,
+            )
+        )
+    if active_cluster_id:
+        target_ids = {task.task_id for task in target_tasks}
+        action_ids = (
+            {mutation.task_id for mutation in active_action.package_mutations}
+            if isinstance(active_action, MultiPackageAction)
+            else set()
+        )
+        if not isinstance(active_action, MultiPackageAction):
+            details = "Atomic cluster dispatch has no validated Supervisor action."
+            errors.append(f"graph: rejected {expected_node} dispatch: {details}")
+            events.append(
+                StateConsistencyEvent(
+                    error_code="CLUSTER_ACTION_MISSING",
+                    action="rejected",
+                    details=details,
+                )
+            )
+        elif (
+            active_action.cluster_id != active_cluster_id
+            or active_action.dispatch_batch_id != active_batch_id
+        ):
+            details = (
+                "Atomic cluster action provenance does not match the active Supervisor "
+                "cluster or dispatch batch."
+            )
+            errors.append(f"graph: rejected {expected_node} dispatch: {details}")
+            events.append(
+                StateConsistencyEvent(
+                    error_code="CLUSTER_ACTION_PROVENANCE_MISMATCH",
+                    action="rejected",
+                    details=details,
+                )
+            )
+        elif action_ids != target_ids:
+            details = "Atomic cluster target IDs must exactly match the committed action mutations."
+            errors.append(f"graph: rejected {expected_node} dispatch: {details}")
+            events.append(
+                StateConsistencyEvent(
+                    error_code="CLUSTER_TARGET_SET_MISMATCH",
+                    action="rejected",
+                    details=details,
+                )
+            )
     for task in target_tasks:
         attempt_id = task.current_attempt_id
         snapshot = snapshots.get(attempt_id) if attempt_id else None
@@ -98,6 +163,16 @@ def _dispatch_boundary_rejection(
         elif task.qa_policy is None or snapshot.qa_policy is None:
             error_code = "DISPATCH_SNAPSHOT_CONTRADICTION"
             details = "Task and committed attempt disagree because QA policy provenance is missing."
+        elif active_cluster_id and (
+            snapshot.cluster_id != active_cluster_id
+            or snapshot.dispatch_batch_id != active_batch_id
+            or (active_action_digest is not None and snapshot.action_digest != active_action_digest)
+        ):
+            error_code = "CLUSTER_SNAPSHOT_MISMATCH"
+            details = "Task snapshot cluster, batch, or action provenance does not match Supervisor state."
+        elif active_cluster_id and expected_node == "update_subagent" and active_action is None:
+            error_code = "CLUSTER_ACTION_MISSING"
+            details = "Atomic update dispatch has no Supervisor-committed multi-package action."
         elif (
             snapshot.task_id != task.task_id
             or snapshot.task_revision != task.task_revision
@@ -105,6 +180,10 @@ def _dispatch_boundary_rejection(
             or snapshot.no_fix_stage != task.no_fix_stage
             or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
+            or (
+                snapshot.selected_plan_issue_ids
+                and snapshot.selected_plan_issue_ids != task.selected_plan_issue_ids
+            )
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _graph_module().instruction_digest(task.instruction)
             or (
@@ -148,7 +227,10 @@ def _dispatch_boundary_rejection(
     }
 
 
-def _workspace_snapshot_id(target_tasks: list[RemediationTask]) -> str | None:
+def _workspace_snapshot_id(
+    target_tasks: list[RemediationTask],
+    snapshots_by_id: Mapping[str, Any] | None = None,
+) -> str | None:
     """Return the stable workspace snapshot ID for one worker dispatch.
 
     Supervisor dispatch normally contains one task, so its committed attempt
@@ -165,6 +247,31 @@ def _workspace_snapshot_id(target_tasks: list[RemediationTask]) -> str | None:
     )
     if not attempt_ids or len(attempt_ids) != len(target_tasks):
         return None
+    if snapshots_by_id is not None:
+        snapshots = [snapshots_by_id.get(task.current_attempt_id) for task in target_tasks]
+        if any(snapshot is None for snapshot in snapshots):
+            return None
+        batch_ids = {
+            snapshot.dispatch_batch_id
+            for snapshot in snapshots
+            if snapshot is not None and snapshot.dispatch_batch_id
+        }
+        cluster_ids = {
+            snapshot.cluster_id
+            for snapshot in snapshots
+            if snapshot is not None and snapshot.cluster_id
+        }
+        if any(snapshot is not None and snapshot.cluster_id for snapshot in snapshots):
+            if (
+                len(cluster_ids) != 1
+                or len(batch_ids) != 1
+                or any(
+                    snapshot is None or not snapshot.cluster_id or not snapshot.dispatch_batch_id
+                    for snapshot in snapshots
+                )
+            ):
+                return None
+            return next(iter(batch_ids))
     if len(attempt_ids) == 1:
         return f"attempt-{attempt_ids[0]}"
     digest = hashlib.sha256("\n".join(attempt_ids).encode("utf-8")).hexdigest()[:24]
@@ -182,7 +289,10 @@ def _create_workspace_attempt_snapshot(
     authoritative attempt map is absent or contradictory.
     """
     workspace_volume = state.get("workspace_volume")
-    snapshot_id = _workspace_snapshot_id(target_tasks)
+    snapshot_id = _workspace_snapshot_id(
+        target_tasks,
+        state.get("attempt_snapshots_by_id") if "attempt_snapshots_by_id" in state else None,
+    )
     if not workspace_volume or snapshot_id is None:
         return None, []
 
@@ -267,6 +377,87 @@ def _restore_workspace_snapshot(
         log.exception("Retained workspace snapshot restore failed for %s.", snapshot_id)
         return [message]
     return []
+
+
+def run_delta_isolation_canaries(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    action: MultiPackageAction,
+    qa_probe: Callable[[Any, MultiPackageAction], Literal["PASS", "FAIL", "INCONCLUSIVE"]],
+) -> dict[str, Any]:
+    """Run bounded subset canaries against a shared Docker baseline.
+
+    ``qa_probe`` is an injected deterministic QA adapter. Every invocation is
+    restored to the same baseline before and after the committed mutation
+    subset, and restore failures are reported as inconclusive.
+    """
+    task_ids = tuple(sorted(task.task_id for task in target_tasks))
+    workspace_volume = state.get("workspace_volume")
+    if len(task_ids) <= 1 or not workspace_volume:
+        return {
+            "status": "INCONCLUSIVE",
+            "diagnostic": "delta isolation requires a cluster workspace",
+        }
+    baseline_id = (
+        "delta-baseline-"
+        + hashlib.sha256(f"{action.cluster_id}:{','.join(task_ids)}".encode()).hexdigest()[:24]
+    )
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    snapshot_id = _workspace_snapshot_id(target_tasks, snapshots)
+    if snapshot_id is None:
+        return {"status": "INCONCLUSIVE", "diagnostic": "cluster attempt metadata is incomplete"}
+    try:
+        with _graph_module().DockerSandbox(
+            repo_root=None, workspace_volume=workspace_volume
+        ) as sandbox:
+            sandbox.create_workspace_snapshot(baseline_id)
+
+            def probe(subset: tuple[str, ...]) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
+                mutations = [
+                    mutation for mutation in action.package_mutations if mutation.task_id in subset
+                ]
+                subset_action = action.model_copy(update={"package_mutations": mutations})
+                outcome: Literal["PASS", "FAIL", "INCONCLUSIVE"] = "INCONCLUSIVE"
+                try:
+                    sandbox.restore_workspace_snapshot(baseline_id)
+                    touched_files: set[str] = set()
+                    applied, _error = apply_multi_package_action(
+                        sandbox,
+                        subset_action,
+                        touched_files,
+                    )
+                    outcome = "INCONCLUSIVE" if not applied else qa_probe(sandbox, subset_action)
+                except Exception:  # noqa: BLE001 - canary infrastructure is inconclusive
+                    outcome = "INCONCLUSIVE"
+                finally:
+                    try:
+                        sandbox.restore_workspace_snapshot(baseline_id)
+                    except Exception:
+                        # A canary that cannot restore its shared baseline is
+                        # never safe to attribute. The outer cleanup still
+                        # gets a chance to report/remove the baseline archive.
+                        outcome = "INCONCLUSIVE"
+                return outcome
+
+            isolation = isolate_delta_failure(task_ids, probe)
+            try:
+                sandbox.restore_workspace_snapshot(baseline_id)
+                sandbox.remove_workspace_snapshot(baseline_id)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "status": "INCONCLUSIVE",
+                    "diagnostic": f"delta baseline cleanup failed: {exc}",
+                    "executions": isolation.executions,
+                }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "INCONCLUSIVE", "diagnostic": f"delta isolation unavailable: {exc}"}
+    return {
+        "status": isolation.status,
+        "responsible_task_ids": list(isolation.responsible_task_ids),
+        "tested_subsets": [list(subset) for subset in isolation.tested_subsets],
+        "executions": isolation.executions,
+        "diagnostic": isolation.diagnostic,
+    }
 
 
 def _workspace_rollback_anchor_ids(
@@ -399,7 +590,7 @@ def _has_partial_update_success(
     dispatches one task at a time; this exception is restricted to a complete
     update-only batch without retained QA rollback anchors.
     """
-    if result.get("errors") or len(target_tasks) < 2:
+    if result.get("errors") or len(target_tasks) < 2 or state.get("active_cluster_id"):
         return False
     if _workspace_rollback_anchor_ids(state, target_tasks):
         return False
@@ -540,8 +731,14 @@ def _finalize_qa_workspace_snapshot(
             for snapshot in candidate_snapshots
         )
     )
+    atomic_cluster = bool(
+        len(target_tasks) > 1
+        and candidate_snapshots
+        and all(snapshot is not None and snapshot.cluster_id for snapshot in candidate_snapshots)
+    )
     has_regression = False
     has_non_remediation_rerun = False
+    has_real_failure = False
     for task in target_tasks:
         evaluation = evaluations.get(task.task_id)
         if evaluation is None:
@@ -552,6 +749,7 @@ def _finalize_qa_workspace_snapshot(
                 # QA rerun; this is not a candidate rejection.
                 has_non_remediation_rerun = True
                 continue
+            has_real_failure = True
             if workaround_attempt:
                 return restore_failed_workaround()
             evidence = evaluation.failure_evidence
@@ -561,6 +759,14 @@ def _finalize_qa_workspace_snapshot(
             if not is_regression:
                 return restore_failed_update()
             has_regression = True
+    if atomic_cluster:
+        if has_real_failure:
+            # A cluster is one acceptance unit. No member may retain a partial
+            # candidate after any real QA rejection.
+            return restore_failed_update()
+        if has_non_remediation_rerun:
+            return []
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
     if update_candidate and has_regression:
         # The next Supervisor decision may dispatch a workaround child. The
         # child creates its own checkpoint from this retained candidate, while
@@ -724,6 +930,9 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         previous_action_summaries_by_task=latest_action_summary_by_task,
         retry_diagnostics_by_task=dict(state.get("retry_diagnostics_by_task", {})),
         target_attempt_snapshots=target_attempt_snapshots,
+        active_cluster_id=state.get("active_cluster_id"),
+        dispatch_batch_id=state.get("active_dispatch_batch_id"),
+        multi_package_action=state.get("active_multi_package_action"),
     )
 
     workspace_snapshot_id, snapshot_errors = _create_workspace_attempt_snapshot(
@@ -891,6 +1100,55 @@ def run_workaround_subagent_from_orchestrator(
     return out
 
 
+def _maybe_run_delta_isolation(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Run canary attribution when a cluster test failure is ambiguous."""
+    if len(target_tasks) <= 1 or state.get("active_multi_package_action") is None:
+        return None
+    evaluations = result.get("qa_evaluations") or {}
+    if not evaluations:
+        return None
+    if any(
+        evaluation.failure_category == FailureCategory.PEER_CONFLICT
+        for evaluation in evaluations.values()
+    ):
+        return None
+    gates = [evaluation.deterministic_gates for evaluation in evaluations.values()]
+    if any(gate is None or not gate.install_passed for gate in gates):
+        return None
+    if any(gate.scanner_execution_status.value not in {"success", "skipped"} for gate in gates):
+        return None
+    if not any(
+        gate.tests_passed is False
+        and (
+            evaluation.test_attribution is None
+            or evaluation.test_attribution.verdict.value == "inconclusive"
+        )
+        for evaluation, gate in zip(evaluations.values(), gates, strict=False)
+    ):
+        return None
+
+    def qa_probe(
+        sandbox: Any, _action: MultiPackageAction
+    ) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
+        install = _qa_test_parsing._run_install(sandbox)
+        if not install.ok:
+            return "INCONCLUSIVE"
+        tests = _qa_test_parsing._run_unit_tests(sandbox)
+        return "PASS" if tests.ok else "FAIL"
+
+    isolation = run_delta_isolation_canaries(
+        state,
+        target_tasks,
+        state["active_multi_package_action"],
+        qa_probe,
+    )
+    return isolation
+
+
 def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
     Run the QA Critic against the current OrchestratorState.
@@ -974,8 +1232,9 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             "valid_groups": scoped_groups,
         }
 
-    workspace_snapshot_id = (
-        _workspace_snapshot_id(target_tasks) if "attempt_snapshots_by_id" in state else None
+    workspace_snapshot_id = _workspace_snapshot_id(
+        target_tasks,
+        state.get("attempt_snapshots_by_id") if "attempt_snapshots_by_id" in state else None,
     )
     try:
         result = _graph_module().run_qa_critic_node(scoped_state)
@@ -999,6 +1258,26 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
                 restore=True,
             )
         raise
+    delta_isolation = _maybe_run_delta_isolation(state, target_tasks, result)
+    if delta_isolation is not None:
+        result = {**result, "delta_isolation": delta_isolation}
+        if delta_isolation.get("status") == "INCONCLUSIVE":
+            result["qa_evaluations"] = {
+                task_id: (
+                    evaluation.model_copy(
+                        update={
+                            "evidence_inconclusive": True,
+                            "retry_feedback": (
+                                f"Delta-isolation QA was inconclusive: "
+                                f"{delta_isolation.get('diagnostic', 'unknown reason')}."
+                            ),
+                        }
+                    )
+                    if not evaluation.passed
+                    else evaluation
+                )
+                for task_id, evaluation in (result.get("qa_evaluations") or {}).items()
+            }
     snapshot_cleanup_errors = _finalize_qa_workspace_snapshot(
         state,
         target_tasks,
@@ -1074,6 +1353,17 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         "status": result.get("status", "qa_completed"),
         "errors": list(result.get("errors", []) or []) + snapshot_cleanup_errors,
     }
+    if delta_isolation is not None:
+        out["delta_isolation_by_cluster"] = {
+            str(state.get("active_cluster_id") or "unknown"): delta_isolation
+        }
+        if delta_isolation.get("status") == "IDENTIFIED":
+            out["portfolio_escalation"] = {
+                "reason": "DELTA_ISOLATION_ATTRIBUTION",
+                "forced_singleton_task_ids": list(delta_isolation.get("responsible_task_ids", [])),
+            }
+            out["portfolio_dirty"] = True
+            out["portfolio_plan"] = None
     qa_results_by_attempt: dict[str, QAAttemptResult] = {}
     task_queue = state.get("task_queue", {})
     evaluations = result.get("qa_evaluations", {}) or {}
@@ -1107,6 +1397,9 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             attempt_id=attempt_id,
             task_id=task_id,
             task_revision=task.task_revision,
+            cluster_id=attempt_snapshot.cluster_id,
+            dispatch_batch_id=attempt_snapshot.dispatch_batch_id,
+            action_digest=attempt_snapshot.action_digest,
             qa_policy=attempt_policy,
             qa_policy_source="attempt_snapshot",
             evaluation=evaluation,

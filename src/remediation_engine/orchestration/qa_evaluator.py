@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
+    RoutingStrategy,
     ScannerExecutionStatus,
     ScratchpadScope,
     SecurityReviewVerdict,
@@ -44,6 +45,7 @@ from .qa_types import (
     _scan_result_value,
     _validate_qa_path,
 )
+from .task_utils import select_package_fix_plan
 
 logger = logging.getLogger(__name__)
 
@@ -551,7 +553,11 @@ def _build_qa_dynamic_context(
     qa_policy: QAPolicy | None = None,
 ) -> str:
     """Build task-owned facts appended to the static evaluator prompt."""
-    fix_plan = group.fix_plan
+    current_strategy = (
+        RoutingStrategy(strategy) if strategy in {item.value for item in RoutingStrategy} else None
+    )
+    selection = select_package_fix_plan(group, current_strategy)
+    fix_plan = selection.plan
     fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
     fix_instruction = fix_plan.instruction if fix_plan else "(none)"
     cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"

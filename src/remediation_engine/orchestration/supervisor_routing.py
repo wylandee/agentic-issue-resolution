@@ -9,6 +9,7 @@ from remediation_engine.contracts.decision_codes import DecisionCode, validate_t
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     NoFixMitigationStage,
+    PortfolioPlan,
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
@@ -44,6 +45,80 @@ from remediation_engine.orchestration.supervisor_policy import (
 from remediation_engine.orchestration.task_utils import build_no_fix_retry_instruction
 
 logger = logging.getLogger(__name__)
+
+
+def _portfolio_cluster_targets(
+    portfolio_plan: PortfolioPlan | None,
+    task_queue: dict[str, RemediationTask],
+    *,
+    qa: bool,
+    preferred_ids: list[str] | None = None,
+) -> tuple[str | None, list[str]]:
+    """Return one ready cluster from the Supervisor-owned portfolio plan."""
+    if portfolio_plan is None:
+        return None, []
+    preferred = set(preferred_ids or [])
+    clusters_by_id = {cluster.cluster_id: cluster for cluster in portfolio_plan.clusters}
+    cluster_positions = {
+        cluster_id: position for position, cluster_id in enumerate(portfolio_plan.cluster_order)
+    }
+    has_cycle_fallback = any(
+        "cycle" in diagnostic.casefold() for diagnostic in portfolio_plan.diagnostics
+    )
+
+    def upstreams_terminal(cluster: Any) -> bool:
+        members = set(cluster.task_ids)
+        return all(
+            dependency.upstream_task_id in members
+            or task_queue.get(dependency.upstream_task_id) is None
+            or task_queue[dependency.upstream_task_id].status in _TERMINAL_STATUSES
+            or (
+                has_cycle_fallback
+                and cluster_positions.get(
+                    portfolio_plan.task_to_cluster.get(dependency.upstream_task_id, ""),
+                    -1,
+                )
+                > cluster_positions.get(cluster.cluster_id, -1)
+            )
+            for dependency in cluster.dependencies
+        )
+
+    ordered_cluster_ids = list(portfolio_plan.cluster_order)
+    if preferred:
+        preferred_cluster_ids = [
+            portfolio_plan.task_to_cluster[task_id]
+            for task_id in portfolio_plan.task_order
+            if task_id in preferred and task_id in portfolio_plan.task_to_cluster
+        ]
+        ordered_cluster_ids = list(dict.fromkeys(preferred_cluster_ids + ordered_cluster_ids))
+
+    for cluster_id in ordered_cluster_ids:
+        cluster = clusters_by_id.get(cluster_id)
+        if cluster is None or not upstreams_terminal(cluster):
+            continue
+        tasks = [task_queue.get(task_id) for task_id in cluster.task_ids]
+        if any(task is None for task in tasks):
+            continue
+        concrete_tasks = [task for task in tasks if task is not None]
+        if qa:
+            if all(task.status == TaskStatus.OPTIMISTICALLY_FIXED for task in concrete_tasks):
+                return cluster_id, list(cluster.task_ids)
+            continue
+        if any(
+            task.exhausted_update_path
+            or _has_existing_workaround_child(task, task_queue)
+            or _is_exhausted_update_pivot_candidate(task, None)
+            for task in concrete_tasks
+        ):
+            continue
+        if all(
+            task.status in _WORKABLE_STATUSES
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.current_attempt_id is None
+            for task in concrete_tasks
+        ):
+            return cluster_id, list(cluster.task_ids)
+    return None, []
 
 
 def _build_consistency_event(
@@ -113,6 +188,7 @@ def _deterministic_routing(
     triage_required: bool = False,
     workspace_volume: str | None = None,
     final_full_scan_completed: bool = False,
+    portfolio_plan: PortfolioPlan | None = None,
 ) -> SupervisorDecision:
     """
     Pure-Python routing used as the Supervisor's authoritative state machine.
@@ -167,6 +243,23 @@ def _deterministic_routing(
         group_by_id=group_by_id,
         limit=QA_DISPATCH_LIMIT,
     )
+    portfolio_cluster_id, portfolio_qa_targets = _portfolio_cluster_targets(
+        portfolio_plan,
+        task_queue,
+        qa=True,
+        preferred_ids=list(active_target_task_ids or []),
+    )
+    if portfolio_cluster_id and len(portfolio_qa_targets) > 1:
+        return SupervisorDecision(
+            decision_code=DecisionCode.QA_READY_BATCH,
+            next_node="qa_critic",
+            target_task_ids=portfolio_qa_targets,
+            cluster_id=portfolio_cluster_id,
+            instructions="Run QA atomically across the completed package cluster.",
+            decision_reason=(
+                f"All package tasks in cluster '{portfolio_cluster_id}' are ready for QA."
+            ),
+        )
     if current_status != "qa_completed" and current_task_qa_ready:
         return SupervisorDecision(
             decision_code=DecisionCode.QA_READY,
@@ -294,6 +387,24 @@ def _deterministic_routing(
             instructions="Pivot exhausted update remediation to workaround child tasks.",
             decision_reason=(
                 f"Retry diagnostics show {len(exhausted_retries)} update task(s) no longer have a remaining manifest-based update path."
+            ),
+        )
+
+    portfolio_cluster_id, portfolio_update_targets = _portfolio_cluster_targets(
+        portfolio_plan,
+        task_queue,
+        qa=False,
+    )
+    if portfolio_cluster_id and len(portfolio_update_targets) > 1:
+        return SupervisorDecision(
+            decision_code=DecisionCode.ATOMIC_CLUSTER_DISPATCH,
+            next_node="update_subagent",
+            target_task_ids=portfolio_update_targets,
+            cluster_id=portfolio_cluster_id,
+            instructions="Apply the committed package-cluster update atomically.",
+            decision_reason=(
+                f"Dispatching the next dependency cluster '{portfolio_cluster_id}' "
+                "after all upstream package groups completed."
             ),
         )
 

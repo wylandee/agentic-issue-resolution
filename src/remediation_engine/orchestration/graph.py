@@ -14,6 +14,8 @@ Phase 5 graph topology (hub-and-spoke)
       | workspace_ready / failed -> teardown
     supervisor  <-----------------------------------+
       |                                            |
+      +-> portfolio ------------------------------+
+      |                                            |
       +-> update_subagent ----------------------->-+
       |                                            |
       +-> workaround_subagent ------------------->-+
@@ -79,6 +81,7 @@ from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
 )
+from remediation_engine.orchestration.portfolio_orchestrator import build_portfolio_plan
 from remediation_engine.orchestration.qa_critic import (
     run_final_full_scan_node,
     run_qa_critic_node,
@@ -127,6 +130,8 @@ __all__ = [
     "post_qa_triage_node",
     "route_after_triage",
     "route_after_workspace_builder",
+    "route_after_portfolio",
+    "run_portfolio_node",
     "run_orchestrator",
     "triage_node",
     # Compatibility exports for the extracted wrapper implementation.
@@ -272,6 +277,13 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
         ],
         "sources": sorted(source.value for source in (group.sources or [])),
         "issues": sorted(_stable_issue_fingerprint(issue) for issue in (group.issues or [])),
+        "fix_plan_candidates": [
+            candidate.model_dump(mode="json")
+            for candidate in sorted(
+                group.fix_plan_candidates or [],
+                key=lambda candidate: str(candidate.issue_id),
+            )
+        ],
         "fix_plan": group.fix_plan.model_dump(mode="json") if group.fix_plan else None,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -484,6 +496,14 @@ def _reconcile_triaged_groups(
     for previous in previous_groups:
         if previous.group_id in candidate_ids:
             continue
+        if getattr(previous, "is_synthetic", False):
+            # Synthetic coordination groups do not have scanner identifiers,
+            # so a post-QA scan can never reconstitute them. Keep their stable
+            # package identity while the corresponding task remains part of
+            # the portfolio audit trail.
+            result.append(previous)
+            retained.append(previous.group_id)
+            continue
         matching_tasks = [
             (task_id, task)
             for task_id, task in task_queue.items()
@@ -637,6 +657,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
                     "qa_policy": fresh_task.qa_policy,
                     "strategy_stage": fresh_task.strategy_stage,
                     "selected_version": fresh_task.selected_version,
+                    "selected_plan_issue_ids": list(fresh_task.selected_plan_issue_ids),
                     "exhausted_update_path": False,
                     "instruction": fresh_task.instruction,
                     "status": TaskStatus.PENDING,
@@ -678,6 +699,8 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "task_queue": task_queue,
             "qa_evaluations": qa_evaluations,
             "active_target_task_ids": [],
+            "portfolio_dirty": work_reopened,
+            "portfolio_plan": None if work_reopened else state.get("portfolio_plan"),
             "final_full_scan_completed": False
             if work_reopened
             else state.get("final_full_scan_completed", False),
@@ -716,6 +739,68 @@ def route_after_workspace_builder(state: OrchestratorState) -> str:
     return "teardown"
 
 
+def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
+    """Build the deterministic package-group portfolio plan."""
+    try:
+        escalation = state.get("portfolio_escalation") or {}
+        peer_conflict_pairs = (
+            escalation.get("peer_conflict_pairs", []) if isinstance(escalation, dict) else []
+        )
+        forced_singletons = (
+            escalation.get("forced_singleton_task_ids", []) if isinstance(escalation, dict) else []
+        )
+        plan = build_portfolio_plan(
+            state["repo_root"],
+            state.get("valid_groups", []),
+            dict(state.get("task_queue", {}) or {}),
+            peer_conflict_pairs=peer_conflict_pairs,
+            forced_singleton_task_ids=forced_singletons,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
+        return {
+            "status": "portfolio_failed",
+            "next_routing_step": "teardown",
+            "portfolio_dirty": False,
+            "active_target_task_ids": [],
+            "errors": [f"portfolio node failed: {exc}"],
+        }
+    if any("multiple nonterminal tasks" in diagnostic for diagnostic in plan.diagnostics):
+        return {
+            "status": "portfolio_blocked",
+            "next_routing_step": "teardown",
+            "portfolio_plan": plan,
+            "portfolio_dirty": False,
+            "active_target_task_ids": [],
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+            "errors": [
+                "portfolio node blocked dispatch because a package group has multiple "
+                "nonterminal active tasks."
+            ],
+        }
+    return {
+        "status": "portfolio_ready",
+        "next_routing_step": "supervisor",
+        "portfolio_plan": plan,
+        "portfolio_dirty": False,
+        "portfolio_escalation": None,
+        "active_target_task_ids": [],
+        "active_cluster_id": None,
+        "active_dispatch_batch_id": None,
+        "active_multi_package_action": None,
+    }
+
+
+def route_after_portfolio(state: OrchestratorState) -> str:
+    """Return the safe route after portfolio planning."""
+    return (
+        "teardown"
+        if state.get("status") in {"portfolio_failed", "portfolio_blocked"}
+        else "supervisor"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 graph construction
 # ---------------------------------------------------------------------------
@@ -731,6 +816,7 @@ def build_orchestrator_graph():
     workflow.add_node("triage", post_qa_triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
     workflow.add_node("supervisor", run_supervisor_node)
+    workflow.add_node("portfolio", run_portfolio_node)
     workflow.add_node("update_subagent", run_update_subagent_from_orchestrator)
     workflow.add_node("workaround_subagent", run_workaround_subagent_from_orchestrator)
     workflow.add_node("qa_critic", run_qa_critic_from_orchestrator)
@@ -742,6 +828,7 @@ def build_orchestrator_graph():
     workflow.add_conditional_edges("initial_triage", route_after_triage)
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
     workflow.add_conditional_edges("supervisor", supervisor_router)
+    workflow.add_conditional_edges("portfolio", route_after_portfolio)
     workflow.add_edge("update_subagent", "supervisor")
     workflow.add_edge("workaround_subagent", "supervisor")
     workflow.add_edge("qa_critic", "supervisor")

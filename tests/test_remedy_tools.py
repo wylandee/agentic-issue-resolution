@@ -8,11 +8,17 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.contracts.schemas import (
+    CommandResult,
+    MultiPackageAction,
+    PackageMutation,
+    TacticalStrategy,
+)
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    build_multi_package_update_toolbelt,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
@@ -64,6 +70,54 @@ class TestToolbeltFactories:
         tools = _update_tool_map(sandbox)
 
         assert set(tools) == {"modify_and_validate_npm_dependency"}
+
+    def test_multi_package_update_toolbelt_exposes_only_committed_action(self):
+        sandbox = MagicMock()
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-1",
+                    package_name="lodash",
+                    manifest_path="package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-2",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep peer-related updates atomic.",
+        )
+        execution_state = {}
+
+        with patch(
+            "remediation_engine.orchestration.tools_manifest.apply_multi_package_action",
+            return_value=(True, ""),
+        ) as apply_action:
+            tools = build_multi_package_update_toolbelt(
+                sandbox,
+                set(),
+                action,
+                execution_state=execution_state,
+            )
+            tool_map = {tool.name: tool for tool in tools}
+            result = tool_map["apply_committed_multi_package_action"].invoke({})
+            repeated = tool_map["apply_committed_multi_package_action"].invoke({})
+
+        assert set(tool_map) == {"apply_committed_multi_package_action"}
+        assert result.startswith("SUCCESS:")
+        assert execution_state["multi_package_action_executed"] is True
+        assert execution_state["multi_package_action_succeeded"] is True
+        assert repeated.startswith("ERROR_CODE: MULTI_PACKAGE_ACTION_ALREADY_EXECUTED:")
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[:3] == (sandbox, action, set())
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -567,6 +621,38 @@ class TestModifyAndValidateNpmDependency:
         assert "npm pkg set" in edit_command
         assert "cd /workspace/frontend" in edit_command
         assert "npm install --package-lock-only --ignore-scripts" in sync_command
+
+    def test_nested_manifest_validates_its_own_lockfile_not_root_lockfile(self):
+        from remediation_engine.orchestration.tools_manifest import (
+            _PackageCheckpoint,
+            _verify_lockfile_mutations,
+        )
+
+        sandbox = MagicMock()
+        root_lock = '{"lockfileVersion": 3, "packages": {}}'
+        frontend_lock = (
+            '{"lockfileVersion": 3, "packages": {"node_modules/axios": {"version": "1.7.4"}}}'
+        )
+        sandbox.read_file.side_effect = lambda path: {
+            "package-lock.json": root_lock,
+            "frontend/package-lock.json": frontend_lock,
+        }.get(path)
+        checkpoint = _PackageCheckpoint(
+            files={
+                "package-lock.json": root_lock,
+                "frontend/package-lock.json": frontend_lock,
+            },
+            touched_files_before=set(),
+        )
+        mutation = PackageMutation(
+            task_id="task-1",
+            package_name="axios",
+            manifest_path="frontend/package.json",
+            target_version="1.7.4",
+            dependency_type="dependencies",
+        )
+
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
 
     def test_rejects_manifest_outside_allowed_batch_targets(self):
         sandbox = MagicMock()

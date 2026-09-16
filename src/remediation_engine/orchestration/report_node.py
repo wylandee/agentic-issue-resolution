@@ -293,6 +293,8 @@ def _report_groups(context: ReportContext) -> list[_ReportGroup]:
     groups: list[_ReportGroup] = []
     seen: set[str] = set()
     for group in [*context.initial_valid_groups, *context.final_valid_groups]:
+        if bool(_value(group, "is_synthetic")):
+            continue
         group_id = _text(_value(group, "group_id"))
         if not group_id or group_id in seen:
             continue
@@ -300,6 +302,8 @@ def _report_groups(context: ReportContext) -> list[_ReportGroup]:
         groups.append(group)
 
     for _task_id, task in sorted(context.task_queue.items(), key=lambda item: str(item[0])):
+        if bool(_value(task, "is_synthetic")):
+            continue
         group_id = _text(_value(task, "parent_group_id"))
         if not group_id or group_id in seen:
             continue

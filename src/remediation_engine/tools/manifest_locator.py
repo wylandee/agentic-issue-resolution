@@ -282,8 +282,10 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     Walk up from the directory implied by the ODC file path to find the closest
     ``package.json`` that is still inside ``repo_root``.
 
-    For lockfile-path notation (``/src/package-lock.json?...``), the directory
-    of the lockfile is used as the starting point.
+    For lockfile-path notation (``/src/package-lock.json?...`` or
+    ``/scan/frontend/package-lock.json?...``), the directory of the lockfile is
+    used as the starting point after removing the scanner's virtual mount
+    prefix.
     """
     if not odc_file_path.strip():
         return None
@@ -291,9 +293,11 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     # Strip the lockfile ancestry suffix if present
     raw_path = odc_file_path.split("?")[0].split("#")[0].strip()
 
-    # Try to make it relative to repo_root. ODC often records paths with a
-    # leading /src/ that maps to the repo root, so we prefer the stripped form
-    # first and fall back to the raw form if needed.
+    # Try to make it relative to repo_root. ODC runs in a container where the
+    # repository is mounted at ``/scan`` (older runs used ``/src``), so those
+    # virtual roots are not repository directories and must be stripped before
+    # looking for the nearest manifest. Keep the raw variant as a fallback for
+    # scanners that already emit repository-relative paths.
     candidate_abs = Path(raw_path)
     has_root_prefix = raw_path.startswith(("/", "\\"))
     if candidate_abs.is_absolute() or has_root_prefix:
@@ -302,7 +306,11 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
         rel_parts = candidate_abs.parts
 
     variants = [Path(*rel_parts)] if rel_parts else []
-    if rel_parts and rel_parts[0].lower() in {"src", repo_root.name.lower()}:
+    if rel_parts and rel_parts[0].lower() in {
+        "src",
+        "scan",
+        repo_root.name.lower(),
+    }:
         stripped = Path(*rel_parts[1:])
         if str(stripped):
             variants.insert(0, stripped)

@@ -574,7 +574,7 @@ class TestApplyGuardrails:
 
     def test_no_fix_stage_two_derives_code_workaround_strategy(self):
         group = _make_group(
-            group_id="sca:package.json:notevil:NO_FIX",
+            group_id="sca:package.json:notevil",
             cve_ids=["CVE-2021-23771"],
             ghsa_ids=[],
             fix_plan_status=FixPlanStatus.NO_FIX,
@@ -598,7 +598,7 @@ class TestApplyGuardrails:
 
     def test_no_fix_stage_one_remains_strict(self):
         group = _make_group(
-            group_id="sca:package.json:notevil:NO_FIX",
+            group_id="sca:package.json:notevil",
             cve_ids=["CVE-2021-23771"],
             ghsa_ids=[],
             fix_plan_status=FixPlanStatus.NO_FIX,

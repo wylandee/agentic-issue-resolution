@@ -8,6 +8,7 @@ from typing import Any, TypeVar, cast
 
 from remediation_engine.contracts.schemas import (
     ODCScanEvidence,
+    PeerConflictEvidence,
     QADependencyEvidence,
     RemediationTask,
     ScannerExecutionStatus,
@@ -68,6 +69,7 @@ class _QAExecutionResults:
     install_error_category: str | None = None
     install_raw_stdout: str | None = None
     install_raw_stderr: str | None = None
+    peer_conflicts: list[PeerConflictEvidence] = field(default_factory=list)
     test_exit_code: int | None = None
     test_failure_count: int | None = None
     test_raw_stdout: str | None = None

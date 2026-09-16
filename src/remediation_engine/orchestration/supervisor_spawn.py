@@ -33,7 +33,10 @@ from remediation_engine.orchestration.supervisor_policy import (
     _parent_status_for_strategy_pivot,
 )
 from remediation_engine.orchestration.supervisor_routing import _build_consistency_event
-from remediation_engine.orchestration.task_utils import group_parent_context
+from remediation_engine.orchestration.task_utils import (
+    group_parent_context,
+    select_package_fix_plan,
+)
 from remediation_engine.tools.registry_tools import plan_npm_parent_version
 
 logger = logging.getLogger(__name__)
@@ -71,7 +74,8 @@ def _plan_initial_transitive_task(
         or task.strategy_stage != SCARemediationStage.OSV_MINIMUM
     ):
         return task
-    child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
+    child_selection = select_package_fix_plan(group, task.strategy)
+    child_fixed_version = child_selection.plan.fixed_version if child_selection.plan else None
     parent_name, parent_version, parent_type = group_parent_context(group)
     installed_parent_version = task.parent_package_version or parent_version
     if installed_parent_version and task.parent_package_version != installed_parent_version:
@@ -459,44 +463,28 @@ def _materialize_spawn_requests(
         else:
             child_policy = QAPolicy.INITIAL_CODE_WORKAROUND
 
-        _TRIAGE_BUCKET_TO_STRATEGY: dict[str, str] = {
-            "UPDATE_VERSION": RoutingStrategy.VERSION_BUMP.name,
-            "WORKAROUND": RoutingStrategy.CODE_WORKAROUND.name,
-            "NO_FIX": RoutingStrategy.CODE_WORKAROUND.name,
-        }
         new_group_id = parent_task.parent_group_id
-        if parent_task.strategy.name in new_group_id and req.strategy.name not in new_group_id:
-            new_group_id = new_group_id.replace(parent_task.strategy.name, req.strategy.name)
-        elif parent_task.strategy.value in new_group_id and req.strategy.value not in new_group_id:
-            new_group_id = new_group_id.replace(parent_task.strategy.value, req.strategy.value)
-        else:
-            # Fallback: try triage-level strategy bucket tokens
-            for bucket_token, mapped_strategy_name in _TRIAGE_BUCKET_TO_STRATEGY.items():
-                if (
-                    bucket_token in new_group_id
-                    and mapped_strategy_name == parent_task.strategy.name
-                    and req.strategy.name != parent_task.strategy.name
-                ):
-                    new_group_id = new_group_id.replace(
-                        bucket_token,
-                        req.strategy.name,
-                    )
-                    break
+        # Strategy pivots remain child-task audit records, but the package-only
+        # triage group is the stable logical portfolio item. Never manufacture
+        # a second strategy-specific VulnerabilityGroup.
 
-        if new_group_id != parent_task.parent_group_id and new_group_id not in group_by_id:
-            parent_group = group_by_id.get(parent_task.parent_group_id)
-            if parent_group:
-                new_group = parent_group.model_copy(update={"group_id": new_group_id})
-                group_by_id[new_group_id] = new_group
-                if valid_groups is not None:
-                    valid_groups.append(new_group)
-
+        package_selection = (
+            select_package_fix_plan(
+                group_by_id[parent_task.parent_group_id],
+                req.strategy,
+            )
+            if group_by_id and parent_task.parent_group_id in group_by_id
+            else None
+        )
         new_task = RemediationTask(
             task_id=child_task_id,
             parent_group_id=new_group_id,
             parent_task_id=req.parent_task_id,
             qa_policy=child_policy,
             strategy=req.strategy,
+            selected_plan_issue_ids=(
+                list(package_selection.issue_ids) if package_selection is not None else []
+            ),
             strategy_stage=(
                 SCARemediationStage.CODE_WORKAROUND
                 if req.strategy == RoutingStrategy.CODE_WORKAROUND

@@ -8,7 +8,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from remediation_engine.contracts.schemas import QAFailureEvidence
+from remediation_engine.contracts.schemas import PeerConflictEvidence, QAFailureEvidence
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 from . import _test_normalization
@@ -107,6 +107,64 @@ def _install_error_category(stdout: str, stderr: str, exit_code: int) -> str:
     return "INSTALL_FAILURE"
 
 
+_PEER_FROM_RE = re.compile(
+    r"peer(?:Optional)?\s+(?P<peer>@?[A-Za-z0-9._\-/]+)@"
+    r"(?:\"(?P<quoted_range>[^\"]+)\"|(?P<unquoted_range>[^\s]+))\s+from\s+"
+    r"(?P<requester>@?[A-Za-z0-9._\-/]+)@(?P<requester_version>[^\s]+)",
+    re.IGNORECASE,
+)
+_OVERRIDE_CONFLICT_RE = re.compile(
+    r"Override\s+for\s+(?P<peer>@?[A-Za-z0-9._\-/]+)@(?P<range>[^\s]+)\s+"
+    r"conflicts\s+with\s+direct\s+dependency",
+    re.IGNORECASE,
+)
+_FOUND_VERSION_RE = re.compile(
+    r"Found:\s+(?P<package>@?[A-Za-z0-9._\-/]+)@(?P<version>[^\s]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_peer_conflict_evidence(stdout: str, stderr: str) -> list[PeerConflictEvidence]:
+    """Parse npm ``ERESOLVE``/``EOVERRIDE`` output into stable evidence."""
+    text = _strip_ansi(f"{stdout}\n{stderr}")
+    observed_versions = {
+        match.group("package"): match.group("version").rstrip(".,")
+        for match in _FOUND_VERSION_RE.finditer(text)
+    }
+    records: dict[tuple[str, str, str, str], PeerConflictEvidence] = {}
+    for match in _PEER_FROM_RE.finditer(text):
+        peer = match.group("peer").rstrip(".,")
+        requester = match.group("requester").rstrip(".,")
+        required_range = (
+            match.group("quoted_range") or match.group("unquoted_range") or ""
+        ).rstrip(".,")
+        key = (requester, peer, required_range, observed_versions.get(peer, ""))
+        records[key] = PeerConflictEvidence(
+            requester_package=requester,
+            peer_package=peer,
+            required_range=required_range,
+            observed_version=observed_versions.get(peer),
+            evidence=match.group(0)[:2000],
+        )
+    for match in _OVERRIDE_CONFLICT_RE.finditer(text):
+        peer = match.group("peer").rstrip(".,")
+        required_range = match.group("range").rstrip(".,")
+        key = ("", peer, required_range, observed_versions.get(peer, ""))
+        records[key] = PeerConflictEvidence(
+            peer_package=peer,
+            required_range=required_range,
+            observed_version=observed_versions.get(peer),
+            evidence=match.group(0)[:2000],
+        )
+    if not records and any(
+        marker.casefold() in text.casefold() for marker in _PEER_CONFLICT_PATTERNS
+    ):
+        records[("", "", "", "")] = PeerConflictEvidence(
+            evidence="\n".join(text.splitlines()[-20:])[:2000]
+        )
+    return [records[key] for key in sorted(records)]
+
+
 def _store_install_outcome(results: _QAExecutionResults, outcome: _QAInstallOutcome) -> None:
     """Store install projections and its private raw evidence."""
     results.install = (outcome.ok, outcome.summary)
@@ -114,6 +172,9 @@ def _store_install_outcome(results: _QAExecutionResults, outcome: _QAInstallOutc
     results.install_error_category = outcome.error_category
     results.install_raw_stdout = outcome.raw_stdout
     results.install_raw_stderr = outcome.raw_stderr
+    results.peer_conflicts = parse_peer_conflict_evidence(
+        outcome.raw_stdout or "", outcome.raw_stderr or ""
+    )
     _append_qa_log_records(results, "install", (outcome.log_record,))
 
 

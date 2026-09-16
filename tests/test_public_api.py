@@ -177,7 +177,7 @@ def test_graph_group_paths_are_repo_relative(tmp_path: Path) -> None:
     )
     absolute_manifest = str(tmp_path / "package.json")
     group = VulnerabilityGroup(
-        group_id=f"sca:{absolute_manifest}:lodash:UPDATE_VERSION",
+        group_id=f"sca:{absolute_manifest}:lodash",
         issue_type=IssueType.SCA,
         vulnerable_component="lodash",
         file_path=absolute_manifest,
@@ -255,7 +255,7 @@ def test_preprocessed_groups_expand_compressed_npm_ancestry(tmp_path: Path) -> N
         parent_declaration_type="dependencies",
     )
     group = VulnerabilityGroup(
-        group_id="sca:package.json:@tootallnate/once:UPDATE_VERSION",
+        group_id="sca:package.json:@tootallnate/once",
         issue_type=IssueType.SCA,
         vulnerable_component="@tootallnate/once",
         file_path="package.json",

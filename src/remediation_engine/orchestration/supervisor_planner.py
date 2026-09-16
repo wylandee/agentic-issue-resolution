@@ -25,7 +25,11 @@ from remediation_engine.orchestration.supervisor_policy import (
     _next_sca_stage,
     _task_sort_key,
 )
-from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
+from remediation_engine.orchestration.task_utils import (
+    group_parent_context,
+    is_transitive_group,
+    select_package_fix_plan,
+)
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -115,8 +119,14 @@ def _build_high_level_retry_instruction(
             "do not edit any other dependency target; "
             "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
         )
-    if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
-        floor = group.fix_plan.fixed_version
+    selected_plan = select_package_fix_plan(group, task.strategy) if group else None
+    if (
+        task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+        and group
+        and selected_plan
+        and selected_plan.plan
+    ):
+        floor = selected_plan.plan.fixed_version
         if floor:
             manifest = group.file_paths[0] if group.file_paths else "package.json"
             if parent_name and target == parent_name:
@@ -438,10 +448,18 @@ def _repair_invalid_planner_plans(
             continue
 
         group = group_by_id.get(task_queue[task_id].parent_group_id)
-        if group is not None and is_transitive_group(group) and group.fix_plan:
+        selected_plan = (
+            select_package_fix_plan(group, task_queue[task_id].strategy) if group else None
+        )
+        if (
+            group is not None
+            and is_transitive_group(group)
+            and selected_plan
+            and selected_plan.plan
+        ):
             # Parent registry exhaustion is the deterministic handoff to the
             # native child override stage, not yet a code-workaround pivot.
-            child_version = group.fix_plan.fixed_version
+            child_version = selected_plan.plan.fixed_version
             target_type = _override_dependency_type(group)
             if diagnostics is None:
                 diagnostics = UpdateRetryDiagnostics(task_id=task_id)
@@ -537,7 +555,10 @@ def _build_deterministic_retry_plan(
     current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
     effective_stage = requested if requested_order >= current_order else task.strategy_stage
     attempted = set(diagnostics.attempted_versions)
-    security_floor = group.fix_plan.fixed_version if group and group.fix_plan else None
+    selected_plan = select_package_fix_plan(group, task.strategy) if group else None
+    security_floor = (
+        selected_plan.plan.fixed_version if selected_plan and selected_plan.plan else None
+    )
     transitive = bool(group and is_transitive_group(group))
     candidate_versions: list[str] = []
     latest_version_seen: str | None = None
@@ -824,9 +845,14 @@ def _run_deterministic_retry_planner(
                 "strategy_stage": plan.strategy_stage,
                 "security_floor": diagnostics.security_floor
                 or (
-                    group_by_id[task.parent_group_id].fix_plan.fixed_version
+                    select_package_fix_plan(
+                        group_by_id[task.parent_group_id], task.strategy
+                    ).plan.fixed_version
                     if task.parent_group_id in group_by_id
-                    and group_by_id[task.parent_group_id].fix_plan is not None
+                    and select_package_fix_plan(
+                        group_by_id[task.parent_group_id], task.strategy
+                    ).plan
+                    is not None
                     else None
                 ),
                 "selected_version": plan.selected_version,
@@ -834,8 +860,12 @@ def _run_deterministic_retry_planner(
                 "latest_version_seen": plan.latest_version_seen,
                 "registry_query_performed": bool(
                     group_by_id.get(task.parent_group_id)
-                    and group_by_id[task.parent_group_id].fix_plan
-                    and group_by_id[task.parent_group_id].fix_plan.fixed_version
+                    and select_package_fix_plan(
+                        group_by_id[task.parent_group_id], task.strategy
+                    ).plan
+                    and select_package_fix_plan(
+                        group_by_id[task.parent_group_id], task.strategy
+                    ).plan.fixed_version
                 ),
                 "exhausted_update_path": plan.exhausted_update_path,
                 "target_package_name": plan.target_package_name,
