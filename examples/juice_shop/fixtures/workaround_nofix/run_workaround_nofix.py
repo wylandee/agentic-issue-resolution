@@ -74,7 +74,7 @@ _NOFIX_METADATA = {
     "workflow_phase": "qa_regression_repair",
     "package_name": "notevil",
     "no_fix_stage": "vulnerable_code_removal",
-    "source_group_id": "sca:package.json:notevil:NO_FIX",
+    "source_group_id": "sca:package.json:notevil",
 }
 
 
@@ -114,7 +114,7 @@ def load_nofix_fixture(path: Path = _DEFAULT_FIXTURE) -> dict[str, Any]:
         raise ValueError("NO_FIX fixture must start at VULNERABLE_CODE_REMOVAL.")
     if not payload.get("qa_evidence"):
         raise ValueError("Stage-two NO_FIX fixture must include prior QA failure evidence.")
-    if payload["group"].get("group_id") != "sca:package.json:notevil:NO_FIX":
+    if payload["group"].get("group_id") != "sca:package.json:notevil":
         raise ValueError("NO_FIX fixture must contain the notevil NO_FIX group.")
     return payload
 

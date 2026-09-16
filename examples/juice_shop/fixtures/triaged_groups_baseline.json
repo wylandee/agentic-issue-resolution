@@ -1,6 +1,6 @@
 [
   {
-    "group_id": "sca:scan/frontend/node_modules/font-mfizz/blaze.jar/META-INF/maven/commons-io/commons-io/pom.xml:commons-io:commons-io:NO_FIX",
+    "group_id": "sca:scan/frontend/node_modules/font-mfizz/blaze.jar/META-INF/maven/commons-io/commons-io/pom.xml:commons-io:commons-io",
     "issue_type": "sca",
     "vulnerable_component": "commons-io:commons-io",
     "file_path": "scan/frontend/node_modules/font-mfizz/blaze.jar/META-INF/maven/commons-io/commons-io/pom.xml",
@@ -2733,7 +2733,7 @@
     "grouped_at": "2026-08-03T16:51:22.088081Z"
   },
   {
-    "group_id": "sca:scan/frontend/node_modules/font-mfizz/blaze.jar:blaze.jar:NO_FIX",
+    "group_id": "sca:scan/frontend/node_modules/font-mfizz/blaze.jar:blaze.jar",
     "issue_type": "sca",
     "vulnerable_component": "blaze.jar",
     "file_path": "scan/frontend/node_modules/font-mfizz/blaze.jar",
@@ -3042,7 +3042,7 @@
     "grouped_at": "2026-08-03T16:51:22.088110Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/@angular/common:21.2.14:@angular/common:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/@angular/common:21.2.14:@angular/common",
     "issue_type": "sca",
     "vulnerable_component": "@angular/common",
     "file_path": "scan/frontend/package-lock.json?/@angular/common:21.2.14",
@@ -3970,7 +3970,7 @@
     "grouped_at": "2026-08-03T16:51:22.087429Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/@angular/compiler:21.2.14:@angular/compiler:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/@angular/compiler:21.2.14:@angular/compiler",
     "issue_type": "sca",
     "vulnerable_component": "@angular/compiler",
     "file_path": "scan/frontend/package-lock.json?/@angular/compiler:21.2.14",
@@ -4450,7 +4450,7 @@
     "grouped_at": "2026-08-03T16:51:22.087531Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/@angular/core:21.2.14:@angular/core:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/@angular/core:21.2.14:@angular/core",
     "issue_type": "sca",
     "vulnerable_component": "@angular/core",
     "file_path": "scan/frontend/package-lock.json?/@angular/core:21.2.14",
@@ -5159,7 +5159,7 @@
     "grouped_at": "2026-08-03T16:51:22.087627Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/elliptic:6.6.1:elliptic:NO_FIX",
+    "group_id": "sca:scan/frontend/package-lock.json?/elliptic:6.6.1:elliptic",
     "issue_type": "sca",
     "vulnerable_component": "elliptic",
     "file_path": "scan/frontend/package-lock.json?/elliptic:6.6.1",
@@ -5410,7 +5410,7 @@
     "grouped_at": "2026-08-03T16:51:22.088436Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/hono:4.12.21:hono:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/hono:4.12.21:hono",
     "issue_type": "sca",
     "vulnerable_component": "hono",
     "file_path": "scan/frontend/package-lock.json?/hono:4.12.21",
@@ -7114,7 +7114,7 @@
     "grouped_at": "2026-08-03T16:51:22.089049Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/piscina:5.1.4:piscina:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/piscina:5.1.4:piscina",
     "issue_type": "sca",
     "vulnerable_component": "piscina",
     "file_path": "scan/frontend/package-lock.json?/piscina:5.1.4",
@@ -7345,7 +7345,7 @@
     "grouped_at": "2026-08-03T16:51:22.090920Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/sigstore:4.1.0:sigstore:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/sigstore:4.1.0:sigstore",
     "issue_type": "sca",
     "vulnerable_component": "sigstore",
     "file_path": "scan/frontend/package-lock.json?/sigstore:4.1.0",
@@ -7566,7 +7566,7 @@
     "grouped_at": "2026-08-03T16:51:22.091223Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/undici:7.24.4:undici:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/undici:7.24.4:undici",
     "issue_type": "sca",
     "vulnerable_component": "undici",
     "file_path": "scan/frontend/package-lock.json?/undici:7.24.4",
@@ -9101,7 +9101,7 @@
     "grouped_at": "2026-08-03T16:51:22.091715Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?/ws:8.18.0:ws:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?/ws:8.18.0:ws",
     "issue_type": "sca",
     "vulnerable_component": "ws",
     "file_path": "scan/frontend/package-lock.json?/ws:8.18.0",
@@ -9976,7 +9976,7 @@
     "grouped_at": "2026-08-03T16:51:22.091933Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?@modelcontextprotocol/sdk:1.26.0/@hono/node-server:^1.19.9:@hono/node-server:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?@modelcontextprotocol/sdk:1.26.0/@hono/node-server:^1.19.9:@hono/node-server",
     "issue_type": "sca",
     "vulnerable_component": "@hono/node-server",
     "file_path": "scan/frontend/package-lock.json?@modelcontextprotocol/sdk:1.26.0/@hono/node-server:^1.19.9",
@@ -10217,7 +10217,7 @@
     "grouped_at": "2026-08-03T16:51:22.087747Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?express:5.2.1/body-parser:^2.2.1:body-parser:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?express:5.2.1/body-parser:^2.2.1:body-parser",
     "issue_type": "sca",
     "vulnerable_component": "body-parser",
     "file_path": "scan/frontend/package-lock.json?express:5.2.1/body-parser:^2.2.1",
@@ -10528,7 +10528,7 @@
     "grouped_at": "2026-08-03T16:51:22.088185Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?sass:1.99.0/immutable:^5.1.5:immutable:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?sass:1.99.0/immutable:^5.1.5:immutable",
     "issue_type": "sca",
     "vulnerable_component": "immutable",
     "file_path": "scan/frontend/package-lock.json?sass:1.99.0/immutable:^5.1.5",
@@ -11062,7 +11062,7 @@
     "grouped_at": "2026-08-03T16:51:22.089129Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/core:^3.1.0:@sigstore/core:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/core:^3.1.0:@sigstore/core",
     "issue_type": "sca",
     "vulnerable_component": "@sigstore/core",
     "file_path": "scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/core:^3.1.0",
@@ -11283,7 +11283,7 @@
     "grouped_at": "2026-08-03T16:51:22.087781Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/verify:^3.1.0:@sigstore/verify:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/verify:^3.1.0:@sigstore/verify",
     "issue_type": "sca",
     "vulnerable_component": "@sigstore/verify",
     "file_path": "scan/frontend/package-lock.json?sigstore:4.1.0/@sigstore/verify:^3.1.0",
@@ -11504,7 +11504,7 @@
     "grouped_at": "2026-08-03T16:51:22.087820Z"
   },
   {
-    "group_id": "sca:scan/frontend/package-lock.json?vite:7.3.2/esbuild:^0.27.0:esbuild:UPDATE_VERSION",
+    "group_id": "sca:scan/frontend/package-lock.json?vite:7.3.2/esbuild:^0.27.0:esbuild",
     "issue_type": "sca",
     "vulnerable_component": "esbuild",
     "file_path": "scan/frontend/package-lock.json?vite:7.3.2/esbuild:^0.27.0",
@@ -11735,7 +11735,7 @@
     "grouped_at": "2026-08-03T16:51:22.088548Z"
   },
   {
-    "group_id": "sca:scan/node_modules/express-jwt/node_modules/moment/min/moment.min.js:moment.js:NO_FIX",
+    "group_id": "sca:scan/node_modules/express-jwt/node_modules/moment/min/moment.min.js:moment.js",
     "issue_type": "sca",
     "vulnerable_component": "moment.js",
     "file_path": "scan/node_modules/express-jwt/node_modules/moment/min/moment.min.js",
@@ -12995,7 +12995,7 @@
     "grouped_at": "2026-08-03T16:51:22.090633Z"
   },
   {
-    "group_id": "sca:scan/node_modules/express-jwt/node_modules/moment/moment.js:moment.js:NO_FIX",
+    "group_id": "sca:scan/node_modules/express-jwt/node_modules/moment/moment.js:moment.js",
     "issue_type": "sca",
     "vulnerable_component": "moment.js",
     "file_path": "scan/node_modules/express-jwt/node_modules/moment/moment.js",
@@ -14255,7 +14255,7 @@
     "grouped_at": "2026-08-03T16:51:22.090561Z"
   },
   {
-    "group_id": "sca:scan/node_modules/fast.js/dist/bench.js:underscore.js:NO_FIX",
+    "group_id": "sca:scan/node_modules/fast.js/dist/bench.js:underscore.js",
     "issue_type": "sca",
     "vulnerable_component": "underscore.js",
     "file_path": "scan/node_modules/fast.js/dist/bench.js",
@@ -15182,7 +15182,7 @@
     "grouped_at": "2026-08-03T16:51:22.087951Z"
   },
   {
-    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.js:lodash:UPDATE_VERSION",
+    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.js:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.js",
@@ -18524,7 +18524,7 @@
     "grouped_at": "2026-08-03T16:51:22.089642Z"
   },
   {
-    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js:lodash:UPDATE_VERSION",
+    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js",
@@ -21866,7 +21866,7 @@
     "grouped_at": "2026-08-03T16:51:22.089999Z"
   },
   {
-    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js:lodash:WORKAROUND",
+    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/node_modules/sanitize-html/node_modules/lodash/dist/lodash.min.js",
@@ -22155,7 +22155,7 @@
     "grouped_at": "2026-08-03T16:51:22.090023Z"
   },
   {
-    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/lodash.js:lodash:UPDATE_VERSION",
+    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/lodash.js:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/node_modules/sanitize-html/node_modules/lodash/lodash.js",
@@ -25497,7 +25497,7 @@
     "grouped_at": "2026-08-03T16:51:22.089814Z"
   },
   {
-    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/lodash.js:lodash:WORKAROUND",
+    "group_id": "sca:scan/node_modules/sanitize-html/node_modules/lodash/lodash.js:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/node_modules/sanitize-html/node_modules/lodash/lodash.js",
@@ -25786,7 +25786,7 @@
     "grouped_at": "2026-08-03T16:51:22.089839Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/@cyclonedx/cyclonedx-npm:4.2.1:@cyclonedx/cyclonedx-npm:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/@cyclonedx/cyclonedx-npm:4.2.1:@cyclonedx/cyclonedx-npm",
     "issue_type": "sca",
     "vulnerable_component": "@cyclonedx/cyclonedx-npm",
     "file_path": "scan/package-lock.json?/@cyclonedx/cyclonedx-npm:4.2.1",
@@ -26001,7 +26001,7 @@
     "grouped_at": "2026-08-03T16:51:22.087710Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/@tootallnate/once:1.1.2:@tootallnate/once:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/@tootallnate/once:1.1.2:@tootallnate/once",
     "issue_type": "sca",
     "vulnerable_component": "@tootallnate/once",
     "file_path": "scan/package-lock.json?/@tootallnate/once:1.1.2",
@@ -26272,7 +26272,7 @@
     "grouped_at": "2026-08-03T16:51:22.087854Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/cookie:0.4.2:cookie:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/cookie:0.4.2:cookie",
     "issue_type": "sca",
     "vulnerable_component": "cookie",
     "file_path": "scan/package-lock.json?/cookie:0.4.2",
@@ -26487,7 +26487,7 @@
     "grouped_at": "2026-08-03T16:51:22.088290Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/express-jwt:0.1.3:express-jwt:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/express-jwt:0.1.3:express-jwt",
     "issue_type": "sca",
     "vulnerable_component": "express-jwt",
     "file_path": "scan/package-lock.json?/express-jwt:0.1.3",
@@ -26997,7 +26997,7 @@
     "grouped_at": "2026-08-03T16:51:22.088625Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:11.1.0:file-type:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/file-type:11.1.0:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:11.1.0",
@@ -27306,7 +27306,7 @@
     "grouped_at": "2026-08-03T16:51:22.088650Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:16.5.4:file-type:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/file-type:16.5.4:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:16.5.4",
@@ -27752,7 +27752,7 @@
     "grouped_at": "2026-08-03T16:51:22.088697Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:3.9.0:file-type:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/file-type:3.9.0:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:3.9.0",
@@ -28061,7 +28061,7 @@
     "grouped_at": "2026-08-03T16:51:22.088721Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:4.4.0:file-type:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/file-type:4.4.0:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:4.4.0",
@@ -28370,7 +28370,7 @@
     "grouped_at": "2026-08-03T16:51:22.088743Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:5.2.0:file-type:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/file-type:5.2.0:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:5.2.0",
@@ -28679,7 +28679,7 @@
     "grouped_at": "2026-08-03T16:51:22.088766Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/file-type:6.2.0:file-type:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/file-type:6.2.0:file-type",
     "issue_type": "sca",
     "vulnerable_component": "file-type",
     "file_path": "scan/package-lock.json?/file-type:6.2.0",
@@ -28988,7 +28988,7 @@
     "grouped_at": "2026-08-03T16:51:22.088789Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/form-data:4.0.5:form-data:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/form-data:4.0.5:form-data",
     "issue_type": "sca",
     "vulnerable_component": "form-data",
     "file_path": "scan/package-lock.json?/form-data:4.0.5",
@@ -29279,7 +29279,7 @@
     "grouped_at": "2026-08-03T16:51:22.088818Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/got:8.3.2:got:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/got:8.3.2:got",
     "issue_type": "sca",
     "vulnerable_component": "got",
     "file_path": "scan/package-lock.json?/got:8.3.2",
@@ -29570,7 +29570,7 @@
     "grouped_at": "2026-08-03T16:51:22.088870Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/got:8.3.2:got:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/got:8.3.2:got",
     "issue_type": "sca",
     "vulnerable_component": "got",
     "file_path": "scan/package-lock.json?/got:8.3.2",
@@ -29835,7 +29835,7 @@
     "grouped_at": "2026-08-03T16:51:22.088846Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/grunt-cli:1.5.0:grunt-cli:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/grunt-cli:1.5.0:grunt-cli",
     "issue_type": "sca",
     "vulnerable_component": "grunt-cli",
     "file_path": "scan/package-lock.json?/grunt-cli:1.5.0",
@@ -30104,7 +30104,7 @@
     "grouped_at": "2026-08-03T16:51:22.088893Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/http-cache-semantics:3.8.1:http-cache-semantics:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/http-cache-semantics:3.8.1:http-cache-semantics",
     "issue_type": "sca",
     "vulnerable_component": "http-cache-semantics",
     "file_path": "scan/package-lock.json?/http-cache-semantics:3.8.1",
@@ -30395,7 +30395,7 @@
     "grouped_at": "2026-08-03T16:51:22.089077Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/js-yaml:4.1.1:js-yaml:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/js-yaml:4.1.1:js-yaml",
     "issue_type": "sca",
     "vulnerable_component": "js-yaml",
     "file_path": "scan/package-lock.json?/js-yaml:4.1.1",
@@ -30885,7 +30885,7 @@
     "grouped_at": "2026-08-03T16:51:22.089177Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.1.0:jsonwebtoken:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.1.0:jsonwebtoken",
     "issue_type": "sca",
     "vulnerable_component": "jsonwebtoken",
     "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
@@ -31216,7 +31216,7 @@
     "grouped_at": "2026-08-03T16:51:22.089202Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.1.0:jsonwebtoken:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.1.0:jsonwebtoken",
     "issue_type": "sca",
     "vulnerable_component": "jsonwebtoken",
     "file_path": "scan/package-lock.json?/jsonwebtoken:0.1.0",
@@ -31993,7 +31993,7 @@
     "grouped_at": "2026-08-03T16:51:22.089271Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.4.0:jsonwebtoken:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.4.0:jsonwebtoken",
     "issue_type": "sca",
     "vulnerable_component": "jsonwebtoken",
     "file_path": "scan/package-lock.json?/jsonwebtoken:0.4.0",
@@ -32324,7 +32324,7 @@
     "grouped_at": "2026-08-03T16:51:22.089297Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.4.0:jsonwebtoken:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/jsonwebtoken:0.4.0:jsonwebtoken",
     "issue_type": "sca",
     "vulnerable_component": "jsonwebtoken",
     "file_path": "scan/package-lock.json?/jsonwebtoken:0.4.0",
@@ -33995,7 +33995,7 @@
     "grouped_at": "2026-08-03T16:51:22.089434Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/jws:0.2.6:jws:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/jws:0.2.6:jws",
     "issue_type": "sca",
     "vulnerable_component": "jws",
     "file_path": "scan/package-lock.json?/jws:0.2.6",
@@ -34489,7 +34489,7 @@
     "grouped_at": "2026-08-03T16:51:22.089482Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/lodash.set:4.3.2:lodash.set:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/lodash.set:4.3.2:lodash.set",
     "issue_type": "sca",
     "vulnerable_component": "lodash.set",
     "file_path": "scan/package-lock.json?/lodash.set:4.3.2",
@@ -34830,7 +34830,7 @@
     "grouped_at": "2026-08-03T16:51:22.090047Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/lodash:2.4.2:lodash:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/lodash:2.4.2:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/package-lock.json?/lodash:2.4.2",
@@ -39681,7 +39681,7 @@
     "grouped_at": "2026-08-03T16:51:22.090337Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/lodash:2.4.2:lodash:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/lodash:2.4.2:lodash",
     "issue_type": "sca",
     "vulnerable_component": "lodash",
     "file_path": "scan/package-lock.json?/lodash:2.4.2",
@@ -41012,7 +41012,7 @@
     "grouped_at": "2026-08-03T16:51:22.090154Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/marsdb:0.6.11:marsdb:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/marsdb:0.6.11:marsdb",
     "issue_type": "sca",
     "vulnerable_component": "marsdb",
     "file_path": "scan/package-lock.json?/marsdb:0.6.11",
@@ -41217,7 +41217,7 @@
     "grouped_at": "2026-08-03T16:51:22.090359Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/minimatch:3.0.5:minimatch:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/minimatch:3.0.5:minimatch",
     "issue_type": "sca",
     "vulnerable_component": "minimatch",
     "file_path": "scan/package-lock.json?/minimatch:3.0.5",
@@ -42795,7 +42795,7 @@
     "grouped_at": "2026-08-03T16:51:22.090487Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/moment:2.0.0:moment:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/moment:2.0.0:moment",
     "issue_type": "sca",
     "vulnerable_component": "moment",
     "file_path": "scan/package-lock.json?/moment:2.0.0",
@@ -43498,7 +43498,7 @@
     "grouped_at": "2026-08-03T16:51:22.090674Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/moment:2.0.0:moment:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/moment:2.0.0:moment",
     "issue_type": "sca",
     "vulnerable_component": "moment",
     "file_path": "scan/package-lock.json?/moment:2.0.0",
@@ -43913,7 +43913,7 @@
     "grouped_at": "2026-08-03T16:51:22.090709Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/morgan:1.10.1:morgan:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/morgan:1.10.1:morgan",
     "issue_type": "sca",
     "vulnerable_component": "morgan",
     "file_path": "scan/package-lock.json?/morgan:1.10.1",
@@ -44359,7 +44359,7 @@
     "grouped_at": "2026-08-03T16:51:22.090757Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/nanoid:3.1.20:nanoid:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/nanoid:3.1.20:nanoid",
     "issue_type": "sca",
     "vulnerable_component": "nanoid",
     "file_path": "scan/package-lock.json?/nanoid:3.1.20",
@@ -44718,7 +44718,7 @@
     "grouped_at": "2026-08-03T16:51:22.090783Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/nanoid:3.1.20:nanoid:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/nanoid:3.1.20:nanoid",
     "issue_type": "sca",
     "vulnerable_component": "nanoid",
     "file_path": "scan/package-lock.json?/nanoid:3.1.20",
@@ -45268,7 +45268,7 @@
     "grouped_at": "2026-08-03T16:51:22.090833Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/notevil:1.3.3:notevil:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?/notevil:1.3.3:notevil",
     "issue_type": "sca",
     "vulnerable_component": "notevil",
     "file_path": "scan/package-lock.json?/notevil:1.3.3",
@@ -45770,7 +45770,7 @@
     "grouped_at": "2026-08-03T16:51:22.090869Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/sanitize-html:1.4.2:sanitize-html:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/sanitize-html:1.4.2:sanitize-html",
     "issue_type": "sca",
     "vulnerable_component": "sanitize-html",
     "file_path": "scan/package-lock.json?/sanitize-html:1.4.2",
@@ -47449,7 +47449,7 @@
     "grouped_at": "2026-08-03T16:51:22.091133Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/serialize-javascript:5.0.1:serialize-javascript:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/serialize-javascript:5.0.1:serialize-javascript",
     "issue_type": "sca",
     "vulnerable_component": "serialize-javascript",
     "file_path": "scan/package-lock.json?/serialize-javascript:5.0.1",
@@ -47959,7 +47959,7 @@
     "grouped_at": "2026-08-03T16:51:22.091192Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/socket.io-parser:4.0.5:socket.io-parser:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/socket.io-parser:4.0.5:socket.io-parser",
     "issue_type": "sca",
     "vulnerable_component": "socket.io-parser",
     "file_path": "scan/package-lock.json?/socket.io-parser:4.0.5",
@@ -49075,7 +49075,7 @@
     "grouped_at": "2026-08-03T16:51:22.091314Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/socket.io:3.1.2:socket.io:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/socket.io:3.1.2:socket.io",
     "issue_type": "sca",
     "vulnerable_component": "socket.io",
     "file_path": "scan/package-lock.json?/socket.io:3.1.2",
@@ -49346,7 +49346,7 @@
     "grouped_at": "2026-08-03T16:51:22.091344Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/tar:4.4.19:tar:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/tar:4.4.19:tar",
     "issue_type": "sca",
     "vulnerable_component": "tar",
     "file_path": "scan/package-lock.json?/tar:4.4.19",
@@ -50426,7 +50426,7 @@
     "grouped_at": "2026-08-03T16:51:22.091444Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/tar:7.5.15:tar:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/tar:7.5.15:tar",
     "issue_type": "sca",
     "vulnerable_component": "tar",
     "file_path": "scan/package-lock.json?/tar:7.5.15",
@@ -51506,7 +51506,7 @@
     "grouped_at": "2026-08-03T16:51:22.091544Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/tmp:0.2.5:tmp:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/tmp:0.2.5:tmp",
     "issue_type": "sca",
     "vulnerable_component": "tmp",
     "file_path": "scan/package-lock.json?/tmp:0.2.5",
@@ -51731,7 +51731,7 @@
     "grouped_at": "2026-08-03T16:51:22.091579Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/uuid:8.3.2:uuid:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/uuid:8.3.2:uuid",
     "issue_type": "sca",
     "vulnerable_component": "uuid",
     "file_path": "scan/package-lock.json?/uuid:8.3.2",
@@ -52062,7 +52062,7 @@
     "grouped_at": "2026-08-03T16:51:22.091747Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?/ws:8.17.1:ws:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?/ws:8.17.1:ws",
     "issue_type": "sca",
     "vulnerable_component": "ws",
     "file_path": "scan/package-lock.json?/ws:8.17.1",
@@ -52937,7 +52937,7 @@
     "grouped_at": "2026-08-03T16:51:22.091861Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?brace-expansion:brace-expansion:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?brace-expansion:brace-expansion",
     "issue_type": "sca",
     "vulnerable_component": "brace-expansion",
     "file_path": "scan/package-lock.json?brace-expansion",
@@ -53278,7 +53278,7 @@
     "grouped_at": "2026-08-03T16:51:22.088258Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?download:8.0.0/decompress:^4.2.1:decompress:WORKAROUND",
+    "group_id": "sca:scan/package-lock.json?download:8.0.0/decompress:^4.2.1:decompress",
     "issue_type": "sca",
     "vulnerable_component": "decompress",
     "file_path": "scan/package-lock.json?download:8.0.0/decompress:^4.2.1",
@@ -53551,7 +53551,7 @@
     "grouped_at": "2026-08-03T16:51:22.088377Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?express:4.22.2/body-parser:~1.20.5:body-parser:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?express:4.22.2/body-parser:~1.20.5:body-parser",
     "issue_type": "sca",
     "vulnerable_component": "body-parser",
     "file_path": "scan/package-lock.json?express:4.22.2/body-parser:~1.20.5",
@@ -53862,7 +53862,7 @@
     "grouped_at": "2026-08-03T16:51:22.088149Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?istanbul-lib-instrument:4.0.3/@babel/core:^7.7.5:@babel/core:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?istanbul-lib-instrument:4.0.3/@babel/core:^7.7.5:@babel/core",
     "issue_type": "sca",
     "vulnerable_component": "@babel/core",
     "file_path": "scan/package-lock.json?istanbul-lib-instrument:4.0.3/@babel/core:^7.7.5",
@@ -54123,7 +54123,7 @@
     "grouped_at": "2026-08-03T16:51:22.087670Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?jws:0.2.6/base64url:0.0.6:base64url:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?jws:0.2.6/base64url:0.0.6:base64url",
     "issue_type": "sca",
     "vulnerable_component": "base64url",
     "file_path": "scan/package-lock.json?jws:0.2.6/base64url:0.0.6",
@@ -54338,7 +54338,7 @@
     "grouped_at": "2026-08-03T16:51:22.087887Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?minimatch:3.0.5/brace-expansion:^1.1.7:brace-expansion:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?minimatch:3.0.5/brace-expansion:^1.1.7:brace-expansion",
     "issue_type": "sca",
     "vulnerable_component": "brace-expansion",
     "file_path": "scan/package-lock.json?minimatch:3.0.5/brace-expansion:^1.1.7",
@@ -54679,7 +54679,7 @@
     "grouped_at": "2026-08-03T16:51:22.088222Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?pdfkit:0.11.0/crypto-js:^3.1.9-1:crypto-js:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?pdfkit:0.11.0/crypto-js:^3.1.9-1:crypto-js",
     "issue_type": "sca",
     "vulnerable_component": "crypto-js",
     "file_path": "scan/package-lock.json?pdfkit:0.11.0/crypto-js:^3.1.9-1",
@@ -55209,7 +55209,7 @@
     "grouped_at": "2026-08-03T16:51:22.088347Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?sinon:11.1.2/diff:^5.0.0:diff:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?sinon:11.1.2/diff:^5.0.0:diff",
     "issue_type": "sca",
     "vulnerable_component": "diff",
     "file_path": "scan/package-lock.json?sinon:11.1.2/diff:^5.0.0",
@@ -55464,7 +55464,7 @@
     "grouped_at": "2026-08-03T16:51:22.088410Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?socket.io-client:3.1.3/parseuri:0.0.6:parseuri:NO_FIX",
+    "group_id": "sca:scan/package-lock.json?socket.io-client:3.1.3/parseuri:0.0.6:parseuri",
     "issue_type": "sca",
     "vulnerable_component": "parseuri",
     "file_path": "scan/package-lock.json?socket.io-client:3.1.3/parseuri:0.0.6",
@@ -55699,7 +55699,7 @@
     "grouped_at": "2026-08-03T16:51:22.090891Z"
   },
   {
-    "group_id": "sca:scan/package-lock.json?socket.io:3.1.2/engine.io:~4.1.0:engine.io:UPDATE_VERSION",
+    "group_id": "sca:scan/package-lock.json?socket.io:3.1.2/engine.io:~4.1.0:engine.io",
     "issue_type": "sca",
     "vulnerable_component": "engine.io",
     "file_path": "scan/package-lock.json?socket.io:3.1.2/engine.io:~4.1.0",

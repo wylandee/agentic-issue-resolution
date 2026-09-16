@@ -1,6 +1,6 @@
 [
   {
-    "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "group_id": "sca:package.json:express-jwt",
     "issue_type": "sca",
     "vulnerable_component": "express-jwt",
     "file_path": "package.json",
@@ -510,7 +510,7 @@
     "grouped_at": "2026-08-03T16:51:22.088625Z"
   },
   {
-    "group_id": "sca:package.json:jsonwebtoken:UPDATE_VERSION",
+    "group_id": "sca:package.json:jsonwebtoken",
     "issue_type": "sca",
     "vulnerable_component": "jsonwebtoken",
     "file_path": "package.json",
