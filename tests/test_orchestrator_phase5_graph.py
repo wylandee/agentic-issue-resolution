@@ -1246,11 +1246,10 @@ class TestPhase5GraphIntegration:
 
         assert [call.args for call in sandbox.restore_workspace_snapshot.call_args_list] == [
             ("attempt-attempt-workaround",),
-            ("attempt-parent",),
         ]
+        assert result["workspace_rollback_anchors_by_task"] == {"task-parent": "attempt-parent"}
         assert [call.args for call in sandbox.remove_workspace_snapshot.call_args_list] == [
             ("attempt-attempt-workaround",),
-            ("attempt-parent",),
         ]
         assert result["qa_results_by_attempt"]["attempt-workaround"].evaluation.passed is False
 

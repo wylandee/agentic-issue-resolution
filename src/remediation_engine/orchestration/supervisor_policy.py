@@ -8,10 +8,13 @@ future policy changes.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
     FailureCategory,
+    FixPlanStatus,
     QAEvaluation,
     QAPolicy,
     RemediationTask,
@@ -34,6 +37,87 @@ _SEVERITY_RANK: dict[str, int] = {
     "medium": 2,
     "low": 3,
 }
+
+
+def _normalise_security_floor(value: Any) -> tuple[str | None, tuple[int, int, int] | None]:
+    """Normalize one authoritative fixed-version value for comparison.
+
+    The Supervisor accepts only a complete stable semantic version as a
+    security floor.  Ranges, partial versions, prereleases, and prose are not
+    safe authorization data and therefore remain unresolved.
+    """
+    if value is None:
+        return None, None
+    normalized = str(value).strip().lstrip("vV")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", normalized)
+    if match is None:
+        return None, None
+    return normalized, tuple(int(part) for part in match.groups())
+
+
+def _canonical_security_floor(
+    group: VulnerabilityGroup | None,
+) -> tuple[str | None, str | None]:
+    """Return the validated group security floor and any conflict reason.
+
+    ``VulnerabilityGroup.fix_plan.fixed_version`` is the canonical aggregate
+    floor.  Member finding versions are corroborating evidence: lower member
+    floors are subsumed by the aggregate floor, while a higher member floor or
+    malformed authoritative value is a contradiction and must fail closed.
+
+    Args:
+        group: Vulnerability group whose fix metadata is being authorized.
+
+    Returns:
+        ``(floor, error)``.  Exactly one value is populated: ``floor`` for a
+        valid floor, or ``error`` when the evidence is unavailable or
+        contradictory.
+    """
+    if group is None:
+        return None, "vulnerability group metadata is unavailable"
+
+    fix_plan = group.fix_plan
+    if fix_plan is not None and fix_plan.status != FixPlanStatus.VERSION_FOUND:
+        return None, "the fix plan does not provide an authoritative fixed version"
+
+    plan_floor, plan_key = _normalise_security_floor(
+        fix_plan.fixed_version if fix_plan is not None else None
+    )
+    if fix_plan is not None and fix_plan.fixed_version is not None and plan_floor is None:
+        return None, "the fix-plan fixed version is not a complete stable semver"
+
+    member_values: list[tuple[str, tuple[int, int, int]]] = []
+    for issue in group.issues or []:
+        value, key = _normalise_security_floor(getattr(issue, "fixed_version", None))
+        raw = getattr(issue, "fixed_version", None)
+        if raw is None:
+            continue
+        if value is None or key is None:
+            return None, "a vulnerability fixed version is not a complete stable semver"
+        member_values.append((value, key))
+
+    if plan_floor is not None and plan_key is not None:
+        conflicting = [value for value, key in member_values if key > plan_key]
+        if conflicting:
+            return (
+                None,
+                "member vulnerability floor exceeds the canonical fix-plan floor: "
+                + ", ".join(sorted(set(conflicting))),
+            )
+        return plan_floor, None
+
+    if member_values:
+        # With no aggregate plan, use the highest corroborated member floor so
+        # every grouped finding is covered by one safe version.
+        _value, _key = max(member_values, key=lambda item: item[1])
+        return _value, None
+    return None, "no authoritative security floor is available"
+
+
+def instruction_digest(instruction: str) -> str:
+    """Return the stable SHA-256 digest for a committed worker instruction."""
+    normalized = " ".join((instruction or "").split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _task_sort_key(
@@ -206,6 +290,7 @@ __all__ = [
     "MAX_RETRIES",
     "_TERMINAL_STATUSES",
     "_WORKABLE_STATUSES",
+    "_canonical_security_floor",
     "_dispatchable_task_ids_for_status",
     "_has_existing_workaround_child",
     "_is_exhausted_update_pivot_candidate",
@@ -215,4 +300,5 @@ __all__ = [
     "_selection_for_stage",
     "_task_sort_key",
     "_worker_node_for_strategy",
+    "instruction_digest",
 ]

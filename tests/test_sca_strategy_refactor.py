@@ -262,6 +262,31 @@ def test_supervisor_typed_registry_candidates_share_latest_when_same_major_is_la
     assert latest == "4.18.0"
 
 
+def test_registry_candidate_surface_contains_only_three_strategic_slots(monkeypatch):
+    monkeypatch.setattr(
+        "remediation_engine.tools.registry_tools._fetch_package_data",
+        lambda package: {
+            "versions": {
+                "1.0.0": {},
+                "1.1.0": {},
+                "1.2.0": {},
+                "2.0.0": {},
+                "3.0.0": {},
+            },
+            "dist-tags": {"latest": "3.0.0"},
+        },
+    )
+
+    candidates = fetch_registry_candidates("pkg", "1.0.0")
+
+    assert [candidate.version for candidate in candidates] == ["1.0.0", "1.2.0", "3.0.0"]
+    assert [candidate.selection_roles for candidate in candidates] == [
+        ("osv_minimum",),
+        ("same_major",),
+        ("npm_latest",),
+    ]
+
+
 def test_parent_selector_orders_stable_compatible_releases_by_stage():
     data = {
         "versions": {

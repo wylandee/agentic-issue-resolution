@@ -1,11 +1,13 @@
 """
 supervisor_node.py - Agentic Supervisor Node for Phase 5 hub-and-spoke orchestration.
 
-Phase 5 architecture: deterministic Supervisor
+Phase 5 architecture: guarded tactical Supervisor
 -----------------------------------------------
-The Supervisor owns the state machine and produces every routing and retry
-decision in Python. Registry facts are inputs to the deterministic retry
-planner; they are never selected by a model or delegated to a worker.
+The Supervisor owns the state machine and produces every committed routing and
+retry decision in Python. When an API key is configured, a structured tactical
+reasoner may propose a strategy and instruction; Python verifies and commits it
+or falls back to the deterministic retry planner. Registry facts are never
+selected by a worker.
 
   Guardrails (Python):
     Validate and apply the decision: reject unknown task IDs, clamp cardinality,
@@ -28,6 +30,7 @@ import logging
 import re
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,6 +51,7 @@ from remediation_engine.contracts.schemas import (
     StateConsistencyEvent,
     SupervisorDecision,
     SupervisorRetryPlan,
+    TacticalStrategy,
     TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
@@ -59,6 +63,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
     _OVERRIDE_DEPENDENCY_TYPES,
@@ -80,6 +85,7 @@ from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _WORKABLE_STATUSES,
     MAX_RETRIES,
+    _canonical_security_floor,
     _dispatchable_task_ids_for_status,
     _is_exhausted_update_pivot_candidate,
     _next_sca_stage,
@@ -105,6 +111,13 @@ from remediation_engine.orchestration.supervisor_spawn import (
     _plan_initial_transitive_task,
     _reconcile_terminal_pivot_parents,
     _terminalize_pivot_parents,
+)
+from remediation_engine.orchestration.tactical_supervisor import (
+    TacticalDiagnosticKind,
+    build_tactical_context,
+    classify_diagnostics,
+    propose_and_verify_tactical_action,
+    registry_candidate_sets_for_context,
 )
 from remediation_engine.orchestration.task_utils import (
     advance_no_fix_stage,
@@ -133,6 +146,20 @@ _VALID_NEXT_NODES: set[str] = {
 _WORKER_NODES = frozenset({"update_subagent", "workaround_subagent", "qa_critic"})
 
 
+@dataclass(frozen=True)
+class _StagedTacticalResolution:
+    """Uncommitted tactical task data held until routing guardrails pass."""
+
+    task_id: str
+    expected_task_revision: int
+    decision_code: DecisionCode
+    next_node: str
+    instruction: str
+    updates: dict[str, Any]
+    retry_diagnostics: UpdateRetryDiagnostics
+    retry_plan: SupervisorRetryPlan
+
+
 __all__ = [
     "MAX_RETRIES",
     "UPDATE_DISPATCH_LIMIT",
@@ -140,6 +167,7 @@ __all__ = [
     "_SCA_STAGE_ORDER",
     "_OVERRIDE_DEPENDENCY_TYPES",
     "_task_sort_key",
+    "_next_sca_stage",
     "instruction_digest",
     "run_supervisor_node",
     "supervisor_router",
@@ -356,6 +384,491 @@ def _create_attempt_snapshot(
     return updated_task, snapshot
 
 
+def _commit_registry_resolution_fallback(
+    task_queue: dict[str, RemediationTask],
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    evaluation: QAEvaluation | None,
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    candidate_sets: Iterable[Any],
+    *,
+    consistency_events: list[StateConsistencyEvent],
+    errors: list[str],
+    staged_resolutions: list[_StagedTacticalResolution] | None = None,
+) -> SupervisorDecision | None:
+    """Commit a verified deterministic update when tactical reasoning is absent.
+
+    Registry facts are still Supervisor-owned even when the optional model is
+    disabled or fails to produce a valid action.  The helper consumes only the
+    candidate set already fetched for the active task and emits no worker
+    request until the selected version is verified.
+    """
+    fallback_strategy = (
+        TacticalStrategy.PACKAGE_OVERRIDE
+        if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+        else TacticalStrategy.VERSION_BUMP
+    )
+    version_set = next(
+        (candidate for candidate in candidate_sets if candidate.strategy == fallback_strategy),
+        None,
+    )
+    selected = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    if version_set is None or not version_set.versions:
+        # An empty verified set is normal exhaustion, not a registry outage.
+        # Return control to the deterministic planner so it can advance the
+        # bounded stage ladder or pivot to a workaround. A registry exception
+        # is handled earlier by ``_apply_tactical_supervisor`` and remains an
+        # INCONCLUSIVE, no-dispatch outcome.
+        return None
+
+    if selected not in set(version_set.versions):
+        selected = version_set.canonical_version
+    if not selected:
+        return None
+    target_type = version_set.dependency_type or task.target_dependency_type
+    diagnostics_for_commit = (
+        retry_diagnostics_by_task.get(task.task_id) or UpdateRetryDiagnostics(task_id=task.task_id)
+    ).model_copy(
+        update={
+            "strategy_stage": task.strategy_stage,
+            "security_floor": version_set.security_floor,
+            "selected_version": selected,
+            "target_package_name": version_set.target_package_name,
+            "target_dependency_type": target_type,
+            "candidate_versions_considered": list(version_set.versions),
+            "candidate_dependency_types": _supervisor_dependency_type_candidates(
+                task.strategy_stage,
+                target_type,
+            ),
+            "latest_version_seen": version_set.versions[-1],
+            "registry_query_performed": True,
+            "reasoning_summary": (
+                "policy=lowest_verified_stable_semver; "
+                f"canonical_candidate={version_set.canonical_version or 'none'}"
+            ),
+        }
+    )
+    resolved_task = task.model_copy(
+        update={
+            "selected_version": selected,
+            "target_package_name": version_set.target_package_name,
+            "target_dependency_type": target_type,
+        }
+    )
+    resolved_task = resolved_task.model_copy(
+        update={
+            "instruction": _build_high_level_retry_instruction(
+                resolved_task,
+                group,
+                evaluation,
+                diagnostics_for_commit,
+            )
+        }
+    )
+    updates = {
+        "selected_version": resolved_task.selected_version,
+        "target_package_name": resolved_task.target_package_name,
+        "target_dependency_type": resolved_task.target_dependency_type,
+        "instruction": resolved_task.instruction,
+    }
+    if staged_resolutions is not None:
+        committed = _project_tactical_task_transition(task, updates)
+    else:
+        committed = _commit_task_transition(
+            task_queue,
+            task.task_id,
+            updates=updates,
+            consistency_events=consistency_events,
+        )
+    if committed is None:
+        return None
+    retry_plan = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=committed.task_revision,
+        strategy_stage=committed.strategy_stage,
+        selected_version=selected,
+        target_package_name=committed.target_package_name,
+        target_dependency_type=committed.target_dependency_type,
+        parent_minimum_version=committed.parent_minimum_version,
+        candidate_versions_considered=list(version_set.versions),
+        candidate_dependency_types=list(diagnostics_for_commit.candidate_dependency_types),
+        action="retry_update",
+        exact_instruction=committed.instruction,
+    )
+    if staged_resolutions is not None:
+        staged_resolutions.append(
+            _StagedTacticalResolution(
+                task_id=task.task_id,
+                expected_task_revision=task.task_revision,
+                decision_code=(
+                    DecisionCode.RETRY_VERSION_BUMP
+                    if task.status == TaskStatus.NEEDS_RETRY or task.retry_count > 0
+                    else DecisionCode.NEW_VERSION_BUMP
+                ),
+                next_node="update_subagent",
+                instruction=committed.instruction,
+                updates=updates,
+                retry_diagnostics=diagnostics_for_commit,
+                retry_plan=retry_plan,
+            )
+        )
+    else:
+        retry_diagnostics_by_task[task.task_id] = diagnostics_for_commit
+        retry_plans_by_task[task.task_id] = retry_plan
+    return SupervisorDecision(
+        decision_code=(
+            DecisionCode.RETRY_VERSION_BUMP
+            if task.status == TaskStatus.NEEDS_RETRY or task.retry_count > 0
+            else DecisionCode.NEW_VERSION_BUMP
+        ),
+        next_node="update_subagent",
+        target_task_ids=[task.task_id],
+        revised_instructions={task.task_id: committed.instruction},
+        instructions=committed.instruction,
+        decision_reason=(
+            f"Deterministic Supervisor selected the lowest verified candidate "
+            f"{selected} for task '{task.task_id}'."
+        ),
+    )
+
+
+def _apply_tactical_supervisor(
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+    qa_evaluations: dict[str, QAEvaluation],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    worker_results_by_attempt: dict[str, WorkerAttemptResult],
+    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot] | None = None,
+    *,
+    target_task_id: str | None = None,
+    consistency_events: list[StateConsistencyEvent],
+    errors: list[str],
+    staged_resolutions: list[_StagedTacticalResolution] | None = None,
+) -> SupervisorDecision | None:
+    """Apply one optional tactical proposal before deterministic routing.
+
+    The tactical layer is deliberately limited to one task per Supervisor
+    turn.  It may alter only the same task-input fields that the deterministic
+    planner owns, or create the existing single workaround child pivot.  A
+    disabled/unavailable/rejected proposal returns ``None`` so the existing
+    deterministic router remains authoritative.
+    """
+    settings = get_runtime_settings()
+
+    candidates = sorted(
+        (
+            task
+            for task in task_queue.values()
+            if (target_task_id is None or task.task_id == target_task_id)
+            if task.current_attempt_id is None
+            and task.status in _WORKABLE_STATUSES
+            and task.no_fix_stage is None
+        ),
+        key=lambda task: _task_sort_key(task, group_by_id),
+    )
+    for task in candidates:
+        group = group_by_id.get(task.parent_group_id)
+        if group is None:
+            continue
+        evaluation = qa_evaluations.get(task.task_id)
+        worker_result = next(
+            (
+                result
+                for result in sorted(
+                    worker_results_by_attempt.values(),
+                    key=lambda item: item.attempt_id,
+                    reverse=True,
+                )
+                if result.task_id == task.task_id
+            ),
+            None,
+        )
+        retry_diagnostics = retry_diagnostics_by_task.get(task.task_id)
+        prior_attempts = tuple(
+            snapshot
+            for snapshot in (attempt_snapshots_by_id or {}).values()
+            if snapshot.task_id == task.task_id
+        )
+        base_context = build_tactical_context(
+            task,
+            group,
+            evaluation=evaluation,
+            worker_result=worker_result,
+            retry_diagnostics=retry_diagnostics,
+            candidate_dependency_types=(
+                task.target_dependency_type,
+                *(
+                    _supervisor_dependency_type_candidates(
+                        task.strategy_stage,
+                        task.target_dependency_type,
+                    )
+                    if task.strategy == RoutingStrategy.VERSION_BUMP
+                    else []
+                ),
+            ),
+            prior_attempts=prior_attempts,
+        )
+        if classify_diagnostics(base_context).value == "inconclusive":
+            # QA contract/infrastructure/attribution gaps are rerun evidence,
+            # not a remediation signal. Do not spend a model call or retry
+            # budget on tactical replanning.
+            return None
+        candidate_sets, registry_error = registry_candidate_sets_for_context(base_context)
+        if registry_error:
+            detail = f"Registry verification pending for task {task.task_id}: {registry_error}"
+            consistency_events.append(
+                _build_consistency_event(
+                    error_code="REGISTRY_VERIFICATION_PENDING",
+                    task_id=task.task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            errors.append(f"supervisor: {detail}")
+            return SupervisorDecision(
+                decision_code=DecisionCode.REGISTRY_VERIFICATION_PENDING,
+                next_node="final_full_scan",
+                target_task_ids=[],
+                task_status_updates={task.task_id: TaskStatus.INCONCLUSIVE},
+                instructions=(
+                    "Registry verification is unavailable; defer remediation and preserve retry budget."
+                ),
+                decision_reason=detail,
+            )
+        if (
+            not settings.openai_api_key
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.status != TaskStatus.NEEDS_RETRY
+            and task.retry_count == 0
+        ):
+            return _commit_registry_resolution_fallback(
+                task_queue,
+                task,
+                group,
+                evaluation,
+                retry_diagnostics_by_task,
+                retry_plans_by_task,
+                candidate_sets,
+                consistency_events=consistency_events,
+                errors=errors,
+                staged_resolutions=staged_resolutions,
+            )
+        candidate_versions = next(
+            (
+                candidate.versions
+                for candidate in candidate_sets
+                if candidate.strategy == TacticalStrategy.VERSION_BUMP
+            ),
+            (),
+        )
+        context = build_tactical_context(
+            task,
+            group,
+            evaluation=evaluation,
+            worker_result=worker_result,
+            retry_diagnostics=retry_diagnostics,
+            candidate_versions=candidate_versions,
+            candidate_dependency_types=base_context.candidate_dependency_types,
+            candidate_sets=candidate_sets,
+            remaining_scanner_identifiers=(
+                evaluation.deterministic_gates.target_remaining_identifiers
+                if evaluation and evaluation.deterministic_gates
+                else ()
+            ),
+            dependency_evidence=(
+                evaluation.deterministic_gates.dependency_evidence
+                if evaluation and evaluation.deterministic_gates
+                else None
+            ),
+        )
+        action, verification = propose_and_verify_tactical_action(
+            context,
+            settings=settings,
+        )
+        if action is None or verification is None:
+            if task.strategy != RoutingStrategy.VERSION_BUMP:
+                return None
+            # A retry must advance through the deterministic fallback ladder;
+            # the current-stage registry set was fetched for tactical
+            # verification and must not silently replay the failed version.
+            if task.status == TaskStatus.NEEDS_RETRY or task.retry_count > 0:
+                return None
+            return _commit_registry_resolution_fallback(
+                task_queue,
+                task,
+                group,
+                evaluation,
+                retry_diagnostics_by_task,
+                retry_plans_by_task,
+                candidate_sets,
+                consistency_events=consistency_events,
+                errors=errors,
+                staged_resolutions=staged_resolutions,
+            )
+        if not verification.accepted:
+            detail = verification.reason
+            if registry_error and "candidate" in detail.lower():
+                detail = f"{detail} {registry_error}"
+            consistency_events.append(
+                _build_consistency_event(
+                    error_code="TACTICAL_ACTION_REJECTED",
+                    task_id=task.task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            errors.append(f"supervisor: tactical action rejected for {task.task_id}: {detail}")
+            return None
+
+        diagnostic_kind = classify_diagnostics(context)
+        instruction = verification.instruction or task.instruction
+        verified_versions = list(verification.allowed_target_versions)
+        canonical_version = (
+            verified_versions[0] if verified_versions else verification.selected_version
+        )
+        decision_reason = (
+            f"Tactical Supervisor selected {action.selected_strategy.value} for task "
+            f"'{task.task_id}' after {diagnostic_kind.value} evidence: {action.rationale}"
+        )
+        if action.selected_strategy == TacticalStrategy.ESCALATE_TO_PORTFOLIO:
+            referral = (
+                f"{task.task_id}: peer-conflict referral requires a coordinated multi-package "
+                "resolution; Phase 2 cannot safely select a compatible single-task candidate."
+            )
+            return SupervisorDecision(
+                decision_code=DecisionCode.PEER_CONFLICT_ESCALATION,
+                next_node="teardown",
+                target_task_ids=[],
+                unfixable_task_ids=[task.task_id],
+                task_status_updates={task.task_id: TaskStatus.UNFIXABLE},
+                new_constraints=[referral],
+                decision_reason=decision_reason,
+                instructions=(
+                    "Peer conflict requires a multi-package portfolio resolution; "
+                    "Phase 2 records the referral and ends single-task remediation."
+                ),
+            )
+        if action.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
+            if task.strategy == RoutingStrategy.CODE_WORKAROUND:
+                return SupervisorDecision(
+                    decision_code=DecisionCode.WORKAROUND_DISPATCH,
+                    next_node="workaround_subagent",
+                    target_task_ids=[task.task_id],
+                    revised_instructions={task.task_id: instruction},
+                    instructions=instruction,
+                    decision_reason=decision_reason,
+                )
+            return SupervisorDecision(
+                decision_code=DecisionCode.PIVOT_TO_WORKAROUND,
+                next_node="workaround_subagent",
+                target_task_ids=[task.task_id],
+                spawn_requests=[
+                    TaskSpawnRequest(
+                        parent_task_id=task.task_id,
+                        strategy=RoutingStrategy.CODE_WORKAROUND,
+                        instruction=instruction,
+                        reason=decision_reason,
+                    )
+                ],
+                instructions=instruction,
+                decision_reason=decision_reason,
+            )
+
+        updates = {
+            "strategy_stage": verification.strategy_stage or task.strategy_stage,
+            "selected_version": verification.selected_version,
+            "target_package_name": verification.target_package_name,
+            "target_dependency_type": verification.target_dependency_type,
+            "instruction": instruction,
+            "exhausted_update_path": False,
+        }
+        if staged_resolutions is not None:
+            committed = _project_tactical_task_transition(task, updates)
+        else:
+            committed = _commit_task_transition(
+                task_queue,
+                task.task_id,
+                updates=updates,
+                consistency_events=consistency_events,
+            )
+        if committed is None:
+            return None
+        diagnostics_for_commit = (
+            retry_diagnostics or UpdateRetryDiagnostics(task_id=task.task_id)
+        ).model_copy(
+            update={
+                "strategy_stage": committed.strategy_stage,
+                "selected_version": committed.selected_version,
+                "target_package_name": committed.target_package_name,
+                "target_dependency_type": committed.target_dependency_type,
+                "security_floor": _canonical_security_floor(group)[0],
+                "candidate_versions_considered": list(dict.fromkeys(verified_versions)),
+                "candidate_dependency_types": list(
+                    dict.fromkeys(
+                        [
+                            *verification.allowed_dependency_types,
+                        ]
+                    )
+                ),
+                "registry_query_performed": bool(candidate_sets),
+                "reasoning_summary": (
+                    "policy=lowest_verified_stable_semver; "
+                    f"canonical_candidate={canonical_version or 'none'}; "
+                    f"diagnostic_basis={action.diagnostic_basis}; rationale={action.rationale}"
+                ),
+            }
+        )
+        retry_plan = SupervisorRetryPlan(
+            task_id=task.task_id,
+            source_task_revision=committed.task_revision,
+            strategy_stage=committed.strategy_stage,
+            selected_version=committed.selected_version,
+            target_package_name=committed.target_package_name,
+            target_dependency_type=committed.target_dependency_type,
+            parent_minimum_version=committed.parent_minimum_version,
+            attempted_versions=list(diagnostics_for_commit.attempted_versions),
+            candidate_versions_considered=verified_versions,
+            candidate_dependency_types=list(verification.allowed_dependency_types),
+            action="retry_update",
+            exact_instruction=instruction,
+        )
+        decision_code = (
+            DecisionCode.RETRY_VERSION_BUMP
+            if task.status == TaskStatus.NEEDS_RETRY or task.retry_count > 0
+            else DecisionCode.NEW_VERSION_BUMP
+        )
+        if staged_resolutions is not None:
+            staged_resolutions.append(
+                _StagedTacticalResolution(
+                    task_id=task.task_id,
+                    expected_task_revision=task.task_revision,
+                    decision_code=decision_code,
+                    next_node="update_subagent",
+                    instruction=instruction,
+                    updates=updates,
+                    retry_diagnostics=diagnostics_for_commit,
+                    retry_plan=retry_plan,
+                )
+            )
+        else:
+            retry_diagnostics_by_task[task.task_id] = diagnostics_for_commit
+            retry_plans_by_task[task.task_id] = retry_plan
+        return SupervisorDecision(
+            decision_code=decision_code,
+            next_node="update_subagent",
+            target_task_ids=[task.task_id],
+            revised_instructions={task.task_id: instruction},
+            instructions=instruction,
+            decision_reason=decision_reason,
+        )
+
+
 def _qa_failure_evidence_for_workaround_retry(
     task_id: str,
     qa_evaluations: dict[str, QAEvaluation],
@@ -498,6 +1011,73 @@ def _commit_task_transition(
             clear_selected_version=clear_selected_version,
             allow_breaking_change_pivot=allow_breaking_change_pivot,
             consistency_events=consistency_events,
+        )
+
+
+def _project_tactical_task_transition(
+    task: RemediationTask,
+    updates: dict[str, Any],
+) -> RemediationTask:
+    """Project a tactical input transition without mutating orchestration state.
+
+    Tactical verification happens before the Supervisor guardrails.  This
+    helper mirrors the revision behavior of ``_commit_task_transition`` so a
+    staged retry plan can be correlated to the revision it will receive if
+    the final guarded decision still selects it.
+    """
+    committed_updates = dict(updates)
+    input_changed = any(
+        field in committed_updates and committed_updates[field] != getattr(task, field)
+        for field in _ATTEMPT_INPUT_FIELDS
+    )
+    if input_changed:
+        committed_updates["task_revision"] = task.task_revision + 1
+    return task.model_copy(update=committed_updates)
+
+
+def _commit_staged_tactical_resolutions(
+    staged_resolutions: list[_StagedTacticalResolution],
+    decision: SupervisorDecision,
+    task_queue: dict[str, RemediationTask],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    retry_plans_by_task: dict[str, SupervisorRetryPlan],
+    *,
+    consistency_events: list[StateConsistencyEvent],
+) -> None:
+    """Commit only tactical data that survived the post-decision guardrails.
+
+    A model proposal is not orchestration state.  The final decision may be
+    replaced by deterministic routing after cardinality, NO_FIX, or stale
+    target checks.  Comparing the rendered instruction and route before this
+    commit prevents a tactical version or retry plan from leaking into a
+    deterministic fallback.
+    """
+    for staged in staged_resolutions:
+        if (
+            decision.decision_code != staged.decision_code
+            or decision.next_node != staged.next_node
+            or decision.target_task_ids != [staged.task_id]
+            or decision.revised_instructions.get(staged.task_id) != staged.instruction
+        ):
+            continue
+        task = task_queue.get(staged.task_id)
+        if (
+            task is None
+            or task.task_revision != staged.expected_task_revision
+            or task.current_attempt_id is not None
+        ):
+            continue
+        committed = _commit_task_transition(
+            task_queue,
+            staged.task_id,
+            updates=staged.updates,
+            consistency_events=consistency_events,
+        )
+        if committed is None:
+            continue
+        retry_diagnostics_by_task[staged.task_id] = staged.retry_diagnostics
+        retry_plans_by_task[staged.task_id] = staged.retry_plan.model_copy(
+            update={"source_task_revision": committed.task_revision}
         )
 
 
@@ -869,16 +1449,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             task_updates["instruction"] = group.fix_plan.instruction
         if (
             task.task_revision == 0
+            and task.status not in _TERMINAL_STATUSES
             and task.current_attempt_id is None
-            and task.status == TaskStatus.PENDING
-            and task.selected_version is None
             and task.strategy == RoutingStrategy.VERSION_BUMP
-            and not task.parent_package_name
-            and group is not None
-            and group.fix_plan is not None
-            and group.fix_plan.fixed_version
+            and task.selected_version is not None
         ):
-            task_updates["selected_version"] = group.fix_plan.fixed_version
+            # Compatibility state may contain a fix-plan version projected
+            # before registry verification existed. Clear that uncommitted
+            # target so the first active-task routing pass must verify it.
+            task_updates["selected_version"] = None
         if (
             task.task_revision == 0
             and task.current_attempt_id is None
@@ -894,68 +1473,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_updates["target_package_name"] = parent_name
                 task_updates["target_dependency_type"] = task.target_dependency_type or parent_type
         if task_updates:
-            if "qa_policy" in task_updates:
+            if "qa_policy" in task_updates or "selected_version" in task_updates:
                 task_updates["task_revision"] = task.task_revision + 1
             task_queue[task_id] = task.model_copy(update=task_updates)
 
-    # A transitive VERSION_BUMP task is planned against its nearest directly
-    # declared parent before the first update worker is dispatched. This keeps
-    # child pins/overrides out of the initial instruction.
-    for task_id, task in list(task_queue.items()):
-        group = group_by_id.get(task.parent_group_id)
-        if (
-            group is not None
-            and is_transitive_group(group)
-            and task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.status == TaskStatus.PENDING
-            and task.current_attempt_id is None
-            and task.parent_package_name
-            and task.strategy_stage == SCARemediationStage.OSV_MINIMUM
-        ):
-            initial_candidates: list[str] = []
-            planned_task = _plan_initial_transitive_task(
-                task,
-                group,
-                candidate_versions=initial_candidates,
-            )
-            task_queue[task_id] = planned_task
-            prior_diagnostics = retry_diagnostics_by_task.get(task_id)
-            parent_name, _, parent_type = group_parent_context(group)
-            target_type = planned_task.target_dependency_type or parent_type
-            initial_diagnostics = prior_diagnostics or UpdateRetryDiagnostics(task_id=task_id)
-            retry_diagnostics_by_task[task_id] = initial_diagnostics.model_copy(
-                update={
-                    "strategy_stage": planned_task.strategy_stage,
-                    "security_floor": (
-                        group.fix_plan.fixed_version
-                        if group.fix_plan is not None
-                        else initial_diagnostics.security_floor
-                    ),
-                    "selected_version": planned_task.selected_version,
-                    "candidate_versions_considered": list(
-                        dict.fromkeys(
-                            [
-                                *initial_diagnostics.candidate_versions_considered,
-                                *initial_candidates,
-                                *(
-                                    [planned_task.selected_version]
-                                    if planned_task.selected_version
-                                    else []
-                                ),
-                            ]
-                        )
-                    ),
-                    "candidate_dependency_types": _supervisor_dependency_type_candidates(
-                        planned_task.strategy_stage,
-                        target_type,
-                    ),
-                    "target_package_name": planned_task.target_package_name,
-                    "target_dependency_type": target_type,
-                    "parent_package_name": parent_name,
-                    "parent_minimum_version": planned_task.parent_minimum_version,
-                    "registry_query_performed": bool(initial_candidates),
-                }
-            )
+    # Registry planning is intentionally deferred until deterministic routing
+    # has selected one active task below.  The former implementation planned
+    # every transitive task while normalizing the queue, which made registry
+    # spans and candidate evidence appear to belong to the wrong task and
+    # could consume network work for tasks that were not dispatchable yet.
 
     # ------------------------------------------------------------------
     # 2. Ingest attempt-tagged worker results (active targets only)
@@ -1319,44 +1845,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # immutable snapshot.
                 failed_group = group_by_id.get(task.parent_group_id)
                 transitive_failure = bool(failed_group and is_transitive_group(failed_group))
-                next_failure_stage = (
-                    _next_sca_stage(task.strategy_stage, transitive=True)
-                    if transitive_failure
-                    else task.strategy_stage
-                )
                 failure_updates: dict[str, Any] = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
-                if transitive_failure and next_failure_stage != task.strategy_stage:
-                    failure_updates["strategy_stage"] = next_failure_stage
-                    if next_failure_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-                        failure_updates.update(
-                            {
-                                "target_package_name": failed_group.vulnerable_component,
-                                "target_dependency_type": _override_dependency_type(failed_group),
-                                "selected_version": (
-                                    failed_group.fix_plan.fixed_version
-                                    if failed_group.fix_plan
-                                    else None
-                                ),
-                            }
-                        )
-                    elif next_failure_stage == SCARemediationStage.CODE_WORKAROUND:
-                        failure_updates.update(
-                            {
-                                "selected_version": None,
-                                "exhausted_update_path": True,
-                            }
-                        )
                 _commit_task_transition(
                     task_queue,
                     task_id,
                     updates=failure_updates,
                     close_attempt=True,
-                    clear_selected_version=(
-                        next_failure_stage == SCARemediationStage.CODE_WORKAROUND
-                    ),
+                    clear_selected_version=False,
                 )
                 if transitive_failure:
                     committed_failure_task = task_queue[task_id]
@@ -1541,6 +2039,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         task_queue,
                         resolved_t_id,
                         updates=no_fix_updates,
+                        close_attempt=True,
                         clear_selected_version=True,
                     )
                     if reset_workspace:
@@ -1554,60 +2053,38 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     continue
 
                 group = group_by_id.get(task.parent_group_id)
-                next_stage = _next_sca_stage(
-                    task.strategy_stage,
-                    transitive=bool(group and is_transitive_group(group)),
-                )
                 task_updates = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
-                if task.strategy == RoutingStrategy.VERSION_BUMP:
-                    task_updates["strategy_stage"] = next_stage
-                    if next_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-                        task_updates.update(
-                            {
-                                "target_package_name": (
-                                    group.vulnerable_component if group else task.parent_group_id
-                                ),
-                                "target_dependency_type": _override_dependency_type(group),
-                                "selected_version": (
-                                    group.fix_plan.fixed_version
-                                    if group and group.fix_plan
-                                    else task.selected_version
-                                ),
-                            }
-                        )
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
                     updates=task_updates,
+                    close_attempt=True,
                 )
                 task = task_queue[resolved_t_id]
                 if task.strategy == RoutingStrategy.VERSION_BUMP:
+                    # Keep the failed stage intact until tactical reasoning
+                    # has had the first opportunity to choose an immediate
+                    # pivot. The deterministic planner advances stages only
+                    # when tactical reasoning is unavailable or rejected.
+                    next_stage = task.strategy_stage
                     prior_diag = retry_diagnostics_by_task.get(resolved_t_id)
                     parent_name, _, parent_type = (
                         group_parent_context(group) if group is not None else (None, None, None)
                     )
-                    next_target = (
-                        group.vulnerable_component
-                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
-                        else task.target_package_name or parent_name
-                    )
-                    next_target_type = (
-                        _override_dependency_type(group)
-                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
-                        else task.target_dependency_type or parent_type
-                    )
+                    next_target = task.target_package_name or parent_name
+                    next_target_type = task.target_dependency_type or parent_type
                     if prior_diag is None:
                         retry_diagnostics_by_task[resolved_t_id] = UpdateRetryDiagnostics(
                             task_id=resolved_t_id,
                             strategy_stage=next_stage,
                             security_floor=(
-                                group.fix_plan.fixed_version if group and group.fix_plan else None
+                                _canonical_security_floor(group)[0] if group is not None else None
                             ),
                             exhausted_update_path=(
-                                next_stage == SCARemediationStage.CODE_WORKAROUND
+                                task.strategy_stage == SCARemediationStage.CODE_WORKAROUND
                             ),
                             target_package_name=next_target,
                             target_dependency_type=next_target_type,
@@ -1619,13 +2096,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         retry_diagnostics_by_task[resolved_t_id] = prior_diag.model_copy(
                             update={
                                 "strategy_stage": next_stage,
-                                "security_floor": prior_diag.security_floor
-                                or (
-                                    group.fix_plan.fixed_version
-                                    if group and group.fix_plan
-                                    else None
+                                "security_floor": (
+                                    _canonical_security_floor(group)[0]
+                                    if group is not None
+                                    else prior_diag.security_floor
                                 ),
-                                "exhausted_update_path": next_stage
+                                "exhausted_update_path": task.strategy_stage
                                 == SCARemediationStage.CODE_WORKAROUND,
                                 "target_package_name": next_target,
                                 "target_dependency_type": next_target_type,
@@ -1764,8 +2240,80 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
 
     # ------------------------------------------------------------------
-    # 6. Deterministic retry planning
+    # 6. Optional tactical planning, then deterministic retry planning
     # ------------------------------------------------------------------
+    tactical_fallback_requires_stage_advance = False
+    staged_tactical_resolutions: list[_StagedTacticalResolution] = []
+    if decision is None:
+        deterministic_target_decision = _deterministic_routing(
+            task_queue,
+            group_by_id,
+            qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
+            active_target_task_ids=active_target_task_ids,
+            current_status=str(state.get("status") or ""),
+            triage_required=bool(state.get("triage_required")),
+        )
+        target_task_id = (
+            deterministic_target_decision.target_task_ids[0]
+            if deterministic_target_decision.next_node in {"update_subagent", "workaround_subagent"}
+            and len(deterministic_target_decision.target_task_ids) == 1
+            else None
+        )
+        target_task = task_queue.get(target_task_id) if target_task_id else None
+        if target_task is None or target_task.no_fix_stage is not None:
+            # NO_FIX and unsupported/multi-task decisions are deterministic
+            # state-machine transitions.  They are never handed to the
+            # tactical classifier, and their target is the only task that may
+            # be considered this turn.
+            decision = deterministic_target_decision
+        else:
+            target_group = group_by_id.get(target_task.parent_group_id)
+            target_evaluation = qa_evaluations.get(target_task.task_id)
+            target_worker_result = next(
+                (
+                    result
+                    for result in sorted(
+                        worker_results_by_attempt.values(),
+                        key=lambda item: item.attempt_id,
+                        reverse=True,
+                    )
+                    if result.task_id == target_task.task_id
+                ),
+                None,
+            )
+            if target_group is not None and target_task.status == TaskStatus.NEEDS_RETRY:
+                tactical_fallback_context = build_tactical_context(
+                    target_task,
+                    target_group,
+                    evaluation=target_evaluation,
+                    worker_result=target_worker_result,
+                    retry_diagnostics=retry_diagnostics_by_task.get(target_task.task_id),
+                )
+                tactical_fallback_requires_stage_advance = (
+                    classify_diagnostics(tactical_fallback_context)
+                    != TacticalDiagnosticKind.INCONCLUSIVE
+                )
+            # The tactical layer receives exactly the target selected by the
+            # deterministic router.  It cannot scan the queue and drift to a
+            # different task because another task happens to be workable.
+            tactical_decision = _apply_tactical_supervisor(
+                task_queue,
+                group_by_id,
+                qa_evaluations,
+                retry_diagnostics_by_task,
+                retry_plans_by_task,
+                worker_results_by_attempt,
+                attempt_snapshots_by_id,
+                target_task_id=target_task_id,
+                consistency_events=consistency_events,
+                errors=errors,
+                staged_resolutions=staged_tactical_resolutions,
+            )
+            if tactical_decision is not None:
+                decision = tactical_decision
+
     if decision is None and _needs_planner(
         task_queue,
         qa_evaluations,
@@ -1776,6 +2324,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             task_queue,
             group_by_id,
             retry_diagnostics_by_task,
+            advance_failed_stage=str(state.get("status") or "")
+            in {
+                "qa_completed",
+                "qa_failed",
+            }
+            or tactical_fallback_requires_stage_advance,
+            target_task_ids=[target_task_id] if target_task_id else None,
         )
         planner_violations = _planner_plan_violations(
             parsed_plans,
@@ -1858,7 +2413,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # The deterministic decision is authoritative. QA feedback below is
     # carried only when Python produced it for the selected task; no model
     # can add worker feedback or constraints to this projection.
-    decision = deterministic_decision
+    if decision is None:
+        decision = deterministic_decision
 
     # ------------------------------------------------------------------
     # 7. Guardrails: validate and clamp (or deterministic fallback)
@@ -1866,7 +2422,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     pivot_parent_status_by_parent: dict[str, TaskStatus] = {}
     pivot_target_parent_ids: set[str] = set()
 
-    if decision is not None and _no_fix_decision_requires_fallback(decision, task_queue):
+    if decision is not None and _no_fix_decision_requires_fallback(
+        decision, task_queue, group_by_id
+    ):
         errors.append(
             "supervisor: rejected router decision that attempted to bypass the "
             "deterministic NO_FIX mitigation lifecycle."
@@ -2140,9 +2698,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 clean_feedback = dict(decision.feedback_by_task)
                 clean_updated_task_strategies = dict(decision.updated_task_strategies)
 
-            # Validate task_status_updates â€” only known tasks, only terminal statuses
+            # Validate task_status_updates — only known tasks and fail-closed statuses
             clean_status_updates: dict[str, TaskStatus] = {}
-            _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+            _allowed_statuses = {
+                TaskStatus.QA_PASSED,
+                TaskStatus.UNFIXABLE,
+                TaskStatus.INCONCLUSIVE,
+            }
             for t_id, new_status in decision.task_status_updates.items():
                 if t_id not in known_task_ids:
                     errors.append(
@@ -2300,6 +2862,18 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # 8. Apply guarded updates to task_queue
     # ------------------------------------------------------------------
 
+    # Tactical registry resolutions are staged while the routing decision is
+    # being checked.  Commit them only after all guardrails have preserved the
+    # same route, target, and exact rendered instruction.
+    _commit_staged_tactical_resolutions(
+        staged_tactical_resolutions,
+        decision,
+        task_queue,
+        retry_diagnostics_by_task,
+        retry_plans_by_task,
+        consistency_events=consistency_events,
+    )
+
     # 8a. Apply revised_instructions (copy-on-write per task)
     for t_id, new_instr in decision.revised_instructions.items():
         if t_id in task_queue and new_instr.strip():
@@ -2326,8 +2900,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 close_attempt=task_queue[t_id].current_attempt_id is not None,
             )
 
-    # 8c. Apply guarded task status overrides (only QA_PASSED and UNFIXABLE)
-    _allowed_statuses = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+    # 8c. Apply guarded task status overrides.
+    _allowed_statuses = {
+        TaskStatus.QA_PASSED,
+        TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
+    }
     for t_id, new_status in decision.task_status_updates.items():
         if (
             t_id in task_queue

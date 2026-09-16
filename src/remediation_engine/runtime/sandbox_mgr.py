@@ -22,7 +22,10 @@ import shlex
 import tarfile
 import time
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
+from threading import RLock
 
 from langsmith import traceable
 
@@ -45,6 +48,135 @@ _WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
 _WORKSPACE_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS = 900
 _WORKSPACE_SNAPSHOT_VALIDATION_TIMEOUT_SECONDS = 60
+_READ_CACHE_MAX_ENTRIES = 512
+_READ_CACHE_MAX_BYTES = 8 * 1024 * 1024
+
+
+class WorkspaceReadCache:
+    """Bounded, revision-aware cache for workspace file reads.
+
+    The cache is deliberately separate from Docker I/O.  A cache hit returns
+    before the traced container reader is entered, while the revision key
+    prevents content from surviving an explicit workspace mutation or
+    snapshot restore.  A cache instance may be shared by nested QA/workaround
+    helpers or by short-lived sandbox wrappers for the same attempt.
+
+    Args:
+        max_entries: Maximum number of normalized file entries to retain.
+        max_bytes: Maximum UTF-8 payload size retained by the cache.
+
+    Raises:
+        ValueError: If either bound is not positive.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = _READ_CACHE_MAX_ENTRIES,
+        max_bytes: int = _READ_CACHE_MAX_BYTES,
+    ) -> None:
+        """Initialize an empty cache with bounded entry and byte limits.
+
+        Args:
+            max_entries: Maximum number of file entries to retain.
+            max_bytes: Maximum UTF-8 payload size to retain.
+        """
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[str, int, str], str | None] = OrderedDict()
+        self._cached_bytes = 0
+        self._epoch = 0
+        self._requests = 0
+        self._hits = 0
+        self._misses = 0
+        self._docker_reads = 0
+        self._oversized_reads = 0
+        self._invalidations = 0
+        self._last_invalidation_reason = "initial"
+        self._lock = RLock()
+
+    @property
+    def epoch(self) -> int:
+        """Return the current workspace revision used for cache keys."""
+        with self._lock:
+            return self._epoch
+
+    def invalidate(self, reason: str) -> None:
+        """Discard all entries and advance the workspace revision.
+
+        Args:
+            reason: Bounded operational reason for diagnostics and metrics.
+        """
+        with self._lock:
+            self._entries.clear()
+            self._cached_bytes = 0
+            self._epoch += 1
+            self._invalidations += 1
+            self._last_invalidation_reason = str(reason or "unknown")[:200]
+
+    def get_or_load(
+        self,
+        scope: str,
+        relative_path: str,
+        loader: Callable[[], str | None],
+    ) -> str | None:
+        """Return a cached file or load it exactly once for the current epoch.
+
+        Args:
+            scope: Stable workspace/volume scope for the cache key.
+            relative_path: Already normalized workspace-relative path.
+            loader: Callable that performs one real Docker read on a miss.
+
+        Returns:
+            The file contents, or ``None`` when the loader cannot read it.
+        """
+        with self._lock:
+            self._requests += 1
+            key = (str(scope), self._epoch, relative_path)
+            if key in self._entries:
+                self._hits += 1
+                self._entries.move_to_end(key)
+                return self._entries[key]
+
+            self._misses += 1
+            # Keep the load under the lock so concurrent tool calls for the
+            # same file cannot create a burst of duplicate Docker reads.
+            self._docker_reads += 1
+            content = loader()
+            content_size = len(content.encode("utf-8")) if isinstance(content, str) else 0
+            if content_size <= self._max_bytes:
+                while self._entries and (
+                    len(self._entries) >= self._max_entries
+                    or self._cached_bytes + content_size > self._max_bytes
+                ):
+                    _old_key, old_value = self._entries.popitem(last=False)
+                    if isinstance(old_value, str):
+                        self._cached_bytes -= len(old_value.encode("utf-8"))
+                self._entries[key] = content
+                self._cached_bytes += content_size
+            else:
+                self._oversized_reads += 1
+            return content
+
+    def metrics(self) -> dict[str, int | str]:
+        """Return bounded read-cache counters without exposing file contents."""
+        with self._lock:
+            return {
+                "epoch": self._epoch,
+                "requests": self._requests,
+                "hits": self._hits,
+                "misses": self._misses,
+                "docker_reads": self._docker_reads,
+                "cached_entries": len(self._entries),
+                "cached_bytes": self._cached_bytes,
+                "oversized_reads": self._oversized_reads,
+                "invalidations": self._invalidations,
+                "last_invalidation_reason": self._last_invalidation_reason,
+            }
 
 
 def _workspace_snapshot_archive(snapshot_id: str) -> str:
@@ -113,8 +245,18 @@ class DockerSandbox:
         repo_root: str | Path | None,
         image: str = _DEFAULT_IMAGE,
         workspace_volume: str | None = None,
+        read_cache: WorkspaceReadCache | None = None,
     ) -> None:
-        """Initialize an unopened sandbox configuration."""
+        """Initialize an unopened sandbox configuration.
+
+        Args:
+            repo_root: Optional host repository to copy into the workspace.
+            image: Docker image used for the sandbox container.
+            workspace_volume: Optional named Docker volume mounted at
+                ``/workspace``.
+            read_cache: Optional attempt-scoped cache shared by nested
+                workspace readers. A private cache is created when omitted.
+        """
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._image = image
         self._workspace_volume = workspace_volume
@@ -122,10 +264,22 @@ class DockerSandbox:
         self._container = None
         self._client = None
         self._alive = False
+        # Read-heavy QA and workaround flows often request the same file from
+        # several tools in one turn. Cache hits are handled before the traced
+        # I/O helper so they do not create one LangSmith span per duplicate
+        # read. The scope is part of the key when a cache is shared across
+        # short-lived wrappers for one remediation attempt.
+        self._read_cache = read_cache or WorkspaceReadCache()
+        self._read_scope = (
+            f"volume:{workspace_volume}"
+            if workspace_volume
+            else f"repo:{self._repo_root or '<unbound>'}"
+        )
 
     @traceable(run_type="tool", name="docker_sandbox.start")
     def start(self) -> None:
         """Start the sandbox container and prepare ``/workspace``."""
+        self.invalidate_read_cache("sandbox_start")
         try:
             import docker.errors as docker_errors  # type: ignore[import]
         except ImportError as exc:  # pragma: no cover
@@ -216,6 +370,7 @@ class DockerSandbox:
             self._container = None
             self._alive = False
             self._client = None
+            self.invalidate_read_cache("sandbox_teardown")
             try:
                 close_docker_client(client)
             except Exception as exc:  # noqa: BLE001
@@ -269,8 +424,23 @@ class DockerSandbox:
         self,
         command: str,
         timeout: int = _DEFAULT_TIMEOUT_SECONDS,
+        *,
+        mutates_workspace: bool = True,
     ) -> CommandResult:
-        """Execute *command* inside ``/workspace`` using ``/bin/sh -lc``."""
+        """Execute *command* inside ``/workspace`` using ``/bin/sh -lc``.
+
+        Args:
+            command: Shell command to execute inside the workspace.
+            timeout: Maximum execution time in seconds.
+            mutates_workspace: Whether the caller knows the command can
+                change workspace contents. Mutating commands advance the
+                read-cache epoch; read-only commands retain cached evidence.
+
+        Returns:
+            The typed command result.
+        """
+        if mutates_workspace:
+            self.invalidate_read_cache("sandbox_command")
         if not self._alive or self._container is None:
             return CommandResult(
                 exit_code=1,
@@ -369,12 +539,45 @@ class DockerSandbox:
             duration_seconds=round(duration, 3),
         )
 
+    def run_readonly(
+        self,
+        command: str,
+        timeout: int = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> CommandResult:
+        """Execute a declared read-only command without evicting file evidence.
+
+        Args:
+            command: Shell command that does not modify workspace inputs.
+            timeout: Maximum execution time in seconds.
+
+        Returns:
+            The typed command result.
+
+        Note:
+            Callers must use :meth:`run` for commands whose mutation behavior
+            is unknown. This method is an explicit opt-in safety boundary.
+        """
+        return self.run(command, timeout=timeout, mutates_workspace=False)
+
+    def invalidate_read_cache(self, reason: str = "workspace_mutation") -> None:
+        """Invalidate cached workspace reads after an external mutation.
+
+        Args:
+            reason: Bounded operational reason retained in cache metrics.
+        """
+        self._read_cache.invalidate(reason)
+
+    def read_cache_metrics(self) -> dict[str, int | str]:
+        """Return read-cache counters for diagnostics and trace summaries."""
+        return self._read_cache.metrics()
+
     @traceable(run_type="tool", name="docker_sandbox.write_file")
     def write_file(self, file_path: str, content: str) -> None:
         """Write *content* to *file_path* inside ``/workspace``."""
         if not self._alive or self._container is None:
             raise RuntimeError("Sandbox is not running.")
 
+        self.invalidate_read_cache("write_file")
         relative_path = normalize_workspace_path(file_path)
         abs_path = f"/workspace/{relative_path}"
         parent_dir = abs_path.rsplit("/", 1)[0]
@@ -394,14 +597,27 @@ class DockerSandbox:
         self._container.put_archive(parent_dir, buf.read())
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
 
-    @traceable(run_type="tool", name="docker_sandbox.read_file")
     def read_file(self, file_path: str) -> str | None:
-        """Read *file_path* from ``/workspace`` and return decoded text."""
+        """Read *file_path*, avoiding duplicate traced container reads.
+
+        The public cache lookup is intentionally outside the trace decorator.
+        Only a cache miss reaches :meth:`_read_file_from_container`, so repeat
+        reads from workaround and QA tools do not become trace spam.
+        """
+        relative_path = normalize_workspace_path(file_path)
+        return self._read_cache.get_or_load(
+            self._read_scope,
+            relative_path,
+            lambda: self._read_file_from_container(relative_path),
+        )
+
+    @traceable(run_type="tool", name="docker_sandbox.read_file")
+    def _read_file_from_container(self, relative_path: str) -> str | None:
+        """Read one normalized path from ``/workspace`` through Docker."""
         if not self._alive or self._container is None:
             logger.warning("DockerSandbox.read_file: sandbox is not running.")
             return None
 
-        relative_path = normalize_workspace_path(file_path)
         abs_path = f"/workspace/{relative_path}"
 
         try:

@@ -314,6 +314,62 @@ def test_validation_gate_can_validate_replayed_edits() -> None:
     assert has_successful_validation_gate(events, has_prior_edits=True) is True
 
 
+def test_validation_pass_terminates_without_a_max_round_error() -> None:
+    """A valid workaround PASS closes the bounded worker loop immediately."""
+    edit_tool = MagicMock()
+    edit_tool.name = "deterministic_search_replace"
+    edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.ts"
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_workaround"
+    validate_tool.invoke.return_value = (
+        "SUCCESS: Workaround validation gate passed. JSON: "
+        '{"overall_status":"PASS","validated_files":["src/auth.ts"]}'
+    )
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": edit_tool.name,
+                    "args": {"file_path": "src/auth.ts"},
+                    "id": "edit-pass-1",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {
+                        "modified_files": ["src/auth.ts"],
+                        "runtime_smoke_file": "src/auth.ts",
+                        "targeted_test_file": "tests/auth.test.ts",
+                    },
+                    "id": "validate-pass-1",
+                }
+            ],
+        ),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [edit_tool, validate_tool],
+        [HumanMessage(content="Apply and validate the patch.")],
+        set(),
+        execution_state={"validation_calls": 0},
+    )
+
+    assert bound_llm.invoke.call_count == 2
+    assert result.terminal_validation_passed is True
+    assert result.errors == []
+    assert "MAX_SUBAGENT_TOOL_CALL_ROUNDS" not in " ".join(result.errors)
+
+
 def test_validation_recovery_explains_checkpoint_behavior() -> None:
     """Tell the worker which edit state each validation outcome leaves behind."""
     instruction = _validation_gate_recovery_instruction(

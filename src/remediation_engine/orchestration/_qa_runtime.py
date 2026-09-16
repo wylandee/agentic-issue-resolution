@@ -45,6 +45,7 @@ from remediation_engine.tools.lockfile_closure import (
     resolve_dependency_closure,
 )
 
+from ._tool_support import _run_readonly
 from .qa_odc import _ODC_HTML_REPORT_NAME, _ODC_REPORT_NAME
 from .qa_test_parsing import _NPM_INSTALL_TIMEOUT_SECONDS, _workspace_json_file
 from .qa_types import (
@@ -728,7 +729,11 @@ def _collect_dependency_package_state(
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
         command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
         try:
-            command_result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
+            command_result = _run_readonly(
+                sandbox,
+                command,
+                timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
+            )
             exit_code = getattr(command_result, "exit_code", None)
             if isinstance(exit_code, int) and exit_code != 0:
                 graph_errors.append(f"npm ls failed for {manifest} with exit code {exit_code}.")
@@ -930,7 +935,11 @@ def _collect_group_package_state(
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
         command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
         try:
-            command_result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
+            command_result = _run_readonly(
+                sandbox,
+                command,
+                timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
+            )
             raw = (command_result.stdout or "").strip()
             tree = json.loads(raw) if raw else None
             if isinstance(tree, dict):

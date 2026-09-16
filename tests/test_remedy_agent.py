@@ -862,7 +862,9 @@ class TestUpdateSubagentWrapper:
         ):
             result = run_workaround_subagent_node(state)
 
-        assert bound.invoke.call_count == 7
+        # The successful validation gate is terminal; the old extra textual
+        # model round must not be requested.
+        assert bound.invoke.call_count == 6
         assert loop.call_args.kwargs["context_manager"] is not None
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert result["changed_files"] == ["routes/login.ts"]

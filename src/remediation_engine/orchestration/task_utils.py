@@ -606,11 +606,11 @@ def build_initial_remediation_task(
         parent_package_version=parent_version,
         parent_minimum_version=None,
         no_fix_stage=no_fix_stage,
-        selected_version=(
-            None
-            if no_fix_stage is not None or has_parent_target
-            else (group.fix_plan.fixed_version if group.fix_plan is not None else None)
-        ),
+        # A fix-plan version is a security floor, not a registry-verified
+        # worker target. The Supervisor fills this field only after the active
+        # task's candidate lookup has completed and the exact dispatch input
+        # has been committed.
+        selected_version=None,
         instruction=instruction,
         status=TaskStatus.PENDING,
         retry_count=0,

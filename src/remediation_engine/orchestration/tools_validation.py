@@ -21,6 +21,7 @@ from ._tool_support import (
     _is_authoritative_evidence_source,
     _is_infrastructure_failure,
     _is_test_file_path,
+    _run_readonly,
     _runtime_smoke_path_error,
     _select_lightweight_runtime_smoke_target,
     _select_targeted_test_file,
@@ -220,7 +221,7 @@ def _make_run_targeted_test_tool(
             return f"BLOCKED: Could not construct targeted test command for runner '{runner}' and file '{norm_path}'."
 
         try:
-            result = sandbox.run(cmd, timeout=_NPM_TEST_TIMEOUT_SECONDS)
+            result = _run_readonly(sandbox, cmd, timeout=_NPM_TEST_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
             return f"BLOCKED: Targeted test execution was unavailable - {exc}"
 
@@ -258,7 +259,8 @@ def _make_run_targeted_test_tool(
                         )
                         if discovery_cmd and discovery_cmd != cmd:
                             try:
-                                discovery_result = sandbox.run(
+                                discovery_result = _run_readonly(
+                                    sandbox,
                                     discovery_cmd,
                                     timeout=_NPM_TEST_TIMEOUT_SECONDS,
                                 )
@@ -389,7 +391,7 @@ def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
                 "Supported extensions are .js, .mjs, .cjs, .ts, .tsx, and .jsx."
             )
 
-        result = sandbox.run(cmd, timeout=_SYNTAX_CHECK_TIMEOUT_SECONDS)
+        result = _run_readonly(sandbox, cmd, timeout=_SYNTAX_CHECK_TIMEOUT_SECONDS)
         if result.exit_code == 0:
             return f"SUCCESS: Syntax validation passed for {rel_path}."
         return (
@@ -513,7 +515,7 @@ def _make_validate_workaround_tool(
         if not isinstance(tsconfig, str) or not tsconfig.strip():
             return "SKIPPED: TypeScript gate (tsconfig.json not found)."
         try:
-            result = sandbox.run("npx --no-install tsc --noEmit", timeout=60)
+            result = _run_readonly(sandbox, "npx --no-install tsc --noEmit", timeout=60)
         except Exception as exc:  # noqa: BLE001
             return f"BLOCKED: TypeScript gate execution failed: {exc}"
         if result.exit_code == 0:
@@ -543,7 +545,7 @@ def _make_validate_workaround_tool(
         if not source_files:
             return "SKIPPED: Lint gate (no lintable source files were modified)."
         try:
-            eslint_probe = sandbox.run("test -x node_modules/.bin/eslint", timeout=10)
+            eslint_probe = _run_readonly(sandbox, "test -x node_modules/.bin/eslint", timeout=10)
         except Exception as exc:  # noqa: BLE001
             return f"FAILURE: Lint gate probe failed: {exc}"
         if eslint_probe.exit_code != 0:
@@ -552,7 +554,7 @@ def _make_validate_workaround_tool(
             shlex.quote(path) for path in source_files
         )
         try:
-            result = sandbox.run(command, timeout=_LINT_CHECK_TIMEOUT_SECONDS)
+            result = _run_readonly(sandbox, command, timeout=_LINT_CHECK_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
             return f"FAILURE: Lint gate execution failed: {exc}"
         if result.exit_code == 0:
@@ -590,7 +592,7 @@ def _make_validate_workaround_tool(
         loader = "--import tsx " if suffix in {".ts", ".tsx", ".jsx"} else ""
         command = f"node {loader}--input-type=module -e {shlex.quote(script)}"
         try:
-            result = sandbox.run(command, timeout=_RUNTIME_SMOKE_TIMEOUT_SECONDS)
+            result = _run_readonly(sandbox, command, timeout=_RUNTIME_SMOKE_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
             return f"BLOCKED: Runtime smoke gate execution failed: {exc}"
         if result.exit_code == 0:

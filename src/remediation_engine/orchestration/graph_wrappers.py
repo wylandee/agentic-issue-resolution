@@ -511,9 +511,12 @@ def _finalize_qa_workspace_snapshot(
     )
 
     def restore_failed_workaround() -> list[str]:
-        errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
-        errors.extend(_finish_workspace_rollback_anchors(state, target_tasks, restore=True))
-        return errors
+        # The parent anchor represents the pre-update baseline, not the
+        # candidate workspace from which this workaround was attempted.  An
+        # intermediate workaround QA failure must roll back only the child
+        # source snapshot so the resolved dependency remains available to the
+        # next workaround hypothesis.
+        return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=True)
 
     def restore_failed_update() -> list[str]:
         if _workspace_rollback_anchor_ids(state, target_tasks):
@@ -625,9 +628,10 @@ def _qa_workspace_rollback_anchor_updates(
         if _qa_result_requires_non_remediation_rerun(result):
             return anchors
         if workaround_attempt:
-            for task in target_tasks:
-                if task.parent_task_id:
-                    anchors.pop(task.parent_task_id, None)
+            # Preserve the parent dependency candidate while a workaround
+            # retry remains possible.  The anchor is consumed only after a
+            # workaround passes or the Supervisor terminalizes the task.
+            return anchors
         return anchors
     evaluations = result.get("qa_evaluations") or {}
     workaround_passed = workaround_attempt
@@ -639,7 +643,7 @@ def _qa_workspace_rollback_anchor_updates(
         if workaround_attempt:
             if not evaluation.passed:
                 workaround_passed = False
-            if task.parent_task_id:
+            if evaluation.passed and task.parent_task_id:
                 anchors.pop(task.parent_task_id, None)
             continue
         if evaluation.passed:

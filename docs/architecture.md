@@ -50,10 +50,10 @@ are graph-level operations rather than task dispatches.
   ingestion, triage, orchestration, workers, QA, and the public result
   boundary. `contracts/accessors.py` provides the typed accessor used where
   orchestration accepts model or mapping state.
-- Phase 1 tactical action, task-cluster, dependency, and multi-package
-  envelopes are proposal contracts only. They do not change routing or grant
-  worker permissions; they become authoritative only when a future verifier
-  validates and seals them into a `TaskAttemptSnapshot`.
+- Tactical action, task-cluster, dependency, and multi-package envelopes are
+  proposal contracts. Phase 2 validates and seals single-task tactical actions
+  into `TaskAttemptSnapshot`; cluster and multi-package envelopes remain
+  non-authoritative until Phase 3.
 - `triage` owns scanner normalization, enrichment, reachability analysis,
   grouping, and the initial/post-QA triage pipeline.
 - `orchestration/graph.py` builds the LangGraph and owns graph-level triage,
@@ -65,7 +65,10 @@ are graph-level operations rather than task dispatches.
   helpers in `supervisor_planner.py`, `supervisor_routing.py`,
   `supervisor_spawn.py`, `_supervisor_execution.py`, and
   `supervisor_policy.py` plan candidates, validate transitions, materialize
-  attempts, and route deterministic decisions.
+  attempts, and route guarded decisions. `tactical_supervisor.py` supplies an
+  optional QA-aware structured reasoner using the same stable-system and
+  dynamic-context prompt layout as the worker and QA agents; Python validates
+  its proposals and falls back to deterministic routing.
 - `orchestration/graph_wrappers.py` bridges master state to the update,
   workaround, and QA subagent nodes. It validates task/attempt provenance and
   correlates each result back to its committed attempt.
@@ -134,6 +137,36 @@ The Supervisor alone:
 Workers execute the instruction and candidate set already committed to their
 attempt. They do not create tasks or choose the next remediation action.
 
+### Phase 2 tactical supervision
+
+The tactical Supervisor is a pure diagnostic classifier layered on top of the
+deterministic target selector. The selector chooses one eligible task first;
+the tactical call receives exactly that task and cannot independently scan the
+queue. NO_FIX, terminal, multi-task, and inconclusive-QA transitions remain
+deterministic. The classifier prompt has a byte-stable system message and a
+fresh, ordered dynamic context for every proposal and one optional repair.
+The dynamic context contains bounded QA evidence, worker diagnostics, prior
+attempt summaries, and strategy-specific verified candidate sets. Attempt IDs,
+timestamps, full instructions, and conversation replay remain Python-side
+correlation data.
+
+The model emits `diagnostic_basis`, strategy fields, file hints, and a concise
+rationale; it does not emit worker authorization. Python derives the target
+package and dependency type, enforces the canonical security floor and the
+lowest eligible stable semver, verifies direct/parent/child candidate sets,
+and renders the final update, override, or workaround instruction. The
+rendered instruction is committed, hashed, and sealed in the attempt snapshot
+before dispatch. A rejected proposal can receive one repair proposal; neither
+proposal can mutate task state, create a spawn request, or invoke a worker.
+
+The tactical playbook permits an immediate breaking-change workaround, a
+transitive child override, or a Phase 2 `PEER_CONFLICT_ESCALATION` referral
+when no compatible single-task candidate exists. The referral uses existing
+UNFIXABLE reporting and final-scan/teardown routing; Phase 2 does not add
+portfolio execution, clustering, or DAG orchestration. The stage ladder is
+used only by deterministic fallback, and API-key/model/registry failures do
+not change safety boundaries.
+
 ## Worker execution
 
 The update worker receives a deterministic repository map and task-scoped
@@ -150,7 +183,18 @@ committed plan; execution and validation then apply that plan through the
 allowed edit and validation tools. Replay plans and attempt snapshots preserve
 the committed work across retries. The worker context is bounded, excludes
 complete file bodies and credentials, and is not persisted as orchestration
-state.
+state. The Supervisor's committed workaround instruction includes the bounded
+QA evidence, hypothesis, target-file hints, prohibited changes, and validation
+criteria before the attempt snapshot is sealed.
+
+Workspace lifecycle is candidate-preserving: an intermediate workaround QA
+failure restores only that child attempt's source snapshot, while the parent
+dependency candidate remains live for the next hypothesis. An inconclusive QA
+result reruns against the candidate without consuming remediation retry
+budget. The parent anchor is restored only when the workaround is terminally
+abandoned; a successful workaround promotes the cumulative dependency-plus-
+source state and clears stale anchors. A valid workaround validation PASS is
+terminal for the bounded worker loop after matching tool responses are emitted.
 
 ## QA execution and authority
 

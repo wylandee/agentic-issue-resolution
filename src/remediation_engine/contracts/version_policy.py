@@ -18,6 +18,7 @@ class RegistryCandidate(BaseModel):
     is_stable: bool
     same_major: bool
     already_attempted: bool
+    selection_roles: tuple[str, ...] = ()
 
 
 def select_version(
@@ -41,6 +42,16 @@ def select_version(
     ]
     if stage == SCARemediationStage.NPM_SAME_MAJOR:
         eligible = [candidate for candidate in eligible if candidate.same_major]
+    elif stage == SCARemediationStage.NPM_LATEST:
+        # The npm ``latest`` dist-tag is the authoritative final registry
+        # candidate when the fetch boundary supplied it.  Older test fixtures
+        # and injected callers do not carry roles, so retain the historical
+        # highest-semver behavior as a compatibility fallback.
+        npm_latest = [
+            candidate for candidate in eligible if "npm_latest" in candidate.selection_roles
+        ]
+        if npm_latest:
+            eligible = npm_latest
     if stage == SCARemediationStage.OSV_MINIMUM:
         eligible.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
     else:

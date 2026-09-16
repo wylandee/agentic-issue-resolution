@@ -55,6 +55,12 @@ def _build_consistency_event(
     action: str,
     details: str,
 ) -> StateConsistencyEvent:
+    # ``deferred`` was used by the registry-pending branch before it was
+    # added to the typed event contract.  Keep this compatibility boundary
+    # fail-closed: a deferred proposal is a rejected dispatch, and must never
+    # crash the Supervisor while constructing its diagnostic event.
+    if action == "deferred":
+        action = "rejected"
     return StateConsistencyEvent(
         error_code=error_code,
         task_id=task_id,
@@ -243,8 +249,9 @@ def _deterministic_routing(
             ),
         )
 
-    # All VERSION_BUMP QA failures follow the ordered version stages. A
-    # BREAKING_CHANGE is evidence for the next stage, not an immediate pivot.
+    # Tactical reasoning gets the first opportunity to pivot after a QA
+    # failure. This deterministic ladder is fallback-only, so a
+    # BREAKING_CHANGE can become a workaround without burning later versions.
 
     exhausted_retries = sorted(
         [
@@ -649,19 +656,23 @@ def _emit_audit(
 def _no_fix_decision_requires_fallback(
     decision: SupervisorDecision,
     task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> bool:
     """Return whether an untrusted router decision violates NO_FIX routing."""
-    actionable = [
-        task
-        for task in task_queue.values()
-        if task.status in _WORKABLE_STATUSES
-        and task.strategy == RoutingStrategy.CODE_WORKAROUND
-        and task.no_fix_stage
-        in {
-            NoFixMitigationStage.PACKAGE_REMOVAL,
-            NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
-        }
-    ]
+    actionable = sorted(
+        [
+            task
+            for task in task_queue.values()
+            if task.status in _WORKABLE_STATUSES
+            and task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and task.no_fix_stage
+            in {
+                NoFixMitigationStage.PACKAGE_REMOVAL,
+                NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+            }
+        ],
+        key=lambda task: _task_sort_key(task, group_by_id or {}),
+    )
     if not actionable:
         return False
 

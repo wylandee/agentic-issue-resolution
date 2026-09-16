@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 import requests
 from langchain_core.tools import tool
+from langsmith import traceable
 from semantic_version import NpmSpec, Version
 
 from remediation_engine.contracts.version_policy import RegistryCandidate
@@ -235,9 +236,41 @@ def select_npm_parent_version(
 
     compatible = sorted(set(compatible))
     same_major = [version for version in compatible if version.major == installed_version.major]
-    eligible = same_major if selection == "same_major" else compatible
-    ordered = sorted(eligible, reverse=selection != "minimum")
-    selected = next((version for version in ordered if str(version) not in attempted), None)
+    unattempted_compatible = [version for version in compatible if str(version) not in attempted]
+    unattempted_same_major = [version for version in same_major if str(version) not in attempted]
+    osv_minimum = min(unattempted_compatible) if unattempted_compatible else None
+    same_major_candidate = max(unattempted_same_major) if unattempted_same_major else None
+    npm_latest_candidate: Version | None = None
+    dist_tags = data.get("dist-tags") or {}
+    if isinstance(dist_tags, dict):
+        tagged = _stable_semantic_version(str(dist_tags.get("latest", "")))
+        if tagged is not None and tagged in unattempted_compatible:
+            npm_latest_candidate = tagged
+    # Fixtures and private registries sometimes omit dist-tags.  In that
+    # case, npm's effective latest stable release is the highest eligible
+    # release.  It still occupies the single ``npm_latest`` policy slot.
+    if npm_latest_candidate is None and unattempted_compatible:
+        npm_latest_candidate = max(unattempted_compatible)
+
+    # Keep the registry surface intentionally small.  These are the only
+    # versions that the Supervisor may expose to a model or worker plan;
+    # compatibility analysis above may still inspect the complete registry
+    # internally for transitive range validation.
+    strategic_versions = {
+        version
+        for version in (
+            osv_minimum,
+            same_major_candidate,
+            npm_latest_candidate,
+        )
+        if version is not None
+    }
+    if selection == "minimum":
+        selected = osv_minimum
+    elif selection == "same_major":
+        selected = same_major_candidate
+    else:
+        selected = npm_latest_candidate
     return {
         "selected": str(selected) if selected is not None else None,
         "compatible": [str(version) for version in compatible],
@@ -245,6 +278,9 @@ def select_npm_parent_version(
         "latest": str(max(compatible)) if compatible else None,
         "same_major_latest": str(max(same_major)) if same_major else None,
         "attempted": sorted(attempted),
+        "osv_minimum": str(osv_minimum) if osv_minimum is not None else None,
+        "npm_latest": str(npm_latest_candidate) if npm_latest_candidate is not None else None,
+        "strategic_candidates": [str(version) for version in sorted(strategic_versions)],
     }
 
 
@@ -269,12 +305,13 @@ def _fetch_package_data(package_name: str) -> dict[str, Any]:
     return response.json()
 
 
+@traceable(run_type="tool", name="supervisor.fetch_registry_candidates")
 def fetch_registry_candidates(
     package_name: str,
     security_floor: str,
     attempted_versions: set[str] | None = None,
 ) -> list[RegistryCandidate]:
-    """Fetch stable npm versions as typed deterministic policy inputs.
+    """Fetch a small stable npm candidate set as typed policy inputs.
 
     Args:
         package_name: Package name accepted by the npm registry.
@@ -282,7 +319,10 @@ def fetch_registry_candidates(
         attempted_versions: Versions already tried by prior worker attempts.
 
     Returns:
-        Candidates sorted by ascending semantic-version key.
+        At most three candidates sorted by ascending semantic-version key.  The
+        candidates represent the lowest OSV-safe version, the latest same-major
+        version, and npm's effective ``latest`` release when those values are
+        distinct and eligible.
 
     Raises:
         ValueError: If ``security_floor`` is not stable semver or the package
@@ -306,13 +346,13 @@ def fetch_registry_candidates(
         data = _fetch_package_data(package_name)
     except requests.RequestException as exc:
         raise ValueError(f"Could not fetch registry data for {package_name}: {exc}") from exc
-    candidates: list[RegistryCandidate] = []
+    all_candidates: list[RegistryCandidate] = []
     for raw_version in data.get("versions") or {}:
         version = str(raw_version).strip().lstrip("vV")
         key = _stable_version_key(version)
         if key is None:
             continue
-        candidates.append(
+        all_candidates.append(
             RegistryCandidate(
                 version=version,
                 semver_key=key,
@@ -322,11 +362,45 @@ def fetch_registry_candidates(
                 already_attempted=version in attempted,
             )
         )
-    candidates.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+
+    eligible = [
+        candidate
+        for candidate in all_candidates
+        if candidate.is_stable and candidate.security_floor_met and not candidate.already_attempted
+    ]
+    eligible.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+    by_version = {candidate.version: candidate for candidate in eligible}
+    roles_by_version: dict[str, set[str]] = {}
+
+    if eligible:
+        roles_by_version.setdefault(eligible[0].version, set()).add("osv_minimum")
+        same_major = [candidate for candidate in eligible if candidate.same_major]
+        if same_major:
+            roles_by_version.setdefault(same_major[-1].version, set()).add("same_major")
+    dist_tags = data.get("dist-tags") or {}
+    tagged_value = dist_tags.get("latest") if isinstance(dist_tags, dict) else None
+    tagged_version = _stable_semantic_version(str(tagged_value or ""))
+    npm_latest_version = (
+        str(tagged_version)
+        if tagged_version is not None and str(tagged_version) in by_version
+        else eligible[-1].version
+        if eligible
+        else None
+    )
+    if npm_latest_version is not None:
+        roles_by_version.setdefault(npm_latest_version, set()).add("npm_latest")
+
+    candidates = [
+        by_version[version].model_copy(
+            update={"selection_roles": tuple(sorted(roles_by_version.get(version, set())))}
+        )
+        for version in sorted(roles_by_version, key=lambda value: _stable_version_key(value))
+    ]
     return candidates
 
 
 @tool
+@traceable(run_type="tool", name="supervisor.plan_npm_parent_version")
 def plan_npm_parent_version(
     parent_package_name: str,
     child_package_name: str,
@@ -401,9 +475,9 @@ def plan_npm_parent_version(
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: Could not plan parent '{parent_package_name}': {exc}"
 
-    compatible = result["compatible"]
     same_major_latest = result["same_major_latest"]
     latest = result["latest"]
+    strategic_candidates = result.get("strategic_candidates") or []
     lines = [
         f"# NPM Parent Version Plan: {parent_package_name}",
         f"- Selection: {selection}",
@@ -414,8 +488,9 @@ def plan_npm_parent_version(
         f"- Selected Version: {result['selected'] or 'NONE'}",
         f"- Same-Major Latest: {same_major_latest or 'NONE'}",
         f"- Latest Compatible: {latest or 'NONE'}",
+        f"- Npm Latest: {result.get('npm_latest') or 'NONE'}",
         f"- Attempted Versions: {', '.join(result['attempted']) or 'none'}",
-        f"- Compatible Parent Versions: {', '.join(compatible) or 'none'}",
-        f"- Eligible Candidates: {', '.join(result['same_major'] if selection == 'same_major' else compatible) or 'none'}",
+        f"- Compatible Parent Versions: {', '.join(strategic_candidates) or 'none'}",
+        f"- Eligible Candidates: {', '.join(strategic_candidates) or 'none'}",
     ]
     return "\n".join(lines)

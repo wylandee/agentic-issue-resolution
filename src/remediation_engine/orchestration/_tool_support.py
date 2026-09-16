@@ -51,6 +51,27 @@ _SEARCH_MAX_BYTES = 32_768
 _SEARCH_TIMEOUT_SECONDS = 15
 _INSPECT_TEXT_MAX_CHARS = 8_000
 
+
+def _run_readonly(sandbox: DockerSandbox, command: str, *, timeout: int) -> Any:
+    """Run an explicitly read-only workspace command when supported.
+
+    Production Docker sandboxes use the revision-aware read-cache path. Test
+    doubles and replay sandboxes continue to use their existing ``run`` seam,
+    which keeps this optimization backward-compatible for injected adapters.
+
+    Args:
+        sandbox: Docker-backed or test-double workspace.
+        command: Command that does not modify workspace inputs.
+        timeout: Maximum execution time in seconds.
+
+    Returns:
+        The sandbox command result.
+    """
+    if isinstance(sandbox, DockerSandbox):
+        return sandbox.run_readonly(command, timeout=timeout)
+    return sandbox.run(command, timeout=timeout)
+
+
 _SERPER_SEARCH_URL = "https://google.serper.dev/search"
 _SERPER_REQUEST_TIMEOUT = 10
 _SERPER_MAX_RESULTS = 3

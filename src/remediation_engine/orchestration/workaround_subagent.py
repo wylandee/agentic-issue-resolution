@@ -904,8 +904,15 @@ def _workaround_attempt_succeeded(
     validation_passed = (
         validation_gate_passed if validation_gate_passed is not None else has_all_validated
     )
+    runtime_errors = list(getattr(runtime, "errors", []) or [])
+    if getattr(runtime, "terminal_validation_passed", False):
+        runtime_errors = [
+            error
+            for error in runtime_errors
+            if not str(error).startswith("MAX_SUBAGENT_TOOL_CALL_ROUNDS:")
+        ]
     if not (
-        runtime.changed_files and not runtime.errors and validation_passed and has_recorded_plan
+        runtime.changed_files and not runtime_errors and validation_passed and has_recorded_plan
     ):
         return False
     if requires_targeted_test and not targeted_test_passed:

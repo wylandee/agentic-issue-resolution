@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
+from collections.abc import Iterable
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
@@ -21,11 +21,14 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.contracts.version_policy import select_version
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
+    _canonical_security_floor,
     _is_exhausted_update_pivot_candidate,
     _next_sca_stage,
     _task_sort_key,
+    instruction_digest,
 )
 from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
+from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -43,18 +46,46 @@ _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
 _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
+_MAX_REGISTRY_CANDIDATES = 3
+
+
+def _supervisor_fetch_registry_candidates(
+    package_name: str,
+    security_floor: str,
+    attempted_versions: set[str],
+) -> list[Any]:
+    """Fetch registry candidates as a Supervisor-owned traced operation."""
+    inputs = {
+        "package_name": package_name,
+        "security_floor": security_floor,
+        "attempted_versions": attempted_versions,
+    }
+    return invoke_with_trajectory(
+        "supervisor.fetch_registry_candidates",
+        lambda: fetch_registry_candidates(
+            package_name,
+            security_floor,
+            attempted_versions,
+        ),
+        inputs,
+        run_type="tool",
+    )
+
+
+def _supervisor_plan_npm_parent_version(inputs: dict[str, Any]) -> str:
+    """Run the npm parent planner under an explicit Supervisor tool span."""
+    return invoke_with_trajectory(
+        "supervisor.plan_npm_parent_version",
+        lambda: plan_npm_parent_version.invoke(inputs),
+        inputs,
+        run_type="tool",
+    )
 
 
 def _commit_task_transition(*args: Any, **kwargs: Any) -> Any:
     from remediation_engine.orchestration import supervisor_node
 
     return supervisor_node._commit_task_transition(*args, **kwargs)
-
-
-def instruction_digest(instruction: str) -> str:
-    """Return the stable digest used to correlate worker input and output."""
-    normalized = " ".join((instruction or "").split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _supervisor_dependency_type_candidates(
@@ -438,49 +469,71 @@ def _repair_invalid_planner_plans(
             continue
 
         group = group_by_id.get(task_queue[task_id].parent_group_id)
-        if group is not None and is_transitive_group(group) and group.fix_plan:
+        if group is not None and is_transitive_group(group):
             # Parent registry exhaustion is the deterministic handoff to the
-            # native child override stage, not yet a code-workaround pivot.
-            child_version = group.fix_plan.fixed_version
+            # native child override stage, but the child version must be
+            # verified independently. Never reuse the child's fix-plan floor
+            # as if it were a registry candidate.
+            child_floor, _floor_error = _canonical_security_floor(group)
             target_type = _override_dependency_type(group)
-            if diagnostics is None:
-                diagnostics = UpdateRetryDiagnostics(task_id=task_id)
-            diagnostics = diagnostics.model_copy(
-                update={
-                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                    "selected_version": child_version,
-                    "target_package_name": group.vulnerable_component,
-                    "target_dependency_type": target_type,
-                    "exhausted_update_path": False,
-                }
-            )
-            repaired_diagnostics[task_id] = diagnostics
-            override_task = task_queue[task_id].model_copy(
-                update={
-                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                    "selected_version": child_version,
-                    "target_package_name": group.vulnerable_component,
-                    "target_dependency_type": target_type,
-                }
-            )
-            instruction = _build_high_level_retry_instruction(
-                override_task,
-                group,
-                None,
-                diagnostics,
-            )
-            repaired_plans[task_id] = plan.model_copy(
-                update={
-                    "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                    "selected_version": child_version,
-                    "exhausted_update_path": False,
-                    "action": "retry_update",
-                    "exact_instruction": instruction,
-                    "target_package_name": group.vulnerable_component,
-                    "target_dependency_type": target_type,
-                }
-            )
-            continue
+            child_candidate: str | None = None
+            if child_floor and group.vulnerable_component:
+                try:
+                    child_candidates = _supervisor_fetch_registry_candidates(
+                        group.vulnerable_component,
+                        child_floor,
+                        set(attempted),
+                    )
+                    child_candidate = select_version(
+                        child_candidates,
+                        SCARemediationStage.OSV_MINIMUM,
+                        set(attempted),
+                    )
+                except Exception:  # noqa: BLE001 - fall through to safe pivot
+                    child_candidate = None
+            if child_candidate is not None:
+                if diagnostics is None:
+                    diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+                diagnostics = diagnostics.model_copy(
+                    update={
+                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                        "security_floor": child_floor,
+                        "selected_version": child_candidate,
+                        "candidate_versions_considered": [child_candidate],
+                        "registry_query_performed": True,
+                        "target_package_name": group.vulnerable_component,
+                        "target_dependency_type": target_type,
+                        "exhausted_update_path": False,
+                    }
+                )
+                repaired_diagnostics[task_id] = diagnostics
+                override_task = task_queue[task_id].model_copy(
+                    update={
+                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                        "selected_version": child_candidate,
+                        "target_package_name": group.vulnerable_component,
+                        "target_dependency_type": target_type,
+                    }
+                )
+                instruction = _build_high_level_retry_instruction(
+                    override_task,
+                    group,
+                    None,
+                    diagnostics,
+                )
+                repaired_plans[task_id] = plan.model_copy(
+                    update={
+                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                        "selected_version": child_candidate,
+                        "candidate_versions_considered": [child_candidate],
+                        "exhausted_update_path": False,
+                        "action": "retry_update",
+                        "exact_instruction": instruction,
+                        "target_package_name": group.vulnerable_component,
+                        "target_dependency_type": target_type,
+                    }
+                )
+                continue
 
         # No direct unattempted candidate can be proven. Clear stale selection
         # and pivot at the terminal update stage so no guessed/old version is
@@ -537,21 +590,40 @@ def _build_deterministic_retry_plan(
     current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
     effective_stage = requested if requested_order >= current_order else task.strategy_stage
     attempted = set(diagnostics.attempted_versions)
-    security_floor = group.fix_plan.fixed_version if group and group.fix_plan else None
+    security_floor, floor_error = _canonical_security_floor(group)
     transitive = bool(group and is_transitive_group(group))
     candidate_versions: list[str] = []
     latest_version_seen: str | None = None
     selected_version: str | None = None
-    failure_reason = ""
+    failure_reason = floor_error or ""
     parent_minimum_version = task.parent_minimum_version
     target_package_name = task.target_package_name
     target_dependency_type = task.target_dependency_type
 
     if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        selected_version = security_floor
         if group is not None:
             target_package_name = group.vulnerable_component
             target_dependency_type = _override_dependency_type(group)
+            if security_floor and target_package_name:
+                try:
+                    child_candidates = _supervisor_fetch_registry_candidates(
+                        target_package_name,
+                        security_floor,
+                        attempted,
+                    )
+                    candidate_versions = [
+                        candidate.version
+                        for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
+                    ]
+                    selected_version = select_version(
+                        child_candidates,
+                        SCARemediationStage.OSV_MINIMUM,
+                        attempted,
+                    )
+                    if selected_version is None:
+                        failure_reason = "No verified vulnerable-child override candidate meets the security floor."
+                except Exception as exc:  # noqa: BLE001
+                    failure_reason = f"Deterministic child override verification failed: {exc}"
     elif effective_stage != SCARemediationStage.CODE_WORKAROUND and security_floor:
         # The QA transition already advances the committed stage one step.
         # Plan only that stage here; an empty candidate set must not silently
@@ -571,7 +643,7 @@ def _build_deterministic_retry_plan(
                         SCARemediationStage.NPM_LATEST: "latest",
                     }[stage]
                     try:
-                        report = plan_npm_parent_version.invoke(
+                        report = _supervisor_plan_npm_parent_version(
                             {
                                 "parent_package_name": parent_name,
                                 "child_package_name": group.vulnerable_component,
@@ -592,7 +664,8 @@ def _build_deterministic_retry_plan(
                         dict.fromkeys([*candidate_versions, *report_candidates])
                     )
                     latest_version_seen = (
-                        _registry_report_value(report, "Latest Compatible")
+                        _registry_report_value(report, "Npm Latest")
+                        or _registry_report_value(report, "Latest Compatible")
                         or _registry_report_value(report, "Latest Stable")
                         or latest_version_seen
                     )
@@ -605,13 +678,22 @@ def _build_deterministic_retry_plan(
                         break
         else:
             try:
-                candidates = fetch_registry_candidates(
+                candidates = _supervisor_fetch_registry_candidates(
                     group.vulnerable_component or "",
                     security_floor,
                     attempted,
                 )
-                candidate_versions = [candidate.version for candidate in candidates[:30]]
-                latest_version_seen = candidates[-1].version if candidates else None
+                candidate_versions = [
+                    candidate.version for candidate in candidates[:_MAX_REGISTRY_CANDIDATES]
+                ]
+                latest_version_seen = next(
+                    (
+                        candidate.version
+                        for candidate in candidates
+                        if "npm_latest" in candidate.selection_roles
+                    ),
+                    candidates[-1].version if candidates else None,
+                )
                 for stage in stages:
                     selected = select_version(candidates, stage, attempted)
                     if selected:
@@ -620,16 +702,40 @@ def _build_deterministic_retry_plan(
                         break
             except Exception as exc:  # noqa: BLE001
                 failure_reason = f"Deterministic registry planning failed: {exc}"
-    elif effective_stage != SCARemediationStage.CODE_WORKAROUND:
+    elif effective_stage != SCARemediationStage.CODE_WORKAROUND and not failure_reason:
         failure_reason = "No security floor is available for deterministic version selection."
 
     if selected_version is None and effective_stage != SCARemediationStage.PACKAGE_OVERRIDE:
         if transitive and security_floor and effective_stage == SCARemediationStage.NPM_LATEST:
             effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
-            selected_version = security_floor
             target_package_name = group.vulnerable_component if group else task.parent_group_id
             target_dependency_type = _override_dependency_type(group)
-            failure_reason = "Parent update stages are exhausted; entering package override."
+            try:
+                child_candidates = _supervisor_fetch_registry_candidates(
+                    target_package_name,
+                    security_floor,
+                    attempted,
+                )
+                candidate_versions = [
+                    candidate.version for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
+                ]
+                selected_version = select_version(
+                    child_candidates,
+                    SCARemediationStage.OSV_MINIMUM,
+                    attempted,
+                )
+                if selected_version is None:
+                    failure_reason = (
+                        "Parent update stages are exhausted and no verified "
+                        "vulnerable-child override candidate remains."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                failure_reason = f"Child override verification failed: {exc}"
+            if selected_version is None:
+                # Keep the terminal marker used by the deterministic router;
+                # never turn the child security floor itself into an
+                # unverified worker target.
+                effective_stage = SCARemediationStage.NPM_LATEST
         elif effective_stage == SCARemediationStage.NPM_LATEST:
             effective_stage = SCARemediationStage.NPM_LATEST
             target_package_name = target_package_name or task.target_package_name
@@ -644,7 +750,9 @@ def _build_deterministic_retry_plan(
             "parent_minimum_version": parent_minimum_version,
         }
     )
-    safe_candidate_versions = candidate_versions[:30] if selected_version or exhausted else []
+    safe_candidate_versions = (
+        candidate_versions[:_MAX_REGISTRY_CANDIDATES] if selected_version or exhausted else []
+    )
     safe_latest_version = latest_version_seen if selected_version or exhausted else None
     candidate_dependency_types = _supervisor_dependency_type_candidates(
         effective_stage,
@@ -653,7 +761,7 @@ def _build_deterministic_retry_plan(
     effective_diagnostics = diagnostics.model_copy(
         update={
             "strategy_stage": effective_stage,
-            "security_floor": security_floor or diagnostics.security_floor,
+            "security_floor": security_floor,
             "selected_version": selected_version,
             "candidate_versions_considered": safe_candidate_versions,
             "latest_version_seen": safe_latest_version,
@@ -749,16 +857,29 @@ def _run_deterministic_retry_planner(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    *,
+    advance_failed_stage: bool = False,
+    target_task_ids: Iterable[str] | None = None,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
-    """Plan every actionable retry from task state and deterministic registry facts."""
+    """Plan retries from state and registry facts.
+
+    ``advance_failed_stage`` is used only by the deterministic fallback after
+    tactical reasoning is unavailable or rejected.  Tactical callers inspect
+    the failed stage before this advancement occurs.
+    ``target_task_ids`` optionally narrows planning to the task selected by
+    deterministic routing, preventing registry work for tasks that are not
+    active yet.
+    """
     updated_diagnostics = dict(retry_diagnostics_by_task)
     plans: dict[str, SupervisorRetryPlan] = {}
+    target_ids = set(target_task_ids) if target_task_ids is not None else None
     retry_tasks = sorted(
         (
             task
             for task in task_queue.values()
             if task.status == TaskStatus.NEEDS_RETRY
             and task.strategy == RoutingStrategy.VERSION_BUMP
+            and (target_ids is None or task.task_id in target_ids)
             and task.strategy_stage
             in {
                 SCARemediationStage.OSV_MINIMUM,
@@ -779,7 +900,18 @@ def _run_deterministic_retry_planner(
         if _is_exhausted_update_pivot_candidate(task, diagnostics):
             continue
         group = group_by_id.get(task.parent_group_id)
-        plan = _build_deterministic_retry_plan(task, diagnostics, group)
+        requested_stage = None
+        if advance_failed_stage:
+            requested_stage = _next_sca_stage(
+                task.strategy_stage,
+                transitive=bool(group and is_transitive_group(group)),
+            )
+        plan = _build_deterministic_retry_plan(
+            task,
+            diagnostics,
+            group,
+            requested_stage=requested_stage,
+        )
         # An empty stage is deterministic evidence to advance to the next
         # bounded stage, not a request for the worker to inspect the registry.
         # Keep the worker execution-only: every update dispatch must end with

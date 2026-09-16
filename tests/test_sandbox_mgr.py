@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from remediation_engine.contracts import CommandResult
 from remediation_engine.runtime.sandbox_mgr import (
     DockerSandbox,
+    WorkspaceReadCache,
     _make_tar_archive,
     get_docker_client,
 )
@@ -409,6 +410,68 @@ class TestSandboxFileIO:
         args, _kwargs = container.get_archive.call_args
         assert args[0] == "/workspace/package.json"
         assert result == "{}"
+
+    def test_duplicate_read_file_uses_one_container_read(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        assert sandbox.read_file("package.json") == "{}"
+        assert sandbox.read_file("./package.json") == "{}"
+
+        container.get_archive.assert_called_once()
+
+    def test_readonly_commands_preserve_cache_and_mutations_advance_epoch(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "old"), {})
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        assert sandbox.read_file("package.json") == "old"
+        sandbox.run_readonly("grep -R package package.json")
+        assert sandbox.read_file("/workspace/./package.json") == "old"
+
+        container.get_archive.return_value = (_tar_chunks("package.json", "new"), {})
+        sandbox.run("npm install")
+        assert sandbox.read_file("package.json") == "new"
+
+        container.get_archive.assert_has_calls(
+            [
+                # The first call is the initial cache miss; the read after
+                # the read-only command is a cache hit; the mutation forces a
+                # second real read.
+                container.get_archive.call_args_list[0],
+                container.get_archive.call_args_list[1],
+            ]
+        )
+        assert container.get_archive.call_count == 2
+        metrics = sandbox.read_cache_metrics()
+        assert metrics["requests"] == 3
+        assert metrics["hits"] == 1
+        assert metrics["docker_reads"] == 2
+
+    def test_attempt_cache_can_be_shared_by_sandbox_wrappers(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
+        cache = WorkspaceReadCache()
+        first = DockerSandbox(
+            tmp_path,
+            workspace_volume="agent_workspace_shared",
+            read_cache=cache,
+        )
+        second = DockerSandbox(
+            tmp_path,
+            workspace_volume="agent_workspace_shared",
+            read_cache=cache,
+        )
+        for sandbox in (first, second):
+            sandbox._client = client
+            sandbox._container = container
+            sandbox._alive = True
+
+        assert first.read_file("package.json") == "{}"
+        assert second.read_file("./package.json") == "{}"
+        container.get_archive.assert_called_once()
+        assert cache.metrics()["hits"] == 1
 
     def test_read_file_returns_none_when_missing(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()

@@ -23,6 +23,7 @@ from remediation_engine.contracts import (
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
+    CodeWorkaroundSupervisorAction,
     DecisionCode,
     FailureCategory,
     FixPlan,
@@ -33,6 +34,8 @@ from remediation_engine.contracts import (
     MultiPackageAction,
     ODCScanEvidence,
     PackageMutation,
+    PackageOverrideSupervisorAction,
+    PortfolioEscalationSupervisorAction,
     QAEvaluation,
     QAFailureEvidence,
     QATestAttribution,
@@ -41,10 +44,12 @@ from remediation_engine.contracts import (
     Severity,
     TacticalStrategy,
     TacticalSupervisorAction,
+    TacticalSupervisorDecision,
     TaskCluster,
     TaskDependency,
     TaskDependencyKind,
     TestAttributionVerdict,
+    VersionBumpSupervisorAction,
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.schemas import (
@@ -584,10 +589,15 @@ class TestFixPlan:
             TacticalStrategy.CODE_WORKAROUND,
             {"workaround_hypothesis": " Add input validation ", "target_version": None},
         ),
+        (
+            TacticalStrategy.ESCALATE_TO_PORTFOLIO,
+            {},
+        ),
     ],
 )
 def test_tactical_supervisor_action_strategies_normalize_and_round_trip(strategy, fields):
     action = TacticalSupervisorAction(
+        diagnostic_basis="The selected value follows the deterministic policy.",
         selected_strategy=strategy,
         rationale=" Explain the evidence ",
         **fields,
@@ -625,13 +635,18 @@ def test_tactical_supervisor_action_strategies_normalize_and_round_trip(strategy
 )
 def test_tactical_supervisor_action_rejects_invalid_strategy_fields(fields):
     with pytest.raises(ValidationError):
-        TacticalSupervisorAction(rationale="reason", **fields)
+        TacticalSupervisorAction(
+            diagnostic_basis="The evidence does not support these fields.",
+            rationale="reason",
+            **fields,
+        )
 
 
 def test_tactical_supervisor_action_rejects_unsafe_or_duplicate_file_hints():
     for hint in ("/absolute/file.js", r"..\secret.js", "C:/absolute/file.js"):
         with pytest.raises(ValidationError):
             TacticalSupervisorAction(
+                diagnostic_basis="The target path is not safe.",
                 selected_strategy=TacticalStrategy.CODE_WORKAROUND,
                 workaround_hypothesis="sanitize input",
                 target_files_hint=[hint],
@@ -639,6 +654,7 @@ def test_tactical_supervisor_action_rejects_unsafe_or_duplicate_file_hints():
             )
     with pytest.raises(ValidationError):
         TacticalSupervisorAction(
+            diagnostic_basis="The target path is duplicated.",
             selected_strategy=TacticalStrategy.CODE_WORKAROUND,
             workaround_hypothesis="sanitize input",
             target_files_hint=["src/app.js", r"src\app.js"],
@@ -648,6 +664,7 @@ def test_tactical_supervisor_action_rejects_unsafe_or_duplicate_file_hints():
 
 def test_phase1_models_are_frozen_and_forbid_extra_fields():
     action = TacticalSupervisorAction(
+        diagnostic_basis="The selected value follows the deterministic policy.",
         selected_strategy=TacticalStrategy.VERSION_BUMP,
         target_version="1.2.3",
         rationale="reason",
@@ -656,10 +673,78 @@ def test_phase1_models_are_frozen_and_forbid_extra_fields():
         action.rationale = "changed"
     with pytest.raises(ValidationError):
         TacticalSupervisorAction(
+            diagnostic_basis="The selected value follows the deterministic policy.",
             selected_strategy=TacticalStrategy.VERSION_BUMP,
             target_version="1.2.3",
             rationale="reason",
             unexpected="rejected",
+        )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "payload_type", "payload"),
+    [
+        (
+            TacticalStrategy.VERSION_BUMP,
+            VersionBumpSupervisorAction,
+            {"target_version": "1.2.3"},
+        ),
+        (
+            TacticalStrategy.PACKAGE_OVERRIDE,
+            PackageOverrideSupervisorAction,
+            {"target_version": "2.0.0"},
+        ),
+        (
+            TacticalStrategy.CODE_WORKAROUND,
+            CodeWorkaroundSupervisorAction,
+            {
+                "workaround_hypothesis": "Guard the vulnerable call.",
+                "target_files_hint": ["src/app.ts"],
+            },
+        ),
+        (
+            TacticalStrategy.ESCALATE_TO_PORTFOLIO,
+            PortfolioEscalationSupervisorAction,
+            {},
+        ),
+    ],
+)
+def test_tactical_model_output_uses_mandatory_strategy_contracts(strategy, payload_type, payload):
+    common = {
+        "diagnostic_basis": "The QA evidence maps to the selected tactical rule.",
+        "rationale": "The selected action addresses the dominant evidence.",
+        "selected_strategy": strategy,
+        **payload,
+    }
+
+    action = TacticalSupervisorDecision.model_validate(common).root
+
+    assert isinstance(action, payload_type)
+    assert "instruction" not in action.model_dump()
+    with pytest.raises(ValidationError):
+        TacticalSupervisorDecision.model_validate(
+            {key: value for key, value in common.items() if key != "rationale"}
+        )
+
+
+def test_tactical_model_output_rejects_instruction_and_missing_strategy_fields():
+    with pytest.raises(ValidationError):
+        TacticalSupervisorDecision.model_validate(
+            {
+                "selected_strategy": TacticalStrategy.VERSION_BUMP,
+                "diagnostic_basis": "The evidence supports a version bump.",
+                "rationale": "Use the verified version.",
+                "instruction": "Update the dependency.",
+            }
+        )
+    with pytest.raises(ValidationError):
+        TacticalSupervisorDecision.model_validate(
+            {
+                "selected_strategy": TacticalStrategy.CODE_WORKAROUND,
+                "diagnostic_basis": "The evidence supports a workaround.",
+                "rationale": "Repair the breaking API.",
+                "workaround_hypothesis": "Guard the call.",
+            }
         )
 
 

@@ -12,6 +12,7 @@ from ._tool_support import (
     Any,
     DockerSandbox,
     Path,
+    _run_readonly,
     _validate_workspace_path,
     resolve_repository_path,
     tool,
@@ -28,7 +29,7 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
             "-not -name '*.map' "
             "| sed 's|^./||' | sort"
         )
-        result = sandbox.run(script, timeout=10)
+        result = _run_readonly(sandbox, script, timeout=10)
         if result.exit_code != 0:
             return f"ERROR: Could not list workspace: {result.stderr.strip()}"
 
@@ -271,7 +272,7 @@ def _make_search_codebase_pattern_tool(
         )
 
         try:
-            result = sandbox.run(cmd, timeout=_SEARCH_TIMEOUT_SECONDS)
+            result = _run_readonly(sandbox, cmd, timeout=_SEARCH_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: search failed: {exc}"
 

@@ -55,6 +55,7 @@ class SubagentRuntimeResult:
     changed_files: list[str]
     errors: list[str]
     structured_output: BaseModel | None = None
+    terminal_validation_passed: bool = False
 
 
 def _contains_sandbox_not_running(content: str) -> bool:
@@ -171,6 +172,27 @@ def _is_validation_gate_failure(content: str) -> bool:
             "ERROR: [WRITE_FAILURE]",
         )
     )
+
+
+def _is_successful_workaround_validation(content: str) -> bool:
+    """Return whether a validation response contains a valid terminal PASS."""
+    if _is_invalid_validation_request(content) or _is_validation_gate_failure(content):
+        return False
+    if (content or "").lstrip().startswith(
+        "SUCCESS: Workaround validation gate passed"
+    ) and "JSON:" not in content:
+        # Production validation includes the structured JSON payload.  Keep
+        # the success marker authoritative for deterministic replay doubles
+        # that intentionally return only the bounded gate summary.
+        return True
+    marker = "JSON:"
+    if marker not in content:
+        return False
+    try:
+        payload = json.loads(content.split(marker, 1)[1].strip())
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and str(payload.get("overall_status", "")) == "PASS"
 
 
 def _manifest_retry_recovery_instruction(
@@ -454,6 +476,9 @@ def run_bounded_subagent_loop(
     validation_input_error_count = int((execution_state or {}).get("validation_input_errors", 0))
     scope_violation_count = 0
     invalid_validation_signatures: set[str] = set()
+    # This flag is scoped to this bounded worker run.  A prior replay state is
+    # evidence, but cannot by itself terminate a fresh worker invocation.
+    terminal_validation_passed = False
     for loop_index in range(MAX_SUBAGENT_TOOL_CALL_ROUNDS):
         round_number = loop_index + 1
         if context_manager is not None:
@@ -847,6 +872,10 @@ def run_bounded_subagent_loop(
                                 execution_state["validation_passed"] = (
                                     payload.get("overall_status") == "PASS"
                                 )
+                                if execution_state["validation_passed"]:
+                                    terminal_validation_passed = True
+                    if _is_successful_workaround_validation(event.content):
+                        terminal_validation_passed = True
                     if (
                         validation_gate_call_count >= MAX_VALIDATION_GATE_ATTEMPTS
                         and _is_validation_gate_failure(event.content)
@@ -951,6 +980,20 @@ def run_bounded_subagent_loop(
                 errors=errors,
             )
 
+        # A valid validation PASS is a terminal worker result.  We still
+        # processed every tool call emitted in the current assistant turn
+        # above, so each call has a matching ToolMessage.  Do not issue a
+        # follow-up LLM round and, importantly, do not append the generic
+        # max-round error that used to invalidate this successful gate.
+        if terminal_validation_passed:
+            return SubagentRuntimeResult(
+                final_text=final_text,
+                tool_events=tool_events,
+                changed_files=sorted(observed_changed_files | set(touched_files)),
+                errors=list(dict.fromkeys(errors)),
+                terminal_validation_passed=True,
+            )
+
         if infrastructure_blocked:
             errors.extend(blocker_errors)
             revert_tool = all_tool_map.get("revert_workspace_file")
@@ -1022,6 +1065,7 @@ def run_bounded_subagent_loop(
         tool_events=tool_events,
         changed_files=sorted(observed_changed_files | set(touched_files)),
         errors=errors,
+        terminal_validation_passed=terminal_validation_passed,
     )
 
 

@@ -47,6 +47,7 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
+    _build_consistency_event,
     _create_attempt_snapshot,
     _deterministic_routing,
     _materialize_spawn_requests,
@@ -59,6 +60,7 @@ from remediation_engine.orchestration.supervisor_node import (
     supervisor_router,
 )
 from remediation_engine.orchestration.task_utils import derive_initial_strategy
+from remediation_engine.settings import AppSettings
 
 
 def _issue() -> VulnerabilityIssue:
@@ -327,6 +329,19 @@ class TestSupervisorDecisionSchema:
             )
 
 
+def test_deferred_consistency_action_is_mapped_to_typed_rejection():
+    event = _build_consistency_event(
+        error_code="REGISTRY_VERIFICATION_PENDING",
+        task_id="task-1",
+        expected_attempt_id=None,
+        received_attempt_id=None,
+        action="deferred",
+        details="registry lookup is pending",
+    )
+
+    assert event.action == "rejected"
+
+
 def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
     """New candidate fields remain readable when historical snapshots omit them."""
     snapshot = TaskAttemptSnapshot(
@@ -501,6 +516,42 @@ class TestRunSupervisorNodeNormalization:
 
 
 class TestRunSupervisorNodeVersionBump:
+    def test_first_active_update_task_is_the_only_registry_target(self, monkeypatch):
+        g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
+        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND).model_copy(
+            update={"vulnerable_component": "other-pkg"}
+        )
+        calls: list[tuple[str, str, set[str]]] = []
+
+        def candidates(package_name, security_floor, attempted_versions=None):
+            calls.append((package_name, security_floor, set(attempted_versions or set())))
+            return [
+                RegistryCandidate(
+                    version="2.0.0",
+                    semver_key=(2, 0, 0),
+                    security_floor_met=True,
+                    is_stable=True,
+                    same_major=True,
+                    already_attempted=False,
+                )
+            ]
+
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+            candidates,
+        )
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+            lambda: AppSettings(openai_api_key=""),
+        )
+
+        result = run_supervisor_node(_base_state([g1, g2]))
+
+        assert result["next_routing_step"] == "update_subagent"
+        assert result["active_target_task_ids"] == ["task-1"]
+        assert calls == [("test-pkg", "1.2.3", set())]
+        assert result["task_queue"]["task-2"].selected_version is None
+
     def test_version_bump_tasks_dispatch_one_at_a_time(self):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
@@ -1163,7 +1214,10 @@ class TestRunSupervisorNodeQAUpdates:
 
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
-        assert result["task_queue"]["task-1"].instruction == "test"
+        committed_instruction = result["task_queue"]["task-1"].instruction
+        assert committed_instruction.startswith("Apply the supervisor-selected test-pkg")
+        assert "test-pkg" in committed_instruction
+        assert "2.0.0" in committed_instruction
 
 
 def test_invalid_latest_repair_pivots_instead_of_reusing_stale_candidate():
@@ -1322,16 +1376,18 @@ def test_deterministic_latest_selection_skips_attempted_versions():
 
     result = run_supervisor_node(state)
 
-    # The deterministic planner chooses the unattempted latest registry
-    # candidate directly; no corrective model call is involved.
-    assert result["retry_diagnostics_by_task"]["task-1"].selected_version == "2.0.0"
+    # Once the latest stage has no eligible candidate, the deterministic
+    # fallback pivots to the existing workaround lifecycle instead of
+    # dispatching another update attempt.
+    assert result["retry_diagnostics_by_task"]["task-1"].selected_version is None
     assert result["retry_diagnostics_by_task"]["task-1"].strategy_stage == (
         SCARemediationStage.NPM_LATEST
     )
-    assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is False
-    assert result["task_queue"]["task-1"].selected_version == "2.0.0"
-    assert result["next_routing_step"] == "update_subagent"
-    assert result["active_target_task_ids"] == ["task-1"]
+    assert result["retry_diagnostics_by_task"]["task-1"].exhausted_update_path is True
+    assert result["task_queue"]["task-1"].selected_version is None
+    assert result["next_routing_step"] == "workaround_subagent"
+    child_id = result["active_target_task_ids"][0]
+    assert result["task_queue"][child_id].strategy == RoutingStrategy.CODE_WORKAROUND
 
 
 def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(monkeypatch):

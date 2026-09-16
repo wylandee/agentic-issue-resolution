@@ -12,9 +12,11 @@ python -m pip install -e ".[dev]"
 ```
 
 Python 3.11 or newer and Docker are required. Copy `.env.example` to `.env`.
-Set `OPENAI_API_KEY` when using LLM-backed triage or workers; the Supervisor
-route, version selection, retry/pivot decisions, and task creation are
-deterministic.
+Set `OPENAI_API_KEY` to enable the QA-aware tactical Supervisor and other
+LLM-backed agents. The tactical Supervisor uses a stable system prompt plus a
+bounded dynamic context, may select an immediate remediation pivot, and falls
+back to the deterministic router when the key or model is unavailable. Python
+still verifies every target and version and commits the worker instruction.
 
 The runtime reads these environment names:
 
@@ -64,6 +66,26 @@ Supervisor-committed attempts in isolation. QA runs deterministic install,
 security-scan, and test gates, then performs a bounded read-only evaluation
 for each task. QA results remain keyed to their task, and Supervisor requires
 the authoritative final full scan before teardown.
+
+Phase 2 tactical supervision is single-task and QA-aware. It uses a stable
+system prompt plus a bounded, deterministically ordered context so task facts
+do not invalidate the reusable prompt prefix. The model returns only a typed
+diagnostic basis and strategy proposal; Python verifies the normalized
+security floor, candidate whitelist, task identity, dependency type, and
+relative file hints, then renders and digests the exact worker instruction.
+Breaking-change evidence can pivot directly to a workaround. Peer conflicts
+may be recorded as a Phase 2 portfolio referral, while actual clustering and
+multi-package orchestration remain deferred to Phase 3. Without an API key,
+or when the model or registry verification fails, the deterministic router
+remains authoritative.
+
+Workaround retries restore only the child source-edit snapshot when QA rejects
+an intermediate hypothesis, preserving the resolved dependency candidate.
+The original parent rollback anchor is consumed only after workaround success
+or terminal abandonment. A successful `validate_workaround` gate terminates
+the bounded worker loop after all tool responses in that model turn are
+recorded, so a later max-round guard cannot turn a passing workaround into a
+surrender.
 
 The CLI exits with `0` for a completed run without errors, `1` for a completed
 run with remediation errors or unfixable tasks, and `2` for invalid input or

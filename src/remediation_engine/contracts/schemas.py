@@ -16,13 +16,15 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
+    TypeAdapter,
     field_serializer,
     field_validator,
     model_validator,
@@ -124,6 +126,7 @@ class TacticalStrategy(StrEnum):
     VERSION_BUMP = "version_bump"
     PACKAGE_OVERRIDE = "package_override"
     CODE_WORKAROUND = "code_workaround"
+    ESCALATE_TO_PORTFOLIO = "escalate_to_portfolio"
 
 
 class QAPolicy(StrEnum):
@@ -296,7 +299,32 @@ def _normalize_relative_file_hint(value: Any) -> str:
     do not authorize a worker to access or mutate a file.
     """
     normalized = _trim_required_contract_text(value, "target_files_hint")
+    normalized = normalized.strip("`'\" ")
     normalized = normalized.replace("\\", "/")
+    normalized = re.sub(
+        r"^(?:at\s+|file\s*:\s*|source\s*:\s*)",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\s*\((?:line\s*)?\d+(?::\d+)?\)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"(?::\d+(?::\d+)?)$|#L\d+(?:-L\d+)?$", "", normalized)
+    normalized = re.sub(r"\s+#?\d+\s*$", "", normalized)
+    lowered = normalized.lower()
+    if lowered.startswith("file://"):
+        normalized = normalized[7:]
+        lowered = normalized.lower()
+    workspace_marker = "/workspace/"
+    if workspace_marker in lowered:
+        normalized = normalized[lowered.index(workspace_marker) + len(workspace_marker) :]
+    elif lowered.startswith("workspace/"):
+        normalized = normalized[len("workspace/") :]
+    normalized = re.sub(r"^(?:\./)+", "", normalized)
     if "\x00" in normalized:
         raise ValueError("target_files_hint must not contain NUL bytes.")
     if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
@@ -1252,24 +1280,34 @@ class WorkaroundValidationResult(BaseModel):
 
 
 class TacticalSupervisorAction(BaseModel):
-    """Proposal envelope for one tactical remediation action.
+    """Legacy input compatibility envelope for tactical actions.
 
-    The envelope describes a proposal only.  It does not identify the active
-    task or authorize file access; task identity and provenance remain owned by
-    the committed ``TaskAttemptSnapshot`` and its surrounding orchestration
-    state.
+    New Supervisor model calls use the strategy-specific contracts below.  This
+    permissive envelope remains importable for callers that construct historical
+    decisions directly; it is not passed to ``with_structured_output`` and does
+    not authorize a worker or identify the active task.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    diagnostic_basis: str = Field(
+        ...,
+        min_length=10,
+        max_length=1200,
+        description=(
+            "Bounded evidence-to-rule summary. This is not a hidden reasoning transcript "
+            "and is never used as a worker instruction."
+        ),
+    )
     selected_strategy: TacticalStrategy
     target_version: str | None = None
     workaround_hypothesis: str | None = None
     target_files_hint: list[str] = Field(
         default_factory=list,
+        max_length=5,
         description="Normalized relative path hints, not worker authorization.",
     )
-    rationale: str = Field(..., min_length=1)
+    rationale: str = Field(..., min_length=1, max_length=600)
 
     @field_validator("selected_strategy", mode="before")
     @classmethod
@@ -1296,11 +1334,11 @@ class TacticalSupervisorAction(BaseModel):
             raise ValueError("target_files_hint must not contain duplicates.")
         return result
 
-    @field_validator("rationale", mode="before")
+    @field_validator("diagnostic_basis", "rationale", mode="before")
     @classmethod
-    def _normalize_tactical_rationale(cls, value: Any) -> str:
-        """Require a trimmed tactical rationale."""
-        return _trim_required_contract_text(value, "rationale")
+    def _normalize_tactical_text(cls, value: Any, info: Any) -> str:
+        """Require trimmed tactical diagnostic and rationale text."""
+        return _trim_required_contract_text(value, info.field_name)
 
     @model_validator(mode="after")
     def _validate_tactical_strategy_fields(self) -> TacticalSupervisorAction:
@@ -1310,7 +1348,10 @@ class TacticalSupervisorAction(BaseModel):
                 raise ValueError("code_workaround actions must not specify target_version.")
             if self.workaround_hypothesis is None:
                 raise ValueError("code_workaround actions require workaround_hypothesis.")
-        else:
+        elif self.selected_strategy in {
+            TacticalStrategy.VERSION_BUMP,
+            TacticalStrategy.PACKAGE_OVERRIDE,
+        }:
             if self.target_version is None:
                 raise ValueError(f"{self.selected_strategy.value} actions require target_version.")
             if self.workaround_hypothesis is not None:
@@ -1318,7 +1359,114 @@ class TacticalSupervisorAction(BaseModel):
                     f"{self.selected_strategy.value} actions must not specify "
                     "workaround_hypothesis."
                 )
+        else:
+            if self.target_version is not None:
+                raise ValueError("escalation actions must not specify target_version.")
+            if self.workaround_hypothesis is not None:
+                raise ValueError("escalation actions must not specify workaround_hypothesis.")
+            if self.target_files_hint:
+                raise ValueError("escalation actions must not specify target_files_hint.")
         return self
+
+
+class _TacticalSupervisorActionBase(BaseModel):
+    """Common bounded fields shared by the four model-output contracts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    diagnostic_basis: str = Field(
+        ...,
+        min_length=10,
+        max_length=1200,
+        description=(
+            "Bounded evidence-to-rule summary. This is not hidden reasoning "
+            "and is never a worker instruction."
+        ),
+    )
+    rationale: str = Field(..., min_length=1, max_length=600)
+
+    @field_validator("target_version", "workaround_hypothesis", mode="before", check_fields=False)
+    @classmethod
+    def _normalize_action_text(cls, value: Any, info: Any) -> str:
+        """Normalize one required strategy-specific text field."""
+        if not isinstance(value, str):
+            raise ValueError(f"{info.field_name} must be a string.")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{info.field_name} must be non-empty.")
+        return normalized
+
+    @field_validator("diagnostic_basis", "rationale", mode="before")
+    @classmethod
+    def _normalize_action_summary(cls, value: Any, info: Any) -> str:
+        """Require bounded non-empty summary text."""
+        return _trim_required_contract_text(value, info.field_name)
+
+
+class VersionBumpSupervisorAction(_TacticalSupervisorActionBase):
+    """Mandatory structured output for a direct or parent version bump."""
+
+    selected_strategy: Literal[TacticalStrategy.VERSION_BUMP]
+    target_version: str = Field(..., min_length=1, max_length=64)
+
+
+class PackageOverrideSupervisorAction(_TacticalSupervisorActionBase):
+    """Mandatory structured output for a transitive child override."""
+
+    selected_strategy: Literal[TacticalStrategy.PACKAGE_OVERRIDE]
+    target_version: str = Field(..., min_length=1, max_length=64)
+
+
+class CodeWorkaroundSupervisorAction(_TacticalSupervisorActionBase):
+    """Mandatory structured output for a source-workaround proposal."""
+
+    selected_strategy: Literal[TacticalStrategy.CODE_WORKAROUND]
+    workaround_hypothesis: str = Field(..., min_length=1, max_length=1200)
+    target_files_hint: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=5,
+        description="Evidence-backed relative source paths; Python remains authoritative.",
+    )
+
+    @field_validator("target_files_hint", mode="before")
+    @classmethod
+    def _normalize_workaround_file_hints(cls, value: Any) -> list[str]:
+        """Normalize required relative source hints and reject duplicates."""
+        if not isinstance(value, list):
+            raise ValueError("target_files_hint must be a list of relative paths.")
+        result = [_normalize_relative_file_hint(item) for item in value]
+        if len(result) != len(set(result)):
+            raise ValueError("target_files_hint must not contain duplicates.")
+        return result
+
+
+class PortfolioEscalationSupervisorAction(_TacticalSupervisorActionBase):
+    """Mandatory structured output for a Phase 2 peer-conflict referral."""
+
+    selected_strategy: Literal[TacticalStrategy.ESCALATE_TO_PORTFOLIO]
+
+
+SupervisorTacticalAction = Annotated[
+    VersionBumpSupervisorAction
+    | PackageOverrideSupervisorAction
+    | CodeWorkaroundSupervisorAction
+    | PortfolioEscalationSupervisorAction,
+    Field(discriminator="selected_strategy"),
+]
+
+
+class TacticalSupervisorDecision(RootModel[SupervisorTacticalAction]):
+    """Internal compatibility adapter for discriminated tactical actions.
+
+    This root union remains useful for validating persisted or legacy callers,
+    but it must not be passed to an OpenAI response-format schema. The live
+    Supervisor provider boundary binds each concrete action contract as a
+    separate function tool so the provider never receives a root ``oneOf``.
+    """
+
+
+TACTICAL_SUPERVISOR_ACTION_ADAPTER = TypeAdapter(SupervisorTacticalAction)
 
 
 class QAFailureEvidence(BaseModel):
@@ -2370,13 +2518,14 @@ class SupervisorDecision(BaseModel):
                 raise ValueError("revised_instructions keys must be non-empty task IDs.")
             if not v.strip():
                 raise ValueError(f"revised_instructions['{k}'] must be a non-empty instruction.")
-        # Validate task_status_updates values are only QA_PASSED or UNFIXABLE
-        _allowed = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE}
+        # Inconclusive is reserved for fail-closed registry/QA evidence and
+        # does not authorize a worker dispatch or consume a retry.
+        _allowed = {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE}
         for tid, status in self.task_status_updates.items():
             if status not in _allowed:
                 raise ValueError(
                     f"task_status_updates['{tid}'] = '{status}' is not allowed; "
-                    "only QA_PASSED and UNFIXABLE may be set by the Supervisor guardrail."
+                    "only QA_PASSED, UNFIXABLE, or INCONCLUSIVE may be set by the Supervisor guardrail."
                 )
         return self
 
