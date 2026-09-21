@@ -1035,47 +1035,26 @@ def _render_markdown(
     return "\n".join(lines)
 
 
-def export_phase5_trajectory(
+def _write_trajectory_markdown(
     *,
-    trace_id: uuid.UUID | str,
+    trace_id: str,
     repo_root: str,
     initial_state: Any,
     final_state: Any,
-    recorder: TrajectoryRecorder,
-    langsmith_enabled: bool,
-    langsmith_url: str | None = None,
-    run_error: BaseException | None = None,
-    output_path: str | Path | None = None,
-) -> Path:
-    """Write one Markdown trajectory, optionally to a reserved output path.
+    spans: list[dict[str, Any]],
+    source: str,
+    langsmith_url: str | None,
+    warnings: Sequence[str],
+    run_error: BaseException | None,
+    output_file: Path,
+) -> None:
+    """Atomically write one local trajectory snapshot.
 
-    A caller-supplied ``output_path`` lets a final report reference the exact
-    trajectory file that contains the finalized report fields.
+    The caller may invoke this before any remote LangSmith lookup so a partial
+    local trajectory exists even when remote enrichment is interrupted.
     """
-    warnings: list[str] = []
-    spans = recorder.spans()
-    source = "local-fallback"
-    if langsmith_enabled:
-        try:
-            spans = fetch_langsmith_spans(trace_id)
-            source = "langsmith"
-            pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
-            if pending_spans:
-                warnings.append(
-                    "LangSmith returned "
-                    f"{len(pending_spans)} span(s) without terminal status after export settling."
-                )
-        except Exception as exc:  # noqa: BLE001 - fallback is intentional
-            warning = f"LangSmith trace retrieval failed: {exc}"
-            warnings.append(warning)
-            logger.warning(warning)
-
-    output_file = (
-        Path(output_path) if output_path is not None else build_phase5_trajectory_path(trace_id)
-    )
-    output_file.parent.mkdir(parents=True, exist_ok=True)
     markdown = _render_markdown(
-        trace_id=str(trace_id),
+        trace_id=trace_id,
         repo_root=repo_root,
         initial_state=initial_state,
         final_state=final_state,
@@ -1089,4 +1068,79 @@ def export_phase5_trajectory(
     temporary_path = output_file.with_suffix(".md.tmp")
     temporary_path.write_text(markdown, encoding="utf-8")
     temporary_path.replace(output_file)
+
+
+def export_phase5_trajectory(
+    *,
+    trace_id: uuid.UUID | str,
+    repo_root: str,
+    initial_state: Any,
+    final_state: Any,
+    recorder: TrajectoryRecorder,
+    langsmith_enabled: bool,
+    langsmith_url: str | None = None,
+    run_error: BaseException | None = None,
+    output_path: str | Path | None = None,
+) -> Path:
+    """Write a local trajectory before optionally enriching it from LangSmith.
+
+    The first write always uses the in-process recorder and does not require
+    network access.  LangSmith retrieval and the subsequent enriched rewrite
+    are best-effort; if they fail, the initial local snapshot remains valid.
+    """
+    output_file = (
+        Path(output_path) if output_path is not None else build_phase5_trajectory_path(trace_id)
+    )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    local_spans = recorder.spans()
+    _write_trajectory_markdown(
+        trace_id=str(trace_id),
+        repo_root=repo_root,
+        initial_state=initial_state,
+        final_state=final_state,
+        spans=local_spans,
+        source="local-fallback",
+        langsmith_url=langsmith_url,
+        warnings=(),
+        run_error=run_error,
+        output_file=output_file,
+    )
+
+    if not langsmith_enabled:
+        return output_file
+
+    warnings: list[str] = []
+    spans = local_spans
+    source = "local-fallback"
+    try:
+        spans = fetch_langsmith_spans(trace_id)
+        source = "langsmith"
+        pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
+        if pending_spans:
+            warnings.append(
+                "LangSmith returned "
+                f"{len(pending_spans)} span(s) without terminal status after export settling."
+            )
+    except Exception as exc:  # noqa: BLE001 - local snapshot already exists
+        warning = f"LangSmith trace retrieval failed: {exc}"
+        warnings.append(warning)
+        logger.warning(warning)
+
+    try:
+        _write_trajectory_markdown(
+            trace_id=str(trace_id),
+            repo_root=repo_root,
+            initial_state=initial_state,
+            final_state=final_state,
+            spans=spans,
+            source=source,
+            langsmith_url=langsmith_url,
+            warnings=warnings,
+            run_error=run_error,
+            output_file=output_file,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the first local snapshot
+        logger.warning("trajectory enrichment rewrite failed: %s", exc)
+
     return output_file

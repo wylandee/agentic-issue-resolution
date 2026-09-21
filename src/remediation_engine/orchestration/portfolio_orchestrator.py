@@ -31,6 +31,16 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.portfolio_solver import (
+    apply_portfolio_plan as _apply_solver_portfolio_plan,
+)
+from remediation_engine.orchestration.portfolio_solver import (
+    build_portfolio_plan as _build_solver_portfolio_plan,
+)
+from remediation_engine.orchestration.portfolio_solver import (
+    prepare_portfolio_inputs as _prepare_solver_portfolio_inputs,
+)
+from remediation_engine.tools.npm_graph import npm_range_contains
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -441,17 +451,8 @@ def _synthetic_issue_id(manifest_path: str, package_name: str) -> UUID:
 
 
 def _npm_range_contains(version_range: str, version: str) -> bool | None:
-    """Check an npm peer range, returning ``None`` when it cannot be parsed."""
-    normalized_range = version_range.strip()
-    normalized_version = version.strip().lstrip("vV")
-    if not normalized_range or normalized_range in {"*", "latest"}:
-        return True
-    try:
-        from semantic_version import NpmSpec, Version
-
-        return NpmSpec(normalized_range).match(Version.coerce(normalized_version))
-    except (ImportError, ValueError):
-        return None
+    """Check an npm peer range through the shared neutral graph helper."""
+    return npm_range_contains(version_range, version)
 
 
 def _synthetic_target_version(
@@ -690,12 +691,28 @@ def materialize_synthetic_dependency_tasks(
         existing_groups_by_key[
             (_group_manifest_path(group, root), (group.vulnerable_component or "").strip())
         ] = group
+    committed_target_keys = {
+        (
+            _group_manifest_path(group, root),
+            (
+                task.target_package_name
+                or task.parent_package_name
+                or (group.vulnerable_component or "")
+            ).strip(),
+        )
+        for task in augmented_queue.values()
+        if (group := groups_by_id.get(task.parent_group_id)) is not None
+    }
     from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
     for key in all_keys:
         record = records_by_key[key]
-        inherited_version = alignment_targets.get(key)
         existing_group = existing_groups_by_key.get(key)
+        if key in committed_target_keys and (
+            existing_group is None or not existing_group.is_synthetic
+        ):
+            continue
+        inherited_version = alignment_targets.get(key)
         if existing_group is not None and not existing_group.is_synthetic:
             # Finding-backed groups already have authoritative triage evidence
             # and must never be replaced by a synthetic group.
@@ -1381,7 +1398,7 @@ def _topological_cluster_order(
     return [cluster_id for component in ordered_components for cluster_id in component]
 
 
-def build_portfolio_plan(
+def _legacy_build_portfolio_plan(
     repo_root: str | Path,
     groups: Iterable[VulnerabilityGroup],
     task_queue: dict[str, RemediationTask],
@@ -1558,5 +1575,59 @@ __all__ = [
     "build_portfolio_plan",
     "isolate_delta_failure",
     "materialize_synthetic_dependency_tasks",
+    "repository_fingerprint",
+]
+
+
+def prepare_portfolio_inputs(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
+    """Prepare the outer portfolio inputs using detached task/group objects."""
+    return _prepare_solver_portfolio_inputs(repo_root, groups, task_queue)
+
+
+def build_portfolio_plan(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+    *,
+    peer_conflict_pairs: Iterable[tuple[str, str]] = (),
+    forced_singleton_task_ids: Iterable[str] = (),
+    settings: Any | None = None,
+    portfolio_iteration: int = 0,
+    portfolio_replan_request: Any | None = None,
+) -> PortfolioPlan:
+    """Build the solver-backed portfolio plan at the stable public boundary."""
+    return _build_solver_portfolio_plan(
+        repo_root,
+        groups,
+        task_queue,
+        peer_conflict_pairs=peer_conflict_pairs,
+        forced_singleton_task_ids=forced_singleton_task_ids,
+        settings=settings,
+        portfolio_iteration=portfolio_iteration,
+        portfolio_replan_request=portfolio_replan_request,
+    )
+
+
+def apply_portfolio_plan(
+    plan: PortfolioPlan,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
+    """Commit solver-approved decisions to detached task objects."""
+    return _apply_solver_portfolio_plan(plan, groups, task_queue)
+
+
+__all__ = [
+    "DeltaIsolationResult",
+    "active_leaf_task_ids",
+    "apply_portfolio_plan",
+    "build_portfolio_plan",
+    "isolate_delta_failure",
+    "materialize_synthetic_dependency_tasks",
+    "prepare_portfolio_inputs",
     "repository_fingerprint",
 ]

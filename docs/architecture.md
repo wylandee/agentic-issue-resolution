@@ -8,41 +8,49 @@ apply a patch to the caller's repository.
 
 ## Graph topology
 
-The graph has one preprocessing pass, a shared Docker workspace, and a
-Supervisor hub. Every worker result returns to the Supervisor, which decides
-the next committed transition.
+The graph has one initial preprocessing pass, a shared Docker workspace, and an
+outer portfolio boundary before the Supervisor hub. Every worker result returns
+to the Supervisor, which may request a post-QA triage/portfolio replan before
+deciding the next committed transition.
 
 ```text
 START
   |
-  +--> initial_triage --(no work/failure)--------------------+
-  |          |                                              |
-  |          +--> workspace_builder --(failure)-------------+--> teardown
-  |                              |                           |
-  |                              +--> supervisor <------------+
-  |                                     |  ^                  |
-  |             +-----------------------+  |                  |
-  |             |                          |                  |
-  |             +--> update_subagent ------+                  |
-  |             +--> workaround_subagent --+                  |
-  |             +--> qa_critic ------------+                  |
-  |             +--> triage ----------------+                  |
-  |             +--> final_full_scan -------+                  |
-  |             +--> teardown -------------------------------> report --> END
+  +--> initial_triage --(no work/failure)--------------------------+
+  |          |                                                    |
+  |          +--> workspace_builder --(failure)-------------------+--> teardown
+  |                              |                                 |
+  |                              +--> portfolio --(invalid)--------+
+  |                                     |                          |
+  |                                     +--> supervisor <-----------+
+  |                                            |  ^                 |
+  |                    +-----------------------+  |                 |
+  |                    |                          |                 |
+  |                    +--> update_subagent ------+                 |
+  |                    +--> workaround_subagent --+                 |
+  |                    +--> qa_critic ------------+                 |
+  |                    +--> triage --> portfolio --+                 |
+  |                    +--> final_full_scan -------+                 |
+  |                    +--> teardown --------------------------------> report --> END
 ```
 
 `initial_triage` accepts the caller's groups or runs the initial triage
 pipeline. `workspace_builder` creates and populates the shared volume.
-`supervisor` then dispatches one committed task at a time (subject to the
-dispatch limits in the implementation) to an update worker, workaround
-worker, or QA. It can also send the graph through post-QA `triage`, request the
-authoritative `final_full_scan`, or finish at `teardown`.
+`portfolio` snapshots the npm graph, solves the active SCA task portfolio, and
+commits the resulting task allowlists copy-on-write. Only a validated,
+dispatchable portfolio reaches `supervisor`; infeasible, unknown, fallback,
+invalid-DAG, and unresolved no-fix plans fail closed to teardown.
+
+The `supervisor` dispatches committed tasks subject to the dispatch limits in
+the implementation. It can route an update worker, workaround worker, or QA;
+request post-QA `triage` (which always returns through `portfolio`); request the
+authoritative `final_full_scan`; or finish at `teardown`. The final scan and
+teardown are graph-level operations rather than task dispatches.
 
 The `triage` node is reserved for post-QA reconciliation. It consumes the
 complete parseable scan snapshot, reconciles groups with task lineage, and
-returns control to the Supervisor. A reopened cycle clears the final-scan
-completion gate before more work is dispatched. The final scan and teardown
-are graph-level operations rather than task dispatches.
+returns control to the outer portfolio boundary. A reopened cycle clears the
+final-scan completion gate before more work is dispatched.
 
 ## Package boundaries
 
@@ -93,19 +101,27 @@ are graph-level operations rather than task dispatches.
   `sandbox_mgr.py` provides `DockerSandbox`, `docker_client.py` manages client
   acquisition/closure, and `path_policy.py` validates repository-relative and
   workspace-relative paths.
+- `solver/subgraph.py`, `solver/cpsat.py`, and `solver/graph.py` contain pure,
+  occurrence-aware graph extraction, bounded CP-SAT assignment, atomic batching,
+  DAG validation, and SCC phase scheduling. They consume immutable solver
+  contracts and never read environment variables or dispatch workers.
+- `orchestration/portfolio_solver.py` is the outer copy-on-write adapter. It
+  loads the npm graph and optional registry cache, projects active task/finding
+  domains into solver contracts, and applies only solver-approved decisions.
 - `tools` contains deterministic parsers, lockfile-closure and package
   planning helpers, repository maps, locators, and scanner utilities.
 - `api.py` and `cli.py` are the supported Python and command-line boundaries.
   Callers do not construct LangGraph state directly.
 
-## Authoritative task and attempt state
-
 `OrchestratorState.task_queue` is the authoritative mapping from task ID to
-`RemediationTask`. `attempt_snapshots_by_id` is the authoritative record of
-each committed attempt. Task lineage uses `parent_group_id` and explicit
-parent-task links; group identity is triage/report context, while task ID is
-the execution and QA correlation key. `active_target_task_ids` identifies the
-tasks selected for the current dispatch.
+`RemediationTask`. `portfolio_plan` is the committed outer-plan projection;
+its `portfolio_plan_id`, repository/graph/solver digests, task membership, and
+planned revisions must match the active queue before the Supervisor dispatches.
+`attempt_snapshots_by_id` is the authoritative record of each committed
+attempt. Task lineage uses `parent_group_id` and explicit parent-task links;
+group identity is triage/report context, while task ID is the execution and QA
+correlation key. `active_target_task_ids` identifies the tasks selected for the
+current dispatch.
 
 Before dispatch, the Supervisor commits an attempt snapshot containing the
 task ID and revision, attempt ID, strategy stage, selected version (when
@@ -123,16 +139,20 @@ that produced it. Scratchpads, conversation messages, summaries, and report
 views are derived or ephemeral and cannot select a version, retry, pivot, or
 new task.
 
+The outer Portfolio Orchestrator alone:
+
+1. snapshots the npm graph and selects bounded registry/cache candidates through
+   the CP-SAT portfolio solver;
+2. commits the immutable plan, target identities, allowlists, and task revisions;
+3. validates the dependency DAG and dispatch phases before handing work to the
+   Supervisor.
+
 The Supervisor alone:
 
-1. selects registry versions and dependency types;
-2. chooses retry, pivot, and post-QA reconciliation actions;
-3. creates tasks and commits their attempt snapshots; and
-4. decides when all actionable work is complete and the final scan gate may
-   run.
-
-Workers execute the instruction and candidate set already committed to their
-attempt. They do not create tasks or choose the next remediation action.
+1. consumes the committed plan and selects the next route;
+2. chooses retry, pivot, and post-QA reconciliation actions from committed
+   evidence; and
+3. commits task attempts and decides when the final scan gate may run.
 
 ## Worker execution
 

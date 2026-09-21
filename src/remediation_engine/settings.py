@@ -31,6 +31,11 @@ def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
 
 DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 
+# A finite model-variable cap keeps an accidentally unbounded CP-SAT model
+# from exhausting process resources.  Deployments with larger repositories can
+# raise it explicitly through REMEDY_SOLVER_MAX_MODEL_VARIABLES.
+DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
+
 
 @dataclass(frozen=True)
 class AppSettings:
@@ -51,6 +56,17 @@ class AppSettings:
     langsmith_project: str = "AppSec-Remediation-Engine"
     langsmith_endpoint: str = ""
     triage_cache_dir: Path | None = None
+    solver_timeout_seconds: int = 10
+    solver_top_k: int = 3
+    solver_phase_budget: int = 8
+    solver_accept_feasible: bool = True
+    solver_random_seed: int = 0
+    solver_num_search_workers: int = 1
+    solver_max_candidates_per_target: int = 64
+    solver_max_model_variables: int = DEFAULT_SOLVER_MAX_MODEL_VARIABLES
+    solver_cache_dir: Path | None = None
+    solver_llm_enabled: bool = False
+    solver_llm_model: str = "gpt-4o-mini"
     remediation_trajectory_dir: Path | None = None
     remediation_report_dir: Path | None = None
     remedy_bypass_workaround_subagent: bool = False
@@ -69,6 +85,7 @@ class AppSettings:
         """
         trajectory = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
         report_dir = os.environ.get("REMEDIATION_REPORT_DIR", "").strip()
+        solver_cache_dir = os.environ.get("REMEDIATION_SOLVER_CACHE_DIR", "").strip()
         default_model = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini").strip()
         if not default_model:
             default_model = "gpt-4o-mini"
@@ -99,6 +116,23 @@ class AppSettings:
                 if os.environ.get("TRIAGE_CACHE_DIR", "").strip()
                 else None
             ),
+            solver_timeout_seconds=_env_int("REMEDY_SOLVER_TIMEOUT_SECONDS", 10, minimum=1),
+            solver_top_k=_env_int("REMEDY_SOLVER_TOP_K", 3, minimum=1),
+            solver_phase_budget=_env_int("REMEDY_SOLVER_PHASE_BUDGET", 8, minimum=1),
+            solver_accept_feasible=_env_bool("REMEDY_SOLVER_ACCEPT_FEASIBLE", True),
+            solver_random_seed=_env_int("REMEDY_SOLVER_RANDOM_SEED", 0, minimum=0),
+            solver_num_search_workers=_env_int("REMEDY_SOLVER_NUM_SEARCH_WORKERS", 1, minimum=1),
+            solver_max_candidates_per_target=_env_int(
+                "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET", 64, minimum=1
+            ),
+            solver_max_model_variables=_env_int(
+                "REMEDY_SOLVER_MAX_MODEL_VARIABLES",
+                DEFAULT_SOLVER_MAX_MODEL_VARIABLES,
+                minimum=1,
+            ),
+            solver_cache_dir=Path(solver_cache_dir) if solver_cache_dir else None,
+            solver_llm_enabled=_env_bool("REMEDY_SOLVER_LLM_ENABLED"),
+            solver_llm_model=os.environ.get("SOLVER_LLM_MODEL", "").strip() or default_model,
             remediation_trajectory_dir=Path(trajectory) if trajectory else None,
             remediation_report_dir=Path(report_dir) if report_dir else None,
             remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),

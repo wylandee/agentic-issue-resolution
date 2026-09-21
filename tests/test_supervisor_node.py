@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
+    MAX_MULTI_PACKAGE_ACTION_SIZE,
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
@@ -284,11 +285,11 @@ class TestSupervisorDecisionSchema:
         )
         assert decision.target_task_ids == ["t1", "t2"]
 
-    def test_update_subagent_rejects_more_than_ten_targets(self):
+    def test_update_subagent_rejects_more_than_configured_targets(self):
         with pytest.raises(ValidationError):
             SupervisorDecision(
                 next_node="update_subagent",
-                target_task_ids=[f"t{i}" for i in range(11)],
+                target_task_ids=[f"t{i}" for i in range(MAX_MULTI_PACKAGE_ACTION_SIZE + 1)],
                 instructions="test",
                 decision_reason="test",
             )
@@ -2227,7 +2228,6 @@ class TestRunSupervisorNodeTargetGuardrails:
             ["task-1", "task-2"],
             {"task-1": task1, "task-2": task2},
         ) == ["task-1"]
-
 
 class TestRunSupervisorMaxRetries:
     def test_max_retries_marks_task_unfixable_and_removes_from_targets(self):

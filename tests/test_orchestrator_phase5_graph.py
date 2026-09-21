@@ -30,14 +30,18 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.orchestration import (
     build_orchestrator_graph,
     orchestrator_engine,
     run_orchestrator,
 )
 from remediation_engine.orchestration.graph import (
+    MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _finish_workspace_attempt_snapshot,
+    route_after_portfolio,
     route_after_workspace_builder,
+    run_portfolio_node,
     run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
@@ -156,6 +160,31 @@ class TestPhase5Routing:
 
     def test_route_after_workspace_builder_unknown_status_routes_to_teardown(self):
         assert route_after_workspace_builder({"status": "something_else"}) == "teardown"
+
+
+def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
+    reason = "committed portfolio plan has stale task revision"
+    state = {
+        "repo_root": str(tmp_path),
+        "portfolio_iteration": 3,
+        "portfolio_replan_request": PortfolioReplanRequest(reason=reason),
+        "portfolio_replan_history": {reason: MAX_PORTFOLIO_REPLAN_ATTEMPTS},
+        "portfolio_plan": object(),
+        "portfolio_solver_plan": object(),
+        "valid_groups": [],
+        "task_queue": {},
+    }
+
+    with patch("remediation_engine.orchestration.graph.prepare_portfolio_inputs") as prepare:
+        result = run_portfolio_node(state)
+
+    prepare.assert_not_called()
+    assert result["status"] == "portfolio_replan_guarded"
+    assert result["next_routing_step"] == "teardown"
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_replan_history"] == {reason: MAX_PORTFOLIO_REPLAN_ATTEMPTS}
+    assert reason in result["errors"][0]
+    assert route_after_portfolio(result) == "teardown"
 
 
 class TestPhase5RunOrchestrator:

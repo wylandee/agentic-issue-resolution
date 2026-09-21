@@ -19,6 +19,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.graph import (
     build_orchestrator_graph,
+    route_after_post_qa_triage,
     route_after_triage,
     run_orchestrator,
     triage_node,
@@ -97,6 +98,11 @@ class TestTriageNodeIntegration:
         assert route_after_triage({"status": "triage_skipped"}) == "workspace_builder"
         assert route_after_triage({"status": "triage_completed_no_work"}) == "teardown"
         assert route_after_triage({"status": "failed"}) == "teardown"
+
+    def test_route_after_post_qa_triage_only_dispatches_actionable_work(self):
+        assert route_after_post_qa_triage({"status": "triage_completed"}) == "portfolio"
+        assert route_after_post_qa_triage({"status": "triage_completed_no_work"}) == "teardown"
+        assert route_after_post_qa_triage({"status": "triage_failed"}) == "teardown"
 
     @patch("remediation_engine.orchestration.graph.run_triage_pipeline")
     def test_triage_skipped_when_no_issues(self, mock_pipeline, tmp_path: Path):

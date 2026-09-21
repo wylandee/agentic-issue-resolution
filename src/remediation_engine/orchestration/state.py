@@ -38,7 +38,6 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
-    StateConsistencyEvent,
     SupervisorRetryPlan,
     SystemContext,
     TaskAttemptSnapshot,
@@ -47,6 +46,10 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
     WorkaroundReplayPlan,
     WorkerAttemptResult,
+)
+from remediation_engine.contracts.solver_models import (
+    PortfolioReplanRequest,
+    SolverRemediationPlan,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
 from remediation_engine.runtime.path_policy import (
@@ -374,15 +377,20 @@ class OrchestratorState(TypedDict, total=False):
     scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
-    consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
-    state_revision: int
-    changed_files: Annotated[list[str], merge_changed_files_reducer]
-
     # Phase 5 Task Queue (primary orchestration unit)
     task_queue: Annotated[dict[str, RemediationTask], replace_dict_reducer]
     active_target_task_ids: list[str]
     portfolio_plan: PortfolioPlan | None
+    portfolio_solver_plan: SolverRemediationPlan | None
+    portfolio_iteration: int
+    portfolio_replan_request: PortfolioReplanRequest | None
+    # Counts replan requests by their exact diagnostic reason.  The outer
+    # portfolio node uses this bounded ledger to fail closed on no-progress
+    # replan loops without making ordinary one-off replans terminal.
+    portfolio_replan_history: Annotated[dict[str, int], replace_dict_reducer]
     portfolio_dirty: bool
+    # Legacy dictionary retained at the migration boundary. New callers should
+    # use ``portfolio_replan_request``.
     portfolio_escalation: dict[str, Any] | None
     active_cluster_id: str | None
     active_dispatch_batch_id: str | None
@@ -503,6 +511,10 @@ def initial_orchestrator_state(
         "task_queue": {},
         "active_target_task_ids": [],
         "portfolio_plan": None,
+        "portfolio_solver_plan": None,
+        "portfolio_iteration": 0,
+        "portfolio_replan_request": None,
+        "portfolio_replan_history": {},
         "portfolio_dirty": True,
         "portfolio_escalation": None,
         "active_cluster_id": None,

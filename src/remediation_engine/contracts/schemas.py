@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from remediation_engine.contracts.decision_codes import DecisionCode
+from remediation_engine.contracts.solver_models import SolverRemediationPlan
 
 # ---------------------------------------------------------------------------
 # Enumerations
@@ -204,7 +205,7 @@ class NoFixMitigationStage(StrEnum):
 
 MAX_ANCESTRY_DEPTH: int = 3
 MAX_TASK_QUEUE_SIZE: int = 20
-MAX_MULTI_PACKAGE_ACTION_SIZE: int = 10
+MAX_MULTI_PACKAGE_ACTION_SIZE: int = 30
 
 
 class AgentActionStatus(StrEnum):
@@ -1744,6 +1745,7 @@ class TaskAttemptSnapshot(BaseModel):
     instruction_digest: str = Field(..., min_length=1)
     dispatch_node: Literal["update_subagent", "workaround_subagent", "qa_critic"]
     plan_id: str | None = None
+    portfolio_plan_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     workaround_context: WorkaroundContext | None = Field(default=None)
 
@@ -2204,6 +2206,8 @@ class TaskCluster(BaseModel):
     )
     dependencies: list[TaskDependency] = Field(default_factory=list)
     reason: str = Field(..., min_length=1)
+    atomic: bool = True
+    dispatchable: bool = True
 
     @field_validator("cluster_id", "reason", mode="before")
     @classmethod
@@ -2239,20 +2243,28 @@ class TaskCluster(BaseModel):
 
 
 class PortfolioPlan(BaseModel):
-    """Deterministic package-group ordering and cluster membership plan."""
+    """Deterministic package-group ordering and solver-backed execution plan."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     plan_id: str = Field(..., min_length=1)
+    portfolio_plan_id: str = Field(
+        default="",
+        description="Immutable outer-plan identity retained across task-local retries.",
+    )
     repository_fingerprint: str = Field(..., min_length=1)
     graph_digest: str = Field(..., min_length=1)
     plan_digest: str = Field(..., min_length=1)
+    solver_input_digest: str | None = None
+    solver_plan: SolverRemediationPlan | None = None
+    portfolio_iteration: int = Field(default=0, ge=0)
     task_ids: list[str] = Field(..., min_length=1)
     clusters: list[TaskCluster] = Field(..., min_length=1)
     cluster_order: list[str] = Field(..., min_length=1)
     task_order: list[str] = Field(..., min_length=1)
     task_to_cluster: dict[str, str] = Field(default_factory=dict)
     task_revisions: dict[str, int] = Field(default_factory=dict)
+    planned_task_revisions: dict[str, int] = Field(default_factory=dict)
     task_strategies: dict[str, RoutingStrategy] = Field(default_factory=dict)
     diagnostics: list[str] = Field(default_factory=list)
 
@@ -2266,6 +2278,20 @@ class PortfolioPlan(BaseModel):
     @classmethod
     def _normalize_plan_text(cls, value: Any, info: Any) -> str:
         return _trim_required_contract_text(value, info.field_name)
+
+    @field_validator("portfolio_plan_id", mode="before")
+    @classmethod
+    def _normalize_portfolio_plan_id(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("portfolio_plan_id must be a string.")
+        return value.strip()
+
+    @field_validator("solver_input_digest", mode="before")
+    @classmethod
+    def _normalize_solver_input_digest(cls, value: Any) -> str | None:
+        return _trim_optional_contract_text(value, "solver_input_digest")
 
     @field_validator("task_ids", "cluster_order", "task_order", mode="before")
     @classmethod
@@ -2294,8 +2320,14 @@ class PortfolioPlan(BaseModel):
             raise ValueError("task_to_cluster must match cluster membership.")
         if set(self.task_revisions) != task_ids:
             raise ValueError("task_revisions must cover every planned task.")
+        if not self.planned_task_revisions:
+            object.__setattr__(self, "planned_task_revisions", dict(self.task_revisions))
+        elif set(self.planned_task_revisions) != task_ids:
+            raise ValueError("planned_task_revisions must cover every planned task.")
         if set(self.task_strategies) != task_ids:
             raise ValueError("task_strategies must cover every planned task.")
+        if not self.portfolio_plan_id:
+            object.__setattr__(self, "portfolio_plan_id", self.plan_id)
         return self
 
 
@@ -2738,4 +2770,16 @@ class RemediationTask(BaseModel):
         default=0,
         ge=0,
         description="How many parent tasks spawned this task (0 = initial task).",
+    )
+    allowed_target_versions: list[str] = Field(
+        default_factory=list,
+        description="Solver-approved target versions the inner Supervisor may attempt.",
+    )
+    allowed_dependency_types: list[str] = Field(
+        default_factory=list,
+        description="Solver-approved manifest dependency sections for this task.",
+    )
+    portfolio_plan_id: str | None = Field(
+        default=None,
+        description="Committed outer portfolio plan authorizing the task input.",
     )

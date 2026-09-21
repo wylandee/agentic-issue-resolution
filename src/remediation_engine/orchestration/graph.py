@@ -11,10 +11,12 @@ Phase 5 graph topology (hub-and-spoke)
       | triage_completed / skipped -> workspace_builder
       | failed | no_work -> teardown
     workspace_builder
-      | workspace_ready / failed -> teardown
+      | workspace_ready -> portfolio
+      | failed -> teardown
+    portfolio
+      | validated -> supervisor
+      | invalid / infeasible / unknown / native failure -> teardown
     supervisor  <-----------------------------------+
-      |                                            |
-      +-> portfolio ------------------------------+
       |                                            |
       +-> update_subagent ----------------------->-+
       |                                            |
@@ -22,9 +24,11 @@ Phase 5 graph topology (hub-and-spoke)
       |                                            |
       +-> qa_critic ------------------------------>+
       |                                            |
-      +-> triage (post-QA reconciliation) -------->+
+      +-> triage (post-QA reconciliation) --------> portfolio
       |                                            |
       +-> final_full_scan ------------------------>+
+      |                         +-> triage -> portfolio
+      |                         +-> teardown
       |
       +-> teardown -> report -> END
 
@@ -50,11 +54,13 @@ from langgraph.graph import END, START, StateGraph
 from remediation_engine.contracts.accessors import model_or_dict_value
 from remediation_engine.contracts.schemas import (
     IssueSource,
+    IssueType,
     SystemContext,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
 from remediation_engine.orchestration.graph_wrappers import (
     _create_workspace_attempt_snapshot,
@@ -81,7 +87,11 @@ from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
     resolve_phase5_trace_url,
 )
-from remediation_engine.orchestration.portfolio_orchestrator import build_portfolio_plan
+from remediation_engine.orchestration.portfolio_orchestrator import (
+    apply_portfolio_plan,
+    build_portfolio_plan,
+    prepare_portfolio_inputs,
+)
 from remediation_engine.orchestration.qa_critic import (
     run_final_full_scan_node,
     run_qa_critic_node,
@@ -124,13 +134,17 @@ from remediation_engine.triage.pipeline import run_triage_pipeline
 
 log = logging.getLogger(__name__)
 
+MAX_PORTFOLIO_REPLAN_ATTEMPTS = 3
+
+
 __all__ = [
     "build_orchestrator_graph",
     "orchestrator_engine",
     "post_qa_triage_node",
-    "route_after_triage",
+    "route_after_post_qa_triage",
     "route_after_workspace_builder",
     "route_after_portfolio",
+    "route_after_final_full_scan",
     "run_portfolio_node",
     "run_orchestrator",
     "triage_node",
@@ -701,6 +715,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "active_target_task_ids": [],
             "portfolio_dirty": work_reopened,
             "portfolio_plan": None if work_reopened else state.get("portfolio_plan"),
+            "portfolio_solver_plan": None if work_reopened else state.get("portfolio_solver_plan"),
             "final_full_scan_completed": False
             if work_reopened
             else state.get("final_full_scan_completed", False),
@@ -727,34 +742,159 @@ def route_after_triage(state: OrchestratorState) -> str:
     return "workspace_builder"
 
 
+def route_after_post_qa_triage(state: OrchestratorState) -> str:
+    """Route only actionable post-QA reconciliation results into the portfolio."""
+    return "portfolio" if state.get("status") == "triage_completed" else "teardown"
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 routing
 # ---------------------------------------------------------------------------
 
 
 def route_after_workspace_builder(state: OrchestratorState) -> str:
-    """Route Phase 5 flow after the workspace builder node."""
+    """Route successful workspace preparation into the outer portfolio."""
     if state.get("status") == "workspace_ready":
-        return "supervisor"
+        return "portfolio"
     return "teardown"
 
 
-def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
-    """Build the deterministic package-group portfolio plan."""
+def _portfolio_replan_request(state: OrchestratorState) -> PortfolioReplanRequest | None:
+    """Normalize typed and legacy outer-replan state at the graph boundary."""
+    request = state.get("portfolio_replan_request")
+    if isinstance(request, PortfolioReplanRequest):
+        return request
+
+    # ``portfolio_escalation`` was the pre-contract dictionary.  Accept it
+    # during migration, but validate only the fields in the typed boundary
+    # rather than leaking arbitrary evidence into solver state.
+    legacy = request if isinstance(request, dict) else state.get("portfolio_escalation")
+    if not isinstance(legacy, dict):
+        return None
+    fields = (
+        "reason",
+        "peer_conflict_pairs",
+        "forced_singleton_task_ids",
+        "triggering_attempt_id",
+        "triggering_scan_id",
+        "source_portfolio_plan_id",
+    )
+    payload = {key: legacy[key] for key in fields if key in legacy}
+    if not payload.get("reason"):
+        payload["reason"] = "PORTFOLIO_REPLAN"
     try:
-        escalation = state.get("portfolio_escalation") or {}
-        peer_conflict_pairs = (
-            escalation.get("peer_conflict_pairs", []) if isinstance(escalation, dict) else []
+        return PortfolioReplanRequest.model_validate(payload)
+    except Exception as exc:  # noqa: BLE001 - migration input is best effort
+        log.warning("Ignoring invalid legacy portfolio escalation: %s", exc)
+        return None
+
+
+def _record_portfolio_replan_attempt(
+    state: OrchestratorState,
+    request: PortfolioReplanRequest | None,
+) -> tuple[dict[str, int], str | None]:
+    """Record a replan request and report an identical-reason loop.
+
+    The portfolio node is the only graph boundary that consumes a
+    ``PortfolioReplanRequest``.  Keeping the ledger here means every source
+    of a replan, including the legacy escalation projection, gets the same
+    bounded fail-closed behavior.
+
+    Args:
+        state: Current orchestrator state containing the prior ledger.
+        request: Normalized outer-replan request, if this is a replan.
+
+    Returns:
+        A replacement ledger and an optional diagnostic.  The diagnostic is
+        non-empty only when another identical request would exceed the limit.
+    """
+    history: dict[str, int] = {}
+    for raw_reason, raw_count in dict(state.get("portfolio_replan_history", {}) or {}).items():
+        if not isinstance(raw_reason, str):
+            continue
+        try:
+            history[raw_reason] = max(0, int(raw_count))
+        except (TypeError, ValueError):
+            history[raw_reason] = 0
+    if request is None:
+        return history, None
+
+    reason = request.reason.strip() or "PORTFOLIO_REPLAN"
+    attempts = history.get(reason, 0)
+    if attempts >= MAX_PORTFOLIO_REPLAN_ATTEMPTS:
+        return (
+            history,
+            "portfolio replan guard: refusing another portfolio iteration after "
+            f"{attempts} identical requests (reason={reason!r}).",
         )
-        forced_singletons = (
-            escalation.get("forced_singleton_task_ids", []) if isinstance(escalation, dict) else []
-        )
-        plan = build_portfolio_plan(
+    history[reason] = attempts + 1
+    return history, None
+
+
+def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
+    """Prepare, solve, and commit one copy-on-write outer portfolio plan."""
+    iteration = int(state.get("portfolio_iteration", 0) or 0) + 1
+    request = _portfolio_replan_request(state)
+    replan_history, replan_guard_error = _record_portfolio_replan_attempt(state, request)
+    if replan_guard_error:
+        log.warning("run_portfolio_node: %s", replan_guard_error)
+        return {
+            "status": "portfolio_replan_guarded",
+            "next_routing_step": "teardown",
+            "portfolio_plan": state.get("portfolio_plan"),
+            "portfolio_solver_plan": state.get("portfolio_solver_plan"),
+            "portfolio_iteration": iteration,
+            "portfolio_replan_request": None,
+            "portfolio_replan_history": replan_history,
+            "portfolio_dirty": False,
+            "portfolio_escalation": None,
+            "valid_groups": list(state.get("valid_groups", []) or []),
+            "task_queue": dict(state.get("task_queue", {}) or {}),
+            "active_target_task_ids": [],
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+            "errors": [replan_guard_error],
+        }
+    peer_conflict_pairs = request.peer_conflict_pairs if request else ()
+    forced_singletons = request.forced_singleton_task_ids if request else ()
+
+    try:
+        settings = get_runtime_settings()
+        prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
             state["repo_root"],
             state.get("valid_groups", []),
             dict(state.get("task_queue", {}) or {}),
+        )
+        if prepared_groups and not any(
+            group.issue_type == IssueType.SCA for group in prepared_groups
+        ):
+            return {
+                "status": "portfolio_ready",
+                "next_routing_step": "supervisor",
+                "portfolio_plan": None,
+                "portfolio_solver_plan": None,
+                "portfolio_iteration": iteration,
+                "portfolio_replan_request": None,
+                "portfolio_replan_history": replan_history,
+                "portfolio_escalation": None,
+                "portfolio_dirty": False,
+                "valid_groups": prepared_groups,
+                "task_queue": prepared_queue,
+                "active_target_task_ids": [],
+                "active_cluster_id": None,
+                "active_dispatch_batch_id": None,
+                "errors": sorted(set(prepare_diagnostics)),
+            }
+        plan = build_portfolio_plan(
+            state["repo_root"],
+            prepared_groups,
+            prepared_queue,
             peer_conflict_pairs=peer_conflict_pairs,
             forced_singleton_task_ids=forced_singletons,
+            settings=settings,
+            portfolio_iteration=iteration,
+            portfolio_replan_request=request,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
         return {
@@ -762,43 +902,188 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "next_routing_step": "teardown",
             "portfolio_dirty": False,
             "active_target_task_ids": [],
+            "portfolio_iteration": iteration,
+            "portfolio_replan_request": request,
+            "portfolio_replan_history": replan_history,
             "errors": [f"portfolio node failed: {exc}"],
         }
-    if any("multiple nonterminal tasks" in diagnostic for diagnostic in plan.diagnostics):
+
+    solver_plan = getattr(plan, "solver_plan", None)
+    solver_plan_diagnostics = list(getattr(solver_plan, "diagnostics", []) or [])
+    plan_diagnostics = list(getattr(plan, "diagnostics", []) or [])
+    diagnostics = sorted(
+        set(prepare_diagnostics) | set(plan_diagnostics) | set(solver_plan_diagnostics)
+    )
+    diagnostics_text = "\n".join(diagnostics).lower()
+    solver_status = getattr(solver_plan, "status", None)
+    solver_status = getattr(solver_status, "value", solver_status)
+    solver_status = str(solver_status or "").upper()
+    invalid_dag = any(
+        marker in diagnostics_text
+        for marker in (
+            "invalid dag",
+            "invalid-dag",
+            "invalid dependency dag",
+            "dag validation failed",
+            "unknown endpoint",
+            "unresolved cycle",
+            "partial result",
+        )
+    )
+    all_non_dispatchable_clusters = [
+        cluster
+        for cluster in getattr(plan, "clusters", [])
+        if not getattr(cluster, "dispatchable", True)
+    ]
+    hard_overflow_clusters = [
+        cluster.cluster_id
+        for cluster in all_non_dispatchable_clusters
+        if str(getattr(cluster, "reason", "")).lower().startswith("hard atomic component exceeds ")
+    ]
+    if all_non_dispatchable_clusters:
+        diagnostics.append(
+            "portfolio plan contains retained non-dispatchable cluster(s): "
+            f"{sorted(cluster.cluster_id for cluster in all_non_dispatchable_clusters)!r}"
+        )
+        diagnostics_text = "\n".join(diagnostics).lower()
+    selected_plan = getattr(solver_plan, "selected_plan", None)
+    no_fix_task_ids = [
+        decision.task_id
+        for decision in (getattr(selected_plan, "task_decisions", None) or [])
+        if str(decision.selected_strategy).lower().replace("-", "_") == "no_fix"
+        and (
+            (task := prepared_queue.get(decision.task_id)) is None
+            or task.status
+            not in {
+                TaskStatus.QA_PASSED,
+                TaskStatus.UNFIXABLE,
+                TaskStatus.INCONCLUSIVE,
+                TaskStatus.PIVOTED,
+            }
+        )
+    ]
+    multiple_active_tasks = any(
+        "multiple nonterminal tasks" in diagnostic for diagnostic in plan_diagnostics
+    )
+    blocked = multiple_active_tasks or bool(no_fix_task_ids) or bool(hard_overflow_clusters)
+    failed_status = solver_status in {
+        "INFEASIBLE",
+        "UNKNOWN",
+        "FALLBACK",
+        "INVALID",
+        "NATIVE_ERROR",
+    }
+    if blocked or invalid_dag or failed_status:
+        errors = list(diagnostics)
+        if multiple_active_tasks:
+            errors.append(
+                "portfolio node blocked dispatch because a package group has multiple "
+                "nonterminal active tasks."
+            )
+        if hard_overflow_clusters:
+            errors.append(
+                "portfolio node blocked dispatch because hard atomic component(s) "
+                "exceed the multi-package action limit: "
+                f"{sorted(hard_overflow_clusters)!r}."
+            )
+        if failed_status:
+            errors.append(f"portfolio solver returned non-dispatchable status {solver_status}.")
+        if no_fix_task_ids:
+            errors.append(
+                "portfolio node blocked dispatch because the solver left unresolved "
+                f"no-fix tasks: {sorted(no_fix_task_ids)!r}."
+            )
+        failure_state = (
+            "portfolio_native_error"
+            if solver_status == "NATIVE_ERROR"
+            else "portfolio_unknown"
+            if solver_status == "UNKNOWN"
+            else "portfolio_infeasible"
+            if solver_status == "INFEASIBLE"
+            else "portfolio_invalid"
+            if invalid_dag or solver_status in {"INVALID", "FALLBACK"}
+            else "portfolio_blocked"
+        )
         return {
-            "status": "portfolio_blocked",
+            "status": failure_state,
             "next_routing_step": "teardown",
             "portfolio_plan": plan,
+            "portfolio_solver_plan": solver_plan,
+            "portfolio_iteration": iteration,
+            "portfolio_replan_request": request,
+            "portfolio_replan_history": replan_history,
             "portfolio_dirty": False,
+            "valid_groups": prepared_groups,
+            "task_queue": prepared_queue,
             "active_target_task_ids": [],
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,
             "active_multi_package_action": None,
-            "errors": [
-                "portfolio node blocked dispatch because a package group has multiple "
-                "nonterminal active tasks."
-            ],
+            "errors": errors,
         }
+    try:
+        committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
+            plan,
+            prepared_groups,
+            prepared_queue,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
+        return {
+            "status": "portfolio_failed",
+            "next_routing_step": "teardown",
+            "portfolio_plan": plan,
+            "portfolio_solver_plan": solver_plan,
+            "portfolio_iteration": iteration,
+            "portfolio_replan_request": request,
+            "portfolio_replan_history": replan_history,
+            "portfolio_dirty": False,
+            "valid_groups": prepared_groups,
+            "task_queue": prepared_queue,
+            "active_target_task_ids": [],
+            "errors": [f"portfolio plan application failed: {exc}"],
+        }
+    diagnostics = sorted(set(diagnostics) | set(apply_diagnostics))
     return {
         "status": "portfolio_ready",
         "next_routing_step": "supervisor",
         "portfolio_plan": plan,
+        "portfolio_solver_plan": solver_plan,
+        "portfolio_iteration": iteration,
+        "portfolio_replan_request": None,
+        "portfolio_replan_history": replan_history,
         "portfolio_dirty": False,
         "portfolio_escalation": None,
+        "valid_groups": committed_groups,
+        "task_queue": committed_queue,
         "active_target_task_ids": [],
         "active_cluster_id": None,
         "active_dispatch_batch_id": None,
         "active_multi_package_action": None,
+        "errors": diagnostics,
     }
 
 
 def route_after_portfolio(state: OrchestratorState) -> str:
-    """Return the safe route after portfolio planning."""
-    return (
-        "teardown"
-        if state.get("status") in {"portfolio_failed", "portfolio_blocked"}
-        else "supervisor"
-    )
+    """Route only validated, dispatchable portfolio plans to the Supervisor."""
+    return "supervisor" if state.get("status") == "portfolio_ready" else "teardown"
+
+
+def route_after_final_full_scan(state: OrchestratorState) -> str:
+    """Re-enter triage only when the authoritative scan requires it."""
+    if state.get("status") != "final_scan_completed":
+        return "teardown"
+    required = bool(state.get("triage_required"))
+    result = state.get("final_full_scan_result")
+    if isinstance(result, dict):
+        required = required or bool(
+            result.get("new_identifiers") or result.get("remaining_target_identifiers")
+        )
+    else:
+        required = required or bool(
+            getattr(result, "new_identifiers", ())
+            or getattr(result, "remaining_target_identifiers", ())
+        )
+    return "triage" if required else "teardown"
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +1096,7 @@ def build_orchestrator_graph():
     workflow = StateGraph(OrchestratorState)
 
     # ``initial_triage`` is the one preprocessing pass.  The node named
-    # ``triage`` is reserved for Supervisor-dispatched post-QA re-triage.
+    # ``triage`` is the outer-loop post-QA reconciliation pass.
     workflow.add_node("initial_triage", triage_node)
     workflow.add_node("triage", post_qa_triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
@@ -832,8 +1117,8 @@ def build_orchestrator_graph():
     workflow.add_edge("update_subagent", "supervisor")
     workflow.add_edge("workaround_subagent", "supervisor")
     workflow.add_edge("qa_critic", "supervisor")
-    workflow.add_edge("triage", "supervisor")
-    workflow.add_edge("final_full_scan", "supervisor")
+    workflow.add_conditional_edges("triage", route_after_post_qa_triage)
+    workflow.add_conditional_edges("final_full_scan", route_after_final_full_scan)
     workflow.add_edge("teardown", "report")
     workflow.add_edge("report", END)
 

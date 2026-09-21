@@ -732,7 +732,7 @@ def test_task_cluster_rejects_invalid_membership_or_edges(cluster_kwargs):
         TaskCluster(cluster_id="cluster-1", reason="reason", **cluster_kwargs)
 
 
-def test_task_cluster_rejects_self_edges_and_more_than_ten_tasks():
+def test_task_cluster_rejects_self_edges_and_oversized_clusters():
     with pytest.raises(ValidationError):
         TaskDependency(
             upstream_task_id="task-a",

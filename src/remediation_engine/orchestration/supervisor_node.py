@@ -65,12 +65,8 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
-from remediation_engine.orchestration.portfolio_orchestrator import (
-    active_leaf_task_ids,
-    materialize_synthetic_dependency_tasks,
-    repository_fingerprint,
-)
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
     _OVERRIDE_DEPENDENCY_TYPES,
@@ -85,7 +81,6 @@ from remediation_engine.orchestration.supervisor_planner import (
     _planner_plan_violations,
     _repair_invalid_planner_plans,
     _run_deterministic_retry_planner,
-    _supervisor_dependency_type_candidates,
     instruction_digest,
 )
 from remediation_engine.orchestration.supervisor_policy import (
@@ -120,15 +115,13 @@ from remediation_engine.orchestration.supervisor_spawn import (
 )
 from remediation_engine.orchestration.task_utils import (
     advance_no_fix_stage,
-    build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
-    derive_missing_task_qa_policy,
     group_parent_context,
-    is_no_fix_group,
     is_transitive_group,
     select_package_fix_plan,
 )
+from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +172,7 @@ __all__ = [
     "_select_deterministic_action",
     "_terminalize_pivot_parents",
     "_validate_invariants",
+    "_next_sca_stage",
     "_validate_committed_state",
 ]
 
@@ -199,70 +193,44 @@ def _ordered_update_candidates(
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Build immutable version and dependency-type candidates for an update attempt."""
-    selected_version = (
-        plan.selected_version
-        if plan is not None and plan.selected_version
-        else task.selected_version
+    """Return only candidates committed by the outer Portfolio Orchestrator."""
+    approved_versions = list(
+        dict.fromkeys(
+            str(value).strip().lstrip("vV")
+            for value in task.allowed_target_versions
+            if str(value).strip()
+        )
     )
-    attempted_version_values = [
-        *(diagnostics.attempted_versions if diagnostics else []),
-        *(plan.attempted_versions if plan else []),
-    ]
-    attempted_versions = {item.strip().lstrip("vV") for item in attempted_version_values if item}
-    if plan is not None:
-        candidate_versions = list(plan.candidate_versions_considered)
-    elif diagnostics is not None:
-        candidate_versions = list(diagnostics.candidate_versions_considered)
-    else:
-        candidate_versions = []
-
-    allowed_versions: list[str] = []
-    seen_versions: set[str] = set()
-    for version in [selected_version, *candidate_versions]:
-        if not version:
-            continue
-        normalized = version.strip().lstrip("vV")
-        if not normalized or normalized in seen_versions:
-            continue
-        if normalized in attempted_versions:
-            continue
-        seen_versions.add(normalized)
-        allowed_versions.append(normalized)
-
-    selected_type = (
-        (plan.target_dependency_type if plan is not None else None)
-        or task.target_dependency_type
-        or (diagnostics.target_dependency_type if diagnostics else None)
-    )
-    strategy_stage = plan.strategy_stage if plan is not None else task.strategy_stage
-    policy_types = _supervisor_dependency_type_candidates(strategy_stage, selected_type)
-    if plan is not None and plan.candidate_dependency_types:
-        committed_plan_types = set(plan.candidate_dependency_types)
-        candidate_types = [
-            dependency_type
-            for dependency_type in policy_types
-            if dependency_type in committed_plan_types
-        ]
-    else:
-        candidate_types = policy_types
-    attempted_types = {
-        item.strip()
-        for item in (diagnostics.attempted_dependency_types if diagnostics else ())
-        if item
+    selected_version = task.selected_version
+    attempted_versions = {
+        str(value).strip().lstrip("vV").lower()
+        for value in (list(diagnostics.attempted_versions) if diagnostics else [])
+        + (list(plan.attempted_versions) if plan else [])
+        if str(value).strip()
     }
-    allowed_types: list[str] = []
-    seen_types: set[str] = set()
-    for dependency_type in candidate_types:
-        if not dependency_type:
+    versions: list[str] = []
+    for value in [selected_version, *approved_versions]:
+        if not value:
             continue
-        normalized = str(dependency_type).strip()
-        if normalized in attempted_types:
-            continue
-        if normalized and normalized not in seen_types:
-            seen_types.add(normalized)
-            allowed_types.append(normalized)
-    return allowed_versions, allowed_types
+        normalized = str(value).strip().lstrip("vV")
+        if (
+            normalized
+            and normalized.lower() not in attempted_versions
+            and normalized not in versions
+        ):
+            versions.append(normalized)
+
+    approved_types = list(
+        dict.fromkeys(
+            str(value).strip() for value in task.allowed_dependency_types if str(value).strip()
+        )
+    )
+    selected_type = task.target_dependency_type
+    types: list[str] = []
+    for value in [selected_type, *approved_types]:
+        if value and str(value).strip() not in types:
+            types.append(str(value).strip())
+    return versions, types
 
 
 def _current_action_summaries(
@@ -312,6 +280,7 @@ def _create_attempt_snapshot(
     snapshots_by_id: dict[str, TaskAttemptSnapshot],
     state_revision: int,
     plan_id: str | None = None,
+    portfolio_plan_id: str | None = None,
     workaround_context: WorkaroundContext | None = None,
     allowed_target_versions: Iterable[str] = (),
     allowed_dependency_types: Iterable[str] = (),
@@ -367,6 +336,7 @@ def _create_attempt_snapshot(
         instruction_digest=instruction_digest(task.instruction),
         dispatch_node=dispatch_node,  # type: ignore[arg-type]
         plan_id=plan_id,
+        portfolio_plan_id=portfolio_plan_id or task.portfolio_plan_id,
         created_at=datetime.fromtimestamp(state_revision, tz=UTC),
         workaround_context=workaround_context,
     )
@@ -390,44 +360,165 @@ def _cluster_dispatch_batch_id(
     return f"batch-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
 
 
+def _is_hard_overflow_cluster(cluster: Any) -> bool:
+    """Return whether a retained cluster exceeds the atomic action limit."""
+    return str(getattr(cluster, "reason", "")).lower().startswith("hard atomic component exceeds ")
+
+
+def _portfolio_plan_violations(
+    plan: Any,
+    task_queue: dict[str, RemediationTask],
+    valid_groups: list[VulnerabilityGroup],
+    *,
+    repo_root: str | None = None,
+) -> list[str]:
+    """Validate the immutable outer-plan contract before any dispatch."""
+    if plan is None:
+        return ["missing committed portfolio plan"]
+    violations: list[str] = []
+    for cluster in getattr(plan, "clusters", ()) or ():
+        if not getattr(cluster, "dispatchable", True) and _is_hard_overflow_cluster(cluster):
+            violations.append(
+                f"portfolio cluster {cluster.cluster_id!r} is marked non-dispatchable"
+            )
+    plan_id = getattr(plan, "portfolio_plan_id", None) or getattr(plan, "plan_id", None)
+    selected = getattr(getattr(plan, "solver_plan", None), "selected_plan", None)
+    decisions = {
+        decision.task_id: decision for decision in (getattr(selected, "task_decisions", None) or [])
+    }
+    sca_group_ids = {group.group_id for group in valid_groups if group.issue_type == IssueType.SCA}
+    groups_by_id = {group.group_id: group for group in valid_groups}
+    tasks_by_group: dict[str, list[RemediationTask]] = {}
+    for task in task_queue.values():
+        if task.parent_group_id in sca_group_ids:
+            tasks_by_group.setdefault(task.parent_group_id, []).append(task)
+    terminal_statuses = {
+        TaskStatus.QA_PASSED,
+        TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
+        TaskStatus.PIVOTED,
+    }
+    active_sca_tasks = []
+    for tasks in tasks_by_group.values():
+        nonterminal = [task for task in tasks if task.status not in terminal_statuses]
+        active_sca_tasks.append(
+            max(nonterminal or tasks, key=lambda task: (task.task_revision, task.task_id))
+        )
+    sca_task_ids = {task.task_id for task in active_sca_tasks}
+    planned_ids = set(getattr(plan, "task_ids", ()) or ())
+    if sca_task_ids != planned_ids:
+        violations.append(
+            f"portfolio membership mismatch: active SCA tasks={sorted(sca_task_ids)!r}, "
+            f"planned={sorted(planned_ids)!r}"
+        )
+    planned_revisions = getattr(plan, "planned_task_revisions", None) or {}
+    strategies = getattr(plan, "task_strategies", None) or {}
+    for task_id in sorted(planned_ids):
+        task = task_queue.get(task_id)
+        if task is None:
+            violations.append(f"portfolio plan references missing task {task_id!r}")
+            continue
+        if task.portfolio_plan_id != plan_id:
+            violations.append(
+                f"task {task_id} portfolio plan {task.portfolio_plan_id!r} "
+                f"differs from committed {plan_id!r}"
+            )
+        baseline = planned_revisions.get(task_id)
+        if baseline is None:
+            violations.append(f"task {task_id} has no committed planned task revision")
+        elif task.task_revision < baseline:
+            violations.append(
+                f"task {task_id} is older than committed planned revision "
+                f"{baseline!r} (current={task.task_revision})"
+            )
+        expected_strategy = strategies.get(task_id)
+        if expected_strategy is not None and task.strategy != expected_strategy:
+            violations.append(
+                f"task {task_id} strategy {task.strategy.value!r} differs from "
+                f"committed {expected_strategy.value!r}"
+            )
+        decision = decisions.get(task_id)
+        if decision is None:
+            violations.append(f"task {task_id} has no committed solver decision")
+            continue
+        decision_strategy = str(decision.selected_strategy).replace("-", "_").lower()
+        expected = (
+            RoutingStrategy.CODE_WORKAROUND
+            if decision_strategy in {"code_workaround", "workaround", "no_fix"}
+            else RoutingStrategy.VERSION_BUMP
+        )
+        if task.strategy != expected:
+            violations.append(f"task {task_id} strategy is outside solver decision")
+        group = groups_by_id.get(task.parent_group_id)
+        expected_package = (
+            (task.target_package_name or group.vulnerable_component or "").strip()
+            if group is not None
+            else ""
+        )
+        expected_manifest = _group_manifest_path(group) if group is not None else None
+        expected_identity = {
+            "target_occurrence_id": (
+                make_occurrence_id(expected_manifest, expected_package)
+                if expected_manifest and expected_package
+                else None
+            ),
+            "target_group_id": task.parent_group_id,
+            "target_package_name": expected_package or None,
+            "manifest_path": expected_manifest,
+            "lockfile_package_key": (
+                f"node_modules/{expected_package}" if expected_package else None
+            ),
+        }
+        for field_name, expected_value in expected_identity.items():
+            if getattr(decision, field_name, None) != expected_value:
+                violations.append(f"task {task_id} solver identity field {field_name} is invalid")
+        try:
+            if task.strategy_stage != SCARemediationStage(decision.strategy_stage):
+                violations.append(f"task {task_id} strategy stage differs from solver decision")
+        except ValueError:
+            violations.append(f"task {task_id} has unknown committed strategy stage")
+        approved_versions = [
+            str(value).strip().lstrip("vV").lower()
+            for value in ([decision.selected_version] + list(decision.allowed_alternative_versions))
+            if value
+        ]
+        task_versions = [
+            str(value).strip().lstrip("vV").lower()
+            for value in task.allowed_target_versions
+            if value
+        ]
+        if task_versions != approved_versions:
+            violations.append(f"task {task_id} allowed_target_versions differ from solver")
+        if task.selected_version and str(task.selected_version).strip().lstrip(
+            "vV"
+        ).lower() not in set(approved_versions):
+            violations.append(f"task {task_id} selected_version is not solver-approved")
+        approved_types = [str(value).strip() for value in decision.allowed_dependency_types]
+        task_types = [str(value).strip() for value in task.allowed_dependency_types]
+        if task_types != approved_types:
+            violations.append(f"task {task_id} allowed_dependency_types differ from solver")
+        if task.target_dependency_type and task.target_dependency_type not in set(task_types):
+            violations.append(f"task {task_id} dependency type is not solver-approved")
+    return violations
+
+
 def _portfolio_plan_is_stale(
     plan: Any,
     task_queue: dict[str, RemediationTask],
     valid_groups: list[VulnerabilityGroup],
-    repo_root: str | None,
+    repo_root: str | None = None,
 ) -> bool:
-    """Return whether a committed portfolio plan no longer matches state."""
-    if plan is None:
-        return True
-    group_ids = {group.group_id for group in valid_groups if group.issue_type == IssueType.SCA}
-    if set(active_leaf_task_ids(task_queue, group_ids)) != set(plan.task_ids):
-        return True
-    planned_group_ids = {
-        task_queue[task_id].parent_group_id for task_id in plan.task_ids if task_id in task_queue
-    }
-    if planned_group_ids != group_ids:
-        return True
-    if any(task_id not in task_queue for task_id in plan.task_ids):
-        return True
-    if any(
-        task_queue[task_id].task_revision != revision
-        for task_id, revision in plan.task_revisions.items()
-        if task_id in task_queue
-    ):
-        return True
-    if any(
-        task_queue[task_id].strategy != strategy
-        for task_id, strategy in plan.task_strategies.items()
-        if task_id in task_queue
-    ):
-        return True
-    if repo_root:
+    """Compatibility predicate backed by committed plan fields and graph fingerprint."""
+    violations = _portfolio_plan_violations(plan, task_queue, valid_groups)
+    if repo_root and plan is not None:
+        expected_fingerprint = getattr(plan, "repository_fingerprint", None)
         try:
-            if repository_fingerprint(repo_root) != plan.repository_fingerprint:
-                return True
+            actual_fingerprint = load_npm_graph_snapshot(repo_root).repository_fingerprint
         except (OSError, ValueError):
-            return True
-    return False
+            actual_fingerprint = None
+        if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+            violations.append("repository fingerprint differs from committed portfolio plan")
+    return bool(violations)
 
 
 def _build_multi_package_action(
@@ -515,7 +606,7 @@ def _peer_conflict_escalation(
     gates = evaluation.deterministic_gates
     if evaluation.failure_category != FailureCategory.PEER_CONFLICT or gates is None:
         return None, []
-    leaf_ids = set(active_leaf_task_ids(task_queue))
+    leaf_ids = set(task_queue)
     package_to_task: dict[str, str] = {}
     for candidate_id in sorted(leaf_ids):
         candidate = task_queue.get(candidate_id)
@@ -1028,214 +1119,49 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     errors: list[str] = []
     prior_error_messages = set(state.get("errors", []) or [])
 
-    # ------------------------------------------------------------------
-    # 1. Normalize task_queue (copy-on-write)
-    # ------------------------------------------------------------------
+    # The outer Portfolio Orchestrator is the only owner of task creation,
+    # synthetic dependency materialization, and version selection.
     raw_task_queue: dict[str, RemediationTask] = dict(state.get("task_queue", {}))
-    # Copy-on-write: work with model copies so we never mutate state-owned objects
     task_queue: dict[str, RemediationTask] = {
-        tid: t.model_copy() for tid, t in raw_task_queue.items()
+        task_id: task.model_copy() for task_id, task in raw_task_queue.items()
     }
-    existing_group_ids = {t.parent_group_id for t in task_queue.values()}
-    next_task_index = 1
-    for group in valid_groups:
-        if group.group_id not in existing_group_ids:
-            while f"task-{next_task_index}" in task_queue:
-                next_task_index += 1
-            task_id = f"task-{next_task_index}"
-            task_queue[task_id] = build_initial_remediation_task(group, task_id)
-            existing_group_ids.add(group.group_id)
-            next_task_index += 1
-
-    # The scanner only creates groups for findings. The portfolio also needs
-    # directly declared dependencies without CVEs so every package occurrence
-    # is represented in the dependency graph. Materialize those
-    # coordination-only groups after the finding-backed tasks have their
-    # Supervisor-selected versions. This is copy-on-write and never performs
-    # registry or network work.
-    valid_groups, task_queue, synthetic_diagnostics = materialize_synthetic_dependency_tasks(
-        state.get("repo_root", ""),
-        valid_groups,
-        task_queue,
-    )
-    if synthetic_diagnostics:
-        logger.info(
-            "supervisor: synthetic dependency discovery diagnostics: %s",
-            synthetic_diagnostics,
-        )
-    group_by_id = {g.group_id: g for g in valid_groups}
-
-    # Keep task-owned planner fields synchronized with the initial OSV plan.
-    # Later planner commits are the only source allowed to change these fields.
-    for task_id, task in list(task_queue.items()):
-        group = group_by_id.get(task.parent_group_id)
-        selection = select_package_fix_plan(group, task.strategy) if group is not None else None
-        selected_plan = selection.plan if selection is not None else None
-        task_updates: dict[str, Any] = {}
-        if (
-            selection is not None
-            and task.current_attempt_id is None
-            and list(selection.issue_ids) != list(task.selected_plan_issue_ids)
-        ):
-            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
-        if task.qa_policy is None and task.current_attempt_id is None:
-            recovered_policy = derive_missing_task_qa_policy(task, group)
-            if recovered_policy is not None:
-                task_updates["qa_policy"] = recovered_policy
-            elif task.status not in _TERMINAL_STATUSES:
-                details = (
-                    "Task has no recoverable QA policy provenance before dispatch; "
-                    "the Supervisor will fail closed."
-                )
-                errors.append(f"supervisor: task {task_id} has missing QA policy provenance.")
-                consistency_events.append(
-                    _build_consistency_event(
-                        error_code="MISSING_QA_POLICY_PROVENANCE",
-                        task_id=task_id,
-                        expected_attempt_id=None,
-                        received_attempt_id=None,
-                        action="rejected",
-                        details=details,
-                    )
-                )
-        if (
-            task.status not in _TERMINAL_STATUSES
-            and task.current_attempt_id is None
-            and task.no_fix_stage is None
-            and group is not None
-            and is_no_fix_group(group)
-        ):
-            task_updates["no_fix_stage"] = NoFixMitigationStage.PACKAGE_REMOVAL
-            if task.selected_version is not None:
-                task_updates["selected_version"] = None
-            if not task.instruction or task.instruction.strip().casefold() == (
-                "no upstream patch or workaround was found. inform the user."
-            ):
-                task_updates["instruction"] = build_no_fix_package_removal_instruction(group)
-        if (
-            task.task_revision == 0
-            and task.status not in _TERMINAL_STATUSES
-            and task.current_attempt_id is None
-            and not task.instruction
-            and group is not None
-            and selected_plan is not None
-            and selected_plan.instruction
-        ):
-            task_updates["instruction"] = selected_plan.instruction
-            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
-        if (
-            task.task_revision == 0
-            and task.current_attempt_id is None
-            and task.status == TaskStatus.PENDING
-            and task.selected_version is None
-            and task.strategy == RoutingStrategy.VERSION_BUMP
-            and not task.parent_package_name
-            and group is not None
-            and selected_plan is not None
-            and selected_plan.fixed_version
-        ):
-            task_updates["selected_version"] = selected_plan.fixed_version
-            task_updates["selected_plan_issue_ids"] = list(selection.issue_ids)
-        if (
-            task.task_revision == 0
-            and task.current_attempt_id is None
-            and group is not None
-            and is_transitive_group(group)
-        ):
-            parent_name, parent_version, parent_type = group_parent_context(group)
-            if parent_name and task.parent_package_name != parent_name:
-                task_updates["parent_package_name"] = parent_name
-            if parent_version and task.parent_package_version != parent_version:
-                task_updates["parent_package_version"] = parent_version
-            if parent_name and task.target_package_name is None:
-                task_updates["target_package_name"] = parent_name
-                task_updates["target_dependency_type"] = task.target_dependency_type or parent_type
-        if task_updates:
-            if "qa_policy" in task_updates or "selected_plan_issue_ids" in task_updates:
-                task_updates["task_revision"] = task.task_revision + 1
-            task_queue[task_id] = task.model_copy(update=task_updates)
-
-    # A transitive VERSION_BUMP task is planned against its nearest directly
-    # declared parent before the first update worker is dispatched. This keeps
-    # child pins/overrides out of the initial instruction.
-    for task_id, task in list(task_queue.items()):
-        group = group_by_id.get(task.parent_group_id)
-        if (
-            group is not None
-            and is_transitive_group(group)
-            and task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.status == TaskStatus.PENDING
-            and task.current_attempt_id is None
-            and task.parent_package_name
-            and task.strategy_stage == SCARemediationStage.OSV_MINIMUM
-        ):
-            initial_candidates: list[str] = []
-            planned_task = _plan_initial_transitive_task(
-                task,
-                group,
-                candidate_versions=initial_candidates,
-            )
-            task_queue[task_id] = planned_task
-            prior_diagnostics = retry_diagnostics_by_task.get(task_id)
-            parent_name, _, parent_type = group_parent_context(group)
-            target_type = planned_task.target_dependency_type or parent_type
-            initial_diagnostics = prior_diagnostics or UpdateRetryDiagnostics(task_id=task_id)
-            retry_diagnostics_by_task[task_id] = initial_diagnostics.model_copy(
-                update={
-                    "strategy_stage": planned_task.strategy_stage,
-                    "security_floor": (
-                        select_package_fix_plan(group, task.strategy).plan.fixed_version
-                        if select_package_fix_plan(group, task.strategy).plan is not None
-                        else initial_diagnostics.security_floor
-                    ),
-                    "selected_version": planned_task.selected_version,
-                    "candidate_versions_considered": list(
-                        dict.fromkeys(
-                            [
-                                *initial_diagnostics.candidate_versions_considered,
-                                *initial_candidates,
-                                *(
-                                    [planned_task.selected_version]
-                                    if planned_task.selected_version
-                                    else []
-                                ),
-                            ]
-                        )
-                    ),
-                    "candidate_dependency_types": _supervisor_dependency_type_candidates(
-                        planned_task.strategy_stage,
-                        target_type,
-                    ),
-                    "target_package_name": planned_task.target_package_name,
-                    "target_dependency_type": target_type,
-                    "parent_package_name": parent_name,
-                    "parent_minimum_version": planned_task.parent_minimum_version,
-                    "registry_query_performed": bool(initial_candidates),
-                }
-            )
-
     active_target_task_ids = list(state.get("active_target_task_ids") or [])
-    if (
-        not active_target_task_ids
-        and any(task.status not in _TERMINAL_STATUSES for task in task_queue.values())
-        and any(group.issue_type == IssueType.SCA for group in valid_groups)
-        and ("portfolio_dirty" in state or "portfolio_plan" in state)
-        and (
-            state.get("portfolio_dirty", False)
-            or _portfolio_plan_is_stale(
-                state.get("portfolio_plan"),
-                task_queue,
-                valid_groups,
-                state.get("repo_root"),
-            )
+    committed_plan = state.get("portfolio_plan")
+    has_sca_groups = any(group.issue_type == IssueType.SCA for group in valid_groups)
+    plan_violations = (
+        _portfolio_plan_violations(
+            committed_plan,
+            task_queue,
+            valid_groups,
+            repo_root=state.get("repo_root"),
         )
-    ):
+        if has_sca_groups or committed_plan is not None
+        else []
+    )
+    if plan_violations:
+        source_plan_id = (
+            getattr(committed_plan, "portfolio_plan_id", None)
+            if committed_plan is not None
+            else None
+        )
+        request = PortfolioReplanRequest(
+            reason="; ".join(plan_violations)[:2000],
+            triggering_attempt_id=next(
+                (
+                    task.current_attempt_id
+                    for task in task_queue.values()
+                    if task.current_attempt_id
+                ),
+                None,
+            ),
+            source_portfolio_plan_id=source_plan_id,
+        )
         decision = SupervisorDecision(
             decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
             next_node="portfolio",
             target_task_ids=[],
-            instructions="Build the deterministic package-group portfolio plan before dispatch.",
-            decision_reason="The package-group portfolio plan is missing or stale.",
+            instructions="Rebuild the outer portfolio plan before Supervisor dispatch.",
+            decision_reason=request.reason,
         )
         return {
             "status": "supervisor_routed",
@@ -1246,6 +1172,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             "supervisor_instructions": decision.instructions,
             "task_queue": task_queue,
             "valid_groups": valid_groups,
+            "portfolio_replan_request": request,
+            "portfolio_dirty": True,
             "state_revision": state_revision,
         }
 
@@ -1327,6 +1255,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 result.task_id != task_id
                 or result.task_revision != task.task_revision
                 or snapshot is None
+                or (snapshot is not None and snapshot.task_revision != result.task_revision)
+                or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
+                or (
+                    committed_plan is not None
+                    and snapshot is not None
+                    and snapshot.portfolio_plan_id != committed_plan.portfolio_plan_id
+                )
                 or result.instruction_digest != snapshot.instruction_digest
                 or (snapshot_cluster_id is not None and result.cluster_id != snapshot_cluster_id)
                 or (snapshot_batch_id is not None and result.dispatch_batch_id != snapshot_batch_id)
@@ -1641,60 +1576,20 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # supervisor pass. Detach the consumed attempt first so the
                 # planner cannot observe a new stage paired with an old
                 # immutable snapshot.
-                failed_group = group_by_id.get(task.parent_group_id)
-                transitive_failure = bool(failed_group and is_transitive_group(failed_group))
-                next_failure_stage = (
-                    _next_sca_stage(task.strategy_stage, transitive=True)
-                    if transitive_failure
-                    else task.strategy_stage
-                )
+                # A failed attempt consumes a task-local retry only.  The
+                # outer plan owns stage/version transitions; Supervisor must
+                # never infer a new stage or fixed version from group data.
                 failure_updates: dict[str, Any] = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
-                if transitive_failure and next_failure_stage != task.strategy_stage:
-                    failure_updates["strategy_stage"] = next_failure_stage
-                    if next_failure_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-                        failure_updates.update(
-                            {
-                                "target_package_name": failed_group.vulnerable_component,
-                                "target_dependency_type": _override_dependency_type(failed_group),
-                                "selected_version": (
-                                    select_package_fix_plan(
-                                        failed_group, task.strategy
-                                    ).plan.fixed_version
-                                    if select_package_fix_plan(failed_group, task.strategy).plan
-                                    else None
-                                ),
-                            }
-                        )
-                    elif next_failure_stage == SCARemediationStage.CODE_WORKAROUND:
-                        failure_updates.update(
-                            {
-                                "selected_version": None,
-                                "exhausted_update_path": True,
-                            }
-                        )
                 _commit_task_transition(
                     task_queue,
                     task_id,
                     updates=failure_updates,
                     close_attempt=True,
-                    clear_selected_version=(
-                        next_failure_stage == SCARemediationStage.CODE_WORKAROUND
-                    ),
+                    clear_selected_version=True,
                 )
-                if transitive_failure:
-                    committed_failure_task = task_queue[task_id]
-                    retry_diagnostics_by_task[task_id] = prior.model_copy(
-                        update={
-                            "strategy_stage": committed_failure_task.strategy_stage,
-                            "selected_version": committed_failure_task.selected_version,
-                            "target_package_name": committed_failure_task.target_package_name,
-                            "target_dependency_type": committed_failure_task.target_dependency_type,
-                            "exhausted_update_path": committed_failure_task.exhausted_update_path,
-                        }
-                    )
             processed_worker_attempt_ids.add(current_attempt_id)
             new_worker_attempt_ids.append(current_attempt_id)
             continue
@@ -1808,6 +1703,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             qa_result.task_id != task_id
             or qa_result.task_revision != task.task_revision
             or snapshot is None
+            or (snapshot is not None and snapshot.task_revision != qa_result.task_revision)
+            or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
+            or (
+                committed_plan is not None
+                and snapshot is not None
+                and snapshot.portfolio_plan_id != committed_plan.portfolio_plan_id
+            )
             or (snapshot_cluster_id is not None and qa_result.cluster_id != snapshot_cluster_id)
             or (snapshot_batch_id is not None and qa_result.dispatch_batch_id != snapshot_batch_id)
             or (
@@ -1940,6 +1842,25 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             errors.append(
                 "supervisor: atomic package-cluster QA failure kept every member non-passed."
             )
+    portfolio_replan_request = state.get("portfolio_replan_request")
+    if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
+        escalation = portfolio_escalation
+        if isinstance(escalation, dict) and escalation.get("reason"):
+            try:
+                portfolio_replan_request = PortfolioReplanRequest(
+                    reason=str(escalation["reason"]),
+                    peer_conflict_pairs=escalation.get("peer_conflict_pairs", []),
+                    forced_singleton_task_ids=escalation.get("forced_singleton_task_ids", []),
+                    triggering_attempt_id=escalation.get("triggering_attempt_id"),
+                    triggering_scan_id=escalation.get("triggering_scan_id"),
+                    source_portfolio_plan_id=(
+                        committed_plan.portfolio_plan_id
+                        if committed_plan is not None
+                        else escalation.get("source_portfolio_plan_id")
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                portfolio_replan_request = None
 
     auto_new_constraints: list[str] = []
 
@@ -2043,91 +1964,42 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             workaround_replay_plans_by_task[resolved_t_id] = reset_plan
                     continue
 
-                group = group_by_id.get(task.parent_group_id)
-                next_stage = _next_sca_stage(
-                    task.strategy_stage,
-                    transitive=bool(group and is_transitive_group(group)),
-                )
+                # QA failure stays within the committed task decision.  Do
+                # not advance strategy stages or derive a package version in
+                # the inner loop; retry planning can only consume the
+                # task's solver-approved alternatives.
                 task_updates = {
                     "status": TaskStatus.NEEDS_RETRY,
                     "retry_count": task.retry_count + 1,
                 }
-                if task.strategy == RoutingStrategy.VERSION_BUMP:
-                    task_updates["strategy_stage"] = next_stage
-                    if next_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-                        task_updates.update(
-                            {
-                                "target_package_name": (
-                                    group.vulnerable_component if group else task.parent_group_id
-                                ),
-                                "target_dependency_type": _override_dependency_type(group),
-                                "selected_version": (
-                                    select_package_fix_plan(group, task.strategy).plan.fixed_version
-                                    if group and select_package_fix_plan(group, task.strategy).plan
-                                    else task.selected_version
-                                ),
-                            }
-                        )
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
                     updates=task_updates,
+                    close_attempt=True,
+                    clear_selected_version=True,
                 )
-                task = task_queue[resolved_t_id]
-                if task.strategy == RoutingStrategy.VERSION_BUMP:
-                    prior_diag = retry_diagnostics_by_task.get(resolved_t_id)
-                    parent_name, _, parent_type = (
-                        group_parent_context(group) if group is not None else (None, None, None)
-                    )
-                    next_target = (
-                        group.vulnerable_component
-                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
-                        else task.target_package_name or parent_name
-                    )
-                    next_target_type = (
-                        _override_dependency_type(group)
-                        if next_stage == SCARemediationStage.PACKAGE_OVERRIDE
-                        else task.target_dependency_type or parent_type
-                    )
-                    if prior_diag is None:
-                        retry_diagnostics_by_task[resolved_t_id] = UpdateRetryDiagnostics(
-                            task_id=resolved_t_id,
-                            strategy_stage=next_stage,
-                            security_floor=(
-                                select_package_fix_plan(group, task.strategy).plan.fixed_version
-                                if group and select_package_fix_plan(group, task.strategy).plan
-                                else None
-                            ),
-                            exhausted_update_path=(
-                                next_stage == SCARemediationStage.CODE_WORKAROUND
-                            ),
-                            target_package_name=next_target,
-                            target_dependency_type=next_target_type,
-                            parent_package_name=parent_name,
-                            parent_minimum_version=task.parent_minimum_version,
-                            selected_version=task.selected_version,
-                        )
-                    else:
-                        retry_diagnostics_by_task[resolved_t_id] = prior_diag.model_copy(
-                            update={
-                                "strategy_stage": next_stage,
-                                "security_floor": prior_diag.security_floor
-                                or (
-                                    select_package_fix_plan(group, task.strategy).plan.fixed_version
-                                    if group and select_package_fix_plan(group, task.strategy).plan
-                                    else None
-                                ),
-                                "exhausted_update_path": next_stage
-                                == SCARemediationStage.CODE_WORKAROUND,
-                                "target_package_name": next_target,
-                                "target_dependency_type": next_target_type,
-                                "parent_package_name": parent_name,
-                                "parent_minimum_version": task.parent_minimum_version,
-                                "selected_version": task.selected_version,
-                            }
-                        )
 
     # ------------------------------------------------------------------
+    # Normalize any escalation emitted while reconciling the final QA result.
+    if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
+        escalation = portfolio_escalation
+        if isinstance(escalation, dict) and escalation.get("reason"):
+            try:
+                portfolio_replan_request = PortfolioReplanRequest(
+                    reason=str(escalation["reason"]),
+                    peer_conflict_pairs=escalation.get("peer_conflict_pairs", []),
+                    forced_singleton_task_ids=escalation.get("forced_singleton_task_ids", []),
+                    triggering_attempt_id=escalation.get("triggering_attempt_id"),
+                    triggering_scan_id=escalation.get("triggering_scan_id"),
+                    source_portfolio_plan_id=(
+                        committed_plan.portfolio_plan_id
+                        if committed_plan is not None
+                        else escalation.get("source_portfolio_plan_id")
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                portfolio_replan_request = None
     # 4. Mark UNFIXABLE tasks that hit the retry cap
     # ------------------------------------------------------------------
     for task_id, task in task_queue.items():
@@ -2462,14 +2334,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             valid_target_ids = _qa_ready_task_ids(
                 task_queue,
                 preferred_ids=list(decision.target_task_ids),
-                limit=QA_DISPATCH_LIMIT,
+                limit=None if decision.cluster_id else QA_DISPATCH_LIMIT,
             )
         elif decision.next_node == "update_subagent":
             valid_target_ids = _update_worker_task_ids(
                 task_queue,
                 retry_diagnostics_by_task,
                 preferred_ids=list(decision.target_task_ids),
-                limit=UPDATE_DISPATCH_LIMIT,
+                limit=None if decision.cluster_id else UPDATE_DISPATCH_LIMIT,
             )
         elif decision.next_node == "workaround_subagent":
             valid_target_ids = []
@@ -2508,6 +2380,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 
         if (
             not needs_fallback
+            and not decision.cluster_id
             and decision.next_node == "update_subagent"
             and requested_target_count > UPDATE_DISPATCH_LIMIT
         ):
@@ -2518,6 +2391,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             needs_fallback = True
         if (
             not needs_fallback
+            and not decision.cluster_id
             and decision.next_node == "qa_critic"
             and requested_target_count > QA_DISPATCH_LIMIT
         ):
@@ -2526,7 +2400,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 requested_target_count,
             )
             needs_fallback = True
-        if not needs_fallback and decision.next_node == "update_subagent" and valid_target_ids:
+        if (
+            not needs_fallback
+            and not decision.cluster_id
+            and decision.next_node == "update_subagent"
+            and valid_target_ids
+        ):
             has_retry_targets = any(
                 task_queue[t_id].status == TaskStatus.NEEDS_RETRY
                 or task_queue[t_id].retry_count > 0
@@ -2824,8 +2703,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("supervisor: decision rebuild failed (%s) â€” falling back.", exc)
-                pivot_parent_status_by_parent = {}
-                pivot_target_parent_ids = set()
                 decision = _deterministic_routing(
                     task_queue,
                     group_by_id,
@@ -2834,6 +2711,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
+                    portfolio_plan=state.get("portfolio_plan"),
                 )
 
     # ------------------------------------------------------------------
@@ -3152,6 +3030,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     active_cluster_id: str | None = None
     active_dispatch_batch_id: str | None = None
     active_multi_package_action: MultiPackageAction | None = None
+    portfolio_dispatch_rejected = False
     if resolved_next_node == "update_subagent" and decision.cluster_id:
         action = _build_multi_package_action(
             decision.cluster_id,
@@ -3160,20 +3039,29 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             group_by_id,
         )
         if action is None or len(resolved_target_task_ids) < 2:
-            errors.append(
-                "supervisor: rejected atomic cluster dispatch because its committed action "
-                "could not be represented exactly; falling back to singleton routing."
+            reason = (
+                f"supervisor: rejected atomic cluster '{decision.cluster_id}' because "
+                "its committed action could not be represented exactly; requesting "
+                "a portfolio replan."
             )
-            first_target = resolved_target_task_ids[:1]
-            resolved_target_task_ids = first_target
-            decision = decision.model_copy(
-                update={
-                    "cluster_id": None,
-                    "multi_package_action": None,
-                    "target_task_ids": first_target,
-                    "decision_code": DecisionCode.NEW_VERSION_BUMP,
-                }
+            errors.append(reason)
+            portfolio_dispatch_rejected = True
+            portfolio_replan_request = PortfolioReplanRequest(
+                reason=reason,
+                source_portfolio_plan_id=(
+                    committed_plan.portfolio_plan_id if committed_plan is not None else None
+                ),
             )
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+                next_node="portfolio",
+                target_task_ids=[],
+                instructions="Rebuild the portfolio plan before dispatching the package cluster.",
+                decision_reason=reason,
+            )
+            resolved_next_node = "portfolio"
+            resolved_target_task_ids = []
+            remapped_feedback_by_task = {}
         else:
             active_cluster_id = decision.cluster_id
             active_dispatch_batch_id = _cluster_dispatch_batch_id(
@@ -3246,6 +3134,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 snapshots_by_id=attempt_snapshots_by_id,
                 state_revision=state_revision,
                 plan_id=plan.plan_id if plan is not None else None,
+                portfolio_plan_id=(
+                    committed_plan.portfolio_plan_id if committed_plan is not None else None
+                ),
                 workaround_context=workaround_ctx,
                 allowed_target_versions=(
                     _ordered_update_candidates(
@@ -3347,13 +3238,37 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # attempt-correlated audit record.
     errors = list(dict.fromkeys(error for error in errors if error not in prior_error_messages))
 
-    portfolio_dirty = bool(state.get("portfolio_dirty", False))
+    portfolio_dirty = bool(state.get("portfolio_dirty", False)) or portfolio_dispatch_rejected
     if state.get("portfolio_plan") is not None:
         portfolio_dirty = portfolio_dirty or _portfolio_plan_is_stale(
             state.get("portfolio_plan"),
             task_queue,
             valid_groups,
             state.get("repo_root"),
+        )
+    if portfolio_dirty and not isinstance(portfolio_replan_request, PortfolioReplanRequest):
+        stale_reasons = _portfolio_plan_violations(
+            committed_plan,
+            task_queue,
+            valid_groups,
+        )
+        portfolio_replan_request = PortfolioReplanRequest(
+            reason=(
+                "; ".join(stale_reasons)
+                if stale_reasons
+                else "Committed portfolio plan was marked dirty by Supervisor reconciliation."
+            )[:2000],
+            triggering_attempt_id=next(
+                (
+                    task.current_attempt_id
+                    for task in task_queue.values()
+                    if task.current_attempt_id
+                ),
+                None,
+            ),
+            source_portfolio_plan_id=(
+                committed_plan.portfolio_plan_id if committed_plan is not None else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -3369,8 +3284,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         "active_dispatch_batch_id": active_dispatch_batch_id,
         "active_multi_package_action": active_multi_package_action,
         "portfolio_dirty": portfolio_dirty,
+        "portfolio_replan_request": portfolio_replan_request,
         "portfolio_escalation": portfolio_escalation,
-        "feedback_by_task": feedback_by_task,
         "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
         # Compatibility projection: the attempt-tagged QA envelope remains

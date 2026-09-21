@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from remediation_engine.orchestration.trajectory_exporter import (
@@ -284,6 +285,68 @@ def test_export_writes_one_markdown_file_with_root_state_and_span_details(tmp_pa
     assert "route task-1" in content
     assert "local-fallback" in content
     assert len(list(tmp_path.glob("*.md"))) == 1
+
+
+def test_local_trajectory_exists_before_langsmith_fetch(tmp_path, monkeypatch):
+    monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(tmp_path))
+    recorder = TrajectoryRecorder()
+    recorder.record_manual(
+        name="phase5.root_input",
+        run_type="state",
+        inputs={"status": "pending"},
+    )
+    observed: dict[str, str] = {}
+
+    def fetch_during_export(_trace_id):
+        files = list(tmp_path.glob("*.md"))
+        assert len(files) == 1
+        observed["content"] = files[0].read_text(encoding="utf-8")
+        raise RuntimeError("trace unavailable")
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.fetch_langsmith_spans",
+        fetch_during_export,
+    )
+
+    path = export_phase5_trajectory(
+        trace_id="trace-local-first",
+        repo_root="repo",
+        initial_state={"status": "pending"},
+        final_state={"status": "completed_with_errors"},
+        recorder=recorder,
+        langsmith_enabled=True,
+    )
+
+    assert path.exists()
+    assert '"status": "pending"' in observed["content"]
+    assert "Export source: `local-fallback`" in path.read_text(encoding="utf-8")
+
+
+def test_local_trajectory_survives_keyboard_interrupt_during_langsmith_fetch(tmp_path, monkeypatch):
+    monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(tmp_path))
+    recorder = TrajectoryRecorder()
+
+    def interrupt_during_fetch(_trace_id):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.trajectory_exporter.fetch_langsmith_spans",
+        interrupt_during_fetch,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        export_phase5_trajectory(
+            trace_id="trace-interrupted",
+            repo_root="repo",
+            initial_state={"status": "pending"},
+            final_state={"status": "completed_with_errors"},
+            recorder=recorder,
+            langsmith_enabled=True,
+        )
+
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    assert '"status": "pending"' in files[0].read_text(encoding="utf-8")
 
 
 def test_langsmith_spans_are_preferred_and_rendered(tmp_path, monkeypatch):

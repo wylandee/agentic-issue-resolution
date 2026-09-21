@@ -94,6 +94,12 @@ def _portfolio_cluster_targets(
 
     for cluster_id in ordered_cluster_ids:
         cluster = clusters_by_id.get(cluster_id)
+        if not getattr(cluster, "dispatchable", True):
+            logger.warning(
+                "portfolio cluster %s is non-dispatchable; preserving its hard-unit rejection",
+                cluster_id,
+            )
+            continue
         if cluster is None or not upstreams_terminal(cluster):
             continue
         tasks = [task_queue.get(task_id) for task_id in cluster.task_ids]
@@ -405,6 +411,49 @@ def _deterministic_routing(
             decision_reason=(
                 f"Dispatching the next dependency cluster '{portfolio_cluster_id}' "
                 "after all upstream package groups completed."
+            ),
+        )
+    if portfolio_cluster_id and portfolio_update_targets:
+        target = task_queue[portfolio_update_targets[0]]
+        if target.status == TaskStatus.NEEDS_RETRY:
+            evaluation = qa_evaluations.get(target.task_id)
+            feedback_by_task: dict[str, str] = {}
+            revised_instructions = {
+                target.task_id: _build_high_level_retry_instruction(
+                    target,
+                    group_by_id.get(target.parent_group_id),
+                    evaluation,
+                    retry_diagnostics_by_task.get(target.task_id),
+                )
+            }
+            if evaluation and evaluation.retry_feedback:
+                feedback_by_task[target.task_id] = evaluation.retry_feedback
+            return SupervisorDecision(
+                decision_code=DecisionCode.RETRY_VERSION_BUMP,
+                next_node="update_subagent",
+                target_task_ids=[target.task_id],
+                feedback_by_task=feedback_by_task,
+                revised_instructions=revised_instructions,
+                instructions=(
+                    "Route the next committed portfolio task back to the update worker "
+                    "with its high-level retry goal."
+                ),
+                decision_reason=(
+                    f"Retrying the ready singleton portfolio task '{target.task_id}' "
+                    f"from cluster '{portfolio_cluster_id}' before dependent clusters."
+                ),
+            )
+        return SupervisorDecision(
+            decision_code=DecisionCode.NEW_VERSION_BUMP,
+            next_node="update_subagent",
+            target_task_ids=[target.task_id],
+            instructions=(
+                "Apply the next committed portfolio task update before dispatching "
+                "dependent package clusters."
+            ),
+            decision_reason=(
+                f"Dispatching the ready singleton portfolio task '{target.task_id}' "
+                f"from cluster '{portfolio_cluster_id}' before dependent clusters."
             ),
         )
 
@@ -727,6 +776,7 @@ def _apply_transition(
                     snapshots_by_id=projected_snapshots,
                     state_revision=state_revision,
                     plan_id=(plan.plan_id if plan is not None else None),
+                    portfolio_plan_id=task.portfolio_plan_id,
                     allowed_target_versions=allowed_versions,
                     allowed_dependency_types=allowed_dependency_types,
                 )
