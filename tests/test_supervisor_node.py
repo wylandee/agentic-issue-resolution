@@ -47,6 +47,7 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
+    _authorize_update_dispatch,
     _build_consistency_event,
     _create_attempt_snapshot,
     _deterministic_routing,
@@ -54,6 +55,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
     _repair_invalid_planner_plans,
+    _validate_committed_state,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
@@ -383,7 +385,10 @@ def test_ordered_update_candidates_excludes_attempted_versions_and_types():
 def test_create_attempt_snapshot_commits_update_candidate_allowlists():
     """Candidate lists are captured in the immutable worker input snapshot."""
     task = _make_task("task-1", "g1").model_copy(
-        update={"instruction": "Update the committed dependency candidate."}
+        update={
+            "instruction": "Update the committed dependency candidate.",
+            "selected_version": "1.2.3",
+        }
     )
     committed, snapshot = _create_attempt_snapshot(
         task,
@@ -397,6 +402,72 @@ def test_create_attempt_snapshot_commits_update_candidate_allowlists():
     assert committed.current_attempt_id == snapshot.attempt_id
     assert snapshot.allowed_target_versions == ["1.2.3", "1.4.0"]
     assert snapshot.allowed_dependency_types == ["dependencies", "devDependencies"]
+
+
+def test_update_dispatch_authorization_requires_committed_selected_candidate():
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        candidate_versions_considered=["1.2.3", "1.4.0"],
+    )
+    valid_task = _make_task("task-1", "g1").model_copy(
+        update={"selected_version": "1.2.3", "instruction": "Update test-pkg to 1.2.3."}
+    )
+    authorization = _authorize_update_dispatch(valid_task, diagnostics=diagnostics)
+
+    assert authorization is not None
+    assert authorization.selected_version == "1.2.3"
+    assert authorization.allowed_target_versions == ("1.2.3", "1.4.0")
+
+    stale_task = valid_task.model_copy(update={"selected_version": "9.9.9"})
+    assert _authorize_update_dispatch(stale_task, diagnostics=diagnostics) is None
+
+
+def test_create_attempt_snapshot_rejects_candidate_less_update():
+    task = _make_task("task-1", "g1").model_copy(
+        update={"instruction": "Update only with a committed candidate."}
+    )
+
+    with pytest.raises(ValueError, match="non-empty candidate authorization"):
+        _create_attempt_snapshot(
+            task,
+            dispatch_node="update_subagent",
+            snapshots_by_id={},
+            state_revision=3,
+        )
+
+
+def test_committed_state_rejects_active_empty_update_authorization():
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": "attempt-1",
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "selected_version": "1.2.3",
+            "instruction": "Update test-pkg to 1.2.3.",
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-1",
+        task_id="task-1",
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        selected_version="1.2.3",
+        instruction=task.instruction,
+        instruction_digest=instruction_digest(task.instruction),
+        dispatch_node="update_subagent",
+    )
+
+    events, errors = _validate_committed_state(
+        {"task-1": task},
+        {"attempt-1": snapshot},
+        {},
+        {},
+        ["task-1"],
+        "update_subagent",
+    )
+
+    assert any(event.error_code == "UPDATE_ATTEMPT_WITHOUT_CANDIDATE" for event in events)
+    assert any("candidate authorization" in error for error in errors)
 
 
 # ===========================================================================
@@ -508,6 +579,25 @@ class TestRunSupervisorNodeNormalization:
 
         snapshot = result["attempt_snapshots_by_id"][task.current_attempt_id]
         assert snapshot.qa_policy == QAPolicy.VERSION_BUMP
+
+    def test_candidate_less_update_is_rejected_before_snapshot_creation(self, monkeypatch):
+        g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+            lambda *_args, **_kwargs: [],
+        )
+
+        result = run_supervisor_node(_base_state([g1]))
+
+        assert result["active_target_task_ids"] == []
+        assert all(
+            snapshot.dispatch_node != "update_subagent"
+            for snapshot in result.get("attempt_snapshots_by_id", {}).values()
+        )
+        assert any(
+            event.error_code == "UPDATE_DISPATCH_WITHOUT_CANDIDATE"
+            for event in result["consistency_events"]
+        )
 
 
 # ===========================================================================
@@ -1174,8 +1264,10 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
-        assert result["task_queue"]["task-1"].instruction.startswith("Apply strategy stage")
-        assert "exact OSV minimum fixed version 1.2.3" in result["task_queue"]["task-1"].instruction
+        assert result["task_queue"]["task-1"].instruction.startswith(
+            "Apply the supervisor-selected test-pkg dependency version"
+        )
+        assert "exact version 2.0.0" in result["task_queue"]["task-1"].instruction
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
 

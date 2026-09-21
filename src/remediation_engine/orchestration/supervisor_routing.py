@@ -607,16 +607,30 @@ def _apply_transition(
         group_by_id,
     )
     if decision.next_node in {"update_subagent", "workaround_subagent"}:
+        dispatchable_target_ids: list[str] = []
         for task_id in target_ids:
             task = projected_tasks[task_id]
-            if task.current_attempt_id is None and task.instruction:
+            if decision.next_node == "update_subagent" and task.current_attempt_id is None:
                 plan = retry_plans_by_task.get(task_id)
                 diagnostics = retry_diagnostics_by_task.get(task_id)
-                allowed_versions, allowed_dependency_types = (
-                    _ordered_update_candidates(task, plan=plan, diagnostics=diagnostics)
-                    if decision.next_node == "update_subagent"
-                    else ([], [])
+                authorization = _authorize_update_dispatch(
+                    task,
+                    plan=plan,
+                    diagnostics=diagnostics,
                 )
+                if authorization is None:
+                    logger.warning(
+                        "supervisor: rejected candidate-less update projection for task '%s'.",
+                        task_id,
+                    )
+                    continue
+                allowed_versions = list(authorization.allowed_target_versions)
+                allowed_dependency_types = list(authorization.allowed_dependency_types)
+            else:
+                allowed_versions, allowed_dependency_types = [], []
+            dispatchable_target_ids.append(task_id)
+            if task.current_attempt_id is None and task.instruction:
+                plan = retry_plans_by_task.get(task_id)
                 committed, _snapshot = _create_attempt_snapshot(
                     task,
                     dispatch_node=decision.next_node,
@@ -627,6 +641,7 @@ def _apply_transition(
                     allowed_dependency_types=allowed_dependency_types,
                 )
                 projected_tasks[task_id] = committed
+        target_ids = dispatchable_target_ids
     return {
         "task_queue": projected_tasks,
         "attempt_snapshots_by_id": projected_snapshots,
@@ -712,6 +727,12 @@ def _normalize_target_task_ids_for_node(*args: Any, **kwargs: Any) -> Any:
     from remediation_engine.orchestration import supervisor_node
 
     return supervisor_node._normalize_target_task_ids_for_node(*args, **kwargs)
+
+
+def _authorize_update_dispatch(*args: Any, **kwargs: Any) -> Any:
+    from remediation_engine.orchestration import supervisor_node
+
+    return supervisor_node._authorize_update_dispatch(*args, **kwargs)
 
 
 def _ordered_update_candidates(*args: Any, **kwargs: Any) -> Any:

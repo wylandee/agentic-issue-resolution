@@ -186,6 +186,7 @@ def test_same_state_same_decision_is_replayable():
 
 def test_transition_table_accepts_worker_and_qa_edges_and_rejects_terminal_edges():
     assert validate_transition(TaskStatus.PENDING, TaskStatus.OPTIMISTICALLY_FIXED)
+    assert validate_transition(TaskStatus.PENDING, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.UNFIXABLE)
     assert not validate_transition(TaskStatus.QA_PASSED, TaskStatus.PENDING)
@@ -319,6 +320,50 @@ def test_deterministic_retry_planner_preserves_committed_stage(monkeypatch):
     plan = _build_deterministic_retry_plan(task, diagnostics, group)
     assert plan.strategy_stage == SCARemediationStage.NPM_LATEST
     assert plan.selected_version == "1.3.0"
+
+
+def test_deterministic_retry_planner_does_not_widen_approved_candidate_pool(monkeypatch):
+    group = _group("g")
+    task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY)
+    diagnostics = UpdateRetryDiagnostics(
+        task_id="task-1",
+        target_package_name="test-package",
+        target_dependency_type="dependencies",
+        attempted_versions=["1.0.0"],
+        candidate_versions_considered=["1.0.0", "1.2.0", "2.0.0"],
+    )
+    calls: list[set[str]] = []
+
+    def candidates(_package_name, _security_floor, attempted_versions):
+        calls.append(set(attempted_versions))
+        return [
+            RegistryCandidate(
+                version=version,
+                semver_key=tuple(int(part) for part in version.split(".")),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=version.startswith("1."),
+                already_attempted=False,
+                selection_roles=roles,
+            )
+            for version, roles in (
+                ("1.0.0", ("osv_minimum",)),
+                ("1.1.0", ("osv_minimum",)),
+                ("1.2.0", ("same_major",)),
+                ("2.0.0", ("npm_latest",)),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+        candidates,
+    )
+
+    plan = _build_deterministic_retry_plan(task, diagnostics, group)
+
+    assert calls == [set()]
+    assert plan.selected_version == "1.2.0"
+    assert plan.candidate_versions_considered == ["1.0.0", "1.2.0", "2.0.0"]
 
 
 def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch):

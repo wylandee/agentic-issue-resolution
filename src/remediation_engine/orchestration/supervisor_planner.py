@@ -72,6 +72,84 @@ def _supervisor_fetch_registry_candidates(
     )
 
 
+def _normalise_candidate_version(value: Any) -> str:
+    """Normalize a registry version for immutable-pool comparisons."""
+    return str(value).strip().lstrip("vV")
+
+
+def _candidate_version_key(value: Any) -> tuple[int, int, int]:
+    """Return a stable semantic-version sort key for registry report values."""
+    parts = _normalise_candidate_version(value).split(".")
+    try:
+        numbers = tuple(int(part) for part in parts)
+    except ValueError:
+        return (0, 0, 0)
+    return (numbers + (0, 0, 0))[:3]
+
+
+def _select_report_candidate(
+    values: Iterable[str],
+    stage: SCARemediationStage,
+    attempted_versions: set[str],
+) -> str | None:
+    """Select an approved report candidate without inventing a version."""
+    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
+    eligible = [
+        _normalise_candidate_version(value)
+        for value in values
+        if _normalise_candidate_version(value) not in attempted
+    ]
+    if not eligible:
+        return None
+    return (
+        min(eligible, key=_candidate_version_key)
+        if stage == SCARemediationStage.OSV_MINIMUM
+        else max(eligible, key=_candidate_version_key)
+    )
+
+
+def _approved_candidate_pool(
+    diagnostics: UpdateRetryDiagnostics,
+    target_package_name: str | None,
+) -> tuple[str, ...]:
+    """Return the previously committed candidate pool for one target."""
+    if (
+        target_package_name
+        and diagnostics.target_package_name
+        and diagnostics.target_package_name != target_package_name
+    ):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            _normalise_candidate_version(version)
+            for version in diagnostics.candidate_versions_considered
+            if _normalise_candidate_version(version)
+        )
+    )
+
+
+def _fetch_registry_candidates_for_task(
+    package_name: str,
+    security_floor: str,
+    attempted_versions: set[str],
+    diagnostics: UpdateRetryDiagnostics,
+) -> list[Any]:
+    """Revalidate only the task's committed candidate pool on retries."""
+    approved_pool = _approved_candidate_pool(diagnostics, package_name)
+    candidates = _supervisor_fetch_registry_candidates(
+        package_name,
+        security_floor,
+        set() if approved_pool else attempted_versions,
+    )
+    if not approved_pool:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if _normalise_candidate_version(getattr(candidate, "version", "")) in set(approved_pool)
+    ]
+
+
 def _supervisor_plan_npm_parent_version(inputs: dict[str, Any]) -> str:
     """Run the npm parent planner under an explicit Supervisor tool span."""
     return invoke_with_trajectory(
@@ -606,10 +684,11 @@ def _build_deterministic_retry_plan(
             target_dependency_type = _override_dependency_type(group)
             if security_floor and target_package_name:
                 try:
-                    child_candidates = _supervisor_fetch_registry_candidates(
+                    child_candidates = _fetch_registry_candidates_for_task(
                         target_package_name,
                         security_floor,
                         attempted,
+                        diagnostics,
                     )
                     candidate_versions = [
                         candidate.version
@@ -636,6 +715,7 @@ def _build_deterministic_retry_plan(
             if not parent_name or not parent_version or not group.vulnerable_component:
                 failure_reason = "Missing parent context for deterministic transitive planning."
             else:
+                parent_approved_pool = _approved_candidate_pool(diagnostics, parent_name)
                 for stage in stages:
                     selection = {
                         SCARemediationStage.OSV_MINIMUM: "minimum",
@@ -650,7 +730,9 @@ def _build_deterministic_retry_plan(
                                 "child_fixed_version": security_floor,
                                 "installed_parent_version": parent_version,
                                 "selection": selection,
-                                "attempted_versions": ",".join(sorted(attempted)),
+                                "attempted_versions": (
+                                    "" if parent_approved_pool else ",".join(sorted(attempted))
+                                ),
                                 "dependency_ancestry": ",".join(group.dependency_ancestry),
                             }
                         )
@@ -660,6 +742,14 @@ def _build_deterministic_retry_plan(
                     report_candidates = _registry_report_versions(
                         report, "Eligible Candidates"
                     ) or _registry_report_versions(report, "Compatible Parent Versions")
+                    if parent_approved_pool:
+                        approved = set(parent_approved_pool)
+                        report_candidates = [
+                            _normalise_candidate_version(version)
+                            for version in report_candidates
+                            if _normalise_candidate_version(version) in approved
+                            and _normalise_candidate_version(version) not in attempted
+                        ]
                     candidate_versions = list(
                         dict.fromkeys([*candidate_versions, *report_candidates])
                     )
@@ -670,6 +760,12 @@ def _build_deterministic_retry_plan(
                         or latest_version_seen
                     )
                     selected = _registry_selected_version(report)
+                    if parent_approved_pool and selected not in set(report_candidates):
+                        selected = _select_report_candidate(
+                            report_candidates,
+                            stage,
+                            attempted,
+                        )
                     if selected:
                         selected_version = selected
                         effective_stage = stage
@@ -678,10 +774,11 @@ def _build_deterministic_retry_plan(
                         break
         else:
             try:
-                candidates = _supervisor_fetch_registry_candidates(
+                candidates = _fetch_registry_candidates_for_task(
                     group.vulnerable_component or "",
                     security_floor,
                     attempted,
+                    diagnostics,
                 )
                 candidate_versions = [
                     candidate.version for candidate in candidates[:_MAX_REGISTRY_CANDIDATES]
@@ -711,10 +808,11 @@ def _build_deterministic_retry_plan(
             target_package_name = group.vulnerable_component if group else task.parent_group_id
             target_dependency_type = _override_dependency_type(group)
             try:
-                child_candidates = _supervisor_fetch_registry_candidates(
+                child_candidates = _fetch_registry_candidates_for_task(
                     target_package_name,
                     security_floor,
                     attempted,
+                    diagnostics,
                 )
                 candidate_versions = [
                     candidate.version for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
@@ -753,6 +851,8 @@ def _build_deterministic_retry_plan(
     safe_candidate_versions = (
         candidate_versions[:_MAX_REGISTRY_CANDIDATES] if selected_version or exhausted else []
     )
+    approved_pool = _approved_candidate_pool(diagnostics, target_package_name)
+    provenance_candidate_versions = list(approved_pool or safe_candidate_versions)
     safe_latest_version = latest_version_seen if selected_version or exhausted else None
     candidate_dependency_types = _supervisor_dependency_type_candidates(
         effective_stage,
@@ -761,9 +861,8 @@ def _build_deterministic_retry_plan(
     effective_diagnostics = diagnostics.model_copy(
         update={
             "strategy_stage": effective_stage,
-            "security_floor": security_floor,
+            "candidate_versions_considered": provenance_candidate_versions,
             "selected_version": selected_version,
-            "candidate_versions_considered": safe_candidate_versions,
             "latest_version_seen": safe_latest_version,
             "registry_query_performed": bool(security_floor),
             "exhausted_update_path": exhausted,
@@ -796,7 +895,7 @@ def _build_deterministic_retry_plan(
         strategy_stage=effective_stage,
         selected_version=selected_version,
         attempted_versions=list(diagnostics.attempted_versions),
-        candidate_versions_considered=safe_candidate_versions,
+        candidate_versions_considered=provenance_candidate_versions,
         candidate_dependency_types=candidate_dependency_types,
         latest_version_seen=safe_latest_version,
         exhausted_update_path=exhausted,

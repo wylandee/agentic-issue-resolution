@@ -1440,6 +1440,52 @@ class TestPhase5GraphIntegration:
         sandbox.restore_workspace_snapshot.assert_called_once_with("attempt-attempt-first")
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-second")
 
+    def test_unrelated_dispatch_restores_retained_failed_task_workspace(self, tmp_path):
+        """A failed task's candidate must not leak into the next task."""
+        groups = [
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        ]
+        task_a = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"status": TaskStatus.UNFIXABLE}
+        )
+        task_b, snapshot_b = _committed_dispatch(
+            build_initial_remediation_task(groups[1], "task-2"),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "workspace_volume": "agent_workspace_deadbeef",
+                "task_queue": {"task-1": task_a, "task-2": task_b},
+                "active_target_task_ids": ["task-2"],
+                "attempt_snapshots_by_id": {snapshot_b.attempt_id: snapshot_b},
+                "workspace_rollback_anchors_by_task": {"task-1": "attempt-attempt-task-1"},
+            }
+        )
+        summary = AgentActionSummary(
+            task_id="task-2",
+            status=AgentActionStatus.SUCCESS,
+            summary="The unrelated task completed its worker transaction.",
+        )
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+
+        with (
+            patch(
+                "remediation_engine.orchestration.graph.run_update_subagent_node",
+                return_value={"action_summaries": [summary], "errors": []},
+            ) as worker,
+            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+        ):
+            result = run_update_subagent_from_orchestrator(state)
+
+        worker.assert_called_once()
+        sandbox.restore_workspace_snapshot.assert_called_once_with("attempt-attempt-task-1")
+        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-task-1")
+        sandbox.create_workspace_snapshot.assert_called_once_with("attempt-attempt-task-2")
+        assert result["workspace_rollback_anchors_by_task"] == {}
+
     def test_successful_retry_discards_baseline_anchor(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(

@@ -10,31 +10,39 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from remediation_engine.contracts.schemas import (
     CodeWorkaroundSupervisorAction,
+    DependencyParentContext,
     FailureCategory,
     FixPlan,
     FixPlanStatus,
     IssueSource,
     IssueType,
+    PackageOverrideSupervisorAction,
     QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
     RemediationTask,
     RoutingStrategy,
     ScannerExecutionStatus,
+    SCARemediationStage,
     Severity,
     TacticalStrategy,
     TacticalSupervisorAction,
+    TaskAttemptSnapshot,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.tactical_supervisor import (
     _SUPERVISOR_ACTION_CONTRACTS,
     _SUPERVISOR_STATIC_INSTRUCTIONS,
     _model_action,
+    allowed_tactical_strategies,
     build_supervisor_messages,
     build_tactical_context,
     propose_and_verify_tactical_action,
     registry_candidate_sets_for_context,
+    registry_candidates_for_context,
     verify_tactical_action,
 )
 from remediation_engine.settings import AppSettings
@@ -330,3 +338,188 @@ def test_parent_minimum_is_not_used_as_a_security_floor() -> None:
     assert error is None
     assert calls == ["1.2.3"]
     assert candidate_sets[0].versions == ("1.2.3",)
+
+
+def test_package_override_stage_does_not_require_parent_version() -> None:
+    group = _group().model_copy(
+        update={
+            "parent_contexts": [
+                DependencyParentContext(package_name="direct-parent", package_version=None)
+            ]
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "overrides",
+        }
+    )
+    calls: list[tuple[str, str, set[str]]] = []
+
+    def provider(package_name: str, security_floor: str, attempted_versions: set[str]):
+        calls.append((package_name, security_floor, attempted_versions))
+        return [
+            RegistryCandidate(
+                version="1.2.3",
+                semver_key=(1, 2, 3),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=True,
+                already_attempted=False,
+            )
+        ]
+
+    context = build_tactical_context(task, group)
+    candidate_sets, error = registry_candidate_sets_for_context(
+        context,
+        registry_provider=provider,
+    )
+    legacy_versions, legacy_error = registry_candidates_for_context(
+        context,
+        registry_provider=provider,
+    )
+
+    assert error is None
+    assert legacy_error is None
+    assert calls == [("test-pkg", "1.2.3", set()), ("test-pkg", "1.2.3", set())]
+    assert legacy_versions == ("1.2.3",)
+    assert len(candidate_sets) == 1
+    assert candidate_sets[0].strategy == TacticalStrategy.PACKAGE_OVERRIDE
+    assert candidate_sets[0].target_package_name == "test-pkg"
+
+
+def test_package_override_stage_accepts_only_authorized_override_action() -> None:
+    group = _group().model_copy(
+        update={
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+            "parent_declaration_type": "dependencies",
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "overrides",
+        }
+    )
+
+    def provider(_package_name: str, _security_floor: str, _attempted_versions: set[str]):
+        return [
+            RegistryCandidate(
+                version="1.2.3",
+                semver_key=(1, 2, 3),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=True,
+                already_attempted=False,
+            )
+        ]
+
+    base_context = build_tactical_context(task, group)
+    candidate_sets, error = registry_candidate_sets_for_context(
+        base_context,
+        registry_provider=provider,
+    )
+    context = build_tactical_context(task, group, candidate_sets=candidate_sets)
+
+    assert error is None
+    assert allowed_tactical_strategies(task, group) == (
+        TacticalStrategy.PACKAGE_OVERRIDE,
+        TacticalStrategy.CODE_WORKAROUND,
+    )
+    assert (
+        verify_tactical_action(
+            context,
+            TacticalSupervisorAction(
+                diagnostic_basis="A direct update is not authorized at the override stage.",
+                selected_strategy=TacticalStrategy.VERSION_BUMP,
+                target_version="1.2.3",
+                rationale="Try a direct update anyway.",
+            ),
+        ).accepted
+        is False
+    )
+
+    verification = verify_tactical_action(
+        context,
+        PackageOverrideSupervisorAction(
+            diagnostic_basis="The vulnerable transitive child has a verified override candidate.",
+            selected_strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+            target_version="1.2.3",
+            rationale="Override the vulnerable child without changing its parent.",
+        ),
+    )
+
+    assert verification.accepted is True
+    assert verification.target_package_name == "test-pkg"
+    assert verification.target_dependency_type == "overrides"
+    assert verification.allowed_target_versions == ("1.2.3",)
+    assert "AUTHORIZED TARGET: test-pkg" in (verification.instruction or "")
+
+
+def test_retry_registry_candidates_remain_inside_initial_approved_pool() -> None:
+    group = _group()
+    task = _task().model_copy(
+        update={
+            "selected_version": "1.0.0",
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "dependencies",
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-initial",
+        task_id=task.task_id,
+        strategy_stage=SCARemediationStage.OSV_MINIMUM,
+        selected_version="1.0.0",
+        allowed_target_versions=["1.0.0", "1.2.0", "2.0.0"],
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        instruction="Update test-pkg.",
+        instruction_digest="digest",
+        dispatch_node="update_subagent",
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        attempted_versions=["1.0.0"],
+        candidate_versions_considered=["1.0.0", "1.2.0", "2.0.0"],
+    )
+    calls: list[set[str]] = []
+
+    def provider(package_name: str, security_floor: str, attempted_versions: set[str]):
+        calls.append(attempted_versions)
+        return [
+            RegistryCandidate(
+                version=version,
+                semver_key=tuple(int(part) for part in version.split(".")),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=version.startswith("1."),
+                already_attempted=False,
+                selection_roles=roles,
+            )
+            for version, roles in (
+                ("1.0.0", ("osv_minimum",)),
+                ("1.1.0", ("osv_minimum",)),
+                ("1.2.0", ("same_major",)),
+                ("2.0.0", ("npm_latest",)),
+            )
+        ]
+
+    candidate_sets, error = registry_candidate_sets_for_context(
+        build_tactical_context(
+            task,
+            group,
+            retry_diagnostics=diagnostics,
+            prior_attempts=[snapshot],
+        ),
+        registry_provider=provider,
+    )
+
+    assert error is None
+    assert calls == [set()]
+    assert candidate_sets[0].versions == ("1.2.0", "2.0.0")
+    assert "1.1.0" not in candidate_sets[0].versions

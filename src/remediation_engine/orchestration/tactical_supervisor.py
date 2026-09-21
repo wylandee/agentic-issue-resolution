@@ -386,10 +386,24 @@ def allowed_tactical_strategies(
     task: RemediationTask,
     group: VulnerabilityGroup,
 ) -> tuple[TacticalStrategy, ...]:
-    """Return strategies that are semantically valid for the committed task."""
+    """Return strategies that are semantically valid for the committed task.
+
+    The strategy stage is part of the action contract.  In particular, a
+    package-override stage has an override authorization, not a direct-update
+    authorization, so advertising ``VERSION_BUMP`` there would invite the
+    model to select an action that cannot be verified or dispatched safely.
+    """
     if task.no_fix_stage is not None:
         return (TacticalStrategy.CODE_WORKAROUND,)
     if task.strategy == RoutingStrategy.CODE_WORKAROUND:
+        return (TacticalStrategy.CODE_WORKAROUND,)
+    if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        return (
+            (TacticalStrategy.PACKAGE_OVERRIDE, TacticalStrategy.CODE_WORKAROUND)
+            if is_transitive_group(group)
+            else (TacticalStrategy.CODE_WORKAROUND,)
+        )
+    if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND:
         return (TacticalStrategy.CODE_WORKAROUND,)
     strategies = [TacticalStrategy.VERSION_BUMP, TacticalStrategy.CODE_WORKAROUND]
     if is_transitive_group(group):
@@ -519,6 +533,12 @@ def build_tactical_context(
     repair_feedback: str | None = None,
 ) -> TacticalDiagnosticContext:
     """Build a deterministic tactical context from committed state and evidence."""
+    normalized_candidate_sets = _normalise_context_candidate_sets(
+        task,
+        group,
+        candidate_versions=candidate_versions,
+        candidate_sets=candidate_sets,
+    )
     return TacticalDiagnosticContext(
         task=task,
         group=group,
@@ -538,15 +558,7 @@ def build_tactical_context(
                 key=lambda snapshot: (snapshot.task_revision, snapshot.attempt_number),
             )
         ),
-        candidate_sets=tuple(
-            sorted(
-                candidate_sets,
-                key=lambda candidate: (
-                    candidate.strategy.value,
-                    candidate.target_package_name,
-                ),
-            )
-        )[:_MAX_CANDIDATES],
+        candidate_sets=normalized_candidate_sets,
         remaining_scanner_identifiers=tuple(
             sorted(
                 {
@@ -674,9 +686,11 @@ def _build_supervisor_dynamic_context(
         )
     ]
     if not candidate_lines:
-        candidate_lines = [
-            f"- {TacticalStrategy.VERSION_BUMP.value}: versions={','.join(context.candidate_versions) or 'none'}"
-        ]
+        candidate_lines = (
+            ["- code_workaround: no registry candidate required"]
+            if TacticalStrategy.CODE_WORKAROUND in strategies
+            else ["- No strategy-specific registry authorization is available."]
+        )
     attempt_lines = [
         f"- stage={snapshot.strategy_stage.value}; version={snapshot.selected_version or 'none'}"
         for snapshot in context.prior_attempts[-_MAX_LIST_ITEMS:]
@@ -738,12 +752,13 @@ def _build_supervisor_dynamic_context(
         "",
         "## Registry-Verified Candidates",
         *candidate_lines,
-        f"- Candidate dependency types: {', '.join(context.candidate_dependency_types) or 'none'}",
         "",
         "## Allowed Tactical Strategies",
         f"- Strategies: {', '.join(strategy_names)}",
         "- Current committed strategy is context, not a constraint.",
-        "- The candidate whitelist constrains versions and package targets only; CODE_WORKAROUND does not require a registry candidate.",
+        "- Every VERSION_BUMP or PACKAGE_OVERRIDE action must use the candidate authorization for its exact strategy, target package, and dependency type.",
+        "- CODE_WORKAROUND does not require a registry candidate.",
+        "- The package_override stage authorizes PACKAGE_OVERRIDE or CODE_WORKAROUND, never a direct VERSION_BUMP.",
         "- Apply the static soft decision policies: choose the strategy that best addresses the dominant evidence, compare it with the leading alternative, and include the expected validation signal.",
         "- The old stage ladder is not mandatory when evidence supports an immediate pivot.",
     ]
@@ -788,7 +803,14 @@ def registry_candidates_for_context(
     """Fetch the bounded candidate whitelist for one tactical context."""
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
-    package_name = _target_package_name(context.task, context.group)
+    if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        if not is_transitive_group(context.group) or not context.group.vulnerable_component:
+            return (), "Package override requires a transitive vulnerable child."
+        package_name = context.group.vulnerable_component
+        dependency_type = _override_dependency_type(context.group)
+    else:
+        package_name = _target_package_name(context.task, context.group)
+        dependency_type = _target_dependency_type(context.task, context.group)
     floor = _security_floor(context.task, context.group)
     floor_error = _security_floor_error(context.group)
     if not package_name or not floor or floor_error is not None:
@@ -798,15 +820,24 @@ def registry_candidates_for_context(
             else f"Security floor verification failed: {floor_error}."
         )
     provider = registry_provider or _supervisor_fetch_registry_candidates
+    approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
     try:
         # Positional invocation keeps this seam compatible with the small
         # deterministic providers used by tests and local integrations while
         # still passing the exact three Supervisor-owned values.  The real
         # provider has the same positional contract.
-        candidates = provider(package_name, floor, set(context.attempted_versions))
+        candidates = provider(
+            package_name,
+            floor,
+            _candidate_query_attempts(approved_pool, context.attempted_versions),
+        )
     except Exception as exc:  # noqa: BLE001
         return (), f"Registry verification unavailable: {exc}"
-    versions = _eligible_candidate_versions(candidates)
+    versions = _current_candidate_versions(
+        candidates,
+        approved_pool=approved_pool,
+        attempted_versions=context.attempted_versions,
+    )
     return versions, None
 
 
@@ -894,6 +925,170 @@ def _candidate_set(
     )
 
 
+def _normalise_context_candidate_sets(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    *,
+    candidate_versions: Sequence[str],
+    candidate_sets: Sequence[TacticalCandidateSet],
+) -> tuple[TacticalCandidateSet, ...]:
+    """Return the single typed candidate authorization representation.
+
+    Older callers may still provide ``candidate_versions`` directly.  Convert
+    that input at the context boundary so prompts and verification never need
+    to consult an untyped version list.
+    """
+    normalized = list(candidate_sets)
+    if not normalized and candidate_versions:
+        if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE and is_transitive_group(
+            group
+        ):
+            strategy = TacticalStrategy.PACKAGE_OVERRIDE
+            target_package = group.vulnerable_component
+            dependency_type = _override_dependency_type(group)
+        else:
+            strategy = TacticalStrategy.VERSION_BUMP
+            target_package = _target_package_name(task, group)
+            dependency_type = _target_dependency_type(task, group)
+        floor = _security_floor(task, group) or "unresolved"
+        if target_package:
+            normalized.append(
+                _candidate_set(
+                    strategy,
+                    target_package,
+                    dependency_type,
+                    floor,
+                    candidate_versions,
+                )
+            )
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda candidate: (
+                candidate.strategy.value,
+                candidate.target_package_name,
+                candidate.dependency_type or "",
+            ),
+        )
+    )[:_MAX_CANDIDATES]
+
+
+def _normalise_candidate_version(value: Any) -> str:
+    """Return a comparable candidate version without a leading ``v``."""
+    return str(value).strip().lstrip("vV")
+
+
+def _candidate_set_for_action(
+    context: TacticalDiagnosticContext,
+    strategy: TacticalStrategy,
+    target_package_name: str,
+    target_dependency_type: str | None,
+) -> TacticalCandidateSet | None:
+    """Find the exact authorization for one proposed tactical action."""
+    normalized_type = (target_dependency_type or "").strip()
+    return next(
+        (
+            candidate
+            for candidate in context.candidate_sets
+            if candidate.strategy == strategy
+            and candidate.target_package_name == target_package_name
+            and (candidate.dependency_type or "").strip() == normalized_type
+        ),
+        None,
+    )
+
+
+def _approved_candidate_pool(
+    context: TacticalDiagnosticContext,
+    package_name: str,
+    dependency_type: str | None,
+) -> tuple[str, ...]:
+    """Return the first Supervisor-approved candidate pool for this target.
+
+    Retry-time registry queries are allowed to revalidate the original pool,
+    but they must not widen it by replacing an attempted lowest candidate
+    with a newly discovered version.  The first matching immutable attempt
+    snapshot is the strongest provenance; retry diagnostics are the fallback
+    for callers that have not retained snapshots.
+    """
+    normalized_package = package_name.strip()
+    normalized_type = (dependency_type or "").strip()
+    for snapshot in context.prior_attempts:
+        if snapshot.dispatch_node != "update_subagent":
+            continue
+        if snapshot.target_package_name != normalized_package:
+            continue
+        if (
+            normalized_type
+            and snapshot.target_dependency_type
+            and snapshot.target_dependency_type != normalized_type
+        ):
+            continue
+        versions = tuple(
+            dict.fromkeys(
+                _normalise_candidate_version(version)
+                for version in snapshot.allowed_target_versions
+                if _normalise_candidate_version(version)
+            )
+        )
+        if versions:
+            return versions
+
+    diagnostics = context.retry_diagnostics
+    if (
+        diagnostics is not None
+        and diagnostics.candidate_versions_considered
+        and (
+            not diagnostics.target_package_name
+            or diagnostics.target_package_name == normalized_package
+        )
+        and (
+            not normalized_type
+            or not diagnostics.target_dependency_type
+            or diagnostics.target_dependency_type == normalized_type
+        )
+    ):
+        return tuple(
+            dict.fromkeys(
+                _normalise_candidate_version(version)
+                for version in diagnostics.candidate_versions_considered
+                if _normalise_candidate_version(version)
+            )
+        )
+    return ()
+
+
+def _current_candidate_versions(
+    candidates: Iterable[RegistryCandidate],
+    *,
+    approved_pool: Sequence[str] = (),
+    attempted_versions: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Project registry candidates onto an immutable pool and retry state."""
+    versions = _eligible_candidate_versions(candidates)
+    approved = {_normalise_candidate_version(version) for version in approved_pool}
+    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
+    if approved:
+        versions = tuple(version for version in versions if version in approved)
+    return tuple(version for version in versions if version not in attempted)
+
+
+def _candidate_query_attempts(
+    approved_pool: Sequence[str],
+    attempted_versions: Iterable[str],
+) -> set[str]:
+    """Query the registry unfiltered when a prior pool must be revalidated."""
+    return (
+        set()
+        if approved_pool
+        else {
+            _normalise_candidate_version(version)
+            for version in attempted_versions
+            if _normalise_candidate_version(version)
+        }
+    )
+
+
 def registry_candidate_sets_for_context(
     context: TacticalDiagnosticContext,
     *,
@@ -920,9 +1115,9 @@ def registry_candidate_sets_for_context(
     targets: list[tuple[TacticalStrategy, str | None, str | None]] = []
     direct_package = _target_package_name(context.task, context.group)
     direct_type = _target_dependency_type(context.task, context.group)
-    if direct_package:
-        targets.append((TacticalStrategy.VERSION_BUMP, direct_package, direct_type))
-    if is_transitive_group(context.group) and context.group.vulnerable_component:
+    if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        if not is_transitive_group(context.group) or not context.group.vulnerable_component:
+            return (), "Package override requires a transitive vulnerable child."
         targets.append(
             (
                 TacticalStrategy.PACKAGE_OVERRIDE,
@@ -930,10 +1125,22 @@ def registry_candidate_sets_for_context(
                 _override_dependency_type(context.group),
             )
         )
+    else:
+        if direct_package:
+            targets.append((TacticalStrategy.VERSION_BUMP, direct_package, direct_type))
+        if is_transitive_group(context.group) and context.group.vulnerable_component:
+            targets.append(
+                (
+                    TacticalStrategy.PACKAGE_OVERRIDE,
+                    context.group.vulnerable_component,
+                    _override_dependency_type(context.group),
+                )
+            )
     result: list[TacticalCandidateSet] = []
     try:
         for strategy, package_name, dependency_type in targets:
             assert package_name is not None
+            approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
             if strategy == TacticalStrategy.VERSION_BUMP and is_transitive_group(context.group):
                 parent_name, parent_version, _parent_type = group_parent_context(context.group)
                 if not parent_name or not parent_version or not context.group.vulnerable_component:
@@ -949,20 +1156,39 @@ def registry_candidate_sets_for_context(
                     "child_fixed_version": floor,
                     "installed_parent_version": parent_version,
                     "selection": selection,
-                    "attempted_versions": ",".join(sorted(context.attempted_versions)),
+                    "attempted_versions": ",".join(
+                        sorted(_candidate_query_attempts(approved_pool, context.attempted_versions))
+                    ),
                     "dependency_ancestry": ",".join(context.group.dependency_ancestry),
                 }
                 report = _supervisor_plan_npm_parent_version(plan_input)
                 report_versions = _registry_report_versions(
                     report, "Eligible Candidates"
                 ) or _registry_report_versions(report, "Compatible Parent Versions")
-                selected = _registry_selected_version(report)
-                versions = _stable_semver_versions(
-                    [*report_versions, *([selected] if selected else [])]
+                report_versions = _stable_semver_versions(
+                    [*report_versions, _registry_selected_version(report)]
                 )
+                if approved_pool:
+                    approved = set(approved_pool)
+                    attempted = set(context.attempted_versions)
+                    versions = tuple(
+                        version
+                        for version in report_versions
+                        if version in approved and version not in attempted
+                    )
+                else:
+                    versions = report_versions
             else:
-                candidates = provider(package_name, floor, set(context.attempted_versions))
-                versions = _eligible_candidate_versions(candidates)
+                candidates = provider(
+                    package_name,
+                    floor,
+                    _candidate_query_attempts(approved_pool, context.attempted_versions),
+                )
+                versions = _current_candidate_versions(
+                    candidates,
+                    approved_pool=approved_pool,
+                    attempted_versions=context.attempted_versions,
+                )
             result.append(
                 _candidate_set(
                     strategy,
@@ -1290,8 +1516,6 @@ def verify_tactical_action(
         compatible = any(
             candidate.peer_compatible and candidate.versions for candidate in context.candidate_sets
         )
-        if not context.candidate_sets and context.candidate_versions:
-            compatible = True
         if compatible:
             return TacticalVerification(
                 False,
@@ -1377,38 +1601,44 @@ def verify_tactical_action(
         )
 
     selected_version = _normalise_version(getattr(action, "target_version", None))
-    candidate_set = next(
-        (
-            candidate
-            for candidate in context.candidate_sets
-            if candidate.strategy == action.selected_strategy
-        ),
-        None,
+    candidate_set = _candidate_set_for_action(
+        context,
+        action.selected_strategy,
+        target_package,
+        target_type,
     )
-    candidate_values = (
-        candidate_set.versions if candidate_set is not None else context.candidate_versions
-    )
-    candidates = {str(value).strip().lstrip("vV") for value in candidate_values}
-    if not selected_version or selected_version not in candidates:
+    if candidate_set is None:
         return TacticalVerification(
             False,
-            f"Version {selected_version or '(missing)'} is not in the registry-verified candidate list.",
+            (
+                "No registry-verified candidate authorization exists for "
+                f"strategy={action.selected_strategy.value}, target={target_package}, "
+                f"type={target_type or 'none'}."
+            ),
             target_package_name=target_package,
             target_dependency_type=target_type,
             strategy_stage=stage,
-            allowed_target_versions=(
-                candidate_set.versions if candidate_set is not None else tuple(sorted(candidates))
+        )
+    candidates = {
+        _normalise_candidate_version(value)
+        for value in candidate_set.versions
+        if str(value).strip()
+    }
+    if not selected_version or selected_version not in candidates:
+        return TacticalVerification(
+            False,
+            (
+                f"Version {selected_version or '(missing)'} is not in the "
+                f"{action.selected_strategy.value} registry-verified candidate authorization."
             ),
+            target_package_name=target_package,
+            target_dependency_type=target_type,
+            strategy_stage=stage,
+            allowed_target_versions=candidate_set.versions,
         )
     if selected_version in set(context.attempted_versions):
         return TacticalVerification(False, f"Version {selected_version} was already attempted.")
-    canonical = (
-        candidate_set.canonical_version
-        if candidate_set is not None
-        else min(candidates, key=lambda value: tuple(int(part) for part in value.split(".")))
-        if candidates
-        else None
-    )
+    canonical = candidate_set.canonical_version
     if canonical and selected_version != canonical:
         return TacticalVerification(
             False,
@@ -1416,9 +1646,7 @@ def verify_tactical_action(
             target_package_name=target_package,
             target_dependency_type=target_type,
             strategy_stage=stage,
-            allowed_target_versions=(
-                candidate_set.versions if candidate_set is not None else tuple(sorted(candidates))
-            ),
+            allowed_target_versions=candidate_set.versions,
         )
     instruction = (
         render_override_instruction(context, action)
@@ -1433,9 +1661,7 @@ def verify_tactical_action(
         strategy_stage=stage,
         selected_version=selected_version,
         instruction=instruction,
-        allowed_target_versions=(
-            candidate_set.versions if candidate_set is not None else tuple(sorted(candidates))
-        ),
+        allowed_target_versions=candidate_set.versions,
         allowed_dependency_types=tuple(
             dict.fromkeys(
                 value for value in (target_type, *context.candidate_dependency_types) if value

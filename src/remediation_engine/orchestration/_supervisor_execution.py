@@ -468,6 +468,34 @@ def _impl__validate_committed_state(
         if snapshot is None:
             errors.append(f"supervisor: active task {task_id} references missing attempt.")
             continue
+        if next_node == "update_subagent" and snapshot.dispatch_node == "update_subagent":
+            allowed_versions = {
+                str(value).strip().lstrip("vV")
+                for value in snapshot.allowed_target_versions
+                if str(value).strip()
+            }
+            selected_version = (
+                task.selected_version.strip().lstrip("vV") if task.selected_version else None
+            )
+            if not allowed_versions or (
+                selected_version is None or selected_version not in allowed_versions
+            ):
+                detail = (
+                    "Active update attempt lacks a non-empty candidate authorization "
+                    "or its selected version is outside that authorization."
+                )
+                errors.append(f"supervisor: {detail}")
+                events.append(
+                    _build_consistency_event(
+                        error_code="UPDATE_ATTEMPT_WITHOUT_CANDIDATE",
+                        task_id=task_id,
+                        expected_attempt_id=task.current_attempt_id,
+                        received_attempt_id=task.current_attempt_id,
+                        action="rejected",
+                        details=detail,
+                    )
+                )
+                continue
         if task.qa_policy is None or snapshot.qa_policy is None:
             errors.append(f"supervisor: active task {task_id} has missing QA policy provenance.")
             events.append(

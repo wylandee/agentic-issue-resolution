@@ -114,6 +114,7 @@ from remediation_engine.orchestration.supervisor_spawn import (
 )
 from remediation_engine.orchestration.tactical_supervisor import (
     TacticalDiagnosticKind,
+    _approved_candidate_pool,
     build_tactical_context,
     classify_diagnostics,
     propose_and_verify_tactical_action,
@@ -180,6 +181,7 @@ __all__ = [
     "_commit_retry_plans",
     "_commit_task_transition",
     "_create_attempt_snapshot",
+    "_authorize_update_dispatch",
     "_dedupe_consistency_events",
     "_deterministic_routing",
     "_emit_audit",
@@ -231,9 +233,29 @@ def _ordered_update_candidates(
     else:
         candidate_versions = []
 
+    # A selected version is only dispatchable when it belongs to the
+    # Supervisor-approved candidate pool.  Never let a stale task field widen
+    # that pool after a planner or registry result has been committed.
+    normalized_candidates = [
+        version.strip().lstrip("vV")
+        for version in candidate_versions
+        if isinstance(version, str) and version.strip()
+    ]
+    candidate_pool = set(normalized_candidates)
+    selected_candidate = (
+        selected_version.strip().lstrip("vV")
+        if isinstance(selected_version, str) and selected_version.strip()
+        else None
+    )
+    ordered_versions = (
+        [selected_candidate, *normalized_candidates]
+        if selected_candidate in candidate_pool
+        else normalized_candidates
+    )
+
     allowed_versions: list[str] = []
     seen_versions: set[str] = set()
-    for version in [selected_version, *candidate_versions]:
+    for version in ordered_versions:
         if not version:
             continue
         normalized = version.strip().lstrip("vV")
@@ -243,7 +265,6 @@ def _ordered_update_candidates(
             continue
         seen_versions.add(normalized)
         allowed_versions.append(normalized)
-
     selected_type = (
         (plan.target_dependency_type if plan is not None else None)
         or task.target_dependency_type
@@ -277,6 +298,72 @@ def _ordered_update_candidates(
             seen_types.add(normalized)
             allowed_types.append(normalized)
     return allowed_versions, allowed_types
+
+
+@dataclass(frozen=True)
+class _UpdateDispatchAuthorization:
+    """Immutable candidate authorization required for one update dispatch."""
+
+    selected_version: str
+    allowed_target_versions: tuple[str, ...]
+    allowed_dependency_types: tuple[str, ...]
+
+
+def _authorize_update_dispatch(
+    task: RemediationTask,
+    *,
+    plan: SupervisorRetryPlan | None = None,
+    diagnostics: UpdateRetryDiagnostics | None = None,
+) -> _UpdateDispatchAuthorization | None:
+    """Return a dispatch authorization or reject incomplete update state.
+
+    Update workers may only receive a candidate pool that came from the
+    committed retry plan or retry diagnostics.  A selected task version by
+    itself is not sufficient registry provenance.
+    """
+    allowed_versions, allowed_dependency_types = _ordered_update_candidates(
+        task,
+        plan=plan,
+        diagnostics=diagnostics,
+    )
+    if not task.instruction.strip():
+        return None
+    if not allowed_versions:
+        return None
+    expected_package = (
+        plan.target_package_name
+        if plan is not None and plan.target_package_name
+        else diagnostics.target_package_name
+        if diagnostics is not None
+        else None
+    )
+    expected_type = (
+        plan.target_dependency_type
+        if plan is not None and plan.target_dependency_type
+        else diagnostics.target_dependency_type
+        if diagnostics is not None
+        else None
+    )
+    if expected_package and task.target_package_name != expected_package:
+        return None
+    if expected_type and task.target_dependency_type != expected_type:
+        return None
+    plan_version = (
+        plan.selected_version.strip().lstrip("vV")
+        if plan is not None and plan.selected_version
+        else None
+    )
+    task_version = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    if plan_version and task_version != plan_version:
+        return None
+    selected_version = plan_version or task_version
+    if selected_version is None or selected_version not in set(allowed_versions):
+        return None
+    return _UpdateDispatchAuthorization(
+        selected_version=selected_version,
+        allowed_target_versions=tuple(allowed_versions),
+        allowed_dependency_types=tuple(allowed_dependency_types),
+    )
 
 
 def _current_action_summaries(
@@ -330,7 +417,24 @@ def _create_attempt_snapshot(
     allowed_target_versions: Iterable[str] = (),
     allowed_dependency_types: Iterable[str] = (),
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
-    """Commit the exact worker input and return the revised task projection."""
+    normalized_allowed_target_versions = list(
+        dict.fromkeys(
+            str(value).strip().lstrip("vV")
+            for value in allowed_target_versions
+            if str(value).strip()
+        )
+    )
+    if dispatch_node == "update_subagent":
+        if not normalized_allowed_target_versions:
+            raise ValueError(
+                "update_subagent snapshots require a non-empty candidate authorization."
+            )
+        if not task.selected_version:
+            raise ValueError("update_subagent snapshots require a committed selected_version.")
+        if task.selected_version.strip().lstrip("vV") not in normalized_allowed_target_versions:
+            raise ValueError(
+                "update_subagent snapshot selected_version must belong to its candidate authorization."
+            )
     task_revision = task.task_revision + 1
     # Attempt identity is derived from committed state rather than wall-clock
     # randomness.  This makes replaying an identical OrchestratorState produce
@@ -352,13 +456,7 @@ def _create_attempt_snapshot(
         strategy_stage=task.strategy_stage,
         no_fix_stage=task.no_fix_stage,
         selected_version=task.selected_version,
-        allowed_target_versions=list(
-            dict.fromkeys(
-                str(value).strip().lstrip("vV")
-                for value in allowed_target_versions
-                if str(value).strip()
-            )
-        ),
+        allowed_target_versions=normalized_allowed_target_versions,
         target_package_name=task.target_package_name,
         target_dependency_type=task.target_dependency_type,
         allowed_dependency_types=list(
@@ -427,16 +525,28 @@ def _commit_registry_resolution_fallback(
     if not selected:
         return None
     target_type = version_set.dependency_type or task.target_dependency_type
-    diagnostics_for_commit = (
-        retry_diagnostics_by_task.get(task.task_id) or UpdateRetryDiagnostics(task_id=task.task_id)
-    ).model_copy(
+    prior_diagnostics = retry_diagnostics_by_task.get(task.task_id)
+    diagnostics_for_commit = prior_diagnostics or UpdateRetryDiagnostics(task_id=task.task_id)
+    prior_pool = (
+        list(diagnostics_for_commit.candidate_versions_considered)
+        if (
+            diagnostics_for_commit.candidate_versions_considered
+            and (
+                not diagnostics_for_commit.target_package_name
+                or diagnostics_for_commit.target_package_name == version_set.target_package_name
+            )
+        )
+        else []
+    )
+    approved_versions = list(dict.fromkeys(prior_pool or list(version_set.versions)))
+    diagnostics_for_commit = diagnostics_for_commit.model_copy(
         update={
             "strategy_stage": task.strategy_stage,
             "security_floor": version_set.security_floor,
             "selected_version": selected,
             "target_package_name": version_set.target_package_name,
             "target_dependency_type": target_type,
-            "candidate_versions_considered": list(version_set.versions),
+            "candidate_versions_considered": approved_versions,
             "candidate_dependency_types": _supervisor_dependency_type_candidates(
                 task.strategy_stage,
                 target_type,
@@ -469,7 +579,7 @@ def _commit_registry_resolution_fallback(
     updates = {
         "selected_version": resolved_task.selected_version,
         "target_package_name": resolved_task.target_package_name,
-        "target_dependency_type": resolved_task.target_dependency_type,
+        "target_dependency_type": target_type,
         "instruction": resolved_task.instruction,
     }
     if staged_resolutions is not None:
@@ -491,7 +601,7 @@ def _commit_registry_resolution_fallback(
         target_package_name=committed.target_package_name,
         target_dependency_type=committed.target_dependency_type,
         parent_minimum_version=committed.parent_minimum_version,
-        candidate_versions_considered=list(version_set.versions),
+        candidate_versions_considered=approved_versions,
         candidate_dependency_types=list(diagnostics_for_commit.candidate_dependency_types),
         action="retry_update",
         exact_instruction=committed.instruction,
@@ -684,6 +794,7 @@ def _apply_tactical_supervisor(
                 if evaluation and evaluation.deterministic_gates
                 else None
             ),
+            prior_attempts=base_context.prior_attempts,
         )
         action, verification = propose_and_verify_tactical_action(
             context,
@@ -799,6 +910,17 @@ def _apply_tactical_supervisor(
             )
         if committed is None:
             return None
+        approved_versions = list(
+            _approved_candidate_pool(
+                context,
+                verification.target_package_name
+                or task.target_package_name
+                or group.vulnerable_component
+                or "",
+                verification.target_dependency_type or task.target_dependency_type,
+            )
+            or verified_versions
+        )
         diagnostics_for_commit = (
             retry_diagnostics or UpdateRetryDiagnostics(task_id=task.task_id)
         ).model_copy(
@@ -808,7 +930,7 @@ def _apply_tactical_supervisor(
                 "target_package_name": committed.target_package_name,
                 "target_dependency_type": committed.target_dependency_type,
                 "security_floor": _canonical_security_floor(group)[0],
-                "candidate_versions_considered": list(dict.fromkeys(verified_versions)),
+                "candidate_versions_considered": list(dict.fromkeys(approved_versions)),
                 "candidate_dependency_types": list(
                     dict.fromkeys(
                         [
@@ -833,7 +955,7 @@ def _apply_tactical_supervisor(
             target_dependency_type=committed.target_dependency_type,
             parent_minimum_version=committed.parent_minimum_version,
             attempted_versions=list(diagnostics_for_commit.attempted_versions),
-            candidate_versions_considered=verified_versions,
+            candidate_versions_considered=approved_versions,
             candidate_dependency_types=list(verification.allowed_dependency_types),
             action="retry_update",
             exact_instruction=instruction,
@@ -3092,6 +3214,85 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 eval_ = qa_evaluations.get(task_id)
                 if eval_ and eval_.retry_feedback:
                     remapped_feedback_by_task[task_id] = eval_.retry_feedback
+    update_dispatch_authorizations: dict[str, _UpdateDispatchAuthorization] = {}
+    if resolved_next_node == "update_subagent":
+        dispatchable_update_ids: list[str] = []
+        for task_id in resolved_target_task_ids:
+            task = task_queue.get(task_id)
+            if task is None:
+                continue
+            plan = retry_plans_by_task.get(task_id)
+            diagnostics = retry_diagnostics_by_task.get(task_id)
+            authorization = _authorize_update_dispatch(
+                task,
+                plan=plan,
+                diagnostics=diagnostics,
+            )
+            if authorization is None and task.strategy == RoutingStrategy.VERSION_BUMP:
+                group = group_by_id.get(task.parent_group_id)
+                if group is not None:
+                    recovery_input = diagnostics or UpdateRetryDiagnostics(
+                        task_id=task_id,
+                        strategy_stage=task.strategy_stage,
+                    )
+                    recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
+                        {task_id: task},
+                        {task.parent_group_id: group},
+                        {task_id: recovery_input},
+                    )
+                    if not _planner_plan_violations(
+                        recovered_plans,
+                        {task_id: task},
+                        recovered_diagnostics,
+                    ):
+                        retry_diagnostics_by_task.update(recovered_diagnostics)
+                        _commit_retry_plans(
+                            task_queue,
+                            retry_diagnostics_by_task,
+                            retry_plans_by_task,
+                            recovered_plans,
+                        )
+                        task = task_queue.get(task_id)
+                        plan = retry_plans_by_task.get(task_id)
+                        diagnostics = retry_diagnostics_by_task.get(task_id)
+                        authorization = _authorize_update_dispatch(
+                            task,
+                            plan=plan,
+                            diagnostics=diagnostics,
+                        )
+            if authorization is not None:
+                update_dispatch_authorizations[task_id] = authorization
+                dispatchable_update_ids.append(task_id)
+                continue
+            detail = (
+                f"Supervisor rejected update dispatch for task {task_id}: "
+                "no unattempted registry-approved target version is committed."
+            )
+            errors.append(f"supervisor: {detail}")
+            consistency_events.append(
+                _build_consistency_event(
+                    error_code="UPDATE_DISPATCH_WITHOUT_CANDIDATE",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=None,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            retry_plans_by_task.pop(task_id, None)
+            if task.exhausted_update_path:
+                continue
+            if task.status not in _TERMINAL_STATUSES:
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.INCONCLUSIVE},
+                    close_attempt=task.current_attempt_id is not None,
+                    clear_selected_version=task.selected_version is not None,
+                    consistency_events=consistency_events,
+                )
+        resolved_target_task_ids = dispatchable_update_ids
+
     if (
         resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}
         and not resolved_target_task_ids
@@ -3233,6 +3434,24 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         and task.parent_group_id in group_by_id
                     ),
                 )
+            update_authorization = (
+                update_dispatch_authorizations.get(task_id)
+                if resolved_next_node == "update_subagent"
+                else None
+            )
+            if resolved_next_node == "update_subagent" and update_authorization is None:
+                update_authorization = _authorize_update_dispatch(
+                    task,
+                    plan=plan,
+                    diagnostics=retry_diagnostics_by_task.get(task_id),
+                )
+                if update_authorization is None:
+                    errors.append(
+                        f"supervisor: skipped update snapshot for task {task_id}; "
+                        "candidate authorization was not committed."
+                    )
+                    continue
+                update_dispatch_authorizations[task_id] = update_authorization
             task, snapshot = _create_attempt_snapshot(
                 task,
                 dispatch_node=resolved_next_node,
@@ -3241,21 +3460,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 plan_id=plan.plan_id if plan is not None else None,
                 workaround_context=workaround_ctx,
                 allowed_target_versions=(
-                    _ordered_update_candidates(
-                        task,
-                        plan=plan,
-                        diagnostics=retry_diagnostics_by_task.get(task_id),
-                    )[0]
-                    if resolved_next_node == "update_subagent"
+                    list(update_authorization.allowed_target_versions)
+                    if update_authorization is not None
                     else []
                 ),
                 allowed_dependency_types=(
-                    _ordered_update_candidates(
-                        task,
-                        plan=plan,
-                        diagnostics=retry_diagnostics_by_task.get(task_id),
-                    )[1]
-                    if resolved_next_node == "update_subagent"
+                    list(update_authorization.allowed_dependency_types)
+                    if update_authorization is not None
                     else []
                 ),
             )

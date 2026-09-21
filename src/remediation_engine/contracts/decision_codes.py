@@ -44,6 +44,7 @@ VALID_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("pending", "pivoted"),
         ("pending", "needs_retry"),
         ("pending", "unfixable"),
+        ("pending", "inconclusive"),
         ("optimistically_fixed", "qa_passed"),
         ("optimistically_fixed", "needs_retry"),
         ("optimistically_fixed", "inconclusive"),

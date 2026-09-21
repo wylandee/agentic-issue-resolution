@@ -328,6 +328,154 @@ def _restore_retained_workspace_anchors(
     return errors
 
 
+def _workspace_dispatch_scope(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> set[str]:
+    """Return task IDs whose retained rollback anchors belong to this dispatch.
+
+    A workaround child may legitimately reuse its parent's dependency
+    candidate, so both the target and its task ancestry remain in scope.
+    Anchors owned by every other task describe failed work that must be
+    settled before the shared workspace is handed to this dispatch.
+    """
+    task_queue = state.get("task_queue", {}) or {}
+    scope: set[str] = set()
+    pending_ids = [task.task_id for task in target_tasks]
+    pending_ids.extend(task.parent_task_id for task in target_tasks if task.parent_task_id)
+    while pending_ids:
+        task_id = pending_ids.pop()
+        if not task_id or task_id in scope:
+            continue
+        scope.add(task_id)
+        task = task_queue.get(task_id)
+        parent_task_id = getattr(task, "parent_task_id", None) if task is not None else None
+        if parent_task_id:
+            pending_ids.append(parent_task_id)
+    return scope
+
+
+def _restore_unrelated_workspace_anchors(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> tuple[dict[str, str], list[str]]:
+    """Restore and discard rollback anchors unrelated to the next dispatch.
+
+    The worker and QA nodes share one cumulative Docker volume.  A retained
+    anchor is useful while its task (or a workaround descendant) is being
+    retried, but it becomes stale once routing moves to another task.  Restore
+    those baselines before the next dispatch so a rejected candidate cannot
+    leak into an unrelated task.  Failed cleanup keeps the anchor projected in
+    state and returns an error, which makes the caller fail closed.
+    """
+    anchors = dict(state.get("workspace_rollback_anchors_by_task", {}) or {})
+    if not anchors or not state.get("workspace_volume"):
+        return anchors, []
+
+    scope = _workspace_dispatch_scope(state, target_tasks)
+    owners_by_anchor: dict[str, set[str]] = {}
+    for task_id, anchor_id in anchors.items():
+        if anchor_id:
+            owners_by_anchor.setdefault(anchor_id, set()).add(task_id)
+
+    attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+
+    def snapshot_order(snapshot: Any) -> tuple[int, int, str]:
+        created_at = getattr(snapshot, "created_at", None)
+        created_key = (
+            created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or "")
+        )
+        return (
+            int(getattr(snapshot, "state_revision", 0) or 0),
+            int(getattr(snapshot, "attempt_number", 0) or 0),
+            created_key,
+        )
+
+    def anchor_order(anchor_id: str) -> tuple[int, int, str, str]:
+        attempt_id = anchor_id.removeprefix("attempt-")
+        snapshot = attempt_snapshots.get(attempt_id)
+        if snapshot is None:
+            owners = owners_by_anchor.get(anchor_id, set())
+            owner_snapshots = [
+                candidate
+                for candidate in attempt_snapshots.values()
+                if getattr(candidate, "task_id", None) in owners
+            ]
+            snapshot = max(owner_snapshots, key=snapshot_order, default=None)
+        return (
+            (*snapshot_order(snapshot), anchor_id)
+            if snapshot is not None
+            else (0, 0, "", anchor_id)
+        )
+
+    unrelated_anchor_ids = sorted(
+        (
+            anchor_id
+            for anchor_id, owners in owners_by_anchor.items()
+            if not owners.intersection(scope)
+        ),
+        key=anchor_order,
+        reverse=True,
+    )
+    if not unrelated_anchor_ids:
+        return anchors, []
+
+    errors: list[str] = []
+    removed_anchor_ids: set[str] = set()
+    for anchor_id in unrelated_anchor_ids:
+        anchor_errors = _finish_workspace_attempt_snapshot(
+            state,
+            anchor_id,
+            restore=True,
+        )
+        errors.extend(anchor_errors)
+        if not anchor_errors:
+            removed_anchor_ids.add(anchor_id)
+
+    cleaned_anchors = {
+        task_id: anchor_id
+        for task_id, anchor_id in anchors.items()
+        if anchor_id not in removed_anchor_ids
+    }
+    return cleaned_anchors, errors
+
+
+def _preserve_cumulative_workaround_candidate(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> bool:
+    """Return whether dispatch must validate a retained cumulative candidate."""
+    anchors = state.get("workspace_rollback_anchors_by_task", {}) or {}
+    if not anchors or not target_tasks:
+        return False
+    snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    return all(
+        task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and task.parent_task_id
+        and anchors.get(task.parent_task_id)
+        and (
+            (snapshot := snapshots.get(task.current_attempt_id)) is None
+            or snapshot.dispatch_node == "workaround_subagent"
+        )
+        for task in target_tasks
+    )
+
+
+def _prepare_workspace_for_dispatch(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+) -> tuple[OrchestratorState, list[str]]:
+    """Return dispatch state after isolating the shared workspace transaction."""
+    if _preserve_cumulative_workaround_candidate(state, target_tasks):
+        return state, []
+    anchors, errors = _restore_unrelated_workspace_anchors(state, target_tasks)
+    if anchors == state.get("workspace_rollback_anchors_by_task", {}):
+        return state, errors
+    prepared_state = dict(state)
+    prepared_state["workspace_rollback_anchors_by_task"] = anchors
+    return prepared_state, errors
+
+
 def _parent_workspace_rollback_anchors(
     state: OrchestratorState,
     target_tasks: list[RemediationTask],
@@ -701,6 +849,14 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
     )
     if boundary_rejection is not None:
         return boundary_rejection
+    state, workspace_cleanup_errors = _prepare_workspace_for_dispatch(state, target_tasks)
+    if workspace_cleanup_errors:
+        return {
+            "errors": workspace_cleanup_errors,
+            "workspace_rollback_anchors_by_task": dict(
+                state.get("workspace_rollback_anchors_by_task", {}) or {}
+            ),
+        }
 
     feedback_by_task = dict(state.get("feedback_by_task", {}))
     attempt_snapshots = dict(state.get("attempt_snapshots_by_id", {}))
@@ -735,7 +891,12 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         target_tasks,
     )
     if snapshot_errors:
-        return {"errors": snapshot_errors}
+        return {
+            "errors": snapshot_errors,
+            "workspace_rollback_anchors_by_task": dict(
+                state.get("workspace_rollback_anchors_by_task", {}) or {}
+            ),
+        }
 
     try:
         result = _graph_module().run_update_subagent_node(subagent_state)
@@ -752,6 +913,9 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         raise
     out: dict[str, Any] = {
         "errors": result.get("errors", []),
+        "workspace_rollback_anchors_by_task": dict(
+            state.get("workspace_rollback_anchors_by_task", {}) or {}
+        ),
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
@@ -828,6 +992,14 @@ def run_workaround_subagent_from_orchestrator(
     )
     if boundary_rejection is not None:
         return boundary_rejection
+    state, workspace_cleanup_errors = _prepare_workspace_for_dispatch(state, [task])
+    if workspace_cleanup_errors:
+        return {
+            "errors": workspace_cleanup_errors,
+            "workspace_rollback_anchors_by_task": dict(
+                state.get("workspace_rollback_anchors_by_task", {}) or {}
+            ),
+        }
 
     group_by_id = {g.group_id: g for g in state.get("valid_groups", [])}
     target_group = group_by_id.get(task.parent_group_id)
@@ -835,7 +1007,12 @@ def run_workaround_subagent_from_orchestrator(
     if target_group is None:
         msg = f"workaround_subagent: could not resolve group for task '{t_id}'."
         log.warning(msg)
-        return {"errors": [msg]}
+        return {
+            "errors": [msg],
+            "workspace_rollback_anchors_by_task": dict(
+                state.get("workspace_rollback_anchors_by_task", {}) or {}
+            ),
+        }
 
     feedback_by_task = dict(state.get("feedback_by_task", {}))
     attempt_snapshot = None
@@ -858,7 +1035,12 @@ def run_workaround_subagent_from_orchestrator(
         [task],
     )
     if snapshot_errors:
-        return {"errors": snapshot_errors}
+        return {
+            "errors": snapshot_errors,
+            "workspace_rollback_anchors_by_task": dict(
+                state.get("workspace_rollback_anchors_by_task", {}) or {}
+            ),
+        }
 
     try:
         result = _graph_module().run_workaround_subagent_node(subagent_state)
@@ -873,6 +1055,9 @@ def run_workaround_subagent_from_orchestrator(
 
     out: dict[str, Any] = {
         "errors": result.get("errors", []),
+        "workspace_rollback_anchors_by_task": dict(
+            state.get("workspace_rollback_anchors_by_task", {}) or {}
+        ),
     }
     if result.get("changed_files"):
         out["changed_files"] = result["changed_files"]
@@ -940,6 +1125,22 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             "eval_status": "state_inconsistent",
             "qa_investigation_report": "",
         }
+    if target_tasks:
+        state, workspace_cleanup_errors = _prepare_workspace_for_dispatch(state, target_tasks)
+        if workspace_cleanup_errors:
+            return {
+                "status": "supervisor_routed",
+                "next_routing_step": "supervisor",
+                "active_target_task_ids": [],
+                "qa_evaluations": {},
+                "eval_status": "state_inconsistent",
+                "qa_investigation_report": "",
+                "errors": workspace_cleanup_errors,
+                "workspace_rollback_anchors_by_task": dict(
+                    state.get("workspace_rollback_anchors_by_task", {}) or {}
+                ),
+            }
+
     scoped_state = state
     if active_task_ids:
         target_group_ids = {
@@ -963,6 +1164,9 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
                 "eval_status": "state_inconsistent",
                 "qa_investigation_report": "",
                 "errors": [details],
+                "workspace_rollback_anchors_by_task": dict(
+                    state.get("workspace_rollback_anchors_by_task", {}) or {}
+                ),
                 "consistency_events": [
                     StateConsistencyEvent(
                         error_code="QA_PARENT_GROUP_MISSING",
