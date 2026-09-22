@@ -2395,6 +2395,41 @@ class TestRunSupervisorMaxRetries:
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert "task-1" not in result["active_target_task_ids"]
 
+    @patch(
+        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        return_value=AppSettings(openai_api_key=""),
+    )
+    def test_qa_failure_at_retry_cap_pivots_before_terminalization(self, _settings):
+        """The final failed update must be replanned before MAX_RETRIES closes it."""
+        g1 = _sca_group("g1")
+        task = _make_task(
+            "task-1",
+            "g1",
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+            retry_count=MAX_RETRIES - 1,
+        ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+        state = _base_state(
+            [g1],
+            status="qa_completed",
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.SECURITY_FLAG,
+                    retry_feedback="The latest candidate still contains the vulnerability.",
+                )
+            },
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "workaround_subagent"
+        assert result["active_target_task_ids"] == ["task-2"]
+        assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
+
     @patch("langchain_openai.ChatOpenAI")
     def test_all_terminal_after_retry_cap_skips_router_and_tears_down(self, mock_chat):
         g1 = _sca_group("g1")

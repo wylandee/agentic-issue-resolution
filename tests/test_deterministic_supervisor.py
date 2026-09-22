@@ -16,6 +16,7 @@ from remediation_engine.contracts import (
     RoutingStrategy,
     SCARemediationStage,
     Severity,
+    TacticalStrategy,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
@@ -26,6 +27,7 @@ from remediation_engine.contracts import (
 from remediation_engine.orchestration.supervisor_node import (
     _build_deterministic_retry_plan,
     _calculate_eligible_actions,
+    _commit_registry_resolution_fallback,
     _commit_task_transition,
     _deterministic_routing,
     _emit_audit,
@@ -34,6 +36,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _task_sort_key,
     supervisor_router,
 )
+from remediation_engine.orchestration.tactical_supervisor import TacticalCandidateSet
 
 
 def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = False):
@@ -155,6 +158,58 @@ def test_decision_codes_cover_fixed_priority_routes():
         ).decision_code
         == DecisionCode.WORKAROUND_DISPATCH
     )
+
+
+def test_registry_fallback_pivots_to_child_override_when_parent_has_no_candidate():
+    group = _group("transitive").model_copy(
+        update={
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+            "parent_declaration_type": "dependencies",
+        }
+    )
+    task = _task("task", group.group_id).model_copy(
+        update={
+            "target_package_name": "direct-parent",
+            "target_dependency_type": "dependencies",
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+        }
+    )
+    task_queue = {task.task_id: task}
+    decision = _commit_registry_resolution_fallback(
+        task_queue,
+        task,
+        group,
+        None,
+        {},
+        {},
+        (
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.VERSION_BUMP,
+                target_package_name="direct-parent",
+                dependency_type="dependencies",
+                security_floor="1.2.3",
+            ),
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+                target_package_name="test-package",
+                dependency_type="overrides",
+                security_floor="1.2.3",
+                versions=("2.0.1",),
+                canonical_version="2.0.1",
+            ),
+        ),
+        consistency_events=[],
+        errors=[],
+    )
+
+    assert decision is not None
+    assert decision.next_node == "update_subagent"
+    committed = task_queue[task.task_id]
+    assert committed.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+    assert committed.target_package_name == "test-package"
+    assert committed.target_dependency_type == "overrides"
+    assert committed.selected_version == "2.0.1"
 
 
 def test_phase1_decision_codes_are_reserved_and_routing_remains_additive():

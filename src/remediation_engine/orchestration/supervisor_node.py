@@ -502,6 +502,7 @@ def _commit_registry_resolution_fallback(
     candidate set already fetched for the active task and emits no worker
     request until the selected version is verified.
     """
+    candidate_sets = tuple(candidate_sets)
     fallback_strategy = (
         TacticalStrategy.PACKAGE_OVERRIDE
         if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
@@ -512,13 +513,38 @@ def _commit_registry_resolution_fallback(
         None,
     )
     selected = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    effective_stage = task.strategy_stage
     if version_set is None or not version_set.versions:
-        # An empty verified set is normal exhaustion, not a registry outage.
-        # Return control to the deterministic planner so it can advance the
-        # bounded stage ladder or pivot to a workaround. A registry exception
-        # is handled earlier by ``_apply_tactical_supervisor`` and remains an
-        # INCONCLUSIVE, no-dispatch outcome.
-        return None
+        # The inventory may prove that the transitive parent has no usable
+        # candidate while the vulnerable child still has an authorized native
+        # override.  Select that action directly rather than pretending the
+        # task is still a parent VERSION_BUMP.  This is the deterministic
+        # no-model fallback for the same action-inventory contract supplied to
+        # the tactical Supervisor.
+        override_set = next(
+            (
+                candidate
+                for candidate in candidate_sets
+                if candidate.strategy == TacticalStrategy.PACKAGE_OVERRIDE and candidate.versions
+            ),
+            None,
+        )
+        if (
+            task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and is_transitive_group(group)
+            and override_set is not None
+        ):
+            fallback_strategy = TacticalStrategy.PACKAGE_OVERRIDE
+            version_set = override_set
+            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
+        else:
+            # An empty verified set is normal exhaustion, not a registry
+            # outage. Return control to the deterministic planner so it can
+            # choose another available action or pivot to a workaround. A
+            # registry exception is handled earlier by ``_apply_tactical_supervisor``
+            # and remains an INCONCLUSIVE, no-dispatch outcome.
+            return None
 
     if selected not in set(version_set.versions):
         selected = version_set.canonical_version
@@ -541,26 +567,28 @@ def _commit_registry_resolution_fallback(
     approved_versions = list(dict.fromkeys(prior_pool or list(version_set.versions)))
     diagnostics_for_commit = diagnostics_for_commit.model_copy(
         update={
-            "strategy_stage": task.strategy_stage,
+            "strategy_stage": effective_stage,
             "security_floor": version_set.security_floor,
             "selected_version": selected,
             "target_package_name": version_set.target_package_name,
             "target_dependency_type": target_type,
             "candidate_versions_considered": approved_versions,
             "candidate_dependency_types": _supervisor_dependency_type_candidates(
-                task.strategy_stage,
+                effective_stage,
                 target_type,
             ),
             "latest_version_seen": version_set.versions[-1],
             "registry_query_performed": True,
             "reasoning_summary": (
-                "policy=lowest_verified_stable_semver; "
-                f"canonical_candidate={version_set.canonical_version or 'none'}"
+                "policy=deterministic_verified_candidate; "
+                f"recommended_candidate={version_set.canonical_version or 'none'}; "
+                f"action={fallback_strategy.value}"
             ),
         }
     )
     resolved_task = task.model_copy(
         update={
+            "strategy_stage": effective_stage,
             "selected_version": selected,
             "target_package_name": version_set.target_package_name,
             "target_dependency_type": target_type,
@@ -577,6 +605,7 @@ def _commit_registry_resolution_fallback(
         }
     )
     updates = {
+        "strategy_stage": effective_stage,
         "selected_version": resolved_task.selected_version,
         "target_package_name": resolved_task.target_package_name,
         "target_dependency_type": target_type,
@@ -803,7 +832,7 @@ def _apply_tactical_supervisor(
         if action is None or verification is None:
             if task.strategy != RoutingStrategy.VERSION_BUMP:
                 return None
-            # A retry must advance through the deterministic fallback ladder;
+            # A retry must choose a different authorized action or version;
             # the current-stage registry set was fetched for tactical
             # verification and must not silently replay the failed version.
             if task.status == TaskStatus.NEEDS_RETRY or task.retry_count > 0:
@@ -940,8 +969,9 @@ def _apply_tactical_supervisor(
                 ),
                 "registry_query_performed": bool(candidate_sets),
                 "reasoning_summary": (
-                    "policy=lowest_verified_stable_semver; "
-                    f"canonical_candidate={canonical_version or 'none'}; "
+                    "policy=verified_candidate_inventory; "
+                    f"recommended_candidate={canonical_version or 'none'}; "
+                    f"selected_candidate={verification.selected_version or 'none'}; "
                     f"diagnostic_basis={action.diagnostic_basis}; rationale={action.rationale}"
                 ),
             }
@@ -1406,7 +1436,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
        valid_groups not yet represented (copy-on-write via model_copy).
     2. Ingest subagent action summaries for current active_target_task_ids only.
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
-    4. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
+    4. Resolve no-fix terminal states; defer the retry-cap terminalization
+       until tactical and deterministic replanning has had a chance to pivot.
     5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic.
     6. If QA produced a parseable scan and set ``triage_required``, route to
        the post-QA triage node before any worker or teardown decision.
@@ -2234,7 +2265,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         )
 
     # ------------------------------------------------------------------
-    # 4. Mark UNFIXABLE tasks that hit the retry cap
+    # 4. Resolve no-fix terminal states
     # ------------------------------------------------------------------
     for task_id, task in task_queue.items():
         if (
@@ -2253,29 +2284,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         ):
             retry_plans_by_task.pop(task_id, None)
             workaround_replay_plans_by_task.pop(task_id, None)
-
-    for task_id, task in task_queue.items():
-        if (
-            task.status == TaskStatus.NEEDS_RETRY
-            and task.retry_count >= MAX_RETRIES
-            and task.no_fix_stage is None
-            and not _is_exhausted_update_pivot_candidate(
-                task,
-                retry_diagnostics_by_task.get(task_id),
-            )
-        ):
-            _commit_task_transition(
-                task_queue,
-                task_id,
-                updates={"status": TaskStatus.UNFIXABLE},
-                close_attempt=task.current_attempt_id is not None,
-                clear_selected_version=task.selected_version is not None,
-            )
-            logger.info(
-                "supervisor: task '%s' marked UNFIXABLE after %d retries.",
-                task_id,
-                task.retry_count,
-            )
 
     # Keep diagnostics aligned with terminal task state without emitting a
     # projection-repair event. The selected version is no longer dispatchable,
@@ -2499,6 +2507,57 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                 )
+
+    # Retry exhaustion is evaluated only after tactical reasoning and the
+    # deterministic planner have had a chance to mark an update path as
+    # exhausted or emit a workaround pivot.  The old ordering terminalized a
+    # task immediately after QA incremented retry_count, so the planner never
+    # saw the failed final update and express-jwt could not pivot.
+    pivot_task_ids: set[str] = set()
+    if decision is not None and decision.decision_code in {
+        DecisionCode.PIVOT_TO_WORKAROUND,
+        DecisionCode.EXHAUSTED_UPDATE_PIVOT,
+    }:
+        pivot_task_ids.update(decision.target_task_ids)
+        pivot_task_ids.update(
+            request.parent_task_id for request in decision.spawn_requests if request.parent_task_id
+        )
+    pending_override_task_ids = {
+        resolution.task_id
+        for resolution in staged_tactical_resolutions
+        if resolution.updates.get("strategy_stage") == SCARemediationStage.PACKAGE_OVERRIDE
+        and resolution.updates.get("selected_version")
+    }
+    retry_cap_terminalized = False
+    for task_id, task in task_queue.items():
+        if (
+            task.status == TaskStatus.NEEDS_RETRY
+            and task.retry_count >= MAX_RETRIES
+            and task.no_fix_stage is None
+            and task_id not in pivot_task_ids | pending_override_task_ids
+            and not _is_exhausted_update_pivot_candidate(
+                task,
+                retry_diagnostics_by_task.get(task_id),
+            )
+        ):
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={"status": TaskStatus.UNFIXABLE},
+                close_attempt=task.current_attempt_id is not None,
+                clear_selected_version=task.selected_version is not None,
+            )
+            retry_cap_terminalized = True
+            logger.info(
+                "supervisor: task '%s' marked UNFIXABLE after %d retries.",
+                task_id,
+                task.retry_count,
+            )
+    if retry_cap_terminalized:
+        # Any earlier routing proposal may have been computed against a task
+        # that was just terminalized. Recompute it at the deterministic
+        # authority boundary below.
+        decision = None
 
     # Deterministic retry planning above is the only Supervisor planning path.
 

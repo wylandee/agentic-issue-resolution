@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
     QAPolicy,
     QASemanticSecurityReview,
+    QATestAttribution,
     ScannerExecutionStatus,
     SecurityReviewVerdict,
     TestAttributionVerdict,
@@ -53,10 +54,10 @@ _QA_POLICY_PROMPT_SPECS: dict[QAPolicy, _QAPolicyPromptSpec] = {
     QAPolicy.VERSION_BUMP: _QAPolicyPromptSpec(
         "Target scanner identifiers must be cleared. Treat remaining target identifiers as a blocking security failure.",
         "Python verifies the authorized manifest and resolved dependency state. Use the supplied typed dependency evidence; do not fail because raw manifest or lockfile output is unavailable.",
-        "Review each failed test independently. Assign responsibility only with positive evidence tied to this group's changed package or behavior; otherwise use structured exoneration or INCONCLUSIVE attribution.",
+        "In singleton scope, attribute an executed failed test run to this task. In multi-task scope, review each failed test independently and assign responsibility only with positive evidence tied to a group's changed package or behavior; otherwise use structured exoneration or INCONCLUSIVE attribution.",
         "A code-path semantic review is not required by this policy.",
         "Validate the Python-owned dependency evidence, target scanner clearance, and any test attribution.",
-        "Do not assign blame because a group was updated in the same batch, and do not exonerate a group without naming exact failed tests and evidence.",
+        "In singleton scope, do not exonerate or mark a failed test run inconclusive merely because install/tests ran through global commands. In multi-task scope, do not assign blame because a group was updated in the same batch, and do not exonerate a group without naming exact failed tests and evidence.",
     ),
     QAPolicy.INITIAL_CODE_WORKAROUND: _QAPolicyPromptSpec(
         "Target scanner identifiers are non-blocking for this policy. They are evidence to interpret, not proof that the code workaround failed.",
@@ -357,6 +358,58 @@ def _version_bump_llm_failure_is_relevant(
     return True
 
 
+def _normalize_singleton_test_attribution(
+    evaluation: QAEvaluation,
+    context: QATaskContext,
+    gates: QADeterministicGates,
+    *,
+    deterministic_test_evidence: QAFailureEvidence | None = None,
+) -> QAEvaluation:
+    """Assign an executed failed test run to the only active task.
+
+    Singleton Supervisor dispatch makes the causal scope deterministic: the
+    current task's committed worker attempt is the only remediation action
+    between the workspace snapshot and QA. This normalization prevents the
+    evaluator from converting that deterministic fact into an inconclusive or
+    cross-task exoneration verdict.
+
+    Args:
+        evaluation: LLM-owned evaluation before policy guardrails.
+        context: The active task and parent vulnerability group.
+        gates: Python-owned deterministic QA gates.
+        deterministic_test_evidence: Optional parsed failed-test evidence.
+
+    Returns:
+        The evaluation with singleton responsibility recorded when applicable.
+    """
+    if (
+        gates.tests_passed is not False
+        or evaluation.contract_error
+        or evaluation.evidence_inconclusive
+    ):
+        return evaluation
+
+    failed_tests: list[str] = []
+    if deterministic_test_evidence is not None:
+        failed_tests.extend(deterministic_test_evidence.failed_tests[:10])
+    if not failed_tests and evaluation.test_attribution is not None:
+        failed_tests.extend(evaluation.test_attribution.failed_tests[:10])
+    if not failed_tests:
+        failed_tests.append("deterministic unit test suite")
+
+    attribution = QATestAttribution(
+        verdict=TestAttributionVerdict.RESPONSIBLE,
+        responsible_group_ids=[context.group.group_id],
+        failed_tests=failed_tests,
+        reasoning=(
+            "Singleton QA scope: the deterministic test suite ran after this task's "
+            "committed worker attempt, so the failed test outcome is attributed to "
+            "the active task by orchestration contract."
+        ),
+    )
+    return evaluation.model_copy(update={"test_attribution": attribution})
+
+
 def _apply_policy_decision(
     task_contexts: list[QATaskContext],
     batch_result: Mapping[str, QAEvaluation] | Iterable[QAEvaluation],
@@ -366,8 +419,25 @@ def _apply_policy_decision(
     install_error_category: str | None = None,
     *,
     terminal_install_conflict: bool = True,
+    singleton_scope: bool = False,
+    deterministic_test_evidence: QAFailureEvidence | None = None,
 ) -> tuple[dict[str, QAEvaluation], list[str]]:
-    """Apply the Supervisor-owned policy matrix to task-keyed evaluations."""
+    """Apply the Supervisor-owned policy matrix to task-keyed evaluations.
+
+    Args:
+        task_contexts: Authoritative active task/group contexts.
+        batch_result: Structured evaluator results.
+        gates_by_task: Python-owned deterministic gates by task ID.
+        task_policies: Supervisor-owned QA policies by task ID.
+        investigations_by_task: Optional evaluator investigation metadata.
+        install_error_category: Deterministic npm install error category.
+        terminal_install_conflict: Whether dependency conflicts terminate QA.
+        singleton_scope: Whether exactly one active task owns this QA run.
+        deterministic_test_evidence: Optional parsed failed-test evidence.
+
+    Returns:
+        Normalized task evaluations and guardrail diagnostics.
+    """
     known_task_ids = {context.task_id for context in task_contexts}
     known_group_ids = {context.group.group_id for context in task_contexts}
     errors: list[str] = []
@@ -404,6 +474,13 @@ def _apply_policy_decision(
         policy = task_policies.get(task_id)
         current = normalized[task_id]
         gates = gates_by_task[task_id]
+        if singleton_scope and len(task_contexts) == 1:
+            current = _normalize_singleton_test_attribution(
+                current,
+                context,
+                gates,
+                deterministic_test_evidence=deterministic_test_evidence,
+            )
         if current.contract_error:
             reason = (
                 current.contract_error_reason.strip()
@@ -656,12 +733,28 @@ def _apply_guardrails(
     results: _QAExecutionResults,
     task_policies: dict[str, QAPolicy | None],
     investigations_by_task: dict[str, GroupInvestigation] | None = None,
+    singleton_scope: bool = False,
+    deterministic_test_evidence: QAFailureEvidence | None = None,
 ) -> tuple[dict[str, QAEvaluation], list[str]]:
     """Apply deterministic QA guardrails to task-keyed evaluations.
 
     Unknown or duplicate task evaluations are rejected, missing task results
     become inconclusive failures, and policy gates enforce scanner,
-    package-state, test, and review requirements.
+    package-state, test, and review requirements. When explicitly enabled for
+    a singleton dispatch, failed test attribution is normalized to the active
+    task before policy decisions are made.
+
+    Args:
+        task_contexts: Authoritative active task/group contexts.
+        batch_result: Structured evaluator results.
+        results: Deterministic global QA results.
+        task_policies: Supervisor-owned QA policies by task ID.
+        investigations_by_task: Optional evaluator investigation metadata.
+        singleton_scope: Whether exactly one active task owns this QA run.
+        deterministic_test_evidence: Optional parsed failed-test evidence.
+
+    Returns:
+        Normalized evaluations and guardrail diagnostics.
     """
     gates, gate_errors = _evaluate_policy_gates(task_contexts, results, task_policies)
     evaluations, decision_errors = _apply_policy_decision(
@@ -671,6 +764,8 @@ def _apply_guardrails(
         task_policies,
         investigations_by_task,
         install_error_category=results.install_error_category,
+        singleton_scope=singleton_scope and len(task_contexts) == 1,
+        deterministic_test_evidence=deterministic_test_evidence,
     )
     return evaluations, gate_errors + decision_errors
 

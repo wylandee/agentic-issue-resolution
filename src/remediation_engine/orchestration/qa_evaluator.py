@@ -452,20 +452,40 @@ def _build_qa_terminal_tool() -> StructuredTool:
 def _format_deterministic_test_failure_ledger(
     results: _QAExecutionResults,
     failure_evidence: QAFailureEvidence | None = None,
+    *,
+    singleton_scope: bool = False,
 ) -> str:
-    """Format bounded, Python-owned test evidence without assigning ownership."""
+    """Format bounded, Python-owned test evidence for evaluator context.
+
+    Args:
+        results: Deterministic QA execution results.
+        failure_evidence: Optional normalized failure records.
+        singleton_scope: Whether exactly one active task owns this QA run.
+
+    Returns:
+        A bounded test-failure ledger with the applicable ownership rule.
+    """
     if results.tests is None:
         return "- Test execution did not produce a result; attribution is unavailable."
     if results.tests[0]:
         return "- No failed tests were reported by deterministic execution."
     if failure_evidence is None:
+        ownership = (
+            "The active dispatch is singleton; attribute this failed test run to the assigned task."
+            if singleton_scope
+            else "No owner is assigned by Python in multi-task scope."
+        )
         return (
             "- Deterministic test execution failed, but no normalized failure records were "
-            "available. Use INCONCLUSIVE rather than inferring an owner from the global summary.\n"
+            f"available. {ownership}\n"
             f"- Bounded test summary: {results.tests[1][:3000]}"
         )
     lines = [
-        "- Failure records are evidence only; no owner has been assigned by Python.",
+        (
+            "- Singleton scope assigns this failed test run to the active task."
+            if singleton_scope
+            else "- Failure records are evidence only; no owner has been assigned by Python."
+        ),
         "- Failed tests:",
         *[
             f"  - {value}"
@@ -498,7 +518,10 @@ _QA_TEST_ATTRIBUTION_VALUES = ", ".join(f"`{verdict.value}`" for verdict in Test
 _QA_EVALUATOR_STATIC_PREAMBLE = f"""You are a task-scoped QA evaluator. Review exactly
 one vulnerability group using deterministic evidence and read-only workspace tools.
 The global install, scanner, and test commands have already run; never execute them
-again. Do not infer ownership from a shared failure without exact evidence.
+again. The dynamic context declares whether this dispatch is singleton scope. In
+singleton scope, a failed application test run is owned by the assigned task because
+its worker attempt is the only remediation action preceding QA; do not treat the
+global command boundary as evidence of multiple owners.
 
 Use only these read-only tools as needed:
 list_changed_files, generate_workspace_diff, read_file_context,
@@ -509,11 +532,12 @@ Classify the assigned group only. A group passes only when its policy is satisfi
 the vulnerable path is addressed where required, and the evidence supports the
 decision. Python owns deterministic dependency, scanner, test, and provenance
 evidence. For VERSION_BUMP, do not require raw manifest or lockfile tool output
-when the supplied dependency evidence is verified. Use test attribution only when
-the evidence supports one of
-{_QA_TEST_ATTRIBUTION_VALUES}; use
-`{TestAttributionVerdict.INCONCLUSIVE.value}` when exact failed-test evidence and
-causal or exonerating source evidence are insufficient.
+when the supplied dependency evidence is verified. In multi-task scope, use test
+attribution only when the evidence supports one of
+{_QA_TEST_ATTRIBUTION_VALUES}. In singleton scope, deterministic Python normalizes
+an executed failed test run to the assigned task; use
+`{TestAttributionVerdict.INCONCLUSIVE.value}` only when the test result was not run
+or the QA contract/evidence itself is invalid.
 
 Completion is terminal-only: call emit_qa_evaluation exactly once and emit no
 free-form final answer. Allowed failure_category values are exactly:
@@ -537,6 +561,8 @@ def _qa_status(
     status_value = getattr(execution_status, "value", execution_status)
     if str(status_value).lower() == "not_run":
         return "NOT_RUN"
+    if isinstance(result, tuple):
+        return "PASS" if bool(result and result[0]) else "FAIL"
     return "PASS" if bool(_scan_result_value(result, "ok", False)) else "FAIL"
 
 
@@ -549,8 +575,24 @@ def _build_qa_dynamic_context(
     candidate_changed_files: list[str],
     action_summaries: list[AgentActionSummary],
     qa_policy: QAPolicy | None = None,
+    singleton_scope: bool = False,
 ) -> str:
-    """Build task-owned facts appended to the static evaluator prompt."""
+    """Build task-owned facts appended to the static evaluator prompt.
+
+    Args:
+        group: Vulnerability group under review.
+        task_id: Active remediation task identifier.
+        strategy: Supervisor-selected routing strategy.
+        results: Deterministic QA execution results.
+        group_remaining_ids: Target identifiers still present for this group.
+        candidate_changed_files: Worker-reported files for this task.
+        action_summaries: Bounded worker action summaries.
+        qa_policy: Supervisor-owned QA policy, when available.
+        singleton_scope: Whether exactly one active task owns this QA run.
+
+    Returns:
+        The bounded dynamic evaluator context.
+    """
     fix_plan = group.fix_plan
     fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
     fix_instruction = fix_plan.instruction if fix_plan else "(none)"
@@ -633,8 +675,23 @@ def _build_qa_dynamic_context(
     changed_files_text = ", ".join(candidate_changed_files) or "(none reported)"
     policy_block = _qa_policy_prompt_block(qa_policy)
     dependency_evidence_text = dependency_evidence_text[:6_000]
+    if singleton_scope:
+        scope_block = f"""## QA Scope and Test Attribution
+- Dispatch scope: SINGLETON
+- Active remediation task: {task_id}
+- The global commands may run once for efficiency, but this is the only worker attempt preceding QA.
+- If Unit tests is FAIL and the test result ran, the failed test run belongs to parent group {group.group_id}.
+- Do not emit EXONERATED or INCONCLUSIVE merely because the command output is global or the lockfile contains other changes.
+"""
+    else:
+        scope_block = """## QA Scope and Test Attribution
+- Dispatch scope: MULTI_TASK_OR_LEGACY
+- Global test ownership is not deterministic from scope alone; require exact attribution evidence.
+- Use INCONCLUSIVE when failed-test evidence cannot support responsible or exonerated attribution.
+"""
 
     return f"""{policy_block}
+{scope_block}
 ## Assigned Task
 - Task ID: {task_id}
 - Parent Group ID: {group.group_id}
@@ -660,6 +717,10 @@ def _build_qa_dynamic_context(
 - Package state: {package_state_text}
 - Dependency evidence (Python-owned and authoritative): {dependency_evidence_text}
 
+## Deterministic Test Attribution Rule
+- Failed test runs in singleton scope are attributed to the active task by Python after evaluation.
+- A test result of NOT_RUN, a missing structured QA result, or an explicitly inconclusive evidence contract remains inconclusive.
+
 ## Identifiers and Files
 - Changed files reported by the worker: {changed_files_text}
 - All post-remediation scanner identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
@@ -680,8 +741,8 @@ emit_qa_evaluation:
 - retry_feedback: null when passed=true; otherwise concise guidance with exact evidence
 - semantic_security_review: include a verdict from {_QA_SECURITY_REVIEW_VALUES},
   reasoning, and concrete evidence_refs when the assigned policy requires semantic review
-- test_attribution: include only when shared tests failed; use one of
-  {_QA_TEST_ATTRIBUTION_VALUES} with exact evidence
+- test_attribution: when Unit tests is FAIL, use one of {_QA_TEST_ATTRIBUTION_VALUES};
+  in SINGLETON scope the assigned task is responsible by deterministic contract
 
 Python owns deterministic_gates, failure_evidence, scan_evidence, and
 contract/provenance fields. Do not fill those fields."""
@@ -696,8 +757,24 @@ def _build_individual_investigator_prompt(
     candidate_changed_files: list[str],
     action_summaries: list[AgentActionSummary],
     qa_policy: QAPolicy | None = None,
+    singleton_scope: bool = False,
 ) -> str:
-    """Build the lean static-plus-dynamic prompt for one QA evaluator."""
+    """Build the lean static-plus-dynamic prompt for one QA evaluator.
+
+    Args:
+        group: Vulnerability group under review.
+        task_id: Active remediation task identifier.
+        strategy: Supervisor-selected routing strategy.
+        results: Deterministic QA execution results.
+        group_remaining_ids: Target identifiers still present for this group.
+        candidate_changed_files: Worker-reported files for this task.
+        action_summaries: Bounded worker action summaries.
+        qa_policy: Supervisor-owned QA policy, when available.
+        singleton_scope: Whether exactly one active task owns this QA run.
+
+    Returns:
+        The complete evaluator prompt.
+    """
     return (
         _QA_EVALUATOR_STATIC_PREAMBLE
         + "\n\n"
@@ -710,6 +787,7 @@ def _build_individual_investigator_prompt(
             candidate_changed_files=candidate_changed_files,
             action_summaries=action_summaries,
             qa_policy=qa_policy,
+            singleton_scope=singleton_scope,
         )
     )
 
@@ -738,8 +816,24 @@ def _run_individual_investigations(
     repo_root: str | None,
     results: _QAExecutionResults,
     task_policies: dict[str, QAPolicy | None],
+    singleton_scope: bool = False,
 ) -> dict[str, GroupInvestigation]:
-    """Run one bounded structured evaluator independently for each task."""
+    """Run one bounded structured evaluator independently for each task.
+
+    Args:
+        task_contexts: Task/group contexts being evaluated.
+        task_strategies: Supervisor-selected strategy by task ID.
+        action_summaries: Recent worker action summaries.
+        changed_files_by_task: Worker-reported changed files by task ID.
+        sandbox: Active read-only QA sandbox.
+        repo_root: Optional host repository root for review tools.
+        results: Deterministic global QA results.
+        task_policies: Supervisor-owned QA policy by task ID.
+        singleton_scope: Whether the dispatch contains exactly one active task.
+
+    Returns:
+        Structured investigation records keyed by task ID.
+    """
     from langchain_openai import ChatOpenAI
 
     model_name = get_runtime_settings().qa_llm_model
@@ -764,6 +858,7 @@ def _run_individual_investigations(
             candidate_changed_files=task_changed_files,
             action_summaries=relevant_summaries,
             qa_policy=qa_policy,
+            singleton_scope=singleton_scope,
         )
         terminal_tool = _build_qa_terminal_tool()
         review_tools = [

@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     QAPolicy,
     QASemanticSecurityReview,
+    QATestAttribution,
     RemediationTask,
     RoutingStrategy,
     ScratchpadScope,
@@ -356,6 +357,24 @@ class TestBuildIndividualInvestigatorPrompt:
         assert "RAW INSTALL STDOUT" not in prompt
         assert "RAW INSTALL STDERR" not in prompt
 
+    def test_prompt_reports_tuple_execution_statuses_and_singleton_scope(self):
+        results = _make_fully_populated_results(ok=True)
+        prompt = _build_individual_investigator_prompt(
+            task_id="task-1",
+            group=_make_group(),
+            strategy="version_bump",
+            results=results,
+            group_remaining_ids=[],
+            candidate_changed_files=[],
+            action_summaries=[],
+            singleton_scope=True,
+        )
+
+        assert "- Install: PASS" in prompt
+        assert "- Unit tests: PASS" in prompt
+        assert "- Dispatch scope: SINGLETON" in prompt
+        assert "attribute" in prompt.lower()
+
     def test_action_summaries_are_bounded(self):
         summary = AgentActionSummary(
             task_id="task-1",
@@ -557,13 +576,22 @@ class TestApplyGuardrails:
             )
         return r
 
-    def _apply(self, contexts, evaluations, results, investigations=None):
+    def _apply(
+        self,
+        contexts,
+        evaluations,
+        results,
+        investigations=None,
+        *,
+        singleton_scope=False,
+    ):
         return _apply_guardrails(
             task_contexts=contexts,
             batch_result=evaluations,
             results=results,
             task_policies={context.task_id: context.task.qa_policy for context in contexts},
             investigations_by_task=investigations,
+            singleton_scope=singleton_scope,
         )
 
     def test_valid_passes_through(self):
@@ -571,6 +599,35 @@ class TestApplyGuardrails:
         evaluations = [QAEvaluation(task_id="task-1", passed=True)]
         evals, errors = self._apply([context], evaluations, self._res())
         assert evals["task-1"].passed is True and not errors
+
+    def test_singleton_failed_tests_are_attributed_to_active_task(self):
+        group = _make_group()
+        context = self._context(group)
+        results = self._res()
+        results.tests = (False, "npm test FAILED")
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="The test owner was inconclusive.",
+            test_attribution=QATestAttribution(
+                verdict=TestAttributionVerdict.INCONCLUSIVE,
+            ),
+        )
+
+        evals, errors = self._apply(
+            [context],
+            [evaluation],
+            results,
+            singleton_scope=True,
+        )
+
+        attribution = evals["task-1"].test_attribution
+        assert not errors
+        assert attribution is not None
+        assert attribution.verdict == TestAttributionVerdict.RESPONSIBLE
+        assert attribution.responsible_group_ids == [group.group_id]
+        assert attribution.failed_tests == ["deterministic unit test suite"]
 
     def test_no_fix_stage_two_derives_code_workaround_strategy(self):
         group = _make_group(

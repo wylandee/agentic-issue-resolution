@@ -436,6 +436,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
             "qa_investigation_report": "",
             **unscanned_projection,
         }
+    singleton_scope = len(task_contexts) == 1
 
     target_identifiers = _collect_target_identifiers(valid_groups)
     logger.info(
@@ -570,6 +571,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 repo_root=repo_root,
                 results=results,
                 task_policies=task_policies,
+                singleton_scope=singleton_scope,
             )
 
     except RuntimeError as exc:
@@ -611,6 +613,8 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         results=results,
         task_policies=task_policies,
         investigations_by_task=investigations_by_task,
+        singleton_scope=singleton_scope,
+        deterministic_test_evidence=deterministic_test_evidence,
     )
     errors.extend(guardrail_errors)
     qa_evaluations = _attach_failure_evidence_to_evaluations(
