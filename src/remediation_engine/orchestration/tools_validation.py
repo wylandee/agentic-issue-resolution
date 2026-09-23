@@ -683,9 +683,21 @@ def _make_validate_workaround_tool(
                     "Record and execute the scoped package-removal plan before validation.",
                     code="PLAN_VIOLATION",
                 )
+            missing_operations: list[str] = []
             if not plan_state.get("no_fix_package_removed"):
+                missing_operations.append("remove_no_fix_dependency")
+            if (
+                plan_state.get("planned_replacements")
+                and plan_state.get("pending_edit_set") is None
+            ):
+                missing_operations.append("deterministic_apply_edit_set")
+            if missing_operations:
                 return _invalid_validation_request(
-                    "The configured dependency was not removed through the scoped tool.",
+                    "NO_FIX PACKAGE_REMOVAL requires successful calls to both "
+                    "remove_no_fix_dependency and deterministic_apply_edit_set when source "
+                    "replacements are planned; either order is valid. Missing operation(s): "
+                    + ", ".join(missing_operations)
+                    + ".",
                     level="FAILURE",
                     code="PACKAGE_REMOVAL",
                 )
@@ -1093,7 +1105,12 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
             }
 
         MUST be called after local investigation is complete and BEFORE
-        executing any code edits.
+        executing any code edits. Test and spec files are read-only: they must
+        not appear in ``affected_files`` or ``planned_replacements``. For a
+        NO_FIX package-removal plan, set ``package_removal_requested`` to true,
+        list only the configured manifest/lockfile paths plus any source files
+        in ``affected_files``, and keep manifest/lockfile mutations out of
+        ``planned_replacements``; the dedicated removal tool owns them.
         """
         if plan_state.get("inspected_files") or plan_state.get("read_files"):
             plan_state["local_investigation_complete"] = True
@@ -1189,6 +1206,16 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         if not declared_files:
             return "ERROR: [PLAN_REJECTED] At least one affected file must be specified."
 
+        declared_test_files = sorted(
+            file_path for file_path in declared_files if _is_test_file_path(file_path)
+        )
+        if declared_test_files:
+            return (
+                "ERROR: [PROHIBITED_TARGET] Test and spec files are read-only and cannot be "
+                "declared in record_plan affected_files: "
+                f"{declared_test_files}."
+            )
+
         replacement_files = set()
         seen_specs = set()
         total_text_bytes = 0
@@ -1225,13 +1252,16 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         if total_text_bytes > 65536:
             return "ERROR: [PLAN_REJECTED] Plan exceeds maximum limit of 64 KiB of combined replacement text."
 
-        allowlisted_package_files = set(plan_state.get("no_fix_manifest_paths", []))
+        manifest_allowlist = set(plan_state.get("no_fix_manifest_paths", []))
+        allowlisted_package_files = set(
+            plan_state.get("no_fix_package_files", []) or manifest_allowlist
+        )
         if package_removal_requested:
             if plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
                 return "ERROR: [PLAN_REJECTED] package_removal_requested is valid only during PACKAGE_REMOVAL."
-            if not allowlisted_package_files:
+            if not manifest_allowlist:
                 return "ERROR: [PLAN_REJECTED] No exact manifest allowlist is configured for package removal."
-            if not declared_files.intersection(allowlisted_package_files):
+            if not declared_files.intersection(manifest_allowlist):
                 return (
                     "ERROR: [PLAN_REJECTED] A package-removal plan must declare at least one "
                     "configured manifest path in affected_files."
@@ -1297,7 +1327,9 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
             "plan_revision": plan_state["plan_revision"],
             "phase_transition": "PLAN -> EXECUTE",
             "evidence_source": ev_source,
-            "planned_targets": sorted(list(replacement_files)),
+            "planned_targets": sorted(
+                list(declared_files if package_removal_requested else replacement_files)
+            ),
             "planned_replacements": [r.model_dump() for r in replacements],
         }
         return (

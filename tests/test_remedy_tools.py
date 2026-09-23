@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from remediation_engine.contracts.schemas import CommandResult
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
+    _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
     build_update_toolbelt,
@@ -82,6 +83,34 @@ class TestToolbeltFactories:
             "revert_workspace_file",
             "validate_workaround",
         }
+
+    def test_repository_map_supports_full_map_queries_and_paging(self):
+        sandbox = MagicMock()
+        paths = sorted([*(f"src/module_{index:03d}.js" for index in range(405)), "package.json"])
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="\n".join(paths) + "\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        read_map = _make_read_repository_map_tool(sandbox)
+
+        first_page = read_map.invoke({})
+        assert "src/module_000.js" in first_page
+        assert "src/module_398.js" in first_page
+        assert "src/module_399.js" not in first_page
+        assert "use offset" in first_page
+
+        full_map = read_map.invoke({"include_all": True})
+        assert "src/module_404.js" in full_map
+        assert "truncated" not in full_map
+
+        queried = read_map.invoke({"query": "package"})
+        assert queried == "package.json"
+
+        page = read_map.invoke({"query": "src/module_", "offset": 400, "limit": 2})
+        assert page.startswith("src/module_400.js\nsrc/module_401.js")
+        assert "src/module_402.js" not in page
 
     def test_targeted_test_uses_matching_npm_script_and_qa_target(self):
         sandbox = MagicMock()

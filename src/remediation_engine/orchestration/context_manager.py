@@ -89,6 +89,7 @@ PHASE_TOOL_REGISTRY: dict[WorkaroundExecutionPhase, frozenset[str]] = {
             "validate_workaround",
             "record_targeted_test_substitution",
             "read_workspace_file",
+            "remove_no_fix_dependency",
         }
     ),
 }
@@ -116,7 +117,11 @@ _PHASE_PROMPTS: dict[WorkaroundExecutionPhase, str] = {
         "rejects a path, use read_repository_map or read_workspace_file to resolve valid "
         "repository-relative paths, then retry validate_workaround. After an infrastructure-only "
         "targeted-test failure, inspect and register one valid substitution. Do not edit or "
-        "re-plan. Once the inputs are valid, your next action must be validate_workaround."
+        "re-plan. For a NO_FIX package-removal plan with source replacements, both "
+        "remove_no_fix_dependency and deterministic_apply_edit_set must have succeeded before "
+        "validation; either operation may happen first, and the removal tool remains available "
+        "to complete that requirement. Once all required operations are complete and the inputs "
+        "are valid, your next action must be validate_workaround."
     ),
 }
 

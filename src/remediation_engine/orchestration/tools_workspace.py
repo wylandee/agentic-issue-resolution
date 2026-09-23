@@ -21,8 +21,36 @@ from ._tool_support import (
 
 def _make_read_repository_map_tool(sandbox: DockerSandbox):
     @tool
-    def read_repository_map() -> str:
-        """Return a deterministic ASCII tree of every file/directory in the workspace."""
+    def read_repository_map(
+        query: str = "",
+        include_all: bool = False,
+        offset: int = 0,
+        limit: int = _REPO_MAP_MAX_ENTRIES,
+    ) -> str:
+        """Return a deterministic, queryable repository path map.
+
+        The default response is the first bounded page for compatibility with
+        the original tool.  ``query`` performs a case-insensitive literal
+        substring filter over repository-relative paths.  Use ``offset`` and
+        ``limit`` for another page, or set ``include_all`` to return every
+        matching entry without the default page cap.
+
+        Args:
+            query: Optional literal path substring to match.
+            include_all: Whether to bypass the page limit for the filtered map.
+            offset: Zero-based entry offset after filtering.
+            limit: Maximum entries in one page when ``include_all`` is false.
+
+        Returns:
+            A sorted newline-delimited path list, with an actionable truncation
+            marker when another page is available.
+        """
+        if offset < 0:
+            return "ERROR: offset must be non-negative."
+        if limit <= 0:
+            return "ERROR: limit must be positive."
+
+        normalized_query = str(query or "").strip().replace("\\", "/")
         script = (
             "find . -not -path '*/node_modules/*' "
             "-not -path '*/.git/*' "
@@ -37,11 +65,29 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
         if not lines:
             return "(workspace is empty)"
 
-        capped = lines[:_REPO_MAP_MAX_ENTRIES]
-        truncated = len(lines) > _REPO_MAP_MAX_ENTRIES
-        output = "\n".join(capped)
+        if normalized_query:
+            query_folded = normalized_query.casefold()
+            lines = [line for line in lines if query_folded in line.casefold()]
+            if not lines:
+                return f"(no repository entries matched query: {normalized_query})"
+
+        if include_all:
+            selected = lines[offset:]
+            truncated = False
+        else:
+            selected = lines[offset : offset + limit]
+            truncated = offset + len(selected) < len(lines)
+
+        if not selected:
+            return f"(no repository entries at offset {offset})"
+
+        output = "\n".join(selected)
         if truncated:
-            output += f"\n... (truncated, {len(lines) - _REPO_MAP_MAX_ENTRIES} more entries)"
+            remaining = len(lines) - offset - len(selected)
+            output += (
+                f"\n... (truncated, {remaining} more entries; use offset or "
+                "include_all=true, optionally with query)"
+            )
         return output
 
     return read_repository_map

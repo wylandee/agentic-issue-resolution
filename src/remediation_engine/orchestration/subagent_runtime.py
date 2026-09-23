@@ -372,6 +372,18 @@ def _validation_request_signature(args: dict[str, Any]) -> str:
 def _validation_input_recovery_instruction(tool_content: str) -> str:
     """Build recovery guidance for a validation request rejected before gate execution."""
     evidence = str(tool_content or "").strip()[:2400]
+    if "[PACKAGE_REMOVAL]" in evidence and (
+        "remove_no_fix_dependency" in evidence or "configured dependency" in evidence
+    ):
+        return (
+            "The validation request was rejected because the NO_FIX package-removal plan is "
+            "incomplete. Do not edit or re-plan the source patch. Ensure both required successful "
+            "operations have been performed: call remove_no_fix_dependency for the configured "
+            "package and deterministic_apply_edit_set for the recorded source replacements when "
+            "they exist. Either operation may happen first. After both succeed, call "
+            "validate_workaround with the complete cumulative file list.\n"
+            f"Exact preflight result:\n{evidence}"
+        )
     return (
         "The validation request was rejected during deterministic preflight; no validation gate ran and "
         "the pending edit set was not judged. Do not edit or re-plan the source patch. Correct the validation "

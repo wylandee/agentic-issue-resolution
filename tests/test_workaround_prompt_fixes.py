@@ -37,6 +37,22 @@ def test_compact_initial_mitigation_prompt():
     assert "Raw Excerpt" not in prompt
 
 
+def test_supervisor_task_instruction_is_not_truncated():
+    instruction = "Apply the exact supervisor directive: " + ("inspect-this-file " * 120)
+    task = MagicMock(task_id="task-long", selected_version="1.2.3", instruction=instruction)
+    group = MagicMock(
+        vulnerable_component="express-jwt",
+        cve_ids=[],
+        ghsa_ids=[],
+        fix_plan=MagicMock(status=MagicMock(value="no_fix"), workaround_snippets=[]),
+    )
+    group.issues = []
+
+    prompt = _build_workaround_prompt(target_task=task, target_group=group)
+
+    assert f"Task Instruction: {instruction.strip()}" in prompt
+
+
 def test_compact_qa_regression_repair_prompt():
     task = MagicMock(task_id="task-2", selected_version="8.5.1", instruction="Update package")
     group = MagicMock(

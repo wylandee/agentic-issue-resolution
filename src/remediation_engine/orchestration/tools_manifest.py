@@ -664,12 +664,14 @@ def _make_remove_no_fix_dependency_tool(
         )
         plan_state["no_fix_package_removed"] = True
         # Package-only plans have no later source edit to advance the
-        # lifecycle, so expose validation immediately. Plans containing
-        # source replacements remain in EXECUTE until those replacements are
-        # applied before the single cumulative validation call.
+        # lifecycle, so expose validation immediately. For a plan containing
+        # source replacements, either operation may be called first: remain in
+        # EXECUTE until the source edit is applied, but preserve VALIDATE when
+        # the edit is already pending and removal is called second.
+        source_edit_pending = plan_state.get("pending_edit_set") is not None
         plan_state["phase"] = (
             WorkaroundExecutionPhase.VALIDATE.value
-            if not plan_state.get("planned_replacements")
+            if not plan_state.get("planned_replacements") or source_edit_pending
             else WorkaroundExecutionPhase.EXECUTE.value
         )
         return (

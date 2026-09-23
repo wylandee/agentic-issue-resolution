@@ -83,7 +83,7 @@ _READ_WEB_PAGE_TIMEOUT = 15
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 
 _SOURCE_MODULE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"})
-_TEST_DIRECTORY_NAMES = frozenset({"test", "tests", "__tests__"})
+_TEST_DIRECTORY_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs"})
 
 # Runtime smoke must prove that the changed module can load.  Application
 # entrypoints are deliberately excluded because importing them can start a

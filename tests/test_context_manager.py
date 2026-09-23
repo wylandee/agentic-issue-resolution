@@ -235,6 +235,7 @@ def test_registry_filters_in_builder_order_and_missing_optional_tools() -> None:
         "revert_workspace_file",
         "validate_workaround",
         "record_targeted_test_substitution",
+        "remove_no_fix_dependency",
     ]
     tools = [SimpleNamespace(name=name) for name in names]
 
@@ -243,8 +244,11 @@ def test_registry_filters_in_builder_order_and_missing_optional_tools() -> None:
         expected = [name for name in names if name in PHASE_TOOL_REGISTRY[phase]]
         assert [tool.name for tool in get_tools_for_phase(phase, tools)] == expected
 
-    assert "remove_no_fix_dependency" not in [
+    assert "remove_no_fix_dependency" in [
         tool.name for tool in get_tools_for_phase(WorkaroundExecutionPhase.EXECUTE, tools)
+    ]
+    assert "remove_no_fix_dependency" in [
+        tool.name for tool in get_tools_for_phase(WorkaroundExecutionPhase.VALIDATE, tools)
     ]
     assert [tool.name for tool in get_tools_for_phase(None, tools)] == [
         name for name in names if name in PHASE_TOOL_REGISTRY[WorkaroundExecutionPhase.INVESTIGATE]
@@ -257,6 +261,7 @@ def test_phase_prompts_are_action_oriented_and_preserve_optional_context() -> No
     assert "record_plan" in get_phase_prompt("PLAN")
     assert "atomic edit" in get_phase_prompt("EXECUTE")
     assert "read_repository_map" in get_phase_prompt("VALIDATE")
+    assert "either operation may happen first" in get_phase_prompt("VALIDATE")
     assert "next action must be validate_workaround" in get_phase_prompt("VALIDATE")
     assert get_phase_prompt("PLAN", "original task") == (
         "original task\n\n" + get_phase_prompt("PLAN")

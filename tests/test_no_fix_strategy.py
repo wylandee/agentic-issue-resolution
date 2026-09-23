@@ -252,6 +252,8 @@ def test_no_fix_prompts_do_not_contradict_package_removal_or_stage_two_rules():
         ),
     )
     assert "remove_no_fix_dependency is the only manifest" in _WORKAROUND_STATIC_INSTRUCTIONS
+    assert "both" in _WORKAROUND_STATIC_INSTRUCTIONS.lower()
+    assert "either operation may be called first" in _WORKAROUND_STATIC_INSTRUCTIONS
     assert "Dependency update is already seeded" not in package_prompt
     assert "manual" in _WORKAROUND_STATIC_INSTRUCTIONS.lower()
 
@@ -339,6 +341,47 @@ def test_scoped_package_removal_requires_plan_and_changes_only_authorized_manife
     )
 
 
+def test_package_removal_plan_accepts_authorized_lockfile_and_rejects_test_files():
+    sandbox = _PackageSandbox(
+        {
+            "package.json": json.dumps({"dependencies": {"notevil": "1.0.0"}}),
+            "package-lock.json": '{"packages": {}}',
+        }
+    )
+    plan_state = {"local_investigation_complete": True, "web_search_performed": True}
+    tools = _package_tool_map(sandbox, plan_state)
+
+    plan = tools["record_plan"].invoke(
+        {
+            "affected_files": ["package.json", "package-lock.json"],
+            "affected_symbols": [],
+            "security_invariant": "the vulnerable package is absent",
+            "causal_hypothesis": "the direct dependency is unused",
+            "planned_replacements": [],
+            "evidence_source": "workspace:package.json",
+            "package_removal_requested": True,
+        }
+    )
+    assert "SUCCESS" in plan
+    assert "package-lock.json" in plan
+
+    test_plan_state = {"local_investigation_complete": True, "web_search_performed": True}
+    test_tools = _package_tool_map(sandbox, test_plan_state)
+    rejected = test_tools["record_plan"].invoke(
+        {
+            "affected_files": ["package.json", "tests/order.test.ts"],
+            "affected_symbols": [],
+            "security_invariant": "the vulnerable package is absent",
+            "causal_hypothesis": "the direct dependency is unused",
+            "planned_replacements": [],
+            "evidence_source": "workspace:package.json",
+            "package_removal_requested": True,
+        }
+    )
+    assert "PROHIBITED_TARGET" in rejected
+    assert "read-only" in rejected
+
+
 def test_package_removal_with_source_replacements_remains_in_execute():
     sandbox = _PackageSandbox(
         {
@@ -377,6 +420,146 @@ def test_package_removal_with_source_replacements_remains_in_execute():
 
     assert "SUCCESS" in result
     assert plan_state["phase"] == WorkaroundExecutionPhase.EXECUTE.value
+
+
+def _record_source_package_removal_plan(tools) -> str:
+    """Record the shared package-removal-plus-source-edit test plan."""
+    return tools["record_plan"].invoke(
+        {
+            "affected_files": ["package.json", "routes/order.ts"],
+            "affected_symbols": ["notevil"],
+            "security_invariant": "the vulnerable dependency and consumer are absent",
+            "causal_hypothesis": "the direct dependency has no fix and its consumer can be removed",
+            "planned_replacements": [
+                {
+                    "file_path": "routes/order.ts",
+                    "old_text": "require('notevil')",
+                    "new_text": "require('safe-lib')",
+                    "expected_occurrences": 1,
+                }
+            ],
+            "evidence_source": "workspace:routes/order.ts",
+            "package_removal_requested": True,
+        }
+    )
+
+
+def _source_package_removal_sandbox() -> _PackageSandbox:
+    """Return a sandbox for the unordered package-removal operation test."""
+    return _PackageSandbox(
+        {
+            "package.json": json.dumps({"dependencies": {"notevil": "1.0.0"}}),
+            "package-lock.json": '{"packages": {}}',
+            "routes/order.ts": "const parser = require('notevil');\n",
+        }
+    )
+
+
+def test_package_removal_and_source_edit_are_unordered_but_both_required():
+    """Require both successful mutations while allowing either call order."""
+    for removal_first in (True, False):
+        sandbox = _source_package_removal_sandbox()
+        plan_state = {
+            "local_investigation_complete": True,
+            "web_search_performed": True,
+            "inspected_files": {"routes/order.ts"},
+        }
+        tools = _package_tool_map(sandbox, plan_state)
+
+        assert "SUCCESS" in _record_source_package_removal_plan(tools)
+        if removal_first:
+            assert "SUCCESS" in tools["remove_no_fix_dependency"].invoke(
+                {"requested_package": "notevil", "manifest_path": "package.json"}
+            )
+            assert "SUCCESS" in tools["deterministic_apply_edit_set"].invoke(
+                {
+                    "replacements": [
+                        {
+                            "file_path": "routes/order.ts",
+                            "old_text": "require('notevil')",
+                            "new_text": "require('safe-lib')",
+                            "expected_occurrences": 1,
+                        }
+                    ]
+                }
+            )
+        else:
+            assert "SUCCESS" in tools["deterministic_apply_edit_set"].invoke(
+                {
+                    "replacements": [
+                        {
+                            "file_path": "routes/order.ts",
+                            "old_text": "require('notevil')",
+                            "new_text": "require('safe-lib')",
+                            "expected_occurrences": 1,
+                        }
+                    ]
+                }
+            )
+            assert "SUCCESS" in tools["remove_no_fix_dependency"].invoke(
+                {"requested_package": "notevil", "manifest_path": "package.json"}
+            )
+
+        assert plan_state["phase"] == WorkaroundExecutionPhase.VALIDATE.value
+        validation = tools["validate_workaround"].invoke(
+            {
+                "modified_files": [
+                    "package.json",
+                    "package-lock.json",
+                    "routes/order.ts",
+                ],
+                "runtime_smoke_file": "routes/order.ts",
+            }
+        )
+        assert validation.startswith("SUCCESS: Workaround validation gate passed")
+        assert plan_state["package_removal_completed"] is True
+        assert plan_state["successful_edit_sets"]
+
+
+def test_package_removal_validation_rejects_missing_required_operation():
+    """Validation must identify whichever of the two package-removal mutations is absent."""
+    for missing_operation in ("remove", "edit"):
+        sandbox = _source_package_removal_sandbox()
+        plan_state = {
+            "local_investigation_complete": True,
+            "web_search_performed": True,
+            "inspected_files": {"routes/order.ts"},
+        }
+        tools = _package_tool_map(sandbox, plan_state)
+        assert "SUCCESS" in _record_source_package_removal_plan(tools)
+
+        if missing_operation == "remove":
+            assert "SUCCESS" in tools["deterministic_apply_edit_set"].invoke(
+                {
+                    "replacements": [
+                        {
+                            "file_path": "routes/order.ts",
+                            "old_text": "require('notevil')",
+                            "new_text": "require('safe-lib')",
+                            "expected_occurrences": 1,
+                        }
+                    ]
+                }
+            )
+            expected = "remove_no_fix_dependency"
+        else:
+            assert "SUCCESS" in tools["remove_no_fix_dependency"].invoke(
+                {"requested_package": "notevil", "manifest_path": "package.json"}
+            )
+            expected = "deterministic_apply_edit_set"
+
+        validation = tools["validate_workaround"].invoke(
+            {
+                "modified_files": [
+                    "package.json",
+                    "package-lock.json",
+                    "routes/order.ts",
+                ],
+                "runtime_smoke_file": "routes/order.ts",
+            }
+        )
+        assert "[PACKAGE_REMOVAL]" in validation
+        assert expected in validation
 
 
 def test_scoped_package_removal_rolls_back_manifest_and_lockfile_on_sync_failure():

@@ -81,11 +81,16 @@ _QA_ERROR_MARKER = re.compile(
 )
 
 
-def _clean_prompt_snippet(value: str, max_chars: int = 240) -> str:
-    """Normalize one extracted QA or vulnerability snippet for prompt use."""
+def _clean_prompt_snippet(value: str, max_chars: int | None = 240) -> str:
+    """Normalize one extracted QA or vulnerability snippet for prompt use.
+
+    ``max_chars=None`` preserves the complete value.  Supervisor-owned task
+    instructions use that mode because truncating an instruction can remove
+    required files, symbols, or exact operations from the worker contract.
+    """
     cleaned = re.sub(r"\s+", " ", value).strip(" `\"'")
     cleaned = cleaned.replace("`", "").replace('"', "")
-    return cleaned[:max_chars].strip()
+    return cleaned if max_chars is None else cleaned[:max_chars].strip()
 
 
 def _clean_prompt_log(value: str, max_chars: int = 1600) -> str:
@@ -625,6 +630,11 @@ tools and relative paths. Perform local inspection before external research, and
 use authoritative advisory, maintainer, migration-guide, or source-repository
 guidance when web research is necessary.
 
+read_repository_map is paged by default. Use its literal query argument to narrow
+the map to relevant paths, offset and limit to inspect another page, or
+include_all=true when the complete map is required; never infer that omitted
+entries do not exist.
+
 Follow Investigate -> Plan -> Execute -> Validate. Record an evidence-backed plan
 before edits. Make one minimal semantic source patch per iteration with
 deterministic_apply_edit_set, and include an import plus all causally related
@@ -646,12 +656,19 @@ once with a recorded mapping; never substitute for an assertion, syntax, type, o
 application-runtime failure."""
 
 _WORKAROUND_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS = """For NO_FIX PACKAGE_REMOVAL,
-record a package-removal plan with the configured authorized manifest paths.
-remove_no_fix_dependency is the only manifest or lockfile operation. Remove
-source imports and dependent usage when local inspection shows them, then
-validate the cumulative source patch. Never manually edit lockfile nodes, bump
-versions, or modify tests. If no removable direct declaration exists, report
-NOT_APPLICABLE and surrender for vulnerable-code removal."""
+record a package-removal plan with package_removal_requested=true. Put the
+configured authorized package.json and lockfile paths in affected_files, put
+only source replacements in planned_replacements, and use an empty replacement
+list when removal is the only mutation. remove_no_fix_dependency is the only manifest
+or lockfile operation. When source replacements are planned, both
+remove_no_fix_dependency and deterministic_apply_edit_set must each succeed
+before validate_workaround; either operation may be called first. If one
+succeeds, call the other before validation. A removal-only plan requires only
+remove_no_fix_dependency. Remove source imports and dependent usage when local
+inspection shows them, then validate the cumulative source patch. Never
+manually edit lockfile nodes, bump versions, or modify tests. If no removable
+direct declaration exists, report NOT_APPLICABLE and surrender for
+vulnerable-code removal."""
 
 _WORKAROUND_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS = """For NO_FIX
 VULNERABLE_CODE_REMOVAL, keep the vulnerable package installed and perform a
@@ -673,12 +690,13 @@ from the targeted test. Supply the complete cumulative modified-file list to
 validate_workaround. Resolve infrastructure-only validation failures through the
 permitted alternative targeted-test path; do not edit for infrastructure noise."""
 
-_WORKAROUND_PROHIBITIONS = """Never modify tests to make assertions pass. Never
-manually edit or delete lockfile nodes, bump library versions, or use absolute
-paths. Before source edits or package removal, call record_plan. For ordinary
-workarounds dependency manifests remain prohibited; for NO_FIX PACKAGE_REMOVAL
-only the configured package-removal operation may change its authorized manifest
-and lockfile paths."""
+_WORKAROUND_PROHIBITIONS = """Never modify tests to make assertions pass. Test
+and spec files are read-only and must not appear in record_plan affected_files
+or planned_replacements. Never manually edit or delete lockfile nodes, bump
+library versions, or use absolute paths. Before source edits or package removal,
+call record_plan. For ordinary workarounds manifests remain prohibited;
+dependency manifests cannot be changed. For NO_FIX PACKAGE_REMOVAL only the configured package-removal
+operation may change its authorized manifest and lockfile paths."""
 
 _WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
     [
@@ -755,7 +773,7 @@ def _build_workaround_prompt(
         f"GHSAs: {ghsas}",
         f"Vulnerability Identifier: {cve_label or 'none'}",
         f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
-        f"Task Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=600)}",
+        f"Task Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=None)}",
     ]
 
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
