@@ -31,6 +31,7 @@ from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FinalFullScanResult,
+    IssueType,
     MultiPackageAction,
     ODCScanEvidence,
     PortfolioPlan,
@@ -61,6 +62,110 @@ from remediation_engine.tools.manifest_locator import expand_dependency_ancestry
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+DEVELOPMENT_ENVIRONMENTS = frozenset({"dev", "development"})
+
+
+def normalize_target_packages(values: Sequence[str] | None) -> list[str]:
+    """Return a deterministic, validated package allowlist.
+
+    Args:
+        values: Package names supplied by a development-only scoped run.
+
+    Returns:
+        Sorted, de-duplicated package names. ``None`` becomes an empty list,
+        which means that the engine should process the full repository.
+
+    Raises:
+        ValueError: If a package name is not a non-empty string.
+    """
+    if isinstance(values, str):
+        raise ValueError("target_packages must be a sequence of package names")
+    normalized: set[str] = set()
+    for value in values or ():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("target_packages must contain non-empty package names")
+        normalized.add(value.strip())
+    return sorted(normalized)
+
+
+def validate_target_package_scope(
+    target_packages: Sequence[str] | None,
+    system_context: SystemContext | None,
+) -> list[str]:
+    """Validate that package scoping is explicitly limited to development.
+
+    Args:
+        target_packages: Requested package allowlist.
+        system_context: Caller-supplied environment metadata.
+
+    Returns:
+        Normalized package names.
+
+    Raises:
+        ValueError: If a non-empty package scope is requested without a
+            development environment label.
+    """
+    normalized = normalize_target_packages(target_packages)
+    environment = (system_context.environment if system_context else "") or ""
+    if normalized and environment.strip().lower() not in DEVELOPMENT_ENVIRONMENTS:
+        raise ValueError(
+            "target_packages is development-only; set system_context.environment to "
+            "'development' or 'dev'"
+        )
+    return normalized
+
+
+def _group_package_identities(group: VulnerabilityGroup) -> set[str]:
+    """Collect package names that identify one vulnerability group."""
+    identities = {
+        value.strip()
+        for value in (
+            group.vulnerable_component,
+            group.parent_package_name,
+            *(issue.package_name for issue in group.issues or []),
+            *(localized.issue.package_name for localized in group.localized_issues or []),
+        )
+        if isinstance(value, str) and value.strip()
+    }
+    return identities
+
+
+def filter_groups_to_target_packages(
+    groups: Sequence[VulnerabilityGroup],
+    target_packages: Sequence[str] | None,
+) -> list[VulnerabilityGroup]:
+    """Keep only SCA groups that belong to a requested package scope.
+
+    Non-SCA groups are retained because package scoping controls dependency
+    portfolio discovery, not source-code remediation.
+    """
+    scope = set(normalize_target_packages(target_packages))
+    if not scope:
+        return list(groups)
+    return [
+        group
+        for group in groups
+        if group.issue_type != IssueType.SCA or bool(_group_package_identities(group) & scope)
+    ]
+
+
+def filter_issues_to_target_packages(
+    issues: Sequence[VulnerabilityIssue],
+    target_packages: Sequence[str] | None,
+) -> list[VulnerabilityIssue]:
+    """Keep dependency findings inside a requested package scope.
+
+    SAST findings remain available to the normal source-remediation path.
+    """
+    scope = set(normalize_target_packages(target_packages))
+    if not scope:
+        return list(issues)
+    return [
+        issue
+        for issue in issues
+        if issue.issue_type != IssueType.SCA or (issue.package_name or "").strip() in scope
+    ]
 
 
 class ChangedFilesProjection(list[str]):
@@ -354,6 +459,10 @@ class OrchestratorState(TypedDict, total=False):
     valid_groups: list[VulnerabilityGroup]
     initial_valid_groups: list[VulnerabilityGroup]
     run_started_at: str
+    # Empty means the normal full-repository portfolio. Non-empty values are
+    # accepted only for development runs and limit synthetic dependency
+    # discovery to the requested package closure.
+    target_packages: list[str]
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
@@ -384,7 +493,7 @@ class OrchestratorState(TypedDict, total=False):
     portfolio_solver_plan: SolverRemediationPlan | None
     portfolio_iteration: int
     portfolio_replan_request: PortfolioReplanRequest | None
-    # Counts replan requests by their exact diagnostic reason.  The outer
+    # Counts replan requests by a stable diagnostic-reason key.  The outer
     # portfolio node uses this bounded ledger to fail closed on no-progress
     # replan loops without making ordinary one-off replans terminal.
     portfolio_replan_history: Annotated[dict[str, int], replace_dict_reducer]
@@ -477,9 +586,22 @@ def initial_orchestrator_state(
     valid_groups: list[VulnerabilityGroup],
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
+    target_packages: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a well-formed initial ``OrchestratorState`` dict."""
+    """Build a well-formed initial ``OrchestratorState`` dict.
+
+    ``target_packages`` is an opt-in development allowlist.  An empty list
+    preserves the production/default behavior of processing the entire
+    repository.
+    """
+    normalized_target_packages = validate_target_package_scope(
+        target_packages,
+        system_context,
+    )
     valid_groups = normalize_group_paths(valid_groups, repo_root)
+    valid_groups = filter_groups_to_target_packages(valid_groups, normalized_target_packages)
+    if issues is not None:
+        issues = filter_issues_to_target_packages(issues, normalized_target_packages)
     baseline_scan_identifiers = (
         _scan_identifiers_from_issues(issues)
         if issues is not None
@@ -491,6 +613,7 @@ def initial_orchestrator_state(
         "valid_groups": valid_groups,
         "initial_valid_groups": list(valid_groups),
         "run_started_at": datetime.now(UTC).isoformat(),
+        "target_packages": normalized_target_packages,
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},

@@ -5,6 +5,7 @@ Tests for the Phase 5 LangGraph orchestrator wiring.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
     WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
 from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.orchestration import (
@@ -39,6 +41,7 @@ from remediation_engine.orchestration import (
 from remediation_engine.orchestration.graph import (
     MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _finish_workspace_attempt_snapshot,
+    _record_portfolio_replan_attempt,
     route_after_portfolio,
     route_after_workspace_builder,
     run_portfolio_node,
@@ -46,7 +49,7 @@ from remediation_engine.orchestration.graph import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
-from remediation_engine.orchestration.supervisor_node import instruction_digest
+from remediation_engine.orchestration.supervisor_node import instruction_digest, run_supervisor_node
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
@@ -162,6 +165,76 @@ class TestPhase5Routing:
         assert route_after_workspace_builder({"status": "something_else"}) == "teardown"
 
 
+def test_supervisor_recovers_worker_result_after_portfolio_cleared_active_targets(
+    tmp_path,
+    monkeypatch,
+):
+    """A stale portfolio pointer must not strand a valid current attempt."""
+    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    task = build_initial_remediation_task(group, "task-1").model_copy(
+        update={
+            "task_revision": 1,
+            "selected_version": "2.0.0",
+            "allowed_target_versions": ["2.0.0"],
+            "portfolio_plan_id": "portfolio-old",
+            "instruction": "Update the committed dependency candidate.",
+        }
+    )
+    committed_task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
+    committed_task = committed_task.model_copy(update={"portfolio_plan_id": "portfolio-old"})
+    snapshot = snapshot.model_copy(
+        update={
+            "portfolio_plan_id": "portfolio-old",
+            "selected_version": "2.0.0",
+            "allowed_target_versions": ["2.0.0"],
+        }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=committed_task.task_id,
+        task_revision=committed_task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        instruction_digest=snapshot.instruction_digest,
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            executed_versions=["2.0.0"],
+            effective_target_version="2.0.0",
+        ),
+    )
+    state = _initial_state(tmp_path, [group])
+    state.update(
+        {
+            "task_queue": {committed_task.task_id: committed_task},
+            "active_target_task_ids": [],
+            "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            "worker_results_by_attempt": {snapshot.attempt_id: worker_result},
+            "portfolio_plan": SimpleNamespace(
+                portfolio_plan_id="portfolio-new",
+                clusters=[],
+                cluster_order=[],
+                task_order=[],
+                task_to_cluster={},
+                diagnostics=[],
+            ),
+            "status": "supervisor_routed",
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        lambda *args, **kwargs: ["stale committed portfolio plan"],
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+        lambda *args, **kwargs: False,
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == ["task-1"]
+    assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert snapshot.attempt_id in result["processed_worker_attempt_ids"]
+
+
 def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
     reason = "committed portfolio plan has stale task revision"
     state = {
@@ -185,6 +258,87 @@ def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
     assert result["portfolio_replan_history"] == {reason: MAX_PORTFOLIO_REPLAN_ATTEMPTS}
     assert reason in result["errors"][0]
     assert route_after_portfolio(result) == "teardown"
+
+
+def test_portfolio_replan_guard_normalizes_changing_plan_ids_and_revisions():
+    reason_one = (
+        "task task-64 portfolio plan 'portfolio-old' differs from committed 'portfolio-a'; "
+        "task task-64 is older than committed planned revision 4 (current=3)"
+    )
+    reason_two = (
+        "task task-64 portfolio plan 'portfolio-new' differs from committed 'portfolio-b'; "
+        "task task-64 is older than committed planned revision 5 (current=4)"
+    )
+    history, error = _record_portfolio_replan_attempt(
+        {
+            "portfolio_replan_history": {reason_one: MAX_PORTFOLIO_REPLAN_ATTEMPTS},
+            "portfolio_iteration": 7,
+        },
+        PortfolioReplanRequest(reason=reason_two),
+    )
+
+    assert error is not None
+    assert len(history) == 1
+    assert next(iter(history.values())) == MAX_PORTFOLIO_REPLAN_ATTEMPTS
+
+
+def test_portfolio_reconciliation_status_routes_back_to_supervisor():
+    assert route_after_portfolio({"status": "portfolio_reconciliation_required"}) == "supervisor"
+
+
+def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, monkeypatch):
+    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    task = build_initial_remediation_task(group, "task-1").model_copy(
+        update={"current_attempt_id": "attempt-1"}
+    )
+    previous_plan = SimpleNamespace(portfolio_plan_id="portfolio-old")
+    candidate_plan = SimpleNamespace(
+        plan_id="portfolio-new",
+        portfolio_plan_id="portfolio-new",
+        diagnostics=[],
+        clusters=[],
+        solver_plan=SimpleNamespace(
+            status="OPTIMAL",
+            diagnostics=[],
+            selected_plan=SimpleNamespace(task_decisions=[]),
+        ),
+    )
+    state = _initial_state(tmp_path, [group])
+    state.update(
+        {
+            "task_queue": {"task-1": task},
+            "portfolio_plan": previous_plan,
+            "portfolio_solver_plan": SimpleNamespace(),
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.prepare_portfolio_inputs",
+        lambda *args, **kwargs: ([group], {"task-1": task}, []),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.build_portfolio_plan",
+        lambda *args, **kwargs: candidate_plan,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.apply_portfolio_plan",
+        lambda *args, **kwargs: (
+            [group],
+            {"task-1": task.model_copy(update={"task_revision": 2})},
+            ["task 'task-1' has an active attempt; plan decision not applied"],
+        ),
+    )
+
+    result = run_portfolio_node(state)
+
+    assert result["status"] == "portfolio_reconciliation_required"
+    assert result["next_routing_step"] == "supervisor"
+    assert result["portfolio_plan"] is previous_plan
+    assert result["task_queue"]["task-1"].task_revision == task.task_revision
+    assert result["active_target_task_ids"] == ["task-1"]
 
 
 class TestPhase5RunOrchestrator:
@@ -325,6 +479,91 @@ class TestPhase5RunOrchestrator:
         report_files = list(report_dir.glob("*.md"))
         assert len(report_files) == 1
         assert report_files[0].read_text(encoding="utf-8")
+
+    def test_failed_langsmith_run_is_closed_without_waiting_for_remote_spans(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        run_id = uuid4()
+        mock_engine = MagicMock()
+        mock_engine.invoke.side_effect = RuntimeError("graph exploded")
+
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=({"run_id": run_id}, run_id),
+            ),
+            patch("remediation_engine.orchestration.graph.mark_phase5_trace_failed") as mark_trace,
+            patch(
+                "remediation_engine.orchestration.graph.export_phase5_trajectory",
+                return_value=trajectory_dir / "trace.md",
+            ) as export_trace,
+            pytest.raises(RuntimeError, match="graph exploded"),
+        ):
+            run_orchestrator(str(tmp_path), groups)
+
+        mark_trace.assert_called_once()
+        assert mark_trace.call_args.args[0] == run_id
+        assert export_trace.call_args.kwargs["langsmith_enabled"] is False
+
+    def test_keyboard_interrupt_persists_local_snapshot_before_closing_trace(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        run_id = uuid4()
+        mock_engine = MagicMock()
+        mock_engine.invoke.side_effect = KeyboardInterrupt()
+        events: list[str] = []
+        exported_states: list[dict[str, object]] = []
+
+        def fake_export(**kwargs):
+            events.append("export")
+            exported_states.append(dict(kwargs["final_state"]))
+            path = Path(kwargs["output_path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("interrupted trajectory", encoding="utf-8")
+            return path
+
+        def fake_mark(*args, **kwargs):
+            events.append("mark")
+
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=({"run_id": run_id}, run_id),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.export_phase5_trajectory",
+                side_effect=fake_export,
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.mark_phase5_trace_failed",
+                side_effect=fake_mark,
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.run_report_node",
+                return_value={"errors": []},
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.finalize_report",
+                return_value=("", None),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            run_orchestrator(str(tmp_path), groups)
+
+        assert events[0] == "export"
+        assert events.index("export") < events.index("mark")
+        early_state = exported_states[0]
+        assert early_state["status"] == "completed_with_errors"
+        assert "KeyboardInterrupt" in early_state["errors"][-1]
+        assert list(trajectory_dir.glob("*.md"))
 
 
 class TestPhase5GraphIntegration:

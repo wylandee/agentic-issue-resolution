@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+
+from langsmith import traceable
 
 from remediation_engine.contracts.solver_models import (
     SolverCandidatePlan,
     SolverFindingRequirement,
     SolverPeerConstraint,
     SolverRemediationPlan,
+    SolverStatistics,
     SolverStatus,
     SolverSubgraph,
     SolverTarget,
@@ -27,6 +31,75 @@ from remediation_engine.contracts.solver_models import (
 
 _MAX_DIAGNOSTICS = 64
 _MAX_DIAGNOSTIC_LENGTH = 500
+
+
+def _trace_field(value: Any, name: str, default: Any = None) -> Any:
+    """Read one field from a contract object or its serialized mapping."""
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _trace_solver_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded, non-sensitive summary for the solver child span."""
+    subgraph = inputs.get("subgraph")
+    targets = list(_trace_field(subgraph, "targets", ()) or ())
+    findings = list(_trace_field(subgraph, "findings", ()) or ())
+    edges = list(_trace_field(subgraph, "edges", ()) or ())
+    peer_constraints = list(_trace_field(subgraph, "peer_constraints", ()) or ())
+    candidate_domains = inputs.get("candidate_domains") or {}
+    domain_counts = (
+        {str(key): len(values or ()) for key, values in candidate_domains.items()}
+        if isinstance(candidate_domains, Mapping)
+        else {}
+    )
+    settings = inputs.get("settings")
+    setting_names = (
+        "solver_timeout_seconds",
+        "solver_top_k",
+        "solver_num_search_workers",
+        "solver_accept_feasible",
+        "solver_max_candidates_per_target",
+        "solver_max_model_variables",
+    )
+    return {
+        "target_count": len(targets),
+        "eligible_target_count": sum(
+            bool(_trace_field(target, "eligible_for_atomic_update", False)) for target in targets
+        ),
+        "finding_count": len(findings),
+        "edge_count": len(edges),
+        "peer_constraint_count": len(peer_constraints),
+        "subgraph_valid": bool(_trace_field(subgraph, "valid", True)),
+        "candidate_domain_count": len(domain_counts),
+        "candidate_total_count": sum(domain_counts.values()),
+        "candidate_counts": domain_counts,
+        "settings": {
+            name: _trace_field(settings, name)
+            for name in setting_names
+            if _trace_field(settings, name) is not None
+        },
+    }
+
+
+def _trace_solver_outputs(output: Any) -> dict[str, Any]:
+    """Return bounded solver results and raw execution statistics."""
+    if not hasattr(output, "status"):
+        return {"result_type": type(output).__name__}
+    status = getattr(output.status, "value", output.status)
+    selected = getattr(output, "selected_plan", None)
+    statistics = getattr(output, "solver_statistics", None)
+    return {
+        "status": str(status),
+        "candidate_plan_count": len(getattr(output, "candidate_plans", ()) or ()),
+        "selected_plan_id": getattr(selected, "candidate_plan_id", None),
+        "unresolved_finding_count": len(getattr(output, "unresolved_finding_ids", ()) or ()),
+        "task_revision_count": len(getattr(output, "task_revisions", {}) or {}),
+        "diagnostics": list(getattr(output, "diagnostics", ()) or ()),
+        "solver_statistics": (
+            statistics.model_dump(mode="json") if statistics is not None else None
+        ),
+    }
 
 
 def _digest(value: Any) -> str:
@@ -663,6 +736,112 @@ def _status_from_cp_code(cp_model: Any, status_code: Any) -> SolverStatus:
     return SolverStatus.UNKNOWN
 
 
+def _raw_status_name(solver: Any, status_code: Any) -> str:
+    """Return the native CP-SAT status name without collapsing it."""
+    try:
+        name = solver.StatusName(status_code)
+    except Exception:  # pragma: no cover - native API compatibility guard
+        name = status_code
+    return str(name).strip().upper() or "UNKNOWN"
+
+
+def _raw_status_code(status_code: Any) -> int | None:
+    """Return a serializable native status code when one is available."""
+    try:
+        return int(status_code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_solver_float(solver: Any, method_name: str) -> float | None:
+    """Read one finite floating-point statistic from a CP-SAT solver."""
+    try:
+        value = float(getattr(solver, method_name)())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _safe_solver_nonnegative_float(solver: Any, method_name: str) -> float:
+    """Read one finite non-negative CP-SAT timing statistic."""
+    value = _safe_solver_float(solver, method_name)
+    return max(0.0, value) if value is not None else 0.0
+
+
+def _safe_solver_int(solver: Any, method_name: str) -> int:
+    """Read one non-negative integer statistic from a CP-SAT solver."""
+    try:
+        return max(0, int(getattr(solver, method_name)()))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _record_solver_result(
+    cp_model: Any,
+    solver: Any,
+    status_code: Any,
+    observations: list[dict[str, Any]],
+) -> SolverStatus:
+    """Record a native solve result before mapping it to the public status."""
+    status = _status_from_cp_code(cp_model, status_code)
+    observations.append(
+        {
+            "raw_status_name": _raw_status_name(solver, status_code),
+            "raw_status_code": _raw_status_code(status_code),
+            "wall_time_seconds": _safe_solver_nonnegative_float(solver, "WallTime"),
+            "user_time_seconds": _safe_solver_nonnegative_float(solver, "UserTime"),
+            "deterministic_time_seconds": _safe_solver_nonnegative_float(
+                solver, "DeterministicTime"
+            ),
+            "num_conflicts": _safe_solver_int(solver, "NumConflicts"),
+            "num_branches": _safe_solver_int(solver, "NumBranches"),
+            "objective_value": _safe_solver_float(solver, "ObjectiveValue"),
+            "best_objective_bound": _safe_solver_float(solver, "BestObjectiveBound"),
+        }
+    )
+    return status
+
+
+def _build_solver_statistics(
+    observations: Sequence[Mapping[str, Any]],
+) -> SolverStatistics | None:
+    """Project native solve observations into the bounded contract model."""
+    if not observations:
+        return None
+    last = observations[-1]
+    status_codes = [
+        code for code in (item.get("raw_status_code") for item in observations) if code is not None
+    ]
+    return SolverStatistics(
+        solve_calls=len(observations),
+        raw_status_name=last.get("raw_status_name"),
+        raw_status_code=last.get("raw_status_code"),
+        status_sequence=[str(item.get("raw_status_name") or "UNKNOWN") for item in observations],
+        status_code_sequence=status_codes,
+        wall_time_seconds=sum(float(item.get("wall_time_seconds") or 0.0) for item in observations),
+        user_time_seconds=sum(float(item.get("user_time_seconds") or 0.0) for item in observations),
+        deterministic_time_seconds=sum(
+            float(item.get("deterministic_time_seconds") or 0.0) for item in observations
+        ),
+        num_conflicts=sum(int(item.get("num_conflicts") or 0) for item in observations),
+        num_branches=sum(int(item.get("num_branches") or 0) for item in observations),
+        objective_value=last.get("objective_value"),
+        best_objective_bound=last.get("best_objective_bound"),
+    )
+
+
+def _add_statistics_diagnostic(diagnostics: list[str], statistics: SolverStatistics | None) -> None:
+    """Add one concise native status summary to the bounded diagnostics."""
+    if statistics is None:
+        return
+    _diagnostic(
+        diagnostics,
+        "CP-SAT raw status "
+        f"{statistics.raw_status_name} (code={statistics.raw_status_code}, "
+        f"calls={statistics.solve_calls})",
+    )
+
+
 def _solve_lexicographic(
     cp_model: Any,
     base_model: Any,
@@ -674,6 +853,7 @@ def _solve_lexicographic(
     timeout_seconds: float,
     accepted_feasible: bool,
     project: Callable[[Any, int, SolverStatus], tuple[SolverCandidatePlan, dict[str, int]]],
+    observations: list[dict[str, Any]],
 ) -> tuple[list[SolverCandidatePlan], SolverStatus | None]:
     """Enumerate top-K assignments with exact bounded lexicographic stages."""
     candidate_plans: list[SolverCandidatePlan] = []
@@ -699,7 +879,8 @@ def _solve_lexicographic(
             else:
                 model.Minimize(expression)
             solver.parameters.max_time_in_seconds = max(0.001, remaining)
-            status = _status_from_cp_code(cp_model, solver.Solve(model))
+            status_code = solver.Solve(model)
+            status = _record_solver_result(cp_model, solver, status_code, observations)
             if status == SolverStatus.FEASIBLE:
                 aggregate_status = SolverStatus.FEASIBLE
             elif status == SolverStatus.OPTIMAL and aggregate_status is None:
@@ -735,6 +916,12 @@ def _solve_lexicographic(
     return candidate_plans, aggregate_status
 
 
+@traceable(
+    name="portfolio_solver",
+    run_type="chain",
+    process_inputs=_trace_solver_inputs,
+    process_outputs=_trace_solver_outputs,
+)
 def solve_portfolio(
     subgraph: SolverSubgraph,
     candidate_domains: Mapping[str, Sequence[SolverVersionCandidate]],
@@ -1122,6 +1309,7 @@ def solve_portfolio(
     top_k = max(1, int(_setting(settings, "solver_top_k", 3)))
     candidate_plans: list[SolverCandidatePlan] = []
     first_status: SolverStatus | None = None
+    observations: list[dict[str, Any]] = []
     weighted_deadline = time.monotonic() + max(
         0.001, float(_setting(settings, "solver_timeout_seconds", 10))
     )
@@ -1163,6 +1351,7 @@ def solve_portfolio(
                 timeout_seconds=float(_setting(settings, "solver_timeout_seconds", 10)),
                 accepted_feasible=accepted_feasible,
                 project=project,
+                observations=observations,
             )
         else:
             for alternative_index in range(top_k):
@@ -1170,7 +1359,8 @@ def solve_portfolio(
                 if remaining <= 0 and candidate_plans:
                     break
                 solver.parameters.max_time_in_seconds = max(0.001, remaining)
-                status = _status_from_cp_code(cp_model, solver.Solve(model))
+                status_code = solver.Solve(model)
+                status = _record_solver_result(cp_model, solver, status_code, observations)
                 if first_status is None:
                     first_status = status
                 elif (
@@ -1181,6 +1371,8 @@ def solve_portfolio(
                     first_status = SolverStatus.FEASIBLE
                 if status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}:
                     if not candidate_plans:
+                        solver_statistics = _build_solver_statistics(observations)
+                        _add_statistics_diagnostic(diagnostics, solver_statistics)
                         return SolverRemediationPlan(
                             status=status,
                             input_digest=input_digest,
@@ -1189,6 +1381,7 @@ def solve_portfolio(
                             task_revisions=revisions,
                             unresolved_finding_ids=[finding.finding_id for finding in finding_list],
                             diagnostics=diagnostics,
+                            solver_statistics=solver_statistics,
                         )
                     break
                 if status == SolverStatus.FEASIBLE and not accepted_feasible:
@@ -1197,6 +1390,8 @@ def solve_portfolio(
                     )
                     if candidate_plans:
                         break
+                    solver_statistics = _build_solver_statistics(observations)
+                    _add_statistics_diagnostic(diagnostics, solver_statistics)
                     return SolverRemediationPlan(
                         status=SolverStatus.UNKNOWN,
                         input_digest=input_digest,
@@ -1205,6 +1400,7 @@ def solve_portfolio(
                         task_revisions=revisions,
                         unresolved_finding_ids=[finding.finding_id for finding in finding_list],
                         diagnostics=diagnostics,
+                        solver_statistics=solver_statistics,
                     )
                 candidate, selected_indices = project(solver, alternative_index, status)
                 candidate_plans.append(candidate)
@@ -1216,6 +1412,8 @@ def solve_portfolio(
                 )
     except Exception as exc:  # pragma: no cover - native CP-SAT failures are environment-specific
         _diagnostic(diagnostics, f"native CP-SAT error: {exc}")
+        solver_statistics = _build_solver_statistics(observations)
+        _add_statistics_diagnostic(diagnostics, solver_statistics)
         return SolverRemediationPlan(
             status=SolverStatus.FALLBACK,
             input_digest=input_digest,
@@ -1224,9 +1422,12 @@ def solve_portfolio(
             task_revisions=revisions,
             unresolved_finding_ids=[finding.finding_id for finding in finding_list],
             diagnostics=diagnostics,
+            solver_statistics=solver_statistics,
         )
 
     final_status = first_status or SolverStatus.UNKNOWN
+    solver_statistics = _build_solver_statistics(observations)
+    _add_statistics_diagnostic(diagnostics, solver_statistics)
     selected_plan = (
         candidate_plans[0]
         if final_status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
@@ -1246,6 +1447,7 @@ def solve_portfolio(
             else [finding.finding_id for finding in finding_list]
         ),
         diagnostics=diagnostics,
+        solver_statistics=solver_statistics,
     )
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ def build_phase5_runnable_config(
     repo_root: str,
     valid_groups: list[VulnerabilityGroup],
     settings=None,
+    target_packages: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, uuid.UUID | None]:
     """
     Build a RunnableConfig-like dict for the Phase 5 orchestrator.
@@ -49,16 +51,24 @@ def build_phase5_runnable_config(
         return None, None
 
     run_id = uuid.uuid4()
+    metadata = {
+        "repo_name": Path(repo_root).name,
+        "repo_root": repo_root,
+        "vulnerability_group_count": len(valid_groups),
+        "max_tool_call_rounds": MAX_SUBAGENT_TOOL_CALL_ROUNDS,
+    }
+    if target_packages:
+        metadata.update(
+            {
+                "target_packages": list(target_packages),
+                "target_package_scope_enabled": True,
+            }
+        )
     config: dict[str, Any] = {
         "run_id": run_id,
         "run_name": _PHASE5_RUN_NAME,
         "tags": list(_PHASE5_TAGS),
-        "metadata": {
-            "repo_name": Path(repo_root).name,
-            "repo_root": repo_root,
-            "vulnerability_group_count": len(valid_groups),
-            "max_tool_call_rounds": MAX_SUBAGENT_TOOL_CALL_ROUNDS,
-        },
+        "metadata": metadata,
     }
     return config, run_id
 
@@ -78,3 +88,38 @@ def resolve_phase5_trace_url(run_id: uuid.UUID) -> str | None:
     except Exception as exc:  # pragma: no cover - defensive logging path
         log.warning("Phase 5 LangSmith URL lookup failed for run_id=%s: %s", run_id, exc)
         return None
+
+
+def mark_phase5_trace_failed(run_id: uuid.UUID | str, error: BaseException | str) -> None:
+    """Close an interrupted Phase 5 root run as an error in LangSmith.
+
+    Args:
+        run_id: LangSmith root run identifier.
+        error: Exception or diagnostic that interrupted the graph.
+
+    Raises:
+        Exception: Propagates LangSmith client errors to the caller, which
+            should treat this as best-effort cleanup and preserve the original
+            orchestration error.
+    """
+    message = str(error).strip() or type(error).__name__
+    settings = get_runtime_settings()
+    client_kwargs: dict[str, Any] = {
+        # This is an emergency terminal update.  Do not enqueue it behind the
+        # normal tracing worker, which may be the work that was interrupted.
+        "auto_batch_tracing": False,
+        # Keep interruption cleanup bounded so a LangSmith outage cannot keep
+        # the CLI process alive after the graph has already stopped.
+        "timeout_ms": (2_000, 5_000),
+    }
+    if settings.langsmith_endpoint:
+        client_kwargs["api_url"] = settings.langsmith_endpoint
+    if settings.langsmith_api_key:
+        client_kwargs["api_key"] = settings.langsmith_api_key
+    client = Client(**client_kwargs)
+    client.update_run(
+        run_id,
+        end_time=datetime.now(UTC),
+        error=message,
+        outputs={"status": "completed_with_errors", "error": message},
+    )

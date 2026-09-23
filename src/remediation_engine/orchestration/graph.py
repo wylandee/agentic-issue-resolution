@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,7 @@ from remediation_engine.orchestration.graph_wrappers import (
 )
 from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
+    mark_phase5_trace_failed,
     resolve_phase5_trace_url,
 )
 from remediation_engine.orchestration.portfolio_orchestrator import (
@@ -104,8 +106,11 @@ from remediation_engine.orchestration.runtime_context import (
 )
 from remediation_engine.orchestration.state import (
     OrchestratorState,
+    filter_groups_to_target_packages,
+    filter_issues_to_target_packages,
     initial_orchestrator_state,
     normalize_group_paths,
+    validate_target_package_scope,
 )
 from remediation_engine.orchestration.supervisor_node import (
     instruction_digest,
@@ -135,6 +140,15 @@ from remediation_engine.triage.pipeline import run_triage_pipeline
 log = logging.getLogger(__name__)
 
 MAX_PORTFOLIO_REPLAN_ATTEMPTS = 3
+MAX_PORTFOLIO_ITERATIONS = 12
+
+
+def _error_text(error: BaseException | str | None) -> str:
+    """Return a non-empty diagnostic for ordinary and message-less errors."""
+    if error is None:
+        return ""
+    text = str(error).strip()
+    return text or type(error).__name__
 
 
 __all__ = [
@@ -147,6 +161,7 @@ __all__ = [
     "route_after_final_full_scan",
     "run_portfolio_node",
     "run_orchestrator",
+    "MAX_PORTFOLIO_ITERATIONS",
     "triage_node",
     # Compatibility exports for the extracted wrapper implementation.
     "_create_workspace_attempt_snapshot",
@@ -329,7 +344,10 @@ def _post_triage_issue_input(
                     retained_non_odc.append(issue)
                     seen_issue_fingerprints.add(fingerprint)
 
-    return retained_non_odc + post_scan_issues
+    return filter_issues_to_target_packages(
+        retained_non_odc + post_scan_issues,
+        state.get("target_packages", []),
+    )
 
 
 _worker_result_value = model_or_dict_value
@@ -607,6 +625,10 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
                 settings=bound_settings,
             )
         candidate_groups = [group for group, triage_result in results if triage_result.is_valid]
+        candidate_groups = filter_groups_to_target_packages(
+            candidate_groups,
+            state.get("target_packages", []),
+        )
         valid_groups, reconciliation = _reconcile_triaged_groups(
             state,
             candidate_groups,
@@ -789,6 +811,30 @@ def _portfolio_replan_request(state: OrchestratorState) -> PortfolioReplanReques
         return None
 
 
+def _stable_portfolio_replan_reason(reason: str) -> str:
+    """Normalize volatile identifiers before using a replan reason as a key.
+
+    Portfolio IDs and task revisions are expected to change when a plan is
+    rebuilt.  They therefore cannot distinguish progress from a repeated
+    request.  The user-facing request keeps its full diagnostic text; only the
+    internal history key is normalized and sorted.
+    """
+    normalized = re.sub(
+        r"portfolio plan '[^']+' differs from committed '[^']+'",
+        "portfolio plan differs from committed",
+        reason,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"is older than committed planned revision \d+ \(current=\d+\)",
+        "is older than committed planned revision",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    clauses = [re.sub(r"\s+", " ", clause).strip() for clause in normalized.split(";")]
+    return "; ".join(sorted(clause for clause in clauses if clause))
+
+
 def _record_portfolio_replan_attempt(
     state: OrchestratorState,
     request: PortfolioReplanRequest | None,
@@ -812,22 +858,26 @@ def _record_portfolio_replan_attempt(
     for raw_reason, raw_count in dict(state.get("portfolio_replan_history", {}) or {}).items():
         if not isinstance(raw_reason, str):
             continue
+        reason_key = _stable_portfolio_replan_reason(raw_reason)
         try:
-            history[raw_reason] = max(0, int(raw_count))
+            history[reason_key] = max(history.get(reason_key, 0), int(raw_count))
         except (TypeError, ValueError):
-            history[raw_reason] = 0
+            history.setdefault(reason_key, 0)
     if request is None:
         return history, None
 
     reason = request.reason.strip() or "PORTFOLIO_REPLAN"
-    attempts = history.get(reason, 0)
-    if attempts >= MAX_PORTFOLIO_REPLAN_ATTEMPTS:
+    reason_key = _stable_portfolio_replan_reason(reason)
+    attempts = history.get(reason_key, 0)
+    portfolio_iteration = int(state.get("portfolio_iteration", 0) or 0)
+    if attempts >= MAX_PORTFOLIO_REPLAN_ATTEMPTS or portfolio_iteration >= MAX_PORTFOLIO_ITERATIONS:
         return (
             history,
             "portfolio replan guard: refusing another portfolio iteration after "
-            f"{attempts} identical requests (reason={reason!r}).",
+            f"{attempts} identical requests or {portfolio_iteration} total iterations "
+            f"(reason={reason!r}).",
         )
-    history[reason] = attempts + 1
+    history[reason_key] = attempts + 1
     return history, None
 
 
@@ -865,6 +915,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             state["repo_root"],
             state.get("valid_groups", []),
             dict(state.get("task_queue", {}) or {}),
+            target_packages=state.get("target_packages", []),
         )
         if prepared_groups and not any(
             group.issue_type == IssueType.SCA for group in prepared_groups
@@ -890,6 +941,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             state["repo_root"],
             prepared_groups,
             prepared_queue,
+            target_packages=state.get("target_packages", []),
             peer_conflict_pairs=peer_conflict_pairs,
             forced_singleton_task_ids=forced_singletons,
             settings=settings,
@@ -1043,6 +1095,54 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "errors": [f"portfolio plan application failed: {exc}"],
         }
     diagnostics = sorted(set(diagnostics) | set(apply_diagnostics))
+    deferred_active_task_ids = sorted(
+        task_id
+        for task_id, task in prepared_queue.items()
+        if task.current_attempt_id is not None
+        and any(
+            diagnostic == f"task {task_id!r} has an active attempt; plan decision not applied"
+            for diagnostic in apply_diagnostics
+        )
+    )
+    if deferred_active_task_ids:
+        # Applying the plan to only the tasks without live attempts would
+        # create a mixed-generation portfolio: the plan revision would advance
+        # while the active tasks still point at the previous plan.  Preserve the
+        # previous committed plan and send control back to Supervisor so the
+        # attempt-tagged worker/QA envelopes can be reconciled first.
+        reconcile_reason = (
+            "portfolio plan application deferred until active attempts are reconciled: "
+            f"{', '.join(deferred_active_task_ids)}"
+        )
+        reconcile_request = request or PortfolioReplanRequest(
+            reason=reconcile_reason,
+            source_portfolio_plan_id=(
+                getattr(plan, "portfolio_plan_id", None) or getattr(plan, "plan_id", None)
+            ),
+        )
+        active_attempt_task_ids = [
+            task_id
+            for task_id, task in prepared_queue.items()
+            if task.current_attempt_id is not None and task.status not in TERMINAL_TASK_STATUSES
+        ]
+        return {
+            "status": "portfolio_reconciliation_required",
+            "next_routing_step": "supervisor",
+            "portfolio_plan": state.get("portfolio_plan"),
+            "portfolio_solver_plan": state.get("portfolio_solver_plan"),
+            "portfolio_iteration": iteration,
+            "portfolio_replan_request": reconcile_request,
+            "portfolio_replan_history": replan_history,
+            "portfolio_dirty": True,
+            "portfolio_escalation": state.get("portfolio_escalation"),
+            "valid_groups": prepared_groups,
+            "task_queue": prepared_queue,
+            "active_target_task_ids": active_attempt_task_ids,
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+            "errors": [*diagnostics, reconcile_reason],
+        }
     return {
         "status": "portfolio_ready",
         "next_routing_step": "supervisor",
@@ -1064,8 +1164,16 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
 
 
 def route_after_portfolio(state: OrchestratorState) -> str:
-    """Route only validated, dispatchable portfolio plans to the Supervisor."""
-    return "supervisor" if state.get("status") == "portfolio_ready" else "teardown"
+    """Route ready plans and attempt-reconciliation states to the Supervisor."""
+    return (
+        "supervisor"
+        if state.get("status")
+        in {
+            "portfolio_ready",
+            "portfolio_reconciliation_required",
+        }
+        else "teardown"
+    )
 
 
 def route_after_final_full_scan(state: OrchestratorState) -> str:
@@ -1134,6 +1242,7 @@ def run_orchestrator(
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
     settings: AppSettings | None = None,
+    target_packages: list[str] | None = None,
 ) -> OrchestratorState:
     """Run the Phase 5 graph and return its final state.
 
@@ -1144,6 +1253,8 @@ def run_orchestrator(
         system_context: Optional deployment context for triage and QA.
         settings: Optional validated application settings used by report
             finalization; environment settings are used when omitted.
+        target_packages: Optional development-only package allowlist. An empty
+            value preserves full-repository portfolio discovery.
 
     Returns:
         The final graph state, including trajectory and report metadata when
@@ -1154,13 +1265,23 @@ def run_orchestrator(
             trajectory export, preserving the existing public behavior.
     """
     settings = settings or AppSettings.from_env()
+    normalized_target_packages = validate_target_package_scope(
+        target_packages,
+        system_context,
+    )
     initial_state = initial_orchestrator_state(
         repo_root=repo_root,
         valid_groups=valid_groups,
         issues=issues,
         system_context=system_context,
+        target_packages=normalized_target_packages,
     )
-    config, run_id = build_phase5_runnable_config(repo_root, valid_groups, settings=settings)
+    config, run_id = build_phase5_runnable_config(
+        repo_root,
+        valid_groups,
+        target_packages=normalized_target_packages,
+        settings=settings,
+    )
     recorder = TrajectoryRecorder()
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
@@ -1174,6 +1295,7 @@ def run_orchestrator(
                 "repo_name": Path(repo_root).name,
                 "repo_root": repo_root,
                 "vulnerability_group_count": len(valid_groups),
+                "target_packages": normalized_target_packages,
             },
             "callbacks": [recorder],
         }
@@ -1189,6 +1311,8 @@ def run_orchestrator(
     result: OrchestratorState | None = None
     run_error: BaseException | None = None
     trace_url: str | None = None
+    interrupted_trace_closed = False
+    planned_trajectory_path = build_phase5_trajectory_path(trace_id)
     try:
         with use_runtime_settings(settings), use_trajectory_recorder(recorder):
             result = orchestrator_engine.invoke(initial_state, runnable_config)
@@ -1199,12 +1323,54 @@ def run_orchestrator(
                 result["langsmith_trace_url"] = trace_url
     except BaseException as exc:
         run_error = exc
+        # Persist a minimal local snapshot before doing any network cleanup.
+        # This is intentionally inside the exception handler: if the caller
+        # sends another interrupt while the normal finally block is running,
+        # the diagnostic artifact already exists.
+        interrupted_state = {
+            **initial_state,
+            "status": "completed_with_errors",
+            "errors": [
+                *list(initial_state.get("errors", []) or []),
+                f"orchestrator interrupted before report phase: {_error_text(exc)}",
+            ],
+            "trajectory_path": str(planned_trajectory_path),
+        }
+        try:
+            export_phase5_trajectory(
+                trace_id=trace_id,
+                repo_root=repo_root,
+                initial_state=initial_state,
+                final_state=interrupted_state,
+                recorder=recorder,
+                langsmith_enabled=False,
+                run_error=exc,
+                output_path=planned_trajectory_path,
+            )
+        except BaseException as export_error:  # noqa: BLE001 - preserve the original interrupt
+            log.warning(
+                "run_orchestrator: failed to persist early interruption trajectory: %s",
+                export_error,
+            )
+        if langsmith_enabled and run_id is not None:
+            try:
+                with use_runtime_settings(settings):
+                    mark_phase5_trace_failed(run_id, exc)
+                interrupted_trace_closed = True
+            except BaseException as trace_error:  # noqa: BLE001 - preserve original interrupt
+                log.warning(
+                    "run_orchestrator: failed to close interrupted LangSmith run %s: %s",
+                    run_id,
+                    trace_error,
+                )
         raise
     finally:
         if result is None:
             fallback_errors = list(initial_state.get("errors", []) or [])
             if run_error is not None:
-                fallback_errors.append(f"orchestrator failed before report phase: {run_error}")
+                fallback_errors.append(
+                    f"orchestrator failed before report phase: {_error_text(run_error)}"
+                )
             else:
                 fallback_errors.append("orchestrator produced no final state before report phase")
             result = {
@@ -1225,7 +1391,6 @@ def run_orchestrator(
                 result.setdefault("errors", []).append(
                     f"report_node fallback failed: {report_node_error}"
                 )
-        planned_trajectory_path = build_phase5_trajectory_path(trace_id)
         if result is not None:
             result.setdefault("report_markdown", "")
             result.setdefault("report_path", None)
@@ -1264,12 +1429,27 @@ def run_orchestrator(
         recorder.record_manual(
             name="phase5.root_output",
             run_type="state",
-            inputs={"error": str(run_error)} if run_error else None,
+            inputs={"error": _error_text(run_error)} if run_error else None,
             outputs=result
             if result is not None
-            else {"error": str(run_error) if run_error else "no result"},
+            else {"error": _error_text(run_error) if run_error else "no result"},
             error=run_error,
         )
+        if (
+            run_error is not None
+            and langsmith_enabled
+            and run_id is not None
+            and not interrupted_trace_closed
+        ):
+            try:
+                with use_runtime_settings(settings):
+                    mark_phase5_trace_failed(run_id, run_error)
+            except BaseException as trace_error:  # noqa: BLE001 - preserve original failure
+                log.warning(
+                    "run_orchestrator: failed to close interrupted LangSmith run %s: %s",
+                    run_id,
+                    trace_error,
+                )
         try:
             trajectory_path = export_phase5_trajectory(
                 trace_id=trace_id,
@@ -1277,9 +1457,13 @@ def run_orchestrator(
                 initial_state=initial_state,
                 final_state=result
                 if result is not None
-                else {"error": str(run_error) if run_error else "no result"},
+                else {"error": _error_text(run_error) if run_error else "no result"},
                 recorder=recorder,
-                langsmith_enabled=langsmith_enabled,
+                # An interrupted/error run is explicitly finalized above;
+                # fetching remote spans here would wait on the very pending
+                # root run that caused the interruption.  The local snapshot
+                # is already complete and should be exported immediately.
+                langsmith_enabled=langsmith_enabled and run_error is None,
                 langsmith_url=trace_url,
                 run_error=run_error,
                 output_path=planned_trajectory_path,

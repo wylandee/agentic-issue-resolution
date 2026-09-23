@@ -365,6 +365,54 @@ def _is_hard_overflow_cluster(cluster: Any) -> bool:
     return str(getattr(cluster, "reason", "")).lower().startswith("hard atomic component exceeds ")
 
 
+def _recover_active_target_task_ids(
+    active_target_task_ids: Iterable[str],
+    task_queue: dict[str, RemediationTask],
+    worker_results_by_attempt: dict[str, WorkerAttemptResult],
+    qa_results_by_attempt: dict[str, QAAttemptResult],
+    processed_worker_attempt_ids: set[str],
+    processed_qa_attempt_ids: set[str],
+) -> list[str]:
+    """Restore active task handles for unprocessed attempt-tagged results.
+
+    The active-target list is a dispatch projection, not the source of truth
+    for attempt results.  A portfolio replan can legitimately rebuild that
+    projection while a worker or QA envelope is still buffered in state.  In
+    that case the current task attempt is the only safe join key: recovering
+    by task ID alone could attach a stale result to a newer attempt.
+
+    Args:
+        active_target_task_ids: Task IDs carried by the prior graph node.
+        task_queue: Detached authoritative task projection for this pass.
+        worker_results_by_attempt: Attempt-correlated worker results.
+        qa_results_by_attempt: Attempt-correlated QA results.
+        processed_worker_attempt_ids: Worker envelopes already consumed.
+        processed_qa_attempt_ids: QA envelopes already consumed.
+
+    Returns:
+        The original active IDs followed by task IDs whose current attempt has
+        an unprocessed worker or QA envelope.  Ordering is stable and IDs are
+        unique.
+    """
+    recovered = list(dict.fromkeys(active_target_task_ids))
+    known_ids = set(recovered)
+    for task_id, task in task_queue.items():
+        attempt_id = task.current_attempt_id
+        if not attempt_id or task_id in known_ids:
+            continue
+        worker_pending = (
+            attempt_id in worker_results_by_attempt
+            and attempt_id not in processed_worker_attempt_ids
+        )
+        qa_pending = (
+            attempt_id in qa_results_by_attempt and attempt_id not in processed_qa_attempt_ids
+        )
+        if worker_pending or qa_pending:
+            recovered.append(task_id)
+            known_ids.add(task_id)
+    return recovered
+
+
 def _portfolio_plan_violations(
     plan: Any,
     task_queue: dict[str, RemediationTask],
@@ -1125,7 +1173,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     task_queue: dict[str, RemediationTask] = {
         task_id: task.model_copy() for task_id, task in raw_task_queue.items()
     }
-    active_target_task_ids = list(state.get("active_target_task_ids") or [])
+    active_target_task_ids = _recover_active_target_task_ids(
+        state.get("active_target_task_ids") or [],
+        task_queue,
+        worker_results_by_attempt,
+        qa_results_by_attempt,
+        processed_worker_attempt_ids,
+        processed_qa_attempt_ids,
+    )
     committed_plan = state.get("portfolio_plan")
     has_sca_groups = any(group.issue_type == IssueType.SCA for group in valid_groups)
     plan_violations = (
@@ -1138,7 +1193,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if has_sca_groups or committed_plan is not None
         else []
     )
-    if plan_violations:
+    # Attempt-tagged worker/QA envelopes must be consumed before a stale outer
+    # plan can trigger another portfolio iteration.  The previous ordering
+    # returned here with an empty active-target projection, so a result from a
+    # task whose attempt survived a portfolio replan was never ingested.
+    has_open_attempt = any(
+        task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
+        for task in task_queue.values()
+    )
+    if plan_violations and not has_open_attempt:
         source_plan_id = (
             getattr(committed_plan, "portfolio_plan_id", None)
             if committed_plan is not None
@@ -1257,11 +1320,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 or snapshot is None
                 or (snapshot is not None and snapshot.task_revision != result.task_revision)
                 or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
-                or (
-                    committed_plan is not None
-                    and snapshot is not None
-                    and snapshot.portfolio_plan_id != committed_plan.portfolio_plan_id
-                )
                 or result.instruction_digest != snapshot.instruction_digest
                 or (snapshot_cluster_id is not None and result.cluster_id != snapshot_cluster_id)
                 or (snapshot_batch_id is not None and result.dispatch_batch_id != snapshot_batch_id)
@@ -1705,11 +1763,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             or snapshot is None
             or (snapshot is not None and snapshot.task_revision != qa_result.task_revision)
             or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
-            or (
-                committed_plan is not None
-                and snapshot is not None
-                and snapshot.portfolio_plan_id != committed_plan.portfolio_plan_id
-            )
             or (snapshot_cluster_id is not None and qa_result.cluster_id != snapshot_cluster_id)
             or (snapshot_batch_id is not None and qa_result.dispatch_batch_id != snapshot_batch_id)
             or (
@@ -2210,11 +2263,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # 6b. Deterministic authority boundary
     # ------------------------------------------------------------------
+    # A live attempt anywhere in the queue blocks an outer replan.  Looking
+    # only at active_target_task_ids is unsafe because portfolio nodes may
+    # clear that projection while leaving the immutable task attempt open.
     active_attempt_is_open = any(
-        (task_queue.get(task_id) is not None)
-        and task_queue[task_id].current_attempt_id is not None
-        and task_queue[task_id].status not in _TERMINAL_STATUSES
-        for task_id in active_target_task_ids
+        task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
+        for task in task_queue.values()
     )
     portfolio_replan_required = bool(
         state.get("portfolio_plan") is not None
@@ -2349,7 +2403,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 if t_id not in known_task_ids:
                     continue
                 task = task_queue[t_id]
-                if task.status in _TERMINAL_STATUSES or task.status not in _WORKABLE_STATUSES:
+                if (
+                    task.status in _TERMINAL_STATUSES
+                    or task.status not in _WORKABLE_STATUSES
+                    or task.current_attempt_id is not None
+                ):
                     continue
                 if task.strategy == RoutingStrategy.CODE_WORKAROUND or t_id in raw_pivot_parent_ids:
                     valid_target_ids.append(t_id)

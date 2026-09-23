@@ -52,6 +52,11 @@ _TERMINAL_STATUSES = frozenset(
 )
 _SUPPORTED_MANAGERS = frozenset({"", "npm"})
 _NAMESPACE_PREFIXES = ("@angular/", "@nestjs/")
+# A development scope may cross a workspace boundary or add a peer whose
+# currently selected target would otherwise violate its declared range. A
+# namespace is not a dependency constraint, and a compatible peer is only
+# validation evidence; neither should create another mutation task.
+_SCOPED_CLOSURE_RELATIONSHIPS = frozenset({"workspace", "peer"})
 _EDGE_KIND_PRIORITY = {
     TaskDependencyKind.PEER: 0,
     TaskDependencyKind.WORKSPACE: 1,
@@ -343,6 +348,15 @@ def _metadata_dependency_names(metadata: dict[str, Any], section: str) -> set[st
     return {str(name).strip() for name in values if str(name).strip()}
 
 
+def _is_optional_peer(metadata: dict[str, Any], package_name: str) -> bool:
+    """Return whether a lockfile peer declaration is marked optional."""
+    peer_metadata = metadata.get("peerDependenciesMeta", {})
+    if not isinstance(peer_metadata, dict):
+        return False
+    details = peer_metadata.get(package_name)
+    return isinstance(details, dict) and details.get("optional") is True
+
+
 def _same_workspace_occurrence(
     left_manifest: str,
     right_manifest: str,
@@ -412,7 +426,12 @@ def _dependency_relationships(
         metadata = lockfile_packages.get(record.key, {})
         for section in _LOCKFILE_DEPENDENCY_SECTIONS:
             for dependency_name in sorted(_metadata_dependency_names(metadata, section)):
-                relationship = "peer" if section == "peerDependencies" else "runtime"
+                if section != "peerDependencies":
+                    relationship = "runtime"
+                elif _is_optional_peer(metadata, dependency_name):
+                    relationship = "optional_peer"
+                else:
+                    relationship = "peer"
                 for dependency_record in records_by_name.get(dependency_name, []):
                     if not _same_workspace_occurrence(
                         record.manifest_path,
@@ -442,6 +461,112 @@ def _dependency_relationships(
     return relationships
 
 
+def _peer_requires_synchronized_target(
+    left: tuple[str, str],
+    right: tuple[str, str],
+    records: dict[tuple[str, str], _DependencyRecord],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    target_versions: dict[tuple[str, str], set[str]],
+) -> bool:
+    """Return whether a peer edge requires a second mutation target.
+
+    A direct peer is coordination-relevant only when a known selected version
+    falls outside the peer range.  This deliberately treats optional peers as
+    installed compatibility constraints without recursively expanding their
+    optional dependency universe.  A peer whose current version already
+    satisfies the selected target remains validation-only and is not promoted
+    into the development mutation scope.
+
+    Args:
+        left: One manifest/package occurrence in the relationship graph.
+        right: The other occurrence in the relationship graph.
+        records: Direct manifest dependency records keyed by occurrence.
+        lockfile_packages: Lockfile metadata keyed by occurrence.
+        target_versions: Selected versions already known for scoped occurrences.
+
+    Returns:
+        ``True`` when one endpoint's selected target is outside the other
+        endpoint's declared peer range; otherwise ``False``.
+    """
+    for source_key, peer_key in ((left, right), (right, left)):
+        versions = target_versions.get(peer_key, set())
+        if not versions:
+            continue
+        metadata = lockfile_packages.get(source_key, {})
+        peer_dependencies = metadata.get("peerDependencies", {})
+        if not isinstance(peer_dependencies, dict):
+            continue
+        peer_name = records[peer_key].package_name
+        if _is_optional_peer(metadata, peer_name):
+            # Optional peers are compatibility evidence for npm/QA, not a
+            # reason to expand the requested mutation scope.
+            continue
+        required_range = peer_dependencies.get(peer_name)
+        if not isinstance(required_range, str) or not required_range.strip():
+            continue
+        results = [_npm_range_contains(required_range.strip(), version) for version in versions]
+        if any(result is False for result in results):
+            return True
+    return False
+
+
+def _scoped_dependency_keys(
+    records: dict[tuple[str, str], _DependencyRecord],
+    relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    target_packages: set[str],
+    seed_versions: dict[tuple[str, str], set[str]],
+) -> set[tuple[str, str]]:
+    """Return the mutation closure for a development package scope.
+
+    The closure starts at explicitly requested direct dependencies.  It keeps
+    workspace coordination and adds peer occurrences only when a selected
+    target version is outside the peer's declared range.  Namespace membership
+    and already-compatible peers remain outside the mutation graph.
+
+    Args:
+        records: Direct manifest dependency records keyed by occurrence.
+        relationships: Undirected occurrence relationship graph.
+        lockfile_packages: Lockfile metadata keyed by occurrence.
+        target_packages: Explicit development package allowlist.
+        seed_versions: Supervisor-selected versions for finding-backed seeds.
+
+    Returns:
+        Direct occurrence keys allowed to become finding or coordination tasks.
+    """
+    seeds = {key for key, record in records.items() if record.package_name in target_packages}
+    allowed = set(seeds)
+    known_versions = {
+        key: set(versions) for key, versions in seed_versions.items() if key in seeds and versions
+    }
+    pending = list(sorted(seeds))
+    while pending:
+        key = pending.pop(0)
+        for neighbor, kinds in sorted(relationships.get(key, {}).items()):
+            if neighbor in allowed:
+                continue
+            include = "workspace" in kinds
+            if not include and "peer" in kinds:
+                include = _peer_requires_synchronized_target(
+                    key,
+                    neighbor,
+                    records,
+                    lockfile_packages,
+                    known_versions,
+                )
+            if not include:
+                continue
+            allowed.add(neighbor)
+            # Propagate the alignment hint through a newly required peer so a
+            # second exact-peer hop can be discovered deterministically. The
+            # existing synthetic target validation still refuses an unsafe
+            # inherited version when its other peer requirements disagree.
+            if key in known_versions and neighbor not in known_versions:
+                known_versions[neighbor] = set(known_versions[key])
+            pending.append(neighbor)
+    return allowed
+
+
 def _synthetic_issue_id(manifest_path: str, package_name: str) -> UUID:
     """Return a stable UUID for a no-CVE coordination finding."""
     return uuid5(
@@ -460,6 +585,7 @@ def _synthetic_target_version(
     inherited_version: str | None,
     relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]],
     lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    coordinated_keys: set[tuple[str, str]] | None = None,
 ) -> str | None:
     """Choose a deterministic target hint for one synthetic dependency.
 
@@ -471,10 +597,11 @@ def _synthetic_target_version(
     runtime relationships affect ordering but must not copy one package's
     fixed version onto another package.
 
-    If lockfile peer metadata says an inherited version is outside the package's
-    required range, retain the currently resolved version when it satisfies
-    every peer requirement. Returning ``None`` prevents an unsafe exact
-    mutation.
+    When a scoped peer component is synchronized, peer ranges from another
+    member of that component describe the old installed generation. They are
+    skipped here and enforced later against the complete solver candidate set.
+    Ranges from packages outside the component remain validation constraints;
+    a current version is retained only when it satisfies those requirements.
     """
     current_version = record.resolved_version
     relationship_kinds = {
@@ -489,11 +616,17 @@ def _synthetic_target_version(
     requirements: list[str] = []
     for neighbor in relationships.get(record.key, {}):
         metadata = lockfile_packages.get(neighbor, {})
+        if coordinated_keys is not None and neighbor in coordinated_keys:
+            continue
         peer_dependencies = metadata.get("peerDependencies", {})
         if not isinstance(peer_dependencies, dict):
             continue
         required_range = peer_dependencies.get(record.package_name)
-        if isinstance(required_range, str) and required_range.strip():
+        if (
+            isinstance(required_range, str)
+            and required_range.strip()
+            and not _is_optional_peer(metadata, record.package_name)
+        ):
             requirements.append(required_range.strip())
     if not requirements:
         return inherited_version
@@ -594,20 +727,26 @@ def materialize_synthetic_dependency_tasks(
     repo_root: str | Path,
     groups: Iterable[VulnerabilityGroup],
     task_queue: dict[str, RemediationTask],
+    target_packages: Iterable[str] | None = None,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
     """Create package tasks for direct dependencies without CVEs.
 
-    The helper is intentionally called by the Supervisor after finding-backed
-    tasks have been materialized. It never queries a registry or chooses a new
-    security version. A synthetic task uses the resolved manifest/lockfile
-    version as a coordination-only target, except when a connected
-    namespace/workspace/peer package supplies one compatible Supervisor-
-    committed target.
+    The helper is intentionally called at the outer Portfolio Orchestrator
+    boundary after finding-backed tasks have been materialized. It never
+    queries a registry or chooses a new security version. A synthetic task
+    uses the resolved manifest/lockfile version as a coordination-only target.
+    In development scope, only a workspace package or a peer whose selected
+    version would become incompatible is materialized alongside the requested
+    package.
 
     Args:
         repo_root: Repository containing npm manifests and optional lockfiles.
         groups: Current triage groups, including previously materialized synthetic groups.
         task_queue: Supervisor-owned task queue used to identify active seeds.
+        target_packages: Optional development package allowlist. When present,
+            only matching direct dependencies and their required mutation
+            closure are materialized. ``None`` or an empty iterable retains
+            full-repository behavior.
 
     Returns:
         A tuple containing the augmented groups, a copy-on-write task queue, and
@@ -626,42 +765,93 @@ def materialize_synthetic_dependency_tasks(
 
     relationships = _dependency_relationships(records, manifests, lockfile_packages)
     records_by_key = records
-    groups_by_id = {
+    initial_groups_by_id = {
         group.group_id: group for group in group_list if group.issue_type == IssueType.SCA
     }
+
+    scoped_packages = {
+        value.strip()
+        for value in (target_packages or ())
+        if isinstance(value, str) and value.strip()
+    }
+
     seed_versions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    seed_keys = {
+        key for key, record in records_by_key.items() if record.package_name in scoped_packages
+    }
     for task in task_queue.values():
-        group = groups_by_id.get(task.parent_group_id)
+        group = initial_groups_by_id.get(task.parent_group_id)
         if group is None or group.is_synthetic or task.strategy != RoutingStrategy.VERSION_BUMP:
             continue
         target_version = (task.selected_version or "").strip()
         package_name = (group.vulnerable_component or "").strip()
         manifest_path = _group_manifest_path(group, root)
         key = (manifest_path, package_name)
-        if key in records_by_key and target_version:
+        if (not scoped_packages or key in seed_keys) and target_version:
             seed_versions[key].add(target_version)
 
+    if scoped_packages:
+        all_keys = sorted(
+            _scoped_dependency_keys(
+                records_by_key,
+                relationships,
+                lockfile_packages,
+                scoped_packages,
+                seed_versions,
+            )
+        )
+    else:
+        all_keys = sorted(records_by_key)
+
+    # A scoped replan must not retain synthetic tasks that were materialized by
+    # an earlier, broader portfolio iteration. Finding-backed target groups are
+    # retained only when their occurrence remains inside the scoped mutation
+    # closure; non-SCA groups continue through the normal source-remediation
+    # path.
+    if scoped_packages:
+        allowed_group_ids = {
+            group.group_id
+            for group in group_list
+            if group.issue_type != IssueType.SCA
+            or (
+                _group_manifest_path(group, root),
+                (group.vulnerable_component or "").strip(),
+            )
+            in set(all_keys)
+        }
+        group_list = [group for group in group_list if group.group_id in allowed_group_ids]
+        groups_by_id = {
+            group.group_id: group for group in group_list if group.issue_type == IssueType.SCA
+        }
+    else:
+        groups_by_id = initial_groups_by_id
+
     # Find alignment components deterministically. Every direct dependency
-    # record is eligible for a synthetic package occurrence, including an
-    # isolated package with no CVE-backed seed. Only namespace, workspace, and
-    # peer relationships can inherit a finding-backed version; plain runtime
-    # relationships affect ordering but must retain each package's resolved
-    # version as a no-op coordination target.
-    all_keys = sorted(records_by_key)
+    # record is eligible for a synthetic package occurrence in full-repository
+    # mode. In a development scope, namespace membership is intentionally not
+    # an alignment relationship: only an actual workspace or peer constraint
+    # can synchronize a selected version.
     diagnostics: list[str] = []
     _alignment_parent, (alignment_find, alignment_union) = _union_find(all_keys)
+    alignment_relationships = (
+        _SCOPED_CLOSURE_RELATIONSHIPS if scoped_packages else {"namespace", "workspace", "peer"}
+    )
     for left in all_keys:
         for right, kinds in relationships.get(left, {}).items():
-            if kinds & {"namespace", "workspace", "peer"}:
+            if right in all_keys and kinds & alignment_relationships:
                 alignment_union(left, right)
     alignment_components: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for key in all_keys:
         alignment_components[alignment_find(key)].append(key)
     alignment_targets: dict[tuple[str, str], str] = {}
+    coordinated_component_by_key: dict[tuple[str, str], set[tuple[str, str]]] = {}
     for component in sorted(
         (tuple(sorted(values)) for values in alignment_components.values()),
         key=lambda value: value[0],
     ):
+        component_keys = set(component)
+        for key in component:
+            coordinated_component_by_key[key] = component_keys
         seeded = [key for key in component if key in seed_versions]
         versions = sorted({version for key in seeded for version in seed_versions[key]})
         if len(versions) == 1:
@@ -674,7 +864,14 @@ def materialize_synthetic_dependency_tasks(
             )
 
     augmented_groups = list(group_list)
-    augmented_queue = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    if scoped_packages:
+        augmented_queue = {
+            task_id: task.model_copy()
+            for task_id, task in task_queue.items()
+            if task.parent_group_id in {group.group_id for group in augmented_groups}
+        }
+    else:
+        augmented_queue = {task_id: task.model_copy() for task_id, task in task_queue.items()}
     next_task_index = 1
 
     def allocate_task_id() -> str:
@@ -722,6 +919,7 @@ def materialize_synthetic_dependency_tasks(
             inherited_version,
             relationships,
             lockfile_packages,
+            coordinated_keys=(coordinated_component_by_key.get(key) if scoped_packages else None),
         )
         if target_version is None:
             reason = (
@@ -1583,9 +1781,28 @@ def prepare_portfolio_inputs(
     repo_root: str | Path,
     groups: Iterable[VulnerabilityGroup],
     task_queue: dict[str, RemediationTask],
+    target_packages: Iterable[str] | None = None,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
-    """Prepare the outer portfolio inputs using detached task/group objects."""
-    return _prepare_solver_portfolio_inputs(repo_root, groups, task_queue)
+    """Prepare the outer portfolio inputs using detached task/group objects.
+
+    Args:
+        repo_root: Repository whose manifests and lockfiles define the portfolio
+            scope.
+        groups: Post-triage vulnerability groups to prepare.
+        task_queue: Existing task projection to copy before preparation.
+        target_packages: Optional development package allowlist. When supplied,
+            synthetic dependency discovery is restricted to the selected
+            packages and their coordination closure.
+
+    Returns:
+        Detached prepared groups, task queue, and preparation diagnostics.
+    """
+    return _prepare_solver_portfolio_inputs(
+        repo_root,
+        groups,
+        task_queue,
+        target_packages=target_packages,
+    )
 
 
 def build_portfolio_plan(
@@ -1593,17 +1810,34 @@ def build_portfolio_plan(
     groups: Iterable[VulnerabilityGroup],
     task_queue: dict[str, RemediationTask],
     *,
+    target_packages: Iterable[str] | None = None,
     peer_conflict_pairs: Iterable[tuple[str, str]] = (),
     forced_singleton_task_ids: Iterable[str] = (),
     settings: Any | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: Any | None = None,
 ) -> PortfolioPlan:
-    """Build the solver-backed portfolio plan at the stable public boundary."""
+    """Build the solver-backed portfolio plan at the stable public boundary.
+
+    Args:
+        repo_root: Repository whose manifests and lockfiles define the graph.
+        groups: Prepared vulnerability and coordination groups.
+        task_queue: Supervisor-owned task projection.
+        target_packages: Optional development package scope.
+        peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
+        forced_singleton_task_ids: Tasks that must remain singleton batches.
+        settings: Solver and registry settings.
+        portfolio_iteration: Current outer portfolio iteration.
+        portfolio_replan_request: Optional Supervisor replan constraints.
+
+    Returns:
+        An immutable solver-backed portfolio plan.
+    """
     return _build_solver_portfolio_plan(
         repo_root,
         groups,
         task_queue,
+        target_packages=target_packages,
         peer_conflict_pairs=peer_conflict_pairs,
         forced_singleton_task_ids=forced_singleton_task_ids,
         settings=settings,

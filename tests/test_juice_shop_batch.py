@@ -324,6 +324,10 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
 
         assert len(summaries) == 2
         assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            request = call.args[0]
+            assert request.target_packages == sorted(request.target_packages)
+            assert request.system_context.environment == "development"
         for s in summaries:
             assert s.status == "completed"
             assert s.changed_files == ["package.json", "package-lock.json"]
@@ -338,3 +342,37 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
             assert (
                 patch_file.read_text(encoding="utf-8") == "--- a/package.json\n+++ b/package.json\n"
             )
+
+
+def test_run_batch_accepts_one_explicit_development_package_batch(tmp_path: Path) -> None:
+    """An explicit package list bypasses sampling and scopes the request."""
+    repo_dir = tmp_path / "juice-shop"
+    repo_dir.mkdir()
+    baseline_file = tmp_path / "baseline_issues.jsonl"
+    baseline_file.write_text(_SAMPLE_ISSUES_JSONL, encoding="utf-8")
+    suppressed_issues_file = tmp_path / "odc_suppressed_issues.jsonl"
+    suppressions_file = tmp_path / "suppressions.xml"
+    suppressions_file.write_text(_SAMPLE_SUPPRESSIONS_XML, encoding="utf-8")
+    output_dir = tmp_path / "trajectories"
+    mock_result = RemediationResult(status="completed", errors=[])
+
+    with patch(
+        "examples.juice_shop.run_batch.run_remediation", return_value=mock_result
+    ) as mock_run:
+        summaries = run_batch(
+            iterations=10,
+            batch_size=3,
+            target_packages=["cookie", "@angular/common"],
+            repo_root=repo_dir,
+            baseline_path=baseline_file,
+            suppressed_issues_path=suppressed_issues_file,
+            suppressions_xml_path=suppressions_file,
+            output_dir=output_dir,
+        )
+
+    assert len(summaries) == 1
+    assert summaries[0].selected_packages == ["@angular/common", "cookie"]
+    assert mock_run.call_count == 1
+    request = mock_run.call_args.args[0]
+    assert request.target_packages == ["@angular/common", "cookie"]
+    assert request.system_context.environment == "development"

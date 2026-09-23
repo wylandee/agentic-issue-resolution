@@ -108,16 +108,99 @@ class TestToolbeltFactories:
                 execution_state=execution_state,
             )
             tool_map = {tool.name: tool for tool in tools}
-            result = tool_map["apply_committed_multi_package_action"].invoke({})
-            repeated = tool_map["apply_committed_multi_package_action"].invoke({})
+            result = tool_map["modify_batch_npm_dependencies"].invoke({})
+            repeated = tool_map["modify_batch_npm_dependencies"].invoke({})
 
-        assert set(tool_map) == {"apply_committed_multi_package_action"}
+        assert set(tool_map) == {"modify_batch_npm_dependencies"}
         assert result.startswith("SUCCESS:")
         assert execution_state["multi_package_action_executed"] is True
         assert execution_state["multi_package_action_succeeded"] is True
         assert repeated.startswith("ERROR_CODE: MULTI_PACKAGE_ACTION_ALREADY_EXECUTED:")
         apply_action.assert_called_once()
         assert apply_action.call_args.args[:3] == (sandbox, action, set())
+
+    def test_multi_package_transaction_syncs_lockfile_cleanly_without_positional_specs(self):
+        from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
+        sandbox = MagicMock()
+        baseline_manifest = json.dumps({"dependencies": {"lodash": "4.17.20", "axios": "1.7.3"}})
+        updated_manifest = json.dumps({"dependencies": {"lodash": "4.17.21", "axios": "1.7.4"}})
+        baseline_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.20"},
+                    "node_modules/axios": {"version": "1.7.3"},
+                },
+            }
+        )
+        updated_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.21"},
+                    "node_modules/axios": {"version": "1.7.4"},
+                },
+            }
+        )
+        edited = False
+
+        def run(command: str, timeout: float | None = None) -> CommandResult:
+            nonlocal edited
+            if "npm pkg set" in command:
+                edited = True
+            return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+        def read_file(path: str) -> str | None:
+            if path == "frontend/package.json":
+                return updated_manifest if edited else baseline_manifest
+            if path == "frontend/package-lock.json":
+                return updated_lockfile if edited else baseline_lockfile
+            return None
+
+        sandbox.run.side_effect = run
+        sandbox.read_file.side_effect = read_file
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-lodash",
+                    package_name="lodash",
+                    manifest_path="frontend/package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-axios",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Update peer-related direct dependencies together.",
+        )
+        touched_files: set[str] = set()
+
+        succeeded, error = apply_multi_package_action(sandbox, action, touched_files)
+
+        assert succeeded is True
+        assert error == ""
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        sync_commands = [command for command in commands if "npm install" in command]
+        assert len(sync_commands) == 2
+        assert sum("--dry-run" in command for command in sync_commands) == 1
+        assert all("--legacy-peer-deps" in command for command in sync_commands)
+        assert all("--no-audit" in command for command in sync_commands)
+        assert all("--no-fund" in command for command in sync_commands)
+        assert not any("axios" in command for command in sync_commands)
+        assert not any("lodash" in command for command in sync_commands)
+        assert sync_commands[1] == (
+            "cd /workspace/frontend && npm install --package-lock-only --ignore-scripts "
+            "--legacy-peer-deps --no-audit --no-fund"
+        )
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -616,11 +699,17 @@ class TestModifyAndValidateNpmDependency:
         assert "dependencies" in result
         assert "4.17.21" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
-        edit_command, sync_command = [call.args[0] for call in sandbox.run.call_args_list]
+        assert sandbox.run.call_count == 3
+        edit_command, preflight_command, sync_command = [
+            call.args[0] for call in sandbox.run.call_args_list
+        ]
         assert "npm pkg set" in edit_command
         assert "cd /workspace/frontend" in edit_command
-        assert "npm install --package-lock-only --ignore-scripts" in sync_command
+        assert "npm install --package-lock-only --ignore-scripts" in preflight_command
+        assert "--dry-run" in preflight_command
+        assert "--legacy-peer-deps" in preflight_command
+        assert "--dry-run" not in sync_command
+        assert "--legacy-peer-deps" in sync_command
 
     def test_nested_manifest_validates_its_own_lockfile_not_root_lockfile(self):
         from remediation_engine.orchestration.tools_manifest import (
@@ -703,7 +792,7 @@ class TestModifyAndValidateNpmDependency:
         assert result.startswith("SUCCESS:")
         assert "frontend/package.json" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
+        assert sandbox.run.call_count == 3
 
     def test_rejects_unknown_package_name_for_batch(self):
         sandbox = MagicMock()
@@ -781,6 +870,7 @@ class TestModifyAndValidateNpmDependency:
         sandbox.run.side_effect = [
             success,
             failure,
+            success,
             success,
             success,
             success,
@@ -1039,7 +1129,7 @@ class TestCombinedManifestTransaction:
         assert axios_result.startswith("SUCCESS:")
         assert execution_state["validation_calls"] == 2
         assert execution_state["manifest_transaction_attempts"] == 2
-        assert sandbox.run.call_count == 4
+        assert sandbox.run.call_count == 6
 
     def test_success_runs_sync_for_each_manifest_directory(self):
         sandbox = MagicMock()
@@ -1069,10 +1159,13 @@ class TestCombinedManifestTransaction:
         )
 
         assert result.startswith("SUCCESS:")
-        assert sandbox.run.call_count == 3
+        assert sandbox.run.call_count == 5
         commands = [call.args[0] for call in sandbox.run.call_args_list]
         assert "npm pkg set" in commands[0]
         assert all("--package-lock-only --ignore-scripts" in cmd for cmd in commands[1:])
+        assert sum("--dry-run" in cmd for cmd in commands[1:]) == 2
+        assert sum("--dry-run" not in cmd for cmd in commands[1:]) == 2
+        assert all("--legacy-peer-deps" in cmd for cmd in commands[1:])
         assert any("cd /workspace/frontend" in cmd for cmd in commands[1:])
 
     def test_sync_failure_surfaces_stderr_and_restores_checkpoint(self):
@@ -1103,6 +1196,14 @@ class TestCombinedManifestTransaction:
         assert "partial" in result
         assert "Rollback" in result
         assert touched_files == set()
+        assert sandbox.run.call_count == 4
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert "npm pkg set" in commands[0]
+        assert "--dry-run" in commands[1]
+        assert "--legacy-peer-deps" in commands[1]
+        assert not any(
+            "npm install" in command and "--dry-run" not in command for command in commands
+        )
         sandbox.write_file.assert_called_once_with("package.json", baseline)
 
 

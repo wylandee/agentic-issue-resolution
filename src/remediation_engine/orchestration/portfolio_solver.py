@@ -137,6 +137,7 @@ def prepare_portfolio_inputs(
     repo_root: str | Path,
     groups: Iterable[VulnerabilityGroup],
     task_queue: Mapping[str, RemediationTask],
+    target_packages: Iterable[str] | None = None,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
     """Create missing finding tasks and synthetic direct-dependency tasks copy-on-write.
 
@@ -144,6 +145,8 @@ def prepare_portfolio_inputs(
         repo_root: Repository whose manifests and lockfiles define the portfolio scope.
         groups: Post-triage groups to prepare.
         task_queue: Existing immutable task projection.
+        target_packages: Optional development package allowlist. ``None`` or an
+            empty iterable preserves full-repository synthetic discovery.
 
     Returns:
         ``(groups, task_queue, diagnostics)`` containing detached Pydantic objects.
@@ -178,7 +181,12 @@ def prepare_portfolio_inputs(
         materialize_synthetic_dependency_tasks,
     )
 
-    return materialize_synthetic_dependency_tasks(repo_root, prepared_groups, prepared_queue)
+    return materialize_synthetic_dependency_tasks(
+        repo_root,
+        prepared_groups,
+        prepared_queue,
+        target_packages=target_packages,
+    )
 
 
 def _issue_identity(issue: Any) -> str:
@@ -829,13 +837,30 @@ def build_portfolio_plan(
     groups: Iterable[VulnerabilityGroup],
     task_queue: Mapping[str, RemediationTask],
     *,
+    target_packages: Iterable[str] | None = None,
     peer_conflict_pairs: Iterable[tuple[str, str]] = (),
     forced_singleton_task_ids: Iterable[str] = (),
     settings: AppSettings | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: PortfolioReplanRequest | None = None,
 ) -> Any:
-    """Build a complete solver-backed immutable PortfolioPlan projection."""
+    """Build a complete solver-backed immutable PortfolioPlan projection.
+
+    Args:
+        repo_root: Repository whose npm graph supplies occurrence metadata.
+        groups: Prepared vulnerability and coordination groups.
+        task_queue: Supervisor-owned task projection.
+        target_packages: Optional development package scope. Scoped plans do
+            not use namespace membership as atomic batch evidence.
+        peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
+        forced_singleton_task_ids: Tasks that must remain singleton batches.
+        settings: Solver and registry settings.
+        portfolio_iteration: Current outer portfolio iteration.
+        portfolio_replan_request: Optional Supervisor replan constraints.
+
+    Returns:
+        An immutable solver-backed portfolio plan.
+    """
     from remediation_engine.contracts.schemas import PortfolioPlan
 
     resolved_settings = settings or AppSettings()
@@ -889,6 +914,7 @@ def build_portfolio_plan(
         decisions,
         forced_singleton_task_ids=forced,
         peer_conflict_pairs=explicit_pairs,
+        scope_coupling=not bool(target_packages),
     )
     diagnostics.extend(cluster_diagnostics)
     dag = build_dependency_dag(subgraph, batches, edges)
@@ -918,6 +944,7 @@ def build_portfolio_plan(
         if decision is not None and str(decision.selected_strategy).lower().replace("-", "_") in {
             "code_workaround",
             "workaround",
+            "no_fix",
         }:
             task_strategies[task_id] = RoutingStrategy.CODE_WORKAROUND
         elif decision is not None and str(decision.selected_strategy).lower().replace("-", "_") in {
@@ -1044,6 +1071,10 @@ def apply_portfolio_plan(
         task = committed[task_id]
         decision = decisions.get(task_id)
         if decision is None:
+            if task.current_attempt_id is not None:
+                diagnostics.append(
+                    f"task {task_id!r} has an active attempt; plan decision not applied"
+                )
             continue
         group = groups_by_id.get(task.parent_group_id)
         if group is None:
@@ -1076,7 +1107,7 @@ def apply_portfolio_plan(
         decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")
         if decision_strategy in {"version_bump", "versionbump"}:
             updates["strategy"] = RoutingStrategy.VERSION_BUMP
-        elif decision_strategy in {"code_workaround", "workaround"}:
+        elif decision_strategy in {"code_workaround", "workaround", "no_fix"}:
             updates["strategy"] = RoutingStrategy.CODE_WORKAROUND
         if decision.selected_version is not None:
             updates["selected_version"] = decision.selected_version

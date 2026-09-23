@@ -15,6 +15,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     Severity,
+    SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -63,6 +64,24 @@ def test_request_rejects_file_as_repository_root(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="existing directory"):
         RemediationRequest(repo_root=file_path)
+
+
+def test_target_package_scope_is_development_only(tmp_path: Path) -> None:
+    """Package scoping is normalized and rejected for production requests."""
+    request = RemediationRequest(
+        repo_root=tmp_path,
+        target_packages=[" @angular/core", "@angular/core", "@angular/common "],
+        system_context=SystemContext(environment="development"),
+    )
+
+    assert request.target_packages == ["@angular/common", "@angular/core"]
+
+    with pytest.raises(ValueError, match="development-only"):
+        RemediationRequest(
+            repo_root=tmp_path,
+            target_packages=["@angular/core"],
+            system_context=SystemContext(environment="production"),
+        )
 
 
 def test_run_remediation_projects_orchestrator_state(tmp_path: Path) -> None:

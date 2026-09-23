@@ -370,11 +370,25 @@ def cluster_packages(
     *,
     forced_singleton_task_ids: Sequence[str] = (),
     peer_conflict_pairs: Sequence[tuple[str, str]] = (),
+    scope_coupling: bool = True,
 ) -> tuple[list[SolverBatch], list[SolverEdge], list[str]]:
     """Hard relationships are never split.  Same-scope relationships are soft
     coupling signals and may be partitioned at the configured action-size cap.
     Unsupported, terminal, and open-attempt tasks are preserved as singleton
-    diagnostics rather than silently dropped."""
+    diagnostics rather than silently dropped.
+
+    Args:
+        subgraph: Occurrence graph to cluster.
+        decisions: Solver decisions for the graph targets.
+        forced_singleton_task_ids: Tasks that must not join an atomic batch.
+        peer_conflict_pairs: Explicit peer-conflict pairs to couple.
+        scope_coupling: Whether same-package-scope targets may form a soft
+            batch. Development-scoped runs disable this because namespace
+            membership is not proof that packages must be mutated together.
+
+    Returns:
+        Solver batches, retained occurrence edges, and deterministic diagnostics.
+    """
     by_occurrence, by_task = _target_indexes(subgraph.targets)
     decision_by_task = _decision_indexes(decisions)
     finding_by_occurrence, _ = _finding_sets(subgraph)
@@ -445,6 +459,8 @@ def cluster_packages(
         key=lambda item: (item.source_occurrence_id, item.target_occurrence_id, item.edge_kind),
     ):
         left, right, kind = edge.source_occurrence_id, edge.target_occurrence_id, _edge_kind(edge)
+        if not scope_coupling and kind == "scope":
+            continue
         if left not in by_occurrence or right not in by_occurrence:
             continue
         hard_relation = (
@@ -457,15 +473,19 @@ def cluster_packages(
         )
         add_relation(left, right, kind, hard_relation)
 
-    # Dynamic scoped coupling is restricted to one manifest or one workspace.
-    ordered_targets = sorted(subgraph.targets, key=lambda item: item.occurrence_id)
-    for index, left in enumerate(ordered_targets):
-        left_scope = _scope(left.target_package_name)
-        if not left_scope:
-            continue
-        for right in ordered_targets[index + 1 :]:
-            if left_scope == _scope(right.target_package_name) and _boundary(left, right):
-                add_relation(left.occurrence_id, right.occurrence_id, "scope", False)
+    # Same-scope coupling is a conservative full-repository fallback. A
+    # development-scoped plan must rely on actual peer/workspace evidence so a
+    # target such as @angular/core cannot pull every @angular/* package into
+    # one atomic mutation.
+    if scope_coupling:
+        ordered_targets = sorted(subgraph.targets, key=lambda item: item.occurrence_id)
+        for index, left in enumerate(ordered_targets):
+            left_scope = _scope(left.target_package_name)
+            if not left_scope:
+                continue
+            for right in ordered_targets[index + 1 :]:
+                if left_scope == _scope(right.target_package_name) and _boundary(left, right):
+                    add_relation(left.occurrence_id, right.occurrence_id, "scope", False)
 
     for pair in sorted(peer_conflict_pairs):
         resolved = _resolve_pair(pair, by_occurrence, by_task)
@@ -597,6 +617,11 @@ def cluster_packages(
     # is bidirectional so SCC scheduling can diagnose non-peer coupling cycles.
     edge_map: dict[tuple[str, str, str], SolverEdge] = {}
     for edge in subgraph.edges:
+        if not scope_coupling and _edge_kind(edge) == "scope":
+            # The boundary extractor retains namespace edges for traceability,
+            # but development-scoped plans treat namespace membership as
+            # validation context rather than mutation or ordering evidence.
+            continue
         source = by_occurrence.get(edge.source_occurrence_id)
         target = by_occurrence.get(edge.target_occurrence_id)
         if source is None or target is None:

@@ -463,7 +463,7 @@ class TestUpdateSubagentWrapper:
                 content="execute the committed action",
                 tool_calls=[
                     {
-                        "name": "apply_committed_multi_package_action",
+                        "name": "modify_batch_npm_dependencies",
                         "args": {},
                         "id": "cluster-call-1",
                         "type": "tool_call",
@@ -493,10 +493,10 @@ class TestUpdateSubagentWrapper:
 
         assert bound.invoke.call_count == 2
         bound_tools = llm.bind_tools.call_args.args[0]
-        assert [tool.name for tool in bound_tools] == ["apply_committed_multi_package_action"]
+        assert [tool.name for tool in bound_tools] == ["modify_batch_npm_dependencies"]
         first_prompt = bound.invoke.call_args_list[0].args[0]
         assert "MULTI-PACKAGE CLUSTER EXECUTION" in first_prompt[-1].content
-        assert "apply_committed_multi_package_action" in first_prompt[-1].content
+        assert "modify_batch_npm_dependencies" in first_prompt[-1].content
         assert '"package_name":"lodash"' in first_prompt[-1].content
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert len(result["worker_results_by_attempt"]) == 2

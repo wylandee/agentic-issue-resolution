@@ -67,6 +67,15 @@ def _redact_string(value: str) -> str:
     return _SECRET_VALUE_RE.sub(replace, value)
 
 
+def _error_text(error: BaseException | str | None) -> str | None:
+    """Return a useful diagnostic even for exceptions with an empty message."""
+    if error is None:
+        return None
+    if isinstance(error, BaseException):
+        return str(error).strip() or type(error).__name__
+    return str(error).strip() or None
+
+
 def to_jsonable(value: Any, *, key: str | None = None) -> Any:
     """Convert common LangChain/Pydantic/runtime objects into safe JSON data."""
     if key and _SECRET_KEY_RE.search(key):
@@ -1062,7 +1071,7 @@ def _write_trajectory_markdown(
         source=source,
         langsmith_url=langsmith_url,
         warnings=warnings,
-        run_error=str(run_error) if run_error else None,
+        run_error=_error_text(run_error),
         trajectory_path=output_file,
     )
     temporary_path = output_file.with_suffix(".md.tmp")

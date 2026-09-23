@@ -619,6 +619,44 @@ class ArbitrationResult(_SolverModel):
         return _required_text(value, "input_digest")
 
 
+class SolverStatistics(_SolverModel):
+    """Bounded raw statistics collected from CP-SAT solve calls.
+
+    The solver may perform several calls while projecting a top-K
+    lexicographic result.  Keeping the status sequence and the final raw
+    status name makes ``UNKNOWN`` distinguishable from statuses such as
+    ``MODEL_INVALID`` that otherwise collapse into the public
+    :class:`SolverStatus.UNKNOWN` value.
+    """
+
+    solve_calls: int = Field(default=0, ge=0)
+    raw_status_name: str | None = None
+    raw_status_code: int | None = None
+    status_sequence: list[str] = Field(default_factory=list)
+    status_code_sequence: list[int] = Field(default_factory=list)
+    wall_time_seconds: float = Field(default=0.0, ge=0.0)
+    user_time_seconds: float = Field(default=0.0, ge=0.0)
+    deterministic_time_seconds: float = Field(default=0.0, ge=0.0)
+    num_conflicts: int = Field(default=0, ge=0)
+    num_branches: int = Field(default=0, ge=0)
+    objective_value: float | None = None
+    best_objective_bound: float | None = None
+
+    @field_validator("raw_status_name", mode="before")
+    @classmethod
+    def _status_name(cls, value: Any) -> str | None:
+        return _optional_text(value, "raw_status_name")
+
+    @field_validator("status_sequence", mode="before")
+    @classmethod
+    def _status_sequence(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("status_sequence must be a list of strings.")
+        return [_required_text(item, "status_sequence") for item in value]
+
+
 class SolverRemediationPlan(_SolverModel):
     """Complete solver output, including failures that must remain visible."""
 
@@ -630,6 +668,9 @@ class SolverRemediationPlan(_SolverModel):
     candidate_plans: list[SolverCandidatePlan] = Field(default_factory=list)
     selected_plan: SolverCandidatePlan | None = None
     arbitration: ArbitrationResult | None = None
+    # Runtime-only observability must not alter immutable plan identity or
+    # deterministic model serialization. The dedicated solver span records it.
+    solver_statistics: SolverStatistics | None = Field(default=None, exclude=True)
     unresolved_finding_ids: list[str] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
 
@@ -786,6 +827,7 @@ __all__ = [
     "SolverPlanStatus",
     "SolverRemediationPlan",
     "SolverStatus",
+    "SolverStatistics",
     "SolverSubgraph",
     "SolverTarget",
     "SolverTaskDecision",

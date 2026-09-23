@@ -140,6 +140,11 @@ def test_cp_sat_selects_smallest_security_floor_and_deterministic_alternative():
     assert result.selected_plan is not None
     assert result.selected_plan.task_decisions[0].selected_version == "1.2.0"
     assert len(result.candidate_plans) == 2
+    assert result.solver_statistics is not None
+    assert result.solver_statistics.solve_calls >= 1
+    assert result.solver_statistics.raw_status_name in {"OPTIMAL", "FEASIBLE"}
+    assert len(result.solver_statistics.status_sequence) == (result.solver_statistics.solve_calls)
+    assert any("CP-SAT raw status" in diagnostic for diagnostic in result.diagnostics)
 
 
 def test_forced_singleton_and_phase_budget_are_preserved():
@@ -297,6 +302,86 @@ def test_optional_peer_edges_do_not_form_atomic_batches():
     )
     assert diagnostics == []
     assert {tuple(batch.task_ids) for batch in batches} == {("task-1",), ("task-2",)}
+
+
+def test_scoped_clustering_does_not_use_namespace_as_atomic_evidence():
+    left = _target("task-1", "package.json::@angular/common").model_copy(
+        update={
+            "package_name": "@angular/common",
+            "target_package_name": "@angular/common",
+            "finding_ids": [],
+        }
+    )
+    right = _target("task-2", "package.json::@angular/core").model_copy(
+        update={
+            "package_name": "@angular/core",
+            "target_package_name": "@angular/core",
+            "finding_ids": [],
+        }
+    )
+    decisions = [
+        SolverTaskDecision(task_id=left.task_id, selected_version="21.2.17"),
+        SolverTaskDecision(task_id=right.task_id, selected_version="21.2.17"),
+    ]
+
+    batches, _edges, diagnostics = cluster_packages(
+        SolverSubgraph(
+            targets=[left, right],
+            edges=[
+                SolverEdge(
+                    source_occurrence_id=left.occurrence_id,
+                    target_occurrence_id=right.occurrence_id,
+                    edge_kind="scope",
+                    is_peer_coupling=True,
+                )
+            ],
+        ),
+        decisions,
+        scope_coupling=False,
+    )
+
+    assert diagnostics == []
+    assert {tuple(batch.task_ids) for batch in batches} == {("task-1",), ("task-2",)}
+
+
+def test_scoped_clustering_keeps_strict_peer_atomic():
+    left = _target("task-1", "package.json::@angular/common").model_copy(
+        update={
+            "package_name": "@angular/common",
+            "target_package_name": "@angular/common",
+            "finding_ids": [],
+        }
+    )
+    right = _target("task-2", "package.json::@angular/core").model_copy(
+        update={
+            "package_name": "@angular/core",
+            "target_package_name": "@angular/core",
+            "finding_ids": [],
+        }
+    )
+
+    batches, _edges, diagnostics = cluster_packages(
+        SolverSubgraph(
+            targets=[left, right],
+            edges=[
+                SolverEdge(
+                    source_occurrence_id=left.occurrence_id,
+                    target_occurrence_id=right.occurrence_id,
+                    edge_kind="peer",
+                    version_range="21.2.17",
+                )
+            ],
+        ),
+        [
+            SolverTaskDecision(task_id=left.task_id, selected_version="21.2.17"),
+            SolverTaskDecision(task_id=right.task_id, selected_version="21.2.17"),
+        ],
+        scope_coupling=False,
+    )
+
+    assert diagnostics == []
+    assert len(batches) == 1
+    assert set(batches[0].task_ids) == {"task-1", "task-2"}
 
 
 def test_workaround_target_projects_authorized_plan_ids():

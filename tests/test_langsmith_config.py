@@ -12,9 +12,11 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
+    mark_phase5_trace_failed,
     resolve_phase5_trace_url,
 )
 from remediation_engine.orchestration.subagent_runtime import MAX_SUBAGENT_TOOL_CALL_ROUNDS
+from remediation_engine.settings import AppSettings
 
 
 def _group() -> VulnerabilityGroup:
@@ -123,3 +125,32 @@ class TestPhase5TraceUrlResolution:
 
         assert result is None
         mock_wait.assert_called_once_with()
+
+
+class TestPhase5TraceFailure:
+    @patch("remediation_engine.orchestration.langsmith_config.Client")
+    @patch("remediation_engine.orchestration.langsmith_config.get_runtime_settings")
+    def test_interrupted_trace_update_is_direct_and_bounded(
+        self, mock_get_settings, mock_client_cls
+    ):
+        run_id = uuid4()
+        mock_get_settings.return_value = AppSettings(
+            langsmith_endpoint="https://apac.api.smith.langchain.com/",
+            langsmith_api_key="test-key",
+        )
+
+        mark_phase5_trace_failed(run_id, KeyboardInterrupt())
+
+        mock_client_cls.assert_called_once_with(
+            api_url="https://apac.api.smith.langchain.com/",
+            api_key="test-key",
+            auto_batch_tracing=False,
+            timeout_ms=(2_000, 5_000),
+        )
+        mock_client_cls.return_value.update_run.assert_called_once()
+        update_kwargs = mock_client_cls.return_value.update_run.call_args.kwargs
+        assert update_kwargs["error"] == "KeyboardInterrupt"
+        assert update_kwargs["outputs"] == {
+            "status": "completed_with_errors",
+            "error": "KeyboardInterrupt",
+        }

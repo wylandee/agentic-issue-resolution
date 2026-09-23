@@ -206,27 +206,58 @@ def _verify_lockfile_mutations(
 def _sync_package_manifests(
     sandbox: DockerSandbox,
     manifest_paths: Sequence[str],
+    package_specs_by_manifest: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[bool, str]:
-    """Synchronize all manifests belonging to one package target."""
-    for manifest_path in manifest_paths:
+    """Validate and synchronize package manifests.
+
+    Args:
+        sandbox: Running Docker workspace sandbox.
+        manifest_paths: Repository-relative manifests to synchronize.
+        package_specs_by_manifest: Optional legacy parameter retained for compatibility.
+
+    Returns:
+        ``(True, "")`` when every synchronization succeeds, otherwise a
+        stable tool error and ``False``.
+    """
+    del package_specs_by_manifest
+
+    def build_command(manifest_path: str, *, dry_run: bool) -> str:
+        """Build one deterministic npm manifest validation or sync command."""
+        npm_args = [
+            "npm",
+            "install",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund",
+        ]
+        if dry_run:
+            npm_args.append("--dry-run")
         workspace_dir = _workspace_dir_for_manifest(manifest_path)
-        cmd = f"cd {shlex.quote(workspace_dir)} && npm install --package-lock-only --ignore-scripts"
-        try:
-            result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001
-            return False, _tool_error(
-                "MANIFEST_SYNC_FAILED",
-                f"Manifest sync failed for {manifest_path}: {exc}",
-            )
-        if result.exit_code != 0:
-            return False, _tool_error(
-                "MANIFEST_SYNC_FAILED",
-                (
-                    f"Manifest sync failed for {manifest_path} (exit {result.exit_code}). "
-                    f"stdout: {_bounded_command_output(result.stdout)}; "
-                    f"stderr: {_bounded_command_output(result.stderr)}"
-                ),
-            )
+        return f"cd {shlex.quote(workspace_dir)} && {shlex.join(npm_args)}"
+
+    for manifest_path in manifest_paths:
+        for dry_run in (True, False):
+            cmd = build_command(manifest_path, dry_run=dry_run)
+            phase = "preflight validation" if dry_run else "synchronization"
+            try:
+                result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                return False, _tool_error(
+                    "MANIFEST_SYNC_FAILED",
+                    f"Manifest {phase} failed for {manifest_path}: {exc}",
+                )
+            if result.exit_code != 0:
+                return False, _tool_error(
+                    "MANIFEST_SYNC_FAILED",
+                    (
+                        f"Manifest {phase} failed for {manifest_path} "
+                        f"(exit {result.exit_code}). "
+                        f"stdout: {_bounded_command_output(result.stdout)}; "
+                        f"stderr: {_bounded_command_output(result.stderr)}"
+                    ),
+                )
     return True, ""
 
 
@@ -284,7 +315,10 @@ def apply_multi_package_action(
             touched_files.add(rel_manifest)
 
         for manifest_path in manifest_paths:
-            synchronized, error = _sync_package_manifests(sandbox, [manifest_path])
+            synchronized, error = _sync_package_manifests(
+                sandbox,
+                [manifest_path],
+            )
             if not synchronized:
                 raise RuntimeError(error)
 
@@ -323,14 +357,14 @@ def apply_multi_package_action(
         return False, f"Multi-package action failed: {exc}.{suffix}"
 
 
-def _make_apply_committed_multi_package_action_tool(
+def _make_modify_batch_npm_dependencies_tool(
     sandbox: DockerSandbox,
     action: MultiPackageAction,
     touched_files: set[str],
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
 ) -> Any:
-    """Build the sole LLM tool for a Supervisor-committed cluster action.
+    """Build the sole LLM tool for a Supervisor-committed dependency batch.
 
     The action is captured in the tool closure. The model can request its
     execution, but cannot provide package names, versions, dependency types,
@@ -353,8 +387,8 @@ def _make_apply_committed_multi_package_action_tool(
         execution_state = {}
 
     @tool
-    def apply_committed_multi_package_action() -> str:
-        """Apply the complete Supervisor-committed multi-package action once."""
+    def modify_batch_npm_dependencies() -> str:
+        """Modify and synchronize the complete committed npm batch once."""
         if execution_state.get("multi_package_action_executed"):
             return _tool_error(
                 "MULTI_PACKAGE_ACTION_ALREADY_EXECUTED",
@@ -392,7 +426,7 @@ def _make_apply_committed_multi_package_action_tool(
             error or "The committed multi-package action failed and was rolled back.",
         )
 
-    return apply_committed_multi_package_action
+    return modify_batch_npm_dependencies
 
 
 def _make_modify_and_validate_npm_dependency_tool(

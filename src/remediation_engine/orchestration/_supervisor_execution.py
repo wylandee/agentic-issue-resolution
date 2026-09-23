@@ -648,6 +648,7 @@ def _impl__update_worker_task_ids(
     dispatchable = [
         task_id
         for task_id in task_ids
+        if task_queue[task_id].current_attempt_id is None
         if not _is_exhausted_update_pivot_candidate(
             task_queue[task_id],
             retry_diagnostics_by_task.get(task_id),
@@ -692,14 +693,17 @@ def _impl__normalize_target_task_ids_for_node(
             group_by_id=group_by_id,
         )
     if next_node == "workaround_subagent":
-        return _dispatchable_task_ids_for_status(
-            task_queue,
-            set(_dependency("_WORKABLE_STATUSES", _DEFAULT_WORKABLE_STATUSES)),
-            preferred_ids=target_task_ids,
-            strategy=RoutingStrategy.CODE_WORKAROUND,
-            limit=1,
-            group_by_id=group_by_id,
-        )
+        return [
+            task_id
+            for task_id in _dispatchable_task_ids_for_status(
+                task_queue,
+                set(_dependency("_WORKABLE_STATUSES", _DEFAULT_WORKABLE_STATUSES)),
+                preferred_ids=target_task_ids,
+                strategy=RoutingStrategy.CODE_WORKAROUND,
+                group_by_id=group_by_id,
+            )
+            if task_queue[task_id].current_attempt_id is None
+        ][:1]
     return []
 
 

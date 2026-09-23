@@ -37,8 +37,8 @@ from .tools_edit import (
 from .tools_manifest import (
     _is_allowlisted_no_fix_package_file,
     _is_prohibited_target,
-    _make_apply_committed_multi_package_action_tool,
     _make_modify_and_validate_npm_dependency_tool,
+    _make_modify_batch_npm_dependencies_tool,
     _make_remove_no_fix_dependency_tool,
     _package_checkpoint_paths,
     _PackageCheckpoint,
@@ -121,7 +121,7 @@ def build_multi_package_update_toolbelt(
         A one-tool list for the bounded update-subagent loop.
     """
     return [
-        _make_apply_committed_multi_package_action_tool(
+        _make_modify_batch_npm_dependencies_tool(
             sandbox,
             action,
             touched_files,

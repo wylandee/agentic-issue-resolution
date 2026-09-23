@@ -54,7 +54,7 @@ from remediation_engine.tools.repository_map import build_repository_map
 logger = logging.getLogger(__name__)
 
 _UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
-_MULTI_PACKAGE_ACTION_TOOL_NAME = "apply_committed_multi_package_action"
+_BATCH_NPM_DEPENDENCIES_TOOL_NAME = "modify_batch_npm_dependencies"
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -367,7 +367,7 @@ It owns candidate generation, version selection, dependency types, retry plannin
 task routing, and cluster membership. Your only job is to execute that committed
 action in the Docker workspace.
 
-You have exactly one tool: apply_committed_multi_package_action. Call it exactly
+You have exactly one tool: modify_batch_npm_dependencies. Call it exactly
 once, with no arguments. The tool applies every package mutation in the committed
 action, synchronizes each affected npm manifest, validates the requested results,
 and rolls back the complete cluster if any step fails.
@@ -416,7 +416,7 @@ def _build_multi_package_update_prompt(
             "The following immutable action is the only action you may execute:",
             action.model_dump_json(),
             "",
-            f"Invoke {_MULTI_PACKAGE_ACTION_TOOL_NAME} exactly once with no arguments.",
+            f"Invoke {_BATCH_NPM_DEPENDENCIES_TOOL_NAME} exactly once with no arguments.",
             "The tool is the only permitted mutation path and applies all listed package mutations atomically.",
             "",
             task_context,
@@ -1223,7 +1223,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 action_tool_events = [
                     event
                     for event in runtime.tool_events
-                    if event.name == _MULTI_PACKAGE_ACTION_TOOL_NAME
+                    if event.name == _BATCH_NPM_DEPENDENCIES_TOOL_NAME
                 ]
                 action_executed = bool(
                     execution_state.get("multi_package_action_executed") or action_tool_events

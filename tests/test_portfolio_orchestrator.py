@@ -29,6 +29,7 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
     build_portfolio_plan,
     isolate_delta_failure,
     materialize_synthetic_dependency_tasks,
+    prepare_portfolio_inputs,
 )
 from remediation_engine.orchestration.portfolio_solver import _issue_identity
 from remediation_engine.orchestration.qa_test_parsing import parse_peer_conflict_evidence
@@ -39,10 +40,17 @@ from remediation_engine.orchestration.supervisor_node import (
 )
 from remediation_engine.orchestration.supervisor_routing import _portfolio_cluster_targets
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.tools.npm_graph import make_occurrence_id
 from remediation_engine.triage.grouper import group_issues
 
 
-def _group(package_name: str, manifest_path: str, *, cve_id: str | None = None):
+def _group(
+    package_name: str,
+    manifest_path: str,
+    *,
+    cve_id: str | None = None,
+    fixed_version: str = "2.0.0",
+):
     issue = VulnerabilityIssue(
         source=IssueSource.SYNTHETIC,
         issue_type=IssueType.SCA,
@@ -68,7 +76,7 @@ def _group(package_name: str, manifest_path: str, *, cve_id: str | None = None):
     )
     plan = FixPlan(
         status=FixPlanStatus.VERSION_FOUND,
-        fixed_version="2.0.0",
+        fixed_version=fixed_version,
         instruction=f"Update {package_name}.",
         strategy_used="osv_api",
     )
@@ -305,6 +313,341 @@ def test_unflagged_direct_dependency_gets_a_synthetic_task_without_a_seed(tmp_pa
     assert synthetic_task.parent_group_id == synthetic.group_id
 
 
+def test_scoped_materialization_excludes_unrelated_direct_dependencies(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "flagged-package": "1.0.0",
+                "selected-package": "2.0.0",
+                "unrelated-package": "3.0.0",
+            },
+        },
+    )
+    flagged = _group("flagged-package", "package.json")
+
+    groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
+        tmp_path,
+        [flagged],
+        _tasks(flagged),
+        target_packages=["flagged-package", "selected-package"],
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in groups} == {
+        "flagged-package",
+        "selected-package",
+    }
+    assert {task.parent_group_id for task in queue.values()} == {
+        "sca:package.json:flagged-package",
+        "sca:package.json:selected-package",
+    }
+
+
+def test_prepare_portfolio_inputs_forwards_target_package_scope(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "selected-package": "1.0.0",
+                "unrelated-package": "2.0.0",
+            },
+        },
+    )
+    selected = _group("selected-package", "package.json")
+
+    groups, queue, diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        [selected],
+        _tasks(selected),
+        target_packages=["selected-package"],
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in groups} == {"selected-package"}
+    assert {task.parent_group_id for task in queue.values()} == {
+        "sca:package.json:selected-package",
+    }
+
+
+def test_scoped_materialization_keeps_compatible_peer_validation_only(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "selected-package": "1.0.0",
+                "required-peer": "1.0.0",
+                "unrelated-package": "1.0.0",
+            },
+        },
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/selected-package": {
+                    "version": "1.0.0",
+                    "peerDependencies": {"required-peer": "^1.0.0"},
+                },
+                "node_modules/required-peer": {"version": "1.0.0"},
+                "node_modules/unrelated-package": {"version": "1.0.0"},
+            },
+        },
+    )
+    selected = _group("selected-package", "package.json")
+
+    groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
+        tmp_path,
+        [selected],
+        _tasks(selected),
+        target_packages=["selected-package"],
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in groups} == {"selected-package"}
+    assert {task.parent_group_id for task in queue.values()} == {
+        "sca:package.json:selected-package",
+    }
+
+
+def test_scoped_materialization_includes_peer_when_target_breaks_required_range(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "selected-package": "1.0.0",
+                "required-peer": "1.0.0",
+                "unrelated-package": "1.0.0",
+            },
+        },
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/selected-package": {"version": "1.0.0"},
+                "node_modules/required-peer": {
+                    "version": "1.0.0",
+                    "peerDependencies": {"selected-package": "^1.0.0"},
+                },
+                "node_modules/unrelated-package": {"version": "1.0.0"},
+            },
+        },
+    )
+    selected = _group("selected-package", "package.json")
+
+    groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
+        tmp_path,
+        [selected],
+        _tasks(selected),
+        target_packages=["selected-package"],
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in groups} == {
+        "selected-package",
+        "required-peer",
+    }
+    assert "sca:package.json:unrelated-package" not in {
+        task.parent_group_id for task in queue.values()
+    }
+
+
+def test_scoped_materialization_does_not_expand_optional_peer(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "selected-package": "1.0.0",
+                "optional-peer": "1.0.0",
+            },
+        },
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/selected-package": {
+                    "version": "1.0.0",
+                    "peerDependencies": {"optional-peer": "^1.0.0"},
+                    "peerDependenciesMeta": {"optional-peer": {"optional": True}},
+                },
+                "node_modules/optional-peer": {"version": "1.0.0"},
+            },
+        },
+    )
+    selected = _group("selected-package", "package.json")
+
+    groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
+        tmp_path,
+        [selected],
+        _tasks(selected),
+        target_packages=["selected-package"],
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in groups} == {"selected-package"}
+    assert {task.parent_group_id for task in queue.values()} == {
+        "sca:package.json:selected-package",
+    }
+
+
+def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
+    angular_packages = [
+        "@angular/animations",
+        "@angular/common",
+        "@angular/compiler",
+        "@angular/compiler-cli",
+        "@angular/core",
+        "@angular/forms",
+        "@angular/platform-browser",
+        "@angular/platform-browser-dynamic",
+        "@angular/router",
+        "@angular/build",
+        "@angular/cdk",
+        "@angular/cli",
+        "@angular/material",
+        "@angular/language-service",
+    ]
+    target_packages = {"@angular/common", "@angular/compiler", "@angular/core"}
+    manifest_dependencies = {package: "^21.2.14" for package in angular_packages}
+    manifest_dependencies.update(
+        {
+            "rxjs": "7.8.2",
+            "zone.js": "0.15.1",
+            "vitest": "3.0.0",
+            "jsdom": "26.0.0",
+            "@types/node": "22.0.0",
+        }
+    )
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": manifest_dependencies},
+    )
+    exact_peer = "21.2.14"
+    lock_packages = {
+        "": {"name": "app"},
+        "node_modules/@angular/animations": {
+            "version": exact_peer,
+            "peerDependencies": {"@angular/core": exact_peer},
+        },
+        "node_modules/@angular/common": {"version": exact_peer},
+        "node_modules/@angular/compiler": {"version": exact_peer},
+        "node_modules/@angular/compiler-cli": {
+            "version": exact_peer,
+            "peerDependencies": {"@angular/compiler": exact_peer},
+        },
+        "node_modules/@angular/core": {"version": exact_peer},
+        "node_modules/@angular/forms": {
+            "version": exact_peer,
+            "peerDependencies": {
+                "@angular/common": exact_peer,
+                "@angular/core": exact_peer,
+            },
+        },
+        "node_modules/@angular/platform-browser": {
+            "version": exact_peer,
+            "peerDependencies": {
+                "@angular/common": exact_peer,
+                "@angular/core": exact_peer,
+            },
+        },
+        "node_modules/@angular/platform-browser-dynamic": {
+            "version": exact_peer,
+            "peerDependencies": {
+                "@angular/common": exact_peer,
+                "@angular/core": exact_peer,
+                "@angular/platform-browser": exact_peer,
+            },
+        },
+        "node_modules/@angular/router": {
+            "version": exact_peer,
+            "peerDependencies": {"@angular/common": exact_peer},
+        },
+        "node_modules/@angular/build": {
+            "version": exact_peer,
+            "peerDependencies": {
+                "@angular/compiler": ">=21.0.0 <22.0.0",
+                "@angular/compiler-cli": ">=21.0.0 <22.0.0",
+            },
+        },
+        "node_modules/@angular/cdk": {
+            "version": exact_peer,
+            "peerDependencies": {"@angular/common": ">=21.0.0 <22.0.0"},
+        },
+        "node_modules/@angular/cli": {"version": exact_peer},
+        "node_modules/@angular/material": {
+            "version": exact_peer,
+            "peerDependencies": {
+                "@angular/cdk": exact_peer,
+                "@angular/common": ">=21.0.0 <22.0.0",
+            },
+        },
+        "node_modules/@angular/language-service": {"version": exact_peer},
+        "node_modules/rxjs": {"version": "7.8.2"},
+        "node_modules/zone.js": {"version": "0.15.1"},
+        "node_modules/vitest": {"version": "3.0.0"},
+        "node_modules/jsdom": {"version": "26.0.0"},
+        "node_modules/@types/node": {"version": "22.0.0"},
+    }
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {"name": "app", "lockfileVersion": 3, "packages": lock_packages},
+    )
+    groups = [
+        _group(package, "package.json", fixed_version="21.2.17")
+        for package in sorted(target_packages)
+    ]
+
+    prepared_groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
+        tmp_path,
+        groups,
+        _tasks(*groups),
+        target_packages=sorted(target_packages),
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in prepared_groups} == {
+        "@angular/animations",
+        "@angular/common",
+        "@angular/compiler",
+        "@angular/compiler-cli",
+        "@angular/core",
+        "@angular/forms",
+        "@angular/platform-browser",
+        "@angular/platform-browser-dynamic",
+        "@angular/router",
+    }
+    assert {task.target_package_name for task in queue.values() if task.target_package_name} == {
+        group.vulnerable_component for group in prepared_groups
+    }
+    assert {task.selected_version for task in queue.values()} == {"21.2.17"}
+
+
 def test_all_exact_direct_dependencies_are_materialized_without_finding_groups(tmp_path: Path):
     _write_manifest(
         tmp_path,
@@ -477,7 +820,7 @@ def test_synthetic_target_refresh_keeps_group_identity(tmp_path: Path):
     assert synthetic_task.task_revision == 1
 
 
-def test_supervisor_adds_synthetic_tasks_before_portfolio_dispatch(tmp_path: Path):
+def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(tmp_path: Path):
     _write_manifest(
         tmp_path,
         "package.json",
@@ -491,9 +834,8 @@ def test_supervisor_adds_synthetic_tasks_before_portfolio_dispatch(tmp_path: Pat
     assert result["next_routing_step"] == "portfolio"
     synthetic_groups = [group for group in result["valid_groups"] if group.is_synthetic]
     synthetic_tasks = [task for task in result["task_queue"].values() if task.is_synthetic]
-    assert [group.vulnerable_component for group in synthetic_groups] == ["@angular/common"]
-    assert len(synthetic_tasks) == 1
-    assert synthetic_tasks[0].parent_group_id == synthetic_groups[0].group_id
+    assert synthetic_groups == []
+    assert synthetic_tasks == []
 
 
 def test_multi_kind_angular_edges_materialize_once_per_task_pair(tmp_path: Path):
@@ -823,3 +1165,40 @@ def test_apply_rejects_a_mismatched_physical_lockfile_occurrence(tmp_path: Path)
 
     with pytest.raises(ValueError, match="lockfile_package_key"):
         apply_portfolio_plan(tampered_plan, [group], queue)
+
+
+def test_apply_maps_solver_no_fix_to_code_workaround(tmp_path: Path):
+    _write_manifest(tmp_path, "package.json", {"dependencies": {"lodash": "1.0.0"}})
+    group = _group("lodash", "package.json")
+    queue = _tasks(group)
+    task = queue["task-1"]
+    decision = SimpleNamespace(
+        task_id="task-1",
+        selected_strategy="no_fix",
+        selected_version=None,
+        allowed_alternative_versions=[],
+        allowed_dependency_types=[],
+        selected_plan_issue_ids=[],
+        dependency_type=None,
+        strategy_stage="npm_latest",
+        exact_instruction=None,
+        target_occurrence_id=make_occurrence_id("package.json", "lodash"),
+        target_group_id=group.group_id,
+        target_package_name="lodash",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/lodash",
+    )
+    plan = SimpleNamespace(
+        plan_id="portfolio-no-fix",
+        portfolio_plan_id="portfolio-no-fix",
+        task_ids=["task-1"],
+        task_revisions={"task-1": task.task_revision},
+        solver_plan=SimpleNamespace(
+            selected_plan=SimpleNamespace(task_decisions=[decision]),
+        ),
+    )
+
+    _groups, committed, diagnostics = apply_portfolio_plan(plan, [group], queue)
+
+    assert diagnostics == []
+    assert committed["task-1"].strategy.value == "code_workaround"

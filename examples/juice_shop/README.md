@@ -188,6 +188,19 @@ python examples/juice_shop/run_batch.py \
   --iterations 2 --batch-size 3 --seed 7
 ```
 
+The batch runner is a development-scoped fixture: each request passes the
+selected package names to the engine, so synthetic portfolio tasks are limited
+to that package set and its required Angular/workspace/peer coordination
+closure. To run one explicit Angular batch instead of sampling:
+
+```bash
+python examples/juice_shop/run_batch.py \
+  --packages @angular/common @angular/compiler @angular/core
+```
+
+The normal `examples/juice_shop/run.py` entrypoint does not set a package
+scope and therefore retains full-repository behavior.
+
 `--dry-run` prepares the sampled issue and suppression fixtures without calling
 the remediation engine, Docker, or LLMs:
 
