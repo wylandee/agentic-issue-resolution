@@ -195,6 +195,7 @@ class TestToolbeltFactories:
         assert all("--legacy-peer-deps" in command for command in sync_commands)
         assert all("--no-audit" in command for command in sync_commands)
         assert all("--no-fund" in command for command in sync_commands)
+        assert touched_files == {"frontend/package-lock.json", "frontend/package.json"}
         assert not any("axios" in command for command in sync_commands)
         assert not any("lodash" in command for command in sync_commands)
         assert sync_commands[1] == (

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -644,7 +644,32 @@ def _changed_files_by_task(
             for path in manifest_paths
             if isinstance(path, str) and path.strip()
         }
-        result[task.task_id] = [path for path in normalized_files if path in manifest_set]
+        manifest_parents = {
+            PurePosixPath(path).parent
+            for path in manifest_set
+            if PurePosixPath(path).name == "package.json"
+        }
+        task_files: list[str] = []
+        for path in normalized_files:
+            if path in manifest_set:
+                task_files.append(path)
+                continue
+
+            # npm synchronization can update the lockfile alongside the
+            # manifest. A shared package cluster has multiple task records,
+            # so exact manifest matching alone would drop the lockfile from
+            # every per-task result. Associate package lockfiles with tasks
+            # whose manifest lives in the lockfile's directory or below it.
+            path_obj = PurePosixPath(path)
+            if path_obj.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+                continue
+            if any(
+                manifest_parent == path_obj.parent
+                or manifest_parent.is_relative_to(path_obj.parent)
+                for manifest_parent in manifest_parents
+            ):
+                task_files.append(path)
+        result[task.task_id] = task_files
     return result
 
 

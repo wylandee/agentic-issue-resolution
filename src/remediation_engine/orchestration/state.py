@@ -472,6 +472,10 @@ class OrchestratorState(TypedDict, total=False):
     group_strategies: Annotated[dict[str, RoutingStrategy], merge_dict_reducer]
     qa_evaluations: Annotated[dict[str, QAEvaluation], replace_dict_reducer]
     action_summaries: Annotated[list[AgentActionSummary], operator.add]
+    # Candidate files accumulate across worker/QA bridges. Teardown emits a
+    # ``ChangedFilesProjection`` marker to replace that candidate ledger with
+    # the files that actually produced the final diff.
+    changed_files: Annotated[list[str], merge_changed_files_reducer]
     retry_diagnostics_by_task: Annotated[dict[str, UpdateRetryDiagnostics], replace_dict_reducer]
     retry_plans_by_task: Annotated[dict[str, SupervisorRetryPlan], replace_dict_reducer]
     workaround_replay_plans_by_task: Annotated[

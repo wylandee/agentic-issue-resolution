@@ -36,6 +36,7 @@ from remediation_engine.orchestration.state import (
 from remediation_engine.orchestration.update_subagent import (
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
+    _changed_files_by_task,
     run_update_subagent_node,
 )
 from remediation_engine.orchestration.workaround_subagent import (
@@ -218,6 +219,23 @@ class TestUpdateSubagentWrapper:
 
         assert "mixed first-pass and retry" in result["errors"][-1]
         assert mock_chat.call_count == 0
+
+    def test_multi_task_changed_file_projection_keeps_shared_lockfile(self):
+        group_a = _sca_group("sca:frontend/package.json:lodash", "frontend/package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        task_a = _task_for_group(group_a)
+        task_b = _task_for_group(group_b)
+
+        projected = _changed_files_by_task(
+            [
+                (task_a, group_a, ["frontend/package.json"]),
+                (task_b, group_b, ["frontend/package.json"]),
+            ],
+            ["frontend/package-lock.json", "frontend/package.json"],
+        )
+
+        expected = ["frontend/package-lock.json", "frontend/package.json"]
+        assert projected == {task_a.task_id: expected, task_b.task_id: expected}
 
     def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
         group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")

@@ -151,6 +151,37 @@ def test_dynamic_context_retains_compaction_proof_dependency_evidence():
     assert "package-lock.json#resolved/lodash" in context
 
 
+def test_dynamic_context_renders_install_and_test_tuple_statuses():
+    """Render tuple-backed install and test outcomes from their boolean field."""
+    group = _make_group(group_id="group-a")
+
+    passing_context = _build_qa_dynamic_context(
+        group=group,
+        task_id="task-a",
+        strategy="version_bump",
+        results=_make_fully_populated_results(ok=True),
+        group_remaining_ids=[],
+        candidate_changed_files=[],
+        action_summaries=[],
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    assert "- Install: PASS" in passing_context
+    assert "- Unit tests: PASS" in passing_context
+
+    failing_context = _build_qa_dynamic_context(
+        group=group,
+        task_id="task-a",
+        strategy="version_bump",
+        results=_make_fully_populated_results(ok=False),
+        group_remaining_ids=[],
+        candidate_changed_files=[],
+        action_summaries=[],
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    assert "- Install: FAIL" in failing_context
+    assert "- Unit tests: FAIL" in failing_context
+
+
 class TestRunGlobalExecution:
     def test_calls_install_scan_and_tests_once(self):
         sandbox = MagicMock()

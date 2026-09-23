@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from langgraph.graph import END, START, StateGraph
+
 from remediation_engine.contracts.schemas import (
     CommandResult,
     RemediationTask,
@@ -18,6 +20,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.state import (
     ChangedFilesProjection,
+    OrchestratorState,
     initial_orchestrator_state,
     merge_changed_files_reducer,
 )
@@ -44,9 +47,28 @@ class TestStateDefaults:
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
         assert state["changed_files"] == []
+        assert "changed_files" in OrchestratorState.__annotations__
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
         assert "messages" not in state
+
+    def test_graph_preserves_changed_file_channel_and_teardown_projection(self):
+        workflow = StateGraph(OrchestratorState)
+        workflow.add_node(
+            "candidate",
+            lambda _state: {"changed_files": ["frontend/package-lock.json"]},
+        )
+        workflow.add_node(
+            "final",
+            lambda _state: {"changed_files": ChangedFilesProjection(["frontend/package.json"])},
+        )
+        workflow.add_edge(START, "candidate")
+        workflow.add_edge("candidate", "final")
+        workflow.add_edge("final", END)
+
+        result = workflow.compile().invoke({"changed_files": []})
+
+        assert result["changed_files"] == ["frontend/package.json"]
 
 
 class TestWorkspaceBuilderNode:

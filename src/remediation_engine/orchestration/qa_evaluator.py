@@ -535,6 +535,12 @@ def _qa_status(
         return "SKIPPED"
     if result is None:
         return "NOT_RUN"
+    if isinstance(result, tuple):
+        # Install and test results are stored as ``(ok, summary)`` tuples,
+        # whereas scan results expose an ``ok`` attribute.  Keep the prompt
+        # projection aligned with the typed execution result instead of
+        # treating the tuple as a scan object.
+        return "PASS" if result and bool(result[0]) else "FAIL"
     execution_status = getattr(result, "execution_status", None)
     status_value = getattr(execution_status, "value", execution_status)
     if str(status_value).lower() == "not_run":
