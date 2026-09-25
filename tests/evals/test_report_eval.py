@@ -47,6 +47,14 @@ _REPORT_SECTIONS = (
     "## 4. References",
 )
 
+_REPORT_CODE_FILE_PATH_RE = re.compile(
+    r"(?<![\w./-])(?P<path>(?:[\w.-]+/)*[\w.-]+\."
+    r"(?:json|lock|js|jsx|mjs|cjs|ts|tsx|py|go|rs|java|kt|swift|cs|c|h|cpp|rb|php|"
+    r"vue|svelte|html|css|scss|sass|less|yaml|yml|toml|xml|md|sql|sh|gradle|"
+    r"properties|cfg|ini|txt|ipynb))(?![\w])",
+    re.IGNORECASE,
+)
+
 
 def _report_format_evidence() -> dict[str, Any]:
     """Describe the canonical report shape supplied to live judges.
@@ -61,12 +69,6 @@ def _report_format_evidence() -> dict[str, Any]:
         "finding_identity": (
             "Use the scanner CVE/GHSA/finding identifier in the report. The group id is "
             "internal state and is only a fallback when no scanner identifier exists."
-        ),
-        "code_detail_scope": (
-            "Successful-remediation rows may list manifest and source files. Diff blocks "
-            "under Code workaround details must contain only the source files belonging "
-            "to the accepted workaround; package-removal attempts are the exception when "
-            "the contract explicitly permits manifest removal diffs."
         ),
         "evidence_policy": (
             "Counts, statuses, attempts, package transitions, file paths, and references "
@@ -88,13 +90,11 @@ the evidence-backed outcome and critical report rules:
    present in the context, including package/version attempts and their
    outcomes. Do not promote a worker claim or a diff into a successful fix
    without QA-passed final task evidence.
-3. Version-only remediations must report the supported package transition and
-   changed manifest files without inventing source-workaround claims. Code
-   workaround and package-removal rows must preserve the supported explanation,
-   source file paths, and source diff evidence. Manifest files may appear in a
-   row's Files Changed cell; only the diff blocks under Code workaround details
-   are source-scoped. A strategy pivot must retain both the version transition
-   and the later workaround evidence.
+3. Version-only rows must report supported package transitions without inventing
+source-workaround claims. Code-workaround and package-removal rows must preserve
+the supported source explanation and accepted source-change evidence. A strategy
+pivot must retain both the version transition and later workaround evidence.
+File-path scope is validated deterministically and is not scored by this judge.
 4. A transitive finding must keep the vulnerable finding package as the report
    identity while retaining the editable parent/target package as context when
    the evidence distinguishes them.
@@ -104,6 +104,71 @@ the evidence-backed outcome and critical report rules:
    changed files, code changes, scan results, or recommendations. Do not turn
    unavailable evidence into a definitive claim.
 """.strip()
+
+
+def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
+    """Build direct, case-specific yes/no questions from report source facts.
+
+    Args:
+        case: Curated report case containing source facts and expected counts.
+
+    Returns:
+        Questions whose factual propositions are present in both the evidence
+        and the rendered report.
+    """
+    facts = _build_report_source_facts(case)
+    summary = facts["summary_facts"]
+    questions = [
+        f"Are there exactly {summary['total_findings']} scanner findings across "
+        f"{summary['total_groups']} vulnerability groups?",
+        f"Are {summary['fixed']} vulnerability groups successfully remediated and "
+        f"{summary['follow_up']} vulnerability groups requiring follow-up?",
+    ]
+    identity_facts = [
+        f"{', '.join(group['scanner_finding_identifiers'])} -> vulnerable package "
+        f"{group['vulnerable_package']}"
+        + (f" (severity {str(group['severity']).upper()})" if group["severity"] else "")
+        for group in facts["finding_groups"]
+        if group["scanner_finding_identifiers"] and group["vulnerable_package"]
+    ]
+    if identity_facts:
+        questions.append("Are these scanner-ID mappings true: " + "; ".join(identity_facts) + "?")
+    package_changes = [
+        f"{change['name']} from {change.get('old') or 'not present'} "
+        f"to {change.get('new') or 'removed'} in {change['file']}"
+        for change in facts["package_changes"]
+    ]
+    if package_changes:
+        questions.append(
+            "Are these package transitions supported: " + "; ".join(package_changes) + "?"
+        )
+    source_changes = [
+        f"{change['file']} from {change['removed']} to {change['added']}"
+        for change in facts["source_changes"]
+    ]
+    if source_changes:
+        questions.append("Are these source changes supported: " + "; ".join(source_changes) + "?")
+    follow_up_packages = set(case["expected_contract"].get("follow_up_packages", []))
+    attempt_facts = [
+        f"{attempt['package']} status {attempt['status']}, selected version "
+        f"{attempt['selected_version'] or 'not specified'}, outcome "
+        f"{attempt['outcome'] or attempt['summary'] or 'not recorded'}"
+        for group in facts["finding_groups"]
+        if group["vulnerable_package"] in follow_up_packages
+        for attempt in group["remediation_attempts"]
+    ]
+    if attempt_facts:
+        questions.append(
+            "Did these follow-up attempts have the stated statuses and outcomes: "
+            + "; ".join(attempt_facts)
+            + "?"
+        )
+    metadata = facts["run_metadata"]
+    questions.append(
+        f"Is the run metadata ID {metadata['run_id']}, duration {metadata['duration']}, "
+        f"total tokens {metadata['total_tokens']}, and patch status {metadata['patch_status']}?"
+    )
+    return questions
 
 
 def _load_golden_cases() -> list[dict[str, Any]]:
@@ -289,51 +354,263 @@ def _build_report_state(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_report_prompt(case: dict[str, Any]) -> str:
-    """Build the input presented to the report evaluator.
+def _group_finding_identifiers(group: dict[str, Any]) -> list[str]:
+    """Return scanner-facing identifiers recorded for one fixture group."""
+    identifiers: list[str] = []
+    for field_name in ("finding_ids", "cve_ids", "ghsa_ids", "rule_ids"):
+        value = group.get(field_name, [])
+        values = value if isinstance(value, list) else [value]
+        identifiers.extend(str(item) for item in values if item)
+    for issue in group.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        for field_name in ("finding_id", "cve_id", "ghsa_id", "rule_id"):
+            value = issue.get(field_name)
+            if value:
+                identifiers.append(str(value))
+    return list(dict.fromkeys(identifiers))
+
+
+def _build_report_source_facts(case: dict[str, Any]) -> dict[str, Any]:
+    """Normalize authoritative fixture facts for all report judges.
+
+    The returned structure contains evidence and report metadata, but excludes
+    output-format rules and the raw expected contract.
 
     Args:
-        case: Curated report case containing deterministic state and provenance.
+        case: Curated report case containing fixture evidence and summary facts.
 
     Returns:
-        A bounded JSON prompt describing the report evidence and required output.
+        Normalized source facts used to build judge input and assessment questions.
     """
-    evidence = {
-        "provenance": case["provenance"],
-        "historical_evidence": case.get("historical_evidence", []),
-        "report_state": _build_report_state(case),
-        "expected_contract": case["expected_contract"],
-        "report_format": _report_format_evidence(),
+    fixture = case["fixture"]
+    state = _build_report_state(case)
+    tasks = fixture.get("tasks", [])
+    attempts = fixture.get("attempts", [])
+    finding_groups: list[dict[str, Any]] = []
+    for group in fixture.get("groups", []):
+        group_tasks = [task for task in tasks if task.get("group") == group.get("id")]
+        group_task_ids = {task.get("id") for task in group_tasks}
+        task_evidence = [
+            {
+                "final_status": task.get("status"),
+                "strategy": task.get("strategy"),
+                "qa_passed": task.get("qa"),
+                "target_package": task.get("target_package_name"),
+                "parent_package": task.get("parent_package_name"),
+                "parent_package_version": task.get("parent_package_version"),
+                "selected_version": task.get("selected_version"),
+            }
+            for task in group_tasks
+        ]
+        attempt_evidence: list[dict[str, Any]] = []
+        for attempt in attempts:
+            if attempt.get("task") not in group_task_ids:
+                continue
+            task = next(
+                (
+                    candidate
+                    for candidate in group_tasks
+                    if candidate.get("id") == attempt.get("task")
+                ),
+                {},
+            )
+            attempt_evidence.append(
+                {
+                    "package": attempt.get("package")
+                    or task.get("target_package_name")
+                    or group.get("package"),
+                    "status": attempt.get("status"),
+                    "selected_version": attempt.get("selected_version"),
+                    "outcome": attempt.get("outcome"),
+                    "summary": attempt.get("final_note") or attempt.get("summary"),
+                    "changed_files": attempt.get("files", []),
+                    "qa_passed": attempt.get("qa", task.get("qa")),
+                }
+            )
+        group_evidence: dict[str, Any] = {
+            "vulnerable_package": group.get("package"),
+            "vulnerable_version": group.get("version"),
+            "severity": group.get("severity"),
+            "scanner_finding_identifiers": _group_finding_identifiers(group),
+            "final_task_outcomes": task_evidence,
+            "remediation_attempts": attempt_evidence,
+        }
+        parent_contexts = group.get("parent_contexts")
+        if parent_contexts:
+            group_evidence["parent_package_context"] = parent_contexts
+        finding_groups.append(group_evidence)
+    finding_groups.sort(
+        key=lambda group: (
+            tuple(group["scanner_finding_identifiers"]) or (str(group["vulnerable_package"]),)
+        )
+    )
+
+    contract = case["expected_contract"]
+    summary_contract = contract.get("summary", {})
+    summary_facts = {
+        "total_findings": contract.get(
+            "total_findings",
+            len(fixture.get("issues", [])),
+        ),
+        "total_groups": summary_contract.get(
+            "total_groups",
+            len(fixture.get("groups", [])),
+        ),
+        "fixed": summary_contract.get("fixed", 0),
+        "follow_up": summary_contract.get("follow_up", 0),
     }
-    return (
-        "Review the deterministic remediation evidence against the canonical "
-        f"{_REPORT_FORMAT_VERSION} Markdown report contract. Preserve the four report "
-        "sections, use scanner finding identifiers, and do not add facts, recalculate "
-        "metrics, change final task statuses, or recommend actions.\n\n"
-        f"Evidence:\n{json.dumps(evidence, sort_keys=True, default=str)[:30000]}"
+    changed_files = state.get("changed_files", [])
+    diff_paths = re.findall(r"(?m)^--- a/([^\n]+)$", str(state.get("diff", "")))
+    patch_files = list(
+        dict.fromkeys(
+            str(path).strip() for path in [*changed_files, *diff_paths] if str(path).strip()
+        )
+    )
+    has_patch = bool(state.get("diff"))
+    patch_noun = "file" if len(patch_files) == 1 else "files"
+    patch_status = (
+        f"Available ({len(patch_files)} {patch_noun} changed)" if has_patch else "Not available"
+    )
+    token_total = state.get("total_tokens")
+    if (
+        token_total is None
+        and state.get("total_input_tokens") is not None
+        and state.get("total_output_tokens") is not None
+    ):
+        token_total = state["total_input_tokens"] + state["total_output_tokens"]
+    return {
+        "run_metadata": {
+            "run_id": state["run_id"],
+            "status": state["status"],
+            "duration": (
+                "Pending finalization"
+                if state.get("duration_seconds") is None
+                else state["duration_seconds"]
+            ),
+            "total_tokens": "Unavailable" if token_total is None else token_total,
+            "patch_status": patch_status,
+            "changed_files": patch_files,
+            "trajectory_reference": state.get("trajectory_path") or "Not available",
+            "langsmith_reference": state.get("langsmith_trace_url") or "Not available",
+            "patch_reference": "Included in run result" if has_patch else "Not available",
+        },
+        "summary_facts": summary_facts,
+        "finding_groups": finding_groups,
+        "package_changes": fixture.get("package_changes", []),
+        "source_changes": fixture.get("source_changes", []),
+        "errors": fixture.get("errors", []),
+    }
+
+
+def _build_report_source_evidence(case: dict[str, Any]) -> str:
+    """Render source facts as explicit statements for report LLM judges.
+
+    Args:
+        case: Curated report case containing normalized remediation evidence.
+
+    Returns:
+        Natural-language evidence with finding IDs paired to their packages.
+    """
+    facts = _build_report_source_facts(case)
+    metadata = facts["run_metadata"]
+    summary = facts["summary_facts"]
+    lines = [
+        "Authoritative source facts for the remediation report:",
+        f"Run ID: {metadata['run_id']}.",
+        f"Run status: {metadata['status']}.",
+        f"Run duration: {metadata['duration']}.",
+        f"Total tokens: {metadata['total_tokens']}.",
+        f"Patch status: {metadata['patch_status']}.",
+        f"Changed files: {', '.join(metadata['changed_files']) or 'none'}.",
+        f"There are exactly {summary['total_findings']} total scanner findings and "
+        f"{summary['total_groups']} vulnerability groups.",
+        f"Final outcomes: {summary['fixed']} vulnerability groups were successfully "
+        f"remediated; {summary['follow_up']} vulnerability groups require follow-up.",
+    ]
+    for group in facts["finding_groups"]:
+        identifiers = ", ".join(group["scanner_finding_identifiers"])
+        package = group["vulnerable_package"]
+        if identifiers and package:
+            detail = f"Scanner IDs {identifiers} map to vulnerable package {package}"
+            if group["vulnerable_version"]:
+                detail += f", version {group['vulnerable_version']}"
+            if group["severity"]:
+                detail += f", severity {str(group['severity']).upper()}"
+            lines.append(detail + ".")
+        for task in group["final_task_outcomes"]:
+            outcome = f"Final task status for {package}: {task['final_status']}."
+            if task["qa_passed"] is not None:
+                outcome += f" QA passed: {task['qa_passed']}."
+            if task["strategy"]:
+                outcome += f" Strategy: {task['strategy']}."
+            lines.append(outcome)
+        for attempt in group["remediation_attempts"]:
+            attempt_text = (
+                f"Attempt for {attempt['package']}: status {attempt['status']}; "
+                f"selected version {attempt['selected_version'] or 'not specified'}; "
+                f"outcome {attempt['outcome'] or attempt['summary'] or 'not recorded'}."
+            )
+            if attempt["changed_files"]:
+                attempt_text += f" Files: {', '.join(attempt['changed_files'])}."
+            if attempt["qa_passed"] is not None:
+                attempt_text += f" QA passed: {attempt['qa_passed']}."
+            lines.append(attempt_text)
+    for change in facts["package_changes"]:
+        lines.append(
+            f"Package transition: {change['name']} changed from "
+            f"{change.get('old') or 'not present'} to {change.get('new') or 'removed'} "
+            f"in {change['file']}."
+        )
+    for change in facts["source_changes"]:
+        lines.append(
+            f"Source change: {change['file']} removed {change['removed']} "
+            f"and added {change['added']}."
+        )
+    lines.append(
+        "References: trajectory "
+        f"{metadata['trajectory_reference']}; LangSmith trace {metadata['langsmith_reference']}; "
+        f"patch {metadata['patch_reference']}."
+    )
+    return "\n".join(lines)
+
+
+def _build_report_policy_context() -> str:
+    """Render non-source constraints for the GEval judge.
+
+    File-path placement is enforced by ``validate_report_contract`` and is
+    deliberately excluded from all LLM metric contexts.
+
+    Returns:
+        General report-format and evidence-policy guidance for GEval.
+    """
+    format_evidence = _report_format_evidence()
+    return "\n".join(
+        [
+            "Constraint-adherence rules follow; they are policies, not source facts.",
+            f"Required sections: {', '.join(format_evidence['sections'])}.",
+            format_evidence["finding_identity"],
+            format_evidence["evidence_policy"],
+            "Successful claims require final QA-passed outcomes; failed attempts alone "
+            "must not be presented as fixes.",
+            "Follow-up rows should preserve supported package/version attempts and outcomes.",
+            "File-path scope is checked deterministically and is not part of this GEval.",
+        ]
     )
 
 
 def build_report_context(case: dict[str, Any]) -> list[str]:
-    """Build structured retrieval context for all four DeepEval metrics.
+    """Build factual evidence and policy guidance for separate judge cases.
 
     Args:
         case: Curated report case containing deterministic state and provenance.
 
     Returns:
-        Evidence documents containing the historical basis and normalized state.
+        The source-evidence document followed by general GEval policy guidance.
     """
-    evidence = {
-        "provenance": case["provenance"],
-        "historical_evidence": case.get("historical_evidence", []),
-        "report_state": _build_report_state(case),
-        "expected_contract": case["expected_contract"],
-        "report_format": _report_format_evidence(),
-    }
     return [
-        "Final task, QA, attempt, and patch evidence:\n"
-        + json.dumps(evidence, indent=2, sort_keys=True, default=str),
-        build_report_expected_output(case),
+        _build_report_source_evidence(case),
+        _build_report_policy_context(),
     ]
 
 
@@ -459,7 +736,7 @@ def parse_report(report: str) -> dict[str, Any]:
 
     Returns:
         Structured sections, summary metrics, remediation rows, follow-up
-        records, code-detail diff paths, and references.
+        records, source-scoped code-detail diff and file paths, and references.
     """
     sections = _report_sections(report)
     summary = sections.get("## 1. Summary", "")
@@ -470,7 +747,19 @@ def parse_report(report: str) -> dict[str, Any]:
     success_rows = _table_rows(successful, "Finding")
     code_detail_match = re.search(r"(?ms)^### Code workaround details\n(?P<body>.*)$", successful)
     code_details = code_detail_match.group("body") if code_detail_match else ""
+    code_detail_prose = re.sub(r"(?ms)^```diff\n.*?^```[ \t]*$", "", code_details)
     code_diff_paths = sorted(set(re.findall(r"(?m)^--- a/(?P<path>[^\n]+)$", code_details)))
+    code_detail_file_paths = {
+        path.strip().strip("* ").strip()
+        for line in code_detail_prose.splitlines()
+        if line.strip().casefold().startswith("- **files changed:**")
+        for path in line.split(":", maxsplit=1)[1].split(",")
+        if path.strip().strip("* ").strip()
+        and path.strip().strip("* ").strip().casefold() != "not recorded"
+    }
+    code_detail_file_paths.update(code_diff_paths)
+    code_detail_file_paths.update(_REPORT_CODE_FILE_PATH_RE.findall(code_detail_prose))
+    code_detail_file_paths = sorted(code_detail_file_paths)
     reference_rows = _table_rows(references, "Artifact")
     return {
         "sections": sections,
@@ -484,6 +773,8 @@ def parse_report(report: str) -> dict[str, Any]:
         "follow_up": _parse_follow_up_records(follow_up),
         "successful_rows": success_rows,
         "code_detail_diff_paths": code_diff_paths,
+        "code_detail_file_paths": code_detail_file_paths,
+        "code_detail_text": code_details,
         "references": {row.get("Artifact", ""): row.get("Reference", "") for row in reference_rows},
     }
 
@@ -512,24 +803,19 @@ def build_report_expected_output(case: dict[str, Any]) -> str:
     return json.dumps(expected, sort_keys=True)
 
 
-def _summary_output_for_eval(parsed: dict[str, Any]) -> str:
-    """Return only the summary facts for the summarization metric."""
-    return json.dumps(parsed["summary"], sort_keys=True)
+def _build_geval_expected_output(case: dict[str, Any]) -> str:
+    """Build expected report facts without path rules reserved for deterministic checks.
 
+    Args:
+        case: Curated report case containing the full golden contract.
 
-def _expected_summary_for_eval(case: dict[str, Any]) -> str:
-    """Return the structured summary expected by the summarization metric."""
-    contract = case["expected_contract"]
-    return json.dumps(
-        {
-            **contract.get("summary", {}),
-            "total_findings": contract.get(
-                "total_findings",
-                len(case["fixture"].get("issues", [])),
-            ),
-        },
-        sort_keys=True,
-    )
+    Returns:
+        A compact contract for GEval that excludes file-path constraints.
+    """
+    expected = json.loads(build_report_expected_output(case))
+    expected.pop("code_detail_diff_paths", None)
+    expected.pop("forbidden_code_detail_diff_paths", None)
+    return json.dumps(expected, sort_keys=True)
 
 
 def validate_report_contract(report: str, contract: dict[str, Any]) -> list[str]:
@@ -604,16 +890,28 @@ def validate_report_contract(report: str, contract: dict[str, Any]) -> list[str]
         if fragment in report:
             violations.append(f"found forbidden fragment: {fragment}")
 
-    for path in contract.get("code_detail_diff_paths", []):
-        if path not in parsed["code_detail_diff_paths"]:
+    expected_detail_paths = set(contract.get("code_detail_diff_paths", []))
+    forbidden_detail_paths = set(contract.get("forbidden_code_detail_diff_paths", []))
+    actual_diff_paths = set(parsed["code_detail_diff_paths"])
+    actual_detail_files = set(parsed["code_detail_file_paths"])
+    for path in expected_detail_paths:
+        if path not in actual_diff_paths:
             violations.append(f"missing code-detail diff path: {path}")
-    for path in contract.get("forbidden_code_detail_diff_paths", []):
-        if path in parsed["code_detail_diff_paths"]:
-            violations.append(f"manifest leaked into code-detail diff: {path}")
+        if path not in actual_detail_files:
+            violations.append(f"missing code-detail file path: {path}")
+    for path in actual_diff_paths - expected_detail_paths:
+        if path not in forbidden_detail_paths:
+            violations.append(f"unexpected code-detail diff path: {path}")
+    for path in actual_detail_files - expected_detail_paths:
+        if path not in forbidden_detail_paths:
+            violations.append(f"unexpected code-detail file path: {path}")
+    for path in forbidden_detail_paths:
+        if path in actual_diff_paths or path in actual_detail_files:
+            violations.append(f"manifest leaked into Code workaround details: {path}")
     return violations
 
 
-def _build_metrics(eval_settings: EvalSettings) -> list[Any]:
+def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[Any]:
     """Construct exactly the four DeepEval metrics for report evaluation."""
     if not HAS_DEEPEVAL:
         raise RuntimeError("DeepEval is required for live report evaluation.")
@@ -633,6 +931,7 @@ def _build_metrics(eval_settings: EvalSettings) -> list[Any]:
         SummarizationMetric(
             threshold=0.80,
             model=eval_settings.judge_model,
+            assessment_questions=_report_summarization_questions(case),
             include_reason=True,
             verbose_mode=True,
         ),
@@ -652,40 +951,37 @@ def _build_metrics(eval_settings: EvalSettings) -> list[Any]:
     ]
 
 
-def _build_metric_test_cases(
+def _build_report_metric_cases(
     case: dict[str, Any],
     report: str,
     context: list[str],
 ) -> tuple[Any, Any]:
-    """Build full-report and summary-only test cases for live metrics."""
+    """Build factual-judge and policy-judge cases with separate contexts."""
     metadata = {
         "case_id": case["case_id"],
         "provenance": case["provenance"],
         "fixture_type": case.get("fixture_type", "historical"),
         "report_format": _REPORT_FORMAT_VERSION,
     }
-    full_report_case = LLMTestCase(
-        name=f"{case['case_id']} [Report Metrics]",
-        input=build_report_prompt(case),
+    evidence = context[0]
+    factual_case = LLMTestCase(
+        name=f"{case['case_id']} [Factual Report Metrics]",
+        input=evidence,
         actual_output=report,
-        expected_output=build_report_expected_output(case),
+        context=[evidence],
+        retrieval_context=[evidence],
+        additional_metadata=metadata,
+    )
+    policy_case = LLMTestCase(
+        name=f"{case['case_id']} [Report Constraint Adherence]",
+        input=evidence,
+        actual_output=report,
+        expected_output=_build_geval_expected_output(case),
         context=context,
         retrieval_context=context,
         additional_metadata=metadata,
     )
-    summary_case = LLMTestCase(
-        name=f"{case['case_id']} [Report Summary]",
-        input=(
-            build_report_prompt(case)
-            + "\n\nFor this metric only, evaluate the JSON summary facts rather than the full Markdown document."
-        ),
-        actual_output=_summary_output_for_eval(parse_report(report)),
-        expected_output=_expected_summary_for_eval(case),
-        context=context,
-        retrieval_context=context,
-        additional_metadata=metadata,
-    )
-    return full_report_case, summary_case
+    return factual_case, policy_case
 
 
 @pytest.mark.eval
@@ -711,14 +1007,23 @@ class TestReportNodeEval:
             pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
 
         context = build_report_context(case)
-        full_report_case, summary_case = _build_metric_test_cases(case, report, context)
-        for metric in _build_metrics(eval_settings):
-            metric_case = (
-                summary_case
-                if metric.__class__.__name__.casefold() == "summarizationmetric"
-                else full_report_case
+        factual_case, policy_case = _build_report_metric_cases(case, report, context)
+        metrics = _build_metrics(eval_settings, case)
+        metric_groups = (
+            ("factual metrics", factual_case, metrics[:3]),
+            ("constraint metric", policy_case, metrics[3:]),
+        )
+        failures: list[str] = []
+        for group_name, metric_case, selected_metrics in metric_groups:
+            try:
+                assert_test(metric_case, selected_metrics)
+            except AssertionError as exc:
+                failures.append(f"{group_name}: {exc}")
+        if failures:
+            pytest.fail(
+                f"Case {case['case_id']} failed live report metrics:\n" + "\n".join(failures),
+                pytrace=False,
             )
-            assert_test(metric_case, [metric])
 
 
 @pytest.mark.parametrize("case", _load_golden_cases(), ids=_REPORT_CASE_IDS)

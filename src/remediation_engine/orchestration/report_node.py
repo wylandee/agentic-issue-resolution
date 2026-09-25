@@ -2252,13 +2252,20 @@ def _render_successful_remediations(context: ReportContext) -> str:
             if code_key in seen_code_evidence:
                 continue
             seen_code_evidence.add(code_key)
+            # The main row includes package and source files; detail bullets
+            # are restricted to the accepted diff blocks for this workaround.
+            code_detail_files = sorted(_diff_block_paths(diff_blocks))
+            code_detail_summary = (
+                "; ".join(_diff_code_change_details("\n".join(diff_blocks), code_detail_files))
+                or "Source changes applied."
+            )
             code_evidence.append(
                 (
                     row[0],
                     row[1],
                     row[2],
-                    "; ".join(code_summaries) or "Source changes applied.",
-                    files,
+                    code_detail_summary,
+                    code_detail_files,
                     diff_blocks,
                 )
             )
@@ -2271,13 +2278,13 @@ def _render_successful_remediations(context: ReportContext) -> str:
     )
     if code_evidence:
         lines.extend(["", "### Code workaround details", ""])
-        for finding, package, severity, summary, files, diff_blocks in code_evidence:
+        for finding, package, severity, summary, code_detail_files, diff_blocks in code_evidence:
             lines.extend(
                 [
                     f"#### {finding} — {package} ({severity})",
                     "",
                     f"- **Summary:** {summary}",
-                    f"- **Files changed:** {', '.join(files) or 'Not recorded'}",
+                    f"- **Files changed:** {', '.join(code_detail_files) or 'Not recorded'}",
                 ]
             )
             for block in diff_blocks:
