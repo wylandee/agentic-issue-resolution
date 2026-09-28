@@ -35,6 +35,9 @@ DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 # from exhausting process resources.  Deployments with larger repositories can
 # raise it explicitly through REMEDY_SOLVER_MAX_MODEL_VARIABLES.
 DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
+# Full candidate catalogs are retained up to this resource guard; larger
+# catalogs fail closed instead of being truncated.
+DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 128
 
 
 @dataclass(frozen=True)
@@ -57,12 +60,13 @@ class AppSettings:
     langsmith_endpoint: str = ""
     triage_cache_dir: Path | None = None
     solver_timeout_seconds: int = 10
+    solver_certification_timeout_seconds: int = 900
     solver_top_k: int = 3
     solver_phase_budget: int = 8
     solver_accept_feasible: bool = True
     solver_random_seed: int = 0
     solver_num_search_workers: int = 1
-    solver_max_candidates_per_target: int = 64
+    solver_max_candidates_per_target: int = DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
     solver_max_model_variables: int = DEFAULT_SOLVER_MAX_MODEL_VARIABLES
     solver_cache_dir: Path | None = None
     solver_llm_enabled: bool = False
@@ -117,13 +121,18 @@ class AppSettings:
                 else None
             ),
             solver_timeout_seconds=_env_int("REMEDY_SOLVER_TIMEOUT_SECONDS", 10, minimum=1),
+            solver_certification_timeout_seconds=_env_int(
+                "REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", 900, minimum=1
+            ),
             solver_top_k=_env_int("REMEDY_SOLVER_TOP_K", 3, minimum=1),
             solver_phase_budget=_env_int("REMEDY_SOLVER_PHASE_BUDGET", 8, minimum=1),
             solver_accept_feasible=_env_bool("REMEDY_SOLVER_ACCEPT_FEASIBLE", True),
             solver_random_seed=_env_int("REMEDY_SOLVER_RANDOM_SEED", 0, minimum=0),
             solver_num_search_workers=_env_int("REMEDY_SOLVER_NUM_SEARCH_WORKERS", 1, minimum=1),
             solver_max_candidates_per_target=_env_int(
-                "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET", 64, minimum=1
+                "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET",
+                DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET,
+                minimum=1,
             ),
             solver_max_model_variables=_env_int(
                 "REMEDY_SOLVER_MAX_MODEL_VARIABLES",

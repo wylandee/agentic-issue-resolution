@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from remediation_engine.cli import _solve_output
 from remediation_engine.contracts import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
     FixPlan,
@@ -24,6 +25,12 @@ from remediation_engine.contracts import (
     TaskStatus,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.solver_models import (
+    PackageResolutionCertificate,
+    PackageResolutionStatus,
+    SolverRuntimeFingerprint,
+)
+from remediation_engine.orchestration.graph import _portfolio_certificate_violations
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
     build_portfolio_plan,
@@ -31,16 +38,24 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
     materialize_synthetic_dependency_tasks,
     prepare_portfolio_inputs,
 )
-from remediation_engine.orchestration.portfolio_solver import _issue_identity
+from remediation_engine.orchestration.portfolio_solver import (
+    _build_targets_and_findings,
+    _candidate_domains,
+    _fetch_candidate_packuments,
+    _issue_identity,
+)
 from remediation_engine.orchestration.qa_test_parsing import parse_peer_conflict_evidence
 from remediation_engine.orchestration.state import initial_orchestrator_state
 from remediation_engine.orchestration.supervisor_node import (
     _deterministic_routing,
+    _portfolio_plan_violations,
     run_supervisor_node,
 )
 from remediation_engine.orchestration.supervisor_routing import _portfolio_cluster_targets
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
-from remediation_engine.tools.npm_graph import make_occurrence_id
+from remediation_engine.settings import AppSettings
+from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
+from remediation_engine.tools.registry_cache import RegistryPackumentCache
 from remediation_engine.triage.grouper import group_issues
 
 
@@ -49,6 +64,7 @@ def _group(
     manifest_path: str,
     *,
     cve_id: str | None = None,
+    package_version: str = "1.0.0",
     fixed_version: str = "2.0.0",
 ):
     issue = VulnerabilityIssue(
@@ -56,7 +72,7 @@ def _group(
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
         package_name=package_name,
-        package_version="1.0.0",
+        package_version=package_version,
         file_path=manifest_path,
         cve_id=(
             cve_id
@@ -96,17 +112,79 @@ def _tasks(*groups):
     }
 
 
+def _attach_test_resolution_certificate(plan):
+    """Attach matching offline evidence for Supervisor contract tests."""
+    solver_plan = plan.solver_plan.model_copy(update={"candidate_catalog_complete": True})
+    selected = solver_plan.selected_plan
+    assert selected is not None
+    assignment_digest = hashlib.sha256(
+        json.dumps(
+            dict(sorted(selected.selected_candidate_versions.items())),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    covered = sorted(
+        coverage_id for batch in selected.batches for coverage_id in batch.resolved_coverage_ids
+    )
+    workaround = sorted(
+        coverage_id for batch in selected.batches for coverage_id in batch.workaround_coverage_ids
+    )
+    assert not any(batch.unresolved_coverage_ids for batch in selected.batches)
+    certificate = PackageResolutionCertificate(
+        status=PackageResolutionStatus.CERTIFIED,
+        portfolio_plan_id=plan.portfolio_plan_id,
+        candidate_plan_id=selected.candidate_plan_id,
+        solver_input_digest=plan.solver_input_digest,
+        repository_fingerprint=plan.repository_fingerprint,
+        task_revisions=plan.task_revisions,
+        workspace_graph_digest=plan.workspace_graph_digest,
+        candidate_catalog_digest=solver_plan.candidate_catalog_digest,
+        candidate_assignment_digest=assignment_digest,
+        resolved_graph_digest="test-resolved-graph-digest",
+        runtime_fingerprint=SolverRuntimeFingerprint(
+            node_version="v22.0.0",
+            npm_version="10.0.0",
+            platform="linux",
+            architecture="x64",
+        ),
+        covered_coverage_ids=covered,
+        workaround_coverage_ids=workaround,
+    )
+    return plan.model_copy(
+        update={
+            "solver_plan": solver_plan,
+            "resolution_certificate": certificate,
+        }
+    )
+
+
 def test_shared_cve_across_packages_keeps_finding_records_distinct(tmp_path: Path):
     _write_manifest(
         tmp_path,
         "package.json",
-        {"name": "root", "workspaces": ["packages/*"]},
+        {
+            "name": "app",
+            "dependencies": {"@angular/compiler": "1.0.0", "@angular/core": "1.0.0"},
+        },
     )
-    _write_manifest(tmp_path, "packages/compiler/package.json", {"name": "@angular/compiler"})
-    _write_manifest(tmp_path, "packages/core/package.json", {"name": "@angular/core"})
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/@angular/compiler": {"version": "1.0.0"},
+                "node_modules/@angular/core": {"version": "1.0.0"},
+            },
+        },
+    )
     shared_cve = "CVE-2026-50557"
-    compiler = _group("@angular/compiler", "packages/compiler/package.json", cve_id=shared_cve)
-    core = _group("@angular/core", "packages/core/package.json", cve_id=shared_cve)
+    compiler = _group("@angular/compiler", "package.json", cve_id=shared_cve)
+    core = _group("@angular/core", "package.json", cve_id=shared_cve)
 
     plan = build_portfolio_plan(tmp_path, [compiler, core], _tasks(compiler, core))
 
@@ -114,8 +192,207 @@ def test_shared_cve_across_packages_keeps_finding_records_distinct(tmp_path: Pat
     assert plan.solver_plan.selected_plan is not None
     coverage_ids = plan.solver_plan.selected_plan.coverage_ids
     assert len(coverage_ids) == 2
-    assert all(coverage_id.startswith("record:") for coverage_id in coverage_ids)
+    assert all(coverage_id.startswith("coverage:") for coverage_id in coverage_ids)
     assert shared_cve not in coverage_ids
+
+
+def test_solver_only_cli_output_is_not_dispatchable(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"lodash": "1.0.0"}},
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "dependencies": {"lodash": "1.0.0"}},
+                "node_modules/lodash": {"version": "1.0.0"},
+            },
+        },
+    )
+    group = _group("lodash", "package.json")
+    plan = build_portfolio_plan(tmp_path, [group], _tasks(group))
+
+    output = _solve_output(plan, [], [])
+
+    assert output["solver_status"] == "OPTIMAL"
+    assert output["package_resolution_status"] == "NOT_RUN"
+    assert output["dispatchable"] is False
+
+
+def test_one_finding_covers_every_matching_physical_occurrence(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {"express-jwt": "1.0.0", "jsonwebtoken": "1.0.0"},
+        },
+    )
+    nested_key = "node_modules/express-jwt/node_modules/jsonwebtoken"
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/express-jwt": {
+                    "version": "1.0.0",
+                    "dependencies": {"jsonwebtoken": "1.0.0"},
+                },
+                "node_modules/jsonwebtoken": {"version": "1.0.0"},
+                nested_key: {"version": "1.0.0"},
+            },
+        },
+    )
+    group = _group("jsonwebtoken", "package.json", cve_id="CVE-2026-70001")
+    plan = build_portfolio_plan(tmp_path, [group], _tasks(group))
+
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    finding_id = _issue_identity(group.issues[0])
+    occurrence_ids = {
+        make_occurrence_id("package.json", "jsonwebtoken"),
+        make_occurrence_id("package.json", "jsonwebtoken", nested_key),
+    }
+    expected_coverage_ids = {
+        "coverage:"
+        + hashlib.sha256((finding_id + "\0" + occurrence_id).encode("utf-8")).hexdigest()
+        for occurrence_id in occurrence_ids
+    }
+    assert set(selected.coverage_ids) == expected_coverage_ids
+    assert selected.unresolved_ids == []
+    batch = selected.batches[0]
+    assert batch.resolved_finding_ids == [finding_id]
+    assert batch.resolved_coverage_ids == sorted(expected_coverage_ids)
+    assert batch.unresolved_coverage_ids == []
+
+
+def test_candidate_catalog_keeps_complete_candidate_metadata_without_truncation(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"foo": "1.0.0"}},
+    )
+    group = _group("foo", "package.json", fixed_version="2.0.0")
+    queue = _tasks(group)
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    targets, findings, diagnostics = _build_targets_and_findings(snapshot, [group], queue)
+    packument = {
+        "name": "foo",
+        "versions": {
+            "1.0.0": {},
+            "2.0.0": {
+                "dependencies": {"runtime-child": "^1.0.0"},
+                "optionalDependencies": {"optional-child": "~2.0.0"},
+                "peerDependencies": {"peer-host": ">=3.0.0"},
+                "peerDependenciesMeta": {"peer-host": {"optional": True}},
+                "engines": {"node": ">=20"},
+                "os": ["darwin"],
+                "cpu": ["arm64"],
+            },
+            "2.1.0": {},
+            "2.2.0": {},
+        },
+    }
+
+    domains, complete, catalog_digest = _candidate_domains(
+        snapshot,
+        targets,
+        findings,
+        queue,
+        [group],
+        AppSettings(solver_max_candidates_per_target=2),
+        diagnostics,
+        packuments={"foo": packument},
+    )
+
+    target_domain = domains[targets[0].occurrence_id]
+    registry_versions = {
+        candidate.version for candidate in target_domain if candidate.source == "registry"
+    }
+    assert complete is False
+    assert registry_versions == {"1.0.0", "2.0.0", "2.1.0", "2.2.0"}
+    assert len(target_domain) > 2
+    candidate = next(item for item in target_domain if item.version == "2.0.0")
+    assert {item.package_name: item.kind for item in candidate.requirements} == {
+        "runtime-child": "dependency",
+        "optional-child": "optional_dependency",
+        "peer-host": "peer",
+    }
+    assert next(
+        item for item in candidate.requirements if item.package_name == "peer-host"
+    ).is_optional
+    assert candidate.engines == {"node": ">=20"}
+    assert candidate.os == ["darwin"]
+    assert candidate.cpu == ["arm64"]
+    assert len(catalog_digest) == 64
+
+
+def test_default_candidate_guard_accepts_82_release_catalog(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"foo": "1.0.0"}},
+    )
+    group = _group("foo", "package.json", fixed_version="2.0.0")
+    queue = _tasks(group)
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    targets, findings, diagnostics = _build_targets_and_findings(snapshot, [group], queue)
+    packument = {
+        "name": "foo",
+        "versions": {f"2.{minor}.0": {} for minor in range(82)},
+    }
+
+    domains, complete, _catalog_digest = _candidate_domains(
+        snapshot,
+        targets,
+        findings,
+        queue,
+        [group],
+        AppSettings(),
+        diagnostics,
+        packuments={"foo": packument},
+    )
+
+    registry_versions = {
+        candidate.version
+        for candidate in domains[targets[0].occurrence_id]
+        if candidate.source == "registry"
+    }
+    assert AppSettings().solver_max_candidates_per_target == 128
+    assert len(registry_versions) == 82
+    assert complete is True
+    assert not any("resource guard exceeded" in item for item in diagnostics)
+
+
+def test_candidate_packuments_are_force_fetched_once_and_cached(tmp_path: Path):
+    fetched: list[str] = []
+
+    def fetcher(package_name: str) -> dict[str, object]:
+        fetched.append(package_name)
+        return {"name": package_name, "versions": {"1.0.0": {}}}
+
+    settings = AppSettings(solver_cache_dir=tmp_path / "registry-cache")
+    packuments, complete, catalog_digest, diagnostics = _fetch_candidate_packuments(
+        ["z-package", "a-package", "z-package"],
+        settings,
+        registry_fetcher=fetcher,
+    )
+
+    assert fetched == ["a-package", "z-package"]
+    assert complete is True
+    assert diagnostics == []
+    assert len(catalog_digest) == 64
+    cache = RegistryPackumentCache(settings.solver_cache_dir)
+    assert cache.get("a-package") == packuments["a-package"]
+    assert cache.get("z-package") == packuments["z-package"]
 
 
 def test_finding_identity_namespaces_scanner_and_record_ids():
@@ -133,15 +410,29 @@ def test_runtime_dependency_order_is_stable(tmp_path: Path):
     _write_manifest(
         tmp_path,
         "package.json",
-        {"name": "root", "dependencies": {"lodash": "1.0.0"}},
+        {
+            "name": "root",
+            "dependencies": {"lodash": "1.0.0", "app": "1.0.0"},
+        },
     )
     _write_manifest(
         tmp_path,
-        "packages/app/package.json",
-        {"name": "app", "dependencies": {"lodash": "1.0.0"}},
+        "package-lock.json",
+        {
+            "name": "root",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "root"},
+                "node_modules/lodash": {"version": "1.0.0"},
+                "node_modules/app": {
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "1.0.0"},
+                },
+            },
+        },
     )
     lodash = _group("lodash", "package.json")
-    app = _group("app", "packages/app/package.json")
+    app = _group("app", "package.json")
     queue = _tasks(lodash, app)
 
     first = build_portfolio_plan(tmp_path, [lodash, app], queue)
@@ -149,19 +440,23 @@ def test_runtime_dependency_order_is_stable(tmp_path: Path):
 
     assert first.model_dump() == second.model_dump()
     assert first.task_order.index("task-1") < first.task_order.index("task-2")
-    assert all(len(cluster.task_ids) == 1 for cluster in first.clusters)
+    assert {task_id for cluster in first.clusters for task_id in cluster.task_ids} == set(queue)
 
 
 def test_workspace_namespace_packages_form_one_atomic_cluster(tmp_path: Path):
     _write_manifest(
         tmp_path,
         "package.json",
-        {"name": "root", "workspaces": ["packages/*"]},
+        {
+            "name": "root",
+            "workspaces": ["packages/*"],
+            "dependencies": {"@angular/core": "1.0.0", "@angular/common": "1.0.0"},
+        },
     )
     _write_manifest(tmp_path, "packages/core/package.json", {"name": "@angular/core"})
     _write_manifest(tmp_path, "packages/common/package.json", {"name": "@angular/common"})
-    core = _group("@angular/core", "packages/core/package.json")
-    common = _group("@angular/common", "packages/common/package.json")
+    core = _group("@angular/core", "package.json")
+    common = _group("@angular/common", "package.json")
     queue = _tasks(core, common)
 
     plan = build_portfolio_plan(tmp_path, [core, common], queue)
@@ -267,7 +562,7 @@ def test_missing_peer_dependency_gets_a_coordination_task_from_lockfile(tmp_path
             },
         },
     )
-    hono = _group("hono", "package.json")
+    hono = _group("hono", "package.json", package_version="4.0.0")
     groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
         tmp_path,
         [hono],
@@ -700,7 +995,7 @@ def test_runtime_edges_use_lockfile_package_metadata(tmp_path: Path):
             "packages": {
                 "node_modules/app-a": {
                     "version": "1.0.0",
-                    "dependencies": {"app-b": "1.0.0"},
+                    "dependencies": {"app-b": "^1.0.0"},
                 },
                 "node_modules/app-b": {"version": "1.0.0"},
             },
@@ -911,7 +1206,14 @@ def test_delta_isolation_preserves_interaction_and_ambiguity():
 
 
 def test_active_cluster_with_internal_dependencies_is_dispatchable(tmp_path: Path):
-    _write_manifest(tmp_path, "package.json", {"name": "root"})
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "root",
+            "dependencies": {"@nestjs/core": "1.0.0", "@nestjs/common": "1.0.0"},
+        },
+    )
     first_group = _group("@nestjs/core", "package.json")
     second_group = _group("@nestjs/common", "package.json")
     queue = _tasks(first_group, second_group)
@@ -926,7 +1228,18 @@ def test_active_cluster_with_internal_dependencies_is_dispatchable(tmp_path: Pat
 
 
 def test_portfolio_order_dispatches_prerequisite_before_atomic_cluster(tmp_path: Path):
-    _write_manifest(tmp_path, "package.json", {"name": "root"})
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "root",
+            "dependencies": {
+                "zeta-package": "1.0.0",
+                "alpha-package": "1.0.0",
+                "beta-package": "1.0.0",
+            },
+        },
+    )
     prerequisite_group = _group("zeta-package", "package.json", cve_id="CVE-2026-10001")
     first_atomic_group = _group(
         "alpha-package",
@@ -1105,15 +1418,35 @@ def test_invalid_atomic_action_requests_portfolio_replan(tmp_path: Path, monkeyp
 
 
 def test_supervisor_preserves_all_cluster_targets_through_commit(tmp_path: Path):
-    _write_manifest(tmp_path, "package.json", {"name": "root"})
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "root",
+            "dependencies": {"@nestjs/core": "1.0.0", "@nestjs/common": "1.0.0"},
+        },
+    )
     first_group = _group("@nestjs/core", "package.json")
     second_group = _group("@nestjs/common", "package.json")
     queue = _tasks(first_group, second_group)
-    plan = build_portfolio_plan(tmp_path, [first_group, second_group], queue)
-    state = initial_orchestrator_state(str(tmp_path), [first_group, second_group])
+    prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        [first_group, second_group],
+        queue,
+    )
+    assert prepare_diagnostics == []
+    plan = build_portfolio_plan(tmp_path, prepared_groups, prepared_queue)
+    plan = _attach_test_resolution_certificate(plan)
+    committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
+        plan,
+        prepared_groups,
+        prepared_queue,
+    )
+    assert apply_diagnostics == []
+    state = initial_orchestrator_state(str(tmp_path), committed_groups)
     state.update(
         {
-            "task_queue": queue,
+            "task_queue": committed_queue,
             "portfolio_plan": plan,
             "portfolio_dirty": False,
             "status": "workspace_ready",
@@ -1131,6 +1464,266 @@ def test_supervisor_preserves_all_cluster_targets_through_commit(tmp_path: Path)
     } == set(queue)
 
 
+def test_certified_plan_continues_after_breaking_change_workaround_pivot(tmp_path: Path):
+    from remediation_engine.contracts.schemas import (
+        FailureCategory,
+        QAAttemptResult,
+        QAEvaluation,
+        QAPolicy,
+        RoutingStrategy,
+        SCARemediationStage,
+        TaskAttemptSnapshot,
+        UpdateRetryDiagnostics,
+    )
+    from remediation_engine.orchestration.supervisor_planner import instruction_digest
+
+    groups = [
+        _group("express-jwt", "package.json", package_version="0.1.3", fixed_version="7.7.8"),
+        _group("companion-package", "package.json", fixed_version="2.0.0"),
+    ]
+    task_queue = _tasks(*groups)
+    portfolio_plan_id = "certified-portfolio"
+    package_specs = [
+        ("task-1", groups[0], "7.7.8"),
+        ("task-2", groups[1], "2.0.0"),
+    ]
+    selected_versions: dict[str, str] = {}
+    decisions = []
+    batches = []
+    clusters = []
+    task_revisions: dict[str, int] = {}
+    task_strategies = {}
+    cluster_order = []
+    task_to_cluster = {}
+
+    for task_id, group, version in package_specs:
+        package_name = group.vulnerable_component
+        occurrence_id = make_occurrence_id("package.json", package_name)
+        selected_versions[occurrence_id] = version
+        task_revisions[task_id] = 1
+        task_strategies[task_id] = RoutingStrategy.VERSION_BUMP
+        task_queue[task_id] = task_queue[task_id].model_copy(
+            update={
+                "task_revision": 1,
+                "portfolio_plan_id": portfolio_plan_id,
+                "strategy": RoutingStrategy.VERSION_BUMP,
+                "strategy_stage": SCARemediationStage.OSV_MINIMUM,
+                "status": TaskStatus.PENDING,
+                "target_package_name": package_name,
+                "target_dependency_type": "dependencies",
+                "selected_version": version,
+                "allowed_target_versions": [version],
+                "allowed_dependency_types": ["dependencies"],
+                "instruction": f"Update {package_name} to {version}.",
+            }
+        )
+        decisions.append(
+            SimpleNamespace(
+                task_id=task_id,
+                selected_strategy=RoutingStrategy.VERSION_BUMP,
+                target_group_id=group.group_id,
+                target_package_name=package_name,
+                manifest_path="package.json",
+                lockfile_package_key=f"node_modules/{package_name}",
+                target_occurrence_id=occurrence_id,
+                dependency_type="dependencies",
+                strategy_stage=SCARemediationStage.OSV_MINIMUM,
+                selected_version=version,
+                allowed_alternative_versions=[],
+                allowed_dependency_types=["dependencies"],
+            )
+        )
+        batches.append(
+            SimpleNamespace(
+                resolved_coverage_ids=[],
+                workaround_coverage_ids=[],
+                unresolved_coverage_ids=[],
+            )
+        )
+        cluster_id = f"cluster-{task_id}"
+        cluster_order.append(cluster_id)
+        task_to_cluster[task_id] = cluster_id
+        clusters.append(
+            SimpleNamespace(
+                cluster_id=cluster_id,
+                task_ids=[task_id],
+                dependencies=[],
+                dispatchable=True,
+                atomic=False,
+                reason="singleton solver task",
+            )
+        )
+
+    candidate_plan_id = "candidate-1"
+    assignment_digest = hashlib.sha256(
+        json.dumps(
+            dict(sorted(selected_versions.items())),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    selected_plan = SimpleNamespace(
+        candidate_plan_id=candidate_plan_id,
+        selected_candidate_versions=selected_versions,
+        task_decisions=decisions,
+        batches=batches,
+    )
+    solver_plan = SimpleNamespace(
+        status="OPTIMAL",
+        candidate_catalog_complete=True,
+        candidate_catalog_digest="candidate-catalog",
+        selected_plan=selected_plan,
+    )
+    plan = SimpleNamespace(
+        plan_id=portfolio_plan_id,
+        portfolio_plan_id=portfolio_plan_id,
+        solver_plan=solver_plan,
+        resolution_certificate=SimpleNamespace(
+            status=PackageResolutionStatus.CERTIFIED,
+            portfolio_plan_id=portfolio_plan_id,
+            candidate_plan_id=candidate_plan_id,
+            solver_input_digest="solver-input",
+            repository_fingerprint="repository",
+            workspace_graph_digest="workspace",
+            candidate_catalog_digest="candidate-catalog",
+            candidate_assignment_digest=assignment_digest,
+            task_revisions=task_revisions,
+            covered_coverage_ids=[],
+            workaround_coverage_ids=[],
+            unresolved_coverage_ids=[],
+        ),
+        solver_input_digest="solver-input",
+        repository_fingerprint="repository",
+        workspace_graph_digest="workspace",
+        task_revisions=task_revisions,
+        planned_task_revisions=task_revisions,
+        task_ids=[task_id for task_id, _group, _version in package_specs],
+        task_strategies=task_strategies,
+        clusters=clusters,
+        cluster_order=cluster_order,
+        task_order=[task_id for task_id, _group, _version in package_specs],
+        task_to_cluster=task_to_cluster,
+        diagnostics=[],
+    )
+
+    stale_stage_tasks = dict(task_queue)
+    stale_stage_tasks["task-2"] = stale_stage_tasks["task-2"].model_copy(
+        update={"strategy_stage": SCARemediationStage.NPM_LATEST, "selected_version": None}
+    )
+    assert "task task-2 strategy stage differs from solver decision" in (
+        _portfolio_plan_violations(plan, stale_stage_tasks, groups)
+    )
+
+    attempted_version = task_queue["task-1"].selected_version
+    instruction = task_queue["task-1"].instruction
+    attempt_id = "attempt-express-jwt"
+    task_queue["task-1"] = task_queue["task-1"].model_copy(
+        update={
+            "status": TaskStatus.OPTIMISTICALLY_FIXED,
+            "task_revision": 2,
+            "retry_count": 0,
+            "current_attempt_id": attempt_id,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        state_revision=1,
+        task_revision=2,
+        strategy_stage=SCARemediationStage.OSV_MINIMUM,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        selected_version=attempted_version,
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+        portfolio_plan_id=portfolio_plan_id,
+    )
+    evaluation = QAEvaluation(
+        task_id="task-1",
+        passed=False,
+        failure_category=FailureCategory.BREAKING_CHANGE,
+        retry_feedback="The selected API breaks the existing application.",
+    )
+    state = initial_orchestrator_state(str(tmp_path), groups)
+    state.update(
+        {
+            "repo_root": None,
+            "status": "qa_completed",
+            "portfolio_dirty": False,
+            "portfolio_replan_request": None,
+            "task_queue": task_queue,
+            "portfolio_plan": plan,
+            "portfolio_solver_plan": solver_plan,
+            "active_target_task_ids": ["task-1"],
+            "attempt_snapshots_by_id": {attempt_id: snapshot},
+            "qa_results_by_attempt": {
+                attempt_id: QAAttemptResult(
+                    attempt_id=attempt_id,
+                    task_id="task-1",
+                    task_revision=2,
+                    qa_policy=QAPolicy.VERSION_BUMP,
+                    qa_policy_source="attempt_snapshot",
+                    evaluation=evaluation,
+                )
+            },
+            "retry_diagnostics_by_task": {
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    strategy_stage=SCARemediationStage.OSV_MINIMUM,
+                    attempted_versions=[attempted_version],
+                    attempted_versions_by_target={"express-jwt": [attempted_version]},
+                    candidate_versions_considered=[attempted_version],
+                    latest_version_seen=attempted_version,
+                    target_package_name="express-jwt",
+                    target_dependency_type="dependencies",
+                    candidate_dependency_types=["dependencies"],
+                )
+            },
+        }
+    )
+
+    pivot = run_supervisor_node(state)
+
+    assert pivot["next_routing_step"] == "workaround_subagent"
+    assert pivot["portfolio_dirty"] is False
+    assert pivot["portfolio_replan_request"] is None
+    parent = pivot["task_queue"]["task-1"]
+    child = next(task for task in pivot["task_queue"].values() if task.parent_task_id == "task-1")
+    assert parent.status == TaskStatus.PIVOTED
+    assert parent.portfolio_plan_id == portfolio_plan_id
+    assert parent.selected_version is None
+    assert child.strategy == RoutingStrategy.CODE_WORKAROUND
+    assert pivot["active_target_task_ids"] == [child.task_id]
+    assert selected_plan.selected_candidate_versions == selected_versions
+
+    resumed_state = dict(state)
+    resumed_state.update(pivot)
+    resumed_tasks = dict(pivot["task_queue"])
+    resumed_tasks[child.task_id] = child.model_copy(
+        update={"status": TaskStatus.QA_PASSED, "current_attempt_id": None}
+    )
+    resumed_state.update(
+        {
+            "status": "supervisor_entered",
+            "active_target_task_ids": [],
+            "task_queue": resumed_tasks,
+            "qa_evaluations": {},
+        }
+    )
+
+    resumed = run_supervisor_node(resumed_state)
+
+    assert resumed["next_routing_step"] == "update_subagent"
+    assert resumed["active_target_task_ids"] == ["task-2"]
+    assert (
+        resumed["task_queue"]["task-2"].selected_version
+        == selected_versions[make_occurrence_id("package.json", "companion-package")]
+    )
+    assert resumed["task_queue"]["task-2"].portfolio_plan_id == portfolio_plan_id
+    assert selected_plan.selected_candidate_versions == selected_versions
+
+
 def test_peer_parser_preserves_quoted_ranges_and_scoped_packages():
     evidence = parse_peer_conflict_evidence(
         "npm error Found: react@18.2.0\n"
@@ -1141,6 +1734,7 @@ def test_peer_parser_preserves_quoted_ranges_and_scoped_packages():
     assert len(evidence) == 1
     assert evidence[0].peer_package == "react"
     assert evidence[0].requester_package == "@angular/core"
+    assert evidence[0].requester_version == "17.0.0"
     assert evidence[0].required_range == "^18.0.0 || ^19.0.0"
     assert evidence[0].observed_version == "18.2.0"
 
@@ -1202,3 +1796,266 @@ def test_apply_maps_solver_no_fix_to_code_workaround(tmp_path: Path):
 
     assert diagnostics == []
     assert committed["task-1"].strategy.value == "code_workaround"
+
+
+def test_apply_synthesizes_major_migration_instruction_when_missing(tmp_path: Path):
+    _write_manifest(tmp_path, "package.json", {"dependencies": {"lodash": "8.5.1"}})
+    group = _group("lodash", "package.json")
+    queue = _tasks(group)
+    task = queue["task-1"]
+    decision = SimpleNamespace(
+        task_id="task-1",
+        selected_strategy="version_bump",
+        selected_version="9.0.2",
+        allowed_alternative_versions=[],
+        allowed_dependency_types=["dependencies"],
+        selected_plan_issue_ids=[],
+        dependency_type="dependencies",
+        strategy_stage="osv_minimum",
+        exact_instruction=None,
+        requires_source_migration=True,
+        installed_version="8.5.1",
+        target_occurrence_id=make_occurrence_id("package.json", "lodash"),
+        target_group_id=group.group_id,
+        target_package_name="lodash",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/lodash",
+    )
+    plan = SimpleNamespace(
+        plan_id="portfolio-major-upgrade",
+        portfolio_plan_id="portfolio-major-upgrade",
+        task_ids=["task-1"],
+        task_revisions={"task-1": task.task_revision},
+        solver_plan=SimpleNamespace(
+            selected_plan=SimpleNamespace(task_decisions=[decision]),
+        ),
+    )
+
+    _groups, committed, diagnostics = apply_portfolio_plan(plan, [group], queue)
+
+    assert diagnostics == []
+    assert "8.5.1" in committed["task-1"].instruction
+    assert "9.0.2" in committed["task-1"].instruction
+    assert (
+        "Migrate all affected production and test code to the selected package API "
+        "while preserving behavior; do not change the solver-approved package or version."
+        in committed["task-1"].instruction
+    )
+
+
+def test_supervisor_rejects_stale_resolution_certificate():
+    assignment_digest = hashlib.sha256(
+        json.dumps({}, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    selected = SimpleNamespace(
+        candidate_plan_id="candidate-plan",
+        selected_candidate_versions={},
+        task_decisions=[],
+        batches=[],
+    )
+    solver_plan = SimpleNamespace(
+        status="OPTIMAL",
+        candidate_catalog_complete=True,
+        candidate_catalog_digest="candidate-catalog-digest",
+        selected_plan=selected,
+    )
+    certificate = SimpleNamespace(
+        status="CERTIFIED",
+        portfolio_plan_id="portfolio-plan",
+        candidate_plan_id="candidate-plan",
+        solver_input_digest="solver-input-digest",
+        repository_fingerprint="repository-fingerprint",
+        workspace_graph_digest="stale-workspace-graph",
+        candidate_catalog_digest="candidate-catalog-digest",
+        candidate_assignment_digest=assignment_digest,
+        task_revisions={},
+        covered_coverage_ids=[],
+        workaround_coverage_ids=[],
+        unresolved_coverage_ids=[],
+    )
+    plan = SimpleNamespace(
+        portfolio_plan_id="portfolio-plan",
+        plan_id="portfolio-plan",
+        solver_plan=solver_plan,
+        resolution_certificate=certificate,
+        solver_input_digest="solver-input-digest",
+        repository_fingerprint="repository-fingerprint",
+        workspace_graph_digest="workspace-graph",
+        task_revisions={},
+        task_ids=[],
+        planned_task_revisions={},
+        task_strategies={},
+    )
+    certificate.workspace_graph_digest = "workspace-graph"
+    assert _portfolio_plan_violations(plan, {}, []) == []
+    assert _portfolio_certificate_violations(plan, {}) == []
+    certificate.candidate_plan_id = "stale-candidate-plan"
+    assert _portfolio_certificate_violations(plan, {}) == [
+        "package-resolution certificate candidate plan ID is stale"
+    ]
+    assert _portfolio_plan_violations(plan, {}, []) == [
+        "package-resolution certificate candidate plan ID is stale"
+    ]
+    certificate.candidate_plan_id = "candidate-plan"
+    certificate.workspace_graph_digest = "stale-workspace-graph"
+
+    violations = _portfolio_plan_violations(plan, {}, [])
+
+    assert violations == [
+        "package-resolution certificate workspace_graph_digest differs from committed plan"
+    ]
+
+
+def test_scoped_transitive_findings_become_override_solver_tasks(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {
+                "express-jwt": "1.0.0",
+                "jsonwebtoken": "1.0.0",
+            },
+        },
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/express-jwt": {
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "jsonwebtoken": "1.0.0",
+                        "moment": "1.0.0",
+                    },
+                },
+                "node_modules/jsonwebtoken": {
+                    "version": "1.0.0",
+                    "dependencies": {"jws": "1.0.0"},
+                },
+                "node_modules/jws": {
+                    "version": "1.0.0",
+                    "dependencies": {"base64url": "1.0.0"},
+                },
+                "node_modules/base64url": {"version": "1.0.0"},
+                "node_modules/express-jwt/node_modules/moment": {"version": "1.0.0"},
+            },
+        },
+    )
+
+    express_jwt = _group("express-jwt", "package.json")
+    jsonwebtoken = _group("jsonwebtoken", "package.json")
+
+    def transitive_group(package_name: str, ancestry: list[str]):
+        group = _group(package_name, "package.json")
+        localized = [
+            item.model_copy(update={"is_direct_dependency": False, "declaration_type": None})
+            for item in group.localized_issues
+        ]
+        return group.model_copy(
+            update={
+                "dependency_ancestry": ancestry,
+                "localized_issues": localized,
+                "versions": ["1.0.0"],
+            }
+        )
+
+    base64url = transitive_group("base64url", ["jws", "base64url"])
+    jws = transitive_group("jws", ["jws"])
+    moment = transitive_group("moment", ["moment"])
+    groups = [express_jwt, jsonwebtoken, base64url, jws, moment]
+    target_packages = [
+        "base64url",
+        "express-jwt",
+        "jsonwebtoken",
+        "jws",
+        "moment",
+    ]
+
+    prepared_groups, queue, diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        groups,
+        _tasks(*groups),
+        target_packages=target_packages,
+    )
+
+    assert diagnostics == []
+    assert {group.vulnerable_component for group in prepared_groups} == set(target_packages)
+    assert {task.parent_group_id for task in queue.values()} == {group.group_id for group in groups}
+    override_tasks = {
+        task.target_package_name: task
+        for task in queue.values()
+        if task.target_package_name in {"base64url", "jws", "moment"}
+    }
+    assert set(override_tasks) == {"base64url", "jws", "moment"}
+    assert all(task.target_dependency_type == "overrides" for task in override_tasks.values())
+    assert all(task.strategy_stage.value == "package_override" for task in override_tasks.values())
+
+    plan = build_portfolio_plan(
+        tmp_path,
+        prepared_groups,
+        queue,
+        target_packages=target_packages,
+    )
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None, (
+        plan.solver_plan.status,
+        plan.solver_plan.diagnostics,
+        plan.diagnostics,
+    )
+    assert set(plan.task_ids) == set(queue)
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    expected_coverage_ids = {
+        "coverage:"
+        + hashlib.sha256(
+            (_issue_identity(issue) + "\0" + occurrence.occurrence_id).encode("utf-8")
+        ).hexdigest()
+        for group in prepared_groups
+        for issue in group.issues
+        if issue.cve_id or issue.ghsa_id or issue.finding_id
+        for occurrence in snapshot.occurrences
+        if occurrence.manifest_path == (group.file_paths[0] if group.file_paths else "package.json")
+        and occurrence.package_name == group.vulnerable_component
+        and occurrence.installed_version == issue.package_version
+    }
+    assert set(selected.coverage_ids) == expected_coverage_ids
+    assert selected.unresolved_ids == []
+
+    decisions = {decision.task_id: decision for decision in selected.task_decisions}
+    for package_name, task in override_tasks.items():
+        decision = decisions[task.task_id]
+        assert decision.target_package_name == package_name
+        assert decision.dependency_type == "overrides"
+        assert decision.lockfile_package_key
+        assert decision.target_occurrence_id.endswith(f"::{decision.lockfile_package_key}")
+
+    mutations = {
+        mutation.package_name: mutation
+        for batch in selected.batches
+        for mutation in batch.mutations
+    }
+    for package_name in {"base64url", "jws", "moment"}:
+        assert mutations[package_name].dependency_type == "overrides"
+        assert mutations[package_name].target_version == "2.0.0"
+
+    committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
+        plan,
+        prepared_groups,
+        queue,
+    )
+    assert apply_diagnostics == []
+    violations = _portfolio_plan_violations(plan, committed_queue, committed_groups)
+    assert violations == ["portfolio plan is missing its package-resolution certificate"]
+    assert len(committed_groups) == 5
+    for package_name in {"base64url", "jws", "moment"}:
+        task = next(
+            task for task in committed_queue.values() if task.target_package_name == package_name
+        )
+        assert task.target_dependency_type == "overrides"
+        assert task.selected_version == "2.0.0"
+        assert task.portfolio_plan_id == plan.portfolio_plan_id
+        assert '"overrides"' in task.instruction

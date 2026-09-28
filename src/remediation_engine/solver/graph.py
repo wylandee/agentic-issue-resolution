@@ -214,7 +214,7 @@ def _finding_sets(
     for target in subgraph.targets:
         ids_by_occurrence[target.occurrence_id].update(target.finding_ids)
     for values in by_occurrence.values():
-        values.sort(key=lambda item: item.finding_id)
+        values.sort(key=lambda item: (item.finding_id, item.coverage_id))
     return by_occurrence, ids_by_occurrence
 
 
@@ -222,34 +222,57 @@ def _candidate_finding_ids(
     target: SolverTarget,
     decision: SolverTaskDecision | None,
     findings: Mapping[str, Sequence[SolverFindingRequirement]],
-) -> tuple[list[str], list[str], list[str]]:
-    """Classify findings as resolved, workaround, or unresolved."""
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
+    """Classify occurrence coverage and its issue-level projection."""
     requirements = findings.get(target.occurrence_id, ())
     explicit_ids = set(target.finding_ids)
-    resolved: list[str] = []
-    workaround: list[str] = []
-    unresolved: list[str] = []
+    status_by_issue: dict[str, set[str]] = defaultdict(set)
+    resolved_coverage: list[str] = []
+    workaround_coverage: list[str] = []
+    unresolved_coverage: list[str] = []
     strategy = _text(getattr(decision, "selected_strategy", "")).lower() if decision else ""
     selected = getattr(decision, "selected_version", None) if decision else None
     for requirement in requirements:
         explicit_ids.add(requirement.finding_id)
         if (
-            strategy in {"workaround", "code_workaround", "no_fix", "no-fix"}
+            strategy in {"workaround", "code_workaround"}
             and requirement.workaround_available
+            and requirement.workaround_plan_ids
         ):
-            workaround.append(requirement.finding_id)
+            workaround_coverage.append(requirement.coverage_id)
+            status_by_issue[requirement.finding_id].add("workaround")
         elif strategy in {"version_bump", "version-bump", "version bump"} and selected:
             floor = _version_key(requirement.fixed_version)
             actual = _version_key(selected)
-            if floor is None or (actual is not None and actual[:3] >= floor[:3]):
-                resolved.append(requirement.finding_id)
+            if floor is not None and actual is not None and actual[:3] >= floor[:3]:
+                resolved_coverage.append(requirement.coverage_id)
+                status_by_issue[requirement.finding_id].add("resolved")
             else:
-                unresolved.append(requirement.finding_id)
+                unresolved_coverage.append(requirement.coverage_id)
+                status_by_issue[requirement.finding_id].add("unresolved")
         else:
-            unresolved.append(requirement.finding_id)
-    accounted = set(resolved) | set(workaround) | set(unresolved)
-    unresolved.extend(sorted(explicit_ids - accounted))
-    return sorted(set(resolved)), sorted(set(workaround)), sorted(set(unresolved))
+            unresolved_coverage.append(requirement.coverage_id)
+            status_by_issue[requirement.finding_id].add("unresolved")
+    for finding_id in explicit_ids:
+        status_by_issue.setdefault(finding_id, {"unresolved"})
+    resolved: list[str] = []
+    workaround: list[str] = []
+    unresolved: list[str] = []
+    for finding_id, statuses in status_by_issue.items():
+        if statuses == {"resolved"}:
+            resolved.append(finding_id)
+        elif statuses == {"workaround"}:
+            workaround.append(finding_id)
+        elif "unresolved" in statuses:
+            unresolved.append(finding_id)
+    return (
+        sorted(resolved),
+        sorted(workaround),
+        sorted(unresolved),
+        sorted(resolved_coverage),
+        sorted(workaround_coverage),
+        sorted(unresolved_coverage),
+    )
 
 
 def _boundary(left: SolverTarget, right: SolverTarget) -> bool:
@@ -285,7 +308,7 @@ def _supported(
     if target.has_open_attempt:
         return False, "task has an open attempt; no new mutation assigned", False
     if not target.eligible_for_atomic_update:
-        return False, "target is unsupported or ambiguous for atomic update", True
+        return False, "target is unsupported or ambiguous for atomic update", False
     if decision is None:
         return False, "missing solver task decision; retained as singleton", True
     strategy = _text(decision.selected_strategy).lower()
@@ -315,7 +338,7 @@ def _new_batch(
     targets: Mapping[str, SolverTarget],
     decisions: Mapping[str, SolverTaskDecision],
     findings: SolverSubgraph,
-    finding_by_occurrence: Mapping[str, set[SolverFindingRequirement]],
+    finding_by_occurrence: Mapping[str, Sequence[SolverFindingRequirement]],
     *,
     atomic: bool,
     dispatchable: bool,
@@ -323,16 +346,28 @@ def _new_batch(
 ) -> SolverBatch:
     ordered = sorted(task_ids)
     mutations: list[SolverMutation] = []
-    resolved: set[str] = set()
-    workaround: set[str] = set()
-    unresolved: set[str] = set()
+    issue_statuses: dict[str, set[str]] = defaultdict(set)
+    resolved_coverage: set[str] = set()
+    workaround_coverage: set[str] = set()
+    unresolved_coverage: set[str] = set()
+    coverage_finding_ids = {
+        requirement.coverage_id: requirement.finding_id
+        for task_id in ordered
+        for requirement in finding_by_occurrence.get(targets[task_id].occurrence_id, ())
+    }
     for task_id in ordered:
         target = targets[task_id]
         decision = decisions.get(task_id)
-        r, w, u = _candidate_finding_ids(target, decision, finding_by_occurrence)
-        resolved.update(r)
-        workaround.update(w)
-        unresolved.update(u)
+        r, w, u, rc, wc, uc = _candidate_finding_ids(target, decision, finding_by_occurrence)
+        for finding_id in r:
+            issue_statuses[finding_id].add("resolved")
+        for finding_id in w:
+            issue_statuses[finding_id].add("workaround")
+        for finding_id in u:
+            issue_statuses[finding_id].add("unresolved")
+        resolved_coverage.update(rc)
+        workaround_coverage.update(wc)
+        unresolved_coverage.update(uc)
         if (
             dispatchable
             and decision is not None
@@ -349,19 +384,77 @@ def _new_batch(
                     dependency_type=decision.dependency_type or target.dependency_type,
                 )
             )
-    all_finding_ids = sorted(resolved | workaround | unresolved)
+    resolved = sorted(
+        finding_id for finding_id, statuses in issue_statuses.items() if statuses == {"resolved"}
+    )
+    workaround = sorted(
+        finding_id for finding_id, statuses in issue_statuses.items() if statuses == {"workaround"}
+    )
+    unresolved = sorted(
+        finding_id for finding_id, statuses in issue_statuses.items() if "unresolved" in statuses
+    )
+    all_finding_ids = sorted(issue_statuses)
     return SolverBatch(
         batch_id=f"batch-{_digest(ordered)}",
         task_ids=ordered,
         mutations=mutations,
-        resolved_finding_ids=sorted(resolved),
-        workaround_finding_ids=sorted(workaround),
-        unresolved_finding_ids=sorted(unresolved),
+        resolved_finding_ids=resolved,
+        workaround_finding_ids=workaround,
+        unresolved_finding_ids=unresolved,
+        resolved_coverage_ids=sorted(resolved_coverage),
+        workaround_coverage_ids=sorted(workaround_coverage),
+        unresolved_coverage_ids=sorted(unresolved_coverage),
+        coverage_finding_ids=coverage_finding_ids,
         severity_rank=_severity_for(all_finding_ids, {f.finding_id: f for f in findings.findings}),
         atomic=atomic,
         dispatchable=dispatchable,
         diagnostic=batch_diagnostic,
     )
+
+
+def _reconcile_batch_issue_projections(batches: Sequence[SolverBatch]) -> list[SolverBatch]:
+    """Project occurrence coverage to issue IDs only after all batches are known."""
+    statuses_by_issue: dict[str, set[str]] = defaultdict(set)
+    for batch in batches:
+        for coverage_id, finding_id in batch.coverage_finding_ids.items():
+            if coverage_id in batch.resolved_coverage_ids:
+                status = "resolved"
+            elif coverage_id in batch.workaround_coverage_ids:
+                status = "workaround"
+            else:
+                status = "unresolved"
+            statuses_by_issue[finding_id].add(status)
+
+    reconciled: list[SolverBatch] = []
+    for batch in batches:
+        issue_ids = set(batch.coverage_finding_ids.values())
+        unprojected_unresolved = set(batch.unresolved_finding_ids) - issue_ids
+        resolved = sorted(
+            finding_id for finding_id in issue_ids if statuses_by_issue[finding_id] == {"resolved"}
+        )
+        workaround = sorted(
+            finding_id
+            for finding_id in issue_ids
+            if statuses_by_issue[finding_id] == {"workaround"}
+        )
+        unresolved = sorted(
+            unprojected_unresolved
+            | {
+                finding_id
+                for finding_id in issue_ids
+                if "unresolved" in statuses_by_issue[finding_id]
+            }
+        )
+        reconciled.append(
+            batch.model_copy(
+                update={
+                    "resolved_finding_ids": resolved,
+                    "workaround_finding_ids": workaround,
+                    "unresolved_finding_ids": unresolved,
+                }
+            )
+        )
+    return reconciled
 
 
 def cluster_packages(
@@ -612,6 +705,7 @@ def cluster_packages(
         for task_id in batch.task_ids:
             task_to_batch[task_id] = batch.batch_id
     batches.sort(key=lambda batch: batch.batch_id)
+    batches = _reconcile_batch_issue_projections(batches)
 
     # Preserve occurrence edges and add explicit coupling metadata.  The latter
     # is bidirectional so SCC scheduling can diagnose non-peer coupling cycles.

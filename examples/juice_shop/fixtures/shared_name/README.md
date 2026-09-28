@@ -16,12 +16,11 @@ all 55 packages in the current baseline, including packages absent from the
 older suppressed fixture.
 
 The three targets share the `@angular/` namespace and the same frontend
-manifest. The portfolio planner should therefore keep the finding-backed
-targets in a coupled bounded package cluster rather than three unrelated
-singleton items. The planner also materializes the other direct frontend
-dependencies as synthetic coordination tasks; if the namespace exceeds the
-multi-package action cap, those synthetic tasks are partitioned into additional
-bounded items while the finding-backed targets remain together when possible.
+manifest. The runner explicitly scopes its development request to these three
+names. Portfolio discovery is limited to the selected findings and any required
+workspace or incompatible-peer coordination closure; unrelated direct frontend
+dependencies are not materialized. Namespace membership alone does not couple
+or expand a scoped plan.
 
 ## Files
 
@@ -29,8 +28,8 @@ bounded items while the finding-backed targets remain together when possible.
 * `suppressions.xml` — 55 package suppression rules, with only the three
   Angular target rules disabled.
 * `run_shared_name.py` — live runner that copies the suppression file into the
-  Juice Shop clone before passing the raw issues through triage and
-  orchestration.
+  Juice Shop clone and passes raw issues through triage with the explicit
+  development-only package scope.
 
 ## Run
 
@@ -50,8 +49,8 @@ data/trajectories/juice-shop-shared-name.patch
 ```
 
 The run passes raw issues rather than pre-triaged groups, so it exercises the
-actual package-only grouper key. In a successful cluster dispatch, inspect the
-trajectory for the three finding-backed `sca:frontend/package.json:@angular/...`
-groups, synthetic direct-dependency tasks, a bounded multi-package portfolio
-cluster containing the target groups, a shared `dispatch_batch_id`, and
-cluster-wide QA evidence.
+actual package-only grouper key. Inspect the trajectory for the three
+finding-backed `sca:frontend/package.json:@angular/...` groups, any synthetic
+tasks in their scoped coordination closure, bounded portfolio batches, a
+shared `dispatch_batch_id` when tasks batch together, and cluster-wide QA
+evidence.

@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +33,14 @@ from remediation_engine.contracts.solver_models import (
     DAGBuildResult,
     PortfolioReplanRequest,
     SolverBatch,
+    SolverDependencyRequirement,
+    SolverEvidenceDomain,
     SolverFindingRequirement,
     SolverPhase,
     SolverRemediationPlan,
+    SolverRuntimeFingerprint,
     SolverStatus,
+    SolverSubgraph,
     SolverTarget,
     SolverVersionCandidate,
 )
@@ -47,16 +52,27 @@ from remediation_engine.solver.graph import (
     cluster_packages,
     schedule_batches,
 )
-from remediation_engine.solver.subgraph import extract_solver_subgraph
+from remediation_engine.solver.subgraph import expand_candidate_relations, extract_solver_subgraph
 from remediation_engine.tools.npm_graph import (
     NpmDependencyRecord,
     NpmGraphSnapshot,
+    NpmLockfilePackage,
+    check_npm_range,
     load_npm_graph_snapshot,
+    lockfile_key_matches_package,
     make_occurrence_id,
+    normalize_dependency_ancestry,
+    resolve_lockfile_dependency_package,
 )
-from remediation_engine.tools.registry_cache import RegistryPackumentCache, load_or_fetch_packument
+from remediation_engine.tools.registry_cache import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    PackumentFetcher,
+    RegistryPackumentCache,
+    validate_packument,
+)
 
-_STABLE_VERSION = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)$")
+_STABLE_VERSION = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$")
+_OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE, TaskStatus.PIVOTED}
 )
@@ -68,6 +84,31 @@ _SEVERITY_RANK = {
     Severity.INFO.value: 4,
     Severity.UNKNOWN.value: 5,
 }
+
+
+@dataclass(frozen=True)
+class _PreparedPortfolioProblem:
+    """One immutable portfolio input bundle reused by every certification solve."""
+
+    repo_root: Path
+    host_repository_fingerprint: str
+    workspace_repository_fingerprint: str
+    groups: list[VulnerabilityGroup]
+    task_queue: dict[str, RemediationTask]
+    npm_snapshot: NpmGraphSnapshot
+    targets: list[SolverTarget]
+    findings: list[SolverFindingRequirement]
+    subgraph: SolverSubgraph
+    packuments: Mapping[str, Mapping[str, Any]]
+    candidate_domains: Mapping[str, list[SolverVersionCandidate]]
+    runtime_fingerprint: SolverRuntimeFingerprint | None
+    candidate_catalog_complete: bool
+    candidate_catalog_digest: str
+    settings: AppSettings
+    diagnostics: list[str]
+    target_packages: tuple[str, ...] | None
+    peer_conflict_pairs: tuple[tuple[str, str], ...]
+    forced_singleton_task_ids: tuple[str, ...]
 
 
 def _digest(value: Any) -> str:
@@ -218,18 +259,147 @@ def _workspace_id(snapshot: NpmGraphSnapshot, manifest_path: str) -> str | None:
     return roots[0] if roots else None
 
 
-def _target_record(
-    records: Mapping[tuple[str, str], NpmDependencyRecord],
+def _issue_dependency_ancestry(group: VulnerabilityGroup, issue: Any | None) -> tuple[str, ...]:
+    """Return the most specific scanner ancestry available for one issue."""
+    issue_id = str(getattr(issue, "id", "") or "")
+    if issue_id:
+        for localized in group.localized_issues:
+            if str(getattr(localized.issue, "id", "") or "") == issue_id:
+                ancestry = normalize_dependency_ancestry(localized.dependency_ancestry)
+                if ancestry:
+                    return ancestry
+    return normalize_dependency_ancestry(group.dependency_ancestry)
+
+
+def _lockfile_packages_for_finding(
+    snapshot: NpmGraphSnapshot,
     manifest_path: str,
     package_name: str,
-    fallback: str,
-) -> NpmDependencyRecord | None:
-    record = records.get((manifest_path, package_name))
-    if record is not None:
-        return record
-    if fallback != package_name:
-        return records.get((manifest_path, fallback))
-    return None
+    issue: Any | None,
+    group: VulnerabilityGroup,
+) -> list[NpmLockfilePackage]:
+    """Resolve every matching physical lockfile occurrence for one finding."""
+    issue_version = str(getattr(issue, "package_version", "") or "").strip().lstrip("=vV")
+    raw_versions = [issue_version] if issue_version else list(group.versions or [])
+    expected_versions = {
+        str(value).strip().lstrip("=vV") for value in raw_versions if value and str(value).strip()
+    }
+    by_physical_key: dict[tuple[str, str | None], NpmLockfilePackage] = {}
+    for package in sorted(
+        snapshot.lockfile_packages,
+        key=lambda item: (
+            item.manifest_path,
+            item.package_key,
+            item.version or "",
+            item.lockfile_path,
+        ),
+    ):
+        version = str(package.version or "").strip().lstrip("=vV") or None
+        if package.manifest_path != manifest_path or package.package_name != package_name:
+            continue
+        if expected_versions and version not in expected_versions:
+            continue
+        by_physical_key.setdefault((package.package_key, version), package)
+    candidates = list(by_physical_key.values())
+    ancestry = _issue_dependency_ancestry(group, issue)
+    if ancestry:
+        ancestry_matches = [
+            package
+            for package in candidates
+            if normalize_dependency_ancestry(package.ancestry) == ancestry
+        ]
+        if len(ancestry_matches) == 1:
+            return ancestry_matches
+    return candidates
+
+
+def _occurrence_id_for_lockfile_package(
+    snapshot: NpmGraphSnapshot,
+    package: NpmLockfilePackage,
+) -> str:
+    """Reuse the graph's direct identity or derive the exact physical key."""
+    for occurrence in snapshot.occurrences:
+        if (
+            occurrence.manifest_path == package.manifest_path
+            and occurrence.package_name == package.package_name
+            and occurrence.lockfile_package_key == package.package_key
+        ):
+            return occurrence.occurrence_id
+    return make_occurrence_id(package.manifest_path, package.package_name, package.package_key)
+
+
+def _finding_occurrences(
+    snapshot: NpmGraphSnapshot,
+    manifest_path: str,
+    package_name: str,
+    issue: Any,
+    group: VulnerabilityGroup,
+) -> list[str]:
+    """Return all evidence IDs matching one finding, without guessing a copy."""
+    packages = _lockfile_packages_for_finding(snapshot, manifest_path, package_name, issue, group)
+    if packages:
+        return sorted(
+            {_occurrence_id_for_lockfile_package(snapshot, package) for package in packages}
+        )
+
+    issue_version = str(getattr(issue, "package_version", "") or "").strip().lstrip("=vV")
+    raw_versions = [issue_version] if issue_version else list(group.versions or [])
+    expected_versions = {
+        str(value).strip().lstrip("=vV") for value in raw_versions if value and str(value).strip()
+    }
+    candidates = [
+        occurrence
+        for occurrence in snapshot.occurrences
+        if occurrence.manifest_path == manifest_path
+        and occurrence.package_name == package_name
+        and (occurrence.is_direct or occurrence.dependency_type == "workspace")
+        and (
+            not expected_versions
+            or not occurrence.installed_version
+            or str(occurrence.installed_version).strip().lstrip("=vV") in expected_versions
+        )
+    ]
+    ancestry = _issue_dependency_ancestry(group, issue)
+    if ancestry:
+        ancestry_matches = [
+            occurrence
+            for occurrence in candidates
+            if normalize_dependency_ancestry(occurrence.ancestry) == ancestry
+        ]
+        if len(ancestry_matches) == 1:
+            candidates = ancestry_matches
+    return sorted({occurrence.occurrence_id for occurrence in candidates})
+
+
+def _representative_override_package(
+    snapshot: NpmGraphSnapshot,
+    manifest_path: str,
+    package_name: str,
+    group: VulnerabilityGroup,
+) -> NpmLockfilePackage | None:
+    """Choose one stable mutation identity without narrowing finding coverage."""
+    by_identity: dict[tuple[str, str | None], NpmLockfilePackage] = {}
+    issues = list(group.issues) or [None]
+    for issue in issues:
+        for package in _lockfile_packages_for_finding(
+            snapshot, manifest_path, package_name, issue, group
+        ):
+            by_identity.setdefault((package.package_key, package.version), package)
+    candidates = list(by_identity.values())
+    if not candidates:
+        return None
+    ancestry = next(
+        (_issue_dependency_ancestry(group, issue) for issue in issues if issue is not None),
+        normalize_dependency_ancestry(group.dependency_ancestry),
+    )
+    ancestry_matches = [
+        package
+        for package in candidates
+        if ancestry and normalize_dependency_ancestry(package.ancestry) == ancestry
+    ]
+    if len(ancestry_matches) == 1:
+        return ancestry_matches[0]
+    return min(candidates, key=lambda package: (package.package_key, package.version or ""))
 
 
 def _group_fixed_version(group: VulnerabilityGroup, task: RemediationTask) -> str | None:
@@ -275,9 +445,9 @@ def _installed_version(
     if record and record.resolved_version:
         values.insert(0, record.resolved_version)
     for value in values:
-        if value and _STABLE_VERSION.fullmatch(str(value).strip()):
+        if value and str(value).strip():
             return str(value).strip().lstrip("vV")
-    return "0.0.0"
+    return "unknown"
 
 
 def _build_targets_and_findings(
@@ -308,20 +478,43 @@ def _build_targets_and_findings(
         target_name = (task.target_package_name or package_name).strip()
         manifest_path = _manifest_path(group, Path("."))
         manager = _group_manager(group)
-        record = _target_record(records, manifest_path, target_name, package_name)
+        record = records.get((manifest_path, target_name))
+        override_action = task.target_dependency_type in _OVERRIDE_DEPENDENCY_TYPES
+        nested_package = (
+            _representative_override_package(snapshot, manifest_path, target_name, group)
+            if record is None and target_name == package_name and override_action
+            else None
+        )
+        target_mapped = record is not None or override_action
+        if not package_name or not target_name or not manifest_path or manager not in {"", "npm"}:
+            diagnostics.append(f"task {task.task_id!r} has an unsupported or ambiguous npm target")
+            target_mapped = False
+        if not target_mapped:
+            diagnostics.append(
+                f"task {task.task_id!r} does not map to a direct declaration or supported override"
+            )
+        if record is None and not override_action:
+            diagnostics.append(
+                f"task {task.task_id!r} has no direct declaration or supported override target"
+            )
+        if record is None and override_action and nested_package is None:
+            diagnostics.append(
+                f"task {task.task_id!r} has no physical package occurrence for its override target"
+            )
         lock_key = (
             record.lockfile_package_key
             if record and record.lockfile_package_key
+            else nested_package.package_key
+            if nested_package is not None
             else f"node_modules/{target_name}"
         )
         occurrence_id = (
-            record.occurrence_id if record else make_occurrence_id(manifest_path, target_name)
+            record.occurrence_id
+            if record
+            else _occurrence_id_for_lockfile_package(snapshot, nested_package)
+            if nested_package is not None
+            else f"missing-target:{task.task_id}"
         )
-        if not package_name or not target_name or not manifest_path or manager not in {"", "npm"}:
-            diagnostics.append(f"task {task.task_id!r} has an unsupported or ambiguous npm target")
-            eligible = False
-        else:
-            eligible = True
         finding_ids = [
             _issue_identity(issue)
             for issue in group.issues
@@ -337,6 +530,19 @@ def _build_targets_and_findings(
             group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
         )
         target_strategy = "no_fix" if no_fix else task.strategy.value
+        group_ancestry = normalize_dependency_ancestry(group.dependency_ancestry)
+        physical_ancestry = (
+            normalize_dependency_ancestry(nested_package.ancestry)
+            if nested_package is not None
+            else ()
+        )
+        dependency_ancestry = (
+            group_ancestry
+            if len(group_ancestry) > len(physical_ancestry)
+            else physical_ancestry
+            if len(physical_ancestry) > 1
+            else group_ancestry or physical_ancestry
+        )
         target = SolverTarget(
             occurrence_id=occurrence_id,
             task_id=task.task_id,
@@ -345,7 +551,11 @@ def _build_targets_and_findings(
             target_package_name=target_name,
             manifest_path=manifest_path or "package.json",
             lockfile_package_key=lock_key,
-            installed_version=_installed_version(group, task, record),
+            installed_version=(
+                nested_package.version
+                if nested_package is not None and nested_package.version
+                else _installed_version(group, task, record)
+            ),
             dependency_type=task.target_dependency_type
             or (
                 group.parent_declaration_type
@@ -353,8 +563,11 @@ def _build_targets_and_findings(
                 else (record.declaration_type if record else "dependencies")
             ),
             strategy=target_strategy,
+            is_synthetic=bool(task.is_synthetic or group.is_synthetic),
+            is_finding_backed=bool(finding_ids),
             eligible_for_atomic_update=(
-                eligible
+                target_mapped
+                and (record is not None or nested_package is not None)
                 and task.status not in _TERMINAL_STATUSES
                 and task.current_attempt_id is None
                 and (
@@ -364,7 +577,7 @@ def _build_targets_and_findings(
                 )
             ),
             workspace_id=_workspace_id(snapshot, manifest_path),
-            dependency_ancestry=tuple(group.dependency_ancestry),
+            dependency_ancestry=dependency_ancestry,
             finding_ids=sorted(set(finding_ids)),
             is_terminal=task.status in _TERMINAL_STATUSES,
             has_open_attempt=task.current_attempt_id is not None,
@@ -384,27 +597,102 @@ def _build_targets_and_findings(
                 else issue.fixed_version or _group_fixed_version(group, task)
             )
             workaround_plan_ids = _workaround_plan_ids(group, issue)
-            workaround = bool(workaround_plan_ids)
-            findings.append(
-                SolverFindingRequirement(
-                    finding_id=finding_id,
-                    cve_id=issue.cve_id,
-                    ghsa_id=issue.ghsa_id,
-                    severity=issue.severity.value
-                    if isinstance(issue.severity, Severity)
-                    else str(issue.severity),
-                    vulnerable_package=package_name,
-                    target_occurrence_id=occurrence_id,
-                    fixed_version=fixed,
-                    direct_parent_name=group.parent_package_name,
-                    direct_parent_minimum_version=task.parent_minimum_version,
-                    strategy_stage=task.strategy_stage.value,
-                    workaround_available=workaround,
-                    workaround_plan_ids=workaround_plan_ids,
-                    is_transitive=bool(group.parent_package_name),
-                )
+            vulnerable_occurrence_ids = _finding_occurrences(
+                snapshot, manifest_path, package_name, issue, group
             )
+            if not vulnerable_occurrence_ids:
+                vulnerable_occurrence_ids = [
+                    f"missing-occurrence:{finding_id}:{manifest_path}:{package_name}"
+                ]
+                diagnostics.append(
+                    f"finding {finding_id!r} has no physical/direct occurrence for "
+                    f"{manifest_path}:{package_name}"
+                )
+            for vulnerable_occurrence_id in vulnerable_occurrence_ids:
+                findings.append(
+                    SolverFindingRequirement(
+                        finding_id=finding_id,
+                        vulnerable_occurrence_id=vulnerable_occurrence_id,
+                        cve_id=issue.cve_id,
+                        ghsa_id=issue.ghsa_id,
+                        severity=issue.severity.value
+                        if isinstance(issue.severity, Severity)
+                        else str(issue.severity),
+                        vulnerable_package=package_name,
+                        target_occurrence_id=occurrence_id,
+                        fixed_version=fixed,
+                        direct_parent_name=(group.parent_package_name or task.parent_package_name),
+                        direct_parent_minimum_version=task.parent_minimum_version,
+                        strategy_stage=task.strategy_stage.value,
+                        workaround_available=bool(workaround_plan_ids),
+                        workaround_plan_ids=workaround_plan_ids,
+                        is_transitive=bool(
+                            group.parent_package_name or task.parent_package_name or nested_package
+                        ),
+                    )
+                )
     return targets, findings, sorted(set(diagnostics))
+
+
+def _required_candidate_package_names(
+    targets: Sequence[SolverTarget],
+    findings: Sequence[SolverFindingRequirement],
+) -> list[str]:
+    """Return every mutable target and transitive ancestry package name."""
+    mutable_targets = {
+        target.occurrence_id: target for target in targets if target.eligible_for_atomic_update
+    }
+    names: set[str] = set()
+    for target in mutable_targets.values():
+        if target.target_package_name:
+            names.add(target.target_package_name)
+        names.update(name for name in target.dependency_ancestry if name)
+    for finding in findings:
+        if finding.target_occurrence_id not in mutable_targets:
+            continue
+        if finding.direct_parent_name:
+            names.add(finding.direct_parent_name)
+        if finding.is_transitive:
+            names.add(finding.vulnerable_package)
+    return sorted(names)
+
+
+def _fetch_candidate_packuments(
+    package_names: Iterable[str],
+    settings: AppSettings,
+    *,
+    registry_fetcher: PackumentFetcher | None = None,
+) -> tuple[dict[str, Mapping[str, Any]], bool, str, list[str]]:
+    """Fetch one fresh raw packument per package and persist configured cache entries."""
+    from remediation_engine.tools.registry_tools import _fetch_package_data
+
+    cache = RegistryPackumentCache(settings.solver_cache_dir) if settings.solver_cache_dir else None
+    required_names = sorted({str(name).strip() for name in package_names if str(name).strip()})
+    packuments: dict[str, Mapping[str, Any]] = {}
+    diagnostics: list[str] = []
+    complete = True
+    for package_name in required_names:
+        try:
+            packument = _fetch_package_data(package_name, fetcher=registry_fetcher, cache=None)
+            packuments[package_name] = packument
+            if cache is not None and not cache.put(package_name, packument):
+                complete = False
+                diagnostics.append(f"packument cache persistence failed for {package_name!r}")
+        except Exception as exc:  # noqa: BLE001
+            complete = False
+            diagnostics.append(f"fresh packument unavailable for {package_name!r}: {exc}")
+    if cache is not None:
+        diagnostics.extend(cache.diagnostics)
+    catalog_digest = _digest(
+        {
+            "packument_digests": {
+                name: _digest(packument) for name, packument in sorted(packuments.items())
+            },
+            "missing_packages": sorted(set(required_names) - set(packuments)),
+            "diagnostics": sorted(set(diagnostics)),
+        }
+    )
+    return packuments, complete, catalog_digest, sorted(set(diagnostics))
 
 
 def _transitive_child_floor(group: VulnerabilityGroup) -> str | None:
@@ -428,26 +716,20 @@ def _resolve_transitive_parent_floors(
     groups: Sequence[VulnerabilityGroup],
     settings: AppSettings,
     diagnostics: list[str],
+    *,
+    packuments: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, set[str]]:
-    """Resolve initial transitive parent floors from cached published metadata.
-
-    Initial transitive tasks intentionally do not commit ``parent_minimum_version``:
-    the outer planner must prove which parent releases can carry the fixed child.
-    A configured registry cache is the only metadata boundary used here.  When
-    no cache is configured, the finding remains without a solver floor and the
-    solver can fail closed rather than selecting an arbitrary parent release.
-
-    Returns:
-        Mapping from parent occurrence IDs to the stable parent versions proven
-        compatible with the vulnerable child.  An empty set is an explicit
-        proof failure for a configured cache.
-    """
+    """Resolve transitive parent floors from one prepared packument snapshot."""
     cache = RegistryPackumentCache(settings.solver_cache_dir) if settings.solver_cache_dir else None
-    if cache is None:
-        return {}
     groups_by_id = {group.group_id: group for group in groups}
     tasks_by_id = dict(task_queue)
     compatible_by_target: dict[str, set[str]] = {}
+
+    def packument_for(package_name: str) -> Mapping[str, Any] | None:
+        if packuments is not None:
+            return packuments.get(package_name)
+        return cache.get(package_name) if cache is not None else None
+
     for target in sorted(targets, key=lambda item: item.occurrence_id):
         task = tasks_by_id.get(target.task_id)
         group = groups_by_id.get(task.parent_group_id) if task else None
@@ -465,28 +747,40 @@ def _resolve_transitive_parent_floors(
             compatible_by_target[target.occurrence_id] = set()
             continue
         try:
-            from remediation_engine.tools.registry_tools import (
-                _fetch_package_data,
-                select_npm_parent_version,
-            )
+            from remediation_engine.tools.registry_tools import select_npm_parent_version
 
-            parent_data = load_or_fetch_packument(parent_name, _fetch_package_data, cache=cache)
+            parent_data = packument_for(parent_name)
+            if parent_data is None:
+                compatible_by_target[target.occurrence_id] = set()
+                diagnostics.append(f"transitive parent packument unavailable for {parent_name!r}")
+                continue
             ancestry = tuple(group.dependency_ancestry)
-            registry_data = {parent_name: parent_data}
+            registry_data: dict[str, Mapping[str, Any]] = {parent_name: parent_data}
+            missing_intermediate: str | None = None
             for intermediate in ancestry[1:-1]:
                 if intermediate and intermediate not in registry_data:
-                    registry_data[intermediate] = load_or_fetch_packument(
-                        intermediate, _fetch_package_data, cache=cache
-                    )
+                    intermediate_data = packument_for(intermediate)
+                    if intermediate_data is None:
+                        missing_intermediate = intermediate
+                        break
+                    registry_data[intermediate] = intermediate_data
+            if missing_intermediate:
+                compatible_by_target[target.occurrence_id] = set()
+                diagnostics.append(
+                    f"transitive ancestry packument unavailable for {missing_intermediate!r}"
+                )
+                continue
             result = select_npm_parent_version(
-                parent_data,
+                dict(parent_data),
                 parent_package_name=parent_name,
                 child_package_name=group.vulnerable_component or target.package_name,
                 child_fixed_version=child_floor,
                 installed_parent_version=target.installed_version,
                 selection="minimum",
                 dependency_ancestry=ancestry or None,
-                registry_data_by_package=registry_data,
+                registry_data_by_package={
+                    name: dict(value) for name, value in registry_data.items()
+                },
             )
             compatible = {
                 str(version).strip().lstrip("vV")
@@ -523,8 +817,10 @@ def _candidate(
     source: str,
     floor: str | None,
     attempted: bool = False,
-    dependency_ranges: Mapping[str, str] | None = None,
-    peer_ranges: Mapping[str, str] | None = None,
+    requirements: Sequence[SolverDependencyRequirement] = (),
+    engines: Mapping[str, str] | None = None,
+    os: Sequence[str] = (),
+    cpu: Sequence[str] = (),
 ) -> SolverVersionCandidate | None:
     normalized = str(version or "").strip().lstrip("vV")
     key = _semver_key(normalized)
@@ -537,11 +833,258 @@ def _candidate(
         source=source,
         meets_security_floor=floor_key is None or key >= floor_key,
         attempted=attempted,
-        dependency_ranges=dict(dependency_ranges or {}),
-        peer_ranges=dict(peer_ranges or {}),
-        published_dependencies=dict(dependency_ranges or {}),
-        published_peer_dependencies=dict(peer_ranges or {}),
+        requirements=list(requirements),
+        engines=dict(engines or {}),
+        os=list(os),
+        cpu=list(cpu),
     )
+
+
+def _candidate_metadata(
+    package_name: str,
+    version: str,
+    metadata: Mapping[str, Any],
+) -> tuple[
+    list[SolverDependencyRequirement],
+    dict[str, str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    """Parse published requirements and runtime constraints without omission."""
+    diagnostics: list[str] = []
+    requirements: list[SolverDependencyRequirement] = []
+    peer_meta_raw = metadata.get("peerDependenciesMeta", {})
+    if not isinstance(peer_meta_raw, Mapping):
+        diagnostics.append(f"malformed peerDependenciesMeta for {package_name}@{version}")
+        peer_meta: Mapping[str, Any] = {}
+    else:
+        peer_meta = peer_meta_raw
+    optional_dependencies = metadata.get("optionalDependencies", {})
+    optional_names = (
+        {str(name).strip() for name in optional_dependencies}
+        if isinstance(optional_dependencies, Mapping)
+        else set()
+    )
+    sections = (
+        ("dependencies", "dependency", False),
+        ("optionalDependencies", "optional_dependency", True),
+        ("peerDependencies", "peer", False),
+    )
+    for section, kind, section_optional in sections:
+        raw = metadata.get(section, {})
+        if not isinstance(raw, Mapping):
+            diagnostics.append(f"malformed {section} for {package_name}@{version}")
+            continue
+        for raw_name, raw_range in sorted(raw.items(), key=lambda item: str(item[0])):
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                diagnostics.append(
+                    f"malformed package name in {section} for {package_name}@{version}"
+                )
+                continue
+            if section == "dependencies" and raw_name.strip() in optional_names:
+                continue
+            if not isinstance(raw_range, str) or not raw_range.strip():
+                diagnostics.append(
+                    f"malformed range for {raw_name!r} in {section} of {package_name}@{version}"
+                )
+                continue
+            optional = section_optional
+            if kind == "peer":
+                peer = peer_meta.get(raw_name, {})
+                if not isinstance(peer, Mapping):
+                    diagnostics.append(
+                        f"malformed peer metadata for {raw_name!r} in {package_name}@{version}"
+                    )
+                    continue
+                peer_optional = peer.get("optional", False)
+                if not isinstance(peer_optional, bool):
+                    diagnostics.append(
+                        f"malformed optional peer flag for {raw_name!r} in {package_name}@{version}"
+                    )
+                    continue
+                optional = peer_optional
+            requirements.append(
+                SolverDependencyRequirement(
+                    package_name=raw_name.strip(),
+                    version_range=raw_range.strip(),
+                    kind=kind,
+                    is_optional=optional,
+                )
+            )
+
+    engines: dict[str, str] = {}
+    raw_engines = metadata.get("engines", {})
+    if not isinstance(raw_engines, Mapping):
+        diagnostics.append(f"malformed engines for {package_name}@{version}")
+    else:
+        for name, requirement in raw_engines.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(requirement, str)
+                or not requirement.strip()
+            ):
+                diagnostics.append(f"malformed engine constraint for {package_name}@{version}")
+                continue
+            engines[name.strip()] = requirement.strip()
+
+    def platform_values(field: str) -> list[str]:
+        raw = metadata.get(field, [])
+        if not isinstance(raw, (list, tuple)) or any(
+            not isinstance(value, str) or not value.strip() for value in raw
+        ):
+            diagnostics.append(f"malformed {field} for {package_name}@{version}")
+            return []
+        return sorted({value.strip() for value in raw})
+
+    requirements.sort(
+        key=lambda item: (
+            item.package_name,
+            item.kind,
+            item.version_range,
+            item.is_optional,
+        )
+    )
+    return (
+        requirements,
+        dict(sorted(engines.items())),
+        platform_values("os"),
+        platform_values("cpu"),
+        diagnostics,
+    )
+
+
+def _supported_dependency_range(version_range: str) -> bool:
+    """Whether one npm specifier has a range model understood by this solver."""
+    value = version_range.strip()
+    if (
+        not value
+        or value.casefold() == "latest"
+        or value.startswith(("npm:", "workspace:", "file:", "git:", "git+", "http:", "https:"))
+    ):
+        return False
+    return check_npm_range(value, "1.0.0").matches is not None
+
+
+def _override_value(value: Any) -> str | None:
+    """Return a simple exact override, leaving nested selector maps unmodeled."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, Mapping) and set(value) == {"."}:
+        replacement = value.get(".")
+        if isinstance(replacement, str) and replacement.strip():
+            return replacement.strip()
+    return None
+
+
+def _override_selector_may_match(selector: str, package_name: str) -> bool:
+    """Detect unsupported scoped override selectors that could affect a package."""
+    return bool(
+        selector.endswith(f"/{package_name}")
+        or selector.startswith(f"{package_name}@")
+        or ("*" in selector and package_name in selector)
+    )
+
+
+def _nested_override_may_match(value: Any, package_name: str) -> bool:
+    """Find package selectors in unsupported nested override objects."""
+    if not isinstance(value, Mapping):
+        return False
+    for raw_selector, nested in value.items():
+        if isinstance(raw_selector, str) and (
+            raw_selector.strip() == package_name
+            or _override_selector_may_match(raw_selector.strip(), package_name)
+        ):
+            return True
+        if _nested_override_may_match(nested, package_name):
+            return True
+    return False
+
+
+def _effective_dependency_override(
+    snapshot: NpmGraphSnapshot,
+    target: SolverTarget,
+    package_name: str,
+) -> tuple[str | None, bool]:
+    """Resolve exact supported manifest overrides or report an unmodeled match."""
+    manifests = snapshot.manifests_by_path
+    workspace_roots = set(snapshot.workspace_membership_map.get(target.manifest_path, set()))
+    if target.workspace_id:
+        workspace_roots.add(target.workspace_id)
+    if len(workspace_roots) > 1:
+        return None, False
+    scope_paths = [next(iter(workspace_roots)) if workspace_roots else target.manifest_path]
+    section_priority = {"overrides": 0, "pnpm_overrides": 1, "resolutions": 2}
+    matches: dict[int, set[str]] = {}
+    for path in scope_paths:
+        manifest = manifests.get(path)
+        if manifest is None:
+            continue
+        data = manifest.data
+        pnpm = data.get("pnpm")
+        pnpm_overrides = pnpm.get("overrides") if isinstance(pnpm, Mapping) else None
+        if "pnpm" in data and not isinstance(pnpm, Mapping):
+            return None, False
+        sections = (
+            ("overrides", data.get("overrides")),
+            ("pnpm_overrides", pnpm_overrides),
+            ("resolutions", data.get("resolutions")),
+        )
+        for section, raw_values in sections:
+            if raw_values is None:
+                continue
+            if not isinstance(raw_values, Mapping):
+                return None, False
+            for raw_selector, raw_value in raw_values.items():
+                if not isinstance(raw_selector, str) or not raw_selector.strip():
+                    return None, False
+                selector = raw_selector.strip()
+                if selector != package_name:
+                    if _override_selector_may_match(selector, package_name):
+                        return None, False
+                    if _nested_override_may_match(raw_value, package_name):
+                        return None, False
+                    continue
+                replacement = _override_value(raw_value)
+                if replacement is None:
+                    return None, False
+                precedence = scope_paths.index(path) * 10 + section_priority[section]
+                matches.setdefault(precedence, set()).add(replacement)
+    if not matches:
+        return None, True
+    highest_priority = min(matches)
+    replacements = matches[highest_priority]
+    if len(replacements) != 1:
+        return None, False
+    return next(iter(replacements)), True
+
+
+def _effective_candidate_requirements(
+    snapshot: NpmGraphSnapshot,
+    target: SolverTarget,
+    requirements: Sequence[SolverDependencyRequirement],
+) -> list[SolverDependencyRequirement]:
+    """Apply supported install-scope overrides before solver range modeling."""
+    result: list[SolverDependencyRequirement] = []
+    for requirement in requirements:
+        effective_range, supported_override = _effective_dependency_override(
+            snapshot, target, requirement.package_name
+        )
+        version_range = effective_range or requirement.version_range
+        is_range_supported = bool(
+            requirement.is_range_supported
+            and supported_override
+            and _supported_dependency_range(version_range)
+        )
+        result.append(
+            requirement.model_copy(
+                update={
+                    "version_range": version_range,
+                    "is_range_supported": is_range_supported,
+                }
+            )
+        )
+    return result
 
 
 def _candidate_domains(
@@ -554,14 +1097,14 @@ def _candidate_domains(
     diagnostics: list[str],
     *,
     transitive_compatible_versions: Mapping[str, set[str]] | None = None,
-) -> dict[str, list[SolverVersionCandidate]]:
-    """Prepare bounded local and optionally cached registry domains."""
+    packuments: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[dict[str, list[SolverVersionCandidate]], bool, str]:
+    """Prepare complete, candidate-specific registry domains without pruning."""
     groups_by_task = {
-        task.task_id: groups_by_id
-        for task, groups_by_id in (
-            (task, next((g for g in groups if g.group_id == task.parent_group_id), None))
-            for task in task_queue.values()
+        task.task_id: next(
+            (group for group in groups if group.group_id == task.parent_group_id), None
         )
+        for task in task_queue.values()
     }
     floors_by_target: dict[str, str | None] = {}
     for finding in findings:
@@ -575,6 +1118,11 @@ def _candidate_domains(
     cache = RegistryPackumentCache(settings.solver_cache_dir) if settings.solver_cache_dir else None
     compatible_versions = transitive_compatible_versions or {}
     domains: dict[str, list[SolverVersionCandidate]] = {}
+    observed_packuments: dict[str, Mapping[str, Any]] = dict(packuments or {})
+    complete = packuments is not None
+    completeness_diagnostics: list[str] = []
+    limit = max(1, settings.solver_max_candidates_per_target)
+
     for target in sorted(targets, key=lambda item: item.occurrence_id):
         task = task_queue.get(target.task_id)
         group = groups_by_task.get(target.task_id)
@@ -606,15 +1154,15 @@ def _candidate_domains(
         def add_candidate(
             candidate: SolverVersionCandidate | None,
             *,
-            _parent_proof: set[str] | None = parent_proof,
-            _values: list[SolverVersionCandidate] = values,
-        ) -> None:
-            """Append a candidate, applying transitive compatibility proof."""
+            proof: set[str] | None = parent_proof,
+            target_values: list[SolverVersionCandidate] = values,
+        ) -> SolverVersionCandidate | None:
             if candidate is None:
-                return
-            if _parent_proof is not None and candidate.version not in _parent_proof:
+                return None
+            if proof is not None and candidate.version not in proof:
                 candidate = candidate.model_copy(update={"meets_security_floor": False})
-            _values.append(candidate)
+            target_values.append(candidate)
+            return candidate
 
         for version, source in (
             (target.installed_version, "current"),
@@ -634,87 +1182,356 @@ def _candidate_domains(
             ),
         ):
             if version:
-                add_candidate(_candidate(str(version), source=source, floor=floor, attempted=False))
-        # Registry access is explicit and bounded: a configured solver cache is
-        # the opt-in network/cache boundary for the outer planner. Unit tests
-        # without a cache remain entirely offline and use local plan evidence.
-        if cache is not None and target.target_package_name:
-            try:
-                from remediation_engine.tools.registry_tools import _fetch_package_data
+                add_candidate(_candidate(str(version), source=source, floor=floor))
 
-                packument = load_or_fetch_packument(
-                    target.target_package_name, _fetch_package_data, cache=cache
-                )
-                for raw_version, metadata in sorted((packument.get("versions") or {}).items()):
-                    if not isinstance(metadata, Mapping):
-                        continue
-                    dependencies: dict[str, str] = {}
-                    for field in ("dependencies", "optionalDependencies"):
-                        values_for_field = metadata.get(field)
-                        if isinstance(values_for_field, Mapping):
-                            dependencies.update(
-                                {
-                                    str(name): str(requirement)
-                                    for name, requirement in values_for_field.items()
-                                    if isinstance(requirement, str)
-                                }
-                            )
-                    peers = (
-                        metadata.get("peerDependencies")
-                        if isinstance(metadata.get("peerDependencies"), Mapping)
-                        else {}
+        eligible_registry_count = 0
+        packument: Mapping[str, Any] | None = None
+        if target.eligible_for_atomic_update and target.target_package_name:
+            package_name = target.target_package_name
+            raw_packument = (
+                packuments.get(package_name)
+                if packuments is not None
+                else cache.get(package_name)
+                if cache is not None
+                else None
+            )
+            if raw_packument is None:
+                complete = False
+                message = f"required packument unavailable for {package_name!r}"
+                completeness_diagnostics.append(message)
+            else:
+                from remediation_engine.tools.registry_cache import validate_packument
+
+                try:
+                    packument = validate_packument(package_name, raw_packument)
+                    observed_packuments[package_name] = packument
+                except (TypeError, ValueError) as exc:
+                    complete = False
+                    completeness_diagnostics.append(
+                        f"malformed packument for {package_name!r}: {exc}"
                     )
-                    add_candidate(
-                        _candidate(
-                            str(raw_version),
+            if packuments is None and packument is not None:
+                complete = False
+                completeness_diagnostics.append(
+                    f"cached packument for {package_name!r} is not a fresh planning snapshot"
+                )
+            if packument is not None:
+                raw_versions = packument.get("versions")
+                if not isinstance(raw_versions, Mapping):
+                    complete = False
+                    completeness_diagnostics.append(
+                        f"packument versions are malformed for {package_name!r}"
+                    )
+                else:
+                    if packuments is not None:
+                        published_versions = {
+                            str(version)
+                            for version in raw_versions
+                            if _semver_key(str(version)) is not None
+                        }
+                        values[:] = [
+                            candidate
+                            for candidate in values
+                            if candidate.source == "current"
+                            or candidate.version in published_versions
+                        ]
+                    for raw_version, metadata in sorted(
+                        raw_versions.items(), key=lambda item: str(item[0])
+                    ):
+                        normalized_version = str(raw_version)
+                        if _semver_key(normalized_version) is None:
+                            continue
+                        if not isinstance(metadata, Mapping):
+                            complete = False
+                            completeness_diagnostics.append(
+                                f"malformed metadata for {package_name}@{normalized_version}"
+                            )
+                            continue
+                        requirements, engines, os_values, cpu_values, metadata_diagnostics = (
+                            _candidate_metadata(package_name, normalized_version, metadata)
+                        )
+                        requirements = _effective_candidate_requirements(
+                            snapshot, target, requirements
+                        )
+                        if metadata_diagnostics:
+                            complete = False
+                            completeness_diagnostics.extend(metadata_diagnostics)
+                        candidate = _candidate(
+                            normalized_version,
                             source="registry",
                             floor=floor,
-                            dependency_ranges=dependencies,
-                            peer_ranges=peers,
+                            requirements=requirements,
+                            engines=engines,
+                            os=os_values,
+                            cpu=cpu_values,
                         )
-                    )
-            except Exception as exc:  # noqa: BLE001
-                diagnostics.append(
-                    f"registry domain unavailable for {target.target_package_name}: {exc}"
-                )
+                        retained = add_candidate(candidate)
+                        if retained is not None and retained.meets_security_floor:
+                            eligible_registry_count += 1
+                    if eligible_registry_count > limit:
+                        complete = False
+                        completeness_diagnostics.append(
+                            f"eligible release catalog for {package_name!r} has "
+                            f"{eligible_registry_count} versions, exceeding resource guard {limit}"
+                        )
+
         dedup: dict[str, SolverVersionCandidate] = {}
         for value in sorted(values, key=lambda item: (item.semver_key, item.version, item.source)):
             existing = dedup.get(value.version)
-            if existing is None or (
-                not existing.dependency_ranges
-                and not existing.peer_ranges
-                and (value.dependency_ranges or value.peer_ranges)
-            ):
+            if existing is None or (existing.source != "registry" and value.source == "registry"):
                 dedup[value.version] = value
         ordered = list(dedup.values())
-        limit = max(1, settings.solver_max_candidates_per_target)
-        if len(ordered) > limit:
-            eligible = [value for value in ordered if value.meets_security_floor]
-            latest = (eligible or ordered)[-1]
-            required: list[SolverVersionCandidate] = [latest]
-            anchor_versions = [
-                target.installed_version,
-                floor,
-                task.selected_version if task else None,
-                *(task.allowed_target_versions if task else []),
-            ]
-            for raw_version in anchor_versions:
-                normalized = str(raw_version or "").strip().lstrip("vV")
-                candidate = dedup.get(normalized)
-                if candidate is not None and candidate not in required:
-                    required.append(candidate)
-            for candidate in reversed(ordered):
-                if len(required) >= limit:
-                    break
-                if candidate not in required:
-                    required.append(candidate)
-            ordered = sorted(required[:limit], key=lambda item: item.semver_key)
         domains[target.occurrence_id] = ordered
-        if not domains[target.occurrence_id] and target.eligible_for_atomic_update:
+        if not ordered and target.eligible_for_atomic_update:
             diagnostics.append(f"empty candidate domain for {target.occurrence_id}")
     if cache is not None:
         diagnostics.extend(cache.diagnostics)
-    return domains
+        completeness_diagnostics.extend(cache.diagnostics)
+    diagnostics.extend(completeness_diagnostics)
+    raw_packument_digests = {
+        name: _digest(value) for name, value in sorted(observed_packuments.items())
+    }
+    catalog_digest = _digest(
+        {
+            "raw_packument_digests": raw_packument_digests,
+            "candidate_domains": {
+                occurrence_id: [item.model_dump(mode="json") for item in values]
+                for occurrence_id, values in sorted(domains.items())
+            },
+            "complete": complete,
+            "diagnostics": sorted(set(completeness_diagnostics)),
+        }
+    )
+    return domains, complete, catalog_digest
+
+
+def _evidence_requirement_keys(
+    snapshot: NpmGraphSnapshot,
+    targets: Sequence[SolverTarget],
+    candidate_domains: Mapping[str, Sequence[SolverVersionCandidate]],
+) -> dict[tuple[str, str, str], SolverTarget]:
+    """Find required runtime dependencies without an eligible physical target."""
+    eligible_by_id = {
+        target.occurrence_id: target for target in targets if target.eligible_for_atomic_update
+    }
+    result: dict[tuple[str, str, str], SolverTarget] = {}
+    for target in sorted(eligible_by_id.values(), key=lambda item: item.occurrence_id):
+        for candidate in candidate_domains.get(target.occurrence_id, ()):
+            for requirement in candidate.requirements:
+                if (
+                    requirement.kind != "dependency"
+                    or requirement.is_optional
+                    or not requirement.is_range_supported
+                ):
+                    continue
+                package = resolve_lockfile_dependency_package(
+                    snapshot, target.occurrence_id, requirement.package_name
+                )
+                if package is not None:
+                    physical_id = make_occurrence_id(
+                        package.manifest_path, package.package_name, package.package_key
+                    )
+                    if physical_id in eligible_by_id:
+                        continue
+                key = (
+                    target.occurrence_id,
+                    requirement.package_name,
+                    requirement.kind,
+                )
+                result[key] = target
+    return result
+
+
+def _platform_values_match(allowed_values: Sequence[str], actual: str) -> bool:
+    """Apply npm positive and negated platform allowlist semantics."""
+    if not allowed_values or actual == "unknown":
+        return True
+    excluded = {value[1:] for value in allowed_values if value.startswith("!")}
+    included = {value for value in allowed_values if not value.startswith("!")}
+    return actual not in excluded and (not included or actual in included)
+
+
+def _build_evidence_domains(
+    snapshot: NpmGraphSnapshot,
+    targets: Sequence[SolverTarget],
+    findings: Sequence[SolverFindingRequirement],
+    candidate_domains: Mapping[str, Sequence[SolverVersionCandidate]],
+    existing_packuments: Mapping[str, Mapping[str, Any]],
+    settings: AppSettings,
+    *,
+    registry_fetcher: PackumentFetcher | None,
+    runtime_fingerprint: SolverRuntimeFingerprint | None,
+) -> tuple[list[SolverEvidenceDomain], str, list[str]]:
+    """Build complete one-hop dependency witnesses without failing mutation catalogs."""
+    requirements = _evidence_requirement_keys(snapshot, targets, candidate_domains)
+    package_names = sorted({key[1] for key in requirements})
+    packuments = dict(existing_packuments)
+    diagnostics: list[str] = []
+    missing_names = [name for name in package_names if name not in packuments]
+    if registry_fetcher is not None and missing_names:
+        fetched, _complete, _digest_value, fetch_diagnostics = _fetch_candidate_packuments(
+            missing_names, settings, registry_fetcher=registry_fetcher
+        )
+        packuments.update(fetched)
+        diagnostics.extend(fetch_diagnostics)
+
+    floors_by_package: dict[str, str] = {}
+    for finding in findings:
+        if not finding.fixed_version or _semver_key(finding.fixed_version) is None:
+            continue
+        current = floors_by_package.get(finding.vulnerable_package)
+        if current is None or (_semver_key(finding.fixed_version) or (0, 0, 0)) > (
+            _semver_key(current) or (0, 0, 0)
+        ):
+            floors_by_package[finding.vulnerable_package] = finding.fixed_version
+
+    domains: list[SolverEvidenceDomain] = []
+    maximum_candidates = max(1, settings.solver_max_candidates_per_target)
+    maximum_domains = max(0, settings.solver_max_model_variables)
+    for (source_id, package_name, dependency_kind), source in sorted(requirements.items()):
+        packument = packuments.get(package_name)
+        if packument is None:
+            diagnostics.append(
+                f"evidence packument unavailable for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        try:
+            payload_size = len(
+                json.dumps(
+                    dict(packument),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            diagnostics.append(
+                f"evidence packument malformed for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        if payload_size > DEFAULT_MAX_PAYLOAD_BYTES:
+            diagnostics.append(
+                f"evidence packument exceeds {DEFAULT_MAX_PAYLOAD_BYTES} bytes for "
+                f"{package_name!r}; dependency left unmodeled"
+            )
+            continue
+        try:
+            validated = validate_packument(package_name, packument)
+        except (TypeError, ValueError):
+            diagnostics.append(
+                f"evidence packument failed validation for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        raw_versions = validated.get("versions")
+        if not isinstance(raw_versions, Mapping):
+            diagnostics.append(
+                f"evidence versions malformed for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        stable_versions = [
+            (str(raw_version).strip().lstrip("vV"), metadata)
+            for raw_version, metadata in sorted(raw_versions.items(), key=lambda item: str(item[0]))
+            if _semver_key(str(raw_version).strip().lstrip("vV")) is not None
+        ]
+        if len(stable_versions) > maximum_candidates:
+            diagnostics.append(
+                f"evidence candidate limit exceeded for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        if len({version for version, _metadata in stable_versions}) != len(stable_versions):
+            diagnostics.append(
+                f"evidence versions ambiguous for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+
+        floor = floors_by_package.get(package_name)
+        floor_key = _semver_key(floor or "")
+        candidate_versions: list[str] = []
+        malformed_metadata = False
+        for version, metadata in stable_versions:
+            if not isinstance(metadata, Mapping):
+                malformed_metadata = True
+                break
+            _requirements, engines, os_values, cpu_values, metadata_diagnostics = (
+                _candidate_metadata(package_name, version, metadata)
+            )
+            if metadata_diagnostics:
+                malformed_metadata = True
+                break
+            version_key = _semver_key(version)
+            if floor_key is not None and version_key is not None and version_key < floor_key:
+                continue
+            compatible = True
+            if runtime_fingerprint is not None:
+                for engine_name, engine_range in engines.items():
+                    if engine_name == "node":
+                        actual = runtime_fingerprint.node_version
+                    elif engine_name == "npm":
+                        actual = runtime_fingerprint.npm_version
+                    else:
+                        continue
+                    if actual == "unknown":
+                        continue
+                    checked = check_npm_range(engine_range, actual)
+                    if checked.matches is None:
+                        malformed_metadata = True
+                        break
+                    if not checked.matches:
+                        compatible = False
+                        break
+                if malformed_metadata:
+                    break
+                if not _platform_values_match(
+                    os_values, runtime_fingerprint.platform
+                ) or not _platform_values_match(cpu_values, runtime_fingerprint.architecture):
+                    compatible = False
+            if compatible:
+                candidate_versions.append(version)
+        if malformed_metadata:
+            diagnostics.append(
+                f"evidence release metadata malformed for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        if len(domains) >= maximum_domains:
+            diagnostics.append(
+                f"evidence model-variable limit exceeded; dependency {package_name!r} "
+                "left unmodeled"
+            )
+            continue
+        identity = {
+            "source_occurrence_id": source_id,
+            "package_name": package_name,
+            "manifest_path": source.manifest_path,
+            "workspace_id": source.workspace_id,
+            "dependency_kind": dependency_kind,
+        }
+        variable_id = f"evidence:{_digest(identity)[:32]}"
+        domains.append(
+            SolverEvidenceDomain(
+                variable_id=variable_id,
+                package_name=package_name,
+                source_occurrence_id=source_id,
+                manifest_path=source.manifest_path,
+                workspace_id=source.workspace_id,
+                dependency_kind=dependency_kind,
+                candidate_versions=sorted(candidate_versions),
+            )
+        )
+    evidence_digest = _digest(
+        {
+            "packument_digests": {
+                name: _digest(packuments[name]) for name in package_names if name in packuments
+            },
+            "missing_packages": sorted(set(package_names) - set(packuments)),
+            "evidence_domains": [
+                domain.model_dump(mode="json")
+                for domain in sorted(domains, key=lambda item: item.variable_id)
+            ],
+            "diagnostics": sorted(set(diagnostics)),
+        }
+    )
+    return domains, evidence_digest, sorted(set(diagnostics))
 
 
 def _severity_rank_for_findings(findings: Sequence[SolverFindingRequirement]) -> dict[str, int]:
@@ -810,6 +1627,154 @@ def _project_clusters(
     return clusters, task_to_cluster, cluster_order, task_order
 
 
+def _prepare_portfolio_problem(
+    repo_root: str | Path,
+    groups: Sequence[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    target_packages: Iterable[str] | None = None,
+    peer_conflict_pairs: Sequence[tuple[str, str]] = (),
+    forced_singleton_task_ids: Sequence[str] = (),
+    portfolio_replan_request: PortfolioReplanRequest | None = None,
+    npm_snapshot: NpmGraphSnapshot | None = None,
+    repository_fingerprint: str | None = None,
+    registry_fetcher: PackumentFetcher | None = None,
+    settings: AppSettings,
+    runtime_fingerprint: SolverRuntimeFingerprint | None = None,
+) -> _PreparedPortfolioProblem:
+    """Prepare one immutable set of npm, registry, and solver inputs."""
+    root = Path(repo_root).resolve()
+    host_snapshot: NpmGraphSnapshot | None = None
+    if npm_snapshot is None or repository_fingerprint is None:
+        host_snapshot = load_npm_graph_snapshot(root)
+    snapshot = npm_snapshot or host_snapshot or NpmGraphSnapshot()
+    host_fingerprint = (
+        repository_fingerprint
+        or (host_snapshot.repository_fingerprint if host_snapshot is not None else None)
+        or snapshot.repository_fingerprint
+    )
+    group_list = [group.model_copy(deep=True) for group in groups]
+    queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    target_scope = (
+        tuple(sorted({str(value).strip() for value in target_packages if str(value).strip()}))
+        if target_packages is not None
+        else None
+    )
+    explicit_pairs = list(peer_conflict_pairs)
+    if portfolio_replan_request is not None:
+        explicit_pairs.extend(portfolio_replan_request.peer_conflict_pairs)
+    forced = tuple(
+        sorted(
+            set(str(value).strip() for value in forced_singleton_task_ids if str(value).strip())
+            | set(
+                portfolio_replan_request.forced_singleton_task_ids
+                if portfolio_replan_request
+                else ()
+            )
+        )
+    )
+    targets, findings, diagnostics = _build_targets_and_findings(snapshot, group_list, queue)
+    if not targets:
+        raise ValueError("Cannot build a portfolio plan without active SCA package tasks.")
+
+    required_names = _required_candidate_package_names(targets, findings)
+    packuments: dict[str, Mapping[str, Any]] = {}
+    packument_complete = False
+    packument_digest = _digest({"required_packages": required_names, "fresh_snapshot": False})
+    if registry_fetcher is not None:
+        (
+            packuments,
+            packument_complete,
+            packument_digest,
+            packument_diagnostics,
+        ) = _fetch_candidate_packuments(
+            required_names,
+            settings,
+            registry_fetcher=registry_fetcher,
+        )
+        diagnostics.extend(packument_diagnostics)
+    transitive_compatible_versions = _resolve_transitive_parent_floors(
+        targets,
+        findings,
+        queue,
+        group_list,
+        settings,
+        diagnostics,
+        packuments=packuments if registry_fetcher is not None else None,
+    )
+    subgraph = extract_solver_subgraph(
+        snapshot,
+        targets,
+        findings,
+        peer_conflict_pairs=explicit_pairs,
+        forced_singleton_task_ids=forced,
+    )
+    diagnostics.extend(subgraph.diagnostics)
+    domains, domain_complete, domain_digest = _candidate_domains(
+        snapshot,
+        targets,
+        findings,
+        queue,
+        group_list,
+        settings,
+        diagnostics,
+        transitive_compatible_versions=transitive_compatible_versions,
+        packuments=packuments if registry_fetcher is not None else None,
+    )
+    evidence_domains, evidence_domain_digest, evidence_diagnostics = _build_evidence_domains(
+        snapshot,
+        targets,
+        findings,
+        domains,
+        packuments,
+        settings,
+        registry_fetcher=registry_fetcher,
+        runtime_fingerprint=runtime_fingerprint,
+    )
+    diagnostics.extend(evidence_diagnostics)
+    subgraph = expand_candidate_relations(
+        subgraph,
+        domains,
+        npm_snapshot=snapshot,
+        evidence_domains=evidence_domains,
+    )
+    diagnostics.extend(subgraph.diagnostics)
+    candidate_catalog_complete = (
+        registry_fetcher is not None and packument_complete and domain_complete
+    )
+    candidate_catalog_digest = _digest(
+        {
+            "fresh_packument_digest": packument_digest,
+            "domain_digest": domain_digest,
+            "complete": candidate_catalog_complete,
+            "evidence_domain_digest": evidence_domain_digest,
+            "evidence_domains": [domain.model_dump(mode="json") for domain in evidence_domains],
+            "diagnostics": sorted(set(diagnostics)),
+        }
+    )
+    return _PreparedPortfolioProblem(
+        repo_root=root,
+        host_repository_fingerprint=host_fingerprint,
+        workspace_repository_fingerprint=snapshot.repository_fingerprint,
+        groups=group_list,
+        task_queue=queue,
+        npm_snapshot=snapshot,
+        targets=targets,
+        findings=findings,
+        subgraph=subgraph,
+        packuments=packuments,
+        candidate_domains=domains,
+        runtime_fingerprint=runtime_fingerprint,
+        candidate_catalog_complete=candidate_catalog_complete,
+        candidate_catalog_digest=candidate_catalog_digest,
+        settings=settings,
+        diagnostics=sorted(set(diagnostics)),
+        target_packages=target_scope,
+        peer_conflict_pairs=tuple(sorted(tuple(sorted(pair)) for pair in explicit_pairs)),
+        forced_singleton_task_ids=forced,
+    )
+
+
 def _empty_solver_plan(
     snapshot: NpmGraphSnapshot,
     targets: Sequence[SolverTarget],
@@ -832,80 +1797,22 @@ def _empty_solver_plan(
     )
 
 
-def build_portfolio_plan(
-    repo_root: str | Path,
-    groups: Iterable[VulnerabilityGroup],
-    task_queue: Mapping[str, RemediationTask],
+def _project_prepared_portfolio_plan(
+    prepared: _PreparedPortfolioProblem,
+    solver_plan: SolverRemediationPlan,
     *,
-    target_packages: Iterable[str] | None = None,
-    peer_conflict_pairs: Iterable[tuple[str, str]] = (),
-    forced_singleton_task_ids: Iterable[str] = (),
-    settings: AppSettings | None = None,
-    portfolio_iteration: int = 0,
-    portfolio_replan_request: PortfolioReplanRequest | None = None,
+    portfolio_iteration: int,
 ) -> Any:
-    """Build a complete solver-backed immutable PortfolioPlan projection.
-
-    Args:
-        repo_root: Repository whose npm graph supplies occurrence metadata.
-        groups: Prepared vulnerability and coordination groups.
-        task_queue: Supervisor-owned task projection.
-        target_packages: Optional development package scope. Scoped plans do
-            not use namespace membership as atomic batch evidence.
-        peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
-        forced_singleton_task_ids: Tasks that must remain singleton batches.
-        settings: Solver and registry settings.
-        portfolio_iteration: Current outer portfolio iteration.
-        portfolio_replan_request: Optional Supervisor replan constraints.
-
-    Returns:
-        An immutable solver-backed portfolio plan.
-    """
+    """Project prepared inputs and one solver result into a public portfolio plan."""
     from remediation_engine.contracts.schemas import PortfolioPlan
 
-    resolved_settings = settings or AppSettings()
-    group_list = [group.model_copy(deep=True) for group in groups]
-    queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
-    snapshot = load_npm_graph_snapshot(repo_root)
-    targets, findings, diagnostics = _build_targets_and_findings(snapshot, group_list, queue)
-    if not targets:
-        raise ValueError("Cannot build a portfolio plan without active SCA package tasks.")
-    transitive_compatible_versions = _resolve_transitive_parent_floors(
-        targets,
-        findings,
-        queue,
-        group_list,
-        resolved_settings,
-        diagnostics,
-    )
-    explicit_pairs = list(peer_conflict_pairs)
-    if portfolio_replan_request is not None:
-        explicit_pairs.extend(portfolio_replan_request.peer_conflict_pairs)
-    forced = sorted(
-        set(str(item).strip() for item in forced_singleton_task_ids if str(item).strip())
-        | set(
-            portfolio_replan_request.forced_singleton_task_ids if portfolio_replan_request else ()
-        )
-    )
-    subgraph = extract_solver_subgraph(
-        snapshot,
-        targets,
-        findings,
-        peer_conflict_pairs=explicit_pairs,
-        forced_singleton_task_ids=forced,
-    )
-    diagnostics.extend(subgraph.diagnostics)
-    domains = _candidate_domains(
-        snapshot,
-        targets,
-        findings,
-        queue,
-        group_list,
-        resolved_settings,
-        diagnostics,
-        transitive_compatible_versions=transitive_compatible_versions,
-    )
-    solver_plan = solve_portfolio(subgraph, domains, settings=resolved_settings)
+    findings = prepared.findings
+    subgraph = prepared.subgraph
+    domains = prepared.candidate_domains
+    queue = prepared.task_queue
+    explicit_pairs = list(prepared.peer_conflict_pairs)
+    forced = list(prepared.forced_singleton_task_ids)
+    diagnostics = list(prepared.diagnostics)
     diagnostics.extend(solver_plan.diagnostics)
     selected = solver_plan.selected_plan
     decisions = selected.task_decisions if selected is not None else []
@@ -914,7 +1821,7 @@ def build_portfolio_plan(
         decisions,
         forced_singleton_task_ids=forced,
         peer_conflict_pairs=explicit_pairs,
-        scope_coupling=not bool(target_packages),
+        scope_coupling=not bool(prepared.target_packages),
     )
     diagnostics.extend(cluster_diagnostics)
     dag = build_dependency_dag(subgraph, batches, edges)
@@ -922,7 +1829,7 @@ def build_portfolio_plan(
     phases, phase_diagnostics = schedule_batches(
         dag,
         severity_rank=_severity_rank_for_findings(findings),
-        phase_budget=resolved_settings.solver_phase_budget,
+        phase_budget=prepared.settings.solver_phase_budget,
     )
     diagnostics.extend(phase_diagnostics)
     clusters, task_to_cluster, cluster_order, task_order = _project_clusters(batches, dag, phases)
@@ -930,7 +1837,6 @@ def build_portfolio_plan(
         task_id: queue[task_id].task_revision for task_id in task_order if task_id in queue
     }
     decision_by_task = {decision.task_id: decision for decision in decisions}
-    task_revisions = dict(current_task_revisions)
     planned_task_revisions = {
         task_id: revision + (1 if task_id in decision_by_task else 0)
         for task_id, revision in current_task_revisions.items()
@@ -954,17 +1860,24 @@ def build_portfolio_plan(
             task_strategies[task_id] = RoutingStrategy.VERSION_BUMP
         else:
             task_strategies[task_id] = task.strategy
-    # Non-SCA tasks are not solver targets, but exact PortfolioPlan membership
-    # remains the active SCA leaf projection consumed by the Supervisor.
     if not task_order:
         raise ValueError("solver produced no task projection")
+
+    selected_assignment = {
+        decision.target_occurrence_id: decision.selected_version
+        for decision in decisions
+        if decision.target_occurrence_id and decision.selected_version
+    }
     graph_payload = {
-        "snapshot": snapshot.repository_fingerprint,
+        "snapshot": prepared.workspace_repository_fingerprint,
+        "host_repository_fingerprint": prepared.host_repository_fingerprint,
         "subgraph": subgraph.model_dump(mode="json"),
         "domains": {
             key: [candidate.model_dump(mode="json") for candidate in values]
             for key, values in sorted(domains.items())
         },
+        "candidate_catalog_complete": prepared.candidate_catalog_complete,
+        "candidate_catalog_digest": prepared.candidate_catalog_digest,
         "batches": [batch.model_dump(mode="json") for batch in batches],
         "edges": [edge.model_dump(mode="json") for edge in edges],
         "phases": [phase.model_dump(mode="json") for phase in phases],
@@ -975,14 +1888,18 @@ def build_portfolio_plan(
     solver_input_digest = solver_plan.input_digest
     plan_digest = _digest(
         {
-            "repository_fingerprint": snapshot.repository_fingerprint,
+            "repository_fingerprint": prepared.host_repository_fingerprint,
+            "workspace_graph_digest": prepared.workspace_repository_fingerprint,
             "graph_digest": graph_digest,
             "solver_input_digest": solver_input_digest,
-            "task_revisions": task_revisions,
+            "candidate_catalog_complete": prepared.candidate_catalog_complete,
+            "candidate_catalog_digest": prepared.candidate_catalog_digest,
+            "task_revisions": current_task_revisions,
             "planned_task_revisions": planned_task_revisions,
             "task_order": task_order,
             "cluster_order": cluster_order,
             "task_to_cluster": task_to_cluster,
+            "selected_assignment": dict(sorted(selected_assignment.items())),
             "solver_status": solver_plan.status.value,
         }
     )
@@ -994,7 +1911,8 @@ def build_portfolio_plan(
     return PortfolioPlan(
         plan_id=plan_id,
         portfolio_plan_id=plan_id,
-        repository_fingerprint=snapshot.repository_fingerprint,
+        repository_fingerprint=prepared.host_repository_fingerprint,
+        workspace_graph_digest=prepared.workspace_repository_fingerprint,
         graph_digest=graph_digest,
         plan_digest=plan_digest,
         solver_input_digest=solver_input_digest,
@@ -1005,10 +1923,48 @@ def build_portfolio_plan(
         cluster_order=cluster_order,
         task_order=task_order,
         task_to_cluster=task_to_cluster,
-        task_revisions=task_revisions,
+        task_revisions=current_task_revisions,
         planned_task_revisions=planned_task_revisions,
         task_strategies=task_strategies,
         diagnostics=sorted(set(diagnostics)),
+    )
+
+
+def build_portfolio_plan(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    target_packages: Iterable[str] | None = None,
+    peer_conflict_pairs: Iterable[tuple[str, str]] = (),
+    forced_singleton_task_ids: Iterable[str] = (),
+    settings: AppSettings | None = None,
+    portfolio_iteration: int = 0,
+    portfolio_replan_request: PortfolioReplanRequest | None = None,
+) -> Any:
+    """Build a deterministic solver-only plan without network or Docker access."""
+    resolved_settings = settings or AppSettings()
+    prepared = _prepare_portfolio_problem(
+        repo_root,
+        list(groups),
+        task_queue,
+        target_packages=target_packages,
+        peer_conflict_pairs=tuple(peer_conflict_pairs),
+        forced_singleton_task_ids=tuple(forced_singleton_task_ids),
+        portfolio_replan_request=portfolio_replan_request,
+        settings=resolved_settings,
+    )
+    solver_plan = solve_portfolio(
+        prepared.subgraph,
+        prepared.candidate_domains,
+        settings=resolved_settings,
+        candidate_catalog_complete=prepared.candidate_catalog_complete,
+        candidate_catalog_digest=prepared.candidate_catalog_digest,
+    )
+    return _project_prepared_portfolio_plan(
+        prepared,
+        solver_plan,
+        portfolio_iteration=portfolio_iteration,
     )
 
 
@@ -1021,6 +1977,42 @@ def _expected_target_identity(
     if not package_name:
         raise ValueError(f"task {task.task_id!r} has no target package identity")
     return task.parent_group_id, manifest_path, package_name
+
+
+def _override_instruction(
+    package_name: str,
+    target_version: str,
+    manifest_path: str,
+    dependency_type: str,
+) -> str:
+    """Build a deterministic manifest instruction for one approved override."""
+    if dependency_type == "pnpm_overrides":
+        declaration = f'"pnpm": {{"overrides": {{"{package_name}": "{target_version}"}}}}'
+        manager = "pnpm overrides"
+    elif dependency_type == "resolutions":
+        declaration = f'"resolutions": {{"{package_name}": "{target_version}"}}'
+        manager = "Yarn resolutions"
+    else:
+        declaration = f'"overrides": {{"{package_name}": "{target_version}"}}'
+        manager = "npm overrides"
+    return (
+        f"Add or update {declaration} in {manifest_path} to pin the "
+        f"transitive package via {manager}."
+    )
+
+
+def _source_migration_instruction(
+    package_name: str,
+    installed_version: str | None,
+    selected_version: str | None,
+) -> str:
+    """Build the deterministic source-migration instruction for one major upgrade."""
+    return (
+        f"Upgrade package {package_name} from installed version {installed_version or 'unknown'} "
+        f"to selected version {selected_version or 'unknown'}.\n"
+        "Migrate all affected production and test code to the selected package API "
+        "while preserving behavior; do not change the solver-approved package or version."
+    )
 
 
 def apply_portfolio_plan(
@@ -1082,16 +2074,40 @@ def apply_portfolio_plan(
                 f"portfolio plan task {task_id!r} references missing group {task.parent_group_id!r}"
             )
         expected_group_id, expected_manifest, expected_package = _expected_target_identity(
-            group, task
+            group,
+            task,
         )
-        expected_occurrence = make_occurrence_id(expected_manifest, expected_package)
-        expected_lockfile_key = f"node_modules/{expected_package}"
+        decision_lockfile_key = str(decision.lockfile_package_key or "").replace("\\", "/")
+        direct_occurrence = make_occurrence_id(expected_manifest, expected_package)
+        physical_occurrence = make_occurrence_id(
+            expected_manifest,
+            expected_package,
+            decision_lockfile_key,
+        )
+        decision_occurrence = str(decision.target_occurrence_id or "")
+        if not lockfile_key_matches_package(decision_lockfile_key, expected_package):
+            raise ValueError(
+                f"portfolio decision for task {task_id!r} has invalid lockfile_package_key "
+                f"{decision_lockfile_key!r}"
+            )
+        if decision_occurrence not in {direct_occurrence, physical_occurrence}:
+            raise ValueError(
+                f"portfolio decision for task {task_id!r} has invalid target occurrence "
+                f"{decision_occurrence!r}"
+            )
+        if (
+            decision_occurrence == physical_occurrence
+            and physical_occurrence != direct_occurrence
+            and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
+        ):
+            raise ValueError(
+                f"nested lockfile target for task {task_id!r} requires a package override"
+            )
         identity_values = {
-            "target_occurrence_id": expected_occurrence,
             "target_group_id": expected_group_id,
             "target_package_name": expected_package,
             "manifest_path": expected_manifest,
-            "lockfile_package_key": expected_lockfile_key,
+            "lockfile_package_key": decision_lockfile_key,
         }
         for field_name, expected in identity_values.items():
             actual = getattr(decision, field_name, None)
@@ -1132,8 +2148,50 @@ def apply_portfolio_plan(
             diagnostics.append(
                 f"task {task_id!r} has unknown strategy stage {decision.strategy_stage!r}"
             )
+        migration_required = bool(getattr(decision, "requires_source_migration", False))
         if decision.exact_instruction:
-            updates["instruction"] = decision.exact_instruction
+            instruction = decision.exact_instruction
+            if (
+                migration_required
+                and decision.dependency_type in _OVERRIDE_DEPENDENCY_TYPES
+                and decision.selected_version
+            ):
+                instruction = (
+                    _override_instruction(
+                        expected_package,
+                        decision.selected_version,
+                        expected_manifest,
+                        decision.dependency_type,
+                    )
+                    + "\n"
+                    + instruction
+                )
+            updates["instruction"] = instruction
+        elif migration_required:
+            instruction = _source_migration_instruction(
+                expected_package,
+                getattr(decision, "installed_version", None),
+                decision.selected_version,
+            )
+            if decision.dependency_type in _OVERRIDE_DEPENDENCY_TYPES and decision.selected_version:
+                instruction = (
+                    _override_instruction(
+                        expected_package,
+                        decision.selected_version,
+                        expected_manifest,
+                        decision.dependency_type,
+                    )
+                    + "\n"
+                    + instruction
+                )
+            updates["instruction"] = instruction
+        elif decision.dependency_type in _OVERRIDE_DEPENDENCY_TYPES and decision.selected_version:
+            updates["instruction"] = _override_instruction(
+                expected_package,
+                decision.selected_version,
+                expected_manifest,
+                decision.dependency_type,
+            )
         elif not task.instruction:
             updates["instruction"] = (
                 f"Apply the outer-solver-approved dependency decision for task {task_id}."

@@ -70,3 +70,26 @@ def test_retriage_limit_rejects_invalid_values(monkeypatch):
 
     with pytest.raises(ValueError, match="REMEDY_RETRIAGE_LIMIT must be an integer"):
         AppSettings.from_env()
+
+
+def test_solver_certification_timeout_has_positive_configurable_default(monkeypatch):
+    monkeypatch.delenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", raising=False)
+    assert AppSettings.from_env().solver_certification_timeout_seconds == 900
+
+    monkeypatch.setenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", "37")
+    assert AppSettings.from_env().solver_certification_timeout_seconds == 37
+
+    monkeypatch.setenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="must be at least 1"):
+        AppSettings.from_env()
+
+
+def test_candidate_limit_default_and_override(monkeypatch):
+    variable = "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET"
+    monkeypatch.delenv(variable, raising=False)
+
+    assert AppSettings().solver_max_candidates_per_target == 128
+    assert AppSettings.from_env().solver_max_candidates_per_target == 128
+
+    monkeypatch.setenv(variable, "96")
+    assert AppSettings.from_env().solver_max_candidates_per_target == 96

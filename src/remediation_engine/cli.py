@@ -100,12 +100,22 @@ def _solve_output(
     prepare_diagnostics: Sequence[str],
     apply_diagnostics: Sequence[str],
 ) -> dict[str, Any]:
-    """Project a portfolio plan into stable, human-readable dry-run JSON."""
+    """Project a solver-only plan into stable, non-dispatchable dry-run JSON."""
     solver_plan = getattr(plan, "solver_plan", None)
-    selected = getattr(solver_plan, "selected_plan", None)
     status = getattr(getattr(solver_plan, "status", None), "value", None)
     if status is None:
         status = str(getattr(solver_plan, "status", "UNKNOWN")).upper()
+    selected = getattr(solver_plan, "selected_plan", None)
+    certificate = getattr(plan, "resolution_certificate", None)
+    resolution_status = getattr(getattr(certificate, "status", None), "value", None)
+    if resolution_status is None:
+        resolution_status = (
+            str(getattr(certificate, "status", "NOT_RUN")).upper()
+            if certificate is not None
+            else "NOT_RUN"
+        )
+    # The offline solve command never runs the isolated package-manager resolver.
+    dispatchable = False
     decisions = sorted(
         (
             decision.model_dump(mode="json")
@@ -137,6 +147,8 @@ def _solve_output(
         "plan_id": plan.plan_id,
         "portfolio_plan_id": plan.portfolio_plan_id,
         "solver_status": status,
+        "package_resolution_status": resolution_status,
+        "dispatchable": dispatchable,
         "task_decisions": decisions,
         "batches": batches,
         "phases": phases,

@@ -126,11 +126,12 @@ def main() -> int:
         RemediationRequest(
             repo_root=repo_root,
             issues=issues,
+            target_packages=sorted(_TARGET_PACKAGES),
             system_context=SystemContext(
                 public_facing=True,
                 deployment_os="linux",
                 deployment_architecture="containerized",
-                environment="production",
+                environment="development",
                 primary_language="javascript/nodejs",
             ),
         )

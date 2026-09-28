@@ -131,16 +131,24 @@ def parse_peer_conflict_evidence(stdout: str, stderr: str) -> list[PeerConflictE
         match.group("package"): match.group("version").rstrip(".,")
         for match in _FOUND_VERSION_RE.finditer(text)
     }
-    records: dict[tuple[str, str, str, str], PeerConflictEvidence] = {}
+    records: dict[tuple[str, str, str, str, str], PeerConflictEvidence] = {}
     for match in _PEER_FROM_RE.finditer(text):
         peer = match.group("peer").rstrip(".,")
         requester = match.group("requester").rstrip(".,")
         required_range = (
             match.group("quoted_range") or match.group("unquoted_range") or ""
         ).rstrip(".,")
-        key = (requester, peer, required_range, observed_versions.get(peer, ""))
+        requester_version = match.group("requester_version").rstrip(".,")
+        key = (
+            requester,
+            requester_version,
+            peer,
+            required_range,
+            observed_versions.get(peer, ""),
+        )
         records[key] = PeerConflictEvidence(
             requester_package=requester,
+            requester_version=requester_version,
             peer_package=peer,
             required_range=required_range,
             observed_version=observed_versions.get(peer),
@@ -149,7 +157,7 @@ def parse_peer_conflict_evidence(stdout: str, stderr: str) -> list[PeerConflictE
     for match in _OVERRIDE_CONFLICT_RE.finditer(text):
         peer = match.group("peer").rstrip(".,")
         required_range = match.group("range").rstrip(".,")
-        key = ("", peer, required_range, observed_versions.get(peer, ""))
+        key = ("", "", peer, required_range, observed_versions.get(peer, ""))
         records[key] = PeerConflictEvidence(
             peer_package=peer,
             required_range=required_range,
@@ -159,7 +167,7 @@ def parse_peer_conflict_evidence(stdout: str, stderr: str) -> list[PeerConflictE
     if not records and any(
         marker.casefold() in text.casefold() for marker in _PEER_CONFLICT_PATTERNS
     ):
-        records[("", "", "", "")] = PeerConflictEvidence(
+        records[("", "", "", "", "")] = PeerConflictEvidence(
             evidence="\n".join(text.splitlines()[-20:])[:2000]
         )
     return [records[key] for key in sorted(records)]

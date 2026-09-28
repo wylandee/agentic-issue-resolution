@@ -65,7 +65,10 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
-from remediation_engine.contracts.solver_models import PortfolioReplanRequest
+from remediation_engine.contracts.solver_models import (
+    PackageResolutionStatus,
+    PortfolioReplanRequest,
+)
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
@@ -121,7 +124,11 @@ from remediation_engine.orchestration.task_utils import (
     is_transitive_group,
     select_package_fix_plan,
 )
-from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
+from remediation_engine.tools.npm_graph import (
+    load_npm_graph_snapshot,
+    lockfile_key_matches_package,
+    make_occurrence_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -430,15 +437,107 @@ def _portfolio_plan_violations(
                 f"portfolio cluster {cluster.cluster_id!r} is marked non-dispatchable"
             )
     plan_id = getattr(plan, "portfolio_plan_id", None) or getattr(plan, "plan_id", None)
-    selected = getattr(getattr(plan, "solver_plan", None), "selected_plan", None)
+    solver_plan = getattr(plan, "solver_plan", None)
+    selected = getattr(solver_plan, "selected_plan", None)
+    certificate = getattr(plan, "resolution_certificate", None)
+    if certificate is None:
+        violations.append("portfolio plan is missing its package-resolution certificate")
+    else:
+        certificate_status = getattr(certificate.status, "value", certificate.status)
+        if str(certificate_status).upper() != PackageResolutionStatus.CERTIFIED.value:
+            violations.append("package-resolution certificate is not CERTIFIED")
+        solver_status = getattr(getattr(solver_plan, "status", None), "value", None)
+        if str(solver_status or getattr(solver_plan, "status", "")).upper() != "OPTIMAL":
+            violations.append("certified dispatch requires an OPTIMAL solver status")
+        if not getattr(solver_plan, "candidate_catalog_complete", False):
+            violations.append("certified dispatch requires a complete candidate catalog")
+        certificate_fields = {
+            "portfolio_plan_id": getattr(plan, "portfolio_plan_id", None),
+            "solver_input_digest": getattr(plan, "solver_input_digest", None),
+            "repository_fingerprint": getattr(plan, "repository_fingerprint", None),
+            "workspace_graph_digest": getattr(plan, "workspace_graph_digest", None),
+            "candidate_catalog_digest": getattr(solver_plan, "candidate_catalog_digest", None),
+        }
+        for field_name, expected_value in certificate_fields.items():
+            if getattr(certificate, field_name, None) != expected_value:
+                violations.append(
+                    f"package-resolution certificate {field_name} differs from committed plan"
+                )
+        plan_revisions = dict(getattr(plan, "task_revisions", {}) or {})
+        if dict(getattr(certificate, "task_revisions", {}) or {}) != plan_revisions:
+            violations.append("package-resolution certificate task revisions are stale")
+        if selected is None:
+            violations.append("certified dispatch requires a selected solver assignment")
+        else:
+            if getattr(certificate, "candidate_plan_id", None) != getattr(
+                selected, "candidate_plan_id", None
+            ):
+                violations.append("package-resolution certificate candidate plan ID is stale")
+            assignment = dict(
+                sorted((getattr(selected, "selected_candidate_versions", {}) or {}).items())
+            )
+            assignment_digest = hashlib.sha256(
+                json.dumps(
+                    assignment,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if getattr(certificate, "candidate_assignment_digest", None) != assignment_digest:
+                violations.append("package-resolution certificate selected assignment is stale")
+            batches = list(getattr(selected, "batches", ()) or ())
+            expected_covered = {
+                coverage_id for batch in batches for coverage_id in batch.resolved_coverage_ids
+            }
+            expected_workaround = {
+                coverage_id for batch in batches for coverage_id in batch.workaround_coverage_ids
+            }
+            expected_all = {
+                coverage_id
+                for batch in batches
+                for coverage_id in (
+                    batch.resolved_coverage_ids
+                    + batch.workaround_coverage_ids
+                    + batch.unresolved_coverage_ids
+                )
+            }
+            certificate_covered = set(certificate.covered_coverage_ids)
+            certificate_workaround = set(certificate.workaround_coverage_ids)
+            certificate_unresolved = set(certificate.unresolved_coverage_ids)
+            if certificate_unresolved:
+                violations.append("package-resolution certificate contains unresolved coverage")
+            if certificate_covered != expected_covered:
+                violations.append("package-resolution certificate covered-coverage set is stale")
+            if certificate_workaround != expected_workaround:
+                violations.append("package-resolution certificate workaround-coverage set is stale")
+            if (
+                certificate_covered | certificate_workaround | certificate_unresolved
+                != expected_all
+            ):
+                violations.append("package-resolution certificate coverage universe is stale")
     decisions = {
         decision.task_id: decision for decision in (getattr(selected, "task_decisions", None) or [])
     }
+    planned_ids = set(getattr(plan, "task_ids", ()) or ())
     sca_group_ids = {group.group_id for group in valid_groups if group.issue_type == IssueType.SCA}
     groups_by_id = {group.group_id: group for group in valid_groups}
     tasks_by_group: dict[str, list[RemediationTask]] = {}
     for task in task_queue.values():
-        if task.parent_group_id in sca_group_ids:
+        if task.parent_group_id not in sca_group_ids:
+            continue
+        # A source-workaround child continues its certified package task; it
+        # is not a new version-selection task in the immutable portfolio.
+        parent = task_queue.get(task.parent_task_id or "")
+        is_certified_workaround_child = (
+            task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and parent is not None
+            and parent.task_id in planned_ids
+            and parent.parent_group_id == task.parent_group_id
+            and parent.strategy == RoutingStrategy.VERSION_BUMP
+            and parent.exhausted_update_path
+        )
+        if not is_certified_workaround_child:
             tasks_by_group.setdefault(task.parent_group_id, []).append(task)
     terminal_statuses = {
         TaskStatus.QA_PASSED,
@@ -453,7 +552,6 @@ def _portfolio_plan_violations(
             max(nonterminal or tasks, key=lambda task: (task.task_revision, task.task_id))
         )
     sca_task_ids = {task.task_id for task in active_sca_tasks}
-    planned_ids = set(getattr(plan, "task_ids", ()) or ())
     if sca_task_ids != planned_ids:
         violations.append(
             f"portfolio membership mismatch: active SCA tasks={sorted(sca_task_ids)!r}, "
@@ -504,25 +602,64 @@ def _portfolio_plan_violations(
             else ""
         )
         expected_manifest = _group_manifest_path(group) if group is not None else None
+        direct_occurrence = (
+            make_occurrence_id(expected_manifest, expected_package)
+            if expected_manifest and expected_package
+            else None
+        )
+        decision_lockfile_key = str(decision.lockfile_package_key or "").replace("\\", "/")
+        lockfile_key_valid = bool(
+            expected_package
+            and lockfile_key_matches_package(decision_lockfile_key, expected_package)
+        )
+        physical_occurrence = (
+            make_occurrence_id(expected_manifest, expected_package, decision_lockfile_key)
+            if expected_manifest and expected_package and lockfile_key_valid
+            else None
+        )
+        decision_occurrence = str(decision.target_occurrence_id or "")
+        valid_occurrences = {
+            occurrence for occurrence in (direct_occurrence, physical_occurrence) if occurrence
+        }
+        if decision_occurrence not in valid_occurrences:
+            violations.append(
+                f"task {task_id} solver identity field target_occurrence_id is invalid"
+            )
+        if not lockfile_key_valid:
+            violations.append(
+                f"task {task_id} solver identity field lockfile_package_key is invalid"
+            )
+        elif (
+            decision_occurrence == physical_occurrence
+            and physical_occurrence != direct_occurrence
+            and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
+        ):
+            violations.append(
+                f"task {task_id} nested lockfile target requires a package-manager override"
+            )
         expected_identity = {
-            "target_occurrence_id": (
-                make_occurrence_id(expected_manifest, expected_package)
-                if expected_manifest and expected_package
-                else None
-            ),
             "target_group_id": task.parent_group_id,
             "target_package_name": expected_package or None,
             "manifest_path": expected_manifest,
-            "lockfile_package_key": (
-                f"node_modules/{expected_package}" if expected_package else None
-            ),
+            "lockfile_package_key": decision_lockfile_key if lockfile_key_valid else None,
         }
         for field_name, expected_value in expected_identity.items():
             if getattr(decision, field_name, None) != expected_value:
                 violations.append(f"task {task_id} solver identity field {field_name} is invalid")
         try:
-            if task.strategy_stage != SCARemediationStage(decision.strategy_stage):
-                violations.append(f"task {task_id} strategy stage differs from solver decision")
+            decision_stage = SCARemediationStage(decision.strategy_stage)
+            if task.strategy_stage != decision_stage:
+                # A committed pivot advances retry stage without changing the
+                # certificate-bound package assignment.
+                preserves_certified_versions = (
+                    expected == RoutingStrategy.VERSION_BUMP
+                    and task.strategy == RoutingStrategy.VERSION_BUMP
+                    and task.exhausted_update_path
+                    and task.strategy_stage == SCARemediationStage.NPM_LATEST
+                    and task.selected_version is None
+                )
+                if not preserves_certified_versions:
+                    violations.append(f"task {task_id} strategy stage differs from solver decision")
         except ValueError:
             violations.append(f"task {task_id} has unknown committed strategy stage")
         approved_versions = [

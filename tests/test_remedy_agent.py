@@ -34,6 +34,7 @@ from remediation_engine.orchestration.state import (
     initial_workaround_subagent_state,
 )
 from remediation_engine.orchestration.update_subagent import (
+    _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
     _changed_files_by_task,
@@ -192,6 +193,41 @@ class TestUpdateSubagentWrapper:
         assert "read_repository_map" not in prompt
         assert "revert_workspace_file" not in prompt
         assert "validate_manifest_sync" not in prompt
+
+    def test_major_upgrade_prompt_commits_source_migration_and_version(self):
+        group = _sca_group().model_copy(update={"vulnerable_component": "jsonwebtoken"})
+        directive = (
+            "Migrate all affected production and test code to the selected package API "
+            "while preserving behavior; do not change the solver-approved package or version."
+        )
+        task = _task_for_group(
+            group,
+            target_package_name="jsonwebtoken",
+            target_dependency_type="dependencies",
+            selected_version="9.0.2",
+            instruction=(
+                "Upgrade package jsonwebtoken from installed version 8.5.1 "
+                f"to selected version 9.0.2.\n{directive}"
+            ),
+        )
+
+        prompt = _build_update_prompt(
+            [(task, group, ["package.json"])],
+            [],
+            {},
+            {},
+        )
+
+        assert "8.5.1" in prompt
+        assert "9.0.2" in prompt
+        assert directive in prompt
+        assert "Major-version source/test migration: required." in prompt
+        assert "source and test migration to the committed package API is authorized" in (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
+        assert "Do not reselect or change any package name or version" in (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
 
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")

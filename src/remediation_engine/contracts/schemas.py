@@ -30,7 +30,10 @@ from pydantic import (
 )
 
 from remediation_engine.contracts.decision_codes import DecisionCode
-from remediation_engine.contracts.solver_models import SolverRemediationPlan
+from remediation_engine.contracts.solver_models import (
+    PackageResolutionCertificate,
+    SolverRemediationPlan,
+)
 
 # ---------------------------------------------------------------------------
 # Enumerations
@@ -1475,6 +1478,7 @@ class PeerConflictEvidence(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     requester_package: str = ""
+    requester_version: str | None = None
     peer_package: str = ""
     required_range: str | None = None
     observed_version: str | None = None
@@ -1482,6 +1486,7 @@ class PeerConflictEvidence(BaseModel):
 
     @field_validator(
         "requester_package",
+        "requester_version",
         "peer_package",
         "required_range",
         "observed_version",
@@ -2252,11 +2257,13 @@ class PortfolioPlan(BaseModel):
         default="",
         description="Immutable outer-plan identity retained across task-local retries.",
     )
+    workspace_graph_digest: str | None = None
     repository_fingerprint: str = Field(..., min_length=1)
     graph_digest: str = Field(..., min_length=1)
     plan_digest: str = Field(..., min_length=1)
     solver_input_digest: str | None = None
     solver_plan: SolverRemediationPlan | None = None
+    resolution_certificate: PackageResolutionCertificate | None = None
     portfolio_iteration: int = Field(default=0, ge=0)
     task_ids: list[str] = Field(..., min_length=1)
     clusters: list[TaskCluster] = Field(..., min_length=1)
@@ -2287,6 +2294,11 @@ class PortfolioPlan(BaseModel):
         if not isinstance(value, str):
             raise ValueError("portfolio_plan_id must be a string.")
         return value.strip()
+
+    @field_validator("workspace_graph_digest", mode="before")
+    @classmethod
+    def _normalize_workspace_graph_digest(cls, value: Any) -> str | None:
+        return _trim_optional_contract_text(value, "workspace_graph_digest")
 
     @field_validator("solver_input_digest", mode="before")
     @classmethod

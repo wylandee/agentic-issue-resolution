@@ -155,8 +155,8 @@ def _committed_dispatch(task, *, dispatch_node: str):
 
 
 class TestPhase5Routing:
-    def test_route_after_workspace_builder_routes_to_supervisor(self):
-        assert route_after_workspace_builder({"status": "workspace_ready"}) == "supervisor"
+    def test_route_after_workspace_builder_routes_to_portfolio(self):
+        assert route_after_workspace_builder({"status": "workspace_ready"}) == "portfolio"
 
     def test_route_after_workspace_builder_failure_routes_to_teardown(self):
         assert route_after_workspace_builder({"status": "workspace_build_failed"}) == "teardown"
@@ -286,6 +286,53 @@ def test_portfolio_reconciliation_status_routes_back_to_supervisor():
     assert route_after_portfolio({"status": "portfolio_reconciliation_required"}) == "supervisor"
 
 
+def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monkeypatch):
+    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    task = build_initial_remediation_task(group, "task-1")
+    candidate_plan = SimpleNamespace(
+        plan_id="portfolio-new",
+        portfolio_plan_id="portfolio-new",
+        diagnostics=[],
+        clusters=[],
+        solver_plan=SimpleNamespace(
+            status="OPTIMAL",
+            candidate_catalog_complete=True,
+            diagnostics=[],
+            selected_plan=SimpleNamespace(
+                task_decisions=[],
+                selected_candidate_versions={},
+                batches=[],
+            ),
+        ),
+    )
+    state = _initial_state(tmp_path, [group])
+    state["task_queue"] = {"task-1": task}
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.prepare_portfolio_inputs",
+        lambda *args, **kwargs: ([group], {"task-1": task}, []),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
+        lambda *args, **kwargs: candidate_plan,
+    )
+    apply_plan = MagicMock()
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.apply_portfolio_plan",
+        apply_plan,
+    )
+
+    result = run_portfolio_node(state)
+
+    assert result["status"] == "portfolio_unknown"
+    assert result["next_routing_step"] == "teardown"
+    assert any("missing its package-resolution certificate" in error for error in result["errors"])
+    apply_plan.assert_not_called()
+
+
 def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, monkeypatch):
     group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
     task = build_initial_remediation_task(group, "task-1").model_copy(
@@ -320,8 +367,12 @@ def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, 
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.build_portfolio_plan",
+        "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
         lambda *args, **kwargs: candidate_plan,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph._portfolio_certificate_violations",
+        lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
         "remediation_engine.orchestration.graph.apply_portfolio_plan",
@@ -928,7 +979,7 @@ class TestPhase5GraphIntegration:
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-handoff")
 
     def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
-        """After workspace_builder succeeds, supervisor routes, then teardown runs."""
+        """After workspace prep, portfolio routes to Supervisor, then teardown runs."""
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
@@ -955,12 +1006,14 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": None,
             }
         )
+        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
 
         with (
             patch(
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
+            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
@@ -968,6 +1021,7 @@ class TestPhase5GraphIntegration:
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
+        assert portfolio.call_count == 1
         assert supervisor.call_count == 1
         assert teardown.call_count == 1
         assert result["status"] == "completed"
@@ -1012,6 +1066,7 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": "vol123",
             }
         )
+        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
 
         call_count = {"n": 0}
 
@@ -1047,6 +1102,7 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
+            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch(
                 "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
@@ -1057,6 +1113,7 @@ class TestPhase5GraphIntegration:
             graph.invoke(_initial_state(tmp_path, groups))
 
         assert supervisor.call_count == 2
+        assert portfolio.call_count == 1
         assert teardown.call_count == 1
 
     def test_supervisor_routes_to_qa_critic_then_back(self, tmp_path):
@@ -1070,6 +1127,7 @@ class TestPhase5GraphIntegration:
             }
         )
 
+        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
         call_count = {"n": 0}
 
         def supervisor_side_effect(state):
@@ -1115,6 +1173,7 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
+            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
@@ -1125,6 +1184,7 @@ class TestPhase5GraphIntegration:
         assert supervisor.call_count == 2
         assert qa_critic.call_count == 1
         assert teardown.call_count == 1
+        assert portfolio.call_count == 1
         assert result["qa_investigation_report"].startswith("# INVESTIGATIVE REPORT")
         assert result["new_vulnerability_identifiers"] == ["CVE-2025-10001"]
         assert result["new_vulnerability_status"] == "detected"

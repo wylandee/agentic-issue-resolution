@@ -12,6 +12,15 @@ Juice Shop baseline active:
 | `base64url` | `package.json` | 0.0.6 | 1 |
 
 The JWT dependency chain and Moment are kept active to exercise upstream prerequisite ordering.
+The runner sets `target_packages` to these five names in a development-scoped
+request. Portfolio discovery includes the selected targets and any required
+workspace or incompatible-peer coordination closure, not every unrelated
+direct dependency.
+
+The lockfile-only findings for `base64url`, `jws`, and `moment` remain
+finding-backed solver tasks. Their exact lockfile occurrences are retained, and
+the tasks pin the vulnerable packages through npm `overrides` rather than
+adding them as direct dependencies.
 
 All other baseline packages have active Dependency-Check suppression rules in
 `suppressions.xml`. The target rules are XML-commented, so only the listed
@@ -22,8 +31,9 @@ for all 55 packages in the current baseline.
 
 * `baseline_issues_upstream_prerequisites.jsonl` — canonical baseline findings for the target packages.
 * `suppressions.xml` — package suppression rules with only the target rules disabled.
-* `run_upstream_prerequisites.py` — live runner that copies the suppression file into the
-  Juice Shop clone before passing raw issues through triage and orchestration.
+* `run_upstream_prerequisites.py` — live runner that copies the suppression file
+  into the Juice Shop clone, then passes raw findings through triage with the
+  explicit development-only package scope.
 
 ## Run
 
@@ -43,7 +53,7 @@ data/trajectories/juice-shop-upstream-prerequisites.patch
 ~~~
 
 The run passes raw issues rather than pre-triaged groups, so it exercises the
-current package-centric grouper and Supervisor portfolio behavior. Inspect the
+current package-centric grouper and scoped portfolio behavior. Inspect the
 trajectory for one package group per target package, dependency/peer
 diagnostics, deterministic cluster membership, task revisions, and shared
 batch provenance when the selected relationships produce a cluster.

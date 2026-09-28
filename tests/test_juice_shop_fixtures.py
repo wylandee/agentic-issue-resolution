@@ -146,3 +146,56 @@ def test_pretriaged_runner_rejects_group_without_baseline_issue() -> None:
 
     with pytest.raises(ValueError, match="has no baseline issues"):
         module._baseline_issues_from_groups([group])
+
+
+@pytest.mark.parametrize(
+    ("name", "runner_path"),
+    [
+        (
+            "shared_name_scope",
+            "examples/juice_shop/fixtures/shared_name/run_shared_name.py",
+        ),
+        (
+            "upstream_prerequisites_scope",
+            "examples/juice_shop/fixtures/upstream_prerequisites/run_upstream_prerequisites.py",
+        ),
+        (
+            "peer_dependencies_scope",
+            "examples/juice_shop/fixtures/peer_dependencies/run_peer_dependencies.py",
+        ),
+        (
+            "peer_conflict_scope",
+            "examples/juice_shop/fixtures/peer_conflict/run_peer_conflict.py",
+        ),
+    ],
+)
+def test_raw_issue_fixture_runners_enforce_package_scope(
+    name: str,
+    runner_path: str,
+    tmp_path: Path,
+) -> None:
+    """Raw issue fixtures pass their exact package scope to the API."""
+    runner_file = _PROJECT_ROOT / runner_path
+    module = _load_runner(name, runner_file)
+    output_path = tmp_path / f"{name}-result.json"
+    patch_path = tmp_path / f"{name}.patch"
+    arguments = [
+        str(runner_file),
+        "--repo",
+        str(tmp_path),
+        "--output",
+        str(output_path),
+        "--patch-out",
+        str(patch_path),
+    ]
+
+    with (
+        patch.object(module, "run_remediation", return_value=_FakeResult()) as run,
+        patch("sys.argv", arguments),
+    ):
+        assert module.main() == 0
+
+    request = run.call_args.args[0]
+    assert request.target_packages == sorted(module._TARGET_PACKAGES)
+    assert request.system_context.environment == "development"
+    assert {issue.package_name for issue in request.issues} == module._TARGET_PACKAGES

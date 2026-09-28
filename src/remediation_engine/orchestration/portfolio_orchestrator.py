@@ -23,6 +23,7 @@ from remediation_engine.contracts.schemas import (
     PortfolioPlan,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     Severity,
     TaskCluster,
     TaskDependency,
@@ -31,6 +32,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.portfolio_certifier import build_certified_portfolio_plan
 from remediation_engine.orchestration.portfolio_solver import (
     apply_portfolio_plan as _apply_solver_portfolio_plan,
 )
@@ -803,13 +805,31 @@ def materialize_synthetic_dependency_tasks(
     else:
         all_keys = sorted(records_by_key)
 
-    # A scoped replan must not retain synthetic tasks that were materialized by
-    # an earlier, broader portfolio iteration. Finding-backed target groups are
-    # retained only when their occurrence remains inside the scoped mutation
-    # closure; non-SCA groups continue through the normal source-remediation
-    # path.
+    # A scoped plan includes direct mutation closure plus explicitly selected
+    # finding-backed packages. Lockfile-only findings remain solver targets and
+    # are represented through package-manager overrides rather than dropped.
     if scoped_packages:
-        allowed_group_ids = {
+        explicitly_selected_finding_group_ids: set[str] = set()
+        for group in group_list:
+            if group.issue_type != IssueType.SCA or group.is_synthetic:
+                continue
+            package_identities = {
+                str(value).strip()
+                for value in (
+                    group.vulnerable_component,
+                    group.parent_package_name,
+                    *(issue.package_name for issue in group.issues),
+                    *(localized.issue.package_name for localized in group.localized_issues),
+                )
+                if isinstance(value, str) and value.strip()
+            }
+            has_finding_identity = any(
+                issue.cve_id or issue.ghsa_id or issue.finding_id for issue in group.issues
+            )
+            if package_identities.intersection(scoped_packages) and has_finding_identity:
+                explicitly_selected_finding_group_ids.add(group.group_id)
+        scope_occurrences = set(all_keys)
+        allowed_group_ids = explicitly_selected_finding_group_ids | {
             group.group_id
             for group in group_list
             if group.issue_type != IssueType.SCA
@@ -817,7 +837,7 @@ def materialize_synthetic_dependency_tasks(
                 _group_manifest_path(group, root),
                 (group.vulnerable_component or "").strip(),
             )
-            in set(all_keys)
+            in scope_occurrences
         }
         group_list = [group for group in group_list if group.group_id in allowed_group_ids]
         groups_by_id = {
@@ -872,6 +892,56 @@ def materialize_synthetic_dependency_tasks(
         }
     else:
         augmented_queue = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    if scoped_packages:
+        for task_id, task in sorted(augmented_queue.items()):
+            group = groups_by_id.get(task.parent_group_id)
+            if (
+                group is None
+                or group.is_synthetic
+                or group.issue_type != IssueType.SCA
+                or task.strategy != RoutingStrategy.VERSION_BUMP
+                or task.status != TaskStatus.PENDING
+                or task.current_attempt_id is not None
+                or task.retry_count > 0
+            ):
+                continue
+            package_name = (group.vulnerable_component or "").strip()
+            manifest_path = _group_manifest_path(group, root)
+            if (
+                not package_name
+                or package_name not in scoped_packages
+                or (manifest_path, package_name) in records_by_key
+            ):
+                continue
+            fixed_version = (
+                group.fix_plan.fixed_version.strip()
+                if group.fix_plan and group.fix_plan.fixed_version
+                else next(
+                    (
+                        str(issue.fixed_version).strip()
+                        for issue in group.issues
+                        if issue.fixed_version and str(issue.fixed_version).strip()
+                    ),
+                    None,
+                )
+            )
+            updates: dict[str, Any] = {
+                "target_package_name": package_name,
+                "target_dependency_type": "overrides",
+                "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                "parent_minimum_version": None,
+                "allowed_target_versions": [fixed_version] if fixed_version else [],
+                "allowed_dependency_types": ["overrides"],
+                "selected_version": fixed_version,
+                "instruction": (
+                    f'Apply the outer-solver-approved npm override for "{package_name}" '
+                    f"in {manifest_path}."
+                ),
+            }
+            if any(getattr(task, key) != value for key, value in updates.items()):
+                if task.task_revision > 0 or task.portfolio_plan_id:
+                    updates["task_revision"] = task.task_revision + 1
+                augmented_queue[task_id] = task.model_copy(update=updates)
     next_task_index = 1
 
     def allocate_task_id() -> str:
@@ -1860,6 +1930,7 @@ __all__ = [
     "active_leaf_task_ids",
     "apply_portfolio_plan",
     "build_portfolio_plan",
+    "build_certified_portfolio_plan",
     "isolate_delta_failure",
     "materialize_synthetic_dependency_tasks",
     "prepare_portfolio_inputs",

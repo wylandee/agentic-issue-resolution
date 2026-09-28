@@ -14,6 +14,7 @@ context-manager that:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -22,6 +23,7 @@ import shlex
 import tarfile
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 from langsmith import traceable
@@ -45,6 +47,40 @@ _WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
 _WORKSPACE_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS = 900
 _WORKSPACE_SNAPSHOT_VALIDATION_TIMEOUT_SECONDS = 60
+_DEFAULT_READ_FILES_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_READ_FILES = 10_000
+
+
+class _ReadFilesResult(dict[str, str]):
+    """Document mapping with private bounded data for the trace callback."""
+
+    __slots__ = ("total_bytes", "duration_seconds", "digest")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total_bytes = 0
+        self.duration_seconds = 0.0
+        self.digest = ""
+
+
+def _trace_read_files_inputs(inputs: dict[str, object]) -> dict[str, int]:
+    """Keep batched read inputs free of workspace paths."""
+    paths = inputs.get("paths", ())
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
+        return {"file_count": 0}
+    return {"file_count": min(len(paths), _MAX_READ_FILES + 1)}
+
+
+def _trace_read_files_outputs(output: object) -> dict[str, object]:
+    """Emit bounded read measurements without document contents or paths."""
+    if not isinstance(output, _ReadFilesResult):
+        return {"file_count": 0, "total_bytes": 0, "duration_seconds": 0.0, "digest": ""}
+    return {
+        "file_count": len(output),
+        "total_bytes": output.total_bytes,
+        "duration_seconds": round(output.duration_seconds, 3),
+        "digest": output.digest,
+    }
 
 
 def _workspace_snapshot_archive(snapshot_id: str) -> str:
@@ -394,38 +430,131 @@ class DockerSandbox:
         self._container.put_archive(parent_dir, buf.read())
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
 
-    @traceable(run_type="tool", name="docker_sandbox.read_file")
-    def read_file(self, file_path: str) -> str | None:
-        """Read *file_path* from ``/workspace`` and return decoded text."""
+    def _read_file_bytes_untraced(
+        self,
+        relative_path: str,
+        *,
+        containment_checked: bool = False,
+        regular_only: bool = False,
+    ) -> bytes | None:
+        """Read one normalized file without creating a trace span."""
         if not self._alive or self._container is None:
             logger.warning("DockerSandbox.read_file: sandbox is not running.")
             return None
-
-        relative_path = normalize_workspace_path(file_path)
         abs_path = f"/workspace/{relative_path}"
-
         try:
-            self._assert_container_path(abs_path)
+            if not containment_checked:
+                self._assert_container_path(abs_path)
             stream, _stat = self._container.get_archive(abs_path)
         except WorkspacePathError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning("DockerSandbox.read_file: could not retrieve %s â€” %s", abs_path, exc)
+            logger.warning("DockerSandbox.read_file: could not retrieve %s — %s", abs_path, exc)
             return None
-
         raw = b"".join(chunk for chunk in stream)
-
         try:
             with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
-                member = tf.getmembers()[0]
+                members = tf.getmembers()
+                member = members[0] if members else None
+                if member is None or (regular_only and not member.isfile()):
+                    logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
+                    return None
                 extracted = tf.extractfile(member)
                 if extracted is None:
                     logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
                     return None
-                return extracted.read().decode("utf-8", errors="replace")
+                return extracted.read()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("DockerSandbox.read_file: failed to extract %s â€” %s", abs_path, exc)
+            logger.warning("DockerSandbox.read_file: failed to extract %s — %s", abs_path, exc)
             return None
+
+    @traceable(run_type="tool", name="docker_sandbox.read_file")
+    def read_file(self, file_path: str) -> str | None:
+        """Read one workspace file, preserving the legacy text API."""
+        relative_path = normalize_workspace_path(file_path)
+        content = self._read_file_bytes_untraced(relative_path)
+        return content.decode("utf-8", errors="replace") if content is not None else None
+
+    @traceable(
+        run_type="tool",
+        name="docker_sandbox.read_files",
+        process_inputs=_trace_read_files_inputs,
+        process_outputs=_trace_read_files_outputs,
+    )
+    def read_files(
+        self,
+        paths: Sequence[str],
+        *,
+        max_total_bytes: int = _DEFAULT_READ_FILES_MAX_TOTAL_BYTES,
+    ) -> dict[str, str] | None:
+        """Read a bounded set of regular workspace files in one trace span.
+
+        Args:
+            paths: Workspace-relative paths to read. Duplicate normalized paths
+                are read once.
+            max_total_bytes: Total raw file-byte cap, never a truncation limit.
+                Tests may lower the cap but cannot raise the hard limit.
+
+        Returns:
+            A complete path-to-text mapping, or ``None`` if any path is missing
+            or is not a regular file. No partial mapping is returned.
+
+        Raises:
+            WorkspacePathError: If a path is unsafe or resolves outside the workspace.
+            ValueError: If the path count or byte cap is invalid or exceeded.
+        """
+        started = time.monotonic()
+        if not self._alive or self._container is None:
+            logger.warning("DockerSandbox.read_files: sandbox is not running.")
+            return None
+        if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
+            raise ValueError("paths must be a sequence of workspace-relative paths.")
+        if (
+            isinstance(max_total_bytes, bool)
+            or not isinstance(max_total_bytes, int)
+            or max_total_bytes < 0
+            or max_total_bytes > _DEFAULT_READ_FILES_MAX_TOTAL_BYTES
+        ):
+            raise ValueError("max_total_bytes must be within the hard batch-read limit.")
+        if len(paths) > _MAX_READ_FILES:
+            raise ValueError(f"batched workspace read exceeds {_MAX_READ_FILES} files.")
+        if any(len(str(path)) > 4096 for path in paths):
+            raise ValueError("batched workspace read contains an overlong path.")
+        try:
+            normalized_paths = sorted({normalize_workspace_path(path) for path in paths})
+        except WorkspacePathError:
+            raise WorkspacePathError("batched workspace read contains an unsafe path") from None
+        if len(normalized_paths) > _MAX_READ_FILES:
+            raise ValueError(f"batched workspace read exceeds {_MAX_READ_FILES} files.")
+        try:
+            for relative_path in normalized_paths:
+                self._assert_container_path(f"/workspace/{relative_path}")
+        except WorkspacePathError:
+            raise WorkspacePathError(
+                "batched workspace read path resolves outside the workspace"
+            ) from None
+
+        documents = _ReadFilesResult()
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for relative_path in normalized_paths:
+            content_bytes = self._read_file_bytes_untraced(
+                relative_path, containment_checked=True, regular_only=True
+            )
+            if content_bytes is None:
+                return None
+            total_bytes += len(content_bytes)
+            if total_bytes > max_total_bytes:
+                raise ValueError("batched workspace read exceeds its total-byte limit.")
+            documents[relative_path] = content_bytes.decode("utf-8", errors="replace")
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(content_bytes)
+            digest.update(b"\0")
+        documents.total_bytes = total_bytes
+        documents.duration_seconds = max(0.0, time.monotonic() - started)
+        documents.digest = digest.hexdigest()[:24]
+        return documents
 
     @traceable(run_type="tool", name="docker_sandbox.create_workspace_snapshot")
     def create_workspace_snapshot(self, snapshot_id: str) -> None:

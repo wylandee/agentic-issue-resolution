@@ -17,7 +17,11 @@ from typing import Any
 from langsmith import traceable
 
 from remediation_engine.contracts.solver_models import (
+    SolverCandidateConflict,
+    SolverCandidateCutKind,
     SolverCandidatePlan,
+    SolverCandidateRejectionReason,
+    SolverCandidateRelation,
     SolverFindingRequirement,
     SolverPeerConstraint,
     SolverRemediationPlan,
@@ -28,6 +32,7 @@ from remediation_engine.contracts.solver_models import (
     SolverTaskDecision,
     SolverVersionCandidate,
 )
+from remediation_engine.settings import DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
 
 _MAX_DIAGNOSTICS = 64
 _MAX_DIAGNOSTIC_LENGTH = 500
@@ -47,6 +52,7 @@ def _trace_solver_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     findings = list(_trace_field(subgraph, "findings", ()) or ())
     edges = list(_trace_field(subgraph, "edges", ()) or ())
     peer_constraints = list(_trace_field(subgraph, "peer_constraints", ()) or ())
+    evidence_domains = list(_trace_field(subgraph, "evidence_domains", ()) or ())
     candidate_domains = inputs.get("candidate_domains") or {}
     domain_counts = (
         {str(key): len(values or ()) for key, values in candidate_domains.items()}
@@ -72,7 +78,38 @@ def _trace_solver_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
         "peer_constraint_count": len(peer_constraints),
         "subgraph_valid": bool(_trace_field(subgraph, "valid", True)),
         "candidate_domain_count": len(domain_counts),
+        "evidence_domain_count": len(evidence_domains),
+        "evidence_candidate_total_count": sum(
+            len(_trace_field(domain, "candidate_versions", ()) or ()) for domain in evidence_domains
+        ),
         "candidate_total_count": sum(domain_counts.values()),
+        "forbidden_assignment_count": len(inputs.get("forbidden_assignments") or ()),
+        "forbidden_assignments": [
+            {
+                "digest": _digest(dict(sorted(item.items()))),
+                "values": dict(sorted(item.items())[:32]),
+            }
+            for item in (inputs.get("forbidden_assignments") or ())[:32]
+            if isinstance(item, Mapping)
+        ],
+        "forbidden_conflict_count": len(inputs.get("forbidden_conflicts") or ()),
+        "forbidden_conflicts": [
+            {
+                "assignment_digest": _trace_field(item, "assignment_digest"),
+                "reason_code": _trace_field(item, "reason_code"),
+                "cut_kind": _trace_field(item, "cut_kind"),
+                "evidence_digest": _trace_field(item, "evidence_digest"),
+                "literals": [
+                    {
+                        "variable_id": _trace_field(literal, "variable_id"),
+                        "version": _trace_field(literal, "version"),
+                    }
+                    for literal in list(_trace_field(item, "literals", ()) or ())[:16]
+                ],
+                "summary": str(_trace_field(item, "summary", "") or "")[:160],
+            }
+            for item in (inputs.get("forbidden_conflicts") or ())[:32]
+        ],
         "candidate_counts": domain_counts,
         "settings": {
             name: _trace_field(settings, name)
@@ -144,6 +181,19 @@ def _version_key(value: str | None) -> tuple[int, ...] | None:
         if len(parts) < 3 or any(not part.isdigit() for part in parts[:3]):
             return None
         return tuple(int(part) for part in parts[:3])
+
+
+def _stable_semver_major(value: str | None) -> int | None:
+    """Return a major version only for valid stable semantic versions."""
+    if not value:
+        return None
+    try:
+        from semantic_version import Version
+
+        parsed = Version(value.strip().lstrip("vV"))
+    except (ImportError, TypeError, ValueError):
+        return None
+    return None if parsed.prerelease else parsed.major
 
 
 def _at_least(version: str, floor: str | None) -> bool:
@@ -285,7 +335,7 @@ def _as_domain(
     max_candidates: int,
     diagnostics: list[str],
 ) -> list[SolverVersionCandidate]:
-    """Normalize, sort, and bound one occurrence's candidate domain."""
+    """Normalize candidate identity without silently pruning a release."""
     raw = candidate_domains.get(target.occurrence_id)
     if raw is None:
         raw = candidate_domains.get(target.task_id, ())
@@ -311,21 +361,9 @@ def _as_domain(
     if len(unique) > max_candidates:
         _diagnostic(
             diagnostics,
-            f"candidate domain for {target.occurrence_id} truncated from {len(unique)} to {max_candidates}",
+            f"candidate resource guard exceeded for {target.occurrence_id}: "
+            f"{len(unique)}>{max_candidates}; domain was not truncated",
         )
-        eligible = [candidate for candidate in unique if candidate.meets_security_floor]
-        required: list[SolverVersionCandidate] = [(eligible or unique)[-1]]
-        installed = target.installed_version.strip().lstrip("vV")
-        for candidate in unique:
-            if candidate.version == installed and candidate not in required:
-                required.append(candidate)
-                break
-        for candidate in reversed(unique):
-            if len(required) >= max_candidates:
-                break
-            if candidate not in required:
-                required.append(candidate)
-        unique = sorted(required[:max_candidates], key=_candidate_key)
     return unique
 
 
@@ -335,62 +373,28 @@ def _floor_for_target(
     diagnostics: list[str],
 ) -> str | None:
     """Return the greatest valid fixed version required by a target's findings."""
-    referenced = set(target.finding_ids)
-    referenced.update(
-        finding.finding_id
-        for finding in findings.values()
-        if finding.target_occurrence_id == target.occurrence_id
+    requirements = sorted(
+        (
+            finding
+            for finding in findings.values()
+            if finding.target_occurrence_id == target.occurrence_id
+        ),
+        key=lambda item: item.coverage_id,
     )
     floors: list[str] = []
-    for finding_id in sorted(referenced):
-        finding = findings.get(finding_id)
-        if finding is None or not finding.fixed_version:
+    for finding in requirements:
+        if not finding.fixed_version:
             continue
         if _version_key(finding.fixed_version) is None:
             _diagnostic(
-                diagnostics, f"invalid security floor {finding.fixed_version!r} for {finding_id}"
+                diagnostics,
+                f"invalid security floor {finding.fixed_version!r} for {finding.coverage_id}",
             )
             continue
         floors.append(finding.fixed_version)
     if not floors:
         return None
     return max(floors, key=lambda item: _version_key(item) or ())
-
-
-def _range_for_candidate(
-    source: SolverTarget,
-    target: SolverTarget,
-    candidate: SolverVersionCandidate,
-    *,
-    edge_range: str | None,
-    peer: SolverPeerConstraint | None,
-) -> bool | None:
-    """Evaluate all known source-to-target range requirements for one pair."""
-    if (
-        peer is not None
-        and peer.candidate_specific_source_version
-        and candidate.version != peer.candidate_specific_source_version
-    ):
-        return False
-    ranges: list[str] = []
-    if edge_range:
-        ranges.append(edge_range)
-    for mapping in (candidate.dependency_ranges, candidate.peer_ranges):
-        for name in (target.package_name, target.target_package_name):
-            if name in mapping:
-                ranges.append(mapping[name])
-                break
-    if peer is not None:
-        ranges.append(peer.version_range)
-    result = True
-    for requirement in ranges:
-        matched = _range_matches(requirement, target.installed_version)
-        if matched is None:
-            # The target's installed version is not the selected value here;
-            # callers perform the full selected-pair check below.
-            continue
-        result = result and matched
-    return result
 
 
 def _pair_allowed(
@@ -401,8 +405,9 @@ def _pair_allowed(
     *,
     edge_range: str | None,
     peer: SolverPeerConstraint | None,
+    candidate_relations: Sequence[SolverCandidateRelation] = (),
 ) -> bool | None:
-    """Evaluate a candidate pair using explicit npm compatibility tables."""
+    """Evaluate static edges and exact candidate-specific dependency ranges."""
     if peer is not None and peer.is_optional:
         return True
     if (
@@ -411,35 +416,60 @@ def _pair_allowed(
         and source_candidate.version != peer.candidate_specific_source_version
     ):
         return False
+    override_target = peer is None and target.dependency_type.strip().lower() in {
+        "overrides",
+        "resolutions",
+        "pnpm_overrides",
+    }
+    candidate_requirement_found = False
+    for relation in candidate_relations:
+        if relation.is_optional or relation.kind == "optional_dependency":
+            continue
+        package_matches_target = relation.package_name in {
+            target.package_name,
+            target.target_package_name,
+        }
+        package_matches_source = relation.package_name in {
+            source.package_name,
+            source.target_package_name,
+        }
+        if (
+            relation.source_occurrence_id == source.occurrence_id
+            and relation.source_candidate_version == source_candidate.version
+            and package_matches_target
+        ):
+            candidate_requirement_found = True
+            if not relation.is_modelled or not relation.is_range_supported:
+                continue
+            if relation.target_occurrence_id == target.occurrence_id:
+                matched = _range_matches(relation.version_range, target_candidate.version)
+                if matched is not True:
+                    return matched
+        elif (
+            relation.source_occurrence_id == target.occurrence_id
+            and relation.source_candidate_version == target_candidate.version
+            and package_matches_source
+        ):
+            candidate_requirement_found = True
+            if not relation.is_modelled or not relation.is_range_supported:
+                continue
+            if relation.target_occurrence_id == source.occurrence_id:
+                matched = _range_matches(relation.version_range, source_candidate.version)
+                if matched is not True:
+                    return matched
+
     ranges: list[tuple[str, str]] = []
-    candidate_range_found = False
-    for mapping in (source_candidate.dependency_ranges, source_candidate.peer_ranges):
-        for name in (target.package_name, target.target_package_name):
-            if name in mapping:
-                ranges.append((mapping[name], target_candidate.version))
-                candidate_range_found = True
-                break
-    # The installed lockfile range is only a fallback.  Once a candidate's
-    # published metadata is available it describes the selected pair and must
-    # supersede the stale installed range.
-    if edge_range and not candidate_range_found:
+    if edge_range and not candidate_requirement_found and not override_target:
         ranges.append((edge_range, target_candidate.version))
-    if peer is not None and not candidate_range_found:
+    if peer is not None and not candidate_requirement_found:
         ranges.append((peer.version_range, target_candidate.version))
-    # Published peer metadata on the target can constrain the source as well.
-    for name in (source.package_name, source.target_package_name):
-        requirement = target_candidate.peer_ranges.get(name)
-        if requirement:
-            ranges.append((requirement, source_candidate.version))
-            break
-    result = True
     for requirement, version in ranges:
         matched = _range_matches(requirement, version)
         if matched is None:
             return None
         if not matched:
             return False
-    return result
+    return True
 
 
 def _constraint_pairs(
@@ -451,6 +481,7 @@ def _constraint_pairs(
     edge_range: str | None,
     peer: SolverPeerConstraint | None,
     diagnostics: list[str],
+    candidate_relations: Sequence[SolverCandidateRelation] = (),
 ) -> list[tuple[int, int]]:
     """Precompute the integer allowed-pair table for one graph relation."""
     pairs: list[tuple[int, int]] = []
@@ -463,6 +494,7 @@ def _constraint_pairs(
                 right,
                 edge_range=edge_range,
                 peer=peer,
+                candidate_relations=candidate_relations,
             )
             if allowed is None:
                 _diagnostic(
@@ -483,9 +515,10 @@ def _compatible_alternatives(
     domains: Mapping[str, Sequence[SolverVersionCandidate]],
     selected_indices: Mapping[str, int],
     relations: Sequence[tuple[str, str, str | None, SolverPeerConstraint | None]],
+    candidate_relations: Sequence[SolverCandidateRelation],
     floor: str | None = None,
 ) -> list[str]:
-    """Return candidate versions compatible with the selected neighboring assignment."""
+    """Return candidate versions compatible with the selected assignment."""
     if target.strategy.replace("-", "_").lower() in {"code_workaround", "workaround"}:
         return []
     compatible: list[str] = []
@@ -520,6 +553,7 @@ def _compatible_alternatives(
                     neighbor_candidate,
                     edge_range=edge_range,
                     peer=peer,
+                    candidate_relations=candidate_relations,
                 )
                 if source_id == target.occurrence_id
                 else _pair_allowed(
@@ -529,6 +563,7 @@ def _compatible_alternatives(
                     candidate,
                     edge_range=edge_range,
                     peer=peer,
+                    candidate_relations=candidate_relations,
                 )
             )
             if allowed is not True:
@@ -556,6 +591,7 @@ def _project_candidate_plan(
     severity_weight: Mapping[str, int],
     floors: Mapping[str, str | None],
     relations: Sequence[tuple[str, str, str | None, SolverPeerConstraint | None]],
+    candidate_relations: Sequence[SolverCandidateRelation],
     diagnostics: Sequence[str],
 ) -> tuple[SolverCandidatePlan, dict[str, int]]:
     """Project one CP-SAT assignment into the immutable candidate contract."""
@@ -577,6 +613,7 @@ def _project_candidate_plan(
             domains=domains,
             selected_indices=selected_indices,
             relations=relations,
+            candidate_relations=candidate_relations,
             floor=floors.get(target.occurrence_id),
         )
         for target in eligible
@@ -593,12 +630,14 @@ def _project_candidate_plan(
         )
         for target in targets
     ]
-    coverage_ids = sorted(finding_id for finding_id, value in covered_values.items() if value)
-    unresolved_ids = sorted(finding_id for finding_id, value in covered_values.items() if not value)
+    coverage_ids = sorted(coverage_id for coverage_id, value in covered_values.items() if value)
+    unresolved_ids = sorted(
+        coverage_id for coverage_id, value in covered_values.items() if not value
+    )
     unresolved_critical_high = sum(
         severity_weight.get(finding.severity.upper(), 0)
         for finding in finding_list
-        if finding.finding_id in unresolved_ids
+        if finding.coverage_id in unresolved_ids
     )
     workaround_count = sum(workaround_values.values())
     changed_count = sum(
@@ -626,6 +665,10 @@ def _project_candidate_plan(
             distance,
             -stable,
         ),
+        selected_candidate_versions={
+            occurrence_id: domains[occurrence_id][candidate_index].version
+            for occurrence_id, candidate_index in sorted(selected_indices.items())
+        },
         coverage_ids=coverage_ids,
         unresolved_ids=unresolved_ids,
         task_decisions=decisions,
@@ -649,15 +692,15 @@ def _build_decision(
 ) -> SolverTaskDecision:
     """Project one assignment into a solver-approved task decision."""
     requirements = list(findings_by_target.get(target.occurrence_id, ()))
-    requirements.sort(key=lambda item: item.finding_id)
+    requirements.sort(key=lambda item: item.coverage_id)
     selected = candidates[selected_index] if 0 <= selected_index < len(candidates) else None
     all_by_version = bool(requirements) and all(
-        finding_covered.get(item.finding_id, False)
-        and not finding_workaround.get(item.finding_id, False)
+        finding_covered.get(item.coverage_id, False)
+        and not finding_workaround.get(item.coverage_id, False)
         for item in requirements
     )
     all_by_workaround = bool(requirements) and all(
-        finding_workaround.get(item.finding_id, False) for item in requirements
+        finding_workaround.get(item.coverage_id, False) for item in requirements
     )
     preferred_strategy = target.strategy.replace("-", "_").lower()
     if preferred_strategy in {"code_workaround", "workaround"}:
@@ -699,23 +742,40 @@ def _build_decision(
             plan_id
             for finding in requirements
             for plan_id in finding.workaround_plan_ids
-            if strategy == "code_workaround" and finding_workaround.get(finding.finding_id, False)
+            if strategy == "code_workaround" and finding_workaround.get(finding.coverage_id, False)
         }
     )
     stage = requirements[0].strategy_stage if requirements else "osv_minimum"
+    selected_version = (
+        selected.version if selected is not None and strategy == "version_bump" else None
+    )
+    installed_major = _stable_semver_major(target.installed_version)
+    selected_major = _stable_semver_major(selected_version)
+    requires_source_migration = bool(
+        selected_version
+        and (installed_major is None or selected_major is None or installed_major != selected_major)
+    )
+    exact_instruction = None
+    if requires_source_migration:
+        exact_instruction = (
+            f"Upgrade package {target.target_package_name} from installed version "
+            f"{target.installed_version} to selected version {selected_version}.\n"
+            "Migrate all affected production and test code to the selected package API "
+            "while preserving behavior; do not change the solver-approved package or version."
+        )
     return SolverTaskDecision(
         task_id=target.task_id,
         selected_strategy=strategy,
         selected_route=route,
-        selected_version=selected.version
-        if selected is not None and strategy == "version_bump"
-        else None,
+        selected_version=selected_version,
         allowed_alternative_versions=alternatives,
         allowed_dependency_types=[target.dependency_type],
         strategy_stage=stage,
         selected_plan_issue_ids=selected_plan_ids,
         instruction_source="deterministic_solver",
-        exact_instruction=None,
+        exact_instruction=exact_instruction,
+        requires_source_migration=requires_source_migration,
+        installed_version=target.installed_version,
         target_occurrence_id=target.occurrence_id,
         target_group_id=target.group_id,
         target_package_name=target.target_package_name,
@@ -723,6 +783,241 @@ def _build_decision(
         lockfile_package_key=target.lockfile_package_key,
         dependency_type=target.dependency_type,
     )
+
+
+def _validate_forbidden_assignments(
+    assignments: Sequence[Mapping[str, str]],
+    eligible: Sequence[SolverTarget],
+    domains: Mapping[str, Sequence[SolverVersionCandidate]],
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Validate exact no-goods against the current complete variable set."""
+    expected_ids = {target.occurrence_id for target in eligible}
+    normalized: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
+    diagnostics: list[str] = []
+    for index, assignment in enumerate(assignments):
+        if not isinstance(assignment, Mapping):
+            diagnostics.append(f"forbidden assignment {index} is not a mapping")
+            continue
+        if set(assignment) != expected_ids:
+            diagnostics.append(
+                f"forbidden assignment {index} must specify exactly the eligible occurrence IDs"
+            )
+            continue
+        values: dict[str, str] = {}
+        malformed = False
+        for occurrence_id in sorted(expected_ids):
+            raw_version = assignment.get(occurrence_id)
+            if not isinstance(raw_version, str) or not raw_version.strip():
+                diagnostics.append(
+                    f"forbidden assignment {index} has an invalid version for {occurrence_id!r}"
+                )
+                malformed = True
+                break
+            version = raw_version.strip().lstrip("vV")
+            if _version_key(version) is None or version not in {
+                candidate.version for candidate in domains.get(occurrence_id, ())
+            }:
+                diagnostics.append(
+                    f"forbidden assignment {index} references an unknown version "
+                    f"{version!r} for {occurrence_id!r}"
+                )
+                malformed = True
+                break
+            values[occurrence_id] = version
+        if not malformed:
+            normalized[tuple(sorted(values.items()))] = values
+    return [normalized[key] for key in sorted(normalized)], diagnostics
+
+
+def _validate_forbidden_conflicts(
+    conflicts: Sequence[SolverCandidateConflict],
+    eligible: Sequence[SolverTarget],
+    domains: Mapping[str, Sequence[SolverVersionCandidate]],
+) -> tuple[
+    list[SolverCandidateConflict],
+    list[dict[str, str]],
+    list[str],
+]:
+    """Validate rejection cuts against the current task-backed candidate catalog."""
+    expected_ids = {target.occurrence_id for target in eligible}
+    canonical: dict[str, SolverCandidateConflict] = {}
+    exact_assignments: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
+    diagnostics: list[str] = []
+    for conflict_index, raw_conflict in enumerate(conflicts):
+        try:
+            conflict = (
+                raw_conflict
+                if isinstance(raw_conflict, SolverCandidateConflict)
+                else SolverCandidateConflict.model_validate(raw_conflict)
+            )
+        except Exception as exc:  # noqa: BLE001 - malformed input must fail closed
+            diagnostics.append(f"forbidden conflict {conflict_index} is invalid: {exc}")
+            continue
+        literal_ids = {literal.variable_id for literal in conflict.literals}
+        if len(literal_ids) != len(conflict.literals):
+            diagnostics.append(
+                f"forbidden conflict {conflict_index} contains duplicate variable IDs"
+            )
+            continue
+        literal_order = [(literal.variable_id, literal.version) for literal in conflict.literals]
+        if literal_order != sorted(literal_order):
+            diagnostics.append(f"forbidden conflict {conflict_index} literals are not canonical")
+            continue
+        if not literal_ids or not literal_ids <= expected_ids:
+            diagnostics.append(
+                f"forbidden conflict {conflict_index} references a non-mutation variable"
+            )
+            continue
+        malformed = False
+        values: dict[str, str] = {}
+        for literal in conflict.literals:
+            version = literal.version
+            if version != version.strip().lstrip("vV") or version not in {
+                candidate.version for candidate in domains.get(literal.variable_id, ())
+            }:
+                diagnostics.append(
+                    f"forbidden conflict {conflict_index} references an unknown version "
+                    f"{version!r} for {literal.variable_id!r}"
+                )
+                malformed = True
+                break
+            values[literal.variable_id] = version
+        if malformed:
+            continue
+        if conflict.cut_kind == SolverCandidateCutKind.UNARY and (
+            len(conflict.literals) != 1
+            or conflict.reason_code
+            not in {
+                SolverCandidateRejectionReason.RUNTIME_ENGINE,
+                SolverCandidateRejectionReason.RUNTIME_PLATFORM,
+            }
+        ):
+            diagnostics.append(f"forbidden conflict {conflict_index} has an invalid unary cut")
+            continue
+        if conflict.cut_kind == SolverCandidateCutKind.PAIR and (
+            len(conflict.literals) != 2
+            or conflict.reason_code
+            not in {
+                SolverCandidateRejectionReason.DEPENDENCY_RANGE,
+                SolverCandidateRejectionReason.PEER_CONFLICT,
+            }
+        ):
+            diagnostics.append(f"forbidden conflict {conflict_index} has an invalid pair cut")
+            continue
+        if conflict.cut_kind == SolverCandidateCutKind.EXACT_ASSIGNMENT:
+            if literal_ids != expected_ids:
+                diagnostics.append(
+                    f"forbidden conflict {conflict_index} must specify every eligible occurrence ID"
+                )
+                continue
+            if _digest(dict(sorted(values.items()))) != conflict.assignment_digest:
+                diagnostics.append(
+                    f"forbidden conflict {conflict_index} assignment digest does not match its map"
+                )
+                continue
+            exact_assignments[tuple(sorted(values.items()))] = dict(sorted(values.items()))
+            continue
+        canonical_key = json.dumps(
+            conflict.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        canonical[canonical_key] = conflict
+    unique_cuts: dict[tuple[tuple[str, str], ...], SolverCandidateConflict] = {}
+    for conflict in (canonical[key] for key in sorted(canonical)):
+        cut_key = tuple((literal.variable_id, literal.version) for literal in conflict.literals)
+        unique_cuts.setdefault(cut_key, conflict)
+    return (
+        sorted(
+            unique_cuts.values(),
+            key=lambda conflict: json.dumps(
+                conflict.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            ),
+        ),
+        [exact_assignments[key] for key in sorted(exact_assignments)],
+        diagnostics,
+    )
+
+
+def _candidate_relations_complete(
+    subgraph: SolverSubgraph,
+    domains: Mapping[str, Sequence[SolverVersionCandidate]],
+    diagnostics: list[str],
+) -> bool:
+    """Require one valid physical relation for every published requirement."""
+    by_source_candidate: dict[tuple[str, str], list[SolverCandidateRelation]] = {}
+    complete = True
+    for relation in subgraph.candidate_relations:
+        source_candidates = domains.get(relation.source_occurrence_id, ())
+        candidate = next(
+            (
+                value
+                for value in source_candidates
+                if value.version == relation.source_candidate_version
+            ),
+            None,
+        )
+        if candidate is None:
+            complete = False
+            _diagnostic(
+                diagnostics,
+                f"candidate relation references unknown source candidate "
+                f"{relation.source_occurrence_id!r}@{relation.source_candidate_version}",
+            )
+            continue
+        if relation.target_occurrence_id == relation.source_occurrence_id:
+            complete = False
+            _diagnostic(
+                diagnostics,
+                f"candidate relation for {relation.source_occurrence_id!r} resolves to itself",
+            )
+        if relation.is_range_supported and _range_matches(relation.version_range, "1.0.0") is None:
+            complete = False
+            _diagnostic(
+                diagnostics,
+                f"invalid candidate range {relation.version_range!r} for "
+                f"{relation.source_occurrence_id!r}@{relation.source_candidate_version}",
+            )
+        if not any(
+            requirement.package_name == relation.package_name
+            and requirement.version_range == relation.version_range
+            and requirement.kind == relation.kind
+            and requirement.is_optional == relation.is_optional
+            and requirement.is_range_supported == relation.is_range_supported
+            for requirement in candidate.requirements
+        ):
+            complete = False
+            _diagnostic(
+                diagnostics,
+                f"candidate relation does not match published metadata for "
+                f"{relation.source_occurrence_id!r}@{relation.source_candidate_version}",
+            )
+        by_source_candidate.setdefault(
+            (relation.source_occurrence_id, relation.source_candidate_version), []
+        ).append(relation)
+
+    for target in subgraph.targets:
+        if not target.eligible_for_atomic_update:
+            continue
+        candidates = domains.get(target.occurrence_id, ())
+        for candidate in candidates:
+            relations = by_source_candidate.get((target.occurrence_id, candidate.version), ())
+            for requirement in candidate.requirements:
+                matches = [
+                    relation
+                    for relation in relations
+                    if relation.package_name == requirement.package_name
+                    and relation.version_range == requirement.version_range
+                    and relation.kind == requirement.kind
+                    and relation.is_optional == requirement.is_optional
+                    and relation.is_range_supported == requirement.is_range_supported
+                ]
+                if len(matches) != 1:
+                    complete = False
+                    _diagnostic(
+                        diagnostics,
+                        f"incomplete candidate relation for {target.occurrence_id!r}@"
+                        f"{candidate.version} -> {requirement.package_name!r}",
+                    )
+    return complete
 
 
 def _status_from_cp_code(cp_model: Any, status_code: Any) -> SolverStatus:
@@ -855,10 +1150,10 @@ def _solve_lexicographic(
     project: Callable[[Any, int, SolverStatus], tuple[SolverCandidatePlan, dict[str, int]]],
     observations: list[dict[str, Any]],
 ) -> tuple[list[SolverCandidatePlan], SolverStatus | None]:
-    """Enumerate top-K assignments with exact bounded lexicographic stages."""
+    """Enumerate top-K assignments without changing the primary solve status."""
     candidate_plans: list[SolverCandidatePlan] = []
     forbidden_assignments: list[dict[str, int]] = []
-    aggregate_status: SolverStatus | None = None
+    primary_status: SolverStatus | None = None
     deadline = time.monotonic() + max(0.001, timeout_seconds)
     ordered_occurrences = sorted(vars_by_id)
     for alternative_index in range(top_k):
@@ -881,22 +1176,13 @@ def _solve_lexicographic(
             solver.parameters.max_time_in_seconds = max(0.001, remaining)
             status_code = solver.Solve(model)
             status = _record_solver_result(cp_model, solver, status_code, observations)
-            if status == SolverStatus.FEASIBLE:
-                aggregate_status = SolverStatus.FEASIBLE
-            elif status == SolverStatus.OPTIMAL and aggregate_status is None:
-                aggregate_status = SolverStatus.OPTIMAL
-            elif (
-                status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}
-                and aggregate_status is None
-            ):
-                aggregate_status = status
             if status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}:
                 final_status = status
                 break
             if status == SolverStatus.FEASIBLE:
                 if not accepted_feasible:
                     if candidate_plans:
-                        return candidate_plans, candidate_plans[0].status
+                        return candidate_plans, primary_status
                     return candidate_plans, SolverStatus.UNKNOWN
                 final_status = SolverStatus.FEASIBLE
             try:
@@ -908,12 +1194,14 @@ def _solve_lexicographic(
             if not candidate_plans:
                 return candidate_plans, final_status
             break
+        if primary_status is None:
+            primary_status = final_status
         candidate, selected_indices = project(solver, alternative_index, final_status)
         candidate_plans.append(candidate)
         if not ordered_occurrences:
             break
         forbidden_assignments.append(selected_indices)
-    return candidate_plans, aggregate_status
+    return candidate_plans, primary_status
 
 
 @traceable(
@@ -927,6 +1215,10 @@ def solve_portfolio(
     candidate_domains: Mapping[str, Sequence[SolverVersionCandidate]],
     *,
     settings: Any,
+    candidate_catalog_complete: bool = True,
+    candidate_catalog_digest: str | None = None,
+    forbidden_assignments: Sequence[Mapping[str, str]] = (),
+    forbidden_conflicts: Sequence[SolverCandidateConflict] = (),
 ) -> SolverRemediationPlan:
     """Solve one occurrence-aware portfolio with deterministic CP-SAT.
 
@@ -936,6 +1228,8 @@ def solve_portfolio(
             accepted as a compatibility key).
         settings: Explicit AppSettings-like object. No environment variables are
             read by this function.
+        forbidden_assignments: Complete mutation maps excluded by exact no-goods.
+        forbidden_conflicts: Structured unary, pair, or exact assignment evidence.
 
     Returns:
         A typed plan with top-K deterministic assignments, or a typed failure
@@ -944,9 +1238,19 @@ def solve_portfolio(
     """
     diagnostics = list(subgraph.diagnostics)
     targets = sorted(subgraph.targets, key=lambda item: item.occurrence_id)
-    findings = {finding.finding_id: finding for finding in subgraph.findings}
-    finding_list = sorted(subgraph.findings, key=lambda item: item.finding_id)
-    max_candidates = max(1, int(_setting(settings, "solver_max_candidates_per_target", 64)))
+    findings = {finding.coverage_id: finding for finding in subgraph.findings}
+    finding_list = sorted(subgraph.findings, key=lambda item: item.coverage_id)
+    issue_finding_ids = sorted({finding.finding_id for finding in finding_list})
+    max_candidates = max(
+        1,
+        int(
+            _setting(
+                settings,
+                "solver_max_candidates_per_target",
+                DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET,
+            )
+        ),
+    )
     max_variables = max(1, int(_setting(settings, "solver_max_model_variables", 10_000)))
     domains: dict[str, list[SolverVersionCandidate]] = {
         target.occurrence_id: _as_domain(
@@ -961,33 +1265,122 @@ def solve_portfolio(
     floors = {
         target.occurrence_id: _floor_for_target(target, findings, diagnostics) for target in targets
     }
+    eligible = [target for target in targets if target.eligible_for_atomic_update]
+    validated_conflicts, exact_conflict_assignments, conflict_diagnostics = (
+        _validate_forbidden_conflicts(forbidden_conflicts, eligible, domains)
+    )
+    normalized_forbidden, forbidden_diagnostics = _validate_forbidden_assignments(
+        [*forbidden_assignments, *exact_conflict_assignments], eligible, domains
+    )
+    diagnostics.extend([*forbidden_diagnostics, *conflict_diagnostics])
+    candidate_relations_complete = _candidate_relations_complete(subgraph, domains, diagnostics)
+    candidate_catalog_complete = bool(candidate_catalog_complete)
+    oversized_domains = [
+        (target.occurrence_id, len(domains.get(target.occurrence_id, ())))
+        for target in eligible
+        if len(domains.get(target.occurrence_id, ())) > max_candidates
+    ]
+    if oversized_domains:
+        candidate_catalog_complete = False
+        for occurrence_id, size in oversized_domains:
+            _diagnostic(
+                diagnostics,
+                f"candidate resource guard exceeded for {occurrence_id}: {size}>{max_candidates}; "
+                "no candidates were pruned",
+            )
     for target in targets:
         if target.eligible_for_atomic_update and not domains.get(target.occurrence_id):
             _diagnostic(
                 diagnostics, f"no candidates for eligible occurrence {target.occurrence_id}"
             )
-    domain_payload = {
+    mutation_domain_payload = {
         occurrence_id: [candidate.model_dump(mode="json") for candidate in values]
         for occurrence_id, values in sorted(domains.items())
     }
-    input_digest = _digest(subgraph.model_dump(mode="json"))
-    domain_digest = _digest(domain_payload)
+    evidence_domain_payload = {
+        domain.variable_id: list(domain.candidate_versions)
+        for domain in sorted(subgraph.evidence_domains, key=lambda item: item.variable_id)
+    }
+    domain_payload = {
+        "mutation_domains": mutation_domain_payload,
+        "evidence_domains": evidence_domain_payload,
+    }
+    candidate_catalog_digest = (
+        candidate_catalog_digest.strip()
+        if isinstance(candidate_catalog_digest, str) and candidate_catalog_digest.strip()
+        else _digest(
+            {
+                "candidate_domains": domain_payload,
+                "complete": candidate_catalog_complete,
+            }
+        )
+    )
+    input_digest = _digest(
+        {
+            "subgraph": subgraph.model_dump(mode="json"),
+            "candidate_catalog_complete": candidate_catalog_complete,
+            "candidate_catalog_digest": candidate_catalog_digest,
+            "forbidden_assignments": normalized_forbidden,
+            "forbidden_assignment_diagnostics": forbidden_diagnostics,
+            "forbidden_conflicts": [
+                conflict.model_dump(mode="json") for conflict in validated_conflicts
+            ],
+            "forbidden_conflict_diagnostics": conflict_diagnostics,
+            "candidate_relations_complete": candidate_relations_complete,
+        }
+    )
+    domain_digest = _digest(
+        {
+            "domains": domain_payload,
+            "candidate_catalog_complete": candidate_catalog_complete,
+            "candidate_catalog_digest": candidate_catalog_digest,
+        }
+    )
     repository_digest = _digest(
         {
             "targets": [target.model_dump(mode="json") for target in targets],
+            "occurrences": [
+                occurrence.model_dump(mode="json") for occurrence in subgraph.occurrences
+            ],
             "edges": [edge.model_dump(mode="json") for edge in subgraph.edges],
+            "candidate_relations": [
+                relation.model_dump(mode="json") for relation in subgraph.candidate_relations
+            ],
+            "evidence_domains": [
+                domain.model_dump(mode="json") for domain in subgraph.evidence_domains
+            ],
         }
     )
     revisions = {target.task_id: 0 for target in targets}
-    if not getattr(subgraph, "valid", True):
-        _diagnostic(diagnostics, "invalid solver subgraph; no dispatchable plan")
+
+    def make_plan(**values: Any) -> SolverRemediationPlan:
+        """Attach immutable candidate-catalog evidence to every solver result."""
         return SolverRemediationPlan(
+            candidate_catalog_complete=candidate_catalog_complete,
+            candidate_catalog_digest=candidate_catalog_digest,
+            **values,
+        )
+
+    if (
+        not getattr(subgraph, "valid", True)
+        or not candidate_relations_complete
+        or forbidden_diagnostics
+        or conflict_diagnostics
+        or oversized_domains
+    ):
+        if not getattr(subgraph, "valid", True):
+            _diagnostic(diagnostics, "invalid solver subgraph; no dispatchable plan")
+        if not candidate_relations_complete:
+            _diagnostic(diagnostics, "candidate dependency relations are incomplete")
+        if forbidden_diagnostics or conflict_diagnostics:
+            _diagnostic(diagnostics, "invalid forbidden-assignment or conflict input")
+        return make_plan(
             status=SolverStatus.UNKNOWN,
             input_digest=input_digest,
             domain_digest=domain_digest,
             repository_digest=repository_digest,
             task_revisions=revisions,
-            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -997,30 +1390,29 @@ def solve_portfolio(
         from ortools.sat.python import cp_model
     except Exception as exc:  # pragma: no cover - exercised by packaging failures
         _diagnostic(diagnostics, f"CP-SAT import failed: {exc}")
-        return SolverRemediationPlan(
+        return make_plan(
             status=SolverStatus.FALLBACK,
             input_digest=input_digest,
             domain_digest=domain_digest,
             repository_digest=repository_digest,
             task_revisions=revisions,
-            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
-    eligible = [target for target in targets if target.eligible_for_atomic_update]
     # One integer variable per eligible occurrence, plus bounded coverage and
     # workaround booleans. Empty domains are a typed infeasible result.
     if any(not domains.get(target.occurrence_id) for target in eligible):
-        return SolverRemediationPlan(
-            status=SolverStatus.INFEASIBLE,
+        return make_plan(
+            status=SolverStatus.INFEASIBLE if candidate_catalog_complete else SolverStatus.UNKNOWN,
             input_digest=input_digest,
             domain_digest=domain_digest,
             repository_digest=repository_digest,
             task_revisions=revisions,
-            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
-    estimated_variables = (
+    base_estimated_variables = (
         len(eligible)
         + sum(len(domains[target.occurrence_id]) for target in eligible)
         + (len(finding_list) * 3)
@@ -1035,22 +1427,38 @@ def solve_portfolio(
             for finding in finding_list
         )
     )
+    evidence_domains_by_id = {domain.variable_id: domain for domain in subgraph.evidence_domains}
+    nonempty_evidence_domains = sum(
+        bool(domain.candidate_versions) for domain in evidence_domains_by_id.values()
+    )
+    evidence_model_enabled = True
+    if base_estimated_variables + nonempty_evidence_domains > max_variables:
+        evidence_model_enabled = False
+        _diagnostic(
+            diagnostics,
+            "evidence-only model variable guard exceeded; required dependency relations "
+            "left unmodeled without pruning mutation candidates",
+        )
+    estimated_variables = base_estimated_variables + (
+        nonempty_evidence_domains if evidence_model_enabled else 0
+    )
     if estimated_variables > max_variables:
         _diagnostic(
             diagnostics,
             f"solver model variable guard exceeded: {estimated_variables}>{max_variables}",
         )
-        return SolverRemediationPlan(
-            status=SolverStatus.FALLBACK,
+        return make_plan(
+            status=SolverStatus.UNKNOWN,
             input_digest=input_digest,
             domain_digest=domain_digest,
             repository_digest=repository_digest,
             task_revisions=revisions,
-            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
     target_by_id = {target.occurrence_id: target for target in targets}
+    evidence_by_id = {occurrence.occurrence_id: occurrence for occurrence in subgraph.occurrences}
     vars_by_id: dict[str, Any] = {}
     finding_by_target: dict[str, list[SolverFindingRequirement]] = {}
     for finding in finding_list:
@@ -1058,8 +1466,8 @@ def solve_portfolio(
     model = cp_model.CpModel()
     for target in eligible:
         values = domains[target.occurrence_id]
-        target_findings = target.finding_ids or [
-            finding.finding_id
+        target_findings = [
+            finding.coverage_id
             for finding in finding_list
             if finding.target_occurrence_id == target.occurrence_id
         ]
@@ -1095,20 +1503,65 @@ def solve_portfolio(
             _diagnostic(
                 diagnostics, f"security floor removes every candidate for {target.occurrence_id}"
             )
-            return SolverRemediationPlan(
+            return make_plan(
                 status=SolverStatus.INFEASIBLE,
                 input_digest=input_digest,
                 domain_digest=domain_digest,
                 repository_digest=repository_digest,
                 task_revisions=revisions,
-                unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         vars_by_id[target.occurrence_id] = model.NewIntVarFromDomain(
             cp_model.Domain.FromValues(allowed), f"occurrence_{len(vars_by_id):04d}"
         )
+    evidence_vars_by_id: dict[str, Any] = {}
+    if evidence_model_enabled:
+        for evidence_index, evidence_domain in enumerate(
+            sorted(subgraph.evidence_domains, key=lambda item: item.variable_id)
+        ):
+            if not evidence_domain.candidate_versions:
+                continue
+            evidence_vars_by_id[evidence_domain.variable_id] = model.NewIntVar(
+                0,
+                len(evidence_domain.candidate_versions) - 1,
+                f"evidence_{evidence_index:04d}",
+            )
+    ordered_occurrences = sorted(vars_by_id)
+    for assignment in normalized_forbidden:
+        if ordered_occurrences:
+            indices = [
+                next(
+                    index
+                    for index, candidate in enumerate(domains[occurrence_id])
+                    if candidate.version == assignment[occurrence_id]
+                )
+                for occurrence_id in ordered_occurrences
+            ]
+            model.AddForbiddenAssignments(
+                [vars_by_id[occurrence_id] for occurrence_id in ordered_occurrences],
+                [indices],
+            )
+    seen_conflict_tuples: set[tuple[tuple[str, str], ...]] = set()
+    for conflict in validated_conflicts:
+        literal_key = tuple((literal.variable_id, literal.version) for literal in conflict.literals)
+        if literal_key in seen_conflict_tuples:
+            continue
+        seen_conflict_tuples.add(literal_key)
+        literal_variables = [vars_by_id[literal.variable_id] for literal in conflict.literals]
+        literal_indices = [
+            next(
+                index
+                for index, candidate in enumerate(domains[literal.variable_id])
+                if candidate.version == literal.version
+            )
+            for literal in conflict.literals
+        ]
+        model.AddForbiddenAssignments(literal_variables, [literal_indices])
 
-    # Add explicit integer allowed-pair tables for every constrained relation.
+    # Peer constraints are the solver's hard package compatibility ranges.
+    # Runtime, ancestry, and pinned edges remain in the graph for ordering and
+    # atomic batching; their installed ranges are not candidate constraints.
     peer_by_pair: dict[tuple[str, str], SolverPeerConstraint] = {
         (peer.source_occurrence_id, peer.target_occurrence_id): peer
         for peer in subgraph.peer_constraints
@@ -1121,15 +1574,7 @@ def solve_portfolio(
     for edge in subgraph.edges:
         if edge.is_optional:
             continue
-        if edge.edge_kind in {
-            "runtime",
-            "dependency",
-            "ancestry",
-            "workspace",
-            "scope",
-            "pinned",
-            "peer",
-        }:
+        if edge.edge_kind in {"workspace", "scope", "peer", "strict_peer", "peer_conflict"}:
             relations.append(
                 (
                     edge.source_occurrence_id,
@@ -1162,24 +1607,188 @@ def solve_portfolio(
             edge_range=edge_range,
             peer=peer,
             diagnostics=diagnostics,
+            candidate_relations=subgraph.candidate_relations,
         )
         if not pairs:
             _diagnostic(diagnostics, f"no compatible candidate pair for {source_id}->{target_id}")
             model.AddBoolOr([])
         else:
             model.AddAllowedAssignments([vars_by_id[source_id], vars_by_id[target_id]], pairs)
+    for relation in subgraph.candidate_relations:
+        if (
+            relation.is_optional
+            or not relation.is_modelled
+            or not relation.is_range_supported
+            or relation.target_occurrence_id is None
+            or relation.source_occurrence_id not in vars_by_id
+            or relation.target_occurrence_id not in vars_by_id
+        ):
+            continue
+        source_id = relation.source_occurrence_id
+        target_id = relation.target_occurrence_id
+        pairs: list[tuple[int, int]] = []
+        invalid_range = False
+        for source_index, source_candidate in enumerate(domains[source_id]):
+            for target_index, target_candidate in enumerate(domains[target_id]):
+                if source_candidate.version != relation.source_candidate_version:
+                    pairs.append((source_index, target_index))
+                    continue
+                matched = _range_matches(relation.version_range, target_candidate.version)
+                if matched is None:
+                    invalid_range = True
+                    break
+                if matched:
+                    pairs.append((source_index, target_index))
+            if invalid_range:
+                break
+        if invalid_range:
+            _diagnostic(
+                diagnostics,
+                f"invalid candidate range {relation.version_range!r} in relation "
+                f"{source_id}->{target_id}",
+            )
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=diagnostics,
+            )
+        if not pairs:
+            _diagnostic(diagnostics, f"no compatible candidate pair for {source_id}->{target_id}")
+            model.AddBoolOr([])
+        else:
+            model.AddAllowedAssignments([vars_by_id[source_id], vars_by_id[target_id]], pairs)
+    for relation in subgraph.candidate_relations:
+        if (
+            relation.is_optional
+            or not relation.is_modelled
+            or not relation.is_range_supported
+            or relation.evidence_variable_id is None
+            or relation.source_occurrence_id not in vars_by_id
+            or not evidence_model_enabled
+        ):
+            continue
+        source_id = relation.source_occurrence_id
+        source_variable = vars_by_id[source_id]
+        evidence_domain = evidence_domains_by_id[relation.evidence_variable_id]
+        if not evidence_domain.candidate_versions:
+            for source_index, source_candidate in enumerate(domains[source_id]):
+                if source_candidate.version == relation.source_candidate_version:
+                    model.Add(source_variable != source_index)
+            continue
+        evidence_variable = evidence_vars_by_id.get(relation.evidence_variable_id)
+        if evidence_variable is None:
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=[*diagnostics, "evidence variable map is incomplete"],
+            )
+        allowed_pairs: list[tuple[int, int]] = []
+        invalid_range = False
+        for source_index, source_candidate in enumerate(domains[source_id]):
+            for evidence_index, version in enumerate(evidence_domain.candidate_versions):
+                if source_candidate.version != relation.source_candidate_version:
+                    allowed_pairs.append((source_index, evidence_index))
+                    continue
+                matched = _range_matches(relation.version_range, version)
+                if matched is None:
+                    invalid_range = True
+                    break
+                if matched:
+                    allowed_pairs.append((source_index, evidence_index))
+            if invalid_range:
+                break
+        if invalid_range:
+            _diagnostic(
+                diagnostics,
+                f"invalid modeled evidence range {relation.version_range!r} for "
+                f"{source_id}->{relation.package_name}",
+            )
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=diagnostics,
+            )
+        if not allowed_pairs:
+            model.AddBoolOr([])
+        else:
+            model.AddAllowedAssignments([source_variable, evidence_variable], allowed_pairs)
+
+    for relation in subgraph.candidate_relations:
+        if (
+            relation.kind != "peer"
+            or relation.is_optional
+            or not relation.is_modelled
+            or not relation.is_range_supported
+            or relation.target_occurrence_id is None
+            or relation.target_occurrence_id in vars_by_id
+            or relation.source_occurrence_id not in vars_by_id
+        ):
+            continue
+        physical_peer = evidence_by_id.get(relation.target_occurrence_id)
+        if physical_peer is None or not physical_peer.installed_version:
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=[
+                    *diagnostics,
+                    f"modeled peer {relation.package_name!r} has no physical version",
+                ],
+            )
+        allowed_indices: list[tuple[int]] = []
+        for source_index, source_candidate in enumerate(domains[relation.source_occurrence_id]):
+            if source_candidate.version != relation.source_candidate_version:
+                allowed_indices.append((source_index,))
+                continue
+            matched = _range_matches(relation.version_range, physical_peer.installed_version)
+            if matched is None:
+                return make_plan(
+                    status=SolverStatus.UNKNOWN,
+                    input_digest=input_digest,
+                    domain_digest=domain_digest,
+                    repository_digest=repository_digest,
+                    task_revisions=revisions,
+                    unresolved_finding_ids=issue_finding_ids,
+                    diagnostics=[
+                        *diagnostics,
+                        f"invalid modeled peer range {relation.version_range!r}",
+                    ],
+                )
+            if matched:
+                allowed_indices.append((source_index,))
+        if not allowed_indices:
+            model.AddBoolOr([])
+        else:
+            model.AddAllowedAssignments(
+                [vars_by_id[relation.source_occurrence_id]], allowed_indices
+            )
 
     findings_covered: dict[str, Any] = {}
     findings_version: dict[str, Any] = {}
     findings_workaround: dict[str, Any] = {}
     coverage_meta: dict[str, tuple[list[int], str | None]] = {}
     for finding in finding_list:
-        covered = model.NewBoolVar(f"finding_covered_{finding.finding_id}")
-        workaround = model.NewBoolVar(f"finding_workaround_{finding.finding_id}")
-        version_bool = model.NewBoolVar(f"finding_version_{finding.finding_id}")
-        findings_covered[finding.finding_id] = covered
-        findings_workaround[finding.finding_id] = workaround
-        findings_version[finding.finding_id] = version_bool
+        covered = model.NewBoolVar(f"finding_covered_{finding.coverage_id}")
+        workaround = model.NewBoolVar(f"finding_workaround_{finding.coverage_id}")
+        version_bool = model.NewBoolVar(f"finding_version_{finding.coverage_id}")
+        findings_covered[finding.coverage_id] = covered
+        findings_workaround[finding.coverage_id] = workaround
+        findings_version[finding.coverage_id] = version_bool
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
         good_indices: list[int] = []
@@ -1193,7 +1802,7 @@ def solve_portfolio(
         if occurrence_var is not None and good_indices:
             literals = []
             for index in good_indices:
-                literal = model.NewBoolVar(f"finding_{finding.finding_id}_version_{index}")
+                literal = model.NewBoolVar(f"finding_{finding.coverage_id}_version_{index}")
                 model.Add(occurrence_var == index).OnlyEnforceIf(literal)
                 model.Add(occurrence_var != index).OnlyEnforceIf(literal.Not())
                 literals.append(literal)
@@ -1206,14 +1815,19 @@ def solve_portfolio(
             if finding.target_occurrence_id in target_by_id
             else ""
         )
-        if not has_workaround:
+        if preferred_strategy in {"code_workaround", "workaround", "no_fix"}:
+            model.Add(version_bool == 0)
+        if not has_workaround or preferred_strategy == "no_fix":
             model.Add(workaround == 0)
         elif preferred_strategy in {"code_workaround", "workaround"}:
             # A workaround target is only dispatchable when every selected
             # workaround carries the plan IDs that authorize it.
             model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.finding_id] = (good_indices, finding.fixed_version)
+        vulnerable_occurrence = evidence_by_id.get(finding.vulnerable_occurrence_id)
+        if vulnerable_occurrence is not None and vulnerable_occurrence.is_direct:
+            model.Add(covered == 1)
+        coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:
@@ -1254,7 +1868,7 @@ def solve_portfolio(
     coverage_expression = sum(findings_covered.values())
     unresolved_expression = sum(
         severity_weight.get(finding.severity.upper(), 0)
-        * (1 - findings_covered[finding.finding_id])
+        * (1 - findings_covered[finding.coverage_id])
         for finding in finding_list
     )
     workaround_expression = sum(findings_workaround.values())
@@ -1336,6 +1950,7 @@ def solve_portfolio(
             severity_weight=severity_weight,
             floors=floors,
             relations=relations,
+            candidate_relations=subgraph.candidate_relations,
             diagnostics=diagnostics,
         )
 
@@ -1363,23 +1978,17 @@ def solve_portfolio(
                 status = _record_solver_result(cp_model, solver, status_code, observations)
                 if first_status is None:
                     first_status = status
-                elif (
-                    status == SolverStatus.FEASIBLE
-                    and first_status == SolverStatus.OPTIMAL
-                    and not candidate_plans
-                ):
-                    first_status = SolverStatus.FEASIBLE
                 if status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}:
                     if not candidate_plans:
                         solver_statistics = _build_solver_statistics(observations)
                         _add_statistics_diagnostic(diagnostics, solver_statistics)
-                        return SolverRemediationPlan(
+                        return make_plan(
                             status=status,
                             input_digest=input_digest,
                             domain_digest=domain_digest,
                             repository_digest=repository_digest,
                             task_revisions=revisions,
-                            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+                            unresolved_finding_ids=issue_finding_ids,
                             diagnostics=diagnostics,
                             solver_statistics=solver_statistics,
                         )
@@ -1392,13 +2001,13 @@ def solve_portfolio(
                         break
                     solver_statistics = _build_solver_statistics(observations)
                     _add_statistics_diagnostic(diagnostics, solver_statistics)
-                    return SolverRemediationPlan(
+                    return make_plan(
                         status=SolverStatus.UNKNOWN,
                         input_digest=input_digest,
                         domain_digest=domain_digest,
                         repository_digest=repository_digest,
                         task_revisions=revisions,
-                        unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+                        unresolved_finding_ids=issue_finding_ids,
                         diagnostics=diagnostics,
                         solver_statistics=solver_statistics,
                     )
@@ -1414,13 +2023,13 @@ def solve_portfolio(
         _diagnostic(diagnostics, f"native CP-SAT error: {exc}")
         solver_statistics = _build_solver_statistics(observations)
         _add_statistics_diagnostic(diagnostics, solver_statistics)
-        return SolverRemediationPlan(
+        return make_plan(
             status=SolverStatus.FALLBACK,
             input_digest=input_digest,
             domain_digest=domain_digest,
             repository_digest=repository_digest,
             task_revisions=revisions,
-            unresolved_finding_ids=[finding.finding_id for finding in finding_list],
+            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
             solver_statistics=solver_statistics,
         )
@@ -1433,7 +2042,7 @@ def solve_portfolio(
         if final_status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
         else None
     )
-    return SolverRemediationPlan(
+    return make_plan(
         status=final_status,
         input_digest=input_digest,
         domain_digest=domain_digest,
@@ -1442,9 +2051,15 @@ def solve_portfolio(
         candidate_plans=candidate_plans,
         selected_plan=selected_plan,
         unresolved_finding_ids=(
-            selected_plan.unresolved_ids
+            sorted(
+                {
+                    finding.finding_id
+                    for finding in finding_list
+                    if finding.coverage_id in set(selected_plan.unresolved_ids)
+                }
+            )
             if selected_plan
-            else [finding.finding_id for finding in finding_list]
+            else issue_finding_ids
         ),
         diagnostics=diagnostics,
         solver_statistics=solver_statistics,

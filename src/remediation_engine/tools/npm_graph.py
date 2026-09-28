@@ -22,7 +22,11 @@ from typing import Any
 
 from semantic_version import NpmSpec, Version
 
-from remediation_engine.runtime.path_policy import WorkspacePathError, resolve_repository_path
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    normalize_workspace_path,
+    resolve_repository_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +118,14 @@ def _package_name_from_lockfile_key(package_key: str) -> str | None:
 
 
 lockfile_package_name = _package_name_from_lockfile_key
+
+
+def lockfile_key_matches_package(package_key: str, package_name: str) -> bool:
+    """Return whether a physical lockfile key identifies the named package."""
+    normalized = str(package_key or "").replace("\\", "/").strip("/")
+    if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        return False
+    return normalized == package_name or _package_name_from_lockfile_key(normalized) == package_name
 
 
 def _package_key_depth(package_key: str) -> int:
@@ -687,14 +699,14 @@ def _workspace_memberships_for_manifests(
 def _build_occurrences(
     records: Sequence[NpmDependencyRecord],
     manifests: Sequence[NpmManifest] = (),
+    lockfiles: Sequence[NpmLockfile] = (),
 ) -> tuple[NpmOccurrence, ...]:
-    """Build direct dependency and manifest-package occurrences.
-
-    A workspace/package manifest can itself be the vulnerable target even when
-    it does not declare a dependency.  Retain that logical occurrence so the
-    solver can validate the target without manufacturing an ungrounded graph
-    node at planning time.
-    """
+    """Build direct manifest and exact lockfile occurrence identities."""
+    direct_lockfile_keys = {
+        (record.manifest_path, record.lockfile_package_key)
+        for record in records
+        if record.lockfile_package_key
+    }
     by_id: dict[str, NpmOccurrence] = {
         record.occurrence_id: NpmOccurrence(
             occurrence_id=record.occurrence_id,
@@ -728,6 +740,27 @@ def _build_occurrences(
             dependency_type="workspace",
             is_direct=False,
         )
+    for lockfile in lockfiles:
+        for package in lockfile.packages:
+            if (package.manifest_path, package.package_key) in direct_lockfile_keys:
+                continue
+            occurrence_id = make_occurrence_id(
+                package.manifest_path,
+                package.package_name,
+                package.package_key,
+            )
+            if occurrence_id in by_id:
+                continue
+            by_id[occurrence_id] = NpmOccurrence(
+                occurrence_id=occurrence_id,
+                manifest_path=package.manifest_path,
+                package_name=package.package_name,
+                lockfile_package_key=package.package_key,
+                installed_version=package.version,
+                dependency_type=None,
+                is_direct=False,
+                ancestry=normalize_dependency_ancestry(package.ancestry),
+            )
     return tuple(sorted(by_id.values(), key=lambda item: item.occurrence_id))
 
 
@@ -751,56 +784,77 @@ def repository_fingerprint_inputs(repo_root: str | Path) -> tuple[tuple[str, str
     return tuple(sorted(inputs))
 
 
-def load_npm_graph_snapshot(repo_root: str | Path) -> NpmGraphSnapshot:
-    """Load npm manifests, lockfiles, occurrences, and workspace memberships.
+def _load_npm_graph_snapshot_from_documents(
+    documents: Mapping[str, str],
+    initial_diagnostics: Sequence[str] = (),
+) -> NpmGraphSnapshot:
+    """Parse safe npm metadata documents through the shared graph builder."""
+    diagnostics = list(initial_diagnostics)
+    normalized_documents: dict[str, str] = {}
+    conflicting_paths: set[str] = set()
+    for raw_path, raw_content in documents.items():
+        if not isinstance(raw_path, str):
+            diagnostics.append("npm metadata document path must be a string")
+            continue
+        try:
+            relative = normalize_workspace_path(raw_path, allow_workspace_prefix=False)
+        except WorkspacePathError as exc:
+            diagnostics.append(f"unsafe npm metadata document path {raw_path!r}: {exc}")
+            continue
+        if any(
+            part in {".git", "node_modules", ".remedy-attempt-snapshots", ".remedy-plan-cert"}
+            for part in Path(relative).parts
+        ):
+            diagnostics.append(f"ignored npm metadata document path: {relative}")
+            continue
+        if Path(relative).name not in {_MANIFEST_NAME, *_LOCKFILE_NAMES}:
+            diagnostics.append(f"unsupported npm metadata document path: {relative}")
+            continue
+        if not isinstance(raw_content, str):
+            diagnostics.append(f"npm metadata document must contain text: {relative}")
+            continue
+        previous = normalized_documents.get(relative)
+        if previous is not None and previous != raw_content:
+            conflicting_paths.add(relative)
+            diagnostics.append(f"conflicting npm metadata documents normalize to {relative!r}")
+            continue
+        normalized_documents[relative] = raw_content
+    for relative in conflicting_paths:
+        normalized_documents.pop(relative, None)
 
-    Invalid metadata is skipped and retained in ``diagnostics``.  No network,
-    subprocess, or repository mutation occurs.  Repeated loads over unchanged
-    files produce byte-identical :meth:`NpmGraphSnapshot.serialize` output.
-    """
-    root = Path(repo_root).resolve()
-    diagnostics: list[str] = []
-    if not root.exists() or not root.is_dir():
-        diagnostics.append(f"repository root is not a directory: {repo_root!r}")
-        return NpmGraphSnapshot(diagnostics=tuple(diagnostics))
-
-    fingerprint_inputs: list[tuple[str, str]] = []
     manifests: list[NpmManifest] = []
-    manifest_paths = _discover_files(root, {_MANIFEST_NAME}, diagnostics)
-    for relative, path in manifest_paths:
-        loaded = _read_json(path, relative, diagnostics)
-        if loaded is None:
-            continue
-        payload, _raw = loaded
-        if not isinstance(payload, Mapping):
-            diagnostics.append(f"manifest is not an object: {relative}")
-            continue
-        fingerprint_inputs.append((relative, _canonical_json(payload)))
-        manifests.append(
-            NpmManifest(
-                path=relative,
-                data=dict(payload),
-                workspace_patterns=_workspace_patterns(payload),
-            )
-        )
-
     lockfiles: list[NpmLockfile] = []
-    for relative, path in _discover_files(root, set(_LOCKFILE_NAMES), diagnostics):
-        loaded = _read_json(path, relative, diagnostics)
-        if loaded is None:
+    fingerprint_inputs: list[tuple[str, str]] = []
+    for relative, raw in sorted(normalized_documents.items()):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            diagnostics.append(f"invalid JSON in {relative}: {exc.msg}")
             continue
-        payload, raw = loaded
-        if not isinstance(payload, Mapping):
-            diagnostics.append(f"lockfile is not an object: {relative}")
-            continue
-        fingerprint_inputs.append((relative, _canonical_json(payload)))
-        lockfiles.append(_parse_lockfile(relative, path, payload, raw, diagnostics))
+        if Path(relative).name == _MANIFEST_NAME:
+            if not isinstance(payload, Mapping):
+                diagnostics.append(f"manifest is not an object: {relative}")
+                continue
+            fingerprint_inputs.append((relative, _canonical_json(payload)))
+            manifests.append(
+                NpmManifest(
+                    path=relative,
+                    data=dict(payload),
+                    workspace_patterns=_workspace_patterns(payload),
+                )
+            )
+        else:
+            if not isinstance(payload, Mapping):
+                diagnostics.append(f"lockfile is not an object: {relative}")
+                continue
+            fingerprint_inputs.append((relative, _canonical_json(payload)))
+            lockfiles.append(_parse_lockfile(relative, Path(relative), payload, raw, diagnostics))
 
     manifests_tuple = tuple(sorted(manifests, key=lambda item: item.path))
     lockfiles_tuple = tuple(sorted(lockfiles, key=lambda item: item.path))
     records = _direct_dependency_records(manifests_tuple, lockfiles_tuple)
     memberships = _workspace_memberships_for_manifests(manifests_tuple)
-    occurrences = _build_occurrences(records, manifests_tuple)
+    occurrences = _build_occurrences(records, manifests_tuple, lockfiles_tuple)
     canonical_inputs = tuple(sorted(fingerprint_inputs))
     return NpmGraphSnapshot(
         manifests=manifests_tuple,
@@ -812,6 +866,75 @@ def load_npm_graph_snapshot(repo_root: str | Path) -> NpmGraphSnapshot:
         repository_fingerprint=_digest(canonical_inputs),
         diagnostics=tuple(diagnostics),
     )
+
+
+def load_npm_graph_snapshot_from_documents(
+    documents: Mapping[str, str],
+) -> NpmGraphSnapshot:
+    """Build an npm graph from safe relative manifest and lockfile documents."""
+    if not isinstance(documents, Mapping):
+        raise TypeError("documents must be a mapping of relative paths to text")
+    return _load_npm_graph_snapshot_from_documents(documents)
+
+
+def load_npm_graph_snapshot(repo_root: str | Path) -> NpmGraphSnapshot:
+    """Load npm graph files and delegate parsing to the document-based loader.
+
+    No network, subprocess, or repository mutation occurs. Repeated loads over
+    unchanged files produce byte-identical :meth:`NpmGraphSnapshot.serialize`
+    output.
+    """
+    root = Path(repo_root).resolve()
+    diagnostics: list[str] = []
+    if not root.exists() or not root.is_dir():
+        diagnostics.append(f"repository root is not a directory: {repo_root!r}")
+        return _load_npm_graph_snapshot_from_documents({}, diagnostics)
+    documents: dict[str, str] = {}
+    for relative, path in _discover_files(root, {_MANIFEST_NAME, *_LOCKFILE_NAMES}, diagnostics):
+        try:
+            documents[relative] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            diagnostics.append(f"could not read {relative}: {exc}")
+    return _load_npm_graph_snapshot_from_documents(documents, diagnostics)
+
+
+def resolve_lockfile_dependency_package(
+    snapshot: NpmGraphSnapshot,
+    source_occurrence_id: str,
+    package_name: str,
+) -> NpmLockfilePackage | None:
+    """Resolve the nearest physical npm dependency visible from one occurrence."""
+    source = next(
+        (item for item in snapshot.occurrences if item.occurrence_id == source_occurrence_id),
+        None,
+    )
+    if source is None or not source.lockfile_package_key or not package_name.strip():
+        return None
+    source_key = source.lockfile_package_key.replace("\\", "/").strip("/")
+    prefixes: list[str] = []
+    current = source_key
+    while current:
+        prefixes.append(current)
+        marker = current.rfind("/node_modules/")
+        current = current[:marker] if marker >= 0 else ""
+    prefixes.append("")
+    packages_by_key: dict[tuple[str, str], list[NpmLockfilePackage]] = {}
+    for package in snapshot.lockfile_packages:
+        packages_by_key.setdefault(
+            (package.manifest_path, package.package_key.replace("\\", "/")), []
+        ).append(package)
+    for prefix in prefixes:
+        child_key = (
+            f"{prefix}/node_modules/{package_name}" if prefix else f"node_modules/{package_name}"
+        )
+        matches = [
+            item
+            for item in packages_by_key.get((source.manifest_path, child_key), ())
+            if item.package_name == package_name
+        ]
+        if matches:
+            return min(matches, key=lambda item: (item.lockfile_path, item.package_key))
+    return None
 
 
 # Practical aliases for callers migrating from private portfolio helpers.
@@ -842,7 +965,9 @@ __all__ = [
     "load_graph_snapshot",
     "load_lockfile_packages",
     "load_npm_graph_snapshot",
+    "load_npm_graph_snapshot_from_documents",
     "load_npm_manifests",
+    "resolve_lockfile_dependency_package",
     "lockfile_package_name",
     "make_occurrence_id",
     "normalize_dependency_ancestry",

@@ -156,12 +156,52 @@ def _lockfile_target_versions(payload: Mapping[str, Any], package_name: str) -> 
     return versions
 
 
+def _override_target_was_pruned(
+    checkpoint: _PackageCheckpoint,
+    mutation: Any,
+    original_lockfile: str | None,
+) -> bool:
+    """Return whether a transitive override target disappeared after sync.
+
+    The multi-package action verifies the override declaration in package.json
+    before calling the lockfile verifier. If an upgraded parent removes a
+    previously installed transitive package, the absence of that package from
+    the synchronized lockfile is a valid resolution. Direct dependencies and
+    targets absent from the original graph remain fail-closed.
+    """
+    if mutation.dependency_type not in {"overrides", "resolutions", "pnpm_overrides"}:
+        return False
+    original_manifest = checkpoint.files.get(mutation.manifest_path)
+    if not isinstance(original_manifest, str) or not isinstance(original_lockfile, str):
+        return False
+    try:
+        manifest = json.loads(original_manifest)
+        lockfile = json.loads(original_lockfile)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(manifest, Mapping) or not isinstance(lockfile, Mapping):
+        return False
+    for section in (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ):
+        declared = manifest.get(section)
+        if isinstance(declared, Mapping) and mutation.package_name in declared:
+            return False
+    return bool(_lockfile_target_versions(lockfile, mutation.package_name))
+
+
 def _verify_lockfile_mutations(
     sandbox: DockerSandbox,
     checkpoint: _PackageCheckpoint,
     mutations: Sequence[Any],
+    *,
+    pruning_baseline: _PackageCheckpoint | None = None,
 ) -> None:
-    """Verify every existing/generated npm lockfile contains requested targets."""
+    """Verify mutations against synchronized lockfiles and the candidate base."""
+    baseline = pruning_baseline if pruning_baseline is not None else checkpoint
     mutation_by_lockfile: dict[str, list[Any]] = {}
     for path in checkpoint.files:
         if Path(path).name not in {"package-lock.json", "npm-shrinkwrap.json"}:
@@ -179,12 +219,13 @@ def _verify_lockfile_mutations(
 
     for path, path_mutations in sorted(mutation_by_lockfile.items()):
         before = checkpoint.files.get(path)
+        baseline_before = baseline.files.get(path)
         content = sandbox.read_file(path)
         if not isinstance(content, str):
             # A lockfile that did not exist before the action is optional: npm
             # may be configured with package-lock=false. Existing lockfiles,
             # however, must survive and prove every requested target.
-            if before is not None:
+            if before is not None or baseline_before is not None:
                 raise RuntimeError(f"lockfile disappeared after synchronization: {path}")
             continue
         try:
@@ -197,6 +238,12 @@ def _verify_lockfile_mutations(
             versions = _lockfile_target_versions(lockfile, mutation.package_name)
             expected = mutation.target_version.strip().lstrip("vV")
             if expected not in versions:
+                if not versions and _override_target_was_pruned(
+                    baseline,
+                    mutation,
+                    baseline_before if isinstance(baseline_before, str) else None,
+                ):
+                    continue
                 raise RuntimeError(
                     f"lockfile verification failed for {mutation.package_name} in {path}: "
                     f"expected {mutation.target_version}, found {sorted(versions) or 'no package entry'}"

@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 
 _UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
 _BATCH_NPM_DEPENDENCIES_TOOL_NAME = "modify_batch_npm_dependencies"
+_MAJOR_MIGRATION_DIRECTIVE = (
+    "Migrate all affected production and test code to the selected package API "
+    "while preserving behavior; do not change the solver-approved package or version."
+)
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -346,14 +350,17 @@ manifest and immediately synchronizes package manifests before returning.
 Transactions are serialized per package. Keep package_name and manifest_path
 within the committed task allowlists.
 
-If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that
-package with a different Supervisor-approved target_version or dependency_type.
-A package may receive at most three combined transaction attempts. Failed
-transactions roll back automatically. Continue with the next independent package
-after a package succeeds or exhausts its attempts.
+If the exact Supervisor instruction requires a major-version migration, you are
+authorized and required to update affected production and test code to the selected
+package API while preserving behavior. Do not reselect or change the committed
+package or version. Otherwise, do not edit source-code files.
 
-Never edit source-code files in this worker. Supervisor-owned dependency-type
-candidates are the only permitted strategy alternatives.
+If a transaction returns ERROR_CODE or FAILURE, retry only with a target_version
+or dependency_type explicitly allowed by the Supervisor. A major-version migration
+instruction never authorizes another package or version. A package may receive at
+most three combined transaction attempts. Failed transactions roll back
+automatically. Continue with the next independent package after a package succeeds
+or exhausts its attempts.
 
 Return control only after every package has one successful combined transaction or
 has exhausted its three attempts and been surrendered."""
@@ -363,19 +370,22 @@ _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manif
 cluster execution worker.
 
 The Supervisor has already selected and validated one atomic multi-package action.
-It owns candidate generation, version selection, dependency types, retry planning,
-task routing, and cluster membership. Your only job is to execute that committed
-action in the Docker workspace.
+It owns candidate generation, package/version selection, dependency types, retry
+planning, task routing, and cluster membership. Your only job is to execute that
+committed action in the Docker workspace.
 
 You have exactly one tool: modify_batch_npm_dependencies. Call it exactly
 once, with no arguments. The tool applies every package mutation in the committed
 action, synchronizes each affected npm manifest, validates the requested results,
 and rolls back the complete cluster if any step fails.
 
-Do not call the singleton dependency tool. Do not change the action, choose another
-version, edit source files, search the registry, or perform retry planning. After
-the tool returns, report its result and return control to the Supervisor. A failed
-or rolled-back action must be surrendered for a new Supervisor-committed attempt."""
+When a task's exact Supervisor instruction requires a major-version migration,
+source and test migration to the committed package API is authorized and required;
+preserve behavior. Do not reselect or change any package name or version in the
+committed action. Do not call the singleton dependency tool, search the registry,
+or perform retry planning. After the tool returns, report its result and return
+control to the Supervisor. A failed or rolled-back action must be surrendered for
+a new Supervisor-committed attempt."""
 
 
 def _build_multi_package_update_prompt(
@@ -463,6 +473,9 @@ def _build_update_prompt(
                     if value
                 )
             )
+        migration_required = _MAJOR_MIGRATION_DIRECTIVE in str(task.instruction or "")
+        if migration_required and task.selected_version:
+            allowed_versions = [task.selected_version]
         allowed_types = list(allowed_dependency_types_by_task.get(task.task_id, ()))
         if not allowed_types:
             allowed_types = [
@@ -490,6 +503,14 @@ def _build_update_prompt(
                 f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
             ]
         )
+        if migration_required:
+            sections.extend(
+                [
+                    "- Major-version source/test migration: required.",
+                    "- Keep the selected package and version exactly as committed; "
+                    "do not reselect or retry another version.",
+                ]
+            )
     return "\n".join(sections)
 
 

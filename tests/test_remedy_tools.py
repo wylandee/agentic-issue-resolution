@@ -1422,3 +1422,147 @@ class TestReadWebPage:
             timeout=15,
         )
         assert "Use expressjwt from the named export" in res
+
+
+def test_lockfile_verification_accepts_pruned_transitive_override_target():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    original_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    original_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = updated_lockfile
+    checkpoint = _PackageCheckpoint(
+        files={
+            "package.json": original_manifest,
+            "package-lock.json": original_lockfile,
+        },
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_lockfile_verification_does_not_hide_missing_override_target():
+    import pytest
+
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    lockfile = json.dumps(
+        {"lockfileVersion": 3, "packages": {"node_modules/express-jwt": {"version": "0.1.3"}}}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = lockfile
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": manifest, "package-lock.json": lockfile},
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    with pytest.raises(RuntimeError, match="no package entry"):
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_multi_package_override_accepts_transitive_target_pruned_by_parent_update():
+    from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
+    sandbox = MagicMock()
+    baseline_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    updated_manifest = json.dumps(
+        {
+            "dependencies": {"express-jwt": "6.0.0"},
+            "overrides": {"base64url": "3.0.0"},
+        }
+    )
+    baseline_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    edited = False
+
+    def run(_command: str, timeout: float | None = None) -> CommandResult:
+        nonlocal edited
+        if "npm pkg set" in _command:
+            edited = True
+        return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+    def read_file(path: str) -> str | None:
+        if path == "package.json":
+            return updated_manifest if edited else baseline_manifest
+        if path == "package-lock.json":
+            return updated_lockfile if edited else baseline_lockfile
+        return None
+
+    sandbox.run.side_effect = run
+    sandbox.read_file.side_effect = read_file
+    action = MultiPackageAction(
+        cluster_id="cluster-transitive",
+        dispatch_batch_id="batch-transitive",
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        package_mutations=[
+            PackageMutation(
+                task_id="task-base64url",
+                package_name="base64url",
+                manifest_path="package.json",
+                target_version="3.0.0",
+                dependency_type="overrides",
+            ),
+            PackageMutation(
+                task_id="task-express-jwt",
+                package_name="express-jwt",
+                manifest_path="package.json",
+                target_version="6.0.0",
+                dependency_type="dependencies",
+            ),
+        ],
+        rationale="Upgrade the direct parent and retain the child override safely.",
+    )
+
+    succeeded, error = apply_multi_package_action(sandbox, action, set())
+
+    assert succeeded is True
+    assert error == ""
