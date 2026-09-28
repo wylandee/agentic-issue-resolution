@@ -251,6 +251,52 @@ def test_spans_to_test_cases_filtering() -> None:
     assert "evaluations" in qa_cases[0].actual_output
 
 
+def test_supervisor_alias_filters_only_tactical_reasoner_spans() -> None:
+    """Select the tactical reasoner and its children, not unrelated Supervisor spans."""
+    spans = [
+        TrajectorySpan(
+            run_id="tactical",
+            name="supervisor.tactical_reasoner",
+            run_type="llm",
+            inputs="tactical input",
+            outputs="tactical output",
+        ),
+        TrajectorySpan(
+            run_id="tactical-child",
+            name="ChatOpenAI",
+            run_type="llm",
+            parent_name="supervisor.tactical_reasoner",
+            inputs="child input",
+            outputs="child output",
+        ),
+        TrajectorySpan(
+            run_id="supervisor",
+            name="supervisor",
+            run_type="chain",
+            inputs="unrelated supervisor input",
+            outputs="unrelated supervisor output",
+        ),
+        TrajectorySpan(
+            run_id="router",
+            name="supervisor_router",
+            run_type="chain",
+            parent_name="supervisor",
+            inputs="router input",
+            outputs="router output",
+        ),
+    ]
+    document = TrajectoryDocument(trace_id="tactical-trace", spans=spans)
+
+    expected_spans = spans[:2]
+    assert document.spans_for_agent("supervisor") == expected_spans
+    assert document.spans_for_agent("tactical_supervisor") == expected_spans
+
+    no_document_cases = spans_to_test_cases(spans, agent_filter="supervisor")
+    assert [case.input for case in no_document_cases] == ["tactical input", "child input"]
+    alias_cases = spans_to_test_cases(spans, agent_filter="tactical_supervisor")
+    assert [case.input for case in alias_cases] == ["tactical input", "child input"]
+
+
 def test_trajectory_loader_caching_and_lookup(trajectory_loader: TrajectoryLoader) -> None:
     """Test TrajectoryLoader caching, load_by_trace_id, and path lookup."""
     paths = trajectory_loader.get_trajectory_paths()

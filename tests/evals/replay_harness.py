@@ -220,7 +220,10 @@ class ScriptedReplayModel:
             This model instance, matching LangChain's binding contract.
         """
         del kwargs
-        self.bound_tool_names = [str(getattr(tool, "name", "")) for tool in tools]
+        self.bound_tool_names = [
+            str(tool.__name__ if isinstance(tool, type) else getattr(tool, "name", ""))
+            for tool in tools
+        ]
         self._bound_tool_names = set(self.bound_tool_names)
         return self
 

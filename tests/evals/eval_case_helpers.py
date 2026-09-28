@@ -96,6 +96,7 @@ def case_metadata(
         "evidence_status",
         "evaluation_note",
         "expected_completion_pass",
+        "task_completion_applicable",
         "expected_tool_correctness_pass",
         "tool_correctness_applicable",
         "expected_qa_verdict",

@@ -97,6 +97,7 @@ _KNOWN_LLM_SPAN_NAMES = frozenset(
         "react.llm",
         "ChatOpenAI",
         "fix_planner.llm",
+        "supervisor.tactical_reasoner",
     }
 )
 
@@ -252,6 +253,13 @@ class TrajectoryDocument:
                 for s in self.spans
                 if "report" in s.name.lower()
                 or (s.parent_name and "report" in s.parent_name.lower())
+            ]
+        if normalized in {"supervisor", "tactical_supervisor"}:
+            return [
+                s
+                for s in self.spans
+                if s.name == "supervisor.tactical_reasoner"
+                or s.parent_name == "supervisor.tactical_reasoner"
             ]
         return [s for s in self.spans if normalized in s.name.lower()]
 
@@ -852,8 +860,8 @@ def spans_to_test_cases(
 
     Args:
         spans: List of TrajectorySpan objects.
-        agent_filter: Filter category (e.g. 'triage', 'update_subagent',
-            'workaround_subagent', 'qa_critic', 'report', or None for all LLM spans).
+        agent_filter: Filter category ('triage', 'update_subagent',
+            'workaround_subagent', 'qa_critic', 'report', or 'supervisor'), or None for all LLM spans.
         doc: Optional parent TrajectoryDocument.
 
     Returns:
@@ -896,6 +904,13 @@ def spans_to_test_cases(
                     for s in spans
                     if "report" in s.name.lower()
                     or (s.parent_name and "report" in s.parent_name.lower())
+                ]
+            elif normalized in {"supervisor", "tactical_supervisor"}:
+                target_spans = [
+                    s
+                    for s in spans
+                    if s.name == "supervisor.tactical_reasoner"
+                    or s.parent_name == "supervisor.tactical_reasoner"
                 ]
             else:
                 target_spans = [s for s in spans if normalized in s.name.lower()]

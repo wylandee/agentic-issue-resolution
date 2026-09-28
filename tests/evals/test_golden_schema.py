@@ -20,24 +20,45 @@ GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 def test_all_golden_datasets_load_and_validate() -> None:
     """Every maintained dataset satisfies the shared envelope."""
     counts: dict[str, int] = {}
+    supervisor_cases: list[dict[str, object]] = []
     for name in GOLDEN_DATASET_NAMES:
         cases = load_golden_dataset(GOLDEN_DIR / f"{name}.json", dataset_name=name)
         counts[name] = len(cases)
         assert cases
+        if name == "supervisor_cases":
+            supervisor_cases = cases
 
     assert counts["fix_planner_cases"] == 15
+    assert counts["supervisor_cases"] == 10
+    assert len({case["case_id"] for case in supervisor_cases}) == 10
 
 
 def test_live_replay_datasets_have_structured_replay_inputs() -> None:
-    """The four production replay suites expose typed-input payloads."""
+    """Every production replay suite exposes typed-input payloads."""
     for name in (
         "triage_cases",
         "qa_cases",
         "update_subagent_cases",
         "workaround_subagent_cases",
+        "supervisor_cases",
     ):
         cases = load_golden_dataset(GOLDEN_DIR / f"{name}.json", dataset_name=name)
         assert all(isinstance(case["replay"]["input"], dict) for case in cases)
+
+
+def test_supervisor_expected_replay_rejects_boolean_counts_and_unknown_decisions() -> None:
+    """Supervisor expectations reject Python booleans as integer counts."""
+    case = load_golden_dataset(GOLDEN_DIR / "supervisor_cases.json")[0]
+    case["expected_replay"]["model_invocations"] = True
+
+    violations = validate_golden_dataset([case], dataset_name="supervisor_cases")
+
+    assert any("model_invocations must be a nonnegative integer" in item for item in violations)
+
+    case["expected_replay"]["model_invocations"] = 1
+    case["expected_replay"]["decision_code"] = "NOT_A_DECISION"
+    violations = validate_golden_dataset([case], dataset_name="supervisor_cases")
+    assert any("decision_code must be a DecisionCode value or null" in item for item in violations)
 
 
 def test_validator_catches_duplicate_ids_and_bad_envelopes() -> None:

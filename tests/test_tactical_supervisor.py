@@ -17,6 +17,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     PackageOverrideSupervisorAction,
+    PortfolioEscalationSupervisorAction,
     QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
@@ -301,9 +302,251 @@ def test_tactical_model_uses_one_of_four_tools_not_a_root_union() -> None:
     ]
     assert llm.bind_tools.call_args.kwargs == {
         "tool_choice": "required",
-        "strict": False,
+        "strict": True,
         "parallel_tool_calls": False,
     }
+
+
+def test_tactical_model_repairs_an_incomplete_override_tool_call_once() -> None:
+    """A missing version is repaired, never inferred from the candidate set."""
+    group = _group().model_copy(
+        update={
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+            "parent_declaration_type": "dependencies",
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "overrides",
+        }
+    )
+    context = build_tactical_context(
+        task,
+        group,
+        candidate_sets=(
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+                target_package_name="test-pkg",
+                dependency_type="overrides",
+                security_floor="1.2.3",
+                versions=("1.2.3",),
+                canonical_version="1.2.3",
+            ),
+        ),
+    )
+    first = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "PackageOverrideSupervisorAction",
+                "args": {
+                    "diagnostic_basis": "A child override candidate is available.",
+                    "rationale": "Use the authorized child override.",
+                },
+                "id": "override-incomplete",
+            }
+        ],
+    )
+    repaired = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "PackageOverrideSupervisorAction",
+                "args": {
+                    "diagnostic_basis": "The transitive child has a verified candidate.",
+                    "selected_strategy": "package_override",
+                    "target_version": "1.2.3",
+                    "rationale": "Pin the vulnerable child at the authorized version.",
+                },
+                "id": "override-repaired",
+            }
+        ],
+    )
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [first, repaired]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    with patch(
+        "remediation_engine.orchestration.tactical_supervisor.invoke_with_trajectory",
+        side_effect=lambda _name, invoke, _inputs: invoke(),
+    ):
+        action, verification = propose_and_verify_tactical_action(
+            context,
+            settings=AppSettings(openai_api_key="test-key"),
+            model_factory=lambda _settings: llm,
+        )
+
+    assert action is not None
+    assert action.selected_strategy == TacticalStrategy.PACKAGE_OVERRIDE
+    assert action.target_version == "1.2.3"
+    assert verification is not None and verification.accepted is True
+    assert bound_llm.invoke.call_count == 2
+    repair_prompt = "\n".join(
+        str(message.content) for message in bound_llm.invoke.call_args_list[1].args[0]
+    )
+    assert "selected_strategy, target_version" in repair_prompt
+
+
+def test_peer_conflict_without_source_evidence_requires_portfolio_referral() -> None:
+    """Do not advertise or accept a workaround without authoritative source paths."""
+    evaluation = QAEvaluation(
+        task_id="task-1",
+        passed=False,
+        failure_category=FailureCategory.PEER_CONFLICT,
+        retry_feedback="The dependency solver reports an unresolved peer conflict.",
+        failure_evidence=QAFailureEvidence(
+            exact_diagnostics=["No compatible peer candidate is available."]
+        ),
+    )
+    context = build_tactical_context(
+        _task(),
+        _group(),
+        evaluation=evaluation,
+        candidate_sets=(
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.VERSION_BUMP,
+                target_package_name="test-pkg",
+                dependency_type="dependencies",
+                security_floor="1.2.3",
+                versions=(),
+                canonical_version=None,
+                peer_compatible=False,
+            ),
+        ),
+    )
+    dynamic = build_supervisor_messages(context)[1].content
+
+    assert "- Strategies: escalate_to_portfolio" in dynamic
+    assert "action=escalate_to_portfolio" in dynamic
+    assert "code_workaround" not in dynamic
+
+    unsupported_workaround = CodeWorkaroundSupervisorAction(
+        diagnostic_basis="QA identifies a peer conflict without source evidence.",
+        selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+        workaround_hypothesis="Change source behavior to avoid the peer conflict.",
+        target_files_hint=["src/auth.ts"],
+        rationale="Try a source workaround despite the missing source evidence.",
+    )
+    rejected = verify_tactical_action(context, unsupported_workaround)
+
+    assert rejected.accepted is False
+    assert (
+        rejected.reason
+        == "Peer conflict has no compatible candidate or evidence-backed source workaround; "
+        "portfolio escalation is required."
+    )
+    assert rejected.instruction is None
+
+    escalation = PortfolioEscalationSupervisorAction(
+        diagnostic_basis="Peer conflict has no compatible verified candidate or source fix.",
+        selected_strategy=TacticalStrategy.ESCALATE_TO_PORTFOLIO,
+        rationale="Refer the incompatible dependency constraints for coordinated resolution.",
+    )
+    accepted = verify_tactical_action(context, escalation)
+    assert accepted.accepted is True
+
+    source_evaluation = evaluation.model_copy(
+        update={
+            "failure_evidence": QAFailureEvidence(
+                exact_diagnostics=["No compatible peer candidate is available."],
+                source_locations=["src/auth.ts"],
+            )
+        }
+    )
+    source_context = build_tactical_context(
+        _task(),
+        _group(),
+        evaluation=source_evaluation,
+        candidate_sets=(
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.VERSION_BUMP,
+                target_package_name="test-pkg",
+                dependency_type="dependencies",
+                security_floor="1.2.3",
+                versions=(),
+                canonical_version=None,
+                peer_compatible=False,
+            ),
+        ),
+    )
+    evidence_backed_workaround = CodeWorkaroundSupervisorAction(
+        diagnostic_basis="QA identifies the source location for a compatibility fix.",
+        selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+        workaround_hypothesis="Guard the incompatible source behavior.",
+        target_files_hint=["src/auth.ts"],
+        rationale="Use the authoritative source evidence to resolve the issue safely.",
+    )
+    source_verification = verify_tactical_action(source_context, evidence_backed_workaround)
+
+    assert source_verification.accepted is True
+    assert "AUTHORIZED TARGET: test-pkg" in (source_verification.instruction or "")
+
+
+def test_incomplete_override_repair_stays_fail_closed() -> None:
+    """Two malformed model responses never become an inferred package version."""
+    group = _group().model_copy(
+        update={
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+            "parent_declaration_type": "dependencies",
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "overrides",
+        }
+    )
+    context = build_tactical_context(
+        task,
+        group,
+        candidate_sets=(
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+                target_package_name="test-pkg",
+                dependency_type="overrides",
+                security_floor="1.2.3",
+                versions=("1.2.3",),
+                canonical_version="1.2.3",
+            ),
+        ),
+    )
+    malformed = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "PackageOverrideSupervisorAction",
+                "args": {
+                    "diagnostic_basis": "A child override candidate is available.",
+                    "rationale": "Use the authorized child override.",
+                },
+                "id": "override-incomplete",
+            }
+        ],
+    )
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [malformed, malformed]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    with patch(
+        "remediation_engine.orchestration.tactical_supervisor.invoke_with_trajectory",
+        side_effect=lambda _name, invoke, _inputs: invoke(),
+    ):
+        action, verification = propose_and_verify_tactical_action(
+            context,
+            settings=AppSettings(openai_api_key="test-key"),
+            model_factory=lambda _settings: llm,
+        )
+
+    assert action is None
+    assert verification is None
+    assert bound_llm.invoke.call_count == 2
 
 
 def test_tactical_model_rejects_free_text_without_a_tool_call() -> None:
@@ -330,7 +573,9 @@ def test_tactical_model_rejects_free_text_without_a_tool_call() -> None:
 def test_provider_action_tools_have_flat_required_schemas() -> None:
     """Each provider tool is independently strict without a root ``oneOf``."""
     for contract in _SUPERVISOR_ACTION_CONTRACTS:
-        schema = convert_to_openai_tool(contract, strict=False)["function"]["parameters"]
+        converted = convert_to_openai_tool(contract, strict=True)
+        schema = converted["function"]["parameters"]
+        assert converted["function"]["strict"] is True
         assert "oneOf" not in schema
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(contract.model_fields)
@@ -403,6 +648,49 @@ def test_evidence_and_model_file_paths_share_workspace_normalization() -> None:
 
     assert verification.accepted is True
     assert action.target_files_hint == ["src/auth.ts"]
+
+
+def test_workaround_manifest_and_lockfile_hints_are_never_authorized() -> None:
+    """Manifest hints stay forbidden even when QA evidence names them."""
+    group = _group().model_copy(update={"file_paths": ["package.json", "package-lock.json"]})
+    evaluation = QAEvaluation(
+        task_id="task-1",
+        passed=False,
+        failure_category=FailureCategory.BREAKING_CHANGE,
+        retry_feedback="The source change needs a compatibility workaround.",
+        failure_evidence=QAFailureEvidence(
+            source_locations=["src/auth.ts"],
+            affected_files=["package.json", "package-lock.json"],
+        ),
+    )
+    context = build_tactical_context(_task(), group, evaluation=evaluation)
+    action = CodeWorkaroundSupervisorAction(
+        diagnostic_basis="QA identifies the source file and affected manifests.",
+        selected_strategy=TacticalStrategy.CODE_WORKAROUND,
+        workaround_hypothesis="Guard the incompatible source behavior.",
+        target_files_hint=["src/auth.ts", "package.json", "package-lock.json"],
+        rationale="The change should remain limited to evidence-backed source code.",
+    )
+
+    rejected = verify_tactical_action(context, action)
+
+    assert rejected.accepted is False
+    assert (
+        rejected.reason
+        == "Manifest and lockfile paths are never valid workaround target-file hints."
+    )
+    assert rejected.instruction is None
+
+    source_only_action = action.model_copy(update={"target_files_hint": ["src/auth.ts"]})
+    accepted = verify_tactical_action(context, source_only_action)
+
+    assert accepted.accepted is True
+    assert accepted.instruction is not None
+    assert "AUTHORIZED TARGET: test-pkg" in accepted.instruction
+    assert "EXACT VERSION OR HYPOTHESIS: Guard the incompatible source behavior." in (
+        accepted.instruction
+    )
+    assert "PROHIBITED OPERATIONS" in accepted.instruction
 
 
 def test_parent_minimum_is_not_used_as_a_security_floor() -> None:

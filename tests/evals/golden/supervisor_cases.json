@@ -1,0 +1,1913 @@
+[
+  {
+    "case_id": "supervisor-direct-version-bump-clean",
+    "eval_type": "supervisor",
+    "golden_kind": "historical_direct_action",
+    "provenance": "historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump.",
+    "input": "Select a verified direct express-jwt upgrade that meets the committed fixed-version floor.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: historical_direct_action. historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump."
+    ],
+    "expected_output": "Accept express-jwt@6.0.0: the selected version meets the committed 6.0.0 security floor and maps to NEW_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified 6.0.0 candidate meets the committed security floor.",
+          "rationale": "Choose the lowest verified release that fixes the finding.",
+          "target_version": "6.0.0"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-direct-version-bump-clean",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-direct-version-bump-clean",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-direct-version-bump-clean",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0001"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+          "issues": [
+            {
+              "id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0001",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "6.0.0",
+            "versions": [
+              "6.0.0",
+              "6.1.2",
+              "8.5.1"
+            ],
+            "canonical_version": "6.0.0",
+            "peer_compatible": true
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept VersionBumpSupervisorAction for express-jwt@6.0.0 and map it to NEW_VERSION_BUMP.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified 6.0.0 candidate meets the committed security floor.",
+            "rationale": "Choose the lowest verified release that fixes the finding.",
+            "target_version": "6.0.0"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-transitive-package-override",
+    "eval_type": "supervisor",
+    "golden_kind": "historical_outcome_only",
+    "provenance": "historical_outcome_only — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call.",
+    "input": "Remediate transitive @tootallnate/once through sqlite3 using its authorized npm override.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: historical_outcome_only. historical_outcome_only — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call."
+    ],
+    "expected_output": "Accept PackageOverrideSupervisorAction for @tootallnate/once@2.0.1 and map it to NEW_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "PackageOverrideSupervisorAction",
+        "args": {
+          "selected_strategy": "package_override",
+          "diagnostic_basis": "The transitive child has a registry-verified override at the committed floor.",
+          "rationale": "Pin the vulnerable child through the authorized npm override.",
+          "target_version": "2.0.1"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-transitive-package-override",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-transitive-package-override",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "package_override",
+          "target_package_name": "@tootallnate/once",
+          "target_dependency_type": "overrides",
+          "parent_package_name": "sqlite3",
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-transitive-package-override",
+          "issue_type": "sca",
+          "vulnerable_component": "@tootallnate/once",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0002"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "1.0.0"
+          ],
+          "dependency_ancestry": [
+            "sqlite3",
+            "@tootallnate/once"
+          ],
+          "dependency_versions": {
+            "@tootallnate/once": "1.0.0"
+          },
+          "parent_package_name": "sqlite3",
+          "parent_package_version": "1.0.0",
+          "parent_declaration_type": "dependencies",
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "83335cb8-5fd6-5d24-9100-33c930c83a9a",
+          "issues": [
+            {
+              "id": "83335cb8-5fd6-5d24-9100-33c930c83a9a",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0002",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "@tootallnate/once",
+              "package_version": "1.0.0",
+              "fixed_version": "2.0.1",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "@tootallnate/once has a security finding with fixed-version floor 2.0.1.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "2.0.1",
+            "workaround_snippets": null,
+            "instruction": "Upgrade @tootallnate/once to the committed security floor 2.0.1.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "package_override",
+            "target_package_name": "@tootallnate/once",
+            "dependency_type": "overrides",
+            "security_floor": "2.0.1",
+            "versions": [
+              "2.0.1"
+            ],
+            "canonical_version": "2.0.1",
+            "peer_compatible": true
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept PackageOverrideSupervisorAction for @tootallnate/once@2.0.1 and map it to NEW_VERSION_BUMP.",
+      "actual_tools": [
+        {
+          "name": "PackageOverrideSupervisorAction",
+          "args": {
+            "selected_strategy": "package_override",
+            "diagnostic_basis": "The transitive child has a registry-verified override at the committed floor.",
+            "rationale": "Pin the vulnerable child through the authorized npm override.",
+            "target_version": "2.0.1"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-workaround-pivot-breaking-change",
+    "eval_type": "supervisor",
+    "golden_kind": "normalized_safe_fixture",
+    "provenance": "normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture.",
+    "input": "The express-jwt retry failed QA for BREAKING_CHANGE; propose a safe workaround using only authorized source evidence.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: normalized_safe_fixture. normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture."
+    ],
+    "expected_output": "Accept the evidence-backed code workaround and pivot to workaround_subagent with one spawn request.",
+    "expected_tools": [
+      {
+        "name": "CodeWorkaroundSupervisorAction",
+        "args": {
+          "selected_strategy": "code_workaround",
+          "diagnostic_basis": "QA classifies the failed update as a breaking change and authorizes both source files.",
+          "rationale": "Use a source-only compatibility pivot instead of repeating the broken dependency update.",
+          "workaround_hypothesis": "Adapt the JWT middleware to the verified express-jwt API while preserving the existing authorization checks.",
+          "target_files_hint": [
+            "lib/insecurity.ts",
+            "server.ts"
+          ]
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-workaround-pivot-breaking-change",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-workaround-pivot-breaking-change",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-workaround-pivot-breaking-change",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0003"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+          "issues": [
+            {
+              "id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0003",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "evaluation": {
+          "task_id": "task-supervisor-workaround-pivot-breaking-change",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The express-jwt update caused a breaking API change; use the authorized source evidence.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware regression"
+            ],
+            "source_locations": [
+              "lib/insecurity.ts",
+              "server.ts"
+            ],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept the evidence-backed code workaround and pivot to workaround_subagent with one spawn request.",
+      "actual_tools": [
+        {
+          "name": "CodeWorkaroundSupervisorAction",
+          "args": {
+            "selected_strategy": "code_workaround",
+            "diagnostic_basis": "QA classifies the failed update as a breaking change and authorizes both source files.",
+            "rationale": "Use a source-only compatibility pivot instead of repeating the broken dependency update.",
+            "workaround_hypothesis": "Adapt the JWT middleware to the verified express-jwt API while preserving the existing authorization checks.",
+            "target_files_hint": [
+              "lib/insecurity.ts",
+              "server.ts"
+            ]
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "PIVOT_TO_WORKAROUND",
+      "spawn_request_count": 1
+    }
+  },
+  {
+    "case_id": "supervisor-portfolio-escalation-peer-conflict",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "synthetic_policy_case — no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy.",
+    "input": "No compatible verified express-jwt candidate satisfies the peer constraints; decide whether to refer the task.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy."
+    ],
+    "expected_output": "Accept PEER_CONFLICT_ESCALATION, mark the task unfixable for teardown referral, and spawn no child.",
+    "expected_tools": [
+      {
+        "name": "PortfolioEscalationSupervisorAction",
+        "args": {
+          "selected_strategy": "escalate_to_portfolio",
+          "diagnostic_basis": "Typed QA evidence identifies a peer conflict and no compatible verified candidate exists.",
+          "rationale": "Refer the conflict for portfolio-level coordination without spawning a child task."
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-portfolio-escalation-peer-conflict",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-portfolio-escalation-peer-conflict",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-portfolio-escalation-peer-conflict",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0004"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "0b651dc5-cce5-5964-9bc3-baf0f6e5b83e",
+          "issues": [
+            {
+              "id": "0b651dc5-cce5-5964-9bc3-baf0f6e5b83e",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0004",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "6.0.0",
+            "versions": [],
+            "canonical_version": null,
+            "peer_compatible": false
+          }
+        ],
+        "evaluation": {
+          "task_id": "task-supervisor-portfolio-escalation-peer-conflict",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "The only direct candidate conflicts with the dependency peer requirements.",
+          "failure_evidence": {
+            "exact_diagnostics": [
+              "No compatible registry-verified candidate satisfies the peer constraints."
+            ],
+            "failed_tests": [],
+            "source_locations": [],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept PEER_CONFLICT_ESCALATION, mark the task unfixable for teardown referral, and spawn no child.",
+      "actual_tools": [
+        {
+          "name": "PortfolioEscalationSupervisorAction",
+          "args": {
+            "selected_strategy": "escalate_to_portfolio",
+            "diagnostic_basis": "Typed QA evidence identifies a peer conflict and no compatible verified candidate exists.",
+            "rationale": "Refer the conflict for portfolio-level coordination without spawning a child task."
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "PEER_CONFLICT_ESCALATION",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-version-advance-after-test-fail",
+    "eval_type": "supervisor",
+    "golden_kind": "normalized_historical_analogue",
+    "provenance": "normalized_historical_analogue — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1.",
+    "input": "The previous express-jwt@6.0.0 attempt failed tests; choose an unattempted registry-authorized candidate.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: normalized_historical_analogue. normalized_historical_analogue — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1."
+    ],
+    "expected_output": "Accept the unattempted 6.1.2 candidate as RETRY_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "Version 6.0.0 was attempted; 6.1.2 is the lowest authorized unattempted candidate.",
+          "rationale": "Advance to the next verified release after the prior test failure.",
+          "target_version": "6.1.2"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-version-advance-after-test-fail",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-version-advance-after-test-fail",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-version-advance-after-test-fail",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0005"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "46b54026-abb7-5793-9176-2ade46ad3a18",
+          "issues": [
+            {
+              "id": "46b54026-abb7-5793-9176-2ade46ad3a18",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0005",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "6.0.0",
+            "versions": [
+              "6.1.2",
+              "8.5.1"
+            ],
+            "canonical_version": "6.1.2",
+            "peer_compatible": true
+          }
+        ],
+        "prior_attempts": [
+          {
+            "attempt_id": "49047144-f573-59a3-8141-023add36289b",
+            "task_id": "task-supervisor-version-advance-after-test-fail",
+            "state_revision": 1,
+            "task_revision": 0,
+            "attempt_number": 1,
+            "qa_policy": null,
+            "strategy_stage": "osv_minimum",
+            "no_fix_stage": null,
+            "selected_version": "6.0.0",
+            "allowed_target_versions": [
+              "6.0.0"
+            ],
+            "target_package_name": "express-jwt",
+            "target_dependency_type": "dependencies",
+            "allowed_dependency_types": [
+              "dependencies"
+            ],
+            "parent_minimum_version": null,
+            "instruction": "Update express-jwt to exact version 6.0.0.",
+            "instruction_digest": "0c9a124d13cae2a901a42b93a0259430544b47d1e453999754d44e48ed8486cf",
+            "dispatch_node": "update_subagent",
+            "plan_id": null,
+            "created_at": "2026-09-21T12:00:00Z",
+            "workaround_context": null
+          }
+        ],
+        "retry_diagnostics": {
+          "task_id": "task-supervisor-version-advance-after-test-fail",
+          "strategy_stage": "osv_minimum",
+          "committed_attempt_id": "49047144-f573-59a3-8141-023add36289b",
+          "security_floor": "6.0.0",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_minimum_version": null,
+          "registry_query_performed": false,
+          "attempted_versions": [
+            "6.0.0"
+          ],
+          "executed_versions": [
+            "6.0.0"
+          ],
+          "attempted_versions_by_target": {},
+          "candidate_versions_considered": [
+            "6.1.2",
+            "8.5.1"
+          ],
+          "attempted_dependency_types": [],
+          "candidate_dependency_types": [],
+          "selected_version": "6.0.0",
+          "effective_target_version": null,
+          "effective_dependency_type": null,
+          "latest_version_seen": null,
+          "used_overrides": false,
+          "package_abandoned": false,
+          "exhausted_update_path": false,
+          "failure_reason": "The prior attempted version did not complete the required QA gates.",
+          "reasoning_summary": "",
+          "instruction_digest": null
+        },
+        "evaluation": {
+          "task_id": "task-supervisor-version-advance-after-test-fail",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The 6.0.0 attempt failed the test suite; select an authorized unattempted version.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware regression"
+            ],
+            "source_locations": [],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "49047144-f573-59a3-8141-023add36289b",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        },
+        "worker_result": {
+          "attempt_id": "49047144-f573-59a3-8141-023add36289b",
+          "task_id": "task-supervisor-version-advance-after-test-fail",
+          "task_revision": 0,
+          "status": "success",
+          "executed_versions": [
+            "6.0.0"
+          ],
+          "changed_files": [
+            "package.json"
+          ],
+          "action_summary": null,
+          "execution_diagnostics": {
+            "attempted_versions": [],
+            "executed_versions": [],
+            "effective_target_version": null,
+            "effective_dependency_type": null,
+            "manifest_transaction_attempts": 0,
+            "validation_calls": 0,
+            "validation_input_errors": 0,
+            "validation_passed": false,
+            "failure_reason": "",
+            "per_gate_results": {},
+            "final_selected_targeted_test": null,
+            "original_to_alternative_test_mapping": {},
+            "alternative_test_mapping_evidence": {},
+            "alternative_test_mapping_details": {},
+            "validated_files": [],
+            "infrastructure_failure_details": null
+          },
+          "instruction_digest": "0c9a124d13cae2a901a42b93a0259430544b47d1e453999754d44e48ed8486cf",
+          "replay_plan": null,
+          "errors": []
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept the unattempted 6.1.2 candidate as RETRY_VERSION_BUMP.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "Version 6.0.0 was attempted; 6.1.2 is the lowest authorized unattempted candidate.",
+            "rationale": "Advance to the next verified release after the prior test failure.",
+            "target_version": "6.1.2"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "RETRY_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-error-unverified-version",
+    "eval_type": "supervisor",
+    "golden_kind": "normalized_historical_rejection",
+    "provenance": "normalized_historical_rejection — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent.",
+    "input": "Select a registry-verified secure version for got; the proposal must respect its committed floor.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: normalized_historical_rejection. normalized_historical_rejection — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent."
+    ],
+    "expected_output": "Accept VersionBumpSupervisorAction for got@11.8.6 and map it to NEW_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The only canonical candidate begins at 11.8.6, above the fixed floor.",
+          "rationale": "Select the exact registry-authorized got release.",
+          "target_version": "11.8.6"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-error-unverified-version",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-error-unverified-version",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "got",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-error-unverified-version",
+          "issue_type": "sca",
+          "vulnerable_component": "got",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0006"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "11.8.4"
+          ],
+          "dependency_ancestry": [
+            "got"
+          ],
+          "dependency_versions": {
+            "got": "11.8.4"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "f5db001d-eb46-576c-b478-622eab613238",
+          "issues": [
+            {
+              "id": "f5db001d-eb46-576c-b478-622eab613238",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0006",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "got",
+              "package_version": "11.8.4",
+              "fixed_version": "11.8.5",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "got has a security finding with fixed-version floor 11.8.5.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "11.8.5",
+            "workaround_snippets": null,
+            "instruction": "Upgrade got to the committed security floor 11.8.5.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "got",
+            "dependency_type": "dependencies",
+            "security_floor": "11.8.5",
+            "versions": [
+              "11.8.6",
+              "16.0.0"
+            ],
+            "canonical_version": "11.8.6",
+            "peer_compatible": true
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 2 rejected model proposal(s); production replay expectation: Reject both unverified 11.8.5 proposals after one repair; produce no instruction or decision.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "This proposal mistakenly assumes the floor itself is authorized.",
+            "rationale": "Try the requested lower version.",
+            "target_version": "11.8.5"
+          }
+        },
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "This proposal mistakenly assumes the floor itself is authorized.",
+            "rationale": "Try the requested lower version.",
+            "target_version": "11.8.5"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 2,
+      "verification_accepted": false,
+      "decision_code": null,
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-error-unsafe-workaround-path",
+    "eval_type": "supervisor",
+    "golden_kind": "policy_fixture",
+    "provenance": "policy_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument.",
+    "input": "The express-jwt retry needs a safe workaround; QA authorizes lib/insecurity.ts and lists package.json as affected.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: policy_fixture. policy_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument."
+    ],
+    "expected_output": "Accept the evidence-backed CodeWorkaroundSupervisorAction for lib/insecurity.ts and pivot to workaround_subagent with one spawn request.",
+    "expected_tools": [
+      {
+        "name": "CodeWorkaroundSupervisorAction",
+        "args": {
+          "selected_strategy": "code_workaround",
+          "diagnostic_basis": "QA authorizes lib/insecurity.ts; package.json is an affected manifest, never a workaround target.",
+          "rationale": "Keep the code change within the evidence-backed source file.",
+          "workaround_hypothesis": "Apply a compatibility guard in the authorized authentication source.",
+          "target_files_hint": [
+            "lib/insecurity.ts"
+          ]
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-error-unsafe-workaround-path",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-error-unsafe-workaround-path",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-error-unsafe-workaround-path",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0007"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "6ad43ca8-f4b4-517f-93f5-34feea39e8dc",
+          "issues": [
+            {
+              "id": "6ad43ca8-f4b4-517f-93f5-34feea39e8dc",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0007",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "evaluation": {
+          "task_id": "task-supervisor-error-unsafe-workaround-path",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The dependency retry needs a source workaround; QA identifies source and affected paths.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [],
+            "source_locations": [
+              "lib/insecurity.ts"
+            ],
+            "affected_files": [
+              "package.json"
+            ],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 2 rejected model proposal(s); production replay expectation: Reject both package.json workaround hints with the manifest guard; produce no instruction or decision.",
+      "actual_tools": [
+        {
+          "name": "CodeWorkaroundSupervisorAction",
+          "args": {
+            "selected_strategy": "code_workaround",
+            "diagnostic_basis": "The manifest is listed among affected files.",
+            "rationale": "Modify the manifest to work around the update failure.",
+            "workaround_hypothesis": "Edit the dependency manifest as a workaround.",
+            "target_files_hint": [
+              "package.json"
+            ]
+          }
+        },
+        {
+          "name": "CodeWorkaroundSupervisorAction",
+          "args": {
+            "selected_strategy": "code_workaround",
+            "diagnostic_basis": "The manifest is listed among affected files.",
+            "rationale": "Modify the manifest to work around the update failure.",
+            "workaround_hypothesis": "Edit the dependency manifest as a workaround.",
+            "target_files_hint": [
+              "package.json"
+            ]
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 2,
+      "verification_accepted": false,
+      "decision_code": null,
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-error-disallowed-strategy",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "synthetic_policy_case — no historical override proposal is claimed; the case tests rejection of an override for a direct dependency.",
+    "input": "Choose a remediation for direct express-jwt; no transitive parent permits an npm override.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — no historical override proposal is claimed; the case tests rejection of an override for a direct dependency."
+    ],
+    "expected_output": "Accept VersionBumpSupervisorAction for direct express-jwt@6.0.0 and map it to NEW_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The task is direct and has an authorized 6.0.0 candidate.",
+          "rationale": "Update the direct dependency without inventing a parent override.",
+          "target_version": "6.0.0"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-error-disallowed-strategy",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-error-disallowed-strategy",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-error-disallowed-strategy",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0008"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "f55939a3-272b-59af-8bc0-d8ffbe48902b",
+          "issues": [
+            {
+              "id": "f55939a3-272b-59af-8bc0-d8ffbe48902b",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0008",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "6.0.0",
+            "versions": [
+              "6.0.0"
+            ],
+            "canonical_version": "6.0.0",
+            "peer_compatible": true
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 2 rejected model proposal(s); production replay expectation: Reject both direct-dependency override proposals; produce no instruction or decision.",
+      "actual_tools": [
+        {
+          "name": "PackageOverrideSupervisorAction",
+          "args": {
+            "selected_strategy": "package_override",
+            "diagnostic_basis": "Use an override even though no transitive parent is committed.",
+            "rationale": "Force the verified version through npm overrides.",
+            "target_version": "6.0.0"
+          }
+        },
+        {
+          "name": "PackageOverrideSupervisorAction",
+          "args": {
+            "selected_strategy": "package_override",
+            "diagnostic_basis": "Use an override even though no transitive parent is committed.",
+            "rationale": "Force the verified version through npm overrides.",
+            "target_version": "6.0.0"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 2,
+      "verification_accepted": false,
+      "decision_code": null,
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-repair-loop-recovery",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "synthetic_policy_case — a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred.",
+    "input": "The prior express-jwt@6.0.0 attempt failed; select the lowest authorized unattempted version for this retry.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred."
+    ],
+    "expected_output": "Select express-jwt@6.1.2, the lowest verified unattempted version above the 6.0.0 floor, as RETRY_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The first proposal is unauthorized; 6.1.2 is an unattempted verified candidate.",
+          "rationale": "Use the single allowed repair to recover with the lowest authorized version.",
+          "target_version": "6.1.2"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-repair-loop-recovery",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-repair-loop-recovery",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-repair-loop-recovery",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0009"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "75e83b94-9a0e-5f8f-9fa2-4fd668f1ea3d",
+          "issues": [
+            {
+              "id": "75e83b94-9a0e-5f8f-9fa2-4fd668f1ea3d",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0009",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "6.0.0",
+            "versions": [
+              "6.1.2",
+              "8.5.1"
+            ],
+            "canonical_version": "6.1.2",
+            "peer_compatible": true
+          }
+        ],
+        "prior_attempts": [
+          {
+            "attempt_id": "7510b296-19fa-58ed-824e-02c66205b1a5",
+            "task_id": "task-supervisor-repair-loop-recovery",
+            "state_revision": 1,
+            "task_revision": 0,
+            "attempt_number": 1,
+            "qa_policy": null,
+            "strategy_stage": "osv_minimum",
+            "no_fix_stage": null,
+            "selected_version": "6.0.0",
+            "allowed_target_versions": [
+              "6.0.0"
+            ],
+            "target_package_name": "express-jwt",
+            "target_dependency_type": "dependencies",
+            "allowed_dependency_types": [
+              "dependencies"
+            ],
+            "parent_minimum_version": null,
+            "instruction": "Update express-jwt to exact version 6.0.0.",
+            "instruction_digest": "0c9a124d13cae2a901a42b93a0259430544b47d1e453999754d44e48ed8486cf",
+            "dispatch_node": "update_subagent",
+            "plan_id": null,
+            "created_at": "2026-09-21T12:00:00Z",
+            "workaround_context": null
+          }
+        ],
+        "retry_diagnostics": {
+          "task_id": "task-supervisor-repair-loop-recovery",
+          "strategy_stage": "osv_minimum",
+          "committed_attempt_id": "7510b296-19fa-58ed-824e-02c66205b1a5",
+          "security_floor": "6.0.0",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_minimum_version": null,
+          "registry_query_performed": false,
+          "attempted_versions": [
+            "6.0.0"
+          ],
+          "executed_versions": [
+            "6.0.0"
+          ],
+          "attempted_versions_by_target": {},
+          "candidate_versions_considered": [
+            "6.1.2",
+            "8.5.1"
+          ],
+          "attempted_dependency_types": [],
+          "candidate_dependency_types": [],
+          "selected_version": "6.0.0",
+          "effective_target_version": null,
+          "effective_dependency_type": null,
+          "latest_version_seen": null,
+          "used_overrides": false,
+          "package_abandoned": false,
+          "exhausted_update_path": false,
+          "failure_reason": "The prior attempted version did not complete the required QA gates.",
+          "reasoning_summary": "",
+          "instruction_digest": null
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 2 model proposal(s); production replay expectation: Reject 9.9.9, include its verifier reason in the repair prompt, then accept 6.1.2 as RETRY_VERSION_BUMP.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "Choose a version without checking the authorized candidate list.",
+            "rationale": "A newer version might contain the fix.",
+            "target_version": "9.9.9"
+          }
+        },
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The first proposal is unauthorized; 6.1.2 is an unattempted verified candidate.",
+            "rationale": "Use the single allowed repair to recover with the lowest authorized version.",
+            "target_version": "6.1.2"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 2,
+      "verification_accepted": true,
+      "decision_code": "RETRY_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-inconclusive-qa-suppressed",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "synthetic_policy_case — data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy.",
+    "input": "QA test attribution is inconclusive for the express-jwt retry; preserve state and do not replan.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy."
+    ],
+    "expected_output": "QA test attribution is inconclusive, so the Supervisor returns NO_CALL with zero model and registry calls, preserves task/retry state, and stages no tactical transition.",
+    "expected_tools": [],
+    "tool_correctness_applicable": false,
+    "expected_tool_correctness_pass": null,
+    "task_completion_applicable": false,
+    "expected_completion_pass": null,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-inconclusive-qa-suppressed",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-inconclusive-qa-suppressed",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0010"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "ccdce802-495b-5bfe-86c3-8cfb8d473814",
+          "issues": [
+            {
+              "id": "ccdce802-495b-5bfe-86c3-8cfb8d473814",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0010",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "prior_attempts": [
+          {
+            "attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+            "task_id": "task-supervisor-inconclusive-qa-suppressed",
+            "state_revision": 1,
+            "task_revision": 0,
+            "attempt_number": 1,
+            "qa_policy": null,
+            "strategy_stage": "osv_minimum",
+            "no_fix_stage": null,
+            "selected_version": "6.0.0",
+            "allowed_target_versions": [
+              "6.0.0"
+            ],
+            "target_package_name": "express-jwt",
+            "target_dependency_type": "dependencies",
+            "allowed_dependency_types": [
+              "dependencies"
+            ],
+            "parent_minimum_version": null,
+            "instruction": "Update express-jwt to exact version 6.0.0.",
+            "instruction_digest": "0c9a124d13cae2a901a42b93a0259430544b47d1e453999754d44e48ed8486cf",
+            "dispatch_node": "update_subagent",
+            "plan_id": null,
+            "created_at": "2026-09-21T12:00:00Z",
+            "workaround_context": null
+          }
+        ],
+        "retry_diagnostics": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "strategy_stage": "osv_minimum",
+          "committed_attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+          "security_floor": "6.0.0",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_minimum_version": null,
+          "registry_query_performed": false,
+          "attempted_versions": [
+            "6.0.0"
+          ],
+          "executed_versions": [
+            "6.0.0"
+          ],
+          "attempted_versions_by_target": {},
+          "candidate_versions_considered": [],
+          "attempted_dependency_types": [],
+          "candidate_dependency_types": [],
+          "selected_version": "6.0.0",
+          "effective_target_version": null,
+          "effective_dependency_type": null,
+          "latest_version_seen": null,
+          "used_overrides": false,
+          "package_abandoned": false,
+          "exhausted_update_path": false,
+          "failure_reason": "The prior attempted version did not complete the required QA gates.",
+          "reasoning_summary": "",
+          "instruction_digest": null
+        },
+        "evaluation": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "QA attribution is inconclusive; rerun evidence collection without replanning.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware suite"
+            ],
+            "source_locations": [],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": {
+            "verdict": "inconclusive",
+            "responsible_group_ids": [
+              "supervisor:supervisor-inconclusive-qa-suppressed"
+            ],
+            "failed_tests": [
+              "authorization middleware suite"
+            ],
+            "reasoning": "The available test evidence cannot be attributed to this remediation task."
+          },
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "NO_CALL: inconclusive QA suppresses tactical reasoning and registry resolution.",
+      "actual_tools": []
+    },
+    "expected_replay": {
+      "model_invocations": 0,
+      "verification_accepted": null,
+      "decision_code": null,
+      "spawn_request_count": 0
+    }
+  }
+]

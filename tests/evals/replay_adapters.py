@@ -8,7 +8,7 @@ import json
 import shlex
 import tempfile
 from collections.abc import Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -23,6 +23,7 @@ from remediation_engine.contracts.schemas import (
     LocalizedIssue,
     NoFixMitigationStage,
     ODCScanEvidence,
+    QAEvaluation,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
@@ -30,8 +31,10 @@ from remediation_engine.contracts.schemas import (
     ScannerExecutionStatus,
     ScanScope,
     SCARemediationStage,
+    TacticalStrategy,
     TaskAttemptSnapshot,
     TaskStatus,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     WorkaroundContext,
     WorkaroundReplayPlan,
@@ -1382,5 +1385,403 @@ def replay_workaround_case(
         external_calls=http_calls
         + [{"kind": "sandbox_command", "command": command} for command in sandbox.commands],
         final_files=final_files,
+        **_recorder_token_fields(recorder),
+    )
+
+
+def replay_supervisor_case(
+    case: Mapping[str, Any],
+    eval_settings: Any,
+    *,
+    llm: Any | None = None,
+) -> ReplayCapture:
+    """Replay one tactical action through the production Supervisor caller.
+
+    Args:
+        case: Canonical tactical Supervisor golden case with complete typed
+            replay payloads.
+        eval_settings: Evaluation settings supplying the generation API key.
+            ``EVAL_JUDGE_MODEL`` is intentionally not used here.
+        llm: Optional test-only model replacement. When supplied, the
+            production tactical proposer receives this model through its
+            normal model-factory seam.
+
+    Returns:
+        The ordered raw proposal trace, typed verification/decision, staged
+        effects, and recorder token metadata.
+
+    Raises:
+        TypeError: If required replay sections or candidate fields have invalid
+            container/value types.
+        ValueError: If a candidate authorization is inconsistent with the
+            committed group floor.
+        ValidationError: If a Pydantic replay payload is invalid.
+    """
+    import remediation_engine.orchestration.supervisor_node as supervisor_node
+    import remediation_engine.orchestration.tactical_supervisor as tactical_supervisor
+
+    replay_input = _replay_input(case)
+    raw_task = replay_input.get("task")
+    raw_group = replay_input.get("group")
+    if not isinstance(raw_task, Mapping):
+        raise TypeError("replay.input.task must be an object")
+    if not isinstance(raw_group, Mapping):
+        raise TypeError("replay.input.group must be an object")
+    task = RemediationTask.model_validate(dict(raw_task))
+    group = VulnerabilityGroup.model_validate(dict(raw_group))
+    if group.fix_plan is None or not group.fix_plan.fixed_version:
+        raise ValueError("Supervisor replay group requires a committed fixed-version floor.")
+
+    raw_candidate_sets = replay_input.get("candidate_sets")
+    if not isinstance(raw_candidate_sets, list):
+        raise TypeError("replay.input.candidate_sets must be a list")
+    candidate_sets = []
+    for index, raw_candidate in enumerate(raw_candidate_sets):
+        if not isinstance(raw_candidate, Mapping):
+            raise TypeError(f"replay.input.candidate_sets[{index}] must be an object")
+        strategy = TacticalStrategy(raw_candidate["strategy"])
+        target_package_name = raw_candidate["target_package_name"]
+        dependency_type = raw_candidate["dependency_type"]
+        security_floor = raw_candidate["security_floor"]
+        raw_versions = raw_candidate["versions"]
+        canonical_version = raw_candidate["canonical_version"]
+        peer_compatible = raw_candidate["peer_compatible"]
+        if not isinstance(target_package_name, str) or not target_package_name:
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].target_package_name must be a string"
+            )
+        if dependency_type is not None and not isinstance(dependency_type, str):
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].dependency_type must be a string or null"
+            )
+        if not isinstance(security_floor, str) or not security_floor:
+            raise TypeError(f"replay.input.candidate_sets[{index}].security_floor must be a string")
+        if not isinstance(raw_versions, list) or not all(
+            isinstance(version, str) for version in raw_versions
+        ):
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].versions must be a list of strings"
+            )
+        if canonical_version is not None and not isinstance(canonical_version, str):
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].canonical_version must be a string or null"
+            )
+        if not isinstance(peer_compatible, bool):
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].peer_compatible must be a boolean"
+            )
+        if security_floor != group.fix_plan.fixed_version:
+            raise ValueError(
+                f"Candidate set {index} security floor does not match the group fix-plan floor."
+            )
+        candidate_sets.append(
+            tactical_supervisor.TacticalCandidateSet(
+                strategy=strategy,
+                target_package_name=target_package_name,
+                dependency_type=dependency_type,
+                security_floor=security_floor,
+                versions=tuple(raw_versions),
+                canonical_version=canonical_version,
+                peer_compatible=peer_compatible,
+            )
+        )
+
+    evaluation = (
+        QAEvaluation.model_validate(replay_input["evaluation"])
+        if "evaluation" in replay_input
+        else None
+    )
+    worker_result = (
+        WorkerAttemptResult.model_validate(replay_input["worker_result"])
+        if "worker_result" in replay_input
+        else None
+    )
+    retry_diagnostics = (
+        UpdateRetryDiagnostics.model_validate(replay_input["retry_diagnostics"])
+        if "retry_diagnostics" in replay_input
+        else None
+    )
+    raw_prior_attempts = replay_input.get("prior_attempts", [])
+    if not isinstance(raw_prior_attempts, list):
+        raise TypeError("replay.input.prior_attempts must be a list")
+    prior_attempts = [
+        TaskAttemptSnapshot.model_validate(snapshot) for snapshot in raw_prior_attempts
+    ]
+
+    typed_candidate_sets = tuple(candidate_sets)
+    settings_api_key = (
+        "scripted-replay" if llm is not None else getattr(eval_settings, "openai_api_key", "") or ""
+    )
+    settings = dataclasses.replace(
+        AppSettings.from_env(),
+        openai_api_key=settings_api_key,
+    )
+    task_queue = {task.task_id: task}
+    group_by_id = {group.group_id: group}
+    qa_evaluations = {task.task_id: evaluation} if evaluation is not None else {}
+    retry_diagnostics_by_task = (
+        {retry_diagnostics.task_id: retry_diagnostics} if retry_diagnostics is not None else {}
+    )
+    worker_results_by_attempt = (
+        {worker_result.attempt_id: worker_result} if worker_result is not None else {}
+    )
+    attempt_snapshots_by_id = {snapshot.attempt_id: snapshot for snapshot in prior_attempts}
+    consistency_events: list[Any] = []
+    errors: list[str] = []
+    staged_resolutions: list[Any] = []
+    proposal_result: dict[str, Any] = {"action": None, "verification": None, "context": None}
+    proposal_trace: list[dict[str, Any]] = []
+    counters = {
+        "model_invocations": 0,
+        "model_factory_calls": 0,
+        "registry_resolution_calls": 0,
+    }
+    recorder = TrajectoryRecorder()
+    original_proposer = supervisor_node.propose_and_verify_tactical_action
+    original_invoker = tactical_supervisor.invoke_with_trajectory
+
+    def _record_tool_calls(result: Any) -> None:
+        for call in tactical_supervisor._tool_calls_from_model_result(result):
+            if isinstance(call, Mapping):
+                function = call.get("function")
+                name = call.get("name")
+                arguments = call.get("args", call.get("arguments"))
+                if not name and isinstance(function, Mapping):
+                    name = function.get("name")
+                if arguments is None and isinstance(function, Mapping):
+                    arguments = function.get("arguments", {})
+            else:
+                function = None
+                name = getattr(call, "name", "")
+                arguments = getattr(call, "args", {})
+            if isinstance(arguments, str):
+                with suppress(json.JSONDecodeError):
+                    arguments = json.loads(arguments)
+            proposal_trace.append(
+                {
+                    "name": str(name or ""),
+                    "args": dict(arguments) if isinstance(arguments, Mapping) else arguments or {},
+                }
+            )
+
+    def _capture_invocation(name: str, invoke: Any, inputs: Any) -> Any:
+        counters["model_invocations"] += 1
+        result = original_invoker(name, invoke, inputs)
+        _record_tool_calls(result)
+        return result
+
+    def _provide_candidates(*_args: Any, **_kwargs: Any) -> tuple[tuple[Any, ...], None]:
+        counters["registry_resolution_calls"] += 1
+        return typed_candidate_sets, None
+
+    def _propose_and_capture(context: Any, *, settings: AppSettings | None = None) -> Any:
+        if llm is None:
+            result = original_proposer(context, settings=settings)
+        else:
+
+            def _model_factory(_settings: AppSettings) -> Any:
+                counters["model_factory_calls"] += 1
+                return llm
+
+            result = original_proposer(
+                context,
+                settings=settings,
+                model_factory=_model_factory,
+            )
+        proposal_result["action"], proposal_result["verification"] = result
+        proposal_result["context"] = context
+        return result
+
+    task_before = task.model_dump(mode="json")
+    retry_before = (
+        retry_diagnostics.model_dump(mode="json") if retry_diagnostics is not None else None
+    )
+    with ExitStack() as stack:
+        stack.enter_context(use_trajectory_recorder(recorder))
+        stack.enter_context(
+            patch.object(supervisor_node, "get_runtime_settings", return_value=settings)
+        )
+        stack.enter_context(
+            patch.object(
+                supervisor_node,
+                "registry_candidate_sets_for_context",
+                side_effect=_provide_candidates,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                supervisor_node,
+                "propose_and_verify_tactical_action",
+                side_effect=_propose_and_capture,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                tactical_supervisor,
+                "invoke_with_trajectory",
+                side_effect=_capture_invocation,
+            )
+        )
+        decision = supervisor_node._apply_tactical_supervisor(
+            task_queue=task_queue,
+            group_by_id=group_by_id,
+            qa_evaluations=qa_evaluations,
+            retry_diagnostics_by_task=retry_diagnostics_by_task,
+            retry_plans_by_task={},
+            worker_results_by_attempt=worker_results_by_attempt,
+            attempt_snapshots_by_id=attempt_snapshots_by_id,
+            target_task_id=task.task_id,
+            consistency_events=consistency_events,
+            errors=errors,
+            staged_resolutions=staged_resolutions,
+        )
+
+    action = proposal_result["action"]
+    verification = proposal_result["verification"]
+    if verification is None:
+        status = "NO_CALL"
+        reason = (
+            "QA evidence is inconclusive; tactical reasoning was suppressed before "
+            "model or registry resolution."
+            if counters["model_invocations"] == 0 and counters["registry_resolution_calls"] == 0
+            else "No tactical proposal was produced."
+        )
+    elif verification.accepted:
+        status = "ACCEPTED"
+        reason = verification.reason
+    else:
+        status = "REJECTED"
+        reason = verification.reason
+
+    action_payload = (
+        {"name": type(action).__name__, "args": action.model_dump(mode="json")}
+        if action is not None
+        else None
+    )
+    verification_payload = (
+        {
+            "accepted": verification.accepted,
+            "reason": verification.reason,
+            "target_package_name": verification.target_package_name,
+            "target_dependency_type": verification.target_dependency_type,
+            "strategy_stage": (
+                verification.strategy_stage.value if verification.strategy_stage else None
+            ),
+            "selected_version": verification.selected_version,
+            "instruction": verification.instruction,
+            "allowed_target_versions": list(verification.allowed_target_versions),
+            "allowed_dependency_types": list(verification.allowed_dependency_types),
+        }
+        if verification is not None
+        else None
+    )
+    spawn_requests = list(getattr(decision, "spawn_requests", []) or [])
+    decision_payload = (
+        {
+            "decision_code": (
+                decision.decision_code.value if decision.decision_code is not None else None
+            ),
+            "route": decision.next_node,
+            "target_task_count": len(decision.target_task_ids),
+            "unfixable_task_count": len(decision.unfixable_task_ids),
+            "spawn_request_count": len(spawn_requests),
+            "spawn_summaries": [
+                {
+                    "strategy": request.strategy.value,
+                    "instruction": request.instruction,
+                    "reason": request.reason,
+                }
+                for request in spawn_requests
+            ],
+            "referral_summary": list(decision.new_constraints),
+            "instructions": decision.instructions,
+            "reason": decision.decision_reason,
+        }
+        if decision is not None
+        else None
+    )
+    task_after = task.model_dump(mode="json")
+    retry_after = (
+        retry_diagnostics_by_task[task.task_id].model_dump(mode="json")
+        if task.task_id in retry_diagnostics_by_task
+        else None
+    )
+    actual_output = json.dumps(
+        {
+            "status": status,
+            "model_invocations": counters["model_invocations"],
+            "registry_resolution_calls": counters["registry_resolution_calls"],
+            "model_factory_calls": counters["model_factory_calls"],
+            "qa_attribution_status": (
+                evaluation.test_attribution.verdict.value
+                if evaluation is not None and evaluation.test_attribution is not None
+                else None
+            ),
+            "task_state_unchanged": task_before == task_after,
+            "retry_diagnostics_unchanged": retry_before == retry_after,
+            "staged_resolution_count": len(staged_resolutions),
+            "security_floor": group.fix_plan.fixed_version,
+            "authorized_target_versions": (
+                list(verification.allowed_target_versions) if verification is not None else []
+            ),
+            "attempted_versions": list(
+                proposal_result["context"].attempted_versions
+                if proposal_result["context"] is not None
+                else (retry_diagnostics.attempted_versions if retry_diagnostics is not None else [])
+            ),
+            "selected_strategy": (action.selected_strategy.value if action is not None else None),
+            "target": {
+                "package_name": (
+                    verification.target_package_name if verification is not None else None
+                ),
+                "dependency_type": (
+                    verification.target_dependency_type if verification is not None else None
+                ),
+                "target_version": getattr(action, "target_version", None),
+                "target_files_hint": getattr(action, "target_files_hint", None),
+                "workaround_hypothesis": getattr(action, "workaround_hypothesis", None),
+            },
+            "diagnostic_basis": getattr(action, "diagnostic_basis", None),
+            "rationale": getattr(action, "rationale", None),
+            "reason": reason,
+            "instruction": (verification.instruction if verification is not None else None),
+            "action": action_payload,
+            "verification": verification_payload,
+            "decision": decision_payload,
+        },
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    typed_result = {
+        "action": action,
+        "verification": verification,
+        "decision": decision,
+        "staged_resolutions": staged_resolutions,
+        "consistency_events": consistency_events,
+        "errors": errors,
+        "task_before": task_before,
+        "task_after": task_after,
+        "retry_diagnostics_before": retry_before,
+        "retry_diagnostics_after": retry_after,
+        "model_invocations": counters["model_invocations"],
+        "model_factory_calls": counters["model_factory_calls"],
+        "registry_resolution_calls": counters["registry_resolution_calls"],
+        "model_invocation_messages": list(getattr(llm, "invocation_messages", []) or []),
+        "task_queue": task_queue,
+        "retry_diagnostics_by_task": retry_diagnostics_by_task,
+        "worker_results_by_attempt": worker_results_by_attempt,
+        "attempt_snapshots_by_id": attempt_snapshots_by_id,
+    }
+    return ReplayCapture(
+        case_id=str(case.get("case_id", "unknown")),
+        component="supervisor",
+        actual_output=actual_output,
+        actual_tools=proposal_trace,
+        typed_result=typed_result,
+        errors=errors,
+        attempt_id=task.current_attempt_id,
+        task_revision=task.task_revision,
+        external_calls=[],
         **_recorder_token_fields(recorder),
     )

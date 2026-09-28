@@ -16,6 +16,7 @@ from enum import StrEnum
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
     TACTICAL_SUPERVISOR_ACTION_ADAPTER,
@@ -86,6 +87,11 @@ _MAX_CONTEXT_CHARS = 2000
 _MAX_LIST_ITEMS = 10
 _MAX_CANDIDATES = 3
 _MAX_DIAGNOSTIC_BASIS_CHARS = 1200
+_FORBIDDEN_WORKAROUND_TARGET_BASENAMES = frozenset(
+    {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}
+)
+
+
 _SUPERVISOR_STATIC_INSTRUCTIONS = """You are the Phase 2 tactical Supervisor for an AppSec remediation engine.
 
 The Supervisor owns remediation strategy, target selection, version selection,
@@ -582,6 +588,58 @@ def build_tactical_context(
     )
 
 
+def _has_compatible_single_task_candidate(context: TacticalDiagnosticContext) -> bool:
+    """Return whether registry evidence authorizes a compatible single-task fix."""
+    return any(
+        candidate.peer_compatible and candidate.versions for candidate in context.candidate_sets
+    )
+
+
+def _has_authoritative_workaround_source(context: TacticalDiagnosticContext) -> bool:
+    """Return whether QA authorizes a non-manifest source path for a workaround."""
+    evidence = context.evaluation.failure_evidence if context.evaluation else None
+    if evidence is None:
+        return False
+    manifests = set(_group_manifest_paths(context.group))
+    evidence_paths = _safe_relative_file_hints(
+        [*evidence.source_locations, *evidence.affected_files]
+    )
+    return any(
+        path not in manifests
+        and path.rsplit("/", 1)[-1].lower() not in _FORBIDDEN_WORKAROUND_TARGET_BASENAMES
+        for path in evidence_paths
+    )
+
+
+def _portfolio_escalation_required(
+    context: TacticalDiagnosticContext,
+    diagnostic_kind: TacticalDiagnosticKind,
+) -> bool:
+    """Require referral when peer conflict has no compatible or source fix."""
+    return (
+        diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
+        and not _has_compatible_single_task_candidate(context)
+        and not _has_authoritative_workaround_source(context)
+    )
+
+
+def _allowed_tactical_strategies_for_prompt(
+    context: TacticalDiagnosticContext,
+    diagnostic_kind: TacticalDiagnosticKind,
+) -> tuple[TacticalStrategy, ...]:
+    """Return the evidence-aware strategy inventory shown to the model."""
+    allowed = list(allowed_tactical_strategies(context.task, context.group))
+    if diagnostic_kind != TacticalDiagnosticKind.PEER_CONFLICT:
+        return tuple(allowed)
+    if _has_compatible_single_task_candidate(context):
+        return tuple(allowed)
+    if _portfolio_escalation_required(context, diagnostic_kind):
+        return (TacticalStrategy.ESCALATE_TO_PORTFOLIO,)
+    if TacticalStrategy.ESCALATE_TO_PORTFOLIO not in allowed:
+        allowed.append(TacticalStrategy.ESCALATE_TO_PORTFOLIO)
+    return tuple(allowed)
+
+
 def _evidence_lines(
     context: TacticalDiagnosticContext,
 ) -> tuple[list[str], list[str], list[str], list[str], str]:
@@ -718,12 +776,10 @@ def _build_supervisor_dynamic_context(
     )
     diagnostic_kind = classify_diagnostics(context)
     security_floor = _security_floor(context.task, context.group)
-    strategies = list(allowed_tactical_strategies(task, group))
-    if (
-        diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
-        and TacticalStrategy.ESCALATE_TO_PORTFOLIO not in strategies
-    ):
-        strategies.append(TacticalStrategy.ESCALATE_TO_PORTFOLIO)
+    strategies = list(_allowed_tactical_strategies_for_prompt(context, diagnostic_kind))
+    portfolio_escalation_required = _portfolio_escalation_required(context, diagnostic_kind)
+    if portfolio_escalation_required:
+        effective_action = TacticalStrategy.ESCALATE_TO_PORTFOLIO.value
     strategy_names = [
         strategy.value
         for strategy in strategies
@@ -744,11 +800,14 @@ def _build_supervisor_dynamic_context(
         )
     ]
     if not candidate_lines:
-        candidate_lines = (
-            ["- action=code_workaround: no registry candidate required"]
-            if TacticalStrategy.CODE_WORKAROUND in strategies
-            else ["- No verified remediation action is available."]
-        )
+        if TacticalStrategy.ESCALATE_TO_PORTFOLIO in strategies:
+            candidate_lines = [
+                "- action=escalate_to_portfolio: no compatible single-task candidate"
+            ]
+        elif TacticalStrategy.CODE_WORKAROUND in strategies:
+            candidate_lines = ["- action=code_workaround: no registry candidate required"]
+        else:
+            candidate_lines = ["- No verified remediation action is available."]
     parent_metadata_lines = (
         []
         if hide_parent_context
@@ -1417,13 +1476,41 @@ def _coerce_model_action(result: Any) -> TacticalAction:
     raise TypeError("The tactical model did not return a structured Supervisor action.")
 
 
+def _action_validation_repair_feedback(error: Exception) -> str:
+    """Return bounded, non-sensitive feedback for one malformed model action."""
+    if isinstance(error, ValidationError):
+        missing_fields = sorted(
+            {
+                str(item["loc"][-1])
+                for item in error.errors()
+                if item.get("type") == "missing" and item.get("loc")
+            }
+        )
+        if missing_fields:
+            return (
+                "The previous action tool call omitted required fields: "
+                f"{', '.join(missing_fields)}. Reissue exactly one complete "
+                "strategy-specific action. Include every required field and "
+                "choose versions only from the supplied verified candidate set."
+            )
+    return (
+        "The previous action tool call did not match the selected action schema. "
+        "Reissue exactly one complete strategy-specific action with every required field."
+    )
+
+
 def _model_action(
     context: TacticalDiagnosticContext,
     settings: AppSettings,
     *,
     model_factory: Callable[[AppSettings], Any] | None = None,
+    validation_feedback: list[str] | None = None,
 ) -> TacticalAction | None:
-    """Invoke the optional structured tactical model once."""
+    """Invoke the optional structured tactical model once.
+
+    Invalid structured responses are reported through ``validation_feedback``
+    so the caller can spend its one repair invocation without inferring fields.
+    """
     if not settings.openai_api_key:
         return None
     try:
@@ -1434,13 +1521,13 @@ def _model_action(
         else:
             llm = model_factory(settings)
         # Do not use ``with_structured_output`` with the discriminated root
-        # union.  OpenAI rejects the generated root ``oneOf`` response schema.
-        # Separate function tools preserve mandatory strategy-specific fields
-        # while allowing Python to validate the returned arguments strictly.
+        # union. OpenAI rejects the generated root ``oneOf`` response schema.
+        # The concrete flat action tools support strict provider-side argument
+        # enforcement while Python still validates each returned contract.
         structured_llm = llm.bind_tools(
             list(_SUPERVISOR_ACTION_CONTRACTS),
             tool_choice="required",
-            strict=False,
+            strict=True,
             parallel_tool_calls=False,
         )
         messages = build_supervisor_messages(context)
@@ -1449,10 +1536,20 @@ def _model_action(
             lambda: structured_llm.invoke(messages),
             messages,
         )
-        return _coerce_model_action(result)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "supervisor: tactical model unavailable; using deterministic fallback: %s", exc
+        )
+        return None
+
+    try:
+        return _coerce_model_action(result)
+    except Exception as exc:  # noqa: BLE001
+        if validation_feedback is not None:
+            validation_feedback.append(_action_validation_repair_feedback(exc))
+        logger.warning(
+            "supervisor: tactical model returned an invalid action schema (%s)",
+            type(exc).__name__,
         )
         return None
 
@@ -1566,14 +1663,31 @@ def verify_tactical_action(
     action: TacticalAction,
 ) -> TacticalVerification:
     """Verify a model proposal against committed task and registry facts."""
-    allowed = allowed_tactical_strategies(context.task, context.group)
     diagnostic_kind = classify_diagnostics(context)
+    portfolio_escalation_required = _portfolio_escalation_required(context, diagnostic_kind)
+    compatible_candidate = _has_compatible_single_task_candidate(context)
+    allowed = list(allowed_tactical_strategies(context.task, context.group))
+    if diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT:
+        if portfolio_escalation_required:
+            allowed = [TacticalStrategy.ESCALATE_TO_PORTFOLIO]
+        elif TacticalStrategy.ESCALATE_TO_PORTFOLIO not in allowed:
+            allowed.append(TacticalStrategy.ESCALATE_TO_PORTFOLIO)
     if (
-        diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
-        and TacticalStrategy.ESCALATE_TO_PORTFOLIO not in allowed
+        action.selected_strategy == TacticalStrategy.ESCALATE_TO_PORTFOLIO
+        and diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
+        and compatible_candidate
     ):
-        allowed = (*allowed, TacticalStrategy.ESCALATE_TO_PORTFOLIO)
+        return TacticalVerification(
+            False,
+            "A compatible verified single-task candidate exists; portfolio referral is not allowed.",
+        )
     if action.selected_strategy not in allowed:
+        if portfolio_escalation_required:
+            return TacticalVerification(
+                False,
+                "Peer conflict has no compatible candidate or evidence-backed source workaround; "
+                "portfolio escalation is required.",
+            )
         return TacticalVerification(False, "The proposed strategy is not valid for this task.")
     if diagnostic_kind == TacticalDiagnosticKind.INCONCLUSIVE:
         return TacticalVerification(
@@ -1632,9 +1746,19 @@ def verify_tactical_action(
     )
     if len(proposal_hints) != len(getattr(action, "target_files_hint", ()) or ()):
         return TacticalVerification(False, "Target file hints must be safe relative paths.")
-    # Code-workaround hints must identify source evidence, never a manifest or
-    # lockfile.  Dependency target paths remain Python-owned renderer data and
-    # are intentionally not part of the model's source-file authorization set.
+    if action.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
+        group_manifest_paths = _group_manifest_paths(context.group)
+        forbidden_hints = [
+            hint
+            for hint in proposal_hints
+            if hint in group_manifest_paths
+            or hint.rsplit("/", 1)[-1].lower() in _FORBIDDEN_WORKAROUND_TARGET_BASENAMES
+        ]
+        if forbidden_hints:
+            return TacticalVerification(
+                False,
+                "Manifest and lockfile paths are never valid workaround target-file hints.",
+            )
     allowed_hints = set(
         _safe_relative_file_hints(
             [
@@ -1740,14 +1864,32 @@ def propose_and_verify_tactical_action(
 ) -> tuple[TacticalAction | None, TacticalVerification | None]:
     """Propose, optionally repair once, and verify one tactical action.
 
-    Returns ``(None, None)`` when the model is disabled or unavailable.  A
-    rejected proposal returns the proposal and its verification result so the
-    caller can record an audit event and use deterministic routing.
+    Returns ``(None, None)`` when the model is disabled or unavailable. A
+    malformed structured response receives the same single repair budget as a
+    verifier-rejected action; no missing target or version is synthesized.
     """
     resolved_settings = settings or get_runtime_settings()
-    action = _model_action(context, resolved_settings, model_factory=model_factory)
+    validation_feedback: list[str] = []
+    action = _model_action(
+        context,
+        resolved_settings,
+        model_factory=model_factory,
+        validation_feedback=validation_feedback,
+    )
     if action is None:
-        return None, None
+        if not validation_feedback:
+            return None, None
+        repair_context = TacticalDiagnosticContext(
+            **{
+                **context.__dict__,
+                "repair_feedback": validation_feedback[-1],
+            }
+        )
+        repaired = _model_action(repair_context, resolved_settings, model_factory=model_factory)
+        if repaired is None:
+            return None, None
+        return repaired, verify_tactical_action(repair_context, repaired)
+
     verification = verify_tactical_action(context, action)
     if verification.accepted:
         return action, verification

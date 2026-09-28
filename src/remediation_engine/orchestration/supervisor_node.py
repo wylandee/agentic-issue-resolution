@@ -115,6 +115,7 @@ from remediation_engine.orchestration.supervisor_spawn import (
 from remediation_engine.orchestration.tactical_supervisor import (
     TacticalDiagnosticKind,
     _approved_candidate_pool,
+    _portfolio_escalation_required,
     build_tactical_context,
     classify_diagnostics,
     propose_and_verify_tactical_action,
@@ -672,6 +673,31 @@ def _commit_registry_resolution_fallback(
     )
 
 
+def _peer_conflict_referral_decision(
+    task: RemediationTask,
+    *,
+    decision_reason: str,
+) -> SupervisorDecision:
+    """Return the Supervisor-owned terminal referral for an unresolved peer conflict."""
+    referral = (
+        f"{task.task_id}: peer-conflict referral requires a coordinated multi-package "
+        "resolution; Phase 2 cannot safely select a compatible single-task candidate."
+    )
+    return SupervisorDecision(
+        decision_code=DecisionCode.PEER_CONFLICT_ESCALATION,
+        next_node="teardown",
+        target_task_ids=[],
+        unfixable_task_ids=[task.task_id],
+        task_status_updates={task.task_id: TaskStatus.UNFIXABLE},
+        new_constraints=[referral],
+        decision_reason=decision_reason,
+        instructions=(
+            "Peer conflict requires a multi-package portfolio resolution; "
+            "Phase 2 records the referral and ends single-task remediation."
+        ),
+    )
+
+
 def _apply_tactical_supervisor(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
@@ -778,24 +804,6 @@ def _apply_tactical_supervisor(
                 ),
                 decision_reason=detail,
             )
-        if (
-            not settings.openai_api_key
-            and task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.status != TaskStatus.NEEDS_RETRY
-            and task.retry_count == 0
-        ):
-            return _commit_registry_resolution_fallback(
-                task_queue,
-                task,
-                group,
-                evaluation,
-                retry_diagnostics_by_task,
-                retry_plans_by_task,
-                candidate_sets,
-                consistency_events=consistency_events,
-                errors=errors,
-                staged_resolutions=staged_resolutions,
-            )
         candidate_versions = next(
             (
                 candidate.versions
@@ -825,11 +833,49 @@ def _apply_tactical_supervisor(
             ),
             prior_attempts=base_context.prior_attempts,
         )
+        portfolio_escalation_required = _portfolio_escalation_required(
+            context,
+            classify_diagnostics(context),
+        )
+        if (
+            not settings.openai_api_key
+            and task.strategy == RoutingStrategy.VERSION_BUMP
+            and task.status != TaskStatus.NEEDS_RETRY
+            and task.retry_count == 0
+        ):
+            if portfolio_escalation_required:
+                return _peer_conflict_referral_decision(
+                    task,
+                    decision_reason=(
+                        "Deterministic Supervisor escalated an unresolved peer conflict "
+                        "without a compatible candidate or evidence-backed source workaround."
+                    ),
+                )
+            return _commit_registry_resolution_fallback(
+                task_queue,
+                task,
+                group,
+                evaluation,
+                retry_diagnostics_by_task,
+                retry_plans_by_task,
+                candidate_sets,
+                consistency_events=consistency_events,
+                errors=errors,
+                staged_resolutions=staged_resolutions,
+            )
         action, verification = propose_and_verify_tactical_action(
             context,
             settings=settings,
         )
         if action is None or verification is None:
+            if portfolio_escalation_required:
+                return _peer_conflict_referral_decision(
+                    task,
+                    decision_reason=(
+                        "Deterministic Supervisor escalated an unresolved peer conflict "
+                        "after no valid tactical action was returned."
+                    ),
+                )
             if task.strategy != RoutingStrategy.VERSION_BUMP:
                 return None
             # A retry must choose a different authorized action or version;
@@ -864,6 +910,14 @@ def _apply_tactical_supervisor(
                 )
             )
             errors.append(f"supervisor: tactical action rejected for {task.task_id}: {detail}")
+            if portfolio_escalation_required:
+                return _peer_conflict_referral_decision(
+                    task,
+                    decision_reason=(
+                        "Deterministic Supervisor escalated an unresolved peer conflict "
+                        "after rejecting an action without an authoritative source workaround."
+                    ),
+                )
             return None
 
         diagnostic_kind = classify_diagnostics(context)
@@ -877,22 +931,9 @@ def _apply_tactical_supervisor(
             f"'{task.task_id}' after {diagnostic_kind.value} evidence: {action.rationale}"
         )
         if action.selected_strategy == TacticalStrategy.ESCALATE_TO_PORTFOLIO:
-            referral = (
-                f"{task.task_id}: peer-conflict referral requires a coordinated multi-package "
-                "resolution; Phase 2 cannot safely select a compatible single-task candidate."
-            )
-            return SupervisorDecision(
-                decision_code=DecisionCode.PEER_CONFLICT_ESCALATION,
-                next_node="teardown",
-                target_task_ids=[],
-                unfixable_task_ids=[task.task_id],
-                task_status_updates={task.task_id: TaskStatus.UNFIXABLE},
-                new_constraints=[referral],
+            return _peer_conflict_referral_decision(
+                task,
                 decision_reason=decision_reason,
-                instructions=(
-                    "Peer conflict requires a multi-package portfolio resolution; "
-                    "Phase 2 records the referral and ends single-task remediation."
-                ),
             )
         if action.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
             if task.strategy == RoutingStrategy.CODE_WORKAROUND:

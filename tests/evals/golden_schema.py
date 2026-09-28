@@ -13,17 +13,18 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from remediation_engine.contracts.schemas import ScanFallbackReason, ScanScope
+from remediation_engine.contracts.schemas import DecisionCode, ScanFallbackReason, ScanScope
 
 REQUIRED_CASE_FIELDS = ("case_id", "input", "context", "expected_output", "expected_tools")
 LIVE_REPLAY_EVAL_TYPES = frozenset(
-    {"triage", "qa_critic", "update_subagent", "workaround_subagent"}
+    {"triage", "qa_critic", "update_subagent", "workaround_subagent", "supervisor"}
 )
 GOLDEN_DATASET_NAMES = (
     "triage_cases",
     "qa_cases",
     "update_subagent_cases",
     "workaround_subagent_cases",
+    "supervisor_cases",
     "report_cases",
     "fix_planner_cases",
 )
@@ -36,6 +37,140 @@ class GoldenSchemaError(ValueError):
 def _case_label(dataset_name: str, case: dict[str, Any], index: int) -> str:
     """Return a useful location label for a case error."""
     return f"{dataset_name}[{index}] ({case.get('case_id', '<missing case_id>')!r})"
+
+
+def _validate_supervisor_replay_input(
+    replay_input: Mapping[str, Any],
+    label: str,
+) -> list[str]:
+    """Validate the shallow JSON shape of a tactical replay payload."""
+    violations: list[str] = []
+    candidate_sets = replay_input.get("candidate_sets")
+    if not isinstance(candidate_sets, list):
+        violations.append(f"{label}.replay.input.candidate_sets must be a list")
+    else:
+        required_fields = {
+            "strategy",
+            "target_package_name",
+            "dependency_type",
+            "security_floor",
+            "versions",
+            "canonical_version",
+            "peer_compatible",
+        }
+        for index, candidate in enumerate(candidate_sets):
+            candidate_label = f"{label}.replay.input.candidate_sets[{index}]"
+            if not isinstance(candidate, Mapping):
+                violations.append(f"{candidate_label} must be an object")
+                continue
+            missing = required_fields - set(candidate)
+            if missing:
+                violations.append(
+                    f"{candidate_label} is missing required fields: {', '.join(sorted(missing))}"
+                )
+            for field in ("strategy", "target_package_name", "security_floor"):
+                value = candidate.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    violations.append(f"{candidate_label}.{field} must be a non-empty string")
+            dependency_type = candidate.get("dependency_type")
+            if dependency_type is not None and not isinstance(dependency_type, str):
+                violations.append(f"{candidate_label}.dependency_type must be a string or null")
+            versions = candidate.get("versions")
+            if not isinstance(versions, list) or not all(
+                isinstance(version, str) for version in versions
+            ):
+                violations.append(f"{candidate_label}.versions must be a list of strings")
+            canonical_version = candidate.get("canonical_version")
+            if canonical_version is not None and not isinstance(canonical_version, str):
+                violations.append(f"{candidate_label}.canonical_version must be a string or null")
+            if not isinstance(candidate.get("peer_compatible"), bool):
+                violations.append(f"{candidate_label}.peer_compatible must be a boolean")
+
+    for field in ("evaluation", "worker_result", "retry_diagnostics"):
+        if field in replay_input and not isinstance(replay_input[field], Mapping):
+            violations.append(f"{label}.replay.input.{field} must be an object")
+    prior_attempts = replay_input.get("prior_attempts")
+    if "prior_attempts" in replay_input and (
+        not isinstance(prior_attempts, list)
+        or not all(isinstance(attempt, Mapping) for attempt in prior_attempts)
+    ):
+        violations.append(f"{label}.replay.input.prior_attempts must be a list of objects")
+    return violations
+
+
+def _validate_supervisor_expected_replay(case: Mapping[str, Any], label: str) -> list[str]:
+    """Validate deterministic expectations for one tactical production replay."""
+    violations: list[str] = []
+    replay = case.get("expected_replay")
+    if not isinstance(replay, Mapping):
+        return [f"{label}.expected_replay must be an object"]
+
+    allowed_fields = {
+        "model_invocations",
+        "verification_accepted",
+        "decision_code",
+        "spawn_request_count",
+    }
+    unknown_fields = set(replay) - allowed_fields
+    if unknown_fields:
+        violations.append(
+            f"{label}.expected_replay contains unsupported fields: "
+            f"{', '.join(sorted(unknown_fields))}"
+        )
+    for field in allowed_fields:
+        if field not in replay:
+            violations.append(f"{label}.expected_replay is missing {field!r}")
+
+    model_invocations = replay.get("model_invocations")
+    if type(model_invocations) is not int or model_invocations < 0:
+        violations.append(
+            f"{label}.expected_replay.model_invocations must be a nonnegative integer"
+        )
+    spawn_request_count = replay.get("spawn_request_count")
+    if type(spawn_request_count) is not int or spawn_request_count < 0:
+        violations.append(
+            f"{label}.expected_replay.spawn_request_count must be a nonnegative integer"
+        )
+    verification_accepted = replay.get("verification_accepted")
+    if verification_accepted is not None and not isinstance(verification_accepted, bool):
+        violations.append(
+            f"{label}.expected_replay.verification_accepted must be a boolean or null"
+        )
+    decision_code = replay.get("decision_code")
+    decision_values = {decision.value for decision in DecisionCode}
+    if decision_code is not None and (
+        not isinstance(decision_code, str) or decision_code not in decision_values
+    ):
+        violations.append(
+            f"{label}.expected_replay.decision_code must be a DecisionCode value or null"
+        )
+
+    no_call_case = case.get("case_id") == "supervisor-inconclusive-qa-suppressed"
+    if no_call_case:
+        if model_invocations != 0:
+            violations.append(
+                f"{label}.expected_replay no-call case must have zero model_invocations"
+            )
+        if verification_accepted is not None or decision_code is not None:
+            violations.append(
+                f"{label}.expected_replay no-call case must use null verification and decision"
+            )
+        if spawn_request_count != 0 or case.get("expected_tools") != []:
+            violations.append(
+                f"{label}.expected_replay no-call case must have no spawn and no expected tools"
+            )
+    elif verification_accepted is None or model_invocations == 0:
+        violations.append(
+            f"{label}.expected_replay null verification and zero calls are reserved for "
+            "the inconclusive no-call case"
+        )
+    elif verification_accepted is True and decision_code is None:
+        violations.append(f"{label}.expected_replay accepted verification requires a decision code")
+    elif verification_accepted is False and decision_code is not None:
+        violations.append(
+            f"{label}.expected_replay rejected verification must not have a decision code"
+        )
+    return violations
 
 
 def validate_golden_case(
@@ -134,6 +269,7 @@ def validate_golden_case(
                     "allowed_target_versions",
                     "allowed_dependency_types",
                 ),
+                "supervisor": ("task", "group", "candidate_sets"),
             }[eval_type]
             for replay_field in required_replay_fields:
                 if replay_field not in replay_input:
@@ -149,6 +285,7 @@ def validate_golden_case(
                 ),
                 "update_subagent": ("workspace_files",),
                 "workaround_subagent": ("workspace_files",),
+                "supervisor": ("task", "group"),
             }[eval_type]
             for replay_field in expected_mapping_fields:
                 value = replay_input.get(replay_field)
@@ -225,6 +362,8 @@ def validate_golden_case(
                 violations.append(
                     f"{label}.replay.input.workspace_files must map string paths to string contents"
                 )
+            if eval_type == "supervisor":
+                violations.extend(_validate_supervisor_replay_input(replay_input, label))
         fixture = case.get("offline_fixture")
         if not isinstance(fixture, dict):
             violations.append(f"{label} live replay cases require an offline_fixture object")
@@ -236,6 +375,8 @@ def validate_golden_case(
             elif not isinstance(fixture["actual_tools"], list):
                 violations.append(f"{label}.offline_fixture.actual_tools must be a list")
 
+    if eval_type == "supervisor":
+        violations.extend(_validate_supervisor_expected_replay(case, label))
     return violations
 
 

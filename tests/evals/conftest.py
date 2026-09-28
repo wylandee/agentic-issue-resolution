@@ -36,6 +36,7 @@ _EVAL_TEST_FILE_NAMES = {
     "test_triage_eval.py",
     "test_update_subagent_eval.py",
     "test_workaround_subagent_eval.py",
+    "test_supervisor_eval.py",
 }
 
 # Pytest reports include every item that ran, while DeepEval only registers
@@ -219,6 +220,7 @@ def _suite_from_nodeid(nodeid: str) -> str:
     """Derive the dashboard suite name from a pytest node ID."""
     normalized = _normalise_nodeid(nodeid)
     suite_by_file = (
+        ("test_supervisor_eval.py", "supervisor"),
         ("test_workaround_subagent_eval.py", "subagent"),
         ("test_update_subagent_eval.py", "subagent"),
         ("test_qa_critic_eval.py", "qa_critic"),
@@ -236,6 +238,8 @@ def _suite_from_nodeid(nodeid: str) -> str:
 def _suite_from_test_case(tc: Any) -> str:
     """Derive a fallback suite name from a DeepEval test-case display name."""
     name = str(getattr(tc, "name", "") or "").casefold()
+    if "tactical supervisor" in name:
+        return "supervisor"
     if "qa critic" in name or "critic" in name:
         return "qa_critic"
     if "triage" in name:
@@ -926,6 +930,14 @@ def workaround_subagent_trajectories(
 
 
 @pytest.fixture
+def supervisor_trajectories(
+    trajectory_loader: TrajectoryLoader,
+) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
+    """Provide tactical Supervisor model spans from local trajectories."""
+    return trajectory_loader.find_agent_spans("supervisor")
+
+
+@pytest.fixture
 def qa_critic_trajectories(
     trajectory_loader: TrajectoryLoader,
 ) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
@@ -1025,6 +1037,18 @@ def workaround_subagent_golden_cases(
         pytest.skip(
             "No golden workaround subagent cases found in tests/evals/golden/workaround_subagent_cases.json"
         )
+    return cases
+
+
+@pytest.fixture
+def supervisor_golden_cases(
+    load_golden_cases: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Provide typed tactical Supervisor cases from the maintained golden file."""
+    all_cases = load_golden_cases("supervisor_cases")
+    cases = [case for case in all_cases if case.get("eval_type") == "supervisor"]
+    if not cases:
+        pytest.skip("No golden Supervisor cases found in tests/evals/golden/supervisor_cases.json")
     return cases
 
 

@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.contracts.schemas import (
+    CodeWorkaroundSupervisorAction,
+    CommandResult,
+    PackageOverrideSupervisorAction,
+    PortfolioEscalationSupervisorAction,
+    VersionBumpSupervisorAction,
+)
 from remediation_engine.evals.models import EvalTestCaseRecord
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.runtime.path_policy import WorkspacePathError
@@ -205,6 +211,42 @@ def test_scripted_model_consumes_bound_tool_trace_and_final_response() -> None:
     assert model.invocation_messages[1][-1]["content"] == "dynamic"
     with pytest.raises(AssertionError, match="more scripted"):
         model.invoke([])
+
+
+def test_pydantic_action_tool_classes_bind_under_strict_tool_validation() -> None:
+    """Class-based action contracts use their Pydantic class names."""
+    action_tools = [
+        VersionBumpSupervisorAction,
+        PackageOverrideSupervisorAction,
+        CodeWorkaroundSupervisorAction,
+        PortfolioEscalationSupervisorAction,
+    ]
+    expected_names = [
+        "VersionBumpSupervisorAction",
+        "PackageOverrideSupervisorAction",
+        "CodeWorkaroundSupervisorAction",
+        "PortfolioEscalationSupervisorAction",
+    ]
+    model = ScriptedReplayModel.from_tool_trace(
+        [
+            {
+                "name": "VersionBumpSupervisorAction",
+                "args": {
+                    "diagnostic_basis": "A verified candidate meets the security floor.",
+                    "selected_strategy": "version_bump",
+                    "target_version": "1.2.3",
+                    "rationale": "The authorized version addresses the finding.",
+                },
+            }
+        ]
+    )
+
+    model.bind_tools(action_tools)
+    response = model.invoke([])
+
+    assert model.bound_tool_names == expected_names
+    assert response.tool_calls[0]["name"] == "VersionBumpSupervisorAction"
+    assert model.invocation_count == 1
 
 
 def test_scripted_model_rejects_unbound_tools() -> None:
