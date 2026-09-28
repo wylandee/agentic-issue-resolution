@@ -12,6 +12,8 @@ import hashlib
 import re
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlanStatus,
@@ -39,20 +41,38 @@ _SEVERITY_RANK: dict[str, int] = {
 }
 
 
-def _normalise_security_floor(value: Any) -> tuple[str | None, tuple[int, int, int] | None]:
-    """Normalize one authoritative fixed-version value for comparison.
-
-    The Supervisor accepts only a complete stable semantic version as a
-    security floor.  Ranges, partial versions, prereleases, and prose are not
-    safe authorization data and therefore remain unresolved.
-    """
+def _normalise_security_floor(
+    value: Any,
+    ecosystem: str = "npm",
+) -> tuple[str | None, object | None]:
+    """Normalize one authoritative fixed-version value for comparison."""
     if value is None:
         return None, None
-    normalized = str(value).strip().lstrip("vV")
+    raw = str(value).strip()
+    if ecosystem.casefold() == "pypi":
+        try:
+            version = Version(raw)
+        except InvalidVersion:
+            return None, None
+        if version.is_prerelease or version.is_devrelease:
+            return None, None
+        return str(version), version
+    normalized = raw.lstrip("vV")
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", normalized)
     if match is None:
         return None, None
     return normalized, tuple(int(part) for part in match.groups())
+
+
+def _group_uses_pypi(group: VulnerabilityGroup) -> bool:
+    """Identify Python package findings from their issue ecosystem or PURL."""
+    for issue in group.issues or []:
+        if str(getattr(issue, "ecosystem", "") or "").strip().casefold() in {"pypi", "python"}:
+            return True
+        purl = str(getattr(issue, "purl", "") or "").strip().casefold()
+        if purl.startswith("pkg:pypi/"):
+            return True
+    return False
 
 
 def _canonical_security_floor(
@@ -80,24 +100,36 @@ def _canonical_security_floor(
     if fix_plan is not None and fix_plan.status != FixPlanStatus.VERSION_FOUND:
         return None, "the fix plan does not provide an authoritative fixed version"
 
+    ecosystem = "pypi" if _group_uses_pypi(group) else "npm"
     plan_floor, plan_key = _normalise_security_floor(
-        fix_plan.fixed_version if fix_plan is not None else None
+        fix_plan.fixed_version if fix_plan is not None else None,
+        ecosystem,
     )
     if fix_plan is not None and fix_plan.fixed_version is not None and plan_floor is None:
+        if ecosystem == "pypi":
+            return None, "the fix-plan fixed version is not a complete stable PEP 440 version"
         return None, "the fix-plan fixed version is not a complete stable semver"
 
-    member_values: list[tuple[str, tuple[int, int, int]]] = []
+    member_values: list[tuple[str, object]] = []
     for issue in group.issues or []:
-        value, key = _normalise_security_floor(getattr(issue, "fixed_version", None))
+        value, key = _normalise_security_floor(
+            getattr(issue, "fixed_version", None),
+            ecosystem,
+        )
         raw = getattr(issue, "fixed_version", None)
         if raw is None:
             continue
         if value is None or key is None:
+            if ecosystem == "pypi":
+                return (
+                    None,
+                    "a vulnerability fixed version is not a complete stable PEP 440 version",
+                )
             return None, "a vulnerability fixed version is not a complete stable semver"
         member_values.append((value, key))
 
     if plan_floor is not None and plan_key is not None:
-        conflicting = [value for value, key in member_values if key > plan_key]
+        conflicting = [value for value, key in member_values if key > plan_key]  # type: ignore[operator]
         if conflicting:
             return (
                 None,
@@ -109,8 +141,8 @@ def _canonical_security_floor(
     if member_values:
         # With no aggregate plan, use the highest corroborated member floor so
         # every grouped finding is covered by one safe version.
-        _value, _key = max(member_values, key=lambda item: item[1])
-        return _value, None
+        value, _key = max(member_values, key=lambda item: item[1])
+        return value, None
     return None, "no authoritative security floor is available"
 
 
@@ -200,9 +232,12 @@ def _is_exhausted_update_pivot_candidate(
     diagnostics: UpdateRetryDiagnostics | None,
 ) -> bool:
     """Return whether a retry update task must pivot instead of retrying."""
-    if task.parent_package_name and task.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-        # A transitive task may only pivot after its explicit child-override
-        # stage has also failed. Parent registry exhaustion is not terminal.
+    if task.parent_package_name and task.strategy_stage not in {
+        SCARemediationStage.CODE_WORKAROUND,
+        SCARemediationStage.PYPI_LATEST,
+    }:
+        # npm transitive updates retain the parent-first override stage. PyPI
+        # has no override stage, so exhaustion at PYPI_LATEST may pivot.
         return False
     return (
         task.strategy == RoutingStrategy.VERSION_BUMP
@@ -232,8 +267,16 @@ def _has_existing_workaround_child(
 def _next_sca_stage(
     stage: SCARemediationStage,
     transitive: bool = False,
+    *,
+    ecosystem: str = "npm",
 ) -> SCARemediationStage:
-    """Advance one ordered SCA version strategy stage."""
+    """Advance one ordered, ecosystem-specific SCA version strategy stage."""
+    if ecosystem.casefold() == "pypi":
+        if stage == SCARemediationStage.OSV_MINIMUM:
+            return SCARemediationStage.PYPI_SAME_MAJOR
+        if stage == SCARemediationStage.PYPI_SAME_MAJOR:
+            return SCARemediationStage.PYPI_LATEST
+        return SCARemediationStage.CODE_WORKAROUND
     if stage == SCARemediationStage.OSV_MINIMUM:
         return SCARemediationStage.NPM_SAME_MAJOR
     if stage == SCARemediationStage.NPM_SAME_MAJOR:
@@ -247,9 +290,9 @@ def _next_sca_stage(
 
 def _selection_for_stage(stage: SCARemediationStage) -> str | None:
     """Return the registry selection mode for a strategy stage."""
-    if stage == SCARemediationStage.NPM_SAME_MAJOR:
+    if stage in {SCARemediationStage.NPM_SAME_MAJOR, SCARemediationStage.PYPI_SAME_MAJOR}:
         return "same_major"
-    if stage == SCARemediationStage.NPM_LATEST:
+    if stage in {SCARemediationStage.NPM_LATEST, SCARemediationStage.PYPI_LATEST}:
         return "latest"
     return None
 

@@ -32,6 +32,16 @@ _SOURCE_SUFFIXES = {".js", ".ts", ".jsx", ".tsx"}
 _EXCLUDED_PARTS = {"node_modules", ".git", "dist", "build"}
 
 
+def _is_pypi_issue_group(group: VulnerabilityGroup) -> bool:
+    """Return whether an SCA group is explicitly identified as PyPI."""
+    for issue in group.issues:
+        ecosystem = str(issue.ecosystem or "").strip().casefold()
+        purl = str(issue.purl or "").strip().casefold()
+        if ecosystem in {"pypi", "python"} or purl.startswith("pkg:pypi/"):
+            return True
+    return False
+
+
 def _load_direct_dependencies(repo_root: Path) -> set[str]:
     """Best-effort load of direct dependencies from package.json."""
     package_json = repo_root / "package.json"
@@ -106,18 +116,24 @@ def _collect_global_imports(repo_root: Path) -> set[str]:
 
 def analyze_reachability(groups: list[VulnerabilityGroup], repo_root: str | Path) -> None:
     """Mutate SCA groups in place with a deterministic reachability signal."""
-    root = Path(repo_root).resolve()
-    if not root.exists():
-        logger.warning("Reachability: repo root does not exist: %s", root)
-        return
-
-    direct_deps = _load_direct_dependencies(root)
-    global_imports = _collect_global_imports(root)
-
+    npm_groups: list[VulnerabilityGroup] = []
     for group in groups:
         if group.issue_type != IssueType.SCA:
             continue
+        if _is_pypi_issue_group(group):
+            # JavaScript import names and package.json declarations do not
+            # establish whether a PyPI distribution is used by Python code.
+            group.is_reachable = None
+        else:
+            npm_groups.append(group)
+    if not npm_groups:
+        return
 
+    root = Path(repo_root)
+    direct_deps = _load_direct_dependencies(root)
+    global_imports = _collect_global_imports(root)
+
+    for group in npm_groups:
         component = (group.vulnerable_component or "").strip()
         if component and any(component in imported for imported in global_imports):
             group.is_reachable = True

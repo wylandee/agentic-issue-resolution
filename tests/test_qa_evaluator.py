@@ -24,6 +24,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     TestAttributionVerdict,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import (
     _derive_qa_task_strategies,
     _group_scan_status,
@@ -35,6 +36,7 @@ from remediation_engine.orchestration.qa_evaluator import (
     _build_qa_dynamic_context,
     _build_qa_terminal_tool,
     _run_individual_investigations,
+    build_qa_review_toolbelt,
 )
 from remediation_engine.orchestration.qa_policy_engine import _apply_guardrails
 from remediation_engine.orchestration.qa_types import (
@@ -308,6 +310,21 @@ class TestBuildIndividualInvestigatorPrompt:
         g = _make_group(group_id="my-group")
         assert "my-group" in self._prompt(group=g)
 
+    def test_python_language_and_pytest_evidence_are_explicit(self):
+        prompt = _build_individual_investigator_prompt(
+            task_id="task-python",
+            group=_make_group(),
+            strategy="code_workaround",
+            results=_make_fully_populated_results(ok=False),
+            group_remaining_ids=[],
+            candidate_changed_files=["src/app.py"],
+            action_summaries=[],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+        assert "Canonical project language: python (Python)." in prompt
+        assert "Interpret pytest failures as Python unit-test evidence." in prompt
+
     def test_contains_cve_ids(self):
         g = _make_group(cve_ids=["CVE-2021-9999"], ghsa_ids=[])
         p = self._prompt(group=g, remaining=["CVE-2021-9999"])
@@ -396,6 +413,29 @@ class TestBuildIndividualInvestigatorPrompt:
         assert len(bounded_prompt) < len(prompt) + 2_000
 
 
+def test_qa_evaluator_toolbelt_is_read_only():
+    tools = build_qa_review_toolbelt(
+        sandbox=MagicMock(),
+        candidate_changed_files=["src/app.py"],
+        host_repo_root="/tmp",
+        results=_make_fully_populated_results(ok=True),
+    )
+    names = [tool.name for tool in tools]
+
+    assert names == [
+        "list_changed_files",
+        "generate_workspace_diff",
+        "read_file_context",
+        "search_codebase_pattern",
+        "inspect_ast_symbol",
+        "query_qa_logs",
+    ]
+    assert not any(
+        any(operation in name for operation in ("edit", "modify", "remove", "install", "run"))
+        for name in names
+    )
+
+
 class TestRunIndividualInvestigations:
     def _lr(self, text="", errors=None, evaluation=None):
         from remediation_engine.orchestration.subagent_runtime import SubagentRuntimeResult
@@ -435,7 +475,13 @@ class TestRunIndividualInvestigations:
                 repo_root="/tmp",
                 results=results,
                 task_policies={"task-1": None, "task-2": None},
+                project_language=ProjectLanguage.PYTHON,
             )
+        assert all(
+            "Canonical project language: python (Python)."
+            in call.kwargs["initial_messages"][0].content
+            for call in ml.call_args_list
+        )
         assert ml.call_count == 2
         assert all(
             call.kwargs["structured_output_model"] is QACriticLLMOutput

@@ -29,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
 )
+from remediation_engine.tools.package_identity import normalize_python_package_name
 
 TERMINAL_TASK_STATUSES = frozenset(
     {
@@ -251,6 +252,21 @@ def is_no_fix_package_removal_task(task: RemediationTask) -> bool:
 def is_no_fix_group(group: VulnerabilityGroup) -> bool:
     """Return whether ``group`` has an explicit ``NO_FIX`` plan."""
     return group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+
+
+def _group_ecosystem(group: VulnerabilityGroup) -> str:
+    """Resolve the SCA ecosystem from vulnerable issue evidence."""
+    for issue in [
+        *group.issues,
+        *(localized.issue for localized in group.localized_issues),
+    ]:
+        ecosystem = str(issue.ecosystem or "").strip().casefold()
+        purl = str(issue.purl or "").strip().casefold()
+        if ecosystem in {"python", "pypi"} or purl.startswith("pkg:pypi/"):
+            return "pypi"
+        if ecosystem == "npm" or purl.startswith("pkg:npm/"):
+            return "npm"
+    return "npm"
 
 
 def is_transitive_group(group: VulnerabilityGroup) -> bool:
@@ -517,25 +533,7 @@ def build_initial_remediation_task(
     group: VulnerabilityGroup,
     task_id: str,
 ) -> RemediationTask:
-    """
-    Create an initial Depth-0 ``RemediationTask`` from a vulnerability group.
-
-    The task inherits the strategy derived from the group's fix plan and
-    starts in the ``PENDING`` status.  The instruction is seeded from the
-    fix plan's instruction field if available.
-
-    Parameters
-    ----------
-    group:
-        The ``VulnerabilityGroup`` to remediate.
-    task_id:
-        Unique identifier for this task (e.g. ``'task-1'``).
-
-    Returns
-    -------
-    RemediationTask
-        A freshly created task ready to be added to ``task_queue``.
-    """
+    """Create an initial Depth-0 ``RemediationTask`` from a vulnerability group."""
     strategy = derive_initial_strategy(group)
     qa_policy = derive_initial_qa_policy(group)
     no_fix_stage: NoFixMitigationStage | None = None
@@ -548,30 +546,54 @@ def build_initial_remediation_task(
             instruction = group.fix_plan.instruction
 
     transitive = is_transitive_group(group)
-    parent_name, parent_version, parent_type = group_parent_context(group)
+    ecosystem = _group_ecosystem(group)
+    is_python = ecosystem == "pypi"
+    # Pipfile.lock entries do not establish parent edges. Keep Python
+    # transitive tasks unbound until the Supervisor proves a unique one-hop
+    # parent from the current Pipfile, lockfile, and PyPI metadata.
+    if is_python and transitive:
+        parent_name, parent_version, parent_type = None, None, None
+    else:
+        parent_name, parent_version, parent_type = group_parent_context(group)
     has_parent_target = (
-        strategy == RoutingStrategy.VERSION_BUMP and transitive and bool(parent_name)
+        not (is_python and transitive)
+        and strategy == RoutingStrategy.VERSION_BUMP
+        and transitive
+        and bool(parent_name)
     )
     target_package_name = (
         parent_name
         if has_parent_target
-        else (group.vulnerable_component if strategy == RoutingStrategy.VERSION_BUMP else None)
+        else (
+            normalize_python_package_name(group.vulnerable_component or "")
+            if is_python and not transitive and strategy == RoutingStrategy.VERSION_BUMP
+            else (
+                group.vulnerable_component
+                if strategy == RoutingStrategy.VERSION_BUMP and not transitive
+                else None
+            )
+        )
     )
     direct_dependency_type = next(
         (
             localized.declaration_type
             for localized in group.localized_issues
             if localized.declaration_type
+            and (not is_python or localized.is_direct_dependency is not False)
         ),
-        None if transitive else "dependencies",
+        None if transitive or is_python else "dependencies",
     )
     target_dependency_type = (
         parent_type
         if has_parent_target
         else (
-            _group_override_dependency_type(group)
-            if transitive and strategy == RoutingStrategy.VERSION_BUMP
-            else direct_dependency_type
+            None
+            if is_python and transitive
+            else (
+                _group_override_dependency_type(group)
+                if transitive and strategy == RoutingStrategy.VERSION_BUMP
+                else direct_dependency_type
+            )
         )
     )
     if has_parent_target:
@@ -586,7 +608,7 @@ def build_initial_remediation_task(
         )
     initial_stage = (
         SCARemediationStage.OSV_MINIMUM
-        if strategy == RoutingStrategy.VERSION_BUMP and has_parent_target
+        if strategy == RoutingStrategy.VERSION_BUMP and (has_parent_target or is_python)
         else SCARemediationStage.PACKAGE_OVERRIDE
         if strategy == RoutingStrategy.VERSION_BUMP and transitive
         else SCARemediationStage.CODE_WORKAROUND

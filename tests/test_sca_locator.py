@@ -175,6 +175,7 @@ class TestPURLHelpers:
             ("pkg:npm/%40tootallnate%2Fonce@1.1.2", "@tootallnate/once"),
             ("pkg:npm/base64url@0.0.6", "base64url"),
             ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),
+            ("pkg:pypi/Requests._Tool-Kit@2.31.0", "requests-tool-kit"),
             # maven: namespace=commons-io, name=commons-io â†’ joined with ':'
             ("pkg:maven/commons-io/commons-io@2.4", "commons-io:commons-io"),
         ],
@@ -436,6 +437,31 @@ class TestParseVulnerabilities:
         assert len(issues) == 1
         assert issues[0].ecosystem == "javascript"
         assert issues[0].package_name == "underscore.js"
+
+    def test_pypi_odc_fixture_emits_normalized_distribution_identity(self):
+        report = {
+            "dependencies": [
+                {
+                    "fileName": "Requests._Tool-Kit-2.31.0",
+                    "filePath": "/src/requirements.txt",
+                    "packages": [{"id": "pkg:pypi/Requests._Tool-Kit@2.31.0"}],
+                    "vulnerabilities": [
+                        {
+                            "name": "CVE-2024-00001",
+                            "severity": "HIGH",
+                            "description": "Fixture PyPI finding",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        issues = parse_vulnerabilities(report)
+
+        assert len(issues) == 1
+        assert issues[0].ecosystem == "pypi"
+        assert issues[0].package_name == "requests-tool-kit"
+        assert issues[0].package_version == "2.31.0"
 
 
 # ===========================================================================

@@ -78,6 +78,7 @@ class TestWorkspaceBuilderNode:
 
         client.volumes.create.assert_called_once()
         mock_sandbox.assert_called_once()
+        assert mock_sandbox.call_args.kwargs["image"] == "node:22"
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "npm install --package-lock=true",
             "cd frontend && npm install --package-lock=true",
@@ -240,6 +241,7 @@ class TestTeardownNode:
         state["status"] = "edits_completed"
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["changed_files"] = ["routes/login.ts", "routes/login.ts"]
+        state["project_language"] = "python"
 
         sandbox = _sandbox_mock()
         sandbox.read_file.return_value = "const x = 2;\n"
@@ -249,7 +251,7 @@ class TestTeardownNode:
             patch(
                 "remediation_engine.orchestration.teardown_node.DockerSandbox",
                 return_value=sandbox,
-            ),
+            ) as sandbox_type,
             patch(
                 "remediation_engine.orchestration.teardown_node.get_docker_client",
                 return_value=client,
@@ -258,6 +260,11 @@ class TestTeardownNode:
             result = run_teardown_node(state)
 
         sandbox.read_file.assert_called_once_with("routes/login.ts")
+        sandbox_type.assert_called_once_with(
+            repo_root=None,
+            image="python:3.11-slim",
+            workspace_volume="agent_workspace_deadbeef",
+        )
         client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")
         client.volumes.get.return_value.remove.assert_called_once_with(force=True)
         assert result["status"] == "completed"

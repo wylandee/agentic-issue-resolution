@@ -30,6 +30,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
     WorkerAttemptResult,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import (
     build_orchestrator_graph,
     orchestrator_engine,
@@ -305,6 +306,7 @@ class TestPhase5GraphIntegration:
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
         state = _initial_state(tmp_path, groups)
+        state["project_language"] = ProjectLanguage.PYTHON
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["task_queue"] = {"task-1": task}
         state["active_target_task_ids"] = ["task-1"]
@@ -335,6 +337,7 @@ class TestPhase5GraphIntegration:
             subagent_state["target_tasks"][0].instruction
             == 'Update "lodash" in package.json to version "4.17.22".'
         )
+        assert subagent_state["project_language"] is ProjectLanguage.PYTHON
         assert (
             subagent_state["previous_action_summaries_by_task"]["task-1"]
             == "Previous version bump failed manifest validation."
@@ -414,6 +417,7 @@ class TestPhase5GraphIntegration:
             instruction_digest=snapshot.instruction_digest,
         )
         state = _initial_state(tmp_path, groups)
+        state["project_language"] = ProjectLanguage.PYTHON
         state.update(
             {
                 "task_queue": {"task-1": task},
@@ -421,20 +425,24 @@ class TestPhase5GraphIntegration:
                 "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
             }
         )
-        with patch(
-            "remediation_engine.orchestration.graph.run_workaround_subagent_node",
+        workaround_subagent = MagicMock(
             return_value={
                 "action_summaries": [summary],
                 "action_summary": summary,
                 "worker_results_by_attempt": {snapshot.attempt_id: worker_result},
                 "errors": [],
-            },
+            }
+        )
+        with patch(
+            "remediation_engine.orchestration.graph.run_workaround_subagent_node",
+            workaround_subagent,
         ):
             result = run_workaround_subagent_from_orchestrator(state)
 
         returned_summary = result["action_summaries"][0]
         assert returned_summary == summary
         assert result["worker_results_by_attempt"][snapshot.attempt_id] == worker_result
+        assert workaround_subagent.call_args[0][0]["project_language"] is ProjectLanguage.PYTHON
 
     def test_update_wrapper_rejects_contradictory_snapshot_before_worker(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

@@ -11,16 +11,28 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.triage.reachability import analyze_reachability
 
 
-def _sca_issue(package_name: str) -> VulnerabilityIssue:
+def _sca_issue(
+    package_name: str,
+    *,
+    ecosystem: str | None = None,
+    purl: str | None = None,
+) -> VulnerabilityIssue:
     return VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         package_name=package_name,
+        ecosystem=ecosystem,
+        purl=purl,
     )
 
 
-def _sca_group(package_name: str) -> VulnerabilityGroup:
-    issue = _sca_issue(package_name)
+def _sca_group(
+    package_name: str,
+    *,
+    ecosystem: str | None = None,
+    purl: str | None = None,
+) -> VulnerabilityGroup:
+    issue = _sca_issue(package_name, ecosystem=ecosystem, purl=purl)
     return VulnerabilityGroup(
         group_id=f"sca:package.json:{package_name}",
         issue_type=IssueType.SCA,
@@ -130,3 +142,31 @@ def test_analyze_reachability_skips_symlinked_source_outside_repository(tmp_path
     analyze_reachability(groups, tmp_path)
 
     assert groups[0].is_reachable is False
+
+
+def test_analyze_reachability_leaves_pypi_findings_unknown(monkeypatch, tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"requests":"2.0.0","flask":"2.0.0"}}',
+        encoding="utf-8",
+    )
+    groups = [
+        _sca_group("requests", ecosystem="pypi"),
+        _sca_group("flask", purl="pkg:pypi/flask@2.0.0"),
+        _sca_group("lodash", ecosystem="python"),
+    ]
+
+    def _unexpected_js_analysis(*_args, **_kwargs):
+        raise AssertionError("PyPI findings must not use JavaScript reachability evidence")
+
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability._load_direct_dependencies",
+        _unexpected_js_analysis,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability._collect_global_imports",
+        _unexpected_js_analysis,
+    )
+
+    analyze_reachability(groups, tmp_path)
+
+    assert [group.is_reachable for group in groups] == [None, None, None]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from remediation_engine.language import ProjectLanguage
+
 from ._tool_support import (
     Any,
     DockerSandbox,
@@ -196,7 +198,7 @@ def _make_deterministic_apply_edit_set_tool(
             for rel_path in affected_files_set:
                 suffix = Path(rel_path).suffix.lower()
                 if (
-                    suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}
+                    suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".py"}
                     and rel_path not in inspected
                 ):
                     return (
@@ -241,8 +243,13 @@ def _make_deterministic_apply_edit_set_tool(
                 f"ERROR: [WRITE_FAILURE] Write failed on '{rel_path}': {exc}. All files restored."
             )
 
-        syntax_tool = _make_validate_code_syntax_tool(sandbox)
         for rel_path in new_file_contents:
+            language = (
+                ProjectLanguage.PYTHON
+                if Path(rel_path).suffix.lower() == ".py"
+                else ProjectLanguage.NODEJS
+            )
+            syntax_tool = _make_validate_code_syntax_tool(sandbox, language=language)
             syntax_res = syntax_tool.invoke({"file_path": rel_path})
             if "FAILURE" in syntax_res or "ERROR" in syntax_res:
                 for p, orig in file_snapshots.items():
@@ -373,7 +380,7 @@ def _make_deterministic_search_replace_tool(
             )
 
         suffix = Path(rel_path).suffix.lower()
-        if suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+        if suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".py"}:
             inspected_files = plan_state.get("inspected_files", set()) if plan_state else set()
             fallback_files = plan_state.get("fallback_files", set()) if plan_state else set()
             if rel_path not in inspected_files and rel_path not in fallback_files:
@@ -411,7 +418,12 @@ def _make_deterministic_search_replace_tool(
 
         sandbox.write_file(rel_path, _restore_newlines(updated, newline_style))
 
-        syntax_tool = _make_validate_code_syntax_tool(sandbox)
+        language = (
+            ProjectLanguage.PYTHON
+            if Path(rel_path).suffix.lower() == ".py"
+            else ProjectLanguage.NODEJS
+        )
+        syntax_tool = _make_validate_code_syntax_tool(sandbox, language=language)
         syntax_res = syntax_tool.invoke({"file_path": rel_path})
         if "FAILURE" in syntax_res or "ERROR" in syntax_res:
             sandbox.write_file(rel_path, current)
@@ -501,6 +513,15 @@ def _make_deterministic_replace_ast_symbol_tool(
                 "do not apply an isolated or unrelated fix."
             )
 
+        if Path(rel_path).suffix.lower() == ".py":
+            inspected_files = plan_state.get("inspected_files", set()) if plan_state else set()
+            fallback_files = plan_state.get("fallback_files", set()) if plan_state else set()
+            if rel_path not in inspected_files and rel_path not in fallback_files:
+                return (
+                    f"ERROR: [MISSING_INSPECTION] AST inspection required before first edit on '{rel_path}'. "
+                    "Use inspect_ast_symbol for the target symbol, or use read_workspace_file "
+                    "and document a no-symbol fallback in record_plan before editing."
+                )
         content = sandbox.read_file(rel_path)
         if content is None:
             return f"ERROR: Could not read '{rel_path}'."
@@ -610,7 +631,12 @@ def _make_deterministic_replace_ast_symbol_tool(
 
         sandbox.write_file(rel_path, updated)
 
-        syntax_tool = _make_validate_code_syntax_tool(sandbox)
+        language = (
+            ProjectLanguage.PYTHON
+            if Path(rel_path).suffix.lower() == ".py"
+            else ProjectLanguage.NODEJS
+        )
+        syntax_tool = _make_validate_code_syntax_tool(sandbox, language=language)
         syntax_res = syntax_tool.invoke({"file_path": rel_path})
         if "FAILURE" in syntax_res or "ERROR" in syntax_res:
             sandbox.write_file(rel_path, content)

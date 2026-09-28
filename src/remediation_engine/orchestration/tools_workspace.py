@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from remediation_engine.language import ProjectLanguage
+
 from ._tool_support import (
     _INSPECT_TEXT_MAX_CHARS,
     _READ_FILE_MAX_BYTES,
@@ -52,9 +54,14 @@ def _make_read_repository_map_tool(sandbox: DockerSandbox):
 
         normalized_query = str(query or "").strip().replace("\\", "/")
         script = (
-            "find . -not -path '*/node_modules/*' "
-            "-not -path '*/.git/*' "
-            "-not -name '*.map' "
+            "find . "
+            "-not -path '*/node_modules/*' -not -path '*/.git/*' "
+            "-not -path '*/.venv' -not -path '*/.venv/*' "
+            "-not -path '*/venv' -not -path '*/venv/*' "
+            "-not -path '*/__pycache__' -not -path '*/__pycache__/*' "
+            "-not -path '*/.pytest_cache' -not -path '*/.pytest_cache/*' "
+            "-not -path '*/.remedy-pipenv' -not -path '*/.remedy-pipenv/*' "
+            "-not -name '*.pyc' -not -name '*.map' "
             "| sed 's|^./||' | sort"
         )
         result = _run_readonly(sandbox, script, timeout=10)
@@ -292,6 +299,8 @@ def _make_revert_workspace_file_tool(
 def _make_search_codebase_pattern_tool(
     sandbox: DockerSandbox,
     plan_state: dict[str, Any] | None = None,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     @tool
     def search_codebase_pattern(search_pattern: str, target_directory: str = ".") -> str:
@@ -308,12 +317,24 @@ def _make_search_codebase_pattern_tool(
 
         safe_pattern = search_pattern.replace("'", "'\"'\"'")
         search_root = td
+        excluded_dirs = (
+            "--exclude-dir=node_modules --exclude-dir=.git "
+            "--exclude-dir=build --exclude-dir=dist --exclude-dir=data "
+            "--exclude-dir=reports --exclude-dir=.pytest_cache "
+            "--exclude-dir=.venv --exclude-dir=venv --exclude-dir=__pycache__ "
+            "--exclude-dir=.remedy-pipenv"
+        )
+        if language == ProjectLanguage.PYTHON:
+            source_includes = (
+                "--include='*.py' --exclude='setup.py' --exclude='conftest.py' --exclude='*.pyc' "
+            )
+        else:
+            source_includes = (
+                "--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
+                "--include='*.mjs' --include='*.cjs' "
+            )
         cmd = (
-            f"grep -RInE "
-            f"--include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' "
-            f"--include='*.mjs' --include='*.cjs' "
-            f"--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=build --exclude-dir=dist "
-            f"--exclude-dir=data --exclude-dir=reports --exclude-dir=.pytest_cache "
+            f"grep -RInE {source_includes}{excluded_dirs} "
             f"-- '{safe_pattern}' '{search_root}' | sed 's|^./||'"
         )
 
@@ -377,7 +398,8 @@ def _make_inspect_ast_symbol_tool(
         if lang is None:
             return (
                 f"ERROR: No AST parser available for '{rel_path}'. "
-                "Only JS/TS files (.js, .jsx, .ts, .tsx, .mjs, .cjs) are supported."
+                "Supported extensions are JS/TS (.js, .jsx, .ts, .tsx, .mjs, .cjs) and "
+                "Python (.py when the Python grammar is available)."
             )
 
         source_bytes = content.encode("utf-8", errors="replace")

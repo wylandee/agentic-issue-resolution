@@ -10,6 +10,7 @@ from remediation_engine.contracts.schemas import (
     ScanFallbackReason,
     ScanScope,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.qa_critic import _run_global_execution
 from remediation_engine.orchestration.qa_test_parsing import (
     _QAInstallOutcome,
@@ -185,3 +186,53 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
     assert evidence.fallback_reason == ScanFallbackReason.MULTIPLE_TARGETS
     assert evidence.complete is False
     sandbox.run.assert_not_called()
+
+
+def test_python_targeted_request_uses_unsupported_manager_full_scan_fallback() -> None:
+    sandbox = MagicMock()
+    full_result = _SecurityScanResult(
+        True,
+        "python full scan",
+        set(),
+        {"CVE-2026-0001"},
+        set(),
+    )
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
+        patch(
+            "remediation_engine.orchestration._qa_runtime._resolve_targeted_closures"
+        ) as resolve_closures,
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan"
+        ) as targeted_scan,
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_security_scan",
+            return_value=full_result,
+        ) as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            scan_targets=[_target()],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    resolve_closures.assert_not_called()
+    targeted_scan.assert_not_called()
+    full_scan.assert_called_once()
+    assert full_scan.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.effective_scope == ScanScope.FULL
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER
+    assert full_scan.call_args.args[2] == {"CVE-2026-0001"}
+    assert full_scan.call_args.args[3] == {"CVE-2026-0001"}
+    assert results.scan_evidence.complete is False

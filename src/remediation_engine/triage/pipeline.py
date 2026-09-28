@@ -43,6 +43,10 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.settings import AppSettings
+from remediation_engine.tools.package_identity import (
+    normalize_python_package_name,
+    package_name_from_purl,
+)
 from remediation_engine.triage.agent import run_triage
 from remediation_engine.triage.enrichment import enrich_cves
 from remediation_engine.triage.grouper import group_issues
@@ -191,10 +195,29 @@ def _prepare_sca_issue_plans(
     issue_plans: list[tuple[LocalizedIssue, FixPlan]] = []
 
     for issue in sca_issues:
+        ecosystem = (issue.ecosystem or "").strip().casefold()
+        purl = (issue.purl or "").strip().casefold()
+        is_pypi = ecosystem in {"python", "pypi"} or purl.startswith("pkg:pypi/")
+        if is_pypi:
+            package_name = issue.package_name or package_name_from_purl(issue.purl) or ""
+            issue = issue.model_copy(
+                update={
+                    "ecosystem": "pypi",
+                    "package_name": normalize_python_package_name(package_name),
+                }
+            )
+
         localized_issue = _fallback_localized_issue(issue)
         if repo_path is not None:
             try:
-                localized_issue = locate_from_issue(issue, repo_path)
+                if is_pypi:
+                    from remediation_engine.tools.python_manifest_locator import (
+                        locate_from_issue as locate_python_from_issue,
+                    )
+
+                    localized_issue = locate_python_from_issue(issue, repo_path)
+                else:
+                    localized_issue = locate_from_issue(issue, repo_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "SCA localization failed for %s (%s); using fallback localization.",

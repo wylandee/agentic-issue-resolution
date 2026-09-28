@@ -388,6 +388,60 @@ class TestRunTriagePipeline:
         assert pairs[0][0] is localized
         assert pairs[0][1].fixed_version == "4.17.21"
 
+    @pytest.mark.parametrize(
+        ("updates", "package_name"),
+        [
+            ({"ecosystem": "python"}, "requests"),
+            ({"ecosystem": "pypi"}, "requests"),
+            ({"purl": "pkg:pypi/zope.interface"}, "zope-interface"),
+        ],
+    )
+    def test_pypi_findings_use_only_python_localizer_and_canonical_identity(
+        self, tmp_path, updates, package_name
+    ):
+        issue = _sca(package_name=updates.get("package_name", "Requests")).model_copy(
+            update=updates
+        )
+        if "purl" in updates:
+            issue = issue.model_copy(update={"package_name": None})
+        raw_plan = {
+            "status": FixPlanStatus.VERSION_FOUND.value,
+            "fixed_version": "2.32.0",
+            "workaround_snippets": None,
+            "instruction": "test plan",
+            "strategy_used": "osv_api",
+        }
+
+        def locate_python(canonical_issue, _repo_path):
+            return LocalizedIssue(
+                issue=canonical_issue,
+                manifest_file="requirements.txt",
+                is_direct_dependency=True,
+                declaration_type="requirements",
+                package_manager="pip",
+                localization_confidence=0.95,
+            )
+
+        with (
+            patch(
+                "remediation_engine.tools.python_manifest_locator.locate_from_issue",
+                side_effect=locate_python,
+            ) as python_locate,
+            patch("remediation_engine.tools.manifest_locator.locate_from_issue") as npm_locate,
+            patch("remediation_engine.tools.fix_planner.plan_fix", return_value=raw_plan),
+        ):
+            pairs = _prepare_sca_issue_plans([issue], str(tmp_path))
+
+        python_locate.assert_called_once()
+        npm_locate.assert_not_called()
+        localized = python_locate.call_args.args[0]
+        assert localized.ecosystem == "pypi"
+        assert localized.package_name == package_name
+        assert pairs[0][0].issue.ecosystem == "pypi"
+        assert pairs[0][0].issue.package_name == package_name
+        assert pairs[0][1].fixed_version == "2.32.0"
+        assert pairs[0][0].manifest_file == "requirements.txt"
+
 
 # ---------------------------------------------------------------------------
 # select_issues_for_remediation

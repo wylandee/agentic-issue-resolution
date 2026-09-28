@@ -14,10 +14,20 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.subagent_runtime import (
     ToolEvent,
+    _infer_changed_files,
+    _manifest_retry_recovery_instruction,
+    _preferred_removal_tool_name,
     _validation_gate_recovery_instruction,
     has_successful_validation_gate,
     run_bounded_subagent_loop,
 )
+
+
+def test_python_workaround_selects_python_removal_tool_name():
+    assert (
+        _preferred_removal_tool_name({"validate_python_workaround": object()})
+        == "remove_no_fix_python_dependency"
+    )
 
 
 def test_structured_terminal_output_is_returned_without_free_text() -> None:
@@ -368,6 +378,159 @@ def test_validation_pass_terminates_without_a_max_round_error() -> None:
     assert result.terminal_validation_passed is True
     assert result.errors == []
     assert "MAX_SUBAGENT_TOOL_CALL_ROUNDS" not in " ".join(result.errors)
+
+
+def test_python_validation_pass_is_terminal_and_counts_the_executed_gate() -> None:
+    edit_tool = MagicMock()
+    edit_tool.name = "deterministic_search_replace"
+    edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.py"
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_python_workaround"
+    validate_tool.invoke.return_value = (
+        "SUCCESS: Workaround validation gate passed. JSON: "
+        '{"overall_status":"PASS","validated_files":["src/auth.py"]}'
+    )
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": edit_tool.name,
+                    "args": {"file_path": "src/auth.py"},
+                    "id": "python-edit-pass",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": validate_tool.name,
+                    "args": {
+                        "modified_files": ["src/auth.py"],
+                        "runtime_smoke_file": "src/auth.py",
+                        "targeted_test_file": "tests/test_auth.py",
+                    },
+                    "id": "python-validate-pass",
+                }
+            ],
+        ),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    execution_state = {"validation_calls": 0}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [edit_tool, validate_tool],
+        [HumanMessage(content="Apply and validate the Python patch.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert bound_llm.invoke.call_count == 2
+    assert result.terminal_validation_passed is True
+    assert result.errors == []
+    assert execution_state["validation_calls"] == 1
+    assert execution_state["validation_passed"] is True
+    assert has_successful_validation_gate(result.tool_events) is True
+
+
+def test_python_validation_names_share_preflight_and_gate_attempt_limits() -> None:
+    validate_tool = MagicMock()
+    validate_tool.name = "validate_python_workaround"
+    validate_tool.invoke.side_effect = [
+        "ERROR: [INVALID_VALIDATION_INPUT] choose a valid source module",
+        "FAILURE: [INVALID_RUNTIME_SMOKE] smoke import failed",
+        'FAILURE: syntax failed\nJSON: {"overall_status":"CODE_FAILURE"}',
+        'FAILURE: pytest failed\nJSON: {"overall_status":"CODE_FAILURE"}',
+    ]
+    args = {
+        "modified_files": ["src/app.py"],
+        "runtime_smoke_file": "src/app.py",
+        "targeted_test_file": "tests/test_app.py",
+    }
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": validate_tool.name, "args": {}, "id": "python-invalid"}],
+        ),
+        *[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": validate_tool.name,
+                        "args": args,
+                        "id": f"python-gate-{index}",
+                    }
+                ],
+            )
+            for index in range(1, 4)
+        ],
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    execution_state = {"validation_calls": 0, "validation_input_errors": 0}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [validate_tool],
+        [HumanMessage(content="Validate the Python patch.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert bound_llm.invoke.call_count == 4
+    assert execution_state["validation_calls"] == 3
+    assert execution_state["validation_input_errors"] == 1
+    assert any("VALIDATION_LIMIT_REACHED" in error for error in result.errors)
+    assert any(
+        isinstance(message, HumanMessage) and "validate_python_workaround" in message.content
+        for message in bound_llm.invoke.call_args_list[1].args[0]
+    )
+    assert any(
+        isinstance(message, HumanMessage) and "validate_python_workaround" in message.content
+        for message in bound_llm.invoke.call_args_list[2].args[0]
+    )
+
+
+def test_python_targeted_test_failure_uses_shared_recovery_feedback() -> None:
+    targeted_test = MagicMock()
+    targeted_test.name = "run_targeted_python_test"
+    targeted_test.invoke.return_value = "FAILURE: Targeted test failed (pytest): tests/test_app.py"
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": targeted_test.name,
+                    "args": {"test_file": "tests/test_app.py", "test_name": "test_route"},
+                    "id": "python-targeted-failure",
+                }
+            ],
+        ),
+        AIMessage(content="I will revise the hypothesis."),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [targeted_test],
+        [HumanMessage(content="Run the targeted Python test.")],
+        set(),
+    )
+
+    assert result.errors == []
+    second_turn = bound_llm.invoke.call_args_list[1].args[0]
+    assert any(
+        isinstance(message, HumanMessage) and "Exact targeted-test result:" in message.content
+        for message in second_turn
+    )
 
 
 def test_validation_recovery_explains_checkpoint_behavior() -> None:
@@ -831,5 +994,152 @@ def test_manifest_retry_limit_is_scoped_to_one_package() -> None:
     assert result.tool_events[5].content.startswith("SUCCESS:")
     assert any(
         isinstance(message, HumanMessage) and "exhausted its 3-attempt limit" in message.content
+        for message in bound_llm.invoke.call_args_list[4].args[0]
+    )
+
+
+def test_python_manifest_success_projects_manifest_and_regenerated_lockfile() -> None:
+    event = ToolEvent(
+        name="modify_and_validate_python_dependency",
+        args={"package_name": "zope.interface", "manifest_path": "Pipfile"},
+        content=(
+            'SUCCESS: updated dependency JSON: {"changed_files": ["Pipfile", "Pipfile.lock"]}'
+        ),
+    )
+
+    assert _infer_changed_files(event) == ["Pipfile", "Pipfile.lock"]
+    recovery = _manifest_retry_recovery_instruction(
+        ToolEvent(
+            name=event.name,
+            args={
+                "package_name": "zope.interface",
+                "target_version": "6.0",
+                "dependency_type": "packages",
+            },
+            content="ERROR_CODE: SYNC_FAILED: restored both Pipfile files",
+        ),
+        attempts=1,
+    )
+    assert "modify_and_validate_python_dependency" in recovery
+    assert "modify_and_validate_npm_dependency" not in recovery
+
+
+def test_python_update_and_removal_transactions_share_turn_serialization() -> None:
+    update_tool = MagicMock()
+    update_tool.name = "modify_and_validate_python_dependency"
+    update_tool.invoke.return_value = (
+        'SUCCESS: updated package JSON: {"changed_files": ["Pipfile", "Pipfile.lock"]}'
+    )
+    removal_tool = MagicMock()
+    removal_tool.name = "remove_no_fix_python_dependency"
+    removal_tool.invoke.return_value = (
+        'SUCCESS: removed package JSON: {"changed_files": ["Pipfile", "Pipfile.lock"]}'
+    )
+
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": update_tool.name,
+                    "args": {
+                        "package_name": "zope.interface",
+                        "target_version": "6.0",
+                        "dependency_type": "packages",
+                        "manifest_path": "Pipfile",
+                    },
+                    "id": "python-update",
+                },
+                {
+                    "name": removal_tool.name,
+                    "args": {
+                        "package_name": "zope.interface",
+                        "manifest_path": "Pipfile",
+                    },
+                    "id": "python-remove-deferred",
+                },
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": removal_tool.name,
+                    "args": {
+                        "package_name": "zope.interface",
+                        "manifest_path": "Pipfile",
+                    },
+                    "id": "python-remove",
+                }
+            ],
+        ),
+        AIMessage(content="complete"),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [update_tool, removal_tool],
+        [HumanMessage(content="Update or remove the authorized dependency.")],
+        set(),
+    )
+
+    assert update_tool.invoke.call_count == 1
+    assert removal_tool.invoke.call_count == 1
+    assert result.tool_events[1].content.startswith("DEFERRED:")
+    assert set(result.changed_files) == {"Pipfile", "Pipfile.lock"}
+
+
+def test_python_manifest_retry_limit_uses_normalized_package_identity() -> None:
+    update_tool = MagicMock()
+    update_tool.name = "modify_and_validate_python_dependency"
+    update_tool.invoke.side_effect = [
+        "ERROR_CODE: EDIT_FAILED: first attempt",
+        "ERROR_CODE: EDIT_FAILED: second attempt",
+        "ERROR_CODE: EDIT_FAILED: third attempt",
+    ]
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": update_tool.name,
+                    "args": {
+                        "package_name": package,
+                        "target_version": version,
+                        "dependency_type": "dependencies",
+                    },
+                    "id": f"python-attempt-{index}",
+                }
+            ],
+        )
+        for index, (package, version) in enumerate(
+            [
+                ("Zope.Interface", "6.0.0"),
+                ("zope_interface", "6.0.1"),
+                ("zope-interface", "6.0.2"),
+                ("ZOPE-INTERFACE", "6.0.3"),
+            ],
+            start=1,
+        )
+    ] + [AIMessage(content="complete")]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [update_tool],
+        [HumanMessage(content="Update the authorized Python dependency.")],
+        set(),
+    )
+
+    assert update_tool.invoke.call_count == 3
+    assert result.tool_events[3].content.startswith("ERROR_CODE: RETRY_LIMIT_REACHED:")
+    assert any(
+        isinstance(message, HumanMessage)
+        and "modify_and_validate_python_dependency" in message.content
         for message in bound_llm.invoke.call_args_list[4].args[0]
     )

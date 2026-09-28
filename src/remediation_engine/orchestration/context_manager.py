@@ -45,9 +45,13 @@ _CRITICAL_SCRATCHPAD_TOOLS = frozenset(
     {
         "record_plan",
         "remove_no_fix_dependency",
-        "record_targeted_test_substitution",
+        "remove_no_fix_python_dependency",
+        "modify_and_validate_python_dependency",
         "deterministic_apply_edit_set",
         "validate_workaround",
+        "validate_python_workaround",
+        "run_targeted_python_test",
+        "validate_python_syntax",
         "emit_qa_evaluation",
     }
 )
@@ -80,16 +84,22 @@ PHASE_TOOL_REGISTRY: dict[WorkaroundExecutionPhase, frozenset[str]] = {
             "revert_workspace_file",
             "read_workspace_file",
             "search_codebase_pattern",
+            "modify_and_validate_python_dependency",
             "remove_no_fix_dependency",
+            "remove_no_fix_python_dependency",
         }
     ),
     WorkaroundExecutionPhase.VALIDATE: frozenset(
         {
             "read_repository_map",
             "validate_workaround",
+            "validate_python_workaround",
+            "validate_python_syntax",
+            "run_targeted_python_test",
             "record_targeted_test_substitution",
             "read_workspace_file",
             "remove_no_fix_dependency",
+            "remove_no_fix_python_dependency",
         }
     ),
 }
@@ -496,7 +506,10 @@ class ScratchpadMemory:
                 else ""
             )
             key_findings.append(_clean_text(f"atomic edit: {status}{summary}", 500))
-        elif event_name == "remove_no_fix_dependency":
+        elif event_name in {
+            "remove_no_fix_dependency",
+            "remove_no_fix_python_dependency",
+        }:
             package = _clean_text(_arg(args, "requested_package", "package_name"), 180)
             manifest = _normalize_path(_arg(args, "manifest_path", "file_path"))
             if manifest:

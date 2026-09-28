@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.accessors import model_or_dict_value
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import ChangedFilesProjection, OrchestratorState
 from remediation_engine.orchestration.task_utils import (
     effective_group_status,
@@ -441,8 +442,15 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                 target_package = getattr(task, "target_package_name", None)
                 if target_package:
                     unfixable_packages.add(target_package)
-
     files_to_exclude = unfixable_files - passed_files
+
+    raw_language = state.get("project_language", ProjectLanguage.NODEJS)
+    project_language = (
+        raw_language
+        if isinstance(raw_language, ProjectLanguage)
+        else ProjectLanguage(raw_language or ProjectLanguage.NODEJS.value)
+    )
+    sandbox_image = LANGUAGE_CONFIGS[project_language].docker_image
 
     try:
         if candidate_changed_files and workspace_volume and repo_root_str:
@@ -455,6 +463,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                 try:
                     with DockerSandbox(
                         repo_root=None,
+                        image=sandbox_image,
                         workspace_volume=workspace_volume,
                     ) as sandbox:
                         # Attempt archives are internal transaction state and

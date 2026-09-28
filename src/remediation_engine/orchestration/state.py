@@ -47,6 +47,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
+from remediation_engine.language import ProjectLanguage, resolve_project_language
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
     normalize_workspace_path,
@@ -328,6 +329,7 @@ class OrchestratorState(TypedDict, total=False):
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
+    project_language: ProjectLanguage
 
     constraints_ledger: Annotated[list[str], operator.add]
     retry_counts: Annotated[dict[str, int], merge_dict_reducer]
@@ -404,6 +406,7 @@ class SubagentState(TypedDict, total=False):
 
     repo_root: str
     workspace_volume: str
+    project_language: ProjectLanguage
 
     target_tasks: list[RemediationTask]
     target_groups: list[VulnerabilityGroup]
@@ -433,8 +436,17 @@ def initial_orchestrator_state(
     valid_groups: list[VulnerabilityGroup],
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
+    project_language: ProjectLanguage | None = None,
 ) -> dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
+    resolved_project_language = (
+        project_language
+        if project_language is not None
+        else resolve_project_language(
+            Path(repo_root),
+            system_context.primary_language if system_context is not None else None,
+        )
+    )
     valid_groups = normalize_group_paths(valid_groups, repo_root)
     baseline_scan_identifiers = (
         _scan_identifiers_from_issues(issues)
@@ -443,6 +455,7 @@ def initial_orchestrator_state(
     )
     state: dict[str, Any] = {
         "repo_root": repo_root,
+        "project_language": resolved_project_language,
         "run_id": "",
         "valid_groups": valid_groups,
         "initial_valid_groups": list(valid_groups),
@@ -516,6 +529,7 @@ def initial_update_subagent_state(
     retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot] | None = None,
     messages: Sequence[Any] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> dict[str, Any]:
     """Build the initial update-worker state from committed task inputs."""
     target_tasks_list = list(target_tasks)
@@ -537,6 +551,7 @@ def initial_update_subagent_state(
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
+        "project_language": project_language,
         "target_tasks": target_tasks_list,
         "target_groups": target_groups_list,
         "feedback_by_group": feedback_by_group_dict,
@@ -560,11 +575,13 @@ def initial_workaround_subagent_state(
     previous_feedback: str | None = None,
     attempt_snapshot: TaskAttemptSnapshot | None = None,
     current_replay_plan: WorkaroundReplayPlan | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> dict[str, Any]:
     """Build a well-formed single-task workaround ``SubagentState`` dict."""
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
+        "project_language": project_language,
         "target_task": target_task,
         "target_group": target_group,
         "constraints_ledger": list(constraints_ledger or []),

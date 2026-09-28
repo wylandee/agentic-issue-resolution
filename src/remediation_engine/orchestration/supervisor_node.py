@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from semantic_version import Version as SemVerVersion
+
 from remediation_engine.contracts.decision_codes import (
     DecisionCode,
     validate_transition,
@@ -45,6 +47,7 @@ from remediation_engine.contracts.schemas import (
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -62,6 +65,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.version_policy import registry_version_key
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
@@ -73,7 +77,9 @@ from remediation_engine.orchestration.supervisor_planner import (
     _build_deterministic_retry_plan,
     _build_high_level_retry_instruction,
     _commit_retry_plans,
+    _group_ecosystem,
     _needs_planner,
+    _normalise_candidate_version,
     _override_dependency_type,
     _planner_plan_violations,
     _repair_invalid_planner_plans,
@@ -113,6 +119,7 @@ from remediation_engine.orchestration.supervisor_spawn import (
     _terminalize_pivot_parents,
 )
 from remediation_engine.orchestration.tactical_supervisor import (
+    TacticalCandidateSet,
     TacticalDiagnosticKind,
     _approved_candidate_pool,
     _portfolio_escalation_required,
@@ -131,6 +138,7 @@ from remediation_engine.orchestration.task_utils import (
     is_no_fix_group,
     is_transitive_group,
 )
+from remediation_engine.tools.package_identity import normalize_python_package_name
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +223,7 @@ def _ordered_update_candidates(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    ecosystem: str = "npm",
 ) -> tuple[list[str], list[str]]:
     """Build immutable version and dependency-type candidates for an update attempt."""
     selected_version = (
@@ -222,50 +231,79 @@ def _ordered_update_candidates(
         if plan is not None and plan.selected_version
         else task.selected_version
     )
-    attempted_version_values = [
-        *(diagnostics.attempted_versions if diagnostics else []),
-        *(plan.attempted_versions if plan else []),
-    ]
-    attempted_versions = {item.strip().lstrip("vV") for item in attempted_version_values if item}
-    if plan is not None:
-        candidate_versions = list(plan.candidate_versions_considered)
-    elif diagnostics is not None:
-        candidate_versions = list(diagnostics.candidate_versions_considered)
-    else:
-        candidate_versions = []
-
-    # A selected version is only dispatchable when it belongs to the
-    # Supervisor-approved candidate pool.  Never let a stale task field widen
-    # that pool after a planner or registry result has been committed.
-    normalized_candidates = [
-        version.strip().lstrip("vV")
-        for version in candidate_versions
-        if isinstance(version, str) and version.strip()
-    ]
-    candidate_pool = set(normalized_candidates)
-    selected_candidate = (
-        selected_version.strip().lstrip("vV")
-        if isinstance(selected_version, str) and selected_version.strip()
-        else None
+    candidate_versions = (
+        list(plan.candidate_versions_considered)
+        if plan is not None
+        else list(diagnostics.candidate_versions_considered)
+        if diagnostics is not None
+        else []
     )
+
+    def version_key(value: str) -> tuple[int, object] | None:
+        normalized = _normalise_candidate_version(value, ecosystem)
+        if not normalized:
+            return None
+        if ecosystem == "pypi":
+            return registry_version_key(normalized, ecosystem)
+        try:
+            parsed = SemVerVersion(normalized)
+        except ValueError:
+            return None
+        return registry_version_key(
+            normalized,
+            ecosystem,
+            (parsed.major, parsed.minor, parsed.patch),
+        )
+
+    normalized_candidates: list[str] = []
+    candidate_keys: set[tuple[int, object]] = set()
+    for version in candidate_versions:
+        if not isinstance(version, str) or not version.strip():
+            continue
+        normalized = _normalise_candidate_version(version, ecosystem)
+        key = version_key(normalized)
+        if normalized and key is not None and key not in candidate_keys:
+            candidate_keys.add(key)
+            normalized_candidates.append(normalized)
+    selected_candidate = (
+        _normalise_candidate_version(selected_version, ecosystem)
+        if isinstance(selected_version, str) and selected_version.strip()
+        else ""
+    )
+    selected_key = version_key(selected_candidate) if selected_candidate else None
     ordered_versions = (
         [selected_candidate, *normalized_candidates]
-        if selected_candidate in candidate_pool
+        if selected_key is not None and selected_key in candidate_keys
         else normalized_candidates
     )
 
+    attempted_values = [
+        *(diagnostics.attempted_versions if diagnostics else []),
+        *(plan.attempted_versions if plan else []),
+    ]
+    if ecosystem == "pypi" and diagnostics is not None and task.target_package_name:
+        target = normalize_python_package_name(task.target_package_name)
+        scoped_attempts = [
+            version
+            for package_name, versions in diagnostics.attempted_versions_by_target.items()
+            if normalize_python_package_name(package_name) == target
+            for version in versions
+        ]
+        attempted_values.extend(scoped_attempts)
+    attempted_keys = {
+        key
+        for value in attempted_values
+        if isinstance(value, str) and (key := version_key(value)) is not None
+    }
     allowed_versions: list[str] = []
-    seen_versions: set[str] = set()
+    seen_keys: set[tuple[int, object]] = set()
     for version in ordered_versions:
-        if not version:
+        key = version_key(version)
+        if key is None or key in seen_keys or key in attempted_keys:
             continue
-        normalized = version.strip().lstrip("vV")
-        if not normalized or normalized in seen_versions:
-            continue
-        if normalized in attempted_versions:
-            continue
-        seen_versions.add(normalized)
-        allowed_versions.append(normalized)
+        seen_keys.add(key)
+        allowed_versions.append(_normalise_candidate_version(version, ecosystem))
+
     selected_type = (
         (plan.target_dependency_type if plan is not None else None)
         or task.target_dependency_type
@@ -293,9 +331,7 @@ def _ordered_update_candidates(
         if not dependency_type:
             continue
         normalized = str(dependency_type).strip()
-        if normalized in attempted_types:
-            continue
-        if normalized and normalized not in seen_types:
+        if normalized not in attempted_types and normalized not in seen_types:
             seen_types.add(normalized)
             allowed_types.append(normalized)
     return allowed_versions, allowed_types
@@ -315,21 +351,16 @@ def _authorize_update_dispatch(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    ecosystem: str = "npm",
 ) -> _UpdateDispatchAuthorization | None:
-    """Return a dispatch authorization or reject incomplete update state.
-
-    Update workers may only receive a candidate pool that came from the
-    committed retry plan or retry diagnostics.  A selected task version by
-    itself is not sufficient registry provenance.
-    """
+    """Return a dispatch authorization or reject incomplete update state."""
     allowed_versions, allowed_dependency_types = _ordered_update_candidates(
         task,
         plan=plan,
         diagnostics=diagnostics,
+        ecosystem=ecosystem,
     )
-    if not task.instruction.strip():
-        return None
-    if not allowed_versions:
+    if not task.instruction.strip() or not allowed_versions:
         return None
     expected_package = (
         plan.target_package_name
@@ -345,20 +376,34 @@ def _authorize_update_dispatch(
         if diagnostics is not None
         else None
     )
-    if expected_package and task.target_package_name != expected_package:
+    if ecosystem == "pypi":
+        if expected_package:
+            expected_package = normalize_python_package_name(expected_package)
+        task_package = (
+            normalize_python_package_name(task.target_package_name)
+            if task.target_package_name
+            else None
+        )
+    else:
+        task_package = task.target_package_name
+    if expected_package and task_package != expected_package:
         return None
     if expected_type and task.target_dependency_type != expected_type:
         return None
     plan_version = (
-        plan.selected_version.strip().lstrip("vV")
+        _normalise_candidate_version(plan.selected_version, ecosystem)
         if plan is not None and plan.selected_version
-        else None
+        else ""
     )
-    task_version = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    task_version = (
+        _normalise_candidate_version(task.selected_version, ecosystem)
+        if task.selected_version
+        else ""
+    )
     if plan_version and task_version != plan_version:
         return None
     selected_version = plan_version or task_version
-    if selected_version is None or selected_version not in set(allowed_versions):
+    if not selected_version or selected_version not in set(allowed_versions):
         return None
     return _UpdateDispatchAuthorization(
         selected_version=selected_version,
@@ -610,6 +655,9 @@ def _commit_registry_resolution_fallback(
         "selected_version": resolved_task.selected_version,
         "target_package_name": resolved_task.target_package_name,
         "target_dependency_type": target_type,
+        "parent_package_name": resolved_task.parent_package_name,
+        "parent_package_version": resolved_task.parent_package_version,
+        "parent_minimum_version": resolved_task.parent_minimum_version,
         "instruction": resolved_task.instruction,
     }
     if staged_resolutions is not None:
@@ -1121,21 +1169,38 @@ def _qa_evidence_indicates_test_regression(
             *(evidence.source_locations or []),
         ]
     ).lower()
-    return any(
-        marker in text
-        for marker in (
-            "npm test",
-            "test failed",
-            "tests failed",
-            "typecheck",
-            "compile failed",
-            "build failed",
-            "is not a function",
-            "typeerror",
-            "/test/",
-            "\\test\\",
-        )
+    regression_markers = (
+        "test failed",
+        "tests failed",
+        "assertionerror",
+        "pytest",
+        "npm test",
+        "unit test",
+        "test suite",
+        "mocha",
+        "jest",
+        "vitest",
     )
+    return any(marker in text for marker in regression_markers)
+
+
+_ATTEMPT_INPUT_FIELDS = frozenset(
+    {
+        "task_revision",
+        "strategy_stage",
+        "selected_version",
+        "exhausted_update_path",
+        "instruction",
+        "strategy",
+        "no_fix_stage",
+        "qa_policy",
+        "target_package_name",
+        "target_dependency_type",
+        "parent_package_name",
+        "parent_package_version",
+        "parent_minimum_version",
+    }
+)
 
 
 def _workaround_task_ancestry(
@@ -1657,6 +1722,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and task.current_attempt_id is None
             and group is not None
             and is_transitive_group(group)
+            and _group_ecosystem(group) != "pypi"
         ):
             parent_name, parent_version, parent_type = group_parent_context(group)
             if parent_name and task.parent_package_name != parent_name:
@@ -1914,6 +1980,20 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     snapshot.target_dependency_type
                     or task.target_dependency_type
                     or (parent_type if group is not None and is_transitive_group(group) else None)
+                )
+            ecosystem = _group_ecosystem(group)
+            if ecosystem == "pypi":
+                target_package_name = (
+                    normalize_python_package_name(target_package_name)
+                    if target_package_name
+                    else None
+                )
+                attempted_versions = list(
+                    dict.fromkeys(
+                        normalized
+                        for value in attempted_versions
+                        if (normalized := _normalise_candidate_version(value, ecosystem))
+                    )
                 )
             attempted_versions_by_target = dict(prior.attempted_versions_by_target)
             if target_package_name and attempted_versions:
@@ -2441,6 +2521,144 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             decision = deterministic_target_decision
         else:
             target_group = group_by_id.get(target_task.parent_group_id)
+            if (
+                target_group is not None
+                and _group_ecosystem(target_group) == "pypi"
+                and is_transitive_group(target_group)
+                and target_task.strategy == RoutingStrategy.VERSION_BUMP
+                and target_task.status == TaskStatus.PENDING
+                and target_task.current_attempt_id is None
+            ):
+                initial_candidates: list[str] = []
+                planned = _plan_initial_transitive_task(
+                    target_task,
+                    target_group,
+                    candidate_versions=initial_candidates,
+                    workspace_volume=state.get("workspace_volume"),
+                )
+                security_floor, _floor_error = _canonical_security_floor(target_group)
+                selected = _normalise_candidate_version(planned.selected_version, "pypi")
+                candidate_pool = list(
+                    dict.fromkeys(
+                        normalized
+                        for value in initial_candidates
+                        if (normalized := _normalise_candidate_version(value, "pypi"))
+                    )
+                )
+                if selected and selected not in candidate_pool:
+                    candidate_pool.append(selected)
+                if (
+                    planned.strategy == RoutingStrategy.VERSION_BUMP
+                    and selected
+                    and candidate_pool
+                    and security_floor
+                    and planned.target_package_name
+                    and planned.target_dependency_type
+                ):
+                    candidate_set = TacticalCandidateSet(
+                        strategy=TacticalStrategy.VERSION_BUMP,
+                        target_package_name=normalize_python_package_name(
+                            planned.target_package_name
+                        ),
+                        dependency_type=planned.target_dependency_type,
+                        security_floor=security_floor,
+                        versions=tuple(candidate_pool),
+                        canonical_version=selected,
+                    )
+                    decision = _commit_registry_resolution_fallback(
+                        task_queue,
+                        planned,
+                        target_group,
+                        None,
+                        retry_diagnostics_by_task,
+                        retry_plans_by_task,
+                        [candidate_set],
+                        consistency_events=consistency_events,
+                        errors=errors,
+                        staged_resolutions=staged_tactical_resolutions,
+                    )
+                    if decision is None:
+                        detail = (
+                            f"Supervisor could not commit the proven Pipfile parent candidate "
+                            f"for task {target_task.task_id}."
+                        )
+                        errors.append(f"supervisor: {detail}")
+                        decision = SupervisorDecision(
+                            decision_code=DecisionCode.REGISTRY_VERIFICATION_PENDING,
+                            next_node="final_full_scan",
+                            target_task_ids=[],
+                            task_status_updates={target_task.task_id: TaskStatus.INCONCLUSIVE},
+                            instructions=detail,
+                            decision_reason=detail,
+                        )
+                else:
+                    instruction = planned.instruction
+                    if planned.strategy != RoutingStrategy.CODE_WORKAROUND:
+                        planned = planned.model_copy(
+                            update={
+                                "strategy": RoutingStrategy.CODE_WORKAROUND,
+                                "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+                                "qa_policy": QAPolicy.INITIAL_CODE_WORKAROUND,
+                                "target_package_name": None,
+                                "target_dependency_type": None,
+                                "parent_package_name": None,
+                                "parent_package_version": None,
+                                "parent_minimum_version": None,
+                                "selected_version": None,
+                                "exhausted_update_path": True,
+                                "instruction": (
+                                    f"No unique direct Pipfile parent could be proven for "
+                                    f"{target_group.vulnerable_component}; use a code workaround "
+                                    "or report no fix. Do not pin the vulnerable child, edit a "
+                                    "package override, or guess a parent."
+                                ),
+                            }
+                        )
+                        instruction = planned.instruction
+                    committed = _commit_task_transition(
+                        task_queue,
+                        target_task.task_id,
+                        updates={
+                            "strategy": RoutingStrategy.CODE_WORKAROUND,
+                            "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+                            "qa_policy": QAPolicy.INITIAL_CODE_WORKAROUND,
+                            "target_package_name": None,
+                            "target_dependency_type": None,
+                            "parent_package_name": None,
+                            "parent_package_version": None,
+                            "parent_minimum_version": None,
+                            "selected_version": None,
+                            "exhausted_update_path": True,
+                            "instruction": instruction,
+                        },
+                        consistency_events=consistency_events,
+                    )
+                    if committed is not None:
+                        decision = SupervisorDecision(
+                            decision_code=DecisionCode.WORKAROUND_DISPATCH,
+                            next_node="workaround_subagent",
+                            target_task_ids=[committed.task_id],
+                            revised_instructions={committed.task_id: committed.instruction},
+                            instructions=committed.instruction,
+                            decision_reason=(
+                                "Supervisor could not prove a unique one-hop PyPI parent; "
+                                "the task is routed to a code workaround without a package target."
+                            ),
+                        )
+                    else:
+                        detail = (
+                            f"Supervisor could not commit fail-closed PyPI parent handling "
+                            f"for task {target_task.task_id}."
+                        )
+                        errors.append(f"supervisor: {detail}")
+                        decision = SupervisorDecision(
+                            decision_code=DecisionCode.REGISTRY_VERIFICATION_PENDING,
+                            next_node="final_full_scan",
+                            target_task_ids=[],
+                            task_status_updates={target_task.task_id: TaskStatus.INCONCLUSIVE},
+                            instructions=detail,
+                            decision_reason=detail,
+                        )
             target_evaluation = qa_evaluations.get(target_task.task_id)
             target_worker_result = next(
                 (
@@ -2469,21 +2687,22 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             # The tactical layer receives exactly the target selected by the
             # deterministic router.  It cannot scan the queue and drift to a
             # different task because another task happens to be workable.
-            tactical_decision = _apply_tactical_supervisor(
-                task_queue,
-                group_by_id,
-                qa_evaluations,
-                retry_diagnostics_by_task,
-                retry_plans_by_task,
-                worker_results_by_attempt,
-                attempt_snapshots_by_id,
-                target_task_id=target_task_id,
-                consistency_events=consistency_events,
-                errors=errors,
-                staged_resolutions=staged_tactical_resolutions,
-            )
-            if tactical_decision is not None:
-                decision = tactical_decision
+            if decision is None:
+                tactical_decision = _apply_tactical_supervisor(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    retry_plans_by_task,
+                    worker_results_by_attempt,
+                    attempt_snapshots_by_id,
+                    target_task_id=target_task_id,
+                    consistency_events=consistency_events,
+                    errors=errors,
+                    staged_resolutions=staged_tactical_resolutions,
+                )
+                if tactical_decision is not None:
+                    decision = tactical_decision
 
     if decision is None and _needs_planner(
         task_queue,
@@ -2502,11 +2721,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             }
             or tactical_fallback_requires_stage_advance,
             target_task_ids=[target_task_id] if target_task_id else None,
+            workspace_volume=state.get("workspace_volume"),
         )
         planner_violations = _planner_plan_violations(
             parsed_plans,
             task_queue,
             parsed_diagnostics,
+            group_by_id,
         )
         if planner_violations:
             errors.extend(
@@ -2524,6 +2745,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 parsed_plans,
                 task_queue,
                 parsed_diagnostics,
+                group_by_id,
             )
             if repair_violations:
                 errors.extend(
@@ -2531,7 +2753,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     for violation in repair_violations
                 )
         retry_diagnostics_by_task = parsed_diagnostics
-        if not _planner_plan_violations(parsed_plans, task_queue, parsed_diagnostics):
+        if not _planner_plan_violations(
+            parsed_plans,
+            task_queue,
+            parsed_diagnostics,
+            group_by_id,
+        ):
             _commit_retry_plans(
                 task_queue,
                 retry_diagnostics_by_task,
@@ -2896,6 +3123,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         recovery_tasks,
                         group_by_id,
                         recovery_inputs,
+                        workspace_volume=state.get("workspace_volume"),
                     )
                     retry_diagnostics_by_task.update(recovered_diagnostics)
                     _commit_retry_plans(
@@ -3327,39 +3555,45 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task,
                 plan=plan,
                 diagnostics=diagnostics,
+                ecosystem=_group_ecosystem(group_by_id.get(task.parent_group_id)),
             )
-            if authorization is None and task.strategy == RoutingStrategy.VERSION_BUMP:
-                group = group_by_id.get(task.parent_group_id)
-                if group is not None:
-                    recovery_input = diagnostics or UpdateRetryDiagnostics(
-                        task_id=task_id,
-                        strategy_stage=task.strategy_stage,
-                    )
-                    recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
-                        {task_id: task},
-                        {task.parent_group_id: group},
-                        {task_id: recovery_input},
-                    )
-                    if not _planner_plan_violations(
+            if (
+                authorization is None
+                and task.strategy == RoutingStrategy.VERSION_BUMP
+                and group is not None
+            ):
+                recovery_input = diagnostics or UpdateRetryDiagnostics(
+                    task_id=task_id,
+                    strategy_stage=task.strategy_stage,
+                )
+                recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
+                    {task_id: task},
+                    {task.parent_group_id: group},
+                    {task_id: recovery_input},
+                    workspace_volume=state.get("workspace_volume"),
+                )
+                if not _planner_plan_violations(
+                    recovered_plans,
+                    {task_id: task},
+                    recovered_diagnostics,
+                    {task.parent_group_id: group},
+                ):
+                    retry_diagnostics_by_task.update(recovered_diagnostics)
+                    _commit_retry_plans(
+                        task_queue,
+                        retry_diagnostics_by_task,
+                        retry_plans_by_task,
                         recovered_plans,
-                        {task_id: task},
-                        recovered_diagnostics,
-                    ):
-                        retry_diagnostics_by_task.update(recovered_diagnostics)
-                        _commit_retry_plans(
-                            task_queue,
-                            retry_diagnostics_by_task,
-                            retry_plans_by_task,
-                            recovered_plans,
-                        )
-                        task = task_queue.get(task_id)
-                        plan = retry_plans_by_task.get(task_id)
-                        diagnostics = retry_diagnostics_by_task.get(task_id)
-                        authorization = _authorize_update_dispatch(
-                            task,
-                            plan=plan,
-                            diagnostics=diagnostics,
-                        )
+                    )
+                    task = task_queue.get(task_id)
+                    plan = retry_plans_by_task.get(task_id)
+                    diagnostics = retry_diagnostics_by_task.get(task_id)
+                    authorization = _authorize_update_dispatch(
+                        task,
+                        plan=plan,
+                        diagnostics=diagnostics,
+                        ecosystem=_group_ecosystem(group_by_id.get(task.parent_group_id)),
+                    )
             if authorization is not None:
                 update_dispatch_authorizations[task_id] = authorization
                 dispatchable_update_ids.append(task_id)
@@ -3500,8 +3734,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             plan = retry_plans_by_task.get(task_id)
             workaround_ctx = None
             if resolved_next_node == "workaround_subagent":
-                attempts = _attempts_for_task(attempt_snapshots_by_id, task_id)
                 parent_task_ids = _workaround_task_ancestry(task, task_queue)
+                has_prior_attempt = bool(
+                    _attempts_for_task(attempt_snapshots_by_id, task_id)
+                ) or any(
+                    _attempts_for_task(attempt_snapshots_by_id, parent_id)
+                    for parent_id in parent_task_ids
+                )
                 evidence = _qa_failure_evidence_for_workaround_retry(
                     task_id,
                     qa_evaluations,
@@ -3510,7 +3749,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
                 phase = (
                     WorkaroundPhase.QA_REGRESSION_REPAIR
-                    if attempts or _qa_evidence_indicates_test_regression(evidence)
+                    if has_prior_attempt or _qa_evidence_indicates_test_regression(evidence)
                     else WorkaroundPhase.INITIAL_MITIGATION
                 )
                 group = next(
@@ -3544,6 +3783,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     task,
                     plan=plan,
                     diagnostics=retry_diagnostics_by_task.get(task_id),
+                    ecosystem=_group_ecosystem(group_by_id.get(task.parent_group_id)),
                 )
                 if update_authorization is None:
                     errors.append(

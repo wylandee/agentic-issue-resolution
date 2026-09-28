@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +17,7 @@ from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.trajectory_exporter import (
     invoke_with_trajectory,
 )
+from remediation_engine.tools.package_identity import normalize_python_package_name
 
 MAX_SUBAGENT_TOOL_CALL_ROUNDS = 24
 MAX_VALIDATION_GATE_ATTEMPTS = 3
@@ -24,11 +25,51 @@ MAX_VALIDATION_INPUT_ERRORS = 3
 MAX_UPDATE_MANIFEST_ATTEMPTS = 3
 SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
-_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
+_UPDATE_MANIFEST_TOOL_NAMES = frozenset(
+    {"modify_and_validate_npm_dependency", "modify_and_validate_python_dependency"}
+)
+_PYTHON_MANIFEST_TRANSACTION_TOOL_NAMES = frozenset(
+    {"modify_and_validate_python_dependency", "remove_no_fix_python_dependency"}
+)
 
 # Manifest mutations and validation form a single ordered transaction. The
 # worker must observe the result of one operation before issuing the next.
-_SERIAL_MANIFEST_TOOL_NAMES = frozenset({_UPDATE_MANIFEST_TOOL_NAME})
+_SERIAL_MANIFEST_TOOL_NAMES = _UPDATE_MANIFEST_TOOL_NAMES | frozenset(
+    {"remove_no_fix_python_dependency"}
+)
+_WORKAROUND_VALIDATION_TOOL_NAMES = frozenset({"validate_workaround", "validate_python_workaround"})
+_TARGETED_TEST_TOOL_NAMES = frozenset({"run_targeted_test", "run_targeted_python_test"})
+
+
+def _is_workaround_validation_tool(tool_name: str) -> bool:
+    return tool_name in _WORKAROUND_VALIDATION_TOOL_NAMES
+
+
+def _preferred_validation_tool_name(
+    tool_names: Mapping[str, Any] | Sequence[str] | set[str],
+) -> str:
+    if "validate_python_workaround" in tool_names and "validate_workaround" not in tool_names:
+        return "validate_python_workaround"
+    return "validate_workaround"
+
+
+def _preferred_removal_tool_name(
+    tool_names: Mapping[str, Any] | Sequence[str] | set[str],
+) -> str:
+    """Return the package-removal tool name matching the worker language."""
+    if "remove_no_fix_dependency" not in tool_names and (
+        "remove_no_fix_python_dependency" in tool_names
+        or "validate_python_workaround" in tool_names
+    ):
+        return "remove_no_fix_python_dependency"
+    return "remove_no_fix_dependency"
+
+
+def _manifest_package_key(tool_name: str, package_name: Any) -> str:
+    package = str(package_name or "").strip()
+    if tool_name in _PYTHON_MANIFEST_TRANSACTION_TOOL_NAMES:
+        return normalize_python_package_name(package)
+    return package
 
 
 @dataclass(frozen=True)
@@ -74,35 +115,47 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
                 json_part = tool_event.content.split("JSON:", 1)[1].strip()
                 data = json.loads(json_part)
                 if isinstance(data, dict) and "affected_files" in data:
-                    return [str(f).replace("\\", "/").lstrip("/") for f in data["affected_files"]]
-            except Exception:
+                    return [
+                        str(path).replace("\\", "/").lstrip("/") for path in data["affected_files"]
+                    ]
+            except (TypeError, ValueError):
                 pass
-        repls = tool_event.args.get("replacements", [])
-        if isinstance(repls, str):
+        replacements = tool_event.args.get("replacements", [])
+        if isinstance(replacements, str):
             try:
-                repls = json.loads(repls)
-            except Exception:
-                repls = []
-        if isinstance(repls, list):
-            res = []
-            for r in repls:
-                if isinstance(r, dict) and "file_path" in r:
-                    res.append(str(r["file_path"]).replace("\\", "/").lstrip("/"))
-            return res
+                replacements = json.loads(replacements)
+            except (TypeError, ValueError):
+                replacements = []
+        if isinstance(replacements, list):
+            return [
+                str(item["file_path"]).replace("\\", "/").lstrip("/")
+                for item in replacements
+                if isinstance(item, dict) and isinstance(item.get("file_path"), str)
+            ]
 
-    if tool_event.name == _UPDATE_MANIFEST_TOOL_NAME:
-        # Deferred and failed transactions did not leave a committed file
-        # change. The combined tool's SUCCESS result is the authoritative
-        # changed-file signal.
-        if not tool_event.content.lstrip().startswith("SUCCESS:"):
+    if tool_event.name in _PYTHON_MANIFEST_TRANSACTION_TOOL_NAMES:
+        if "JSON:" not in tool_event.content:
             return []
+        try:
+            payload = json.loads(tool_event.content.split("JSON:", 1)[1].strip())
+        except (TypeError, ValueError):
+            return []
+        changed_files = payload.get("changed_files") if isinstance(payload, dict) else None
+        if not isinstance(changed_files, list):
+            return []
+        return [
+            path.replace("\\", "/").lstrip("/")
+            for path in changed_files
+            if isinstance(path, str) and path.strip()
+        ]
+
+    if tool_event.name == "modify_and_validate_npm_dependency":
         manifest_path = tool_event.args.get("manifest_path", "package.json")
         if isinstance(manifest_path, str) and manifest_path.strip():
             return [manifest_path.replace("\\", "/")]
         return ["package.json"]
 
     if tool_event.name in {
-        "deterministic_apply_edit_set",
         "deterministic_search_replace",
         "deterministic_replace_ast_symbol",
         "revert_workspace_file",
@@ -202,6 +255,11 @@ def _manifest_retry_recovery_instruction(
 ) -> str:
     """Build the next-step instruction after a failed update transaction."""
     package_name = str(tool_event.args.get("package_name", "")).strip() or "the same package"
+    transaction_name = (
+        tool_event.name
+        if tool_event.name in _UPDATE_MANIFEST_TOOL_NAMES
+        else "manifest transaction"
+    )
     current_version = (
         str(tool_event.args.get("target_version", "")).strip() or "the current version"
     )
@@ -214,18 +272,20 @@ def _manifest_retry_recovery_instruction(
     )
     if attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS:
         return (
-            f"The update transaction for {package_name} has exhausted its {MAX_UPDATE_MANIFEST_ATTEMPTS}-attempt limit. "
-            "Do not call modify_and_validate_npm_dependency for this package again; continue with the next independent task "
-            "or surrender this package.\n"
+            f"The update transaction for {package_name} has exhausted its "
+            f"{MAX_UPDATE_MANIFEST_ATTEMPTS}-attempt limit. Do not call "
+            f"{transaction_name} for this package again; continue with the next "
+            "independent task or surrender this package.\n"
             f"Exact transaction result:\n{evidence}"
         )
     return (
         f"The combined manifest transaction for {package_name} failed on attempt {attempts} with "
         f"target_version={current_version!r}, dependency_type={current_type!r}.\n"
         f"Exact transaction result:\n{evidence}\n"
-        "Call modify_and_validate_npm_dependency again for the same Supervisor-owned package and manifest, "
-        "but change target_version or dependency_type to a different value from the Supervisor-approved candidate lists. "
-        "Do not query the registry, edit source files, or repeat the exact same call signature."
+        f"Call {transaction_name} again for the same Supervisor-owned package and manifest, "
+        "but change target_version or dependency_type to a different value from the "
+        "Supervisor-approved candidate lists. Do not query the registry, edit source files, "
+        "or repeat the exact same call signature."
     )
 
 
@@ -244,6 +304,11 @@ def _stagnation_recovery_instruction(
             "An imported identifier or package binding is not an AST symbol. Use search_codebase_pattern "
             "to find the call site, then inspect the enclosing declared function/class, or use "
             "read_workspace_file and document the fallback in record_plan."
+        )
+    elif tool_name == "run_targeted_python_test":
+        alternative = (
+            "Verify the test path is relative and the pytest runner is supported, or proceed with "
+            "AST inspection and syntax validation."
         )
     elif tool_name == "run_targeted_test":
         alternative = (
@@ -282,7 +347,11 @@ def _targeted_test_recovery_instruction(tool_content: str) -> str:
     )
 
 
-def _validation_gate_recovery_instruction(tool_content: str) -> str:
+def _validation_gate_recovery_instruction(
+    tool_content: str,
+    *,
+    validation_tool_name: str = "validate_workaround",
+) -> str:
     """Build a recovery message from a failed combined validation gate."""
     evidence = (
         tool_content.strip()[:2400] or "The validation gate failed without diagnostic output."
@@ -293,7 +362,7 @@ def _validation_gate_recovery_instruction(tool_content: str) -> str:
             "The validation request used an invalid runtime smoke target. Do not edit the code again. "
             "Choose a lightweight repository source module (for example, the changed source module), "
             "never a test/spec file or build/dist artifact, and keep it separate from the targeted test. "
-            "Call validate_workaround again with the corrected runtime_smoke_file.\n"
+            f"Call {validation_tool_name} again with the corrected runtime_smoke_file.\n"
             f"Exact validation-gate result:\n{evidence}"
         )
     if "Runtime smoke gate unavailable" in evidence or "Command timed out after" in evidence:
@@ -369,49 +438,51 @@ def _validation_request_signature(args: dict[str, Any]) -> str:
     return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
-def _validation_input_recovery_instruction(tool_content: str) -> str:
+def _validation_input_recovery_instruction(
+    tool_content: str,
+    *,
+    validation_tool_name: str = "validate_workaround",
+    removal_tool_name: str = "remove_no_fix_dependency",
+) -> str:
     """Build recovery guidance for a validation request rejected before gate execution."""
     evidence = str(tool_content or "").strip()[:2400]
     if "[PACKAGE_REMOVAL]" in evidence and (
-        "remove_no_fix_dependency" in evidence or "configured dependency" in evidence
+        "remove_no_fix_dependency" in evidence
+        or "remove_no_fix_python_dependency" in evidence
+        or "configured dependency" in evidence
     ):
         return (
             "The validation request was rejected because the NO_FIX package-removal plan is "
             "incomplete. Do not edit or re-plan the source patch. Ensure both required successful "
-            "operations have been performed: call remove_no_fix_dependency for the configured "
+            f"operations have been performed: call {removal_tool_name} for the configured "
             "package and deterministic_apply_edit_set for the recorded source replacements when "
             "they exist. Either operation may happen first. After both succeed, call "
-            "validate_workaround with the complete cumulative file list.\n"
+            f"{validation_tool_name} with the complete cumulative file list.\n"
             f"Exact preflight result:\n{evidence}"
         )
-    return (
+    instruction = (
         "The validation request was rejected during deterministic preflight; no validation gate ran and "
         "the pending edit set was not judged. Do not edit or re-plan the source patch. Correct the validation "
         "arguments, resolving the repository-relative runtime smoke and targeted test paths from the workspace "
         "map. The smoke target must be a lightweight source module, and the targeted test must be an existing "
-        "test/spec file separate from the smoke target.\n"
-        f"Exact preflight result:\n{evidence}"
+        "test/spec file separate from the smoke target."
     )
+    if validation_tool_name != "validate_workaround":
+        instruction += f" Then retry with {validation_tool_name}."
+    return f"{instruction}\nExact preflight result:\n{evidence}"
 
 
 def _manifest_call_deferred_instruction(deferred_tool_names: Sequence[str]) -> str:
-    """Tell the worker to resume after deferred manifest calls.
-
-    Args:
-        deferred_tool_names: Manifest tools acknowledged but not executed from
-            the current assistant message.
-
-    Returns:
-        A bounded instruction for the next model turn.
-    """
+    """Tell the worker to resume after deferred manifest calls."""
     names = ", ".join(deferred_tool_names)
+    transaction_names = ", ".join(sorted(_SERIAL_MANIFEST_TOOL_NAMES))
     return (
-        "Manifest transaction sequencing barrier: only one "
-        f"{_UPDATE_MANIFEST_TOOL_NAME} call may execute per assistant turn. "
-        f"Deferred call(s): {names}. The prior combined edit-and-sync transaction "
-        "has already been executed. On the next turn, inspect its result and "
-        "continue with the next authorized package or a changed candidate; do not "
-        "repeat a successful transaction."
+        "Manifest transaction sequencing barrier: only one of "
+        f"{transaction_names} may execute per assistant turn. "
+        f"Deferred call(s): {names}. The prior manifest transaction has already "
+        "been executed. On the next turn, inspect its result and continue with the "
+        "next authorized package or a changed candidate; do not repeat a successful "
+        "transaction."
     )
 
 
@@ -456,6 +527,8 @@ def run_bounded_subagent_loop(
     """
     all_tools = tuple(tools)
     all_tool_map = {str(getattr(tool, "name", "")): tool for tool in all_tools}
+    validation_tool_name = _preferred_validation_tool_name(all_tool_map)
+    removal_tool_name = _preferred_removal_tool_name(all_tool_map)
     # This is only a provider hint; the runtime barrier below remains
     # authoritative for providers that ignore it or still emit multiple calls.
     if (structured_output_model is None) != (structured_output_tool_name is None):
@@ -633,7 +706,7 @@ def run_bounded_subagent_loop(
                 }:
                     violation_content = (
                         "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
-                        "Call validate_workaround before planning or web research."
+                        f"Call {validation_tool_name} before planning or web research."
                     )
                 else:
                     violation_content = (
@@ -674,7 +747,9 @@ def run_bounded_subagent_loop(
                             context_manager.update_scratchpad(event, turn_phase, round_number)
                         continue
                     manifest_call_seen = True
-                if call_signature in recovery_signatures and tool_name != "validate_workaround":
+                if call_signature in recovery_signatures and not _is_workaround_validation_tool(
+                    tool_name
+                ):
                     prior_failure = last_failed_tool_content.get(call_signature, "")[:500]
                     # Validation retries have their own bounded gate counter; do not
                     # hide a legitimate gate attempt behind generic stagnation suppression.
@@ -688,12 +763,13 @@ def run_bounded_subagent_loop(
                         name=tool_name,
                     )
                 else:
-                    if tool_name == _UPDATE_MANIFEST_TOOL_NAME:
+                    if tool_name in _UPDATE_MANIFEST_TOOL_NAMES:
                         # A synthetic retry-limit response is still the one
                         # serialized manifest call for this assistant turn.
-                        package_name = str(
+                        raw_package_name = str(
                             (tool_call.get("args", {}) or {}).get("package_name", "")
                         ).strip()
+                        package_name = _manifest_package_key(tool_name, raw_package_name)
                         state_attempts = int(
                             (
                                 (execution_state or {}).get(
@@ -745,7 +821,7 @@ def run_bounded_subagent_loop(
                             tool_message = ToolMessage(
                                 content=(
                                     "ERROR: [PHASE_VIOLATION] The worker is in VALIDATE. "
-                                    "Call validate_workaround before planning or web research."
+                                    f"Call {validation_tool_name} before planning or web research."
                                 ),
                                 tool_call_id=tool_call_id,
                                 name=tool_name,
@@ -770,10 +846,9 @@ def run_bounded_subagent_loop(
                 if scope_violation_count >= 2:
                     scope_loop_error = f"SCOPE_LOOP_ERROR: Subagent stopped due to repeated scope/plan violations: {tool_message.content}"
 
-            preflight_validation_error = (
-                event.name == "validate_workaround"
-                and _is_invalid_validation_request(tool_message.content)
-            )
+            preflight_validation_error = _is_workaround_validation_tool(
+                event.name
+            ) and _is_invalid_validation_request(tool_message.content)
             if not preflight_validation_error and (
                 tool_message.content.startswith("BLOCKED:") or "BLOCKED:" in tool_message.content
             ):
@@ -801,10 +876,11 @@ def run_bounded_subagent_loop(
             else:
                 failed_tool_call_counts.pop(call_signature, None)
 
-            if event.name == _UPDATE_MANIFEST_TOOL_NAME and _is_failed_tool_result(
+            if event.name in _UPDATE_MANIFEST_TOOL_NAMES and _is_failed_tool_result(
                 tool_message.content
             ):
-                package_name = str(event.args.get("package_name", "")).strip()
+                raw_package_name = str(event.args.get("package_name", "")).strip()
+                package_name = _manifest_package_key(event.name, raw_package_name)
                 attempts_by_package = (execution_state or {}).get(
                     "manifest_transaction_attempts_by_package", {}
                 )
@@ -825,11 +901,11 @@ def run_bounded_subagent_loop(
                     _manifest_retry_recovery_instruction(event, attempts=attempts)
                 )
 
-            if event.name == "run_targeted_test" and event.content.startswith("FAILURE:"):
+            if event.name in _TARGETED_TEST_TOOL_NAMES and event.content.startswith("FAILURE:"):
                 conversation.append(
                     HumanMessage(content=_targeted_test_recovery_instruction(event.content))
                 )
-            if event.name == "validate_workaround":
+            if _is_workaround_validation_tool(event.name):
                 if _is_invalid_validation_request(event.content):
                     validation_signature = _validation_request_signature(event.args)
                     repeated_invalid_request = bool(
@@ -856,7 +932,11 @@ def run_bounded_subagent_loop(
                     else:
                         conversation.append(
                             HumanMessage(
-                                content=_validation_input_recovery_instruction(event.content)
+                                content=_validation_input_recovery_instruction(
+                                    event.content,
+                                    validation_tool_name=validation_tool_name,
+                                    removal_tool_name=removal_tool_name,
+                                )
                             )
                         )
 
@@ -913,7 +993,10 @@ def run_bounded_subagent_loop(
                         else:
                             conversation.append(
                                 HumanMessage(
-                                    content=_validation_gate_recovery_instruction(event.content)
+                                    content=_validation_gate_recovery_instruction(
+                                        event.content,
+                                        validation_tool_name=validation_tool_name,
+                                    )
                                 )
                             )
                     else:
@@ -942,11 +1025,11 @@ def run_bounded_subagent_loop(
                 conversation.append(
                     HumanMessage(
                         content=(
-                            "The patch was applied atomically; call validate_workaround now "
+                            f"The patch was applied atomically; call {validation_tool_name} now "
                             "with the complete modified-file list, an explicit runtime_smoke_file, "
                             "where runtime_smoke_file is a lightweight source module (not a test/spec "
                             "or build/dist artifact) and is separate from the required targeted test. "
-                            "Your next action must be validate_workaround. "
+                            f"Your next action must be {validation_tool_name}. "
                             "Do not edit, re-plan, or browse first."
                         )
                     )
@@ -976,9 +1059,16 @@ def run_bounded_subagent_loop(
                 else:
                     final_phase = turn_phase
                 if final_phase != turn_phase:
-                    conversation.append(
-                        HumanMessage(content=context_manager.get_phase_prompt(final_phase))
-                    )
+                    phase_prompt = context_manager.get_phase_prompt(final_phase)
+                    if validation_tool_name == "validate_python_workaround":
+                        phase_prompt = phase_prompt.replace(
+                            "validate_workaround",
+                            validation_tool_name,
+                        ).replace(
+                            "remove_no_fix_dependency",
+                            removal_tool_name,
+                        )
+                    conversation.append(HumanMessage(content=phase_prompt))
             conversation = context_manager.compact_conversation(conversation, round_number)
 
         if malformed_tool_call:
@@ -1137,7 +1227,7 @@ def has_all_modified_files_validated_after_last_edit(
 
 def has_successful_validation_gate(
     tool_events: Sequence[ToolEvent],
-    validation_tool_name: str = "validate_workaround",
+    validation_tool_name: str | None = None,
     edit_tool_names: Sequence[str] = (
         "deterministic_apply_edit_set",
         "deterministic_search_replace",
@@ -1164,9 +1254,14 @@ def has_successful_validation_gate(
     if last_edit_index < 0 and not has_prior_edits:
         return False
 
+    validation_tool_names = (
+        _WORKAROUND_VALIDATION_TOOL_NAMES
+        if validation_tool_name is None
+        else {validation_tool_name}
+    )
     return any(
         index > last_edit_index
-        and event.name == validation_tool_name
+        and event.name in validation_tool_names
         and event.content.startswith("SUCCESS:")
         for index, event in enumerate(tool_events)
     )

@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contracts.schemas import SystemContext, VulnerabilityGroup, VulnerabilityIssue
+from .language import resolve_project_language
 from .orchestration.graph import run_orchestrator
 from .orchestration.task_utils import terminal_outcome_issues
 from .settings import AppSettings
@@ -78,13 +79,22 @@ def triage_issues(
         Groups whose triage verdict is actionable.
     """
     resolved_settings = settings or AppSettings.from_env()
-    context = system_context or SystemContext(
-        public_facing=True,
-        deployment_os="linux",
-        deployment_architecture="containerized",
-        environment="production",
-        primary_language="javascript/nodejs",
+    project_language = resolve_project_language(
+        repo_root or Path.cwd(),
+        system_context.primary_language if system_context is not None else None,
     )
+    if system_context is None:
+        context = SystemContext(
+            public_facing=True,
+            deployment_os="linux",
+            deployment_architecture="containerized",
+            environment="production",
+            primary_language=project_language.value,
+        )
+    elif system_context.primary_language is None:
+        context = system_context.model_copy(update={"primary_language": project_language.value})
+    else:
+        context = system_context
     results = run_triage_pipeline(
         issues,
         context,
@@ -115,6 +125,15 @@ def run_remediation(
         through the in-memory model and is excluded from serialization.
     """
     resolved_settings = settings or AppSettings.from_env()
+    project_language = resolve_project_language(
+        request.repo_root,
+        request.system_context.primary_language if request.system_context is not None else None,
+    )
+    system_context = request.system_context
+    if system_context is not None and system_context.primary_language is None:
+        system_context = system_context.model_copy(
+            update={"primary_language": project_language.value}
+        )
     # Initial triage belongs to the graph's ``initial_triage`` node.  Passing
     # an empty group list is intentional: it tells the graph to triage the
     # supplied issue set exactly once instead of performing a hidden
@@ -124,8 +143,9 @@ def run_remediation(
         "repo_root": str(request.repo_root),
         "valid_groups": groups,
         "issues": request.issues,
-        "system_context": request.system_context,
+        "system_context": system_context,
         "settings": resolved_settings,
+        "project_language": project_language,
     }
     state = run_orchestrator(**orchestrator_kwargs)
     errors = list(state.get("errors", []) or [])

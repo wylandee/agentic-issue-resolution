@@ -285,6 +285,41 @@ class TestSCAGrouping:
         assert groups[0].vulnerable_component == "@scope/pkg"
         assert "@scope/pkg" in groups[0].group_id
 
+    def test_pypi_package_names_share_pep503_group_identity(self):
+        issues = [
+            _sca(package_name="zope.interface", file_path="requirements.txt").model_copy(
+                update={"ecosystem": "pypi", "purl": "pkg:pypi/zope.interface"}
+            ),
+            _sca(package_name="ZOPE_interface", file_path="requirements.txt").model_copy(
+                update={"ecosystem": "python", "purl": "pkg:pypi/zope_interface"}
+            ),
+        ]
+        pairs = [
+            (
+                _localized(issue, manifest_file="requirements.txt", package_manager="pip"),
+                _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="1.0"),
+            )
+            for issue in issues
+        ]
+
+        groups = group_issues(issues, sca_issue_plans=pairs)
+
+        assert len(groups) == 1
+        assert groups[0].vulnerable_component == "zope-interface"
+        assert "zope-interface" in groups[0].group_id
+
+    def test_non_pypi_package_identity_remains_unchanged(self):
+        issues = [
+            _sca(package_name="zope.interface", file_path="package.json"),
+            _sca(package_name="zope-interface", file_path="package.json"),
+        ]
+        pairs = [
+            (_localized(issue), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none"))
+            for issue in issues
+        ]
+
+        assert len(group_issues(issues, sca_issue_plans=pairs)) == 2
+
     def test_group_tracks_all_manifest_paths(self):
         issues = [
             _sca(package_name="lodash", file_path="/src/package-lock.json?/lodash:4.17.20"),

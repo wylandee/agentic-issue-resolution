@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import re
+from urllib.parse import unquote
+
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.tools.package_identity import normalize_python_package_name
+
 from ._tool_support import (
     _GITHUB_API_URL_PREFIX,
     _JINA_READER_URL_PREFIX,
@@ -189,8 +195,105 @@ def _decode_github_response(resp: Any, target_url: str) -> str:
     return f"No readable content extracted from {target_url}."
 
 
-def _make_read_web_page_tool(plan_state: dict[str, Any] | None = None):
-    """Create a tool to fetch web pages, using GitHub API, raw content, Jina, and npm fallbacks."""
+def _pypi_project_from_target(target: str) -> tuple[str, str] | None:
+    """Resolve a bare Python distribution name or PyPI project URL."""
+    parsed = urlparse(target)
+    if parsed.scheme or parsed.netloc:
+        if (parsed.hostname or "").lower() not in {"pypi.org", "www.pypi.org"}:
+            return None
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 2 or parts[0].lower() not in {"project", "pypi"}:
+            return None
+        raw_name = parts[1]
+    else:
+        raw_name = target
+    normalized = normalize_python_package_name(raw_name.strip())
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", normalized):
+        return None
+    page_url = f"https://pypi.org/project/{quote(normalized, safe='')}/"
+    return normalized, page_url
+
+
+def _format_pypi_project(payload: Any, package_name: str) -> str | None:
+    """Render the useful project metadata from PyPI's JSON API."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("info"), dict):
+        return None
+    info = payload["info"]
+    name = info.get("name") or package_name
+    lines = [f"# PyPI project: {name}"]
+    for label, key in (
+        ("Latest version", "version"),
+        ("Summary", "summary"),
+        ("Requires Python", "requires_python"),
+        ("Homepage", "home_page"),
+    ):
+        value = info.get(key)
+        if value:
+            lines.append(f"{label}: {value}")
+    project_urls = info.get("project_urls")
+    if isinstance(project_urls, dict):
+        for label, link in sorted(project_urls.items()):
+            if link:
+                lines.append(f"{label}: {link}")
+    return "\n".join(lines)
+
+
+def _read_pypi_project(
+    package_name: str,
+    page_url: str,
+    evidence_source: str,
+    plan_state: dict[str, Any] | None,
+) -> str | None:
+    """Read PyPI's project JSON first, then bounded reader/direct page fallbacks."""
+    json_url = f"https://pypi.org/pypi/{quote(package_name, safe='')}/json"
+    try:
+        response = requests.get(json_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+        response.raise_for_status()
+        text = _format_pypi_project(response.json(), package_name)
+        if text and text.strip():
+            if plan_state is not None and _is_authoritative_evidence_source(evidence_source):
+                plan_state["has_authoritative_evidence"] = True
+                plan_state["evidence_source"] = evidence_source
+            return text
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("PyPI JSON fetch failed for %s: %s", package_name, exc)
+
+    for fallback_url, headers in (
+        (f"{_JINA_READER_URL_PREFIX}{page_url}", {"Accept": "text/plain"}),
+        (page_url, None),
+    ):
+        try:
+            kwargs: dict[str, Any] = {"timeout": _READ_WEB_PAGE_TIMEOUT}
+            if headers is not None:
+                kwargs["headers"] = headers
+            response = requests.get(fallback_url, **kwargs)
+            response.raise_for_status()
+            text = response.text or ""
+            if text and text.strip():
+                if plan_state is not None and _is_authoritative_evidence_source(evidence_source):
+                    plan_state["has_authoritative_evidence"] = True
+                    plan_state["evidence_source"] = evidence_source
+                return text
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("PyPI page fetch failed for %s: %s", package_name, exc)
+    return None
+
+
+def _truncate_page_text(text: str) -> str:
+    if len(text) > _READ_WEB_PAGE_MAX_CHARS:
+        return (
+            text[:_READ_WEB_PAGE_MAX_CHARS]
+            + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+        )
+    return text
+
+
+def _make_read_web_page_tool(
+    plan_state: dict[str, Any] | None = None,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+):
+    """Create a page reader with language-specific registry metadata fallbacks."""
 
     @tool
     def read_web_page(url: str) -> str:
@@ -217,6 +320,21 @@ def _make_read_web_page_tool(plan_state: dict[str, Any] | None = None):
         target_url = (url or "").strip()
         if not target_url:
             return "ERROR: url is required."
+        if language is ProjectLanguage.PYTHON:
+            pypi_project = _pypi_project_from_target(target_url)
+            if pypi_project is not None:
+                package_name, page_url = pypi_project
+                evidence_source = target_url if urlparse(target_url).scheme else page_url
+                text = _read_pypi_project(
+                    package_name,
+                    page_url,
+                    evidence_source,
+                    plan_state,
+                )
+                if text:
+                    return (
+                        f"--- Markdown content of {target_url} ---\n\n{_truncate_page_text(text)}"
+                    )
 
         # 1. GitHub API & Raw GitHub fallback
         if "github.com" in target_url and not target_url.startswith(
@@ -309,7 +427,7 @@ def _make_read_web_page_tool(plan_state: dict[str, Any] | None = None):
             logger.debug("Direct page fetch failed for %s: %s", target_url, exc)
 
         # 4. npm registry fallback if URL relates to npm package
-        if (
+        if language is ProjectLanguage.NODEJS and (
             "npmjs.com" in target_url
             or "registry.npmjs.org" in target_url
             or not target_url.startswith("http")

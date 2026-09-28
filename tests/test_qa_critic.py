@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     TaskStatus,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.qa_critic import run_qa_critic_node
 from remediation_engine.orchestration.qa_evaluator import GroupInvestigation
 from remediation_engine.orchestration.qa_types import (
@@ -150,6 +151,25 @@ class TestRunQACriticNode:
         assert result["qa_evaluations"]["task-1"].passed is True
         report = json.loads(result["qa_investigation_report"])
         assert report["evaluations"]["task-1"]["passed"] is True
+
+    def test_python_project_language_reaches_global_execution(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        state["project_language"] = ProjectLanguage.PYTHON
+        patches = self._patch_node(group=group)
+
+        with (
+            patches["sandbox"] as sandbox_factory,
+            patches["global_exec"] as global_execution,
+            patches["investigators"],
+        ):
+            run_qa_critic_node(state)
+
+        assert global_execution.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
+        assert (
+            sandbox_factory.call_args.kwargs["image"]
+            == LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
+        )
 
     def test_package_removal_node_skips_only_security_scan(self):
         group = _make_group(fix_plan_status=FixPlanStatus.NO_FIX)

@@ -182,6 +182,8 @@ class SCARemediationStage(StrEnum):
     OSV_MINIMUM = "osv_minimum"
     NPM_SAME_MAJOR = "npm_same_major"
     NPM_LATEST = "npm_latest"
+    PYPI_SAME_MAJOR = "pypi_same_major"
+    PYPI_LATEST = "pypi_latest"
     PACKAGE_OVERRIDE = "package_override"
     CODE_WORKAROUND = "code_workaround"
 
@@ -681,11 +683,15 @@ class LocalizedIssue(BaseModel):
 
     # Manifest context (SCA)
     manifest_file: str | None = Field(
-        None, description="Repo-relative path to the resolved manifest / lockfile."
+        None,
+        description=(
+            "Repo-relative path to the resolved editable manifest (for example "
+            "package.json, requirements.txt, pyproject.toml, setup.cfg, or Pipfile)."
+        ),
     )
     is_direct_dependency: bool | None = Field(
         None,
-        description="True if the package appears as a direct dependency.",
+        description="Whether the package is declared directly in the editable manifest, when known.",
     )
     manifest_line: int | None = Field(
         None,
@@ -693,37 +699,42 @@ class LocalizedIssue(BaseModel):
         description="1-indexed line in the manifest where the dependency is declared.",
     )
     manifest_snippet: str | None = Field(
-        None, description="3-line snippet centred on the manifest declaration."
+        None,
+        description="Source snippet around the declaration, when a direct manifest line exists.",
     )
     package_manager: str | None = Field(
         None,
-        description="Detected package manager (npm / yarn / pnpm) for the manifest.",
+        description="Detected package manager (npm, yarn, pnpm, pip, or pipenv).",
     )
 
     # Dependency ancestry / parent-first transitive remediation context
     dependency_ancestry: list[str] = Field(
         default_factory=list,
         description=(
-            "Package names in the resolved dependency chain, ordered from the "
-            "outermost package toward the vulnerable leaf."
+            "Package names in a resolved dependency chain, ordered from the outermost "
+            "package toward the vulnerable leaf. Pipfile.lock alone does not prove parent edges."
         ),
     )
     dependency_versions: dict[str, str] = Field(
         default_factory=dict,
-        description="Resolved versions keyed by package name when the scanner supplied them.",
+        description=(
+            "Resolved versions keyed by canonical package name when supplied by the scanner "
+            "or by exact Pipfile.lock entries."
+        ),
     )
     declaration_type: str | None = Field(
         None,
         description=(
-            "Manifest declaration section for the localized leaf dependency "
-            "(dependencies, devDependencies, peerDependencies, or optionalDependencies)."
+            "Manifest declaration section: npm dependencies/devDependencies/peerDependencies/"
+            "optionalDependencies, or Python requirements/dependencies/optional-dependencies/"
+            "install_requires/extras_require/packages/dev-packages."
         ),
     )
     parent_package_name: str | None = Field(
         None,
         description=(
-            "Nearest ancestor in dependency_ancestry that is directly declared "
-            "in the editable manifest."
+            "Nearest directly declared ancestor when a dependency graph proves one. Python "
+            "Pipfile.lock localization does not infer or populate parent ancestry."
         ),
     )
     parent_package_version: str | None = Field(

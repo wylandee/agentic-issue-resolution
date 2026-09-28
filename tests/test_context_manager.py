@@ -255,6 +255,35 @@ def test_registry_filters_in_builder_order_and_missing_optional_tools() -> None:
     ]
 
 
+def test_python_manifest_tools_are_registered_for_their_execution_phases() -> None:
+    python_removal = SimpleNamespace(name="remove_no_fix_python_dependency")
+    python_update = SimpleNamespace(name="modify_and_validate_python_dependency")
+
+    assert get_tools_for_phase(
+        WorkaroundExecutionPhase.EXECUTE,
+        [python_removal, python_update],
+    ) == [python_removal, python_update]
+    assert get_tools_for_phase(
+        WorkaroundExecutionPhase.VALIDATE,
+        [python_removal, python_update],
+    ) == [python_removal]
+    assert (
+        get_tools_for_phase(
+            WorkaroundExecutionPhase.INVESTIGATE,
+            [python_removal, python_update],
+        )
+        == []
+    )
+    node_workaround_tools = [SimpleNamespace(name="remove_no_fix_dependency")]
+    assert (
+        get_tools_for_phase(
+            WorkaroundExecutionPhase.EXECUTE,
+            node_workaround_tools,
+        )
+        == node_workaround_tools
+    )
+
+
 def test_phase_prompts_are_action_oriented_and_preserve_optional_context() -> None:
     assert DEFAULT_COMPACTION_INTERVAL == 4
     assert "do not edit" in get_phase_prompt("INVESTIGATE").lower()

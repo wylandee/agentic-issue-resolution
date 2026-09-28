@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.tools.package_identity import normalize_python_package_name
+
 from ._tool_support import (
     _LINT_CHECK_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
     _RUNTIME_SMOKE_TIMEOUT_SECONDS,
-    _SOURCE_MODULE_SUFFIXES,
     _SYNTAX_CHECK_TIMEOUT_SECONDS,
     Any,
     DockerSandbox,
@@ -25,6 +27,8 @@ from ._tool_support import (
     _runtime_smoke_path_error,
     _select_lightweight_runtime_smoke_target,
     _select_targeted_test_file,
+    _source_suffixes,
+    _test_suffixes,
     _validate_workspace_path,
     json,
     logger,
@@ -138,6 +142,8 @@ def _make_run_targeted_test_tool(
     sandbox: DockerSandbox,
     preferred_test_files: Sequence[str] | None = None,
     plan_state: dict[str, Any] | None = None,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     preferred = tuple(
         path.replace("\\", "/").strip().lstrip("/")
@@ -173,13 +179,20 @@ def _make_run_targeted_test_tool(
             preferred,
             accepted_alt,
             sandbox,
+            language=language,
         )
         if selection_error:
             return f"ERROR: [INVALID_VALIDATION_INPUT] {selection_error}"
+
         if selected_path:
             norm_path = selected_path
             if plan_state is not None and correction_note:
                 plan_state["last_targeted_test_selection"] = correction_note
+        if Path(norm_path).suffix.lower() not in _test_suffixes(language):
+            return (
+                f"ERROR: [INVALID_VALIDATION_INPUT] Targeted test '{norm_path}' must use a "
+                f"supported {language.value} source suffix."
+            )
 
         if preferred and norm_path not in preferred and norm_path != accepted_alt:
             preferred_text = ", ".join(preferred)
@@ -195,30 +208,40 @@ def _make_run_targeted_test_tool(
             )
 
         from remediation_engine.orchestration.qa_test_parsing import (
-            _detect_targeted_test_context,
-            build_targeted_test_command,
             extract_qa_failure_evidence,
         )
 
-        runner, package_cwd, npm_invocation = _detect_targeted_test_context(sandbox, norm_path)
-        if runner == "npm_text_fallback":
-            return (
-                f"BLOCKED: Cannot run targeted test on '{norm_path}'. "
-                "No safe runner-specific target command can be constructed for runner 'npm_text_fallback'."
+        if language == ProjectLanguage.PYTHON:
+            runner = "pytest"
+            package_cwd = None
+            relative_test_file = norm_path
+            node_id = f"{relative_test_file}::{test_name}" if test_name else relative_test_file
+            cmd = f".venv/bin/python -m pytest -q {shlex.quote(node_id)}"
+        else:
+            from remediation_engine.orchestration.qa_test_parsing import (
+                _detect_targeted_test_context,
+                build_targeted_test_command,
             )
 
-        relative_test_file = norm_path
-        if package_cwd and norm_path.startswith(package_cwd.rstrip("/") + "/"):
-            relative_test_file = norm_path[len(package_cwd.rstrip("/")) + 1 :]
-        cmd = build_targeted_test_command(
-            runner,
-            relative_test_file,
-            test_name,
-            npm_invocation=npm_invocation,
-            package_cwd=package_cwd,
-        )
-        if not cmd:
-            return f"BLOCKED: Could not construct targeted test command for runner '{runner}' and file '{norm_path}'."
+            runner, package_cwd, npm_invocation = _detect_targeted_test_context(sandbox, norm_path)
+            if runner == "npm_text_fallback":
+                return (
+                    f"BLOCKED: Cannot run targeted test on '{norm_path}'. "
+                    "No safe runner-specific target command can be constructed for runner 'npm_text_fallback'."
+                )
+
+            relative_test_file = norm_path
+            if package_cwd and norm_path.startswith(package_cwd.rstrip("/") + "/"):
+                relative_test_file = norm_path[len(package_cwd.rstrip("/")) + 1 :]
+            cmd = build_targeted_test_command(
+                runner,
+                relative_test_file,
+                test_name,
+                npm_invocation=npm_invocation,
+                package_cwd=package_cwd,
+            )
+            if not cmd:
+                return f"BLOCKED: Could not construct targeted test command for runner '{runner}' and file '{norm_path}'."
 
         try:
             result = _run_readonly(sandbox, cmd, timeout=_NPM_TEST_TIMEOUT_SECONDS)
@@ -371,17 +394,71 @@ def _make_run_targeted_test_tool(
     return run_targeted_test
 
 
-def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
+def _make_run_targeted_python_test_tool(
+    sandbox: DockerSandbox,
+    preferred_test_files: Sequence[str] | None = None,
+    plan_state: dict[str, Any] | None = None,
+):
+    """Build the Python-only public targeted-test tool."""
+    targeted_test = _make_run_targeted_test_tool(
+        sandbox,
+        preferred_test_files,
+        plan_state,
+        language=ProjectLanguage.PYTHON,
+    )
+
+    @tool
+    def run_targeted_python_test(
+        test_file: str,
+        test_name: str | None = None,
+    ) -> str:
+        """Run one repository-relative pytest target."""
+        return str(targeted_test.invoke({"test_file": test_file, "test_name": test_name}))
+
+    return run_targeted_python_test
+
+
+def _make_validate_python_syntax_tool(sandbox: DockerSandbox):
+    """Build the Python-only public syntax-validation tool."""
+    syntax_validator = _make_validate_code_syntax_tool(
+        sandbox,
+        language=ProjectLanguage.PYTHON,
+    )
+
+    @tool
+    def validate_python_syntax(file_path: str) -> str:
+        """Validate Python syntax without modifying the workspace."""
+        return str(syntax_validator.invoke({"file_path": file_path}))
+
+    return validate_python_syntax
+
+
+def _make_validate_code_syntax_tool(
+    sandbox: DockerSandbox,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+):
     @tool
     def validate_code_syntax(file_path: str) -> str:
-        """Validate syntax for a JS/TS-family source file inside the workspace."""
+        """Validate syntax for one source file in the selected project language."""
         try:
             rel_path = _validate_workspace_path(file_path)
         except ValueError as exc:
             return f"ERROR: {exc}"
 
         suffix = Path(rel_path).suffix.lower()
-        if suffix in {".js", ".mjs", ".cjs"}:
+        if language == ProjectLanguage.PYTHON:
+            if suffix != ".py":
+                return (
+                    f"ERROR: validate_code_syntax does not support '{rel_path}'. "
+                    "Supported extension for Python projects is .py."
+                )
+            script = (
+                "import ast, pathlib; "
+                f"path = pathlib.Path({json.dumps(rel_path)}); "
+                "ast.parse(path.read_text(encoding='utf-8'), filename=str(path))"
+            )
+            cmd = f".venv/bin/python -c {shlex.quote(script)}"
+        elif suffix in {".js", ".mjs", ".cjs"}:
             cmd = f"node -c {shlex.quote(f'/workspace/{rel_path}')}"
         elif suffix in {".ts", ".tsx", ".jsx"}:
             cmd = f"npx --yes esbuild {shlex.quote(rel_path)} --outfile=/dev/null"
@@ -402,6 +479,20 @@ def _make_validate_code_syntax_tool(sandbox: DockerSandbox):
         )
 
     return validate_code_syntax
+
+
+def _python_import_target(file_path: str) -> tuple[str, str] | None:
+    """Resolve a repository-relative Python file to an import root and module."""
+    parts = list(Path(file_path.replace("\\", "/")).with_suffix("").parts)
+    import_root = "."
+    if parts and parts[0] == "src":
+        import_root = "src"
+        parts = parts[1:]
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    if not parts or any(not part.isidentifier() for part in parts):
+        return None
+    return import_root, ".".join(parts)
 
 
 def _revert_current_iteration_edit(
@@ -464,6 +555,8 @@ def _make_validate_workaround_tool(
     touched_files: set[str],
     plan_state: dict[str, Any] | None = None,
     preferred_test_files: Sequence[str] | None = None,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     """Build one short-circuiting validation gate for source workarounds.
 
@@ -480,8 +573,13 @@ def _make_validate_workaround_tool(
     plan_state.setdefault("validation_input_errors", 0)
     plan_state.setdefault("last_validation_input_error", None)
 
-    syntax_tool = _make_validate_code_syntax_tool(sandbox)
-    targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files, plan_state)
+    syntax_tool = _make_validate_code_syntax_tool(sandbox, language=language)
+    targeted_test_tool = _make_run_targeted_test_tool(
+        sandbox,
+        preferred_test_files,
+        plan_state,
+        language=language,
+    )
 
     def _failure(gate: str, detail: str) -> str:
         return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
@@ -567,13 +665,13 @@ def _make_validate_workaround_tool(
     def _run_runtime_smoke_gate(runtime_file: str | None) -> str:
         if not runtime_file or not runtime_file.strip():
             return "FAILURE: Runtime smoke gate failed: runtime_smoke_file must be explicitly supplied for workaround validation."
-        rel_path, path_error = _runtime_smoke_path_error(runtime_file)
+        rel_path, path_error = _runtime_smoke_path_error(runtime_file, language=language)
         if path_error:
             return f"ERROR: [INVALID_RUNTIME_SMOKE] {path_error}"
         assert rel_path is not None
         suffix = Path(rel_path).suffix.lower()
 
-        # Resolve the source path before launching Node. A missing path is a
+        # Resolve the source path before launching the language runtime. A missing path is a
         # target-selection error, not evidence that the code change is broken.
         source_content = sandbox.read_file(rel_path)
         if source_content is None:
@@ -582,15 +680,26 @@ def _make_validate_workaround_tool(
                 "Use read_repository_map or read_workspace_file to resolve a source path."
             )
 
-        import json
-
-        import_expression = json.dumps(f"./{rel_path}")
-        script = (
-            f"import({import_expression}).catch((error) => {{ "
-            "console.error(error?.stack || error); process.exitCode = 1; })"
-        )
-        loader = "--import tsx " if suffix in {".ts", ".tsx", ".jsx"} else ""
-        command = f"node {loader}--input-type=module -e {shlex.quote(script)}"
+        if language == ProjectLanguage.PYTHON:
+            import_target = _python_import_target(rel_path)
+            if import_target is None:
+                return (
+                    "ERROR: [INVALID_RUNTIME_SMOKE] Python runtime smoke path "
+                    f"'{rel_path}' does not map to a valid dotted module name."
+                )
+            import_root, module_name = import_target
+            script = f"import importlib; importlib.import_module({json.dumps(module_name)})"
+            command = (
+                f"PYTHONPATH={shlex.quote(import_root)} .venv/bin/python -c {shlex.quote(script)}"
+            )
+        else:
+            import_expression = json.dumps(f"./{rel_path}")
+            script = (
+                f"import({import_expression}).catch((error) => {{ "
+                "console.error(error?.stack || error); process.exitCode = 1; })"
+            )
+            loader = "--import tsx " if suffix in {".ts", ".tsx", ".jsx"} else ""
+            command = f"node {loader}--input-type=module -e {shlex.quote(script)}"
         try:
             result = _run_readonly(sandbox, command, timeout=_RUNTIME_SMOKE_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001
@@ -616,6 +725,16 @@ def _make_validate_workaround_tool(
             or "tsx: command not found" in lowered
             or "err_module_not_found" in lowered
             or "npx: not found" in lowered
+        ):
+            if len(output) > 3000:
+                output = output[:3000] + "\n... (truncated)"
+            return (
+                f"BLOCKED: Runtime smoke gate blocked.\nCommand: {command}\nDiagnostic:\n{output}"
+            )
+        if language == ProjectLanguage.PYTHON and (
+            result.exit_code == 127
+            or "python: not found" in lowered
+            or ("no such file or directory" in lowered and ".venv/bin/python" in lowered)
         ):
             if len(output) > 3000:
                 output = output[:3000] + "\n... (truncated)"
@@ -683,9 +802,16 @@ def _make_validate_workaround_tool(
                     "Record and execute the scoped package-removal plan before validation.",
                     code="PLAN_VIOLATION",
                 )
+            package_name = str(plan_state.get("no_fix_package_name", "") or "")
+            removal_tool = (
+                "remove_no_fix_python_dependency"
+                if language == ProjectLanguage.PYTHON
+                else "remove_no_fix_dependency"
+            )
             missing_operations: list[str] = []
+
             if not plan_state.get("no_fix_package_removed"):
-                missing_operations.append("remove_no_fix_dependency")
+                missing_operations.append(removal_tool)
             if (
                 plan_state.get("planned_replacements")
                 and plan_state.get("pending_edit_set") is None
@@ -693,20 +819,45 @@ def _make_validate_workaround_tool(
                 missing_operations.append("deterministic_apply_edit_set")
             if missing_operations:
                 return _invalid_validation_request(
-                    "NO_FIX PACKAGE_REMOVAL requires successful calls to both "
-                    "remove_no_fix_dependency and deterministic_apply_edit_set when source "
-                    "replacements are planned; either order is valid. Missing operation(s): "
+                    "NO_FIX PACKAGE_REMOVAL requires successful calls to "
+                    + removal_tool
+                    + " and deterministic_apply_edit_set when source replacements are planned; "
+                    "either order is valid. Missing operation(s): "
                     + ", ".join(missing_operations)
                     + ".",
                     level="FAILURE",
                     code="PACKAGE_REMOVAL",
                 )
-            package_name = str(plan_state.get("no_fix_package_name", "") or "")
+            if language == ProjectLanguage.PYTHON:
+                from remediation_engine.orchestration.tools_manifest_python import (
+                    _matching_declarations,
+                )
+
+                package_name = normalize_python_package_name(package_name)
             for manifest_path in plan_state.get("no_fix_manifest_paths", []):
                 manifest_text = sandbox.read_file(manifest_path)
+                if not isinstance(manifest_text, str):
+                    return _invalid_validation_request(
+                        f"The authorized manifest was unavailable after removal: {manifest_path}.",
+                        level="FAILURE",
+                        code="PACKAGE_REMOVAL",
+                    )
+                if language == ProjectLanguage.PYTHON:
+                    remaining_declarations = _matching_declarations(
+                        manifest_path,
+                        manifest_text,
+                        package_name,
+                    )
+                    if remaining_declarations:
+                        return _invalid_validation_request(
+                            f"The vulnerable package remains in a direct declaration in {manifest_path}.",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
+                    continue
                 try:
-                    manifest_data = json.loads(manifest_text or "")
-                except (TypeError, json.JSONDecodeError):
+                    manifest_data = json.loads(manifest_text)
+                except json.JSONDecodeError:
                     return _invalid_validation_request(
                         f"The authorized manifest could not be parsed after removal: {manifest_path}.",
                         level="FAILURE",
@@ -729,6 +880,7 @@ def _make_validate_workaround_tool(
             preferred_test_files,
             accepted_alt,
             sandbox,
+            language=language,
         )
         if target_selection_error:
             return _invalid_validation_request(target_selection_error)
@@ -763,6 +915,7 @@ def _make_validate_workaround_tool(
                 files,
                 targeted_test_file=test_file,
                 sandbox=sandbox,
+                language=language,
             )
             if normalized_smoke is None:
                 return _invalid_validation_request(
@@ -783,14 +936,14 @@ def _make_validate_workaround_tool(
 
         if test_file:
             normalized_test = test_file
-            if Path(normalized_test).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+            if Path(normalized_test).suffix.lower() not in _test_suffixes(language):
                 return _invalid_validation_request(
-                    f"Targeted test '{normalized_test}' must be a JavaScript/TypeScript source test file."
+                    f"Targeted test '{normalized_test}' must use a supported {language.value} source suffix."
                 )
-            if not _is_test_file_path(normalized_test):
+            if not _is_test_file_path(normalized_test, language=language):
                 return _invalid_validation_request(
                     f"Targeted test '{normalized_test}' is a source module, not a test/spec file. "
-                    "Use a repository-relative path under test/, tests/, __tests__, or a *.test/spec.* file."
+                    "Use a repository-relative Python test path or a supported test/spec file."
                 )
             if sandbox.read_file(normalized_test) is None:
                 return _invalid_validation_request(
@@ -896,13 +1049,14 @@ def _make_validate_workaround_tool(
                 (
                     path
                     for path in files
-                    if Path(path).suffix.lower() in _SOURCE_MODULE_SUFFIXES
-                    and not _is_test_file_path(path)
+                    if Path(path).suffix.lower() in _source_suffixes(language)
+                    and not _is_test_file_path(path, language=language)
                 ),
                 None,
             )
         if package_removal_mode and not any(
-            Path(path).suffix.lower() in _SOURCE_MODULE_SUFFIXES and not _is_test_file_path(path)
+            Path(path).suffix.lower() in _source_suffixes(language)
+            and not _is_test_file_path(path, language=language)
             for path in files
         ):
             runtime_smoke_result = (
@@ -1067,7 +1221,48 @@ def _make_validate_workaround_tool(
     return validate_workaround
 
 
-def _make_record_plan_tool(plan_state: dict[str, Any]):
+def _make_validate_python_workaround_tool(
+    sandbox: DockerSandbox,
+    touched_files: set[str],
+    plan_state: dict[str, Any] | None = None,
+    preferred_test_files: Sequence[str] | None = None,
+):
+    """Build the Python-only public cumulative workaround validator."""
+    workaround_validator = _make_validate_workaround_tool(
+        sandbox,
+        touched_files,
+        plan_state,
+        preferred_test_files,
+        language=ProjectLanguage.PYTHON,
+    )
+
+    @tool
+    def validate_python_workaround(
+        modified_files: list[str],
+        runtime_smoke_file: str | None = None,
+        targeted_test_file: str | None = None,
+        targeted_test_name: str | None = None,
+    ) -> str:
+        """Run Python syntax, import-smoke, and pytest validation gates."""
+        return str(
+            workaround_validator.invoke(
+                {
+                    "modified_files": modified_files,
+                    "runtime_smoke_file": runtime_smoke_file,
+                    "targeted_test_file": targeted_test_file,
+                    "targeted_test_name": targeted_test_name,
+                }
+            )
+        )
+
+    return validate_python_workaround
+
+
+def _make_record_plan_tool(
+    plan_state: dict[str, Any],
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+):
     @tool
     def record_plan(
         affected_files: list[str],
@@ -1207,7 +1402,9 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
             return "ERROR: [PLAN_REJECTED] At least one affected file must be specified."
 
         declared_test_files = sorted(
-            file_path for file_path in declared_files if _is_test_file_path(file_path)
+            file_path
+            for file_path in declared_files
+            if _is_test_file_path(file_path, language=language)
         )
         if declared_test_files:
             return (
@@ -1346,6 +1543,8 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
 def _make_record_targeted_test_substitution_tool(
     sandbox: DockerSandbox,
     plan_state: dict[str, Any],
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     @tool
     def record_targeted_test_substitution(
@@ -1416,7 +1615,9 @@ def _make_record_targeted_test_substitution_tool(
         if norm_alt == norm_orig:
             return "ERROR: [SUBSTITUTION_REJECTED] alternative_test must be different from original_test."
 
-        if not _is_test_file_path(norm_alt):
+        if Path(norm_alt).suffix.lower() not in _test_suffixes(language) or not _is_test_file_path(
+            norm_alt, language=language
+        ):
             return (
                 f"ERROR: [SUBSTITUTION_REJECTED] alternative_test '{norm_alt}' must be an existing "
                 "repository test/spec file. A source module cannot replace the targeted test."

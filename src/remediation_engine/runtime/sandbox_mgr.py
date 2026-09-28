@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_IMAGE = "node:22"
 _DEFAULT_TIMEOUT_SECONDS = 300
-_SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
+_SKIP_DIR_NAMES = frozenset(
+    {".git", "node_modules", ".venv", "venv", ".remedy-pipenv", "__pycache__"}
+)
 _WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
 _WORKSPACE_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKSPACE_SNAPSHOT_TIMEOUT_SECONDS = 900
@@ -193,8 +195,8 @@ def _make_tar_archive(repo_root: Path) -> bytes:
     Create an in-memory tar archive of *repo_root* without dereferencing
     symlinks.
 
-    ``.git`` and ``node_modules`` directories are skipped to avoid streaming
-    large or host-specific data into the Docker daemon.
+    Python virtual environments, Pipenv's helper environment, bytecode caches,
+    ``.git`` and ``node_modules`` are skipped to avoid host-specific data.
     """
     repo_root = repo_root.resolve()
     buf = io.BytesIO()
@@ -202,6 +204,7 @@ def _make_tar_archive(repo_root: Path) -> bytes:
     with tarfile.open(fileobj=buf, mode="w", dereference=False) as tf:
         for dirpath, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
             dirnames[:] = sorted(dirname for dirname in dirnames if dirname not in _SKIP_DIR_NAMES)
+            filenames = [filename for filename in filenames if not filename.endswith(".pyc")]
 
             current_dir = Path(dirpath)
             rel_dir = current_dir.relative_to(repo_root)

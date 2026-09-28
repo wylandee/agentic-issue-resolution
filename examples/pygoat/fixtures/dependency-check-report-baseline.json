@@ -1,0 +1,2843 @@
+{
+    "reportSchema": "1.1",
+    "scanInfo": {
+        "engineVersion": "12.2.2",
+        "dataSource": [
+{
+                "name": "NVD API Last Checked",
+                "timestamp": "2026-06-08T16:04:57Z"
+            }
+,{
+                "name": "NVD API Last Modified",
+                "timestamp": "2026-06-08T15:53:41Z"
+            }
+        ]
+
+
+    },
+    "projectInfo": {
+        "name": "pygoat",
+        "reportDate": "2026-09-28T12:49:47.667541799Z",
+        "credits": {
+            "NVD": "This product uses the NVD API but is not endorsed or certified by the NVD. This report contains data retrieved from the National Vulnerability Database: https://nvd.nist.gov",
+            "CISA": "This report may contain data retrieved from the CISA Known Exploited Vulnerability Catalog: https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+            "NPM": "This report may contain data retrieved from the Github Advisory Database (via NPM Audit API): https://github.com/advisories/",
+            "RETIREJS": "This report may contain data retrieved from the RetireJS community: https://retirejs.github.io/retire.js/",
+            "OSSINDEX": "This report may contain data retrieved from the Sonatype Guide OSS Index API: https://www.sonatype.com/products/sonatype-guide/oss-index-users"
+        }
+    },
+    "dependencies": [
+{
+            "isVirtual": true,
+            "fileName": "Django:4.2",
+            "filePath": "\/scan\/requirements.txt:Django\/4.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Django"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Django"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "4.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django@4.2"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:django_project:django:4.2:*:*:*:*:*:*:*"
+,"confidence": "LOW"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Flask:2.3.3",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:Flask\/2.3.3"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Flask"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Flask"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.3.3"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/flask@2.3.3"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Flask:3.0.0",
+            "filePath": "\/scan\/dockerized_labs\/insec_des_lab\/requirements.txt:Flask\/3.0.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Flask"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Flask"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.0.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/flask@3.0.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Jinja2:3.1.2",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:Jinja2\/3.1.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Jinja2"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Jinja2"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.1.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/jinja2@3.1.2"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "MarkupSafe==2.1.3 ",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:MarkupSafe==2.1.3 \/null"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "MarkupSafe==2.1.3"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "MarkupSafe==2.1.3"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "$enc.json($evidence.getValue().trim())"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/markupsafe%3D%3D2.1.3%20"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Pillow:9.4.0",
+            "filePath": "\/scan\/requirements.txt:Pillow\/9.4.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Pillow"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Pillow"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "9.4.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pillow@9.4.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "PyJWT:2.4.0",
+            "filePath": "\/scan\/requirements.txt:PyJWT\/2.4.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "PyJWT"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "PyJWT"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.4.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pyjwt@2.4.0"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:jwt_project:jwt:2.4.0:*:*:*:*:*:*:*"
+,"confidence": "LOW"                }
+,                {
+                    "id": "cpe:2.3:a:pyjwt_project:pyjwt:2.4.0:*:*:*:*:*:*:*"
+,"confidence": "LOW"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2026-32597",
+                    "severity" : "HIGH",
+                    "cvssv3": {
+                        "baseScore": 7.5
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "NONE"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "HIGH"
+,"exploitabilityScore": "3.9","impactScore": "3.6","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-345",                        "CWE-863"                    ],
+                "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.12.0, PyJWT does not validate the crit (Critical) Header Parameter defined in RFC 7515 \u00A74.1.11. When a JWS token contains a crit array listing extensions that PyJWT does not understand, the library accepts the token instead of rejecting it. This violates the MUST requirement in the RFC. This vulnerability is fixed in 2.12.0.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "134c704f-9b21-4f2e-91b3-4a467353bcc0"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-752w-5fwx-jx9f","name": "EXPLOIT,MITIGATION,VENDOR_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-752w-5fwx-jx9f","name": "EXPLOIT,MITIGATION,VENDOR_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.debian.org\/debian-lts-announce\/2026\/05\/msg00008.html"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyjwt_project:pyjwt:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"2.12.0"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2026-48526",
+                    "severity" : "HIGH",
+                    "cvssv3": {
+                        "baseScore": 7.4
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "HIGH"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "HIGH"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "HIGH"
+,"exploitabilityScore": "2.2","impactScore": "5.2","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-347",                        "CWE-287"                    ],
+                "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, when the verifier is decoding JSON Web Tokens, while supporting both asymmetric and HMAC algorithms, the library does not validate use of JSON Web Keys in HMAC algorithm, allowing attacker to use the issuer public key as the secret key for HMAC algorithm. This vulnerability is fixed in 2.13.0.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-xgmm-8j9v-c9wx","name": "EXPLOIT,VENDOR_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyjwt_project:pyjwt:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"2.13.0"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2025-45770",
+                    "severity" : "HIGH",
+                    "cvssv3": {
+                        "baseScore": 7.0
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "HIGH"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "LOW"
+                        ,"integrityImpact": "LOW"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "HIGH"
+,"exploitabilityScore": "2.2","impactScore": "4.7","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-326"                    ],
+                "description": "jwt v5.4.3 was discovered to contain weak encryption. NOTE: this issue has been disputed on the basis that key lengths are expected to be set by an application, not by this library. This dispute is subject to review under CNA rules 4.1.4, 4.1.14, and other rules; the dispute tagging is not meant to recommend an outcome for this CVE Record.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/github.com\/lcobucci","name": "PRODUCT"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/github.com\/lcobucci\/jwt","name": "PRODUCT"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/gist.github.com\/ZupeiNie\/cd88c827eef11a1618f8baacccd240fb","name": "THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:jwt_project:jwt:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionEndIncluding":"5.4.3"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2026-48522",
+                    "severity" : "MEDIUM",
+                    "cvssv3": {
+                        "baseScore": 4.2
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "HIGH"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "REQUIRED"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "LOW"
+                        ,"integrityImpact": "LOW"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "MEDIUM"
+,"exploitabilityScore": "1.6","impactScore": "2.5","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-918",                        "CWE-441"                    ],
+                "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, PyJWKClient passes its uri argument directly to urllib.request.urlopen() which uses Python stdlib's default OpenerDirector registering HTTPHandler, HTTPSHandler, FTPHandler, FileHandler, and DataHandler. There is currently no documented option to restrict which schemes PyJWKClient will fetch. If an application's jku URL ingestion path accepts attacker-influenced URLs (e.g., from JWT header, configuration file, OAuth flow parameter), the attacker can cause PyJWKClient to read arbitrary local files via file:\/\/ (SSRF on local filesystem), cause PyJWKClient to attempt FTP \/ data-URI fetches (broader SSRF surface), or forge tokens that PyJWT verifies as valid. The library does not directly return non-HTTP(S) URI contents to the attacker; the chained \"plant a JWKS to forge tokens\" scenario described in the original report requires additional application-layer flaws (attacker write access to a filesystem path, untrusted jku derivation) that this fix does not address. This vulnerability is fixed in 2.13.0.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "134c704f-9b21-4f2e-91b3-4a467353bcc0"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-993g-76c3-p5m4","name": "EXPLOIT,MITIGATION,VENDOR_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-993g-76c3-p5m4","name": "EXPLOIT,MITIGATION,VENDOR_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyjwt_project:pyjwt:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"2.13.0"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2026-48524",
+                    "severity" : "LOW",
+                    "cvssv3": {
+                        "baseScore": 3.7
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "HIGH"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "NONE"
+                        ,"integrityImpact": "NONE"
+                        ,"availabilityImpact": "LOW"
+                        ,"baseSeverity": "LOW"
+,"exploitabilityScore": "2.2","impactScore": "1.4","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-755",                        "CWE-460"                    ],
+                "description": "PyJWT is a JSON Web Token implementation in Python. Prior to 2.13.0, PyJWKClient.get_signing_key() forces a fresh HTTP request to the JWKS endpoint for every JWT with an unknown kid value, with no rate limiting. Since kid comes from the unverified token header, an attacker can trigger unlimited outbound requests. The vulnerability surfaces only when a JWKS fetch fails; an attacker can attempt to provoke that with sustained unknown-kid traffic, but the outcome depends on upstream JWKS-endpoint behavior (rate limiting, transient errors) which is beyond the attacker's control. This vulnerability is fixed in 2.13.0.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/jpadilla\/pyjwt\/security\/advisories\/GHSA-fhv5-28vv-h8m8","name": "MITIGATION,VENDOR_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyjwt_project:pyjwt:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"2.13.0"                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": true,
+            "fileName": "PyYAML:5.1",
+            "filePath": "\/scan\/requirements.txt:PyYAML\/5.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "PyYAML"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "PyYAML"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "5.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pyyaml@5.1"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:pyyaml:pyyaml:5.1:*:*:*:*:*:*:*"
+,"confidence": "LOW"                }
+,                {
+                    "id": "cpe:2.3:a:yaml_project:yaml:5.1:*:*:*:*:*:*:*"
+,"confidence": "LOW"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2019-20477",
+                    "severity" : "CRITICAL",
+                    "cvssv2": {
+                        "score": 7.5
+                        ,"accessVector": "NETWORK"
+                        ,"accessComplexity": "LOW"
+                        ,"authenticationr": "NONE"
+                        ,"confidentialityImpact": "PARTIAL"
+                        ,"integrityImpact": "PARTIAL"
+                        ,"availabilityImpact": "PARTIAL"
+                        ,"severity": "HIGH"
+,"version": "2.0","exploitabilityScore": "10.0","impactScore": "6.4"                    },
+                    "cvssv3": {
+                        "baseScore": 9.8
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "HIGH"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "CRITICAL"
+,"exploitabilityScore": "3.9","impactScore": "5.9","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-502"                    ],
+                "description": "PyYAML 5.1 through 5.1.2 has insufficient restrictions on the load and load_all functions because of a class deserialization issue, e.g., Popen is a class in the subprocess module. NOTE: this issue exists because of an incomplete fix for CVE-2017-18342.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/52N5XS73Z5S4ZN7I7R56ICCPCTKCUV4H\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/52N5XS73Z5S4ZN7I7R56ICCPCTKCUV4H\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/33VBUY73AA6CTTYL3LRWHNFDULV7PFPN\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/blob\/master\/CHANGES","name": "RELEASE_NOTES,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/www.exploit-db.com\/download\/47655","name": "EXPLOIT,THIRD_PARTY_ADVISORY,VDB_ENTRY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/www.exploit-db.com\/download\/47655","name": "EXPLOIT,THIRD_PARTY_ADVISORY,VDB_ENTRY"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/33VBUY73AA6CTTYL3LRWHNFDULV7PFPN\/"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/blob\/master\/CHANGES","name": "RELEASE_NOTES,THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyyaml:pyyaml:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"5.1","versionEndIncluding":"5.1.2"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2020-14343",
+                    "severity" : "CRITICAL",
+                    "cvssv2": {
+                        "score": 10.0
+                        ,"accessVector": "NETWORK"
+                        ,"accessComplexity": "LOW"
+                        ,"authenticationr": "NONE"
+                        ,"confidentialityImpact": "COMPLETE"
+                        ,"integrityImpact": "COMPLETE"
+                        ,"availabilityImpact": "COMPLETE"
+                        ,"severity": "HIGH"
+,"version": "2.0","exploitabilityScore": "10.0","impactScore": "10.0"                    },
+                    "cvssv3": {
+                        "baseScore": 9.8
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "HIGH"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "CRITICAL"
+,"exploitabilityScore": "3.9","impactScore": "5.9","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-20"                    ],
+                "description": "A vulnerability was discovered in the PyYAML library in versions before 5.4, where it is susceptible to arbitrary code execution when it processes untrusted YAML files through the full_load method or with the FullLoader loader. Applications that use the library to process untrusted input may be vulnerable to this flaw. This flaw allows an attacker to execute arbitrary code on the system by abusing the python\/object\/new constructor. This flaw is due to an incomplete fix for CVE-2020-1747.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/SeldonIO\/seldon-core\/issues\/2252"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/bugzilla.redhat.com\/show_bug.cgi?id=1860466","name": "ISSUE_TRACKING,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpuapr2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpujul2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/bugzilla.redhat.com\/show_bug.cgi?id=1860466","name": "ISSUE_TRACKING,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/issues\/420"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpujul2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpuapr2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/issues\/420"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/github.com\/SeldonIO\/seldon-core\/issues\/2252"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:oracle:communications_cloud_native_core_network_function_cloud_native_environment:1.10.0:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:oracle:communications_cloud_native_core_network_function_cloud_native_environment:22.1.0:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyyaml:pyyaml:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"5.1","versionEndExcluding":"5.4"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2020-1747",
+                    "severity" : "CRITICAL",
+                    "cvssv2": {
+                        "score": 10.0
+                        ,"accessVector": "NETWORK"
+                        ,"accessComplexity": "LOW"
+                        ,"authenticationr": "NONE"
+                        ,"confidentialityImpact": "COMPLETE"
+                        ,"integrityImpact": "COMPLETE"
+                        ,"availabilityImpact": "COMPLETE"
+                        ,"severity": "HIGH"
+,"version": "2.0","exploitabilityScore": "10.0","impactScore": "10.0"                    },
+                    "cvssv3": {
+                        "baseScore": 9.8
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "HIGH"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "CRITICAL"
+,"exploitabilityScore": "3.9","impactScore": "5.9","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-20"                    ],
+                "description": "A vulnerability was discovered in the PyYAML library in versions before 5.3.1, where it is susceptible to arbitrary code execution when it processes untrusted YAML files through the full_load method or with the FullLoader loader. Applications that use the library to process untrusted input may be vulnerable to this flaw. An attacker could use this flaw to execute arbitrary code on the system by abusing the python\/object\/new constructor.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/ZBJA3SGNJKCAYPSHOHWY3KBCWNM5NYK2\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/lists.opensuse.org\/opensuse-security-announce\/2020-04\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/K5HEPD7LEVDPCITY5IMDYWXUMX37VFMY\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpujul2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/7PPAS6C4SZRDQLR7C22A5U3QOLXY33JX\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/WORRFHPQVAFKKXXWLSSW6XKUYLWM6CSH\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/MMQXSZXNJT6ERABJZAAICI3DQSQLCP3D\/"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/7PPAS6C4SZRDQLR7C22A5U3QOLXY33JX\/"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/www.oracle.com\/security-alerts\/cpujul2022.html","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/pull\/386","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/bugzilla.redhat.com\/show_bug.cgi?id=CVE-2020-1747","name": "ISSUE_TRACKING,PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/ZBJA3SGNJKCAYPSHOHWY3KBCWNM5NYK2\/"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "http:\/\/lists.opensuse.org\/opensuse-security-announce\/2020-04\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/WORRFHPQVAFKKXXWLSSW6XKUYLWM6CSH\/"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "http:\/\/lists.opensuse.org\/opensuse-security-announce\/2020-05\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/MMQXSZXNJT6ERABJZAAICI3DQSQLCP3D\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/lists.opensuse.org\/opensuse-security-announce\/2020-05\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/yaml\/pyyaml\/pull\/386","name": "PATCH,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "secalert@redhat.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce%40lists.fedoraproject.org\/message\/K5HEPD7LEVDPCITY5IMDYWXUMX37VFMY\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/bugzilla.redhat.com\/show_bug.cgi?id=CVE-2020-1747","name": "ISSUE_TRACKING,PATCH,THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:oracle:communications_cloud_native_core_network_function_cloud_native_environment:22.1.0:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:pyyaml:pyyaml:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"5.1","versionEndExcluding":"5.3.1"                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": true,
+            "fileName": "Werkzeug:2.1.2",
+            "filePath": "\/scan\/requirements.txt:Werkzeug\/2.1.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Werkzeug"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Werkzeug"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.1.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/werkzeug@2.1.2"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Werkzeug:2.3.7",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:Werkzeug\/2.3.7"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Werkzeug"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Werkzeug"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.3.7"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/werkzeug@2.3.7"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "Werkzeug:3.0.1",
+            "filePath": "\/scan\/dockerized_labs\/insec_des_lab\/requirements.txt:Werkzeug\/3.0.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "Werkzeug"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "Werkzeug"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.0.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/werkzeug@3.0.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": false,
+            "fileName": "__init__.py",
+            "filePath": "\/scan\/challenge\/__init__.py"
+,"md5": "d41d8cd98f00b204e9800998ecf8427e",
+            "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"            ,"relatedDependencies": [
+  {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/challenge\/migrations\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/dataexposure\/migrations\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/introduction\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/introduction\/migrations\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/introduction\/playground\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/introduction\/playground\/ssrf\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+ , {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/pygoat\/__init__.py"
+,"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    "md5": "d41d8cd98f00b204e9800998ecf8427e"
+                }
+            ]
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "MEDIUM",
+                            "source": "__init__.py",
+                            "name": "PackageName",
+                            "value": "challenge"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "__init__.py",
+                            "name": "PackageName",
+                            "value": "challenge"
+                    }
+                ],
+                "versionEvidence": [
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/challenge"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": false,
+            "fileName": "__init__.py",
+            "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/dataexposure\/__init__.py"
+,"md5": "0b24754f345a292ed518c393d2cffca4",
+            "sha1": "1b92a89c213e9ed43a02e5ffe93a88c988d64080",
+            "sha256": "595028648c667137ea5f36f48385e6eab10cfb9bb4a2b0068aecabc11af5e8a9"            ,"relatedDependencies": [
+  {
+                    "isVirtual": false,
+                    "fileName": "__init__.py",
+                    "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/sensitive_data_lab\/__init__.py"
+,"sha256": "595028648c667137ea5f36f48385e6eab10cfb9bb4a2b0068aecabc11af5e8a9",
+                    "sha1": "1b92a89c213e9ed43a02e5ffe93a88c988d64080",
+                    "md5": "0b24754f345a292ed518c393d2cffca4"
+                }
+            ]
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "MEDIUM",
+                            "source": "__init__.py",
+                            "name": "PackageName",
+                            "value": "dataexposure"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "__init__.py",
+                            "name": "PackageName",
+                            "value": "dataexposure"
+                    }
+                ],
+                "versionEvidence": [
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/dataexposure"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": false,
+            "fileName": "a6.js",
+            "filePath": "\/scan\/introduction\/static\/js\/a6.js"
+,"md5": "120fc673db0d57cc34318108d64d58ff",
+            "sha1": "16c070ba1b003687d8a5b653018a82b697191398",
+            "sha256": "5c90ed9ae6b42ba4ed547f95d45ea2974783a8e39e9724ae06f7dbf20b4846e2"            ,"evidenceCollected": {
+                "vendorEvidence": [
+                ],
+                "productEvidence": [
+                ],
+                "versionEvidence": [
+                ]
+            }
+
+        },{
+            "isVirtual": false,
+            "fileName": "a7.js",
+            "filePath": "\/scan\/introduction\/static\/js\/a7.js"
+,"md5": "1d48a1120a628b28672032c4cc20fb86",
+            "sha1": "291e8ceecdb19c5e77503b0d99620d5615f8f7f3",
+            "sha256": "c83bc8eb6513f491cc89e95ff7ec8714552c4621e3a20b56a3f3d1ea0d75b9ee"            ,"evidenceCollected": {
+                "vendorEvidence": [
+                ],
+                "productEvidence": [
+                ],
+                "versionEvidence": [
+                ]
+            }
+
+        },{
+            "isVirtual": false,
+            "fileName": "a9.js",
+            "filePath": "\/scan\/introduction\/static\/js\/a9.js"
+,"md5": "1767d94cafb5eb364bf8c88e6f819c65",
+            "sha1": "7984858937cc94abb4b4a65a344e09241155d4f8",
+            "sha256": "e26fc1392a600878087a79485a234e4a451295f96e44170afaec635b790049e2"            ,"evidenceCollected": {
+                "vendorEvidence": [
+                ],
+                "productEvidence": [
+                ],
+                "versionEvidence": [
+                ]
+            }
+
+        },{
+            "isVirtual": true,
+            "fileName": "argon2-cffi-bindings:21.2.0",
+            "filePath": "\/scan\/requirements.txt:argon2-cffi-bindings\/21.2.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "argon2-cffi-bindings"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "argon2-cffi-bindings"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "21.2.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/argon2-cffi-bindings@21.2.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "argon2-cffi:21.3.0",
+            "filePath": "\/scan\/requirements.txt:argon2-cffi\/21.3.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "argon2-cffi"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "argon2-cffi"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "21.3.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/argon2-cffi@21.3.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "asgiref:3.6.0",
+            "filePath": "\/scan\/requirements.txt:asgiref\/3.6.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "asgiref"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "asgiref"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.6.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/asgiref@3.6.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "blinker:1.6.2",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:blinker\/1.6.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "blinker"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "blinker"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "1.6.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/blinker@1.6.2"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "certifi:2022.12.7",
+            "filePath": "\/scan\/requirements.txt:certifi\/2022.12.7"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "certifi"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "certifi"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2022.12.7"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/certifi@2022.12.7"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:certifi:certifi:2022.12.7:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Acertifi%3Acertifi%3A2022.12.7%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2023-37920",
+                    "severity" : "CRITICAL",
+                    "cvssv3": {
+                        "baseScore": 9.8
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "HIGH"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "CRITICAL"
+,"exploitabilityScore": "3.9","impactScore": "5.9","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-345"                    ],
+                "description": "Certifi is a curated collection of Root Certificates for validating the trustworthiness of SSL certificates while verifying the identity of TLS hosts. Certifi prior to version 2023.07.22 recognizes \"e-Tugra\" root certificates. e-Tugra's root certificates were subject to an investigation prompted by reporting of security issues in their systems. Certifi 2023.07.22 removes root certificates from \"e-Tugra\" from the root store.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/security.netapp.com\/advisory\/ntap-20240912-0002\/","name": "THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/commit\/8fb96ed81f71e7097ed11bc4d9b19afd7ea5c909","name": "PATCH"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce@lists.fedoraproject.org\/message\/5EX6NG7WUFNUKGFHLM35KHHU3GAKXRTG\/","name": "MAILING_LIST"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/lists.fedoraproject.org\/archives\/list\/package-announce@lists.fedoraproject.org\/message\/5EX6NG7WUFNUKGFHLM35KHHU3GAKXRTG\/","name": "MAILING_LIST"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/commit\/8fb96ed81f71e7097ed11bc4d9b19afd7ea5c909","name": "PATCH"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/security\/advisories\/GHSA-xqr8-7jwr-rhp7","name": "VENDOR_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/groups.google.com\/a\/mozilla.org\/g\/dev-security-policy\/c\/C-HrP1SEq1A","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/groups.google.com\/a\/mozilla.org\/g\/dev-security-policy\/c\/C-HrP1SEq1A","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/security\/advisories\/GHSA-xqr8-7jwr-rhp7","name": "VENDOR_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:certifi:certifi:*:*:*:*:*:python:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"2015.4.28","versionEndExcluding":"2023.7.22"                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:active_iq_unified_manager:-:*:*:*:*:vsphere:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:active_iq_unified_manager:-:*:*:*:*:windows:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:management_services_for_element_software:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:management_services_for_netapp_hci:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:ontap_mediator:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:ontap_select_deploy_administration_utility:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:solidfire_\\&_hci_storage_node:-:*:*:*:*:*:*:*"
+                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2024-39689",
+                    "severity" : "HIGH",
+                    "cvssv3": {
+                        "baseScore": 7.5
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "NONE"
+                        ,"integrityImpact": "HIGH"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "HIGH"
+,"exploitabilityScore": "3.9","impactScore": "3.6","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-345"                    ],
+                "description": "Certifi is a curated collection of Root Certificates for validating the trustworthiness of SSL certificates while verifying the identity of TLS hosts. Certifi starting in 2021.5.30 and prior to 2024.7.4 recognized root certificates from `GLOBALTRUST`. Certifi 2024.7.04 removes root certificates from `GLOBALTRUST` from the root store. These are in the process of being removed from Mozilla's trust store. `GLOBALTRUST`'s root certificates are being removed pursuant to an investigation which identified \"long-running and unresolved compliance issues.\"",
+                "notes": "",
+                "references": [
+ {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/groups.google.com\/a\/mozilla.org\/g\/dev-security-policy\/c\/XpknYMPO8dI","name": "MAILING_LIST"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/commit\/bd8153872e9c6fc98f4023df9c2deaffea2fa463","name": "PATCH"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/groups.google.com\/a\/mozilla.org\/g\/dev-security-policy\/c\/XpknYMPO8dI","name": "MAILING_LIST"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/security\/advisories\/GHSA-248v-346w-9cwc","name": "VENDOR_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/security\/advisories\/GHSA-248v-346w-9cwc","name": "VENDOR_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/certifi\/python-certifi\/commit\/bd8153872e9c6fc98f4023df9c2deaffea2fa463","name": "PATCH"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/security.netapp.com\/advisory\/ntap-20241206-0001\/","name": "THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:certifi:certifi:*:*:*:*:*:python:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"2021.5.30","versionEndExcluding":"2024.7.4"                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:management_services_for_element_software_and_netapp_hci:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:ontap_select_deploy_administration_utility:-:*:*:*:*:*:*:*"
+                        }
+                    }, {
+                        "software": { 
+                            "id":"cpe:2.3:a:netapp:ontap_tools:10:*:*:*:*:vmware_vsphere:*:*"
+                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": true,
+            "fileName": "cffi:1.15.1",
+            "filePath": "\/scan\/requirements.txt:cffi\/1.15.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "cffi"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "cffi"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "1.15.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/cffi@1.15.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "charset-normalizer:3.0.1",
+            "filePath": "\/scan\/requirements.txt:charset-normalizer\/3.0.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "charset-normalizer"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "charset-normalizer"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.0.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/charset-normalizer@3.0.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "click:8.1.7",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:click\/8.1.7"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "click"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "click"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "8.1.7"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/click@8.1.7"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:click_project:click:8.1.7:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Aclick_project%3Aclick%3A8.1.7%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "crispy-bootstrap4:2022.1",
+            "filePath": "\/scan\/requirements.txt:crispy-bootstrap4\/2022.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "crispy-bootstrap4"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "crispy-bootstrap4"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2022.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/crispy-bootstrap4@2022.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "cryptography:39.0.1",
+            "filePath": "\/scan\/requirements.txt:cryptography\/39.0.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "cryptography"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "cryptography"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "39.0.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/cryptography@39.0.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "defusedxml:0.7.1",
+            "filePath": "\/scan\/requirements.txt:defusedxml\/0.7.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "defusedxml"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "defusedxml"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.7.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/defusedxml@0.7.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "dj-database-url:0.5.0",
+            "filePath": "\/scan\/requirements.txt:dj-database-url\/0.5.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "dj-database-url"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "dj-database-url"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.5.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/dj-database-url@0.5.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "django-allauth:0.52.0",
+            "filePath": "\/scan\/requirements.txt:django-allauth\/0.52.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "django-allauth"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "django-allauth"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.52.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django-allauth@0.52.0"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:allauth:allauth:0.52.0:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Aallauth%3Aallauth%3A0.52.0%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+,                {
+                    "id": "cpe:2.3:a:django_project:django:0.52.0:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Adjango_project%3Adjango%3A0.52.0%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2025-65430",
+                    "severity" : "MEDIUM",
+                    "cvssv3": {
+                        "baseScore": 5.4
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "LOW"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "LOW"
+                        ,"integrityImpact": "LOW"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "MEDIUM"
+,"exploitabilityScore": "2.8","impactScore": "2.5","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-613"                    ],
+                "description": "An issue was discovered in allauth-django before 65.13.0. IdP: marking a user as is_active=False after having handed tokens for that user while the account was still active had no effect. Fixed the access\/refresh tokens are now rejected.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/allauth.org\/news\/2025\/10\/django-allauth-65.13.0-released\/","name": "RELEASE_NOTES"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:allauth:allauth:*:*:*:*:*:django:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"65.13.0"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2025-65431",
+                    "severity" : "MEDIUM",
+                    "cvssv3": {
+                        "baseScore": 5.4
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "LOW"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "LOW"
+                        ,"integrityImpact": "LOW"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "MEDIUM"
+,"exploitabilityScore": "2.8","impactScore": "2.5","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-287"                    ],
+                "description": "An issue was discovered in allauth-django before 65.13.0. Both Okta and NetIQ were using preferred_username as the identifier for third-party provider accounts. That value may be mutable and should therefore be avoided for authorization decisions. The providers are now using sub instead.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "https:\/\/allauth.org\/news\/2025\/10\/django-allauth-65.13.0-released\/","name": "RELEASE_NOTES"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:allauth:allauth:*:*:*:*:*:django:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"65.13.0"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2026-27982",
+                    "severity" : "MEDIUM",
+                    "cvssv3": {
+                        "baseScore": 6.1
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "REQUIRED"
+                        ,"scope": "CHANGED"
+                        ,"confidentialityImpact": "LOW"
+                        ,"integrityImpact": "LOW"
+                        ,"availabilityImpact": "NONE"
+                        ,"baseSeverity": "MEDIUM"
+,"exploitabilityScore": "2.8","impactScore": "2.7","version": "3.1"                    },
+                    "cvssv4": {
+                        "vectorString": "CVSS:4.0\/AV:N\/AC:L\/AT:N\/PR:N\/UI:A\/VC:N\/VI:L\/VA:N\/SC:N\/SI:N\/SA:N\/E:X\/CR:X\/IR:X\/AR:X\/MAV:X\/MAC:X\/MAT:X\/MPR:X\/MUI:X\/MVC:X\/MVI:X\/MVA:X\/MSC:X\/MSI:X\/MSA:X\/S:X\/AU:X\/R:X\/V:X\/RE:X\/U:X"
+                        ,"source": "vultures@jpcert.or.jp"
+                        ,"type": "Secondary"
+                        ,"version": "4.0"
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"attackRequirements": "NONE"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "ACTIVE"
+                        ,"vulnerableSystemConfidentiality": "NONE"
+                        ,"vulnerableSystemIntegrity": "LOW"
+                        ,"vulnerableSystemAvailability": "NONE"
+                        ,"subsequentSystemConfidentiality": "NONE"
+                        ,"subsequentSystemIntegrity": "NONE"
+                        ,"subsequentSystemAvailability": "NONE"
+                        ,"exploitMaturity": "NOT_DEFINED"
+                        ,"confidentialityRequirements": "NOT_DEFINED"
+                        ,"integrityRequirements": "NOT_DEFINED"
+                        ,"availabilityRequirements": "NOT_DEFINED"
+                        ,"modifiedAttackVector": "NOT_DEFINED"
+                        ,"modifiedAttackComplexity": "NOT_DEFINED"
+                        ,"modifiedAttackRequirements": "NOT_DEFINED"
+                        ,"modifiedPrivilegesRequired": "NOT_DEFINED"
+                        ,"modifiedUserInteraction": "NOT_DEFINED"
+                        ,"modifiedVulnerableSystemConfidentiality": "NOT_DEFINED"
+                        ,"modifiedVulnerableSystemIntegrity": "NOT_DEFINED"
+                        ,"modifiedVulnerableSystemAvailability": "NOT_DEFINED"
+                        ,"modifiedSubsequentSystemConfidentiality": "NOT_DEFINED"
+                        ,"modifiedSubsequentSystemIntegrity": "NOT_DEFINED"
+                        ,"modifiedSubsequentSystemAvailability": "NOT_DEFINED"
+                        ,"safety": "NOT_DEFINED"
+                        ,"automatable": "NOT_DEFINED"
+                        ,"recovery": "NOT_DEFINED"
+                        ,"valueDensity": "NOT_DEFINED"
+                        ,"vulnerabilityResponseEffort": "NOT_DEFINED"
+                        ,"providerUrgency": "NOT_DEFINED"
+                        ,"baseScore": 5.1
+                        ,"baseSeverity": "MEDIUM"
+                    },
+                    "cwes": [
+                        "CWE-601"                    ],
+                "description": "An open redirect vulnerability exists in django-allauth versions prior to 65.14.1 when SAML IdP initiated SSO is enabled (it is disabled by default), which may allow an attacker to redirect users to an arbitrary external website via a crafted URL.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "vultures@jpcert.or.jp"
+,"url": "https:\/\/allauth.org\/news\/2026\/02\/django-allauth-65.14.1-released\/","name": "RELEASE_NOTES"                    }, {
+                        "source": "vultures@jpcert.or.jp"
+,"url": "https:\/\/jvn.jp\/en\/jp\/JVN23669411\/","name": "THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:allauth:allauth:*:*:*:*:*:django:*:*"
+,"vulnerabilityIdMatched":"true","versionEndExcluding":"65.14.1"                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": true,
+            "fileName": "django-crispy-forms:1.14.0",
+            "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/requirements.txt:django-crispy-forms\/1.14.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "django-crispy-forms"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "django-crispy-forms"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "1.14.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django-crispy-forms@1.14.0"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:django_project:django:1.14.0:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Adjango_project%3Adjango%3A1.14.0%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "django-crispy-forms:2.3",
+            "filePath": "\/scan\/requirements.txt:django-crispy-forms\/2.3"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "django-crispy-forms"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "django-crispy-forms"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.3"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django-crispy-forms@2.3"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:django_project:django:2.3:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Adjango_project%3Adjango%3A2.3%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "django-heroku:0.3.1",
+            "filePath": "\/scan\/requirements.txt:django-heroku\/0.3.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "django-heroku"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "django-heroku"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.3.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django-heroku@0.3.1"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:django_project:django:0.3.1:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Adjango_project%3Adjango%3A0.3.1%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "django:3.2.18",
+            "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/requirements.txt:django\/3.2.18"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "django"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "django"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.2.18"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/django@3.2.18"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:django_project:django:3.2.18:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Adjango_project%3Adjango%3A3.2.18%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "gunicorn:23.0.0",
+            "filePath": "\/scan\/requirements.txt:gunicorn\/23.0.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "gunicorn"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "gunicorn"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "23.0.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/gunicorn@23.0.0"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:gunicorn:gunicorn:23.0.0:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Agunicorn%3Agunicorn%3A23.0.0%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "idna:3.4",
+            "filePath": "\/scan\/requirements.txt:idna\/3.4"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "idna"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "idna"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.4"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/idna@3.4"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "itsdangerous:2.1.2",
+            "filePath": "\/scan\/dockerized_labs\/broken_auth_lab\/requirements.txt:itsdangerous\/2.1.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "itsdangerous"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "itsdangerous"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.1.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/itsdangerous@2.1.2"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "mccabe:0.6.1",
+            "filePath": "\/scan\/requirements.txt:mccabe\/0.6.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "mccabe"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "mccabe"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.6.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/mccabe@0.6.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "oauthlib:3.2.2",
+            "filePath": "\/scan\/requirements.txt:oauthlib\/3.2.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "oauthlib"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "oauthlib"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.2.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/oauthlib@3.2.2"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:oauthlib_project:oauthlib:3.2.2:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Aoauthlib_project%3Aoauthlib%3A3.2.2%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "psycopg2:2.9.3",
+            "filePath": "\/scan\/requirements.txt:psycopg2\/2.9.3"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "psycopg2"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "psycopg2"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.9.3"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/psycopg2@2.9.3"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "pycodestyle:2.7.0",
+            "filePath": "\/scan\/requirements.txt:pycodestyle\/2.7.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "pycodestyle"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "pycodestyle"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.7.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pycodestyle@2.7.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "pycparser:2.21",
+            "filePath": "\/scan\/requirements.txt:pycparser\/2.21"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "pycparser"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "pycparser"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.21"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pycparser@2.21"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "pyflakes:2.3.1",
+            "filePath": "\/scan\/requirements.txt:pyflakes\/2.3.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "pyflakes"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "pyflakes"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.3.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pyflakes@2.3.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "python3-openid:3.2.0",
+            "filePath": "\/scan\/requirements.txt:python3-openid\/3.2.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "python3-openid"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "python3-openid"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.2.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/python3-openid@3.2.0"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:openid:openid:3.2.0:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Aopenid%3Aopenid%3A3.2.0%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2007-1652",
+                    "severity" : "HIGH",
+                    "cvssv2": {
+                        "score": 7.5
+                        ,"accessVector": "NETWORK"
+                        ,"accessComplexity": "LOW"
+                        ,"authenticationr": "NONE"
+                        ,"confidentialityImpact": "PARTIAL"
+                        ,"integrityImpact": "PARTIAL"
+                        ,"availabilityImpact": "PARTIAL"
+                        ,"severity": "HIGH"
+,"version": "2.0","exploitabilityScore": "10.0","impactScore": "6.4","obtainOtherPrivilege": "true"                    },
+                    "cwes": [
+                        "NVD-CWE-Other"                    ],
+                "description": "OpenID allows remote attackers to forcibly log a user into an OpenID enabled site, divulge the user's personal information to this site, and add it site to the trusted sites list via a crafted web page, related to cached tokens.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/osvdb.org\/43601"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000306.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000291.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000288.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000286.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/janrain.com\/blog\/2007\/03\/22\/myopenid-security-fix\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000291.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000306.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/osvdb.org\/43601"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000311.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000286.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000311.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/janrain.com\/blog\/2007\/03\/22\/myopenid-security-fix\/"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000288.html"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:openid:openid:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true"                        }
+                    }                ]
+                }, {
+                "source": "NVD",
+                "name": "CVE-2007-1651",
+                    "severity" : "MEDIUM",
+                    "cvssv2": {
+                        "score": 6.8
+                        ,"accessVector": "NETWORK"
+                        ,"accessComplexity": "MEDIUM"
+                        ,"authenticationr": "NONE"
+                        ,"confidentialityImpact": "PARTIAL"
+                        ,"integrityImpact": "PARTIAL"
+                        ,"availabilityImpact": "PARTIAL"
+                        ,"severity": "MEDIUM"
+,"version": "2.0","exploitabilityScore": "8.6","impactScore": "6.4","obtainOtherPrivilege": "true","userInteractionRequired": "true"                    },
+                    "cwes": [
+                        "NVD-CWE-Other"                    ],
+                "description": "Cross-site request forgery (CSRF) vulnerability in OpenID allows remote attackers to restore the login session of a user on an OpenID enabled site via unspecified vectors related to an arbitrary remote web site and cached tokens, after the user has signed into an OpenID server, logged into the OpenID enabled site, and then logged out of the OpenID enabled site.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000306.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000291.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/osvdb.org\/43600"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000288.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000286.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/janrain.com\/blog\/2007\/03\/22\/myopenid-security-fix\/"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000291.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000306.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/osvdb.org\/43600"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000311.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000286.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000311.html"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/janrain.com\/blog\/2007\/03\/22\/myopenid-security-fix\/"                    }, {
+                        "source": "cve@mitre.org"
+,"url": "http:\/\/openid.net\/pipermail\/security\/2007-March\/000288.html"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:openid:openid:*:*:*:*:*:*:*:*"
+,"vulnerabilityIdMatched":"true"                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": true,
+            "fileName": "pytz:2020.1",
+            "filePath": "\/scan\/requirements.txt:pytz\/2020.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "pytz"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "pytz"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2020.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/pytz@2020.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "requests-oauthlib:1.3.1",
+            "filePath": "\/scan\/requirements.txt:requests-oauthlib\/1.3.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "requests-oauthlib"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "requests-oauthlib"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "1.3.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/requests-oauthlib@1.3.1"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:oauthlib_project:oauthlib:1.3.1:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Aoauthlib_project%3Aoauthlib%3A1.3.1%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "requests:2.28.1",
+            "filePath": "\/scan\/dockerized_labs\/sensitive_data_exposure\/requirements.txt:requests\/2.28.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "requests"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "requests"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.28.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/requests@2.28.1"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "requests:2.28.2",
+            "filePath": "\/scan\/requirements.txt:requests\/2.28.2"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "requests"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "requests"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "2.28.2"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/requests@2.28.2"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "sqlparse:0.3.1",
+            "filePath": "\/scan\/requirements.txt:sqlparse\/0.3.1"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "sqlparse"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "sqlparse"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "0.3.1"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/sqlparse@0.3.1"
+,"confidence": "HIGHEST"                    }
+            ]                ,"vulnerabilityIds": [
+                {
+                    "id": "cpe:2.3:a:sqlparse_project:sqlparse:0.3.1:*:*:*:*:*:*:*"
+,"confidence": "HIGHEST","url": "https:\/\/nvd.nist.gov\/vuln\/search#\/nvd\/home?sortOrder=3&sortDirection=2&cpeFilterMode=applicability&resultType=records&cpeName=cpe%3A2.3%3Aa%3Asqlparse_project%3Asqlparse%3A0.3.1%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A%3A%2A"                }
+            ]
+            ,"vulnerabilities": [
+ {
+                "source": "NVD",
+                "name": "CVE-2023-30608",
+                    "severity" : "HIGH",
+                    "cvssv3": {
+                        "baseScore": 7.5
+                        ,"attackVector": "NETWORK"
+                        ,"attackComplexity": "LOW"
+                        ,"privilegesRequired": "NONE"
+                        ,"userInteraction": "NONE"
+                        ,"scope": "UNCHANGED"
+                        ,"confidentialityImpact": "NONE"
+                        ,"integrityImpact": "NONE"
+                        ,"availabilityImpact": "HIGH"
+                        ,"baseSeverity": "HIGH"
+,"exploitabilityScore": "3.9","impactScore": "3.6","version": "3.1"                    },
+                    "cwes": [
+                        "CWE-1333"                    ],
+                "description": "sqlparse is a non-validating SQL parser module for Python. In affected versions the SQL parser contains a regular expression that is vulnerable to ReDoS (Regular Expression Denial of Service). This issue was introduced by commit `e75e358`. The vulnerability may lead to Denial of Service (DoS). This issues has been fixed in sqlparse 0.4.4 by commit `c457abd5f`. Users are advised to upgrade. There are no known workarounds for this issue.",
+                "notes": "",
+                "references": [
+ {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/lists.debian.org\/debian-lts-announce\/2023\/05\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/commit\/c457abd5f097dd13fb21543381e7cfafe7d31cfb","name": "PATCH"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/owasp.org\/www-community\/attacks\/Regular_expression_Denial_of_Service_-_ReDoS","name": "TECHNICAL_DESCRIPTION"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/commit\/e75e35869473832a1eb67772b1adfee2db11b85a","name": "PATCH"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/owasp.org\/www-community\/attacks\/Regular_expression_Denial_of_Service_-_ReDoS","name": "TECHNICAL_DESCRIPTION"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.debian.org\/debian-lts-announce\/2024\/12\/msg00022.html"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/security\/advisories\/GHSA-rrm6-wvj7-cwh2","name": "PATCH,VENDOR_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/commit\/e75e35869473832a1eb67772b1adfee2db11b85a","name": "PATCH"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/security\/advisories\/GHSA-rrm6-wvj7-cwh2","name": "PATCH,VENDOR_ADVISORY"                    }, {
+                        "source": "security-advisories@github.com"
+,"url": "https:\/\/github.com\/andialbrecht\/sqlparse\/commit\/c457abd5f097dd13fb21543381e7cfafe7d31cfb","name": "PATCH"                    }, {
+                        "source": "af854a3a-2127-422b-91ae-364da2661108"
+,"url": "https:\/\/lists.debian.org\/debian-lts-announce\/2023\/05\/msg00017.html","name": "MAILING_LIST,THIRD_PARTY_ADVISORY"                    }                ],
+                "vulnerableSoftware": [
+ {
+                        "software": { 
+                            "id":"cpe:2.3:a:sqlparse_project:sqlparse:*:*:*:*:*:python:*:*"
+,"vulnerabilityIdMatched":"true","versionStartIncluding":"0.1.15","versionEndExcluding":"0.4.4"                        }
+                    }                ]
+                }            ]        },{
+            "isVirtual": false,
+            "fileName": "ssrf.js",
+            "filePath": "\/scan\/introduction\/static\/Lab\/ssrf.js"
+,"md5": "1f8dac9d3f1db6c2194b23ab2724c631",
+            "sha1": "5edc0085c104dbaf159fc35c388314b16bb376f9",
+            "sha256": "73cc98f0ac5647a768710028d0c0f4a85b10b17b3a8c6cc74055fd963192cca8"            ,"evidenceCollected": {
+                "vendorEvidence": [
+                ],
+                "productEvidence": [
+                ],
+                "versionEvidence": [
+                ]
+            }
+
+        },{
+            "isVirtual": true,
+            "fileName": "urllib3:1.26.9",
+            "filePath": "\/scan\/requirements.txt:urllib3\/1.26.9"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "urllib3"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "urllib3"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "1.26.9"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/urllib3@1.26.9"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": true,
+            "fileName": "whitenoise:6.2.0",
+            "filePath": "\/scan\/requirements.txt:whitenoise\/6.2.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "whitenoise"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "whitenoise"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "6.2.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/whitenoise@6.2.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        },{
+            "isVirtual": false,
+            "fileName": "xss.js",
+            "filePath": "\/scan\/introduction\/static\/Lab\/xss.js"
+,"md5": "ba828a5d641069b89aa8b4f472b8c223",
+            "sha1": "aca03b7a096e4a781f7decae30816e0641beed0e",
+            "sha256": "7fba32638f23dfa6696f563edf6cbfbca47f7069c16c04691c2ae700ac2531c8"            ,"evidenceCollected": {
+                "vendorEvidence": [
+                ],
+                "productEvidence": [
+                ],
+                "versionEvidence": [
+                ]
+            }
+
+        },{
+            "isVirtual": true,
+            "fileName": "zipp:3.8.0",
+            "filePath": "\/scan\/requirements.txt:zipp\/3.8.0"
+            ,"evidenceCollected": {
+                "vendorEvidence": [
+{
+                            "type": "vendor",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "vendor",
+                            "value": "zipp"
+                        }
+                ],
+                "productEvidence": [
+{
+                            "type": "product",
+                            "confidence": "HIGHEST",
+                            "source": "requirements.txt",
+                            "name": "product",
+                            "value": "zipp"
+                    }
+                ],
+                "versionEvidence": [
+                    {
+                        "type": "version",
+                        "confidence": "HIGHEST",
+                        "source": "requirements.txt",
+                        "name": "version",
+                        "value": "3.8.0"
+                    }
+                ]
+            }
+                ,"packages": [
+                    {
+                        "id": "pkg:pypi\/zipp@3.8.0"
+,"confidence": "HIGHEST"                    }
+            ]
+        }    ]
+}

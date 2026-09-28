@@ -506,6 +506,52 @@ class TestQueryOsvFixedVersion:
         mock_post.assert_not_called()
         assert result == (None, None)
 
+    def test_python_alias_queries_pypi_with_normalized_name_and_stable_pep440_fix(self):
+        body = {
+            "results": [
+                {
+                    "vulns": [
+                        {
+                            "id": "PYSEC-2026-1",
+                            "affected": [
+                                {
+                                    "package": {"name": "requests", "ecosystem": "PyPI"},
+                                    "ranges": [
+                                        {
+                                            "type": "ECOSYSTEM",
+                                            "events": [
+                                                {"fixed": "2.30.0rc1"},
+                                                {"fixed": "2.30.0"},
+                                                {"fixed": "2.31.0"},
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        issue = _make_vuln_issue(
+            package_name="Requests",
+            package_version="2.29.0",
+            purl="pkg:pypi/Requests@2.29.0",
+            ecosystem="python",
+            cve_id=None,
+            ghsa_id=None,
+        )
+        response = self._post_mock(body)
+
+        with patch(
+            "remediation_engine.tools.fix_planner.requests.post", return_value=response
+        ) as post:
+            result = _query_osv_fixed_version(issue)
+
+        assert result == ("2.30.0", None)
+        query = post.call_args.kwargs["json"]["queries"][0]
+        assert query["package"] == {"name": "requests", "ecosystem": "PyPI"}
+
 
 # ===========================================================================
 # _query_serper
@@ -960,6 +1006,51 @@ class TestPlanFixInstructionContent:
             result = plan_fix(loc)
         assert "pnpm" in result["instruction"]
 
+    def test_direct_python_instruction_uses_pep508_pin_and_declaration(self):
+        issue = _make_vuln_issue(
+            package_name="Requests",
+            ecosystem="pypi",
+            purl="pkg:pypi/Requests@2.31.0",
+        )
+        loc = _make_localized(
+            issue=issue,
+            manifest_file="pyproject.toml",
+            is_direct_dependency=True,
+            package_manager="pip",
+            declaration_type="dependencies",
+        )
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("2.32.0", None),
+        ):
+            result = plan_fix(loc)
+        assert result["fixed_version"] == "2.32.0"
+        assert "requests==2.32.0" in result["instruction"]
+        assert "pyproject.toml" in result["instruction"]
+        assert "dependencies" in result["instruction"]
+
+    def test_python_without_supported_declaration_does_not_suggest_manifest_pin(self):
+        issue = _make_vuln_issue(
+            package_name="Requests",
+            ecosystem="pypi",
+            purl="pkg:pypi/Requests@2.31.0",
+        )
+        loc = _make_localized(
+            issue=issue,
+            manifest_file="pyproject.toml",
+            is_direct_dependency=True,
+            package_manager=None,
+            declaration_type=None,
+        )
+        with patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=("2.32.0", None),
+        ):
+            result = plan_fix(loc)
+
+        assert "no supported Python declaration" in result["instruction"]
+        assert "requests==2.32.0" not in result["instruction"]
+
 
 # ===========================================================================
 # _minimum_fixed_version & context-aware version selection
@@ -979,6 +1070,26 @@ class TestMinimumFixedVersion:
 
     def test_empty_versions_returns_none(self):
         assert _minimum_fixed_version([]) is None
+
+    def test_pypi_fixed_versions_use_stable_pep440_ordering(self):
+        assert (
+            _minimum_fixed_version(
+                ["1.0.dev1", "1.0rc1", "1.0", "1.0.post1", "invalid"],
+                ecosystem="pypi",
+            )
+            == "1.0"
+        )
+        assert (
+            _minimum_fixed_version(
+                ["2.0rc2", "2.0", "2.0.post1"],
+                current_version="2.0rc1",
+                ecosystem="pypi",
+            )
+            == "2.0"
+        )
+
+    def test_pypi_invalid_fixed_versions_are_rejected(self):
+        assert _minimum_fixed_version(["invalid", "1.0rc1", "1.0.dev1"], ecosystem="pypi") is None
 
 
 # ===========================================================================

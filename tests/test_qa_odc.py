@@ -25,6 +25,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import (
     _build_qa_scan_targets,
     _collect_baseline_identifiers,
@@ -39,6 +40,7 @@ from remediation_engine.orchestration.qa_odc import (
     _ODC_INTERNAL_FULL_SCAN_EXCLUDES,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
+    _odc_command,
     _parse_report_identifiers,
     _read_report_from_workspace,
     _run_odc,
@@ -85,7 +87,7 @@ def test_final_full_scan_records_workspace_fingerprint_for_next_validation(tmp_p
         "repo_root": str(tmp_path),
         "workspace_volume": "agent_workspace_fingerprint",
         "valid_groups": [group],
-        "changed_files": [],
+        "project_language": ProjectLanguage.PYTHON,
     }
     scan = _SecurityScanResult(
         ok=True,
@@ -96,14 +98,22 @@ def test_final_full_scan_records_workspace_fingerprint_for_next_validation(tmp_p
     )
 
     with (
-        patch("remediation_engine.orchestration.qa_critic.DockerSandbox"),
+        patch("remediation_engine.orchestration.qa_critic.DockerSandbox") as sandbox_factory,
         patch(
             "remediation_engine.orchestration.qa_odc._run_security_scan",
             return_value=scan,
-        ),
+        ) as scan_runner,
     ):
         first = run_final_full_scan_node(state)
         second = run_final_full_scan_node({**state, **first})
+    assert all(
+        call.kwargs["project_language"] == ProjectLanguage.PYTHON
+        for call in scan_runner.call_args_list
+    )
+    assert all(
+        call.kwargs["image"] == LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
+        for call in sandbox_factory.call_args_list
+    )
 
     assert first["previous_final_scan_workspace_fingerprint"] is None
     assert first["final_scan_workspace_fingerprint"]
@@ -366,6 +376,73 @@ class TestRunOdc:
             args = mock_run.call_args[0][0]
 
         assert not any(pattern in args for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES)
+
+    def test_python_command_enables_experimental_mode_once(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--format XML"),
+        ):
+            command = _odc_command("python-vol", project_language=ProjectLanguage.PYTHON)
+
+        assert command.count("--enableExperimental") == 1
+        assert command[-3:] == ["--format", "XML", "--enableExperimental"]
+        assert "**/.remedy-pipenv/**" in command
+        assert "**/.venv/**" not in command
+
+    def test_python_command_does_not_duplicate_configured_experimental_flag(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--enableExperimental --format XML"),
+        ):
+            command = _odc_command("python-vol", project_language=ProjectLanguage.PYTHON)
+
+        assert command.count("--enableExperimental") == 1
+        assert command[-3:] == ["--enableExperimental", "--format", "XML"]
+
+    def test_node_command_keeps_configured_odc_arguments_without_python_mode(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--format XML"),
+        ):
+            command = _odc_command("node-vol")
+
+        assert command[-2:] == ["--format", "XML"]
+        assert "--enableExperimental" not in command
+        assert "**/.remedy-pipenv/**" not in command
+
+    def test_python_install_and_tests_use_persistent_venv(self):
+        sandbox = _make_sandbox()
+        sandbox.read_file.side_effect = lambda path: {
+            "requirements.txt": "requests==2.32.0",
+            "pyproject.toml": "[project]\\nname = 'sample'\\n",
+        }.get(path)
+
+        install = _run_install(sandbox, ProjectLanguage.PYTHON)
+        tests = _run_unit_tests(sandbox, ProjectLanguage.PYTHON)
+
+        assert install.ok is True
+        install_command = sandbox.run.call_args_list[0].args[0]
+        assert ".venv/bin/python -m pip install -r requirements.txt" in install_command
+        assert ".venv/bin/python -m pip install -e ." in install_command
+        assert "npm" not in install_command
+        assert tests.ok is True
+        assert sandbox.run.call_args_list[1].args[0] == ".venv/bin/python -m pytest"
+
+    def test_pipfile_is_authoritative_for_python_install(self):
+        sandbox = _make_sandbox()
+        sandbox.read_file.side_effect = lambda path: (
+            '[packages]\\nrequests = "*"\\n'
+            if path == "Pipfile"
+            else '{"default": {}, "develop": {}}'
+            if path == "Pipfile.lock"
+            else "requests==2.32.0"
+        )
+
+        _run_install(sandbox, ProjectLanguage.PYTHON)
+
+        assert sandbox.run.call_args.args[0] == (
+            "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv sync --dev"
+        )
 
     def test_assigns_unique_named_container_for_cleanup(self):
         with patch("subprocess.run") as mock_run:

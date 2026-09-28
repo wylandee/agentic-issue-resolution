@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from remediation_engine.contracts.schemas import ScannerExecutionStatus, VulnerabilityIssue
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
@@ -41,6 +42,7 @@ _ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
     "**/.remedy-attempt-snapshots/**",
     "**/.odc-targeted/**",
 )
+_ODC_PYTHON_FULL_SCAN_EXCLUDES = ("**/.remedy-pipenv/**",)
 
 
 @dataclass(frozen=True)
@@ -297,11 +299,21 @@ def _odc_timeout_summary(exc: subprocess.TimeoutExpired) -> str:
 def _run_odc_process(
     workspace_volume: str,
     scan_subdir: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Run ODC with a unique container identity and durable diagnostics."""
     scope = "targeted" if scan_subdir else "full"
     execution = _new_odc_execution(scope)
-    cmd = _odc_command(workspace_volume, scan_subdir, execution.container_name)
+    cmd = (
+        _odc_command(workspace_volume, scan_subdir, execution.container_name)
+        if project_language == ProjectLanguage.NODEJS
+        else _odc_command(
+            workspace_volume,
+            scan_subdir,
+            execution.container_name,
+            project_language,
+        )
+    )
     logger.info("qa_critic: running %s ODC in Docker: %s", scope, " ".join(cmd))
     try:
         process = subprocess.run(
@@ -457,6 +469,7 @@ def _odc_command(
     workspace_volume: str,
     scan_subdir: str | None = None,
     container_name: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[str]:
     """Build a safe ODC Docker command for the full or targeted workspace."""
     scan_path = "/scan"
@@ -492,27 +505,40 @@ def _odc_command(
     ]
 
     if scan_subdir is None:
-        for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES:
+        excludes = _ODC_INTERNAL_FULL_SCAN_EXCLUDES
+        if project_language == ProjectLanguage.PYTHON:
+            excludes = (*excludes, *_ODC_PYTHON_FULL_SCAN_EXCLUDES)
+        for pattern in excludes:
             cmd.extend(["--exclude", pattern])
 
-    extra_args = get_runtime_settings().odc_extra_args
-    if extra_args:
-        cmd.extend(shlex.split(extra_args))
+    configured_args = get_runtime_settings().odc_extra_args
+    extra_args = shlex.split(configured_args) if configured_args else []
+    if project_language == ProjectLanguage.PYTHON and "--enableExperimental" not in extra_args:
+        extra_args.append("--enableExperimental")
+    cmd.extend(extra_args)
 
     return cmd
 
 
-def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
+def _run_odc(
+    workspace_volume: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> subprocess.CompletedProcess[str]:
     """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
-    return _run_odc_process(workspace_volume)
+    if project_language == ProjectLanguage.NODEJS:
+        return _run_odc_process(workspace_volume)
+    return _run_odc_process(workspace_volume, project_language=project_language)
 
 
 def _run_targeted_odc(
     workspace_volume: str,
     targeted_subdir: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ODC against a validated workspace-relative targeted directory."""
-    return _run_odc_process(workspace_volume, targeted_subdir)
+    if project_language == ProjectLanguage.NODEJS:
+        return _run_odc_process(workspace_volume, targeted_subdir)
+    return _run_odc_process(workspace_volume, targeted_subdir, project_language)
 
 
 def _record_scan_result(
@@ -552,6 +578,7 @@ def _run_security_scan(
     workspace_volume: str,
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run Dependency-Check and return typed scan evidence.
 
@@ -612,7 +639,11 @@ def _run_security_scan(
         )
 
     try:
-        proc = _run_odc(workspace_volume)
+        proc = (
+            _run_odc(workspace_volume)
+            if project_language == ProjectLanguage.NODEJS
+            else _run_odc(workspace_volume, project_language)
+        )
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
@@ -809,6 +840,7 @@ def _run_targeted_security_scan(
     target_identifiers: set[str],
     baseline_identifiers: set[str],
     targeted_subdir: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run and classify ODC against a synthetic targeted workspace."""
     baseline = {
@@ -851,7 +883,15 @@ def _run_targeted_security_scan(
         )
 
     try:
-        proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
+        proc = (
+            _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
+            if project_language == ProjectLanguage.NODEJS
+            else _run_targeted_odc(
+                workspace_volume,
+                _validate_qa_path(targeted_subdir),
+                project_language,
+            )
+        )
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."

@@ -22,6 +22,7 @@ from remediation_engine.contracts.schemas import (
     RoutingStrategy,
     StateConsistencyEvent,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
@@ -29,6 +30,13 @@ from remediation_engine.orchestration.state import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _sandbox_image(state: OrchestratorState) -> str:
+    """Resolve the Docker image selected for this run's project language."""
+    value = state.get("project_language", ProjectLanguage.NODEJS)
+    language = value if isinstance(value, ProjectLanguage) else ProjectLanguage(value)
+    return LANGUAGE_CONFIGS[language].docker_image
 
 
 def _graph_module():
@@ -188,7 +196,9 @@ def _create_workspace_attempt_snapshot(
 
     try:
         with _graph_module().DockerSandbox(
-            repo_root=None, workspace_volume=workspace_volume
+            repo_root=None,
+            image=_sandbox_image(state),
+            workspace_volume=workspace_volume,
         ) as sandbox:
             sandbox.create_workspace_snapshot(snapshot_id)
     except Exception as exc:  # noqa: BLE001 - boundary must prevent unsafe execution
@@ -223,7 +233,9 @@ def _finish_workspace_attempt_snapshot(
     restore_succeeded = not restore
     try:
         with _graph_module().DockerSandbox(
-            repo_root=None, workspace_volume=workspace_volume
+            repo_root=None,
+            image=_sandbox_image(state),
+            workspace_volume=workspace_volume,
         ) as sandbox:
             if restore:
                 sandbox.restore_workspace_snapshot(snapshot_id)
@@ -259,7 +271,9 @@ def _restore_workspace_snapshot(
 
     try:
         with _graph_module().DockerSandbox(
-            repo_root=None, workspace_volume=workspace_volume
+            repo_root=None,
+            image=_sandbox_image(state),
+            workspace_volume=workspace_volume,
         ) as sandbox:
             sandbox.restore_workspace_snapshot(snapshot_id)
     except Exception as exc:  # noqa: BLE001 - preserve the original attempt outcome
@@ -878,6 +892,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
         target_tasks=target_tasks,
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
         target_groups=target_groups,
         constraints_ledger=list(state.get("constraints_ledger", [])),
         feedback_by_task=feedback_by_task,
@@ -1023,6 +1038,7 @@ def run_workaround_subagent_from_orchestrator(
         repo_root=state.get("repo_root", ""),
         workspace_volume=state.get("workspace_volume", ""),
         target_task=task,
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
         target_group=target_group,
         constraints_ledger=list(state.get("constraints_ledger", [])),
         previous_feedback=feedback_by_task.get(task.task_id),

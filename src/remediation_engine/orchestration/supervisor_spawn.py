@@ -24,8 +24,10 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.orchestration.supervisor_planner import (
     _build_high_level_retry_instruction,
     _override_dependency_type,
+    _pipfile_parent_declaration_type,
     _registry_report_versions,
     _registry_selected_version,
+    _resolve_pipfile_parent_context,
     instruction_digest,
 )
 from remediation_engine.orchestration.supervisor_policy import (
@@ -33,10 +35,156 @@ from remediation_engine.orchestration.supervisor_policy import (
     _parent_status_for_strategy_pivot,
 )
 from remediation_engine.orchestration.supervisor_routing import _build_consistency_event
-from remediation_engine.orchestration.task_utils import group_parent_context
+from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
+from remediation_engine.tools.pypi_registry_tools import plan_python_parent_version
 from remediation_engine.tools.registry_tools import plan_npm_parent_version
 
 logger = logging.getLogger(__name__)
+
+
+def _is_pypi_group(group: VulnerabilityGroup) -> bool:
+    """Return whether scanner evidence identifies this group as PyPI."""
+    for issue in group.issues:
+        ecosystem = (issue.ecosystem or "").strip().casefold()
+        purl = (issue.purl or "").strip().casefold()
+        if ecosystem in {"pypi", "python", "pkg:pypi"} or purl.startswith("pkg:pypi/"):
+            return True
+    return False
+
+
+def _fail_closed_python_parent_plan(
+    task: RemediationTask, group: VulnerabilityGroup
+) -> RemediationTask:
+    """Route an unproven Pipenv parent to code work without authorizing a pin."""
+    child = group.vulnerable_component or "the vulnerable package"
+    return task.model_copy(
+        update={
+            "strategy": RoutingStrategy.CODE_WORKAROUND,
+            "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+            "target_package_name": None,
+            "target_dependency_type": None,
+            "parent_package_name": None,
+            "parent_package_version": None,
+            "parent_minimum_version": None,
+            "selected_version": None,
+            "exhausted_update_path": True,
+            "instruction": (
+                f"No unique direct Pipfile parent could be proven for {child}; "
+                "use a code workaround or report no fix. Do not pin the vulnerable child, "
+                "edit a package override, or guess a parent."
+            ),
+        }
+    )
+
+
+def _plan_initial_python_transitive_task(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    *,
+    candidate_versions: list[str] | None,
+    workspace_volume: str | None,
+) -> RemediationTask:
+    """Authorize only a uniquely proven Pipfile parent update for PyPI."""
+    if candidate_versions is not None:
+        candidate_versions.clear()
+    child = group.vulnerable_component
+    child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
+    if not child or not child_fixed_version or not workspace_volume:
+        return _fail_closed_python_parent_plan(task, group)
+
+    try:
+        parent_context = _resolve_pipfile_parent_context(workspace_volume, group)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("supervisor: Pipfile parent proof failed for %s (%s)", child, exc)
+        parent_context = None
+    if not parent_context:
+        return _fail_closed_python_parent_plan(task, group)
+
+    parent_name, installed_parent_version, ancestry = parent_context
+    if not parent_name or not installed_parent_version or ancestry != [parent_name, child]:
+        return _fail_closed_python_parent_plan(task, group)
+    try:
+        parent_type = _pipfile_parent_declaration_type(workspace_volume, parent_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "supervisor: Pipfile parent category lookup failed for %s (%s)",
+            parent_name,
+            exc,
+        )
+        parent_type = None
+    if parent_type not in {"packages", "dev-packages"}:
+        return _fail_closed_python_parent_plan(task, group)
+
+    attempted: set[str] = set()
+    for selection, stage in (
+        ("minimum", SCARemediationStage.OSV_MINIMUM),
+        ("same_major", SCARemediationStage.PYPI_SAME_MAJOR),
+        ("latest", SCARemediationStage.PYPI_LATEST),
+    ):
+        try:
+            report = plan_python_parent_version.invoke(
+                {
+                    "parent_package_name": parent_name,
+                    "child_package_name": child,
+                    "child_fixed_version": child_fixed_version,
+                    "installed_parent_version": installed_parent_version,
+                    "selection": selection,
+                    "attempted_versions": ",".join(sorted(attempted)),
+                    "dependency_ancestry": ",".join(ancestry),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "supervisor: initial PyPI parent planning failed for %s (%s)",
+                parent_name,
+                exc,
+            )
+            report = ""
+        report_candidates = _registry_report_versions(
+            report,
+            "Compatible Parent Versions",
+            ecosystem="pypi",
+        )
+        selected = _registry_selected_version(report, ecosystem="pypi")
+        if not selected:
+            continue
+        attempted.add(selected)
+        stage_candidates = list(dict.fromkeys([*report_candidates, selected]))
+        if candidate_versions is not None:
+            candidate_versions.extend(stage_candidates)
+
+        manifest = next(
+            (path for path in group.file_paths if path.casefold().endswith("pipfile")),
+            "Pipfile",
+        )
+        target_task = task.model_copy(
+            update={
+                "strategy_stage": stage,
+                "target_package_name": parent_name,
+                "target_dependency_type": parent_type,
+                "parent_package_name": parent_name,
+                "parent_package_version": installed_parent_version,
+                "selected_version": selected,
+                "parent_minimum_version": (
+                    selected
+                    if stage == SCARemediationStage.OSV_MINIMUM
+                    else task.parent_minimum_version
+                ),
+            }
+        )
+        return target_task.model_copy(
+            update={
+                "instruction": (
+                    f"Apply strategy stage {stage.value} for transitive PyPI package {child}: "
+                    f"update only directly declared parent {parent_name} in {manifest} "
+                    f"({parent_type}) to exact version {selected}; "
+                    "use modify_and_validate_python_dependency. Do not edit the vulnerable "
+                    "child declaration or add an override."
+                )
+            }
+        )
+
+    return _fail_closed_python_parent_plan(task, group)
 
 
 def _commit_task_transition(*args: Any, **kwargs: Any) -> Any:
@@ -50,26 +198,39 @@ def _plan_initial_transitive_task(
     group: VulnerabilityGroup,
     *,
     candidate_versions: list[str] | None = None,
+    workspace_volume: str | None = None,
 ) -> RemediationTask:
     """Select the first parent-first candidate before worker dispatch.
 
     The worker receives only the committed result of this function. Registry
     failures or an empty candidate set advance deterministically to the next
-    parent stage, and only a fully exhausted parent path commits a child
-    package-manager override.
+    parent stage. PyPI transitive tasks fail closed unless a Pipfile.lock edge
+    proves one directly declared parent.
 
     Args:
         task: Pending transitive dependency task to plan.
         group: Vulnerability group containing the transitive dependency chain.
         candidate_versions: Optional mutable output list populated with the
             unfiltered registry candidates used for the selected parent stage.
+        workspace_volume: Shared workspace volume used to prove Pipfile parentage.
     """
-    if (
-        task.strategy != RoutingStrategy.VERSION_BUMP
-        or task.status != TaskStatus.PENDING
-        or task.parent_package_name is None
-        or task.strategy_stage != SCARemediationStage.OSV_MINIMUM
-    ):
+    if task.strategy != RoutingStrategy.VERSION_BUMP or task.status != TaskStatus.PENDING:
+        return task
+    if _is_pypi_group(group):
+        if not is_transitive_group(group):
+            return task
+        if task.strategy_stage not in {
+            SCARemediationStage.OSV_MINIMUM,
+            SCARemediationStage.PACKAGE_OVERRIDE,
+        }:
+            return task
+        return _plan_initial_python_transitive_task(
+            task,
+            group,
+            candidate_versions=candidate_versions,
+            workspace_volume=workspace_volume,
+        )
+    if task.parent_package_name is None or task.strategy_stage != SCARemediationStage.OSV_MINIMUM:
         return task
     child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
     parent_name, parent_version, parent_type = group_parent_context(group)

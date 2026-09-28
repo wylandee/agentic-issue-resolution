@@ -29,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration._tool_support import (
     _detect_newline_style,
     _normalise_newlines,
@@ -712,6 +713,61 @@ _WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
 )
 
 
+_PYTHON_WORKAROUND_STATIC_INSTRUCTIONS = """You are a Python code security
+specialist operating in the shared workspace. Work on Python source files
+(`.py`) and use the project's pip or Pipenv environment; tests are run with
+pytest. Follow Investigate -> Plan -> Execute -> Validate. Make one minimal,
+semantic source patch per iteration with deterministic_apply_edit_set, including
+imports and causally related call sites in the same atomic edit set. Use
+validate_python_syntax to check Python syntax, run_targeted_python_test for a
+focused pytest run, and validate_python_workaround to validate the cumulative
+modified files. Do not edit unrelated code or weaken the security invariant.
+
+For INITIAL_MITIGATION, inspect local code first, then perform the initial
+search_web call once and read authoritative results with read_web_page. Adapt
+guidance to the local Python code; do not copy an external patch blindly.
+
+For QA_REGRESSION_REPAIR, trace pytest evidence to modified Python source. Use
+search_web only for migration guidance or exact breaking-change diagnostics. An
+alternative targeted test may be substituted once only for a proven
+infrastructure-only failure, with a recorded mapping; never substitute for an
+assertion, syntax, type, or application-runtime failure.
+
+Supported dependency declarations include requirements files such as
+requirements.txt, static PEP 621 pyproject.toml, static setup.cfg, and Pipfile.
+Ordinary workarounds must not
+modify dependency manifests or lockfiles. For NO_FIX PACKAGE_REMOVAL only,
+remove_no_fix_python_dependency is the sole manifest operation; never manually
+edit Pipfile.lock. Remove source imports and dependent usage when inspection
+shows them, then validate the cumulative Python source patch.
+
+Test files are read-only. Runtime smoke must import a lightweight Python source
+module, never a test/spec file or build/dist artifact, and remain separate from
+the targeted pytest run. Supply the complete cumulative modified-file list to
+validate_python_workaround. Resolve infrastructure-only failures through the
+permitted alternative targeted-test path; do not edit for infrastructure noise.
+
+Each deterministic_apply_edit_set is provisional until
+validate_python_workaround returns PASS. CODE_FAILURE rolls back the whole
+pending set; the next plan must re-include every required change. PASS promotes
+it into the cumulative patch. INFRA_FAILURE or BLOCKED retains the pending set
+for recovery; never re-apply the same patch. Always report modified_files
+cumulatively. Before source edits or package removal, call record_plan. Never
+modify tests to make assertions pass, use absolute paths, or bump library
+versions."""
+
+
+def _build_workaround_system_prompt(
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
+    """Return the language-matched workaround instructions."""
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    if project_language == ProjectLanguage.PYTHON:
+        return _PYTHON_WORKAROUND_STATIC_INSTRUCTIONS
+    return _WORKAROUND_STATIC_INSTRUCTIONS
+
+
 def _build_workaround_prompt(
     target_task: RemediationTask,
     target_group: VulnerabilityGroup,
@@ -720,6 +776,7 @@ def _build_workaround_prompt(
     current_replay_plan: WorkaroundReplayPlan | None = None,
     vulnerability_mechanism: str | None = None,
     workaround_context: WorkaroundContext | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
     """Build the dynamic human context for one workaround attempt."""
     constraints_ledger = list(constraints_ledger or [])
@@ -775,6 +832,10 @@ def _build_workaround_prompt(
         f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
         f"Task Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=None)}",
     ]
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    if project_language == ProjectLanguage.PYTHON:
+        sections.insert(1, "Canonical project language: python (Python).")
 
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
         manifest_paths = [
@@ -1064,6 +1125,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     workspace_volume = state.get("workspace_volume", "")
     target_task = state.get("target_task")
     target_group = state.get("target_group")
+    raw_language = state.get("project_language", ProjectLanguage.NODEJS)
+    project_language = (
+        raw_language
+        if isinstance(raw_language, ProjectLanguage)
+        else ProjectLanguage(raw_language or ProjectLanguage.NODEJS.value)
+    )
     t_id = target_task.task_id if target_task else "unknown"
 
     if get_runtime_settings().remedy_bypass_workaround_subagent:
@@ -1165,7 +1232,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         replayed_edit_sets = []
 
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+        with DockerSandbox(
+            repo_root=None,
+            image=LANGUAGE_CONFIGS[project_language].docker_image,
+            workspace_volume=workspace_volume,
+        ) as sandbox:
             # A replay plan's stage baseline is task-local. Restoring the
             # whole file from that baseline on every retry can erase a
             # different vulnerability group's already-validated edit when
@@ -1288,9 +1359,10 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 current_replay_plan,
                 vulnerability_mechanism=vulnerability_mechanism,
                 workaround_context=workaround_ctx,
+                project_language=project_language,
             )
             initial_messages = [
-                SystemMessage(content=_WORKAROUND_STATIC_INSTRUCTIONS),
+                SystemMessage(content=_build_workaround_system_prompt(project_language)),
                 HumanMessage(content=prompt),
             ]
 
@@ -1339,6 +1411,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                         "npm",
                     )
                 ),
+                language=project_language,
             )
             context_manager = ContextManager(toolbelt)
             runtime = run_bounded_subagent_loop(

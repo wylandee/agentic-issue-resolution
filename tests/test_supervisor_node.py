@@ -1366,7 +1366,34 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
         "g1",
         status=TaskStatus.NEEDS_RETRY,
         retry_count=2,
-    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
+    ).model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "task_revision": 1,
+            "current_attempt_id": "update-attempt-1",
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "dependencies",
+            "selected_version": "1.2.3",
+            "instruction": "update package",
+        }
+    )
+    attempt_snapshot = TaskAttemptSnapshot(
+        attempt_id="update-attempt-1",
+        task_id="task-1",
+        state_revision=1,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="1.2.3",
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        allowed_target_versions=["1.2.3"],
+        allowed_dependency_types=["dependencies"],
+        instruction=task.instruction,
+        instruction_digest=instruction_digest(task.instruction),
+        dispatch_node="update_subagent",
+    )
     state = _base_state(
         [group],
         task_queue={"task-1": task},
@@ -1416,6 +1443,7 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
             )
         },
         status="supervisor_entered",
+        attempt_snapshots_by_id={"update-attempt-1": attempt_snapshot},
     )
 
     result = run_supervisor_node(state)
@@ -3190,3 +3218,54 @@ class TestBugFixes:
 
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
+
+
+def test_pypi_dispatch_uses_canonical_attempts_and_immutable_snapshot_pool():
+    task = _make_task("task-pypi", "pypi-group").model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR,
+            "selected_version": "1.2.0",
+            "target_package_name": "requests",
+            "target_dependency_type": "requirements",
+            "instruction": "Update requests to exact version 1.2.0.",
+        }
+    )
+    plan = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=SCARemediationStage.PYPI_SAME_MAJOR,
+        selected_version="1.2.0",
+        target_package_name="requests",
+        target_dependency_type="requirements",
+        candidate_versions_considered=["1.2.0", "1.10.0"],
+        candidate_dependency_types=["requirements"],
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        target_package_name="REQUESTS",
+        target_dependency_type="requirements",
+        attempted_versions_by_target={"ReQuests": ["1.10.0"]},
+    )
+
+    authorization = _authorize_update_dispatch(
+        task,
+        plan=plan,
+        diagnostics=diagnostics,
+        ecosystem="pypi",
+    )
+    assert authorization is not None
+    assert authorization.selected_version == "1.2.0"
+    assert authorization.allowed_target_versions == ("1.2.0",)
+    assert authorization.allowed_dependency_types == ("requirements",)
+
+    _updated_task, snapshot = _create_attempt_snapshot(
+        task,
+        dispatch_node="update_subagent",
+        snapshots_by_id={},
+        state_revision=9,
+        allowed_target_versions=authorization.allowed_target_versions,
+        allowed_dependency_types=authorization.allowed_dependency_types,
+    )
+    assert snapshot.allowed_target_versions == ["1.2.0"]
+    assert snapshot.selected_version == "1.2.0"
+    assert snapshot.target_package_name == "requests"

@@ -8,15 +8,26 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from remediation_engine.contracts.schemas import CommandResult
+import pytest
+
+from remediation_engine.contracts.schemas import CommandResult, NoFixMitigationStage
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration._tool_support import (
+    _is_test_file_path,
+    _runtime_smoke_bootstrap_reason,
+    _runtime_smoke_path_error,
+)
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
+    _make_deterministic_search_replace_tool,
     _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    _make_validate_workaround_tool,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
+from remediation_engine.orchestration.tools_manifest import _is_prohibited_target
 
 
 def _update_tool_map(
@@ -65,6 +76,183 @@ class TestToolbeltFactories:
         tools = _update_tool_map(sandbox)
 
         assert set(tools) == {"modify_and_validate_npm_dependency"}
+
+    def test_python_update_toolbelt_exposes_only_the_pypi_transaction(self):
+        sandbox = MagicMock()
+        tools = build_update_toolbelt(
+            sandbox,
+            set(),
+            ["requirements.txt"],
+            {"requests": ["requirements.txt"]},
+            allowed_target_versions_by_package={"requests": ["2.32.0"]},
+            allowed_dependency_types_by_package={"requests": ["requirements"]},
+            language=ProjectLanguage.PYTHON,
+            package_ecosystem="pypi",
+        )
+
+        assert [tool.name for tool in tools] == ["modify_and_validate_python_dependency"]
+
+    def test_mismatched_update_toolbelt_pairing_fails_before_factories(self):
+        for language, ecosystem in (
+            (ProjectLanguage.NODEJS, "pypi"),
+            (ProjectLanguage.PYTHON, "npm"),
+        ):
+            with (
+                patch(
+                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_npm_dependency_tool"
+                ) as npm_factory,
+                patch(
+                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_python_dependency_tool"
+                ) as python_factory,
+                pytest.raises(
+                    ValueError,
+                    match="Unsupported project-language/package-ecosystem pairing\\.",
+                ),
+            ):
+                build_update_toolbelt(
+                    MagicMock(),
+                    set(),
+                    [],
+                    {},
+                    language=language,
+                    package_ecosystem=ecosystem,
+                )
+            npm_factory.assert_not_called()
+            python_factory.assert_not_called()
+
+    def test_python_no_fix_exposes_only_python_removal_and_protects_manifests(self):
+        sandbox = MagicMock()
+        plan_state = {
+            "recorded": True,
+            "package_removal_planned": True,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        }
+        tools = build_workaround_toolbelt(
+            sandbox,
+            set(),
+            Path("/dummy/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["Pipfile"],
+            no_fix_package_manager="pipenv",
+            language=ProjectLanguage.PYTHON,
+        )
+        names = {tool.name for tool in tools}
+
+        assert "remove_no_fix_python_dependency" in names
+        assert "remove_no_fix_dependency" not in names
+        for path in (
+            "requirements.txt",
+            "requirements-dev.txt",
+            "pyproject.toml",
+            "setup.cfg",
+            "Pipfile",
+            "Pipfile.lock",
+            "setup.py",
+        ):
+            assert _is_prohibited_target(path)
+
+    def test_python_no_fix_validation_reads_python_manifest(self):
+        files = {"requirements.txt": "requests==2.31.0\n"}
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: files.get(path)
+        plan_state = {
+            "recorded": True,
+            "local_investigation_complete": True,
+            "package_removal_planned": True,
+            "no_fix_package_removed": True,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+            "no_fix_package_name": "requests",
+        }
+        toolbelt = build_workaround_toolbelt(
+            sandbox,
+            {"requirements.txt"},
+            Path("/tmp/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["requirements.txt"],
+            no_fix_package_manager="pip",
+            language=ProjectLanguage.PYTHON,
+        )
+        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
+
+        result = validator.invoke(
+            {"modified_files": ["requirements.txt"], "runtime_smoke_file": "src/app.py"}
+        )
+
+        assert "vulnerable package remains in a direct declaration" in result
+        sandbox.run.assert_not_called()
+
+    def test_python_no_fix_validation_requests_python_removal_tool(self):
+        plan_state = {
+            "recorded": True,
+            "local_investigation_complete": True,
+            "package_removal_planned": True,
+            "no_fix_package_removed": False,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+            "no_fix_package_name": "requests",
+        }
+        toolbelt = build_workaround_toolbelt(
+            MagicMock(),
+            {"src/app.py"},
+            Path("/tmp/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["requirements.txt"],
+            no_fix_package_manager="pip",
+            language=ProjectLanguage.PYTHON,
+        )
+        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
+
+        result = validator.invoke(
+            {"modified_files": ["src/app.py"], "runtime_smoke_file": "src/app.py"}
+        )
+
+        assert result.startswith("FAILURE: [PACKAGE_REMOVAL]")
+        assert "remove_no_fix_python_dependency" in result
+        assert "remove_no_fix_dependency" not in result
+
+    def test_python_workaround_toolbelt_exposes_only_python_validation_tools(self):
+        tools = build_workaround_toolbelt(
+            MagicMock(),
+            set(),
+            Path("/dummy/repo"),
+            language=ProjectLanguage.PYTHON,
+        )
+        names = {tool.name for tool in tools}
+
+        assert {
+            "validate_python_syntax",
+            "run_targeted_python_test",
+            "validate_python_workaround",
+        } <= names
+        assert (
+            not {
+                "validate_code_syntax",
+                "run_targeted_test",
+                "validate_workaround",
+                "modify_and_validate_npm_dependency",
+                "remove_no_fix_dependency",
+            }
+            & names
+        )
+
+    def test_update_toolbelts_never_expose_the_other_package_manager(self):
+        node_tools = _update_tool_map(MagicMock())
+        python_tools = build_update_toolbelt(
+            MagicMock(),
+            set(),
+            ["requirements.txt"],
+            {"requests": ["requirements.txt"]},
+            language=ProjectLanguage.PYTHON,
+            package_ecosystem="pypi",
+        )
+
+        assert set(node_tools) == {"modify_and_validate_npm_dependency"}
+        assert [tool.name for tool in python_tools] == ["modify_and_validate_python_dependency"]
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -1263,3 +1451,208 @@ class TestReadWebPage:
             timeout=15,
         )
         assert "Use expressjwt from the named export" in res
+
+
+class TestPythonWorkaroundSupport:
+    def test_python_workspace_map_and_search_include_python_and_exclude_generated_files(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="src/app.py\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tools = {
+            tool.name: tool
+            for tool in build_workaround_toolbelt(
+                sandbox,
+                set(),
+                Path("/dummy/repo"),
+                language=ProjectLanguage.PYTHON,
+            )
+        }
+
+        assert "src/app.py" in tools["read_repository_map"].invoke({})
+        map_command = sandbox.run.call_args[0][0]
+        assert "*.pyc" in map_command
+        for directory in (
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".pytest_cache",
+            ".remedy-pipenv",
+        ):
+            assert f"*/{directory}/*" in map_command
+
+        tools["search_codebase_pattern"].invoke({"search_pattern": "unsafe"})
+        search_command = sandbox.run.call_args[0][0]
+        assert "--include='*.py'" in search_command
+        assert "--include='*.js'" not in search_command
+        assert "--exclude='setup.py'" in search_command
+        for directory in (
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".pytest_cache",
+            ".remedy-pipenv",
+        ):
+            assert f"--exclude-dir={directory}" in search_command
+
+    def test_python_targeted_test_uses_pytest_and_rejects_other_suffixes(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "def test_sample(): pass\n"
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="1 passed\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tool = _make_run_targeted_test_tool(
+            sandbox,
+            preferred_test_files=["tests/test_sample.py"],
+            language=ProjectLanguage.PYTHON,
+        )
+
+        result = tool.invoke({"test_file": "tests/test_sample.py", "test_name": "test_sample"})
+        assert result.startswith("SUCCESS:")
+        command = sandbox.run.call_args[0][0]
+        assert ".venv/bin/python -m pytest" in command
+        assert "tests/test_sample.py::test_sample" in command
+        assert "node" not in command
+
+        sandbox.run.reset_mock()
+        rejected = tool.invoke({"test_file": "tests/test_sample.test.js"})
+        assert rejected.startswith("ERROR: [INVALID_VALIDATION_INPUT]")
+        sandbox.run.assert_not_called()
+
+    def test_python_syntax_and_runtime_smoke_accept_only_importable_python_sources(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        syntax = _make_validate_code_syntax_tool(
+            sandbox,
+            language=ProjectLanguage.PYTHON,
+        )
+
+        assert syntax.invoke({"file_path": "src/module.py"}).startswith("SUCCESS:")
+        command = sandbox.run.call_args[0][0]
+        assert ".venv/bin/python -c" in command
+        assert "ast.parse" in command
+        sandbox.run.reset_mock()
+        assert syntax.invoke({"file_path": "src/module.js"}).startswith("ERROR:")
+        sandbox.run.assert_not_called()
+
+        assert _runtime_smoke_path_error(
+            "src/module.py",
+            language=ProjectLanguage.PYTHON,
+        ) == ("src/module.py", None)
+        assert _runtime_smoke_path_error("src/module.py")[0] is None
+        assert _is_test_file_path("test_helpers.py", language=ProjectLanguage.PYTHON)
+        assert _runtime_smoke_bootstrap_reason(
+            "src/app.py",
+            "app.run()",
+            language=ProjectLanguage.PYTHON,
+        )
+        assert _runtime_smoke_bootstrap_reason(
+            "setup.py",
+            "setup()",
+            language=ProjectLanguage.PYTHON,
+        )
+
+    def test_python_ast_replacement_requires_prior_file_inspection(self):
+        sandbox = MagicMock()
+        plan_state = {
+            "recorded": True,
+            "phase": "EXECUTE",
+            "planned_files": ["src/module.py"],
+            "inspected_files": set(),
+            "fallback_files": set(),
+        }
+        tool = _make_deterministic_replace_ast_symbol_tool(
+            sandbox,
+            set(),
+            plan_state,
+        )
+
+        result = tool.invoke(
+            {
+                "file_path": "src/module.py",
+                "symbol_name": "target",
+                "replacement": "return True",
+            }
+        )
+        assert "[MISSING_INSPECTION]" in result
+
+    def test_python_workaround_runtime_smoke_imports_module_and_runs_pytest(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: {
+            "src/service.py": "def helper():\n    return True\n",
+            "tests/test_service.py": "def test_helper():\n    assert True\n",
+        }.get(path)
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        validation = _make_validate_workaround_tool(
+            sandbox,
+            set(),
+            {},
+            preferred_test_files=["tests/test_service.py"],
+            language=ProjectLanguage.PYTHON,
+        )
+
+        result = validation.invoke(
+            {
+                "modified_files": ["src/service.py"],
+                "runtime_smoke_file": "src/service.py",
+                "targeted_test_file": "tests/test_service.py",
+            }
+        )
+        assert result.startswith("SUCCESS: Workaround validation gate passed")
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert any(
+            ".venv/bin/python -m pytest -q tests/test_service.py" in command for command in commands
+        )
+        assert all(not command.startswith("node ") for command in commands)
+
+    def test_python_search_replace_rolls_back_syntax_errors(self):
+        original = "def helper():\n    return 1\n"
+        files = {"src/helper.py": original}
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: files.get(path)
+        sandbox.write_file.side_effect = lambda path, content: files.__setitem__(path, content)
+        state = {
+            "recorded": True,
+            "phase": "EXECUTE",
+            "planned_files": ["src/helper.py"],
+            "inspected_files": {"src/helper.py"},
+            "fallback_files": set(),
+        }
+        tool = _make_deterministic_search_replace_tool(sandbox, set(), state)
+
+        with patch(
+            "remediation_engine.orchestration.tools_validation._run_readonly",
+            return_value=CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="SyntaxError: '(' was never closed",
+                duration_seconds=0.1,
+            ),
+        ) as syntax_run:
+            result = tool.invoke(
+                {
+                    "file_path": "src/helper.py",
+                    "old_text": "return 1",
+                    "new_text": "return (",
+                }
+            )
+
+        assert "invalid syntax" in result.lower()
+        assert files["src/helper.py"] == original
+        assert ".venv/bin/python -c" in syntax_run.call_args.args[1]

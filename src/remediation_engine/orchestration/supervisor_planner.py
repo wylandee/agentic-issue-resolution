@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import tomllib
 from collections.abc import Iterable
 from typing import Any
+
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.version import InvalidVersion, Version
+from semantic_version import Version as SemVerVersion
 
 from remediation_engine.contracts.schemas import (
     FailureCategory,
@@ -18,7 +24,11 @@ from remediation_engine.contracts.schemas import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
-from remediation_engine.contracts.version_policy import select_version
+from remediation_engine.contracts.version_policy import (
+    RegistryCandidate,
+    registry_version_key,
+    select_version,
+)
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _canonical_security_floor,
@@ -29,6 +39,13 @@ from remediation_engine.orchestration.supervisor_policy import (
 )
 from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
+from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.package_identity import normalize_python_package_name
+from remediation_engine.tools.pypi_registry_tools import (
+    fetch_pypi_registry_candidates,
+    get_pypi_release_requires_dist,
+    plan_python_parent_version,
+)
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -41,7 +58,9 @@ QA_DISPATCH_LIMIT: int = 1
 _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
+    SCARemediationStage.PYPI_SAME_MAJOR: 1,
     SCARemediationStage.NPM_LATEST: 2,
+    SCARemediationStage.PYPI_LATEST: 2,
     SCARemediationStage.PACKAGE_OVERRIDE: 3,
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
@@ -49,81 +68,201 @@ _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overri
 _MAX_REGISTRY_CANDIDATES = 3
 
 
+def _group_ecosystem(group: VulnerabilityGroup | None) -> str:
+    """Resolve the vulnerable package ecosystem from issue and PURL evidence."""
+    if group is None:
+        return "npm"
+    issues = [*group.issues, *(localized.issue for localized in group.localized_issues)]
+    for issue in issues:
+        ecosystem = str(issue.ecosystem or "").strip().casefold()
+        if ecosystem in {"pypi", "python"}:
+            return "pypi"
+        if ecosystem == "npm":
+            return "npm"
+        purl = str(issue.purl or "").strip().casefold()
+        if purl.startswith("pkg:pypi/"):
+            return "pypi"
+        if purl.startswith("pkg:npm/"):
+            return "npm"
+    return "npm"
+
+
+def _normalize_package_target(package_name: str, ecosystem: str) -> str:
+    return normalize_python_package_name(package_name) if ecosystem == "pypi" else package_name
+
+
+def _normalise_candidate_version(value: Any, ecosystem: str = "npm") -> str:
+    """Normalize a candidate without changing npm's legacy ``v`` handling."""
+    normalized = str(value).strip().lstrip("vV")
+    if ecosystem != "pypi":
+        return normalized
+    try:
+        return str(Version(normalized))
+    except InvalidVersion:
+        return ""
+
+
+def _registry_version_key(value: str, ecosystem: str) -> tuple[int, object]:
+    """Build the ecosystem key using the canonical source ordering primitive."""
+    if ecosystem == "npm":
+        parsed = SemVerVersion(value)
+        semver_key = (parsed.major, parsed.minor, parsed.patch)
+        return registry_version_key(value, ecosystem, semver_key)
+    return registry_version_key(value, ecosystem)
+
+
+def _candidate_version_key(value: Any, ecosystem: str = "npm") -> tuple[int, object]:
+    """Return the cross-ecosystem policy key for an exact registry version."""
+    normalized = _normalise_candidate_version(value, ecosystem)
+    return _registry_version_key(normalized, ecosystem)
+
+
 def _supervisor_fetch_registry_candidates(
     package_name: str,
     security_floor: str,
     attempted_versions: set[str],
-) -> list[Any]:
+    ecosystem: str = "npm",
+) -> list[RegistryCandidate]:
     """Fetch registry candidates as a Supervisor-owned traced operation."""
-    inputs = {
-        "package_name": package_name,
-        "security_floor": security_floor,
-        "attempted_versions": attempted_versions,
+    ecosystem = "pypi" if str(ecosystem).casefold() in {"pypi", "python"} else "npm"
+    normalized_name = _normalize_package_target(package_name, ecosystem)
+    normalized_floor = _normalise_candidate_version(security_floor, ecosystem)
+    normalized_attempted = {
+        _normalise_candidate_version(version, ecosystem)
+        for version in attempted_versions
+        if _normalise_candidate_version(version, ecosystem)
     }
+    inputs = {
+        "package_name": normalized_name,
+        "security_floor": normalized_floor,
+        "attempted_versions": normalized_attempted,
+        "ecosystem": ecosystem,
+    }
+
+    def fetch_candidates() -> list[RegistryCandidate]:
+        if ecosystem == "pypi":
+            return fetch_pypi_registry_candidates(
+                normalized_name,
+                normalized_floor,
+                normalized_attempted,
+            )
+        return fetch_registry_candidates(
+            normalized_name,
+            normalized_floor,
+            normalized_attempted,
+        )
+
     return invoke_with_trajectory(
         "supervisor.fetch_registry_candidates",
-        lambda: fetch_registry_candidates(
-            package_name,
-            security_floor,
-            attempted_versions,
-        ),
+        fetch_candidates,
         inputs,
         run_type="tool",
     )
-
-
-def _normalise_candidate_version(value: Any) -> str:
-    """Normalize a registry version for immutable-pool comparisons."""
-    return str(value).strip().lstrip("vV")
-
-
-def _candidate_version_key(value: Any) -> tuple[int, int, int]:
-    """Return a stable semantic-version sort key for registry report values."""
-    parts = _normalise_candidate_version(value).split(".")
-    try:
-        numbers = tuple(int(part) for part in parts)
-    except ValueError:
-        return (0, 0, 0)
-    return (numbers + (0, 0, 0))[:3]
 
 
 def _select_report_candidate(
     values: Iterable[str],
     stage: SCARemediationStage,
     attempted_versions: set[str],
+    ecosystem: str = "npm",
 ) -> str | None:
     """Select an approved report candidate without inventing a version."""
-    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
+    attempted = {
+        _normalise_candidate_version(version, ecosystem)
+        for version in attempted_versions
+        if _normalise_candidate_version(version, ecosystem)
+    }
     eligible = [
-        _normalise_candidate_version(value)
+        normalized
         for value in values
-        if _normalise_candidate_version(value) not in attempted
+        if (normalized := _normalise_candidate_version(value, ecosystem))
+        and normalized not in attempted
     ]
     if not eligible:
         return None
+
+    def version_key(version: str) -> tuple[int, object]:
+        return _candidate_version_key(version, ecosystem)
+
     return (
-        min(eligible, key=_candidate_version_key)
+        min(eligible, key=version_key)
         if stage == SCARemediationStage.OSV_MINIMUM
-        else max(eligible, key=_candidate_version_key)
+        else max(
+            eligible,
+            key=version_key,
+        )
     )
+
+
+def _supervisor_plan_parent_version(inputs: dict[str, Any], ecosystem: str) -> str:
+    """Run the ecosystem-matched read-only parent planner under a tool span."""
+    if ecosystem == "pypi":
+        return invoke_with_trajectory(
+            "supervisor.plan_python_parent_version",
+            lambda: plan_python_parent_version.invoke(inputs),
+            inputs,
+            run_type="tool",
+        )
+    return _supervisor_plan_npm_parent_version(inputs)
+
+
+def _registry_report_version(value: str, ecosystem: str = "npm") -> str:
+    normalized = _normalise_candidate_version(value, ecosystem)
+    if not normalized:
+        return ""
+    if ecosystem == "pypi":
+        parsed = Version(normalized)
+        if parsed.is_prerelease or parsed.is_devrelease:
+            return ""
+    _registry_version_key(normalized, ecosystem)
+    return normalized
+
+
+def _registry_report_versions(
+    report: str,
+    label: str,
+    ecosystem: str = "npm",
+) -> list[str]:
+    """Extract and canonicalize stable versions from a planner report."""
+    match = re.search(
+        rf"^-\s*{re.escape(label)}:\s*(.*)$",
+        report or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if not match:
+        return []
+    versions: list[str] = []
+    for raw in match.group(1).split(","):
+        raw_version = raw.strip()
+        if not raw_version or raw_version.upper() == "NONE":
+            continue
+        value = _registry_report_version(raw_version, ecosystem)
+        if value and value not in versions:
+            versions.append(value)
+    if ecosystem == "npm":
+        return versions
+    return sorted(versions, key=lambda version: _candidate_version_key(version, ecosystem))
 
 
 def _approved_candidate_pool(
     diagnostics: UpdateRetryDiagnostics,
     target_package_name: str | None,
+    ecosystem: str = "npm",
 ) -> tuple[str, ...]:
     """Return the previously committed candidate pool for one target."""
-    if (
-        target_package_name
-        and diagnostics.target_package_name
-        and diagnostics.target_package_name != target_package_name
-    ):
+    normalized_target = (
+        _normalize_package_target(target_package_name, ecosystem) if target_package_name else None
+    )
+    diagnostic_target = diagnostics.target_package_name
+    if ecosystem == "pypi" and diagnostic_target:
+        diagnostic_target = _normalize_package_target(diagnostic_target, ecosystem)
+    if normalized_target and diagnostic_target and diagnostic_target != normalized_target:
         return ()
     return tuple(
         dict.fromkeys(
-            _normalise_candidate_version(version)
+            normalized
             for version in diagnostics.candidate_versions_considered
-            if _normalise_candidate_version(version)
+            if (normalized := _normalise_candidate_version(version, ecosystem))
         )
     )
 
@@ -133,21 +272,242 @@ def _fetch_registry_candidates_for_task(
     security_floor: str,
     attempted_versions: set[str],
     diagnostics: UpdateRetryDiagnostics,
-) -> list[Any]:
+    ecosystem: str = "npm",
+) -> list[RegistryCandidate]:
     """Revalidate only the task's committed candidate pool on retries."""
-    approved_pool = _approved_candidate_pool(diagnostics, package_name)
+    package_name = _normalize_package_target(package_name, ecosystem)
+    attempted = {
+        normalized
+        for version in attempted_versions
+        if (normalized := _normalise_candidate_version(version, ecosystem))
+    }
+    approved_pool = _approved_candidate_pool(diagnostics, package_name, ecosystem)
     candidates = _supervisor_fetch_registry_candidates(
         package_name,
         security_floor,
-        set() if approved_pool else attempted_versions,
+        set() if approved_pool else attempted,
+        ecosystem,
     )
     if not approved_pool:
         return candidates
+    approved = set(approved_pool)
     return [
         candidate
         for candidate in candidates
-        if _normalise_candidate_version(getattr(candidate, "version", "")) in set(approved_pool)
+        if _normalise_candidate_version(candidate.version, ecosystem) in approved
     ]
+
+
+def _attempted_versions_for_target(
+    diagnostics: UpdateRetryDiagnostics,
+    target_package_name: str | None,
+    ecosystem: str,
+) -> set[str]:
+    """Canonicalize attempts while preferring evidence scoped to this target."""
+    normalized_target = (
+        _normalize_package_target(target_package_name, ecosystem) if target_package_name else None
+    )
+    scoped: list[str] = []
+    for package_name, versions in diagnostics.attempted_versions_by_target.items():
+        normalized_name = _normalize_package_target(package_name, ecosystem)
+        if normalized_target and normalized_name == normalized_target:
+            scoped.extend(versions)
+    values = scoped or diagnostics.attempted_versions
+    return {
+        normalized
+        for version in values
+        if (normalized := _normalise_candidate_version(version, ecosystem))
+    }
+
+
+def _pipfile_data(workspace_volume: str) -> dict[str, Any] | None:
+    """Read and parse the authorized root Pipfile from the shared volume."""
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            content = sandbox.read_file("Pipfile")
+        parsed = tomllib.loads(content or "")
+    except Exception as exc:  # noqa: BLE001 - parent proof must fail closed
+        logger.debug("Unable to read or parse Pipfile for parent proof: %s", exc)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _pipfile_declaration_is_unconditional(raw_name: str, value: Any) -> bool:
+    """Accept only unconditional index-style Pipfile declarations."""
+    try:
+        parsed_name = Requirement(raw_name)
+    except InvalidRequirement:
+        return False
+    if parsed_name.extras or parsed_name.marker:
+        return False
+    if isinstance(value, str):
+        version_specifier = value.strip()
+    elif isinstance(value, dict):
+        if set(value) - {"version"}:
+            return False
+        version_specifier = value.get("version", "*")
+        if not isinstance(version_specifier, str):
+            return False
+        version_specifier = version_specifier.strip()
+    else:
+        return False
+    if version_specifier == "*":
+        return True
+    try:
+        requirement = Requirement(f"{parsed_name.name}{version_specifier}")
+    except InvalidRequirement:
+        return False
+    return not requirement.extras and requirement.marker is None
+
+
+def _pipfile_parent_declaration_type(
+    workspace_volume: str,
+    parent_package_name: str,
+) -> str | None:
+    """Return the unique Pipfile category containing a directly declared parent."""
+    pipfile = _pipfile_data(workspace_volume)
+    if pipfile is None:
+        return None
+    normalized_parent = normalize_python_package_name(parent_package_name)
+    matches: list[str] = []
+    for category, declaration_type in (("packages", "packages"), ("dev-packages", "dev-packages")):
+        entries = pipfile.get(category)
+        if entries is None:
+            continue
+        if not isinstance(entries, dict):
+            return None
+        for name, value in entries.items():
+            if normalize_python_package_name(str(name)) != normalized_parent:
+                continue
+            if not _pipfile_declaration_is_unconditional(str(name), value):
+                return None
+            matches.append(declaration_type)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _locked_python_version(category: Any, normalized_name: str) -> str | None:
+    if not isinstance(category, dict):
+        return None
+    matches = [
+        value
+        for name, value in category.items()
+        if normalize_python_package_name(str(name)) == normalized_name
+    ]
+    if len(matches) != 1 or not isinstance(matches[0], dict):
+        return None
+    raw_version = matches[0].get("version")
+    if not isinstance(raw_version, str):
+        return None
+    exact = raw_version.strip()
+    if exact.startswith("=="):
+        exact = exact[2:]
+    elif exact.startswith("="):
+        exact = exact[1:]
+    try:
+        parsed = Version(exact)
+    except InvalidVersion:
+        return None
+    if parsed.is_prerelease or parsed.is_devrelease:
+        return None
+    return str(parsed)
+
+
+def _resolve_pipfile_parent_context(
+    workspace_volume: str,
+    group: VulnerabilityGroup,
+) -> tuple[str, str, list[str]] | None:
+    """Prove one unconditional, category-matched Pipfile.lock parent edge."""
+    child_name = group.vulnerable_component
+    if not child_name:
+        return None
+    normalized_child = normalize_python_package_name(child_name)
+    ancestry = [normalize_python_package_name(str(name)) for name in group.dependency_ancestry]
+    if len(ancestry) > 2 or (ancestry and ancestry[-1] != normalized_child):
+        return None
+    try:
+        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+            pipfile_content = sandbox.read_file("Pipfile")
+            lock_content = sandbox.read_file("Pipfile.lock")
+        pipfile = tomllib.loads(pipfile_content or "")
+        lockfile = json.loads(lock_content or "")
+    except Exception as exc:  # noqa: BLE001 - malformed/missing evidence is not proof
+        logger.debug("Unable to read Pipenv parent evidence: %s", exc)
+        return None
+    if not isinstance(pipfile, dict) or not isinstance(lockfile, dict):
+        return None
+
+    possible_edges: list[tuple[str, str, str, str, bool]] = []
+    for pipfile_category, lock_category_name in (
+        ("packages", "default"),
+        ("dev-packages", "develop"),
+    ):
+        entries = pipfile.get(pipfile_category)
+        if entries is None:
+            continue
+        if not isinstance(entries, dict):
+            return None
+        lock_category = lockfile.get(lock_category_name)
+        locked_child_version = _locked_python_version(lock_category, normalized_child)
+        if locked_child_version is None:
+            # A child lock from the other Pipfile category cannot prove an edge
+            # from this category's directly declared parent.
+            continue
+        for raw_name, declaration in entries.items():
+            try:
+                parsed_name = Requirement(str(raw_name))
+            except InvalidRequirement:
+                return None
+            parent_name = normalize_python_package_name(parsed_name.name)
+            parent_version = _locked_python_version(lock_category, parent_name)
+            if parent_version is None:
+                continue
+            possible_edges.append(
+                (
+                    parent_name,
+                    parent_version,
+                    locked_child_version,
+                    pipfile_category,
+                    _pipfile_declaration_is_unconditional(str(raw_name), declaration),
+                )
+            )
+
+    proven: list[tuple[str, str, str]] = []
+    unproven_child_edge = False
+    try:
+        for (
+            parent_name,
+            parent_version,
+            raw_child_version,
+            category,
+            unconditional_parent,
+        ) in possible_edges:
+            locked_child = Version(raw_child_version)
+            requirements = get_pypi_release_requires_dist(parent_name, parent_version)
+            for raw_requirement in requirements:
+                requirement = Requirement(raw_requirement)
+                if normalize_python_package_name(requirement.name) != normalized_child:
+                    continue
+                if not requirement.specifier.contains(locked_child, prereleases=False):
+                    continue
+                if requirement.marker is not None or requirement.extras or not unconditional_parent:
+                    unproven_child_edge = True
+                    continue
+                proven.append((parent_name, parent_version, category))
+    except (InvalidRequirement, InvalidVersion, TypeError, ValueError) as exc:
+        logger.debug("Malformed Pipfile or PyPI Requires-Dist evidence: %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - registry failure is not ancestry proof
+        logger.debug("Unable to query PyPI Requires-Dist evidence: %s", exc)
+        return None
+    if unproven_child_edge:
+        return None
+    unique_edges = list(dict.fromkeys(proven))
+    if len(unique_edges) != 1:
+        return None
+    parent_name, parent_version, _category = unique_edges[0]
+    if ancestry and len(ancestry) == 2 and ancestry[0] != parent_name:
+        return None
+    return parent_name, parent_version, [parent_name, normalized_child]
 
 
 def _supervisor_plan_npm_parent_version(inputs: dict[str, Any]) -> str:
@@ -187,11 +547,13 @@ def _build_high_level_retry_instruction(
     evaluation: QAEvaluation | None,
     diagnostics: UpdateRetryDiagnostics | None,
 ) -> str:
-    """Synthesize a high-level retry instruction for the update worker."""
+    ecosystem = _group_ecosystem(group)
+    is_python = ecosystem == "pypi"
     component = group.vulnerable_component if group else task.parent_group_id
     parent_name, _, parent_type = (
         group_parent_context(group) if group is not None else (None, None, None)
     )
+    parent_name = parent_name or task.parent_package_name
     target = task.target_package_name
     if not target and task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
         target = parent_name
@@ -199,10 +561,23 @@ def _build_high_level_retry_instruction(
     dependency_type = task.target_dependency_type or parent_type
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         dependency_type = dependency_type or "overrides"
+    transaction_tool = (
+        "modify_and_validate_python_dependency"
+        if is_python
+        else "modify_and_validate_npm_dependency"
+    )
+    manifest = (
+        "Pipfile"
+        if is_python and group is not None and is_transitive_group(group)
+        else (
+            group.file_paths[0]
+            if group and group.file_paths
+            else ("Pipfile" if is_python else "package.json")
+        )
+    )
     category = evaluation.failure_category if evaluation else None
     if diagnostics and diagnostics.selected_version:
-        manifest = group.file_paths[0] if group and group.file_paths else "package.json"
-        is_override = (
+        is_override = not is_python and (
             task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
             or diagnostics.used_overrides
             or dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
@@ -222,23 +597,22 @@ def _build_high_level_retry_instruction(
             f"during strategy stage {task.strategy_stage.value}: "
             f"{target_clause} in {manifest} to exact version {diagnostics.selected_version}; "
             "do not edit any other dependency target; "
-            "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
+            f"use {transaction_tool} so synchronization runs immediately after the edit."
         )
     if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
         floor = group.fix_plan.fixed_version
         if floor:
-            manifest = group.file_paths[0] if group.file_paths else "package.json"
             if parent_name and target == parent_name:
                 return (
                     f"Apply strategy stage {task.strategy_stage.value} for transitive package {component}: "
                     f"update only directly declared parent {parent_name} in {manifest} to the "
                     "supervisor-selected compatible parent version; do not use a child override; "
-                    "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
+                    f"use {transaction_tool} so synchronization runs immediately after the edit."
                 )
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update {manifest} to exact OSV minimum fixed version {floor}; "
-                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
+                f"use {transaction_tool} so synchronization runs immediately after the edit."
             )
     if diagnostics and task.strategy in {RoutingStrategy.VERSION_BUMP}:
         attempted = set(diagnostics.attempted_versions)
@@ -260,7 +634,7 @@ def _build_high_level_retry_instruction(
             return (
                 f"Apply strategy stage {task.strategy_stage.value} for {component}: "
                 f"update only {target} in {manifest} to exact version {candidate}; "
-                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
+                f"use {transaction_tool} so synchronization runs immediately after the edit."
             )
     if diagnostics and diagnostics.package_abandoned:
         return (
@@ -291,19 +665,23 @@ def _build_high_level_retry_instruction(
     )
 
 
-def _registry_selected_version(report: str) -> str | None:
+def _registry_selected_version(report: str, ecosystem: str = "npm") -> str | None:
     """Extract a planner-selected stable version from a registry report."""
     match = re.search(
-        r"^-\s*Selected Version:\s*(\S+)",
+        r"^-\s*Selected(?: Version)?:\s*(\S+)",
         report or "",
         re.IGNORECASE | re.MULTILINE,
     )
     if not match or match.group(1).upper() == "NONE":
         return None
-    return match.group(1).strip().lstrip("vV")
+    return _registry_report_version(match.group(1), ecosystem) or None
 
 
-def _registry_report_value(report: str, label: str) -> str | None:
+def _registry_report_value(
+    report: str,
+    label: str,
+    ecosystem: str = "npm",
+) -> str | None:
     """Extract one normalized value from a deterministic registry-tool report."""
     match = re.search(
         rf"^-\s*{re.escape(label)}:\s*(\S+)",
@@ -312,25 +690,7 @@ def _registry_report_value(report: str, label: str) -> str | None:
     )
     if not match or match.group(1).upper() == "NONE":
         return None
-    return match.group(1).strip().lstrip("vV")
-
-
-def _registry_report_versions(report: str, label: str) -> list[str]:
-    """Extract a comma-separated version list from a registry-tool report."""
-    match = re.search(
-        rf"^-\s*{re.escape(label)}:\s*(.*)$",
-        report or "",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if not match:
-        return []
-    return list(
-        dict.fromkeys(
-            version.strip().lstrip("vV")
-            for version in match.group(1).split(",")
-            if version.strip() and version.strip().upper() != "NONE"
-        )
-    )
+    return _registry_report_version(match.group(1), ecosystem) or None
 
 
 def _override_dependency_type(group: VulnerabilityGroup | None) -> str:
@@ -350,16 +710,11 @@ def _planner_plan_violations(
     plans: dict[str, SupervisorRetryPlan],
     task_queue: dict[str, RemediationTask],
     diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
-    """Validate retry-plan semantics before a plan can mutate routing state.
-
-    Free-form plan evidence is intentionally not treated as an authority. These
-    checks enforce the small set of invariants that must hold for an exact
-    worker instruction to be safe.  Returning human-readable violations also
-    makes the corrective replan visible in LangSmith through the supervisor's
-    accumulated ``errors`` field.
-    """
+    """Validate retry-plan semantics before a plan can mutate routing state."""
     violations: list[str] = []
+    groups = group_by_id or {}
     for task_id, plan in plans.items():
         task = task_queue.get(task_id)
         if task is None:
@@ -372,36 +727,48 @@ def _planner_plan_violations(
                 f"task {task_id}: planner snapshot revision {plan.source_task_revision} "
                 f"does not match current revision {task.task_revision}"
             )
-
+        group = groups.get(task.parent_group_id)
+        ecosystem = _group_ecosystem(group)
         attempted = {
-            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
+            normalized
+            for version in plan.attempted_versions
+            if (normalized := _normalise_candidate_version(version, ecosystem))
         }
         diagnostics = diagnostics_by_task.get(task_id)
         if diagnostics is not None:
             attempted.update(
-                version.strip().lstrip("vV").lower()
+                normalized
                 for version in diagnostics.attempted_versions
-                if version
+                if (normalized := _normalise_candidate_version(version, ecosystem))
             )
-
         selected = (
-            plan.selected_version.strip().lstrip("vV").lower() if plan.selected_version else None
+            _normalise_candidate_version(plan.selected_version, ecosystem)
+            if plan.selected_version
+            else ""
         )
         if selected and selected in attempted:
             violations.append(
                 f"task {task_id}: selected version {plan.selected_version} was already attempted"
             )
-        if (
-            plan.strategy_stage == SCARemediationStage.NPM_LATEST
-            and selected
-            and plan.latest_version_seen
-            and selected != plan.latest_version_seen.strip().lstrip("vV").lower()
-        ):
+        latest_stage = (
+            SCARemediationStage.PYPI_LATEST
+            if ecosystem == "pypi"
+            else SCARemediationStage.NPM_LATEST
+        )
+        latest = (
+            _normalise_candidate_version(plan.latest_version_seen, ecosystem)
+            if plan.latest_version_seen
+            else ""
+        )
+        if plan.strategy_stage == latest_stage and selected and latest and selected != latest:
+            label = "pypi_latest" if ecosystem == "pypi" else "npm_latest"
             violations.append(
-                f"task {task_id}: npm_latest selected {plan.selected_version}, "
+                f"task {task_id}: {label} selected {plan.selected_version}, "
                 f"but registry latest is {plan.latest_version_seen}"
             )
-        if plan.action == "retry_update" and selected is None:
+        if ecosystem == "pypi" and plan.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+            violations.append(f"task {task_id}: PyPI tasks cannot use package_override")
+        if plan.action == "retry_update" and selected == "":
             violations.append(
                 f"task {task_id}: retry_update requires an unattempted exact selected_version"
             )
@@ -415,18 +782,18 @@ def _planner_plan_violations(
         if (
             plan.action == "retry_update"
             and task.strategy == RoutingStrategy.VERSION_BUMP
-            and _SCA_STAGE_ORDER[plan.strategy_stage] < _SCA_STAGE_ORDER[task.strategy_stage]
+            and _SCA_STAGE_ORDER.get(plan.strategy_stage, 99)
+            < _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
         ):
             violations.append(
                 f"task {task_id}: retry plan stage {plan.strategy_stage.value} regresses "
                 f"from committed stage {task.strategy_stage.value}"
             )
-        if (
-            plan.action == "pivot_workaround"
-            and plan.strategy_stage != SCARemediationStage.NPM_LATEST
-        ):
-            violations.append(f"task {task_id}: workaround pivot must be committed at npm_latest")
-        if plan.action == "pivot_workaround" and selected is not None:
+        if plan.action == "pivot_workaround" and plan.strategy_stage != latest_stage:
+            violations.append(
+                f"task {task_id}: workaround pivot must be committed at {latest_stage.value}"
+            )
+        if plan.action == "pivot_workaround" and selected:
             violations.append(
                 f"task {task_id}: workaround pivot cannot retain selected version {plan.selected_version}"
             )
@@ -460,58 +827,70 @@ def _repair_invalid_planner_plans(
             repaired_plans[task_id] = plan
             continue
         diagnostics = repaired_diagnostics.get(task_id)
+        task = task_queue[task_id]
+        group = group_by_id.get(task.parent_group_id)
+        ecosystem = _group_ecosystem(group)
         attempted = {
-            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
+            normalized
+            for version in plan.attempted_versions
+            if (normalized := _normalise_candidate_version(version, ecosystem))
         }
         if diagnostics is not None:
             attempted.update(
-                version.strip().lstrip("vV").lower()
+                normalized
                 for version in diagnostics.attempted_versions
-                if version
+                if (normalized := _normalise_candidate_version(version, ecosystem))
             )
+        latest_stage = (
+            SCARemediationStage.PYPI_LATEST
+            if ecosystem == "pypi"
+            else SCARemediationStage.NPM_LATEST
+        )
 
         candidate = None
-        plan_regresses = (
-            task_queue[task_id].strategy == RoutingStrategy.VERSION_BUMP
-            and _SCA_STAGE_ORDER[plan.strategy_stage]
-            < _SCA_STAGE_ORDER[task_queue[task_id].strategy_stage]
-        )
-        # A correction cannot reopen an earlier stage.  In particular, a
-        # stale same-major proposal must not revive a version-bump parent that
-        # has already reached code_workaround.  Let the fail-closed branch
-        # below create the deterministic latest-stage pivot instead.
+        plan_regresses = task.strategy == RoutingStrategy.VERSION_BUMP and _SCA_STAGE_ORDER.get(
+            plan.strategy_stage, 99
+        ) < _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
         if not plan_regresses and plan.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-            # At npm_latest, only the registry's declared latest version is
-            # safe to repair into a retry. Older candidates are already
-            # covered by the bounded update stages and selecting one here can
-            # produce a null/stale dispatch state after the guardrail clears
-            # the invalid plan. If latest was attempted, fail closed into the
-            # deterministic workaround pivot.
             repair_candidates = (
                 [plan.latest_version_seen]
-                if plan.strategy_stage == SCARemediationStage.NPM_LATEST
+                if plan.strategy_stage == latest_stage
                 else [plan.latest_version_seen, *plan.candidate_versions_considered]
             )
             for version in repair_candidates:
-                if version and version.strip().lstrip("vV").lower() not in attempted:
-                    candidate = version.strip().lstrip("vV")
+                normalized = _normalise_candidate_version(version, ecosystem) if version else ""
+                if normalized and normalized not in attempted:
+                    candidate = normalized
                     break
 
         if candidate:
             effective_stage = plan.strategy_stage
+            same_major_stage = (
+                SCARemediationStage.PYPI_SAME_MAJOR
+                if ecosystem == "pypi"
+                else SCARemediationStage.NPM_SAME_MAJOR
+            )
+            latest_version = (
+                _normalise_candidate_version(plan.latest_version_seen, ecosystem)
+                if plan.latest_version_seen
+                else ""
+            )
             if (
-                effective_stage == SCARemediationStage.NPM_SAME_MAJOR
-                and plan.latest_version_seen
-                and candidate == plan.latest_version_seen.strip().lstrip("vV")
+                effective_stage == same_major_stage
+                and latest_version
+                and candidate == latest_version
             ):
-                effective_stage = SCARemediationStage.NPM_LATEST
+                effective_stage = latest_stage
             if diagnostics is None:
                 diagnostics = UpdateRetryDiagnostics(task_id=task_id)
-            group = group_by_id.get(task_queue[task_id].parent_group_id)
-            target_package = task_queue[task_id].target_package_name or (
-                group_parent_context(group)[0] if group is not None else None
+            target_package = task.target_package_name or (
+                task.parent_package_name
+                if ecosystem == "pypi"
+                else (group_parent_context(group)[0] if group is not None else None)
             )
-            target_type = task_queue[task_id].target_dependency_type
+            if target_package:
+                target_package = _normalize_package_target(target_package, ecosystem)
+            target_type = task.target_dependency_type
             diagnostics = diagnostics.model_copy(
                 update={
                     "strategy_stage": effective_stage,
@@ -546,8 +925,7 @@ def _repair_invalid_planner_plans(
             )
             continue
 
-        group = group_by_id.get(task_queue[task_id].parent_group_id)
-        if group is not None and is_transitive_group(group):
+        if ecosystem != "pypi" and group is not None and is_transitive_group(group):
             # Parent registry exhaustion is the deterministic handoff to the
             # native child override stage, but the child version must be
             # verified independently. Never reuse the child's fix-plan floor
@@ -561,6 +939,7 @@ def _repair_invalid_planner_plans(
                         group.vulnerable_component,
                         child_floor,
                         set(attempted),
+                        ecosystem,
                     )
                     child_candidate = select_version(
                         child_candidates,
@@ -616,7 +995,7 @@ def _repair_invalid_planner_plans(
         # No direct unattempted candidate can be proven. Clear stale selection
         # and pivot at the terminal update stage so no guessed/old version is
         # sent to the dumb update worker.
-        effective_stage = SCARemediationStage.NPM_LATEST
+        effective_stage = latest_stage
         if diagnostics is None:
             diagnostics = UpdateRetryDiagnostics(task_id=task_id)
         diagnostics = diagnostics.model_copy(
@@ -655,19 +1034,21 @@ def _build_deterministic_retry_plan(
     group: VulnerabilityGroup | None,
     *,
     requested_stage: SCARemediationStage | None = None,
+    workspace_volume: str | None = None,
 ) -> SupervisorRetryPlan:
-    """Build an exact retry plan from committed state and registry facts.
-
-    The task's committed stage is authoritative for this pass. A later
-    Supervisor pass may advance the stage after QA evidence; this function
-    never skips an empty stage, regresses, reuses an attempted version, or
-    turns an exhausted update path back into an update retry.
-    """
+    """Build an exact retry plan from committed state and registry facts."""
+    ecosystem = _group_ecosystem(group)
+    is_python = ecosystem == "pypi"
     requested = requested_stage or task.strategy_stage
+    if is_python and requested == SCARemediationStage.PACKAGE_OVERRIDE:
+        requested = SCARemediationStage.PYPI_LATEST
     requested_order = _SCA_STAGE_ORDER.get(requested, 99)
     current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
     effective_stage = requested if requested_order >= current_order else task.strategy_stage
-    attempted = set(diagnostics.attempted_versions)
+    if is_python and effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        effective_stage = SCARemediationStage.PYPI_LATEST
+
+    attempted: set[str] = set()
     security_floor, floor_error = _canonical_security_floor(group)
     transitive = bool(group and is_transitive_group(group))
     candidate_versions: list[str] = []
@@ -677,8 +1058,69 @@ def _build_deterministic_retry_plan(
     parent_minimum_version = task.parent_minimum_version
     target_package_name = task.target_package_name
     target_dependency_type = task.target_dependency_type
+    parent_name: str | None = task.parent_package_name
+    parent_version: str | None = task.parent_package_version
 
-    if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+    if is_python and group is not None:
+        if transitive:
+            target_package_name = None
+            target_dependency_type = None
+            parent_name = None
+            parent_version = None
+            if workspace_volume:
+                parent_context = _resolve_pipfile_parent_context(workspace_volume, group)
+                if parent_context:
+                    parent_name, parent_version, _ancestry = parent_context
+                    parent_name = _normalize_package_target(parent_name, ecosystem)
+                    parent_version = _normalise_candidate_version(parent_version, ecosystem)
+                    target_package_name = parent_name
+                    target_dependency_type = _pipfile_parent_declaration_type(
+                        workspace_volume,
+                        parent_name,
+                    )
+                    if target_dependency_type is None:
+                        parent_name = None
+                        parent_version = None
+                        target_package_name = None
+                        failure_reason = (
+                            "The proven Pipfile parent has no unique editable declaration category."
+                        )
+                else:
+                    failure_reason = "No unique active one-hop Pipfile.lock parent was proven."
+            else:
+                failure_reason = (
+                    "The shared workspace volume is unavailable for Pipfile parent proof."
+                )
+        else:
+            target_package_name = (
+                _normalize_package_target(
+                    group.vulnerable_component or target_package_name or "",
+                    ecosystem,
+                )
+                or None
+            )
+    if transitive and not is_python and group is not None:
+        parent_name, parent_version, parent_type = group_parent_context(group)
+        target_package_name = target_package_name or parent_name
+        target_dependency_type = target_dependency_type or parent_type
+    if is_python:
+        attempted = _attempted_versions_for_target(
+            diagnostics,
+            target_package_name,
+            ecosystem,
+        )
+    else:
+        attempted = {
+            normalized
+            for version in diagnostics.attempted_versions
+            if (normalized := _normalise_candidate_version(version, ecosystem))
+        }
+
+    # An unproved Pipfile.lock child is never an editable target. Continue
+    # through the bounded PyPI stages only to commit the final workaround.
+    selected_stage_allowed = not (is_python and transitive and not parent_name)
+
+    if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE and not is_python:
         if group is not None:
             target_package_name = group.vulnerable_component
             target_dependency_type = _override_dependency_type(group)
@@ -689,6 +1131,7 @@ def _build_deterministic_retry_plan(
                         security_floor,
                         attempted,
                         diagnostics,
+                        ecosystem,
                     )
                     candidate_versions = [
                         candidate.version
@@ -703,68 +1146,99 @@ def _build_deterministic_retry_plan(
                         failure_reason = "No verified vulnerable-child override candidate meets the security floor."
                 except Exception as exc:  # noqa: BLE001
                     failure_reason = f"Deterministic child override verification failed: {exc}"
-    elif effective_stage != SCARemediationStage.CODE_WORKAROUND and security_floor:
-        # The QA transition already advances the committed stage one step.
-        # Plan only that stage here; an empty candidate set must not silently
-        # skip ahead to a later stage in the same Supervisor pass.
+    elif (
+        effective_stage != SCARemediationStage.CODE_WORKAROUND
+        and security_floor
+        and selected_stage_allowed
+    ):
         stages = [effective_stage]
         if transitive:
-            parent_name, parent_version, parent_type = group_parent_context(group)
-            target_package_name = target_package_name or parent_name
-            target_dependency_type = target_dependency_type or parent_type
-            if not parent_name or not parent_version or not group.vulnerable_component:
-                failure_reason = "Missing parent context for deterministic transitive planning."
+            if not parent_name or not parent_version or not group or not group.vulnerable_component:
+                failure_reason = (
+                    failure_reason
+                    or "Missing parent context for deterministic transitive planning."
+                )
             else:
-                parent_approved_pool = _approved_candidate_pool(diagnostics, parent_name)
+                parent_approved_pool = _approved_candidate_pool(
+                    diagnostics,
+                    parent_name,
+                    ecosystem,
+                )
                 for stage in stages:
                     selection = {
                         SCARemediationStage.OSV_MINIMUM: "minimum",
                         SCARemediationStage.NPM_SAME_MAJOR: "same_major",
+                        SCARemediationStage.PYPI_SAME_MAJOR: "same_major",
                         SCARemediationStage.NPM_LATEST: "latest",
-                    }[stage]
+                        SCARemediationStage.PYPI_LATEST: "latest",
+                    }.get(stage)
+                    if selection is None:
+                        continue
+                    parent_inputs = {
+                        "parent_package_name": _normalize_package_target(parent_name, ecosystem),
+                        "child_package_name": _normalize_package_target(
+                            group.vulnerable_component,
+                            ecosystem,
+                        ),
+                        "child_fixed_version": security_floor,
+                        "installed_parent_version": _normalise_candidate_version(
+                            parent_version,
+                            ecosystem,
+                        ),
+                        "selection": selection,
+                        "attempted_versions": (
+                            "" if parent_approved_pool else ",".join(sorted(attempted))
+                        ),
+                        "dependency_ancestry": ",".join(
+                            [
+                                parent_name,
+                                _normalize_package_target(group.vulnerable_component, ecosystem),
+                            ]
+                            if is_python
+                            else group.dependency_ancestry
+                        ),
+                    }
                     try:
-                        report = _supervisor_plan_npm_parent_version(
-                            {
-                                "parent_package_name": parent_name,
-                                "child_package_name": group.vulnerable_component,
-                                "child_fixed_version": security_floor,
-                                "installed_parent_version": parent_version,
-                                "selection": selection,
-                                "attempted_versions": (
-                                    "" if parent_approved_pool else ",".join(sorted(attempted))
-                                ),
-                                "dependency_ancestry": ",".join(group.dependency_ancestry),
-                            }
-                        )
+                        report = _supervisor_plan_parent_version(parent_inputs, ecosystem)
                     except Exception as exc:  # noqa: BLE001
                         failure_reason = f"Deterministic parent registry planning failed: {exc}"
                         continue
                     report_candidates = _registry_report_versions(
-                        report, "Eligible Candidates"
-                    ) or _registry_report_versions(report, "Compatible Parent Versions")
+                        report,
+                        "Eligible Candidates",
+                        ecosystem,
+                    ) or _registry_report_versions(
+                        report,
+                        "Compatible Parent Versions",
+                        ecosystem,
+                    )
                     if parent_approved_pool:
                         approved = set(parent_approved_pool)
                         report_candidates = [
-                            _normalise_candidate_version(version)
+                            version
                             for version in report_candidates
-                            if _normalise_candidate_version(version) in approved
-                            and _normalise_candidate_version(version) not in attempted
+                            if version in approved and version not in attempted
                         ]
                     candidate_versions = list(
                         dict.fromkeys([*candidate_versions, *report_candidates])
                     )
                     latest_version_seen = (
-                        _registry_report_value(report, "Npm Latest")
-                        or _registry_report_value(report, "Latest Compatible")
-                        or _registry_report_value(report, "Latest Stable")
+                        _registry_report_value(
+                            report,
+                            "PyPI Latest" if is_python else "Npm Latest",
+                            ecosystem,
+                        )
+                        or _registry_report_value(report, "Latest Compatible", ecosystem)
+                        or _registry_report_value(report, "Latest Stable", ecosystem)
                         or latest_version_seen
                     )
-                    selected = _registry_selected_version(report)
-                    if parent_approved_pool and selected not in set(report_candidates):
+                    selected = _registry_selected_version(report, ecosystem)
+                    if selected not in set(report_candidates):
                         selected = _select_report_candidate(
                             report_candidates,
                             stage,
                             attempted,
+                            ecosystem,
                         )
                     if selected:
                         selected_version = selected
@@ -775,83 +1249,88 @@ def _build_deterministic_retry_plan(
         else:
             try:
                 candidates = _fetch_registry_candidates_for_task(
-                    group.vulnerable_component or "",
+                    target_package_name
+                    or (
+                        _normalize_package_target(group.vulnerable_component, ecosystem)
+                        if group and group.vulnerable_component
+                        else ""
+                    ),
                     security_floor,
                     attempted,
                     diagnostics,
+                    ecosystem,
                 )
                 candidate_versions = [
                     candidate.version for candidate in candidates[:_MAX_REGISTRY_CANDIDATES]
                 ]
+                latest_role = "pypi_latest" if is_python else "npm_latest"
                 latest_version_seen = next(
                     (
                         candidate.version
                         for candidate in candidates
-                        if "npm_latest" in candidate.selection_roles
+                        if latest_role in candidate.selection_roles
                     ),
                     candidates[-1].version if candidates else None,
                 )
-                for stage in stages:
-                    selected = select_version(candidates, stage, attempted)
-                    if selected:
-                        selected_version = selected
-                        effective_stage = stage
-                        break
+                selected_version = select_version(candidates, effective_stage, attempted)
             except Exception as exc:  # noqa: BLE001
                 failure_reason = f"Deterministic registry planning failed: {exc}"
     elif effective_stage != SCARemediationStage.CODE_WORKAROUND and not failure_reason:
         failure_reason = "No security floor is available for deterministic version selection."
 
-    if selected_version is None and effective_stage != SCARemediationStage.PACKAGE_OVERRIDE:
-        if transitive and security_floor and effective_stage == SCARemediationStage.NPM_LATEST:
-            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
-            target_package_name = group.vulnerable_component if group else task.parent_group_id
-            target_dependency_type = _override_dependency_type(group)
-            try:
-                child_candidates = _fetch_registry_candidates_for_task(
-                    target_package_name,
-                    security_floor,
-                    attempted,
-                    diagnostics,
-                )
-                candidate_versions = [
-                    candidate.version for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
-                ]
-                selected_version = select_version(
-                    child_candidates,
-                    SCARemediationStage.OSV_MINIMUM,
-                    attempted,
-                )
-                if selected_version is None:
-                    failure_reason = (
-                        "Parent update stages are exhausted and no verified "
-                        "vulnerable-child override candidate remains."
-                    )
-            except Exception as exc:  # noqa: BLE001
-                failure_reason = f"Child override verification failed: {exc}"
+    latest_stage = SCARemediationStage.PYPI_LATEST if is_python else SCARemediationStage.NPM_LATEST
+    if (
+        selected_version is None
+        and not is_python
+        and transitive
+        and security_floor
+        and effective_stage == latest_stage
+    ):
+        effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
+        target_package_name = group.vulnerable_component if group else task.parent_group_id
+        target_dependency_type = _override_dependency_type(group)
+        try:
+            child_candidates = _fetch_registry_candidates_for_task(
+                target_package_name,
+                security_floor,
+                attempted,
+                diagnostics,
+                ecosystem,
+            )
+            candidate_versions = [
+                candidate.version for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
+            ]
+            selected_version = select_version(
+                child_candidates,
+                SCARemediationStage.OSV_MINIMUM,
+                attempted,
+            )
             if selected_version is None:
-                # Keep the terminal marker used by the deterministic router;
-                # never turn the child security floor itself into an
-                # unverified worker target.
-                effective_stage = SCARemediationStage.NPM_LATEST
-        elif effective_stage == SCARemediationStage.NPM_LATEST:
+                failure_reason = (
+                    "Parent update stages are exhausted and no verified "
+                    "vulnerable-child override candidate remains."
+                )
+        except Exception as exc:  # noqa: BLE001
+            failure_reason = f"Child override verification failed: {exc}"
+        if selected_version is None:
             effective_stage = SCARemediationStage.NPM_LATEST
-            target_package_name = target_package_name or task.target_package_name
 
-    exhausted = selected_version is None and effective_stage == SCARemediationStage.NPM_LATEST
+    exhausted = selected_version is None and effective_stage == latest_stage
     effective_task = task.model_copy(
         update={
             "strategy_stage": effective_stage,
             "selected_version": selected_version,
             "target_package_name": target_package_name,
             "target_dependency_type": target_dependency_type,
+            "parent_package_name": parent_name,
+            "parent_package_version": parent_version,
             "parent_minimum_version": parent_minimum_version,
         }
     )
     safe_candidate_versions = (
         candidate_versions[:_MAX_REGISTRY_CANDIDATES] if selected_version or exhausted else []
     )
-    approved_pool = _approved_candidate_pool(diagnostics, target_package_name)
+    approved_pool = _approved_candidate_pool(diagnostics, target_package_name, ecosystem)
     provenance_candidate_versions = list(approved_pool or safe_candidate_versions)
     safe_latest_version = latest_version_seen if selected_version or exhausted else None
     candidate_dependency_types = _supervisor_dependency_type_candidates(
@@ -864,14 +1343,12 @@ def _build_deterministic_retry_plan(
             "candidate_versions_considered": provenance_candidate_versions,
             "selected_version": selected_version,
             "latest_version_seen": safe_latest_version,
-            "registry_query_performed": bool(security_floor),
+            "registry_query_performed": bool(security_floor and (not transitive or parent_name)),
             "exhausted_update_path": exhausted,
             "target_package_name": target_package_name,
             "target_dependency_type": target_dependency_type,
             "candidate_dependency_types": candidate_dependency_types,
-            "parent_package_name": (
-                group.parent_package_name if group is not None else diagnostics.parent_package_name
-            ),
+            "parent_package_name": parent_name,
             "parent_minimum_version": parent_minimum_version,
             "failure_reason": failure_reason,
         }
@@ -894,7 +1371,7 @@ def _build_deterministic_retry_plan(
         source_task_revision=task.task_revision,
         strategy_stage=effective_stage,
         selected_version=selected_version,
-        attempted_versions=list(diagnostics.attempted_versions),
+        attempted_versions=sorted(attempted),
         candidate_versions_considered=provenance_candidate_versions,
         candidate_dependency_types=candidate_dependency_types,
         latest_version_seen=safe_latest_version,
@@ -931,6 +1408,8 @@ def _needs_planner(
                     SCARemediationStage.OSV_MINIMUM,
                     SCARemediationStage.NPM_SAME_MAJOR,
                     SCARemediationStage.NPM_LATEST,
+                    SCARemediationStage.PYPI_SAME_MAJOR,
+                    SCARemediationStage.PYPI_LATEST,
                 }
                 or (
                     t.strategy_stage == SCARemediationStage.CODE_WORKAROUND
@@ -959,6 +1438,7 @@ def _run_deterministic_retry_planner(
     *,
     advance_failed_stage: bool = False,
     target_task_ids: Iterable[str] | None = None,
+    workspace_volume: str | None = None,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Plan retries from state and registry facts.
 
@@ -984,6 +1464,8 @@ def _run_deterministic_retry_planner(
                 SCARemediationStage.OSV_MINIMUM,
                 SCARemediationStage.NPM_SAME_MAJOR,
                 SCARemediationStage.NPM_LATEST,
+                SCARemediationStage.PYPI_SAME_MAJOR,
+                SCARemediationStage.PYPI_LATEST,
                 SCARemediationStage.CODE_WORKAROUND,
             }
         ),
@@ -1004,12 +1486,14 @@ def _run_deterministic_retry_planner(
             requested_stage = _next_sca_stage(
                 task.strategy_stage,
                 transitive=bool(group and is_transitive_group(group)),
+                ecosystem=_group_ecosystem(group),
             )
         plan = _build_deterministic_retry_plan(
             task,
             diagnostics,
             group,
             requested_stage=requested_stage,
+            workspace_volume=workspace_volume,
         )
         # An empty stage is deterministic evidence to advance to the next
         # bounded stage, not a request for the worker to inspect the registry.
@@ -1017,7 +1501,11 @@ def _run_deterministic_retry_planner(
         # an exact unattempted version, or with the terminal update pivot.
         while plan.selected_version is None and not plan.exhausted_update_path:
             transitive = bool(group and is_transitive_group(group))
-            next_stage = _next_sca_stage(plan.strategy_stage, transitive=transitive)
+            next_stage = _next_sca_stage(
+                plan.strategy_stage,
+                transitive=transitive,
+                ecosystem=_group_ecosystem(group),
+            )
             if next_stage == SCARemediationStage.CODE_WORKAROUND:
                 break
             if _SCA_STAGE_ORDER.get(next_stage, 99) <= _SCA_STAGE_ORDER.get(
@@ -1029,6 +1517,7 @@ def _run_deterministic_retry_planner(
                 diagnostics,
                 group,
                 requested_stage=next_stage,
+                workspace_volume=workspace_volume,
             )
 
         if plan.selected_version is None and not plan.exhausted_update_path:
@@ -1039,7 +1528,11 @@ def _run_deterministic_retry_planner(
             component = group.vulnerable_component if group else task.parent_group_id
             plan = plan.model_copy(
                 update={
-                    "strategy_stage": SCARemediationStage.NPM_LATEST,
+                    "strategy_stage": (
+                        SCARemediationStage.PYPI_LATEST
+                        if _group_ecosystem(group) == "pypi"
+                        else SCARemediationStage.NPM_LATEST
+                    ),
                     "selected_version": None,
                     "exhausted_update_path": True,
                     "action": "pivot_workaround",

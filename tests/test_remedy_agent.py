@@ -24,6 +24,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.graph import post_qa_triage_node
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
@@ -32,10 +33,13 @@ from remediation_engine.orchestration.state import (
 from remediation_engine.orchestration.update_subagent import (
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
+    _build_update_system_prompt,
     run_update_subagent_node,
 )
 from remediation_engine.orchestration.workaround_subagent import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
     _build_workaround_prompt,
+    _build_workaround_system_prompt,
     run_workaround_subagent_node,
 )
 
@@ -645,6 +649,106 @@ class TestUpdateSubagentWrapper:
         assert summaries[0].status == AgentActionStatus.SUCCESS
         assert summaries[1].status == AgentActionStatus.SURRENDER
 
+    def test_subagent_state_helpers_default_to_nodejs(self):
+        group = _sast_group()
+        task = _task_for_group(group)
+
+        update_state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task],
+            [group],
+        )
+        workaround_state = initial_workaround_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            task,
+            group,
+        )
+
+        assert update_state["project_language"] is ProjectLanguage.NODEJS
+        assert workaround_state["project_language"] is ProjectLanguage.NODEJS
+
+    def test_language_matched_worker_prompts_limit_python_authority(self):
+        group = _sast_group()
+        task = _task_for_group(group)
+        update_state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task],
+            [group],
+            project_language=ProjectLanguage.PYTHON,
+        )
+        workaround_state = initial_workaround_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            task,
+            group,
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+        assert _build_update_system_prompt() == _UPDATE_WORKER_STATIC_INSTRUCTIONS
+        assert _build_workaround_system_prompt() == _WORKAROUND_STATIC_INSTRUCTIONS
+
+        update_prompt = _build_update_system_prompt(update_state["project_language"])
+        assert "Python dependency-manifest" in update_prompt
+        assert "requirements.txt" in update_prompt
+        assert "pyproject.toml" in update_prompt
+        assert "setup.cfg" in update_prompt
+        assert "Pipfile" in update_prompt
+        assert "setup.py is install-only" in update_prompt
+        assert "only modify_and_validate_python_dependency" in update_prompt
+        assert "Do\nnot search PyPI" in update_prompt
+        assert "get_pypi_versions" not in update_prompt
+        assert "select_python_safe_version" not in update_prompt
+        assert "modify_and_validate_npm_dependency" not in update_prompt
+
+        group = _sca_group()
+        task = _task_for_group(group).model_copy(
+            update={
+                "selected_version": "4.17.21",
+                "target_dependency_type": "requirements",
+            }
+        )
+        dynamic_update_prompt = _build_update_prompt(
+            [(task, group, ["requirements.txt"])],
+            [],
+            {},
+            {},
+            allowed_target_versions_by_task={
+                task.task_id: ["4.17.21", "4.17.22"],
+            },
+            allowed_dependency_types_by_task={
+                task.task_id: ["requirements", "optional-dependencies"],
+            },
+            project_language=ProjectLanguage.PYTHON,
+        )
+        assert "Canonical project language: python (Python)." in dynamic_update_prompt
+        assert "Committed target version: 4.17.21" in dynamic_update_prompt
+        assert "Committed dependency type: requirements" in dynamic_update_prompt
+        assert "4.17.22" not in dynamic_update_prompt
+        assert "optional-dependencies" not in dynamic_update_prompt
+        assert "Allowed target versions:" not in dynamic_update_prompt
+
+        workaround_prompt = _build_workaround_system_prompt(workaround_state["project_language"])
+        dynamic_prompt = _build_workaround_prompt(
+            task,
+            group,
+            project_language=workaround_state["project_language"],
+        )
+        for expected in (
+            "Python code security",
+            "`.py`",
+            "pip or Pipenv",
+            "pytest",
+            "validate_python_syntax",
+            "run_targeted_python_test",
+            "validate_python_workaround",
+        ):
+            assert expected in workaround_prompt
+        assert "Canonical project language: python" in dynamic_prompt
+        assert "modify_and_validate_npm_dependency" not in workaround_prompt
+
     def test_workaround_prompt_includes_snippets(self):
         group = _sast_group()
         task = _task_for_group(group)
@@ -670,6 +774,7 @@ class TestUpdateSubagentWrapper:
             group,
             constraints_ledger=["express must remain >= 4.22.1"],
             previous_feedback="Fix the broken regex from the previous attempt.",
+            project_language=ProjectLanguage.PYTHON,
         )
 
         replacement = {
@@ -745,7 +850,7 @@ class TestUpdateSubagentWrapper:
                 content="validating",
                 tool_calls=[
                     {
-                        "name": "validate_workaround",
+                        "name": "validate_python_workaround",
                         "args": {
                             "modified_files": ["routes/login.ts"],
                             "runtime_smoke_file": "routes/login.ts",
@@ -829,7 +934,7 @@ class TestUpdateSubagentWrapper:
                 _edit,
             ),
             _tool(
-                "validate_workaround",
+                "validate_python_workaround",
                 "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
                 'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}',
                 _validate,
@@ -854,7 +959,7 @@ class TestUpdateSubagentWrapper:
             patch(
                 "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
                 side_effect=_build_toolbelt,
-            ),
+            ) as toolbelt_builder,
             patch(
                 "remediation_engine.orchestration.workaround_subagent.run_bounded_subagent_loop",
                 wraps=run_bounded_subagent_loop,
@@ -865,6 +970,7 @@ class TestUpdateSubagentWrapper:
         # The successful validation gate is terminal; the old extra textual
         # model round must not be requested.
         assert bound.invoke.call_count == 6
+        assert toolbelt_builder.call_args.kwargs["language"] is ProjectLanguage.PYTHON
         assert loop.call_args.kwargs["context_manager"] is not None
         assert result["action_summary"].status == AgentActionStatus.SUCCESS
         assert result["changed_files"] == ["routes/login.ts"]

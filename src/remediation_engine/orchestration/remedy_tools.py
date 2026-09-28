@@ -5,7 +5,9 @@ remain in their owning modules; this facade only composes the update and
 workaround toolbelts used by current Phase 5 dispatches.
 """
 
-from __future__ import annotations
+from typing import Literal
+
+from remediation_engine.language import ProjectLanguage
 
 # These imports are the intentional compatibility surface for callers that
 # historically patched or imported tool factories from this facade.
@@ -39,15 +41,24 @@ from .tools_manifest import (
     _is_prohibited_target,
     _make_modify_and_validate_npm_dependency_tool,
     _make_remove_no_fix_dependency_tool,
+    _normalize_python_manifest_targets,
     _package_checkpoint_paths,
     _PackageCheckpoint,
     rollback_pending_package_updates,
 )
+from .tools_manifest_python import (
+    _make_modify_and_validate_python_dependency_tool,
+    _make_remove_no_fix_python_dependency_tool,
+    _normalize_python_package_manifest_targets,
+)
 from .tools_validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
+    _make_run_targeted_python_test_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    _make_validate_python_syntax_tool,
+    _make_validate_python_workaround_tool,
     _make_validate_workaround_tool,
 )
 from .tools_web import (
@@ -73,25 +84,65 @@ def build_update_toolbelt(
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+    package_ecosystem: Literal["npm", "pypi"] = "npm",
 ) -> list:
-    """Build the strict update-only toolbelt."""
-    _normalize_manifest_targets(target_manifest_paths)
-    normalized_package_manifest_paths = _normalize_package_manifest_targets(package_manifest_paths)
+    """Build the strict, manager-matched update-only toolbelt."""
+    if not (
+        (language == ProjectLanguage.NODEJS and package_ecosystem == "npm")
+        or (language == ProjectLanguage.PYTHON and package_ecosystem == "pypi")
+    ):
+        raise ValueError("Unsupported project-language/package-ecosystem pairing.")
+
+    if language == ProjectLanguage.NODEJS:
+        _normalize_manifest_targets(target_manifest_paths)
+        normalized_package_manifest_paths = _normalize_package_manifest_targets(
+            package_manifest_paths
+        )
+        if package_checkpoints is None:
+            package_checkpoints = {}
+        return [
+            _make_modify_and_validate_npm_dependency_tool(
+                sandbox,
+                touched_files,
+                normalized_package_manifest_paths,
+                allowed_target_versions_by_package=allowed_target_versions_by_package,
+                override_required_packages=override_required_packages,
+                allowed_dependency_types_by_package=allowed_dependency_types_by_package,
+                execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
+            )
+        ]
+
+    allowed_manifests = set(_normalize_python_manifest_targets(target_manifest_paths))
+    normalized_python_manifests = _normalize_python_package_manifest_targets(package_manifest_paths)
+    outside_targets = sorted(
+        {
+            manifest
+            for manifests in normalized_python_manifests.values()
+            for manifest in manifests
+            if manifest not in allowed_manifests
+        }
+    )
+    if outside_targets:
+        raise ValueError(
+            "Python package manifest targets must be included in target_manifest_paths. "
+            f"Unauthorized values: {outside_targets}"
+        )
     if package_checkpoints is None:
         package_checkpoints = {}
-    toolbelt = [
-        _make_modify_and_validate_npm_dependency_tool(
+    return [
+        _make_modify_and_validate_python_dependency_tool(
             sandbox,
             touched_files,
-            normalized_package_manifest_paths,
+            normalized_python_manifests,
             allowed_target_versions_by_package=allowed_target_versions_by_package,
-            override_required_packages=override_required_packages,
             allowed_dependency_types_by_package=allowed_dependency_types_by_package,
             execution_state=execution_state,
             package_checkpoints=package_checkpoints,
-        ),
+        )
     ]
-    return toolbelt
 
 
 def build_workaround_toolbelt(
@@ -105,7 +156,9 @@ def build_workaround_toolbelt(
     no_fix_package_name: str | None = None,
     no_fix_manifest_paths: Sequence[str] | None = None,
     no_fix_package_manager: str | None = None,
-) -> list:
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+):
     """Build the strict workaround-only toolbelt.
 
     The optional NO_FIX arguments add one narrowly scoped package-removal
@@ -158,44 +211,106 @@ def build_workaround_toolbelt(
         if effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
             plan_state["targeted_test_required"] = bool(preferred_test_files)
 
-    normalized_no_fix_manifests = _normalize_manifest_targets(no_fix_manifest_paths or [])
-    plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
-    plan_state.setdefault(
-        "no_fix_package_files",
-        sorted(
-            set(normalized_no_fix_manifests)
-            | {
-                path
-                for manifest in normalized_no_fix_manifests
-                for path in _package_checkpoint_paths([manifest])
-                if Path(path).name in {"package-lock.json", "npm-shrinkwrap.json"}
-            }
-        ),
+    if language == ProjectLanguage.PYTHON:
+        normalized_no_fix_manifests = _normalize_python_manifest_targets(
+            no_fix_manifest_paths or []
+        )
+        python_lockfiles = {
+            path
+            for manifest in normalized_no_fix_manifests
+            for path in _package_checkpoint_paths([manifest], package_ecosystem="pypi")
+            if Path(path).name.casefold() == "pipfile.lock"
+        }
+        related_package_files = python_lockfiles
+    else:
+        normalized_no_fix_manifests = _normalize_manifest_targets(no_fix_manifest_paths or [])
+        related_package_files = {
+            path
+            for manifest in normalized_no_fix_manifests
+            for path in _package_checkpoint_paths([manifest])
+            if Path(path).name in {"package-lock.json", "npm-shrinkwrap.json"}
+        }
+    if language == ProjectLanguage.PYTHON:
+        plan_state["no_fix_manifest_paths"] = normalized_no_fix_manifests
+        plan_state["no_fix_package_files"] = sorted(
+            set(normalized_no_fix_manifests) | related_package_files
+        )
+    else:
+        plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
+        plan_state.setdefault(
+            "no_fix_package_files",
+            sorted(set(normalized_no_fix_manifests) | related_package_files),
+        )
+
+    python_removal_manager = (
+        "pipenv"
+        if any(Path(path).name == "Pipfile" for path in normalized_no_fix_manifests)
+        else "pip"
     )
+    if language == ProjectLanguage.PYTHON:
+        validation_tools = [
+            _make_validate_python_syntax_tool(sandbox),
+            _make_run_targeted_python_test_tool(
+                sandbox,
+                preferred_test_files,
+                plan_state,
+            ),
+            _make_validate_python_workaround_tool(
+                sandbox,
+                touched_files,
+                plan_state,
+                preferred_test_files,
+            ),
+        ]
+    else:
+        validation_tools = [
+            _make_validate_workaround_tool(
+                sandbox,
+                touched_files,
+                plan_state,
+                preferred_test_files,
+                language=language,
+            )
+        ]
 
     toolbelt = [
-        _make_record_plan_tool(plan_state),
-        _make_record_targeted_test_substitution_tool(sandbox, plan_state),
+        _make_record_plan_tool(plan_state, language=language),
+        _make_record_targeted_test_substitution_tool(
+            sandbox,
+            plan_state,
+            language=language,
+        ),
         _make_search_web_tool(mandatory_search_terms=mandatory_search_terms, plan_state=plan_state),
-        _make_read_web_page_tool(plan_state),
+        _make_read_web_page_tool(plan_state, language=language),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox, plan_state),
-        _make_search_codebase_pattern_tool(sandbox, plan_state),
+        _make_search_codebase_pattern_tool(sandbox, plan_state, language=language),
         _make_inspect_ast_symbol_tool(sandbox, plan_state),
         _make_deterministic_apply_edit_set_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_workaround_tool(sandbox, touched_files, plan_state, preferred_test_files),
+        *validation_tools,
     ]
     if (
         effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value
         and no_fix_package_name
         and normalized_no_fix_manifests
+        and (
+            language == ProjectLanguage.NODEJS
+            or (
+                language == ProjectLanguage.PYTHON
+                and (no_fix_package_manager or "").strip().casefold() == python_removal_manager
+            )
+        )
     ):
-        # Keep this tool absent in every other stage. The worker cannot use a
-        # prompt trick to acquire manifest mutation capability.
+        # Keep these tools absent in every other language, manager, and stage.
+        remover = (
+            _make_remove_no_fix_python_dependency_tool
+            if language == ProjectLanguage.PYTHON
+            else _make_remove_no_fix_dependency_tool
+        )
         toolbelt.insert(
             1,
-            _make_remove_no_fix_dependency_tool(
+            remover(
                 sandbox,
                 touched_files,
                 plan_state,
@@ -218,17 +333,23 @@ __all__ = [
     "_normalise_newlines",
     "_normalize_manifest_targets",
     "_normalize_package_manifest_targets",
+    "_normalize_python_manifest_targets",
     "_restore_newlines",
     "_is_allowlisted_no_fix_package_file",
     "_is_prohibited_target",
     "_make_modify_and_validate_npm_dependency_tool",
+    "_make_modify_and_validate_python_dependency_tool",
     "_make_remove_no_fix_dependency_tool",
+    "_make_remove_no_fix_python_dependency_tool",
     "_package_checkpoint_paths",
     "_PackageCheckpoint",
     "rollback_pending_package_updates",
     "_make_record_plan_tool",
     "_make_record_targeted_test_substitution_tool",
     "_make_run_targeted_test_tool",
+    "_make_run_targeted_python_test_tool",
+    "_make_validate_python_syntax_tool",
+    "_make_validate_python_workaround_tool",
     "_make_validate_code_syntax_tool",
     "_make_validate_workaround_tool",
     "_make_read_web_page_tool",

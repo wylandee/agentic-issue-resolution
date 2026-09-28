@@ -87,6 +87,33 @@ def _group(group_id: str, identifier: str = "CVE-2025-0001") -> VulnerabilityGro
     )
 
 
+def _python_group(package: str, manifest: str, manager: str) -> VulnerabilityGroup:
+    """Build one localized PyPI group for deterministic QA evidence tests."""
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        package_name=package,
+        purl=f"pkg:pypi/{package}@1.0.0",
+        ecosystem="pypi",
+        severity=Severity.HIGH,
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file=manifest,
+        package_manager=manager,
+        declaration_type="packages" if manager == "pipenv" else "requirements",
+    )
+    return VulnerabilityGroup(
+        group_id=f"sca:{manifest}:{package}",
+        issue_type=IssueType.SCA,
+        vulnerable_component=package,
+        file_paths=[manifest],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[localized],
+    )
+
+
 def _results(
     *,
     install: tuple[bool, str] = (True, "install ok"),
@@ -364,6 +391,154 @@ def test_version_bump_collects_task_keyed_dependency_evidence() -> None:
     assert package_state.dependency_evidence.lockfile_versions == ["2.0.0"]
     assert package_state.dependency_evidence.manifest_paths == ["package.json"]
     sandbox.run.assert_called_once()
+
+
+def test_pypi_dependency_evidence_uses_venv_and_pep440_equivalence() -> None:
+    group = _python_group("requests", "requirements.txt", "pip")
+    task = _task_context(group).task.model_copy(
+        update={"target_package_name": "requests", "selected_version": "2.32.0"}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "Requests==2.32.0\n"
+    sandbox.run.return_value = MagicMock(
+        exit_code=0,
+        stdout="Name: requests\nVersion: 2.32\n",
+        stderr="",
+    )
+
+    state = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.VERSION_BUMP,
+        task=task,
+        expected_version="2.32.0",
+    )
+
+    evidence = state.dependency_evidence
+    assert evidence is not None
+    assert evidence.status == DependencyEvidenceStatus.VERIFIED
+    assert evidence.target_package == "requests"
+    assert evidence.resolved_versions == ["2.32"]
+    assert evidence.lockfile_paths == []
+    command = sandbox.run.call_args.args[0]
+    assert command == ".venv/bin/python -m pip show requests"
+    assert "npm" not in command
+    sandbox.read_file.assert_called_once_with("requirements.txt")
+
+
+def test_pipfile_parent_lock_version_mismatch_is_reported() -> None:
+    group = _python_group("urllib3", "Pipfile", "pipenv").model_copy(
+        update={"file_paths": ["Pipfile.lock"]}
+    )
+    task = _task_context(group).task.model_copy(
+        update={"target_package_name": "requests", "selected_version": "2.32.0"}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = lambda path: {
+        "Pipfile": '[packages]\nrequests = "*"\n',
+        "Pipfile.lock": '{"default":{"requests":{"version":"==2.31.0"}},"develop":{}}',
+    }.get(path)
+    sandbox.run.return_value = MagicMock(
+        exit_code=0,
+        stdout="Name: requests\nVersion: 2.32.0\n",
+        stderr="",
+    )
+
+    state = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.VERSION_BUMP,
+        task=task,
+        expected_version="2.32.0",
+    )
+
+    evidence = state.dependency_evidence
+    assert evidence is not None
+    assert evidence.status == DependencyEvidenceStatus.MISMATCH
+    assert evidence.target_package == "requests"
+    assert evidence.lockfile_versions == ["2.31.0"]
+    assert sandbox.run.call_args.args[0] == ".venv/bin/python -m pip show requests"
+    assert all("npm" not in call.args[0] for call in sandbox.run.call_args_list)
+
+
+def test_missing_pipfile_lock_is_inconclusive_without_npm_fallback() -> None:
+    group = _python_group("requests", "Pipfile", "pipenv")
+    task = _task_context(group).task.model_copy(
+        update={"target_package_name": "requests", "selected_version": "2.32.0"}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = lambda path: (
+        '[packages]\\nrequests = "*"\\n' if path == "Pipfile" else None
+    )
+    sandbox.run.return_value = MagicMock(
+        exit_code=0,
+        stdout="Name: requests\\nVersion: 2.32.0\\n",
+        stderr="",
+    )
+
+    state = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.VERSION_BUMP,
+        task=task,
+        expected_version="2.32.0",
+    )
+
+    evidence = state.dependency_evidence
+    assert evidence is not None
+    assert evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
+    assert evidence.lockfile_paths == ["Pipfile.lock"]
+    assert any("Pipfile.lock was unavailable" in item for item in evidence.diagnostics)
+    assert sandbox.run.call_args.args[0] == ".venv/bin/python -m pip show requests"
+
+
+def test_python_no_fix_package_removal_uses_manifest_and_installed_state() -> None:
+    group = _python_group("requests", "requirements.txt", "pip")
+    task = _task_context(group, policy=QAPolicy.NO_FIX_PACKAGE_REMOVAL).task
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = ""
+    sandbox.run.return_value = MagicMock(
+        exit_code=1,
+        stdout="WARNING: Package(s) not found: requests",
+        stderr="",
+    )
+
+    removed = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+        task=task,
+    )
+
+    assert removed.manifest_state == "absent"
+    assert removed.graph_state == "absent"
+    assert removed.dependency_evidence is not None
+    assert removed.dependency_evidence.status == DependencyEvidenceStatus.VERIFIED
+    assert sandbox.run.call_args.args[0] == ".venv/bin/python -m pip show requests"
+
+
+def test_python_no_fix_package_still_present_is_a_mismatch() -> None:
+    group = _python_group("requests", "requirements.txt", "pip")
+    task = _task_context(group, policy=QAPolicy.NO_FIX_PACKAGE_REMOVAL).task
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "requests==2.31.0\n"
+    sandbox.run.return_value = MagicMock(
+        exit_code=0,
+        stdout="Name: requests\nVersion: 2.31.0\n",
+        stderr="",
+    )
+
+    present = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+        task=task,
+    )
+
+    assert present.manifest_state == "present"
+    assert present.graph_state == "present"
+    assert present.dependency_evidence is not None
+    assert present.dependency_evidence.status == DependencyEvidenceStatus.MISMATCH
 
 
 def test_version_bump_collects_deeply_nested_npm_dependency_evidence() -> None:

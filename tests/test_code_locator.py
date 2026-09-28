@@ -30,6 +30,7 @@ from remediation_engine.tools.code_locator import (
     locate_sast,
 )
 from remediation_engine.tools.code_map import (
+    _PYTHON_TREE_SITTER_AVAILABLE,
     _TREE_SITTER_AVAILABLE,
     extract_imports,
     extract_sink_expression,
@@ -126,19 +127,19 @@ class TestCodeMapHelpers:
             ("app.ts", False),
             ("app.tsx", False),
             ("app.mjs", False),
-            ("app.py", True),
+            ("app.py", False),
             ("app.java", True),
             ("README.md", True),
         ],
     )
     def test_language_for_path(self, path: str, expected_none: bool):
         lang = language_for_path(path)
-        if expected_none:
+        if path.endswith(".py"):
+            assert (lang is not None) == _PYTHON_TREE_SITTER_AVAILABLE
+        elif expected_none:
             assert lang is None
-        else:
-            # When tree-sitter is available, should return a Language object
-            if _TREE_SITTER_AVAILABLE:
-                assert lang is not None
+        elif _TREE_SITTER_AVAILABLE:
+            assert lang is not None
 
     # --- extract_snippet ---
 
@@ -550,17 +551,22 @@ class TestLocateSastFallback:
         assert issue.id == original_id
         assert issue.file_path == "x.js"
 
-    def test_non_js_file_produces_text_fallback(self, tmp_path: Path):
-        """Python files have no tree-sitter language â€” should still return snippet."""
-        src = "def login(username):\n    return username\n"
+    def test_python_file_uses_structural_localization_without_js_taint_hints(self, tmp_path: Path):
+        src = "def login(username):\n    return eval(req.body.username)\n"
         (tmp_path / "app.py").write_text(src)
         issue = _make_issue(file_path="app.py", line_start=2, line_end=2)
         result = locate_sast(issue, str(tmp_path))
-        # snippet should be populated (text fallback)
+
         assert result.snippet is not None
-        # confidence should be low but not zero (file was readable)
-        assert result.localization_confidence > 0.0
-        assert result.localization_confidence < 0.5
+        assert result.data_flow_hints == []
+        if _PYTHON_TREE_SITTER_AVAILABLE:
+            assert result.enclosing_symbol == "login"
+            assert result.enclosing_node_type == ASTNodeType.FUNCTION
+            assert result.sink_expression == "eval(req.body.username)"
+            assert result.localization_confidence >= 0.5
+        else:
+            assert result.enclosing_symbol is None
+            assert 0.0 < result.localization_confidence < 0.5
 
     def test_empty_file_returns_low_confidence(self, tmp_path: Path):
         (tmp_path / "empty.js").write_bytes(b"")

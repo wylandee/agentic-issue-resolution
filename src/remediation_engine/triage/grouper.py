@@ -44,7 +44,10 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from remediation_engine.tools.package_identity import package_name_from_purl
+from remediation_engine.tools.package_identity import (
+    normalize_python_package_name,
+    package_name_from_purl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +73,12 @@ def _dedupe_paths(paths: list[str | None]) -> list[str]:
 
 def _component_from_issue(issue: VulnerabilityIssue) -> str:
     """Return the canonical SCA component identifier for an issue."""
-    # Prefer the normalized scanner field, then use the shared PURL parser so
-    # scoped npm names cannot collapse to the unscoped leaf package.
-    return issue.package_name or package_name_from_purl(issue.purl) or "unknown"
+    purl = issue.purl or ""
+    is_pypi = (issue.ecosystem or "").strip().casefold() in {"python", "pypi"} or (
+        purl.strip().casefold().startswith("pkg:pypi/")
+    )
+    component = issue.package_name or package_name_from_purl(purl) or "unknown"
+    return normalize_python_package_name(component) if is_pypi else component
 
 
 def _fix_strategy_bucket(fix_plan: FixPlan) -> str:

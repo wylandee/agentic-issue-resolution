@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from remediation_engine.contracts.schemas import QAFailureEvidence
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 from . import _test_normalization
@@ -73,7 +74,7 @@ _LOG_QUERY_MAX_CHARS = 6_000
 
 @dataclass(frozen=True)
 class _QAInstallOutcome:
-    """Structured outcome of the deterministic npm install command."""
+    """Structured outcome of the deterministic language-specific install command."""
 
     ok: bool
     summary: str
@@ -127,20 +128,50 @@ def _store_test_outcome(results: _QAExecutionResults, outcome: _QATestExecutionO
     _append_qa_log_records(results, "tests", outcome.log_records)
 
 
-def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
-    """Run npm install and retain bounded and raw deterministic evidence.
+def _python_install_command(sandbox: DockerSandbox) -> str:
+    """Build an install command that updates dependencies in the persistent project venv."""
 
-    Args:
-        sandbox: Active QA sandbox in which npm should run.
+    def read(path: str) -> str | None:
+        try:
+            content = sandbox.read_file(path)
+        except Exception:  # noqa: BLE001 - install still reports unavailable metadata
+            return None
+        return content if isinstance(content, str) else None
 
-    Returns:
-        A structured install outcome. Raw streams remain private to the
-        invocation and are also represented by one immutable log record.
-    """
+    pipfile = read("Pipfile")
+    if pipfile is not None:
+        lockfile = read("Pipfile.lock")
+        operation = "sync --dev" if lockfile is not None else "install --dev"
+        return f"PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv {operation}"
+
+    commands: list[str] = []
+    if read("requirements.txt") is not None:
+        commands.append(".venv/bin/python -m pip install -r requirements.txt")
+
+    pyproject = read("pyproject.toml") or ""
+    setup_cfg = read("setup.cfg") or ""
+    has_project_metadata = (
+        "[project]" in pyproject or "[options]" in setup_cfg or read("setup.py") is not None
+    )
+    if has_project_metadata:
+        commands.append(".venv/bin/python -m pip install -e .")
+    if not commands:
+        commands.append(".venv/bin/python -m pip install pytest")
+    return " && ".join(commands)
+
+
+def _run_install(
+    sandbox: DockerSandbox,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> _QAInstallOutcome:
+    """Run the language-specific dependency install and retain bounded evidence."""
+    is_python = project_language == ProjectLanguage.PYTHON
+    command = _python_install_command(sandbox) if is_python else "npm install --package-lock=true"
+    command_label = "python dependency install" if is_python else "npm install"
     error: BaseException | None = None
     try:
         result = sandbox.run(
-            "npm install --package-lock=true",
+            command,
             timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
         )
         exit_code = int(getattr(result, "exit_code", 1))
@@ -157,14 +188,18 @@ def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
         stderr = _exception_stream(exc, "stderr")
 
     if exit_code == 0:
-        summary = "npm install succeeded."
+        summary = f"{command_label} succeeded."
         category = None
     else:
-        category = _install_error_category(stdout, stderr, exit_code or 1)
+        category = (
+            "INSTALL_FAILURE"
+            if is_python
+            else _install_error_category(stdout, stderr, exit_code or 1)
+        )
         stdout_tail = "\n".join(stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
         stderr_tail = "\n".join(stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
         summary = (
-            f"npm install FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
+            f"{command_label} FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
             f"stdout tail:\n{stdout_tail}\n"
             f"stderr tail:\n{stderr_tail}"
         )
@@ -180,7 +215,7 @@ def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
         raw_stderr=stderr,
         log_record=_QALogRecord(
             phase="install",
-            label="npm install",
+            label=command_label,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
@@ -1419,8 +1454,58 @@ def _run_detected_test_suites(
     )
 
 
-def _run_unit_tests(sandbox: DockerSandbox) -> _QATestExecutionOutcome:
+def _run_unit_tests(
+    sandbox: DockerSandbox,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> _QATestExecutionOutcome:
     """Run workspace tests and retain raw, suite, and normalized evidence."""
+    is_python = project_language == ProjectLanguage.PYTHON
+    if is_python:
+        command = ".venv/bin/python -m pytest"
+        try:
+            result = sandbox.run(command, timeout=_NPM_TEST_TIMEOUT_SECONDS)
+            exit_code = int(getattr(result, "exit_code", 1))
+            stdout = _subprocess_text(getattr(result, "stdout", ""))
+            stderr = _subprocess_text(getattr(result, "stderr", ""))
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+            raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
+            try:
+                exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+            stdout = _exception_stream(exc, "stdout")
+            stderr = _exception_stream(exc, "stderr")
+
+        if exit_code == 0:
+            summary = "pytest passed."
+            failure_count = 0
+        else:
+            summary = _summarize_failed_test_output(exit_code or 1, stdout, stderr)
+            evidence = extract_qa_failure_evidence(exit_code or 1, stdout, stderr)
+            failure_count = len(evidence.failed_tests) if evidence.failed_tests else None
+            if error is not None:
+                summary += f"\nerror: {error}"
+        return _QATestExecutionOutcome(
+            ok=exit_code == 0,
+            summary=summary,
+            exit_code=exit_code,
+            failure_count=failure_count,
+            raw_stdout=stdout,
+            raw_stderr=stderr,
+            log_records=(
+                _QALogRecord(
+                    phase="tests",
+                    label="pytest",
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    error=str(error) if error is not None else None,
+                ),
+            ),
+        )
+
     plans = _detect_test_suite_plans(sandbox)
     if plans and any(plan.runner != "npm_text_fallback" for plan in plans):
         return _run_detected_test_suites(sandbox, plans)

@@ -7,12 +7,18 @@ so a package cannot change identity merely because one fallback parser ran.
 
 from __future__ import annotations
 
+import re
 from urllib.parse import unquote
 
 try:
     from packageurl import PackageURL
 except ImportError:  # pragma: no cover - optional dependency fallback
     PackageURL = None  # type: ignore[assignment,misc]
+
+
+def normalize_python_package_name(name: str) -> str:
+    """Normalize a distribution name according to PEP 503."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def package_name_from_purl(purl: str | None) -> str | None:
@@ -38,6 +44,8 @@ def package_name_from_purl(purl: str | None) -> str | None:
                     if namespace:
                         return f"{unquote(namespace)}/{unquote(name)}"
                     return unquote(name)
+                if str(parsed.type).casefold() == "pypi":
+                    return normalize_python_package_name(unquote(name))
                 return f"{namespace}:{name}" if namespace else unquote(name)
         except Exception:  # noqa: BLE001 - malformed scanner PURLs use fallback
             pass
@@ -48,6 +56,9 @@ def package_name_from_purl(purl: str | None) -> str | None:
         if not ecosystem or not remainder:
             return None
         remainder = unquote(remainder.split("?", 1)[0].split("#", 1)[0])
+        if ecosystem.lower() == "pypi":
+            name = remainder.rsplit("/", 1)[-1].split("@", 1)[0]
+            return normalize_python_package_name(name) or None
 
         if ecosystem.lower() == "npm":
             if remainder.startswith("@"):

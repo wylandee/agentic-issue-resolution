@@ -24,6 +24,7 @@ from remediation_engine.contracts import (
     select_version,
     validate_transition,
 )
+from remediation_engine.contracts.schemas import LocalizedIssue
 from remediation_engine.orchestration.supervisor_node import (
     _build_deterministic_retry_plan,
     _calculate_eligible_actions,
@@ -36,7 +37,9 @@ from remediation_engine.orchestration.supervisor_node import (
     _task_sort_key,
     supervisor_router,
 )
+from remediation_engine.orchestration.supervisor_planner import _resolve_pipfile_parent_context
 from remediation_engine.orchestration.tactical_supervisor import TacticalCandidateSet
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
 def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = False):
@@ -62,6 +65,35 @@ def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = 
         representative_issue_id=issue.id,
         issues=[issue],
         fix_plan=fix_plan,
+    )
+
+
+def _pypi_group(group_id: str, *, transitive: bool = False) -> VulnerabilityGroup:
+    group = _group(group_id)
+    issue = group.issues[0].model_copy(
+        update={
+            "ecosystem": "pypi",
+            "purl": "pkg:pypi/Requests@1.0.0",
+            "package_name": "Requests",
+            "package_version": "1.0.0",
+        }
+    )
+    manifest = "Pipfile.lock" if transitive else "requirements.txt"
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file=manifest,
+        package_manager="pipenv" if transitive else "pip",
+        is_direct_dependency=not transitive,
+        declaration_type=None if transitive else "requirements",
+    )
+    return group.model_copy(
+        update={
+            "vulnerable_component": "Requests",
+            "issues": [issue],
+            "localized_issues": [localized],
+            "file_path": manifest,
+            "file_paths": [manifest],
+        }
     )
 
 
@@ -443,6 +475,208 @@ def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch
     assert plan.action == "pivot_workaround"
     assert plan.exhausted_update_path is True
     assert plan.selected_version is None
+
+
+def test_initial_python_tasks_preserve_direct_declaration_and_fail_closed_transitive_status():
+    direct_group = _pypi_group("pypi-direct")
+    direct_task = build_initial_remediation_task(direct_group, "task-direct")
+    assert direct_task.target_package_name == "requests"
+    assert direct_task.target_dependency_type == "requirements"
+    assert direct_task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+
+    transitive_group = _pypi_group("pypi-transitive", transitive=True)
+    transitive_task = build_initial_remediation_task(transitive_group, "task-transitive")
+    assert transitive_task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+    assert transitive_task.parent_package_name is None
+    assert transitive_task.target_package_name is None
+    assert transitive_task.target_dependency_type is None
+
+
+def test_pypi_retry_uses_pep440_order_and_canonical_attempted_target(monkeypatch):
+    group = _pypi_group("pypi-direct")
+    task = build_initial_remediation_task(group, "task-pypi").model_copy(
+        update={"strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR}
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        attempted_versions_by_target={"Requests": ["1.10.0"]},
+        target_package_name="REQUESTS",
+        target_dependency_type="requirements",
+    )
+    queried = {}
+
+    def fetch(package_name, floor, attempted):
+        queried.update(package=package_name, floor=floor, attempted=set(attempted))
+        return [
+            RegistryCandidate(
+                version="1.9.0",
+                ecosystem="pypi",
+                semver_key=None,
+                security_floor_met=True,
+                is_stable=True,
+                same_major=True,
+                already_attempted=False,
+                selection_roles=("same_major",),
+            ),
+            RegistryCandidate(
+                version="1.10.0",
+                ecosystem="pypi",
+                semver_key=None,
+                security_floor_met=True,
+                is_stable=True,
+                same_major=True,
+                already_attempted=False,
+                selection_roles=("same_major",),
+            ),
+            RegistryCandidate(
+                version="2.0.0",
+                ecosystem="pypi",
+                semver_key=None,
+                security_floor_met=True,
+                is_stable=True,
+                same_major=False,
+                already_attempted=False,
+                selection_roles=("pypi_latest",),
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.fetch_pypi_registry_candidates",
+        fetch,
+    )
+    plan = _build_deterministic_retry_plan(task, diagnostics, group)
+    assert queried == {
+        "package": "requests",
+        "floor": "1.2.3",
+        "attempted": {"1.10.0"},
+    }
+    assert plan.selected_version == "1.9.0"
+    assert plan.target_package_name == "requests"
+    assert plan.target_dependency_type == "requirements"
+
+
+def test_pypi_parent_retry_requires_unique_proven_pipfile_edge(monkeypatch):
+    group = _pypi_group("pypi-transitive", transitive=True)
+    task = build_initial_remediation_task(group, "task-pypi-parent")
+    diagnostics = UpdateRetryDiagnostics(task_id=task.task_id)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner._resolve_pipfile_parent_context",
+        lambda _volume, _group: ("Parent_Pkg", "1.0.0", ["parent-pkg", "requests"]),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner._pipfile_parent_declaration_type",
+        lambda _volume, _parent: "packages",
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner._supervisor_plan_parent_version",
+        lambda _inputs, _ecosystem: (
+            "- Selected: 1.10.0\n- Eligible Candidates: 1.2.0, 1.10.0\n- PyPI Latest: 2.0.0"
+        ),
+    )
+    proven = _build_deterministic_retry_plan(
+        task,
+        diagnostics,
+        group,
+        requested_stage=SCARemediationStage.PYPI_SAME_MAJOR,
+        workspace_volume="workspace",
+    )
+    assert proven.selected_version == "1.10.0"
+    assert proven.target_package_name == "parent-pkg"
+    assert proven.target_dependency_type == "packages"
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner._resolve_pipfile_parent_context",
+        lambda _volume, _group: None,
+    )
+    missing = _build_deterministic_retry_plan(
+        task,
+        diagnostics,
+        group,
+        requested_stage=SCARemediationStage.PYPI_LATEST,
+        workspace_volume="workspace",
+    )
+    assert missing.action == "pivot_workaround"
+    assert missing.target_package_name is None
+    assert missing.target_dependency_type is None
+    assert missing.selected_version is None
+
+
+def test_pipfile_parent_resolver_rejects_ambiguous_missing_category_and_conditional_edges(
+    monkeypatch,
+):
+    group = _pypi_group("pypi-transitive", transitive=True)
+
+    class Sandbox:
+        def __init__(self, files):
+            self.files = files
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read_file(self, path):
+            return self.files.get(path)
+
+    ambiguous_files = {
+        "Pipfile": '[packages]\nparent-a = "*"\nparent-b = "*"\n',
+        "Pipfile.lock": (
+            '{"default":{"parent-a":{"version":"==1.0.0"},'
+            '"parent-b":{"version":"==1.0.0"},'
+            '"requests":{"version":"==1.2.0"}},"develop":{}}'
+        ),
+    }
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.DockerSandbox",
+        lambda **_kwargs: Sandbox(ambiguous_files),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.get_pypi_release_requires_dist",
+        lambda _package, _version: ["requests>=1.0"],
+    )
+    assert _resolve_pipfile_parent_context("workspace", group) is None
+
+    missing_child_files = {
+        "Pipfile": '[packages]\nparent-a = "*"\n',
+        "Pipfile.lock": '{"default":{"parent-a":{"version":"==1.0.0"}},"develop":{}}',
+    }
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.DockerSandbox",
+        lambda **_kwargs: Sandbox(missing_child_files),
+    )
+    assert _resolve_pipfile_parent_context("workspace", group) is None
+    category_mismatch_files = {
+        "Pipfile": '[packages]\nparent-a = "*"\n',
+        "Pipfile.lock": (
+            '{"default":{"parent-a":{"version":"==1.0.0"}},'
+            '"develop":{"requests":{"version":"==1.2.0"}}}'
+        ),
+    }
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.DockerSandbox",
+        lambda **_kwargs: Sandbox(category_mismatch_files),
+    )
+    assert _resolve_pipfile_parent_context("workspace", group) is None
+
+    for declaration in (
+        'parent-a = { version = "*", extras = ["feature"] }',
+        """parent-a = { version = "*", markers = 'sys_platform == "win32"' }""",
+    ):
+        conditional_parent_files = {
+            "Pipfile": f"[packages]\\n{declaration}\\n",
+            "Pipfile.lock": (
+                '{"default":{"parent-a":{"version":"==1.0.0"},'
+                '"requests":{"version":"==1.2.0"}},"develop":{}}'
+            ),
+        }
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_planner.DockerSandbox",
+            lambda conditional_parent_files=conditional_parent_files, **_kwargs: Sandbox(
+                conditional_parent_files
+            ),
+        )
+        assert _resolve_pipfile_parent_context("workspace", group) is None
 
 
 def test_phase_projection_and_audit_are_typed():

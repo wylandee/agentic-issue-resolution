@@ -53,6 +53,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
 from remediation_engine.orchestration.graph_wrappers import (
     _create_workspace_attempt_snapshot,
@@ -764,6 +765,7 @@ def run_orchestrator(
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
     settings: AppSettings | None = None,
+    project_language: ProjectLanguage | None = None,
 ) -> OrchestratorState:
     """Run the Phase 5 graph and return its final state.
 
@@ -774,7 +776,7 @@ def run_orchestrator(
         system_context: Optional deployment context for triage and QA.
         settings: Optional validated application settings used by report
             finalization; environment settings are used when omitted.
-
+        project_language: Optional language profile selected at the API boundary.
     Returns:
         The final graph state, including trajectory and report metadata when
         those artifacts were successfully produced.
@@ -789,6 +791,7 @@ def run_orchestrator(
         valid_groups=valid_groups,
         issues=issues,
         system_context=system_context,
+        project_language=project_language,
     )
     config, run_id = build_phase5_runnable_config(repo_root, valid_groups, settings=settings)
     recorder = TrajectoryRecorder()

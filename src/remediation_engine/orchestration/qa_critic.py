@@ -46,6 +46,7 @@ from remediation_engine.contracts.schemas import (
     ScanScope,
     VulnerabilityGroup,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
@@ -95,6 +96,7 @@ def _run_global_execution(
     scan_targets: Sequence[QAScanTarget] | None = None,
     skip_scan: bool = False,
     scan_skip_reason: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -104,8 +106,15 @@ def _run_global_execution(
     """
     results = _QAExecutionResults()
 
-    logger.info("qa_critic: [Step 0] running npm install.")
-    install_outcome = _qa_test_parsing_module._run_install(sandbox)
+    logger.info(
+        "qa_critic: [Step 0] running %s install.",
+        "Python" if project_language == ProjectLanguage.PYTHON else "npm",
+    )
+    install_outcome = (
+        _qa_test_parsing_module._run_install(sandbox, project_language)
+        if project_language == ProjectLanguage.PYTHON
+        else _qa_test_parsing_module._run_install(sandbox)
+    )
     _qa_test_parsing_module._store_install_outcome(results, install_outcome)
     install_ok = results.install[0]
 
@@ -136,31 +145,47 @@ def _run_global_execution(
     scan_started = time.monotonic()
     if not skip_scan and scan_targets is None:
         if baseline_identifiers is None:
-            _store_scan_outcome(
-                results,
+            scan_result = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                )
             )
         else:
-            _store_scan_outcome(
-                results,
+            scan_result = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
                     baseline_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline_identifiers,
+                )
             )
+        _store_scan_outcome(results, scan_result)
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
         closures: list[DependencyClosure] = []
         targeted_subdir: str | None = None
         fallback_reason: ScanFallbackReason | None = None
         try:
-            if _targeted_extra_args_conflict():
+            if project_language == ProjectLanguage.PYTHON:
+                fallback_reason = ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER
+            elif _targeted_extra_args_conflict():
                 fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
             else:
                 closures, fallback_reason, resolution_detail = _resolve_targeted_closures(
@@ -205,20 +230,38 @@ def _run_global_execution(
         finally:
             if targeted_subdir is not None:
                 _cleanup_targeted_artifacts(sandbox)
-
         if fallback_reason is not None:
             if baseline_identifiers is None:
-                fallback_result = _qa_odc_module._run_security_scan(
-                    sandbox,
-                    workspace_volume,
-                    target_identifiers,
+                fallback_result = (
+                    _qa_odc_module._run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        target_identifiers,
+                        project_language=project_language,
+                    )
+                    if project_language == ProjectLanguage.PYTHON
+                    else _qa_odc_module._run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        target_identifiers,
+                    )
                 )
             else:
-                fallback_result = _qa_odc_module._run_security_scan(
-                    sandbox,
-                    workspace_volume,
-                    target_identifiers,
-                    baseline,
+                fallback_result = (
+                    _qa_odc_module._run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        target_identifiers,
+                        baseline,
+                        project_language=project_language,
+                    )
+                    if project_language == ProjectLanguage.PYTHON
+                    else _qa_odc_module._run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        target_identifiers,
+                        baseline,
+                    )
                 )
             _store_scan_outcome(results, fallback_result, label="odc:fallback-full")
             results.scan_evidence = _scan_evidence(
@@ -257,8 +300,11 @@ def _run_global_execution(
             time.monotonic() - scan_started,
         )
 
-    logger.info("qa_critic: [Step 0] running unit tests.")
-    test_outcome = _qa_test_parsing_module._run_unit_tests(sandbox)
+    test_outcome = (
+        _qa_test_parsing_module._run_unit_tests(sandbox, project_language)
+        if project_language == ProjectLanguage.PYTHON
+        else _qa_test_parsing_module._run_unit_tests(sandbox)
+    )
     _qa_test_parsing_module._store_test_outcome(results, test_outcome)
 
     return results
@@ -331,6 +377,9 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
       Evaluator â€” One bounded read-only tool loop with a typed terminal result
       Guards â€” Python guardrails normalize and validate evaluations
     """
+    project_language = state.get("project_language", ProjectLanguage.NODEJS)
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
     valid_groups: list[VulnerabilityGroup] = state.get("valid_groups") or []
     workspace_volume: str | None = state.get("workspace_volume")
     repo_root: str | None = state.get("repo_root")
@@ -456,7 +505,11 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     errors: list[str] = []
     deterministic_test_evidence: QAFailureEvidence | None = None
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+        with DockerSandbox(
+            repo_root=None,
+            image=LANGUAGE_CONFIGS[project_language].docker_image,
+            workspace_volume=workspace_volume,
+        ) as sandbox:
             # ------------------------------------------------------------------
             # Step 0: Global Execution (deterministic Python, exactly once)
             # ------------------------------------------------------------------
@@ -468,6 +521,11 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 scan_targets=scan_targets,
                 skip_scan=skip_scan,
                 scan_skip_reason="no_fix_package_removal" if skip_scan else None,
+                **(
+                    {"project_language": project_language}
+                    if project_language == ProjectLanguage.PYTHON
+                    else {}
+                ),
             )
             scan_projection = _scan_state_projection(
                 results,
@@ -572,6 +630,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 results=results,
                 task_policies=task_policies,
                 singleton_scope=singleton_scope,
+                project_language=project_language,
             )
 
     except RuntimeError as exc:
@@ -691,6 +750,9 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
 @traceable(name="final_full_scan")
 def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
     """Run the authoritative full ODC scan immediately before teardown."""
+    project_language = state.get("project_language", ProjectLanguage.NODEJS)
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
     workspace_volume = state.get("workspace_volume")
     groups: list[VulnerabilityGroup] = list(state.get("valid_groups") or [])
     baseline = _collect_baseline_identifiers(state, groups)
@@ -717,12 +779,26 @@ def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
         }
 
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            scan = _qa_odc_module._run_security_scan(
-                sandbox,
-                workspace_volume,
-                target_identifiers,
-                baseline,
+        with DockerSandbox(
+            repo_root=None,
+            image=LANGUAGE_CONFIGS[project_language].docker_image,
+            workspace_volume=workspace_volume,
+        ) as sandbox:
+            scan = (
+                _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline,
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline,
+                )
             )
             workspace_fingerprint = _workspace_remediation_fingerprint(
                 str(state.get("repo_root")) if state.get("repo_root") else None,

@@ -697,7 +697,9 @@ def test_parent_minimum_is_not_used_as_a_security_floor() -> None:
     task = _task().model_copy(update={"parent_minimum_version": "9.9.9"})
     calls: list[str] = []
 
-    def provider(package_name: str, security_floor: str, attempted_versions: set[str]):
+    def provider(
+        package_name: str, security_floor: str, attempted_versions: set[str], ecosystem="npm"
+    ):
         calls.append(security_floor)
         from remediation_engine.contracts.version_policy import RegistryCandidate
 
@@ -743,7 +745,9 @@ def test_transitive_inventory_keeps_child_override_when_parent_has_no_compatible
         }
     )
 
-    def provider(_package_name: str, _security_floor: str, _attempted_versions: set[str]):
+    def provider(
+        _package_name: str, _security_floor: str, _attempted_versions: set[str], ecosystem="npm"
+    ):
         return [
             RegistryCandidate(
                 version="2.0.1",
@@ -791,7 +795,9 @@ def test_package_override_stage_does_not_require_parent_version() -> None:
     )
     calls: list[tuple[str, str, set[str]]] = []
 
-    def provider(package_name: str, security_floor: str, attempted_versions: set[str]):
+    def provider(
+        package_name: str, security_floor: str, attempted_versions: set[str], ecosystem="npm"
+    ):
         calls.append((package_name, security_floor, attempted_versions))
         return [
             RegistryCandidate(
@@ -839,7 +845,9 @@ def test_package_override_stage_accepts_only_authorized_override_action() -> Non
         }
     )
 
-    def provider(_package_name: str, _security_floor: str, _attempted_versions: set[str]):
+    def provider(
+        _package_name: str, _security_floor: str, _attempted_versions: set[str], ecosystem="npm"
+    ):
         return [
             RegistryCandidate(
                 version="1.2.3",
@@ -923,7 +931,9 @@ def test_retry_registry_candidates_remain_inside_initial_approved_pool() -> None
     )
     calls: list[set[str]] = []
 
-    def provider(package_name: str, security_floor: str, attempted_versions: set[str]):
+    def provider(
+        package_name: str, security_floor: str, attempted_versions: set[str], ecosystem="npm"
+    ):
         calls.append(attempted_versions)
         return [
             RegistryCandidate(
@@ -957,3 +967,108 @@ def test_retry_registry_candidates_remain_inside_initial_approved_pool() -> None
     assert calls == [set()]
     assert candidate_sets[0].versions == ("1.2.0", "2.0.0")
     assert "1.1.0" not in candidate_sets[0].versions
+
+
+def test_pypi_tactical_candidates_use_pep440_roles_and_normalized_identity():
+    base_group = _group()
+    pypi_issue = base_group.issues[0].model_copy(
+        update={
+            "ecosystem": "pypi",
+            "purl": "pkg:pypi/Requests@1.0.0",
+            "package_name": "Requests",
+        }
+    )
+    group = base_group.model_copy(
+        update={
+            "vulnerable_component": "Requests",
+            "issues": [pypi_issue],
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR,
+            "target_package_name": "requests",
+            "target_dependency_type": "requirements",
+        }
+    )
+    calls = []
+
+    def provider(package_name, floor, attempted, ecosystem):
+        calls.append((package_name, floor, set(attempted), ecosystem))
+        return [
+            RegistryCandidate(
+                version=version,
+                ecosystem="pypi",
+                semver_key=None,
+                security_floor_met=True,
+                is_stable=True,
+                same_major=version.startswith("1."),
+                already_attempted=False,
+                selection_roles=roles,
+            )
+            for version, roles in (
+                ("1.2.3", ("osv_minimum",)),
+                ("1.9.0", ("same_major",)),
+                ("1.10.0", ("same_major",)),
+                ("2.0.0", ("pypi_latest",)),
+            )
+        ]
+
+    candidate_sets, error = registry_candidate_sets_for_context(
+        build_tactical_context(task, group),
+        registry_provider=provider,
+    )
+
+    assert error is None
+    assert calls == [("requests", "1.2.3", set(), "pypi")]
+    assert len(candidate_sets) == 1
+    assert candidate_sets[0].versions == ("1.10.0",)
+    assert candidate_sets[0].target_package_name == "requests"
+
+
+def test_pypi_transitive_tactical_path_never_offers_package_override():
+    base_group = _group()
+    pypi_issue = base_group.issues[0].model_copy(
+        update={
+            "ecosystem": "pypi",
+            "purl": "pkg:pypi/Requests@1.0.0",
+            "package_name": "Requests",
+        }
+    )
+    group = base_group.model_copy(
+        update={
+            "vulnerable_component": "Requests",
+            "issues": [pypi_issue],
+            "parent_contexts": [
+                DependencyParentContext(
+                    package_name="Direct_Parent",
+                    package_version="1.0.0",
+                    declaration_type="packages",
+                )
+            ],
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PYPI_LATEST,
+            "target_package_name": "direct-parent",
+            "target_dependency_type": "packages",
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+        }
+    )
+    with patch(
+        "remediation_engine.orchestration.tactical_supervisor._supervisor_plan_parent_version",
+        return_value=("- Selected: 1.4.0\n- Eligible Candidates: 1.4.0\n- PyPI Latest: 1.4.0"),
+    ):
+        candidate_sets, error = registry_candidate_sets_for_context(
+            build_tactical_context(task, group)
+        )
+
+    assert error is None
+    assert allowed_tactical_strategies(task, group) == (
+        TacticalStrategy.VERSION_BUMP,
+        TacticalStrategy.CODE_WORKAROUND,
+    )
+    assert candidate_sets[0].target_package_name == "direct-parent"
+    assert candidate_sets[0].dependency_type == "packages"
