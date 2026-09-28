@@ -53,6 +53,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
 from remediation_engine.orchestration.graph_wrappers import (
     _create_workspace_attempt_snapshot,
@@ -630,7 +631,11 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             group = groups_by_id.get(task.parent_group_id)
             if group is None:
                 continue
-            fresh_task = build_initial_remediation_task(group, task_id)
+            fresh_task = build_initial_remediation_task(
+                group,
+                task_id,
+                project_language=state.get("project_language", ProjectLanguage.NODEJS),
+            )
             task_queue[task_id] = task.model_copy(
                 update={
                     "task_revision": task.task_revision + 1,

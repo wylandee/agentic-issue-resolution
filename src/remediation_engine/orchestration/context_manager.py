@@ -496,18 +496,42 @@ class ScratchpadMemory:
                 else ""
             )
             key_findings.append(_clean_text(f"atomic edit: {status}{summary}", 500))
-        elif event_name == "remove_no_fix_dependency":
-            package = _clean_text(_arg(args, "requested_package", "package_name"), 180)
+        elif event_name == "modify_and_validate_maven_dependency":
+            package = _clean_text(_arg(args, "package_name"), 180)
+            version = _clean_text(_arg(args, "target_version"), 100)
+            dependency_type = _clean_text(_arg(args, "dependency_type"), 80)
             manifest = _normalize_path(_arg(args, "manifest_path", "file_path"))
             if manifest:
                 files_inspected.append(manifest)
             key_findings.append(
                 _clean_text(
-                    f"package removal {package or '[package omitted]'}: {_first_meaningful_line(content)}"
-                    f" manifest={manifest or '[manifest omitted]'}",
-                    500,
+                    f"Maven update {package or '[GAV omitted]'} version={version or '[version omitted]'} "
+                    f"target={dependency_type or '[type omitted]'}: {_first_meaningful_line(content)} "
+                    f"POM={manifest or '[POM omitted]'}",
+                    650,
                 )
             )
+        elif event_name == "remove_no_fix_dependency":
+            package = _clean_text(_arg(args, "requested_package", "package_name"), 180)
+            manifest = _normalize_path(_arg(args, "manifest_path", "file_path"))
+            if manifest:
+                files_inspected.append(manifest)
+            if manifest.casefold().endswith("pom.xml"):
+                key_findings.append(
+                    _clean_text(
+                        f"Maven direct dependency removal {package or '[GAV omitted]'}: "
+                        f"{_first_meaningful_line(content)} POM={manifest}",
+                        500,
+                    )
+                )
+            else:
+                key_findings.append(
+                    _clean_text(
+                        f"package removal {package or '[package omitted]'}: {_first_meaningful_line(content)}"
+                        f" manifest={manifest or '[manifest omitted]'}",
+                        500,
+                    )
+                )
         elif event_name == "validate_workaround":
             payload = _json_payload(content)
             if payload is not None:

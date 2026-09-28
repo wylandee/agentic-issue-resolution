@@ -128,6 +128,26 @@ class TestTarArchiveHelper:
         assert not any(name.startswith(".git") for name in names)
         assert not any(name.startswith("node_modules") for name in names)
 
+    def test_java_archive_keeps_mvn_and_build_files_but_excludes_target(self, tmp_path):
+        (tmp_path / ".mvn" / "wrapper").mkdir(parents=True)
+        (tmp_path / ".mvn" / "wrapper" / "maven-wrapper.properties").write_text(
+            "distributionUrl=https://example.invalid/maven.zip",
+            encoding="utf-8",
+        )
+        (tmp_path / "target" / "classes").mkdir(parents=True)
+        (tmp_path / "target" / "classes" / "App.class").write_bytes(b"class")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build.gradle").write_text("plugins {}", encoding="utf-8")
+
+        archive = _make_tar_archive(tmp_path, frozenset({"target"}))
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r") as tf:
+            names = tf.getnames()
+
+        assert ".mvn/wrapper/maven-wrapper.properties" in names
+        assert "build" in names
+        assert "build.gradle" in names
+        assert not any(name == "target" or name.startswith("target/") for name in names)
+
 
 class TestSandboxLifecycle:
     def test_start_without_volume_streams_repo(self, tmp_path):
@@ -145,6 +165,7 @@ class TestSandboxLifecycle:
         assert container.put_archive.called
         args, _kwargs = container.put_archive.call_args
         assert args[0] == "/workspace"
+        client.images.get.assert_called_once_with("node:22")
 
     def test_start_with_workspace_volume_mounts_named_volume(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()
@@ -160,6 +181,31 @@ class TestSandboxLifecycle:
         _args, kwargs = client.containers.run.call_args
         assert kwargs["volumes"] == {
             "agent_workspace_deadbeef": {"bind": "/workspace", "mode": "rw"}
+        }
+
+    def test_start_mounts_separate_maven_repository_volume(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(
+                repo_root=None,
+                image="maven:3.9-eclipse-temurin-17",
+                workspace_volume="agent_workspace_deadbeef",
+                maven_repository_volume="agent_maven_repository_deadbeef",
+            )
+            sandbox.start()
+            sandbox.teardown()
+
+        client.images.get.assert_called_once_with("maven:3.9-eclipse-temurin-17")
+        _args, kwargs = client.containers.run.call_args
+        assert kwargs["volumes"] == {
+            "agent_workspace_deadbeef": {"bind": "/workspace", "mode": "rw"},
+            "agent_maven_repository_deadbeef": {
+                "bind": "/root/.m2/repository",
+                "mode": "rw",
+            },
         }
 
     def test_restart_reuses_named_volume_without_recopied_host_files(self, tmp_path):

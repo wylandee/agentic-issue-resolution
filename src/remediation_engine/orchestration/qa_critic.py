@@ -46,6 +46,7 @@ from remediation_engine.contracts.schemas import (
     ScanScope,
     VulnerabilityGroup,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
@@ -455,8 +456,14 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
 
     errors: list[str] = []
     deterministic_test_evidence: QAFailureEvidence | None = None
+    sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
+    project_language = state.get("project_language", ProjectLanguage.NODEJS)
+    if project_language == ProjectLanguage.JAVA:
+        sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
+        sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
+
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+        with DockerSandbox(repo_root=None, **sandbox_options) as sandbox:
             # ------------------------------------------------------------------
             # Step 0: Global Execution (deterministic Python, exactly once)
             # ------------------------------------------------------------------

@@ -22,6 +22,7 @@ from remediation_engine.contracts.schemas import (
     RoutingStrategy,
     StateConsistencyEvent,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
@@ -883,6 +884,8 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         feedback_by_task=feedback_by_task,
         previous_action_summaries_by_task=latest_action_summary_by_task,
         retry_diagnostics_by_task=dict(state.get("retry_diagnostics_by_task", {})),
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
+        maven_cache_volume=state.get("maven_cache_volume"),
         target_attempt_snapshots=target_attempt_snapshots,
     )
 
@@ -1027,6 +1030,8 @@ def run_workaround_subagent_from_orchestrator(
         constraints_ledger=list(state.get("constraints_ledger", [])),
         previous_feedback=feedback_by_task.get(task.task_id),
         attempt_snapshot=attempt_snapshot,
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
+        maven_cache_volume=state.get("maven_cache_volume"),
         current_replay_plan=current_replay_plan,
     )
 

@@ -31,6 +31,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.triage.pipeline import (
     TriagePipelineError,
     TriageSelectionError,
@@ -510,3 +511,45 @@ class TestSelectIssuesForRemediation:
         )
         selected = select_issues_for_remediation([(group, triage)])
         assert selected[0].id == issue.id
+
+
+def test_pipeline_threads_explicit_java_language_to_localization_and_reachability(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
+    issues = [_sca()]
+    context = SystemContext(environment="production", primary_language="java")
+    plans = _sca_issue_plans(issues)
+    with (
+        patch(
+            "remediation_engine.triage.pipeline.enrich_cves",
+            side_effect=_empty_enrichment_map,
+        ),
+        patch(
+            "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+            return_value=plans,
+        ) as prepare,
+        patch("remediation_engine.triage.pipeline.analyze_reachability") as reachability,
+    ):
+        run_triage_pipeline(issues, context, repo_root=str(tmp_path))
+
+    assert prepare.call_args.args[2] is ProjectLanguage.JAVA
+    assert reachability.call_args.kwargs["project_language"] is ProjectLanguage.JAVA
+
+
+def test_pipeline_without_primary_language_preserves_node_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
+    issues = [_sca()]
+    with (
+        patch(
+            "remediation_engine.triage.pipeline.enrich_cves",
+            side_effect=_empty_enrichment_map,
+        ),
+        patch(
+            "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+            return_value=_sca_issue_plans(issues),
+        ) as prepare,
+    ):
+        run_triage_pipeline(issues, _ctx())
+
+    assert prepare.call_args.args[2] is ProjectLanguage.NODEJS

@@ -278,7 +278,7 @@ class ArchitectureBoundaryMetric(BaseMetric):
         versions or query external registries/web during first-pass execution.
       - Registry and web discovery are Supervisor-owned and prohibited for
         update workers.
-      - Update manifest mutations use only modify_and_validate_npm_dependency.
+      - Update manifest mutations use the combined npm or Maven transaction tool.
       - Workaround workers must not call update-only manifest modification tools.
     """
 
@@ -353,7 +353,11 @@ class ArchitectureBoundaryMetric(BaseMetric):
 
         elif eval_type == "workaround_subagent":
             for name, _params in tool_names_and_args:
-                if name in {"modify_npm_dependency", "modify_and_validate_npm_dependency"}:
+                if name in {
+                    "modify_npm_dependency",
+                    "modify_and_validate_npm_dependency",
+                    "modify_and_validate_maven_dependency",
+                }:
                     violations.append(f"Workaround worker called update-only tool '{name}'.")
 
         if violations:

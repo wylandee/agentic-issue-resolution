@@ -25,10 +25,24 @@ MAX_UPDATE_MANIFEST_ATTEMPTS = 3
 SANDBOX_NOT_RUNNING_MARKER = "sandbox is not running"
 STAGNATION_REPETITION_THRESHOLD = 2
 _UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
+_MAVEN_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_maven_dependency"
+_UPDATE_MANIFEST_TOOL_NAMES = frozenset(
+    {_UPDATE_MANIFEST_TOOL_NAME, _MAVEN_UPDATE_MANIFEST_TOOL_NAME}
+)
 
-# Manifest mutations and validation form a single ordered transaction. The
-# worker must observe the result of one operation before issuing the next.
-_SERIAL_MANIFEST_TOOL_NAMES = frozenset({_UPDATE_MANIFEST_TOOL_NAME})
+# Update transactions are serialized for both ecosystems. Maven removal shares
+# the barrier; Node package removal retains its existing call behavior.
+_SERIAL_MANIFEST_TOOL_NAMES = _UPDATE_MANIFEST_TOOL_NAMES
+
+
+def _is_serial_manifest_tool_call(tool_name: str, args: dict[str, Any]) -> bool:
+    """Serialize Maven removal transactions without changing Node removal behavior."""
+    if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
+        return True
+    if tool_name != "remove_no_fix_dependency":
+        return False
+    manifest_path = str(args.get("manifest_path", "") or "").replace("\\", "/").casefold()
+    return manifest_path == "pom.xml" or manifest_path.endswith("/pom.xml")
 
 
 @dataclass(frozen=True)
@@ -90,17 +104,19 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
                     res.append(str(r["file_path"]).replace("\\", "/").lstrip("/"))
             return res
 
-    if tool_event.name == _UPDATE_MANIFEST_TOOL_NAME:
+    if tool_event.name in _UPDATE_MANIFEST_TOOL_NAMES:
         # Deferred and failed transactions did not leave a committed file
         # change. The combined tool's SUCCESS result is the authoritative
         # changed-file signal.
-        if not tool_event.content.lstrip().startswith("SUCCESS:"):
-            return []
-        manifest_path = tool_event.args.get("manifest_path", "package.json")
+        manifest_path = tool_event.args.get(
+            "manifest_path",
+            "pom.xml" if tool_event.name == _MAVEN_UPDATE_MANIFEST_TOOL_NAME else "package.json",
+        )
         if isinstance(manifest_path, str) and manifest_path.strip():
             return [manifest_path.replace("\\", "/")]
-        return ["package.json"]
-
+        return [
+            "pom.xml" if tool_event.name == _MAVEN_UPDATE_MANIFEST_TOOL_NAME else "package.json"
+        ]
     if tool_event.name in {
         "deterministic_apply_edit_set",
         "deterministic_search_replace",
@@ -212,10 +228,15 @@ def _manifest_retry_recovery_instruction(
         tool_event.content.strip()[:2_000]
         or "The combined update transaction failed without diagnostics."
     )
+    tool_name = (
+        tool_event.name
+        if tool_event.name in _UPDATE_MANIFEST_TOOL_NAMES
+        else _UPDATE_MANIFEST_TOOL_NAME
+    )
     if attempts >= MAX_UPDATE_MANIFEST_ATTEMPTS:
         return (
             f"The update transaction for {package_name} has exhausted its {MAX_UPDATE_MANIFEST_ATTEMPTS}-attempt limit. "
-            "Do not call modify_and_validate_npm_dependency for this package again; continue with the next independent task "
+            f"Do not call {tool_name} for this package again; continue with the next independent task "
             "or surrender this package.\n"
             f"Exact transaction result:\n{evidence}"
         )
@@ -223,7 +244,7 @@ def _manifest_retry_recovery_instruction(
         f"The combined manifest transaction for {package_name} failed on attempt {attempts} with "
         f"target_version={current_version!r}, dependency_type={current_type!r}.\n"
         f"Exact transaction result:\n{evidence}\n"
-        "Call modify_and_validate_npm_dependency again for the same Supervisor-owned package and manifest, "
+        f"Call {tool_name} again for the same Supervisor-owned package and manifest, "
         "but change target_version or dependency_type to a different value from the Supervisor-approved candidate lists. "
         "Do not query the registry, edit source files, or repeat the exact same call signature."
     )
@@ -395,19 +416,19 @@ def _validation_input_recovery_instruction(tool_content: str) -> str:
 
 
 def _manifest_call_deferred_instruction(deferred_tool_names: Sequence[str]) -> str:
-    """Tell the worker to resume after deferred manifest calls.
-
-    Args:
-        deferred_tool_names: Manifest tools acknowledged but not executed from
-            the current assistant message.
-
-    Returns:
-        A bounded instruction for the next model turn.
-    """
+    """Tell the worker to resume after deferred manifest calls."""
     names = ", ".join(deferred_tool_names)
+    transaction_name = next(
+        (
+            name
+            for name in deferred_tool_names
+            if name in _UPDATE_MANIFEST_TOOL_NAMES or name == "remove_no_fix_dependency"
+        ),
+        _UPDATE_MANIFEST_TOOL_NAME,
+    )
     return (
         "Manifest transaction sequencing barrier: only one "
-        f"{_UPDATE_MANIFEST_TOOL_NAME} call may execute per assistant turn. "
+        f"{transaction_name} call may execute per assistant turn. "
         f"Deferred call(s): {names}. The prior combined edit-and-sync transaction "
         "has already been executed. On the next turn, inspect its result and "
         "continue with the next authorized package or a changed candidate; do not "
@@ -647,7 +668,7 @@ def run_bounded_subagent_loop(
                     name=tool_name,
                 )
             else:
-                if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
+                if _is_serial_manifest_tool_call(tool_name, tool_call.get("args", {}) or {}):
                     # Set the barrier before handling suppressed or synthetic
                     # failures as well. Every manifest call in an assistant turn
                     # must be deferred after the first one, regardless of whether
@@ -688,7 +709,7 @@ def run_bounded_subagent_loop(
                         name=tool_name,
                     )
                 else:
-                    if tool_name == _UPDATE_MANIFEST_TOOL_NAME:
+                    if tool_name in _UPDATE_MANIFEST_TOOL_NAMES:
                         # A synthetic retry-limit response is still the one
                         # serialized manifest call for this assistant turn.
                         package_name = str(
@@ -801,7 +822,7 @@ def run_bounded_subagent_loop(
             else:
                 failed_tool_call_counts.pop(call_signature, None)
 
-            if event.name == _UPDATE_MANIFEST_TOOL_NAME and _is_failed_tool_result(
+            if event.name in _UPDATE_MANIFEST_TOOL_NAMES and _is_failed_tool_result(
                 tool_message.content
             ):
                 package_name = str(event.args.get("package_name", "")).strip()

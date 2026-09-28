@@ -6,6 +6,7 @@ All Docker SDK interactions are mocked. No real Docker daemon is required.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import (
@@ -15,6 +16,11 @@ from remediation_engine.contracts.schemas import (
     SCARemediationStage,
     TaskAttemptSnapshot,
     TaskStatus,
+)
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.graph_wrappers import (
+    run_update_subagent_from_orchestrator,
+    run_workaround_subagent_from_orchestrator,
 )
 from remediation_engine.orchestration.state import (
     ChangedFilesProjection,
@@ -34,6 +40,61 @@ def _sandbox_mock() -> MagicMock:
     return mock
 
 
+def _maven_dispatch_state():
+    task = SimpleNamespace(
+        task_id="task-1",
+        parent_group_id="group-1",
+        current_attempt_id=None,
+    )
+    group = SimpleNamespace(group_id="group-1")
+    return {
+        "task_queue": {"task-1": task},
+        "active_target_task_ids": ["task-1"],
+        "valid_groups": [group],
+        "repo_root": "/tmp/repository",
+        "workspace_volume": "agent_workspace_test",
+        "maven_cache_volume": "agent_maven_repository_test",
+        "project_language": ProjectLanguage.JAVA,
+        "attempt_snapshots_by_id": {},
+        "action_summaries": [],
+        "constraints_ledger": [],
+        "feedback_by_task": {},
+        "retry_diagnostics_by_task": {},
+        "workaround_replay_plans_by_task": {},
+        "workspace_rollback_anchors_by_task": {},
+    }
+
+
+def _capture_maven_subagent_state(dispatcher, worker_node_name):
+    state = _maven_dispatch_state()
+    worker_node = MagicMock(return_value={})
+    graph = SimpleNamespace(**{worker_node_name: worker_node})
+    with (
+        patch(
+            "remediation_engine.orchestration.graph_wrappers._dispatch_boundary_rejection",
+            return_value=None,
+        ),
+        patch(
+            "remediation_engine.orchestration.graph_wrappers._prepare_workspace_for_dispatch",
+            return_value=(state, []),
+        ),
+        patch(
+            "remediation_engine.orchestration.graph_wrappers._create_workspace_attempt_snapshot",
+            return_value=("snapshot", []),
+        ),
+        patch(
+            "remediation_engine.orchestration.graph_wrappers._finalize_worker_workspace_snapshot",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.graph_wrappers._graph_module",
+            return_value=graph,
+        ),
+    ):
+        dispatcher(state)
+    return worker_node.call_args.args[0]
+
+
 class TestStateDefaults:
     def test_orchestrator_state_initializes_master_state_fields(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
@@ -47,6 +108,27 @@ class TestStateDefaults:
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
         assert "messages" not in state
+        assert state["maven_cache_volume"] is None
+
+
+class TestMavenWorkerCacheRouting:
+    def test_update_dispatch_passes_run_owned_maven_cache(self):
+        state = _capture_maven_subagent_state(
+            run_update_subagent_from_orchestrator,
+            "run_update_subagent_node",
+        )
+
+        assert state["project_language"] == ProjectLanguage.JAVA
+        assert state["maven_cache_volume"] == "agent_maven_repository_test"
+
+    def test_workaround_dispatch_passes_run_owned_maven_cache(self):
+        state = _capture_maven_subagent_state(
+            run_workaround_subagent_from_orchestrator,
+            "run_workaround_subagent_node",
+        )
+
+        assert state["project_language"] == ProjectLanguage.JAVA
+        assert state["maven_cache_volume"] == "agent_maven_repository_test"
 
 
 class TestWorkspaceBuilderNode:
@@ -265,6 +347,122 @@ class TestTeardownNode:
         assert result["changed_files"] == ["routes/login.ts"]
         assert "a/routes/login.ts" in result["diff"]
         assert "b/routes/login.ts" in result["diff"]
+
+    def test_teardown_removes_workspace_and_maven_cache_volumes(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["maven_cache_volume"] = "agent_maven_repository_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        volumes = {
+            state["workspace_volume"]: MagicMock(),
+            state["maven_cache_volume"]: MagicMock(),
+        }
+        client.volumes.get.side_effect = volumes.__getitem__
+
+        with patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ):
+            result = run_teardown_node(state)
+
+        assert client.volumes.get.call_args_list[0].args == ("agent_workspace_deadbeef",)
+        assert client.volumes.get.call_args_list[1].args == ("agent_maven_repository_deadbeef",)
+        for volume in volumes.values():
+            volume.remove.assert_called_once_with(force=True)
+        assert result["workspace_volume"] is None
+        assert result["maven_cache_volume"] is None
+
+    def test_teardown_reports_cache_failure_without_claiming_workspace_live(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["maven_cache_volume"] = "agent_maven_repository_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        workspace = MagicMock()
+        maven_cache = MagicMock()
+        maven_cache.remove.side_effect = RuntimeError("permission denied")
+        client.volumes.get.side_effect = {
+            state["workspace_volume"]: workspace,
+            state["maven_cache_volume"]: maven_cache,
+        }.__getitem__
+
+        with patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ):
+            result = run_teardown_node(state)
+
+        assert [call.args[0] for call in client.volumes.get.call_args_list] == [
+            "agent_workspace_deadbeef",
+            "agent_maven_repository_deadbeef",
+        ]
+        workspace.remove.assert_called_once_with(force=True)
+        maven_cache.remove.assert_called_once_with(force=True)
+        assert result["workspace_volume"] is None
+        assert result["maven_cache_volume"] == "agent_maven_repository_deadbeef"
+        assert result["status"] == "completed_with_errors"
+        assert any("failed to remove Maven cache volume" in error for error in result["errors"])
+
+    def test_teardown_still_removes_cache_when_workspace_removal_fails(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["maven_cache_volume"] = "agent_maven_repository_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        workspace = MagicMock()
+        workspace.remove.side_effect = RuntimeError("workspace volume locked")
+        maven_cache = MagicMock()
+        client.volumes.get.side_effect = {
+            state["workspace_volume"]: workspace,
+            state["maven_cache_volume"]: maven_cache,
+        }.__getitem__
+
+        with patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ):
+            result = run_teardown_node(state)
+
+        assert [call.args[0] for call in client.volumes.get.call_args_list] == [
+            "agent_workspace_deadbeef",
+            "agent_maven_repository_deadbeef",
+        ]
+        workspace.remove.assert_called_once_with(force=True)
+        maven_cache.remove.assert_called_once_with(force=True)
+        assert result["workspace_volume"] == "agent_workspace_deadbeef"
+        assert result["maven_cache_volume"] is None
+        assert any("failed to remove workspace volume" in error for error in result["errors"])
+
+    def test_unexpected_teardown_failure_still_cleans_both_volumes(self, tmp_path):
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["maven_cache_volume"] = "agent_maven_repository_deadbeef"
+        client = MagicMock()
+        client.containers.list.return_value = []
+        volumes = {
+            state["workspace_volume"]: MagicMock(),
+            state["maven_cache_volume"]: MagicMock(),
+        }
+        client.volumes.get.side_effect = volumes.__getitem__
+
+        with (
+            patch(
+                "remediation_engine.orchestration.supervisor_node.reconcile_phase5_state_before_teardown",
+                side_effect=RuntimeError("terminal graph failure"),
+            ),
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+        ):
+            result = run_teardown_node(state)
+
+        for volume in volumes.values():
+            volume.remove.assert_called_once_with(force=True)
+        assert result["workspace_volume"] is None
+        assert result["maven_cache_volume"] is None
+        assert any("terminal graph failure" in error for error in result["errors"])
 
     def test_changed_files_are_derived_from_actual_final_content(self, tmp_path):
         route_dir = tmp_path / "routes"

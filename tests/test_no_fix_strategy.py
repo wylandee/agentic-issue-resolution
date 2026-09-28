@@ -12,17 +12,22 @@ from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlan,
     FixPlanStatus,
+    IssueSource,
     IssueType,
+    LocalizedIssue,
     QAEvaluation,
     QAFailureEvidence,
+    QAPolicy,
     RemediationTask,
     RoutingStrategy,
     TaskStatus,
     VulnerabilityGroup,
+    VulnerabilityIssue,
     WorkaroundContext,
     WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
+from remediation_engine.orchestration._qa_runtime import _collect_group_package_state
 from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
 from remediation_engine.orchestration.supervisor_node import (
     _create_attempt_snapshot,
@@ -34,8 +39,10 @@ from remediation_engine.orchestration.supervisor_node import (
 from remediation_engine.orchestration.task_utils import (
     advance_no_fix_stage,
     build_initial_remediation_task,
+    build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
 )
+from remediation_engine.orchestration.tools_validation import _make_validate_workaround_tool
 from remediation_engine.orchestration.workaround_subagent import (
     _WORKAROUND_STATIC_INSTRUCTIONS,
     _build_workaround_prompt,
@@ -55,6 +62,39 @@ def _group() -> VulnerabilityGroup:
         fix_plan=FixPlan(
             status=FixPlanStatus.NO_FIX,
             instruction="No upstream patch or workaround was found. Inform the user.",
+            strategy_used="test",
+        ),
+    )
+
+
+def _maven_group() -> VulnerabilityGroup:
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        package_name="org.example:widget",
+        package_version="1.0",
+        purl="pkg:maven/org.example/widget@1.0",
+        ecosystem="maven",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="module/pom.xml",
+        package_manager="maven",
+        localization_confidence=1.0,
+    )
+    return VulnerabilityGroup(
+        group_id="maven:module/pom.xml:org.example:widget:NO_FIX",
+        issue_type=IssueType.SCA,
+        vulnerable_component="org.example:widget",
+        file_path="module/pom.xml",
+        file_paths=["module/pom.xml"],
+        versions=["1.0"],
+        representative_issue_id=str(issue.id),
+        issues=[issue],
+        localized_issues=[localized],
+        fix_plan=FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No fix is available.",
             strategy_used="test",
         ),
     )
@@ -124,6 +164,17 @@ def test_initial_and_non_no_fix_task_creation_are_distinct():
     )
     assert build_initial_remediation_task(version_group, "task-2").no_fix_stage is None
     assert build_initial_remediation_task(workaround_group, "task-3").no_fix_stage is None
+
+
+def test_no_fix_package_removal_instruction_is_package_manager_specific():
+    node_instruction = build_no_fix_package_removal_instruction(_group())
+    assert "package.json" in node_instruction
+    assert "lockfile" in node_instruction.lower()
+
+    maven_instruction = build_no_fix_package_removal_instruction(_maven_group())
+    assert "module/pom.xml" in maven_instruction
+    assert "remove_no_fix_dependency" in maven_instruction
+    assert "lockfile" not in maven_instruction.lower()
 
 
 def test_no_fix_stage_transitions_are_exact_and_ignore_terminal_retries():
@@ -288,6 +339,157 @@ class _PackageSandbox:
     def run(self, command: str, **_kwargs):
         self.commands.append(command)
         return self.sync_result
+
+
+def test_maven_qa_package_state_requires_exact_pom_and_dependency_tree_evidence():
+    pom_without_target = """<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId>
+  <artifactId>service</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.other</groupId>
+      <artifactId>widget</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    unrelated_tree = (
+        "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ service ---\n"
+        "[INFO] +- org.other:widget:jar:2.0:compile\n"
+    )
+    sandbox = _PackageSandbox({"module/pom.xml": pom_without_target})
+    sandbox.sync_result = CommandResult(
+        exit_code=0,
+        stdout=unrelated_tree,
+        stderr="",
+        duration_seconds=0,
+    )
+    absent = _collect_group_package_state(
+        sandbox,
+        _maven_group(),
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+    )
+    assert absent.manifest_state == "absent"
+    assert absent.graph_state == "absent"
+    assert sandbox.commands == ["cd module && mvn -B -DoutputType=text dependency:tree"]
+
+    sandbox.sync_result = CommandResult(
+        exit_code=0,
+        stdout=(
+            "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ service ---\n"
+            "[INFO] +- org.example:widget:jar:1.0:compile\n"
+        ),
+        stderr="",
+        duration_seconds=0,
+    )
+    resolved = _collect_group_package_state(
+        sandbox,
+        _maven_group(),
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+    )
+    assert resolved.manifest_state == "absent"
+    assert resolved.graph_state == "present"
+
+
+def test_maven_package_state_includes_authorized_version_property_pom():
+    base_group = _maven_group()
+    localized = base_group.localized_issues[0].model_copy(
+        update={"version_property_file": "parent/pom.xml"}
+    )
+    group = base_group.model_copy(update={"localized_issues": [localized]})
+    pom = "<project><groupId>org.example</groupId><artifactId>app</artifactId></project>"
+    sandbox = _PackageSandbox(
+        {
+            "module/pom.xml": pom,
+            "parent/pom.xml": pom,
+        }
+    )
+    sandbox.sync_result = CommandResult(
+        exit_code=0,
+        stdout=(
+            "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ service ---\n"
+            "[INFO] No dependencies\n"
+        ),
+        stderr="",
+        duration_seconds=0,
+    )
+
+    state = _collect_group_package_state(
+        sandbox,
+        group,
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+    )
+
+    assert state.manifest_state == "absent"
+    assert state.graph_state == "absent"
+    assert sandbox.commands == [
+        "cd module && mvn -B -DoutputType=text dependency:tree",
+        "cd parent && mvn -B -DoutputType=text dependency:tree",
+    ]
+
+
+def test_maven_qa_uncertainty_stays_unknown_and_direct_removal_is_checked():
+    tree = (
+        "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ service ---\n"
+        "[INFO] No dependencies\n"
+    )
+    malformed_sandbox = _PackageSandbox({"module/pom.xml": "<project"})
+    malformed_sandbox.sync_result = CommandResult(
+        exit_code=0,
+        stdout=tree,
+        stderr="",
+        duration_seconds=0,
+    )
+    malformed = _collect_group_package_state(
+        malformed_sandbox,
+        _maven_group(),
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+    )
+    assert malformed.manifest_state == "unknown"
+    assert malformed.graph_state == "unknown"
+
+    command_failure_sandbox = _PackageSandbox({"module/pom.xml": "<project/>"})
+    command_failure_sandbox.sync_result = CommandResult(
+        exit_code=1,
+        stdout=tree,
+        stderr="Maven failed",
+        duration_seconds=0,
+    )
+    command_failure = _collect_group_package_state(
+        command_failure_sandbox,
+        _maven_group(),
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+    )
+    assert command_failure.manifest_state == "absent"
+    assert command_failure.graph_state == "unknown"
+
+    remaining_pom = """<project>
+  <groupId>org.example</groupId><artifactId>service</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>widget</artifactId>
+      <version>1.0</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    validation_sandbox = _PackageSandbox({"module/pom.xml": remaining_pom})
+    plan_state = {
+        "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        "no_fix_package_manager": "maven",
+        "no_fix_package_name": "org.example:widget",
+        "no_fix_manifest_paths": ["module/pom.xml"],
+        "no_fix_package_files": ["module/pom.xml"],
+        "package_removal_planned": True,
+        "no_fix_package_removed": True,
+    }
+    validate = _make_validate_workaround_tool(validation_sandbox, set(), plan_state, [])
+    result = validate.invoke({"modified_files": ["module/pom.xml"]})
+    assert "[PACKAGE_REMOVAL]" in result
+    assert "org.example:widget remains" in result
 
 
 def _package_tool_map(sandbox, plan_state):

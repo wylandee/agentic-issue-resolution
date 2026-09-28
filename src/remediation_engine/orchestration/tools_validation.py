@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ._qa_runtime import _maven_direct_dependency_present
 from ._tool_support import (
     _LINT_CHECK_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
@@ -702,26 +703,72 @@ def _make_validate_workaround_tool(
                     code="PACKAGE_REMOVAL",
                 )
             package_name = str(plan_state.get("no_fix_package_name", "") or "")
-            for manifest_path in plan_state.get("no_fix_manifest_paths", []):
-                manifest_text = sandbox.read_file(manifest_path)
-                try:
-                    manifest_data = json.loads(manifest_text or "")
-                except (TypeError, json.JSONDecodeError):
+            package_manager = (
+                str(plan_state.get("no_fix_package_manager", "") or "").strip().lower()
+            )
+            if package_manager == "maven":
+                manifest_paths = list(plan_state.get("no_fix_manifest_paths", []) or [])
+                coordinates = package_name.split(":")
+                if len(coordinates) != 2 or not all(coordinates) or not manifest_paths:
                     return _invalid_validation_request(
-                        f"The authorized manifest could not be parsed after removal: {manifest_path}.",
+                        "Maven package removal requires an exact group:artifact target and "
+                        "at least one authorized pom.xml.",
                         level="FAILURE",
                         code="PACKAGE_REMOVAL",
                     )
-                if any(
-                    isinstance(manifest_data.get(dep_type), dict)
-                    and package_name in manifest_data[dep_type]
-                    for dep_type in ("dependencies", "devDependencies", "optionalDependencies")
-                ):
-                    return _invalid_validation_request(
-                        f"The vulnerable package remains in a direct declaration in {manifest_path}.",
-                        level="FAILURE",
-                        code="PACKAGE_REMOVAL",
-                    )
+                group_id, artifact_id = coordinates
+                for manifest_path in manifest_paths:
+                    if Path(manifest_path).name.casefold() != "pom.xml":
+                        return _invalid_validation_request(
+                            "The authorized Maven manifest path is not a pom.xml file: "
+                            f"{manifest_path}.",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
+                    try:
+                        manifest_text = sandbox.read_file(manifest_path)
+                        if not isinstance(manifest_text, str) or not manifest_text.strip():
+                            raise ValueError("authorized POM is unavailable")
+                        declaration_present = _maven_direct_dependency_present(
+                            manifest_text,
+                            group_id,
+                            artifact_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return _invalid_validation_request(
+                            f"The authorized POM could not be safely parsed after removal: "
+                            f"{manifest_path}: {exc}",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
+                    if declaration_present:
+                        return _invalid_validation_request(
+                            f"The exact Maven direct dependency {package_name} remains in "
+                            f"{manifest_path}.",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
+            else:
+                for manifest_path in plan_state.get("no_fix_manifest_paths", []):
+                    manifest_text = sandbox.read_file(manifest_path)
+                    try:
+                        manifest_data = json.loads(manifest_text or "")
+                    except (TypeError, json.JSONDecodeError):
+                        return _invalid_validation_request(
+                            f"The authorized manifest could not be parsed after removal: {manifest_path}.",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
+                    if any(
+                        isinstance(manifest_data.get(dep_type), dict)
+                        and package_name in manifest_data[dep_type]
+                        for dep_type in ("dependencies", "devDependencies", "optionalDependencies")
+                    ):
+                        return _invalid_validation_request(
+                            f"The vulnerable package remains in a direct declaration in {manifest_path}.",
+                            level="FAILURE",
+                            code="PACKAGE_REMOVAL",
+                        )
 
         accepted_alt = plan_state.get("accepted_alternative_test")
         test_file, target_selection_note, target_selection_error = _select_targeted_test_file(

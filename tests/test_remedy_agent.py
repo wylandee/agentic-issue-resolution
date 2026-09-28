@@ -16,14 +16,18 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    LocalizedIssue,
+    NoFixMitigationStage,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    SCARemediationStage,
     Severity,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.graph import post_qa_triage_node
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
@@ -32,6 +36,8 @@ from remediation_engine.orchestration.state import (
 from remediation_engine.orchestration.update_subagent import (
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
+    _candidate_manifest_paths,
+    _resolve_manifest_targets,
     run_update_subagent_node,
 )
 from remediation_engine.orchestration.workaround_subagent import (
@@ -76,6 +82,49 @@ def _sca_group(
             status=FixPlanStatus.VERSION_FOUND,
             fixed_version="4.17.21",
             instruction="Upgrade lodash to 4.17.21",
+            strategy_used="osv_api",
+        ),
+    )
+
+
+def _maven_group() -> VulnerabilityGroup:
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-0002",
+        package_name="org.example:library",
+        package_version="1.0.0",
+        purl="pkg:maven/org.example/library@1.0.0",
+        ecosystem="Maven",
+        file_path="modules/service/pom.xml",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="modules/service/pom.xml",
+        package_manager="maven",
+        is_direct_dependency=True,
+        declaration_type="dependencies",
+        version_property_name="library.version",
+        version_property_file="pom.xml",
+        localization_confidence=1.0,
+    )
+    return VulnerabilityGroup(
+        group_id="sca:modules/service/pom.xml:org.example:library",
+        issue_type=IssueType.SCA,
+        vulnerable_component="org.example:library",
+        file_path="modules/service/pom.xml",
+        file_paths=["modules/service/pom.xml"],
+        cve_ids=["CVE-2026-0002"],
+        versions=["1.0.0"],
+        sources=[IssueSource.ODC],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[localized],
+        fix_plan=FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="2.4.1",
+            instruction="Update org.example:library to the selected version.",
             strategy_used="osv_api",
         ),
     )
@@ -187,6 +236,68 @@ class TestUpdateSubagentWrapper:
         assert "read_repository_map" not in prompt
         assert "revert_workspace_file" not in prompt
         assert "validate_manifest_sync" not in prompt
+
+    def test_java_resolution_authorizes_exact_poms_and_prompts_for_maven_gav(self, tmp_path):
+        group = _maven_group()
+        (tmp_path / "pom.xml").write_text(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>"
+            "<artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>"
+            "<properties><library.version>1.0.0</library.version></properties>"
+            "<modules><module>modules/service</module></modules></project>",
+            encoding="utf-8",
+        )
+        module_dir = tmp_path / "modules" / "service"
+        module_dir.mkdir(parents=True)
+        (module_dir / "pom.xml").write_text(
+            "<project><modelVersion>4.0.0</modelVersion>"
+            "<parent><groupId>org.example</groupId><artifactId>parent</artifactId>"
+            "<version>1.0</version><relativePath>../../pom.xml</relativePath></parent>"
+            "<artifactId>service</artifactId><dependencies><dependency>"
+            "<groupId>org.example</groupId><artifactId>library</artifactId>"
+            "<version>${library.version}</version></dependency></dependencies></project>",
+            encoding="utf-8",
+        )
+        unrelated = tmp_path / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "pom.xml").write_text(
+            "<project><modelVersion>4.0.0</modelVersion><artifactId>unrelated</artifactId></project>",
+            encoding="utf-8",
+        )
+
+        candidates = _candidate_manifest_paths(group, ProjectLanguage.JAVA)
+        authorized, errors = _resolve_manifest_targets(
+            group,
+            tmp_path,
+            ProjectLanguage.JAVA,
+        )
+        task = RemediationTask(
+            task_id=group.group_id,
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            strategy_stage=SCARemediationStage.OSV_MINIMUM,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            target_package_name="org.example:library",
+            target_dependency_type="dependencies",
+            selected_version="2.4.1",
+            instruction="Upgrade only org.example:library to 2.4.1.",
+        )
+        prompt = _build_update_prompt(
+            [(task, group, authorized)],
+            [],
+            {},
+            {},
+            allowed_target_versions_by_task={task.task_id: ["2.4.1"]},
+            allowed_dependency_types_by_task={task.task_id: ["dependencies"]},
+            project_language=ProjectLanguage.JAVA,
+        )
+
+        assert "pom.xml" in candidates
+        assert authorized == ["modules/service/pom.xml", "pom.xml"]
+        assert errors == []
+        assert "modify_and_validate_maven_dependency" in prompt
+        assert "org.example:library" in prompt
+        assert "dependencies" in prompt
+        assert "unrelated/pom.xml" not in prompt
 
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
@@ -658,6 +769,34 @@ class TestUpdateSubagentWrapper:
         assert "WORKAROUND SNIPPETS" in prompt
         assert "Escape the user input before rendering." in prompt
         assert "Keep the change narrow." in prompt
+
+    def test_maven_no_fix_prompt_names_authorized_poms_without_lockfile_language(self):
+        group = _maven_group()
+        group.fix_plan = FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="Remove the committed Maven dependency if it is direct.",
+            strategy_used="test",
+        )
+        task = RemediationTask(
+            task_id=group.group_id,
+            parent_group_id=group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            qa_policy=QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            instruction="Remove the exact Maven GAV through the authorized transaction.",
+        )
+
+        prompt = _build_workaround_prompt(
+            task,
+            group,
+            project_language=ProjectLanguage.JAVA,
+            authorized_manifest_paths=["pom.xml", "modules/service/pom.xml"],
+        )
+
+        assert "remove_no_fix_dependency" in prompt
+        assert "pom.xml" in prompt
+        assert "org.example:library" in prompt
+        assert "lockfile" not in prompt.casefold()
 
     def test_success_requires_validation_after_code_edit(self):
         group = _sast_group()

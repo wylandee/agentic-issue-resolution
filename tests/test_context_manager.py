@@ -93,6 +93,43 @@ def test_scratchpad_entry_is_frozen_and_has_safe_defaults() -> None:
         )
 
 
+def test_maven_transaction_events_keep_exact_pom_and_gav_in_scratchpad() -> None:
+    memory = ScratchpadMemory()
+    memory.update_from_tool_event(
+        ToolEvent(
+            "modify_and_validate_maven_dependency",
+            {
+                "package_name": "org.example:library",
+                "target_version": "2.4.1",
+                "dependency_type": "dependencyManagement",
+                "manifest_path": "pom.xml",
+            },
+            "SUCCESS: Updated org.example:library and synchronized authorized POMs.",
+        ),
+        WorkaroundExecutionPhase.EXECUTE,
+        1,
+    )
+    memory.update_from_tool_event(
+        ToolEvent(
+            "remove_no_fix_dependency",
+            {
+                "requested_package": "org.example:library",
+                "manifest_path": "modules/service/pom.xml",
+            },
+            "SUCCESS: Removed direct Maven dependency org.example:library.",
+        ),
+        WorkaroundExecutionPhase.EXECUTE,
+        2,
+    )
+
+    rendered = memory.render()
+
+    assert "org.example:library" in rendered
+    assert "dependencyManagement" in rendered
+    assert "modules/service/pom.xml" in rendered
+    assert "Maven direct dependency removal" in rendered
+
+
 def test_qa_scratchpad_is_phase_free_and_retains_terminal_evidence() -> None:
     memory = ScratchpadMemory(ScratchpadScope.QA)
     memory.update_from_tool_event(

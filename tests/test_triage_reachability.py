@@ -8,6 +8,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.triage.reachability import analyze_reachability
 
 
@@ -130,3 +131,21 @@ def test_analyze_reachability_skips_symlinked_source_outside_repository(tmp_path
     analyze_reachability(groups, tmp_path)
 
     assert groups[0].is_reachable is False
+
+
+def test_java_maven_reachability_stays_unknown_without_javascript_analysis(monkeypatch, tmp_path):
+    group = _sca_group("org.example:widget")
+    group.issues[0].ecosystem = "maven"
+    group.issues[0].purl = "pkg:maven/org.example/widget@1.0"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Maven reachability must not inspect Java/Node source mappings")
+
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability._load_direct_dependencies", forbidden
+    )
+    monkeypatch.setattr("remediation_engine.triage.reachability._collect_global_imports", forbidden)
+
+    analyze_reachability([group], tmp_path, project_language=ProjectLanguage.JAVA)
+
+    assert group.is_reachable is None

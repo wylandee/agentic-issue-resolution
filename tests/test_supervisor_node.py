@@ -10,6 +10,7 @@ Tests have been updated to use the task-centric architecture:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -45,6 +46,7 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _authorize_update_dispatch,
@@ -52,6 +54,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _create_attempt_snapshot,
     _deterministic_routing,
     _materialize_spawn_requests,
+    _maven_attempt_target_paths,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
     _repair_invalid_planner_plans,
@@ -382,8 +385,8 @@ def test_ordered_update_candidates_excludes_attempted_versions_and_types():
     assert dependency_types == ["pnpm_overrides", "resolutions"]
 
 
-def test_create_attempt_snapshot_commits_update_candidate_allowlists():
-    """Candidate lists are captured in the immutable worker input snapshot."""
+def test_create_attempt_snapshot_commits_update_authorizations_and_target_poms():
+    """Candidate and Maven target paths are captured in the worker snapshot."""
     task = _make_task("task-1", "g1").model_copy(
         update={
             "instruction": "Update the committed dependency candidate.",
@@ -397,11 +400,36 @@ def test_create_attempt_snapshot_commits_update_candidate_allowlists():
         state_revision=3,
         allowed_target_versions=["1.2.3", "1.4.0", "1.2.3"],
         allowed_dependency_types=["dependencies", "devDependencies", "dependencies"],
+        target_manifest_paths=["modules\\widget\\pom.xml", "pom.xml", "modules/widget/pom.xml"],
     )
 
     assert committed.current_attempt_id == snapshot.attempt_id
     assert snapshot.allowed_target_versions == ["1.2.3", "1.4.0"]
     assert snapshot.allowed_dependency_types == ["dependencies", "devDependencies"]
+    assert snapshot.target_manifest_paths == ["modules/widget/pom.xml", "pom.xml"]
+
+
+def test_attempt_target_poms_include_only_localized_maven_manifests():
+    group = SimpleNamespace(
+        localized_issues=[
+            SimpleNamespace(
+                package_manager="maven",
+                manifest_file=r"modules\widget\pom.xml",
+                version_property_file="pom.xml",
+            ),
+            SimpleNamespace(
+                package_manager="npm",
+                manifest_file="package.json",
+                version_property_file=None,
+            ),
+        ]
+    )
+
+    assert _maven_attempt_target_paths(group, ProjectLanguage.JAVA) == [
+        "modules/widget/pom.xml",
+        "pom.xml",
+    ]
+    assert _maven_attempt_target_paths(group, ProjectLanguage.NODEJS) == []
 
 
 def test_update_dispatch_authorization_requires_committed_selected_candidate():

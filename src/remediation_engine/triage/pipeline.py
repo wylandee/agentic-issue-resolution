@@ -42,6 +42,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage, resolve_project_language
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.agent import run_triage
 from remediation_engine.triage.enrichment import enrich_cves
@@ -129,11 +130,19 @@ def _find_issue_by_id(
     return None
 
 
-def _fallback_localized_issue(issue: VulnerabilityIssue) -> LocalizedIssue:
-    """Build a minimal LocalizedIssue when repository localization is unavailable."""
+def _fallback_localized_issue(
+    issue: VulnerabilityIssue,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> LocalizedIssue:
+    """Build a minimal issue localization while retaining Maven fail-closed routing."""
+    is_maven = project_language == ProjectLanguage.JAVA and (
+        (issue.ecosystem or "").strip().lower() == "maven"
+        or (issue.purl or "").strip().lower().startswith("pkg:maven/")
+    )
     return LocalizedIssue(
         issue=issue,
-        manifest_file=issue.file_path,
+        manifest_file=None if is_maven else issue.file_path,
+        package_manager="maven" if is_maven else None,
         localization_confidence=0.0,
     )
 
@@ -170,15 +179,20 @@ def _run_enrichment(
 
 
 @traceable(name="triage.reachability", run_type="chain")
-def _run_reachability(groups: list[VulnerabilityGroup], repo_root: str) -> None:
-    """Annotate SCA groups with repository reachability evidence."""
-    analyze_reachability(groups, repo_root)
+def _run_reachability(
+    groups: list[VulnerabilityGroup],
+    repo_root: str,
+    project_language: ProjectLanguage,
+) -> None:
+    """Annotate SCA groups with deterministic reachability evidence."""
+    analyze_reachability(groups, repo_root, project_language=project_language)
 
 
 @traceable(name="triage.sca_localization_and_planning", run_type="chain")
 def _prepare_sca_issue_plans(
     sca_issues: list[VulnerabilityIssue],
     repo_root: str | None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[tuple[LocalizedIssue, FixPlan]]:
     """Locate and plan SCA issues before grouping."""
     if not sca_issues:
@@ -191,10 +205,12 @@ def _prepare_sca_issue_plans(
     issue_plans: list[tuple[LocalizedIssue, FixPlan]] = []
 
     for issue in sca_issues:
-        localized_issue = _fallback_localized_issue(issue)
+        localized_issue = _fallback_localized_issue(issue, project_language)
         if repo_path is not None:
             try:
-                localized_issue = locate_from_issue(issue, repo_path)
+                localized_issue = locate_from_issue(
+                    issue, repo_path, project_language=project_language
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "SCA localization failed for %s (%s); using fallback localization.",
@@ -255,7 +271,14 @@ def run_triage_pipeline(
     logger.info("Triage pipeline: processing %d issues.", len(issues))
 
     sca_issues = [issue for issue in issues if issue.issue_type == IssueType.SCA]
-    sca_issue_plans = _prepare_sca_issue_plans(sca_issues, repo_root)
+
+    primary_language = system_context.primary_language
+    project_language = (
+        resolve_project_language(Path(repo_root or "."), primary_language)
+        if primary_language is not None
+        else ProjectLanguage.NODEJS
+    )
+    sca_issue_plans = _prepare_sca_issue_plans(sca_issues, repo_root, project_language)
 
     # Step 1: Group after SCA locate + plan
     groups = _run_grouping(issues, sca_issue_plans)
@@ -285,7 +308,7 @@ def run_triage_pipeline(
 
     # Step 5: Reachability analysis for SCA groups (failure-safe)
     if repo_root and Path(repo_root).exists():
-        _run_reachability(groups, repo_root)
+        _run_reachability(groups, repo_root, project_language)
 
     # Step 6: Triage each group
     results: list[tuple[VulnerabilityGroup, TriageResult]] = []

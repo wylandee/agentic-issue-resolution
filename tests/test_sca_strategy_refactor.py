@@ -21,9 +21,11 @@ from remediation_engine.contracts import (
     TaskAttemptSnapshot,
     TaskStatus,
     UpdateRetryDiagnostics,
+    VulnerabilityGroup,
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.version_policy import select_version
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
@@ -556,6 +558,64 @@ def test_update_worker_records_failed_exact_version_attempts_without_selecting_n
 
     assert diagnostics.attempted_versions == ["5.0.0"]
     assert diagnostics.selected_version is None
+
+
+def test_java_initial_task_uses_exact_gav_and_only_maven_declaration_targets():
+    tasks = []
+    for declaration_type in ("dependencies", "dependencyManagement"):
+        issue = VulnerabilityIssue(
+            source=IssueSource.ODC,
+            issue_type=IssueType.SCA,
+            severity=Severity.HIGH,
+            package_name="org.example:library",
+            package_version="1.0.0",
+            purl="pkg:maven/org.example/library@1.0.0",
+            ecosystem="Maven",
+            cve_id="CVE-2026-0002",
+            file_path="modules/service/pom.xml",
+        )
+        localized = LocalizedIssue(
+            issue=issue,
+            manifest_file="modules/service/pom.xml",
+            package_manager="maven",
+            is_direct_dependency=declaration_type == "dependencies",
+            declaration_type=declaration_type,
+            localization_confidence=1.0,
+        )
+        group = VulnerabilityGroup(
+            group_id=f"maven:{declaration_type}:org.example:library",
+            issue_type=IssueType.SCA,
+            vulnerable_component="org.example:library",
+            file_path="modules/service/pom.xml",
+            file_paths=["modules/service/pom.xml"],
+            parent_package_name="org.example:parent",
+            parent_package_version="1.0.0",
+            parent_declaration_type="dependencies",
+            dependency_ancestry=["org.example:parent", "org.example:library"],
+            representative_issue_id=issue.id,
+            issues=[issue],
+            localized_issues=[localized],
+            fix_plan=_plan(FixPlanStatus.VERSION_FOUND, version="2.4.1"),
+        )
+        tasks.append(
+            build_initial_remediation_task(
+                group,
+                f"task-{declaration_type}",
+                project_language=ProjectLanguage.JAVA,
+            )
+        )
+
+    assert [task.target_package_name for task in tasks] == [
+        "org.example:library",
+        "org.example:library",
+    ]
+    assert [task.target_dependency_type for task in tasks] == [
+        "dependencies",
+        "dependencyManagement",
+    ]
+    assert all(task.strategy_stage == SCARemediationStage.OSV_MINIMUM for task in tasks)
+
+    assert all(task.parent_package_name is None for task in tasks)
 
 
 def test_supervisor_stage_progression_and_retry_cap():

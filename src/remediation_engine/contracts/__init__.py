@@ -88,7 +88,14 @@ from .schemas import (
     WorkerExecutionDiagnostics,
 )
 from .supervisor_phases import AuditRecord, EligibleActions, ReconciliationResult
-from .version_policy import RegistryCandidate, select_version
+from .version_policy import (
+    MavenRegistryCandidate,
+    RegistryCandidate,
+    compare_maven_versions,
+    is_stable_maven_version,
+    select_maven_version,
+    select_version,
+)
 
 __all__ = [
     "Severity",
@@ -170,6 +177,10 @@ __all__ = [
     # Task queue
     "TaskSpawnRequest",
     "RemediationTask",
+    "MavenRegistryCandidate",
+    "compare_maven_versions",
+    "is_stable_maven_version",
+    "select_maven_version",
     "RegistryCandidate",
     "select_version",
     "ReconciliationResult",

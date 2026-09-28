@@ -32,9 +32,16 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.orchestration.runtime_context import get_runtime_settings  # noqa: F401
 from remediation_engine.runtime.path_policy import (
     normalize_workspace_path,
+    repository_relative_path,
     resolve_repository_path,  # noqa: F401
 )  # noqa: F401
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.maven_manifest_locator import (
+    MavenManifestError,
+    find_dependency_in_pom,
+    locate_maven_manifests,
+    parse_pom_xml,
+)  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -498,21 +505,26 @@ def _workspace_dir_for_manifest(manifest_path: str) -> str:
     return f"/workspace/{parent}"
 
 
-def _normalize_manifest_targets(target_manifest_paths: Iterable[str]) -> list[str]:
-    """Return stable, validated ``package.json`` targets for one update task."""
+def _normalize_manifest_targets(
+    target_manifest_paths: Iterable[str],
+    allowed_manifest_names: Iterable[str] = ("package.json",),
+) -> list[str]:
+    """Return stable, validated paths with one of the explicitly allowed basenames."""
     manifest_paths = sorted(
         {_validate_workspace_path(path) for path in target_manifest_paths if path}
     )
-    invalid = [path for path in manifest_paths if Path(path).name != "package.json"]
+    allowed_names = {str(name).strip() for name in allowed_manifest_names if str(name).strip()}
+    invalid = [path for path in manifest_paths if Path(path).name not in allowed_names]
     if invalid:
         raise ValueError(
-            f"All target manifest paths must point to package.json files. Invalid values: {invalid}"
+            f"Target manifest paths must point to {sorted(allowed_names)} files. Invalid values: {invalid}"
         )
     return manifest_paths
 
 
 def _normalize_package_manifest_targets(
     package_manifest_paths: Mapping[str, Iterable[str]],
+    allowed_manifest_names: Iterable[str] = ("package.json",),
 ) -> dict[str, list[str]]:
     """Return validated package-to-manifest targets for update tasks."""
     normalized: dict[str, list[str]] = {}
@@ -520,8 +532,225 @@ def _normalize_package_manifest_targets(
         package_key = (package_name or "").strip()
         if not package_key:
             raise ValueError("Package manifest target keys must be non-empty.")
-        normalized[package_key] = _normalize_manifest_targets(manifest_paths)
+        normalized[package_key] = _normalize_manifest_targets(
+            manifest_paths,
+            allowed_manifest_names=allowed_manifest_names,
+        )
     return normalized
+
+
+def _resolve_maven_manifest_scope(
+    group: Any,
+    repo_root: Path,
+) -> tuple[list[str], list[str]]:
+    """Resolve exact Maven targets and only their in-repository reactor/parent scope."""
+    root = Path(repo_root).resolve()
+    coordinate = str(getattr(group, "vulnerable_component", "")).strip()
+    if not re.fullmatch(
+        r"[A-Za-z0-9_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_-]*)*:"
+        r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?\Z",
+        coordinate,
+    ):
+        return [], [
+            f"Group '{getattr(group, 'group_id', '')}': Maven target must be a "
+            "canonical group:artifact coordinate."
+        ]
+    group_id, artifact_id = coordinate.split(":", 1)
+
+    target_types: dict[str, set[str]] = {}
+    owner_paths: set[str] = set()
+    for localized in getattr(group, "localized_issues", ()) or ():
+        issue = getattr(localized, "issue", None)
+        is_maven = (
+            str(getattr(localized, "package_manager", "") or "").strip().lower() == "maven"
+            or str(getattr(issue, "ecosystem", "") or "").strip().lower() == "maven"
+            or str(getattr(issue, "purl", "") or "").strip().lower().startswith("pkg:maven/")
+        )
+        if not is_maven:
+            continue
+        path = str(getattr(localized, "manifest_file", "") or "")
+        path = path.replace("\\", "/").strip()
+        dependency_type = str(getattr(localized, "declaration_type", "") or "").strip()
+        if path:
+            target_types.setdefault(path, set()).add(dependency_type)
+        owner = str(getattr(localized, "version_property_file", "") or "")
+        owner = owner.replace("\\", "/").strip()
+        if owner:
+            owner_paths.add(owner)
+    if not target_types:
+        return [], [
+            f"Group '{getattr(group, 'group_id', '')}': no localized Maven POM target is available."
+        ]
+
+    errors: list[str] = []
+    target_rel_paths: set[str] = set()
+    owner_rel_paths: set[str] = set()
+
+    def contained_pom(value: str) -> str:
+        normalized = normalize_workspace_path(value, allow_workspace_prefix=False)
+        path = resolve_repository_path(root, normalized)
+        if path.name != "pom.xml" or path.is_dir() or not path.is_file():
+            raise ValueError(f"'{value}' is not an existing in-repository pom.xml")
+        rel = repository_relative_path(path, root)
+        if not rel:
+            raise ValueError(f"'{value}' is outside the repository")
+        return rel
+
+    for path, dependency_types in target_types.items():
+        try:
+            rel = contained_pom(path)
+            if not dependency_types or not dependency_types <= {
+                "dependencies",
+                "dependencyManagement",
+            }:
+                raise ValueError(
+                    "localized Maven target type must be dependencies or dependencyManagement"
+                )
+            target_rel_paths.add(rel)
+        except (OSError, ValueError) as exc:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': rejected Maven target '{path}': {exc}."
+            )
+    for path in owner_paths:
+        try:
+            owner_rel_paths.add(contained_pom(path))
+        except (OSError, ValueError) as exc:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': rejected Maven "
+                f"property owner '{path}': {exc}."
+            )
+    if errors or not target_rel_paths:
+        return [], errors
+
+    manifests: dict[str, Any] = {}
+    parse_errors: dict[str, str] = {}
+    for path in locate_maven_manifests(root):
+        rel = repository_relative_path(path, root)
+        if not rel:
+            continue
+        try:
+            manifests[rel] = parse_pom_xml(path)
+        except (MavenManifestError, OSError, ValueError) as exc:
+            parse_errors[rel] = str(exc)
+    for rel in sorted(target_rel_paths | owner_rel_paths):
+        if rel not in manifests:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': authorized Maven POM "
+                f"'{rel}' could not be parsed: "
+                f"{parse_errors.get(rel, 'POM was not discovered')}."
+            )
+    if errors:
+        return [], errors
+
+    for rel, dependency_types in target_types.items():
+        try:
+            target_rel = contained_pom(rel)
+            dependency = find_dependency_in_pom(
+                group_id,
+                artifact_id,
+                manifests[target_rel],
+            )
+        except (MavenManifestError, OSError, ValueError) as exc:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': ambiguous Maven target '{rel}': {exc}."
+            )
+            continue
+        if dependency is None or dependency.dependency_type not in dependency_types:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': POM '{rel}' "
+                "does not contain the exact "
+                f"{group_id}:{artifact_id} declaration at its authorized target type."
+            )
+    if errors:
+        return [], errors
+
+    module_children: dict[str, set[str]] = {}
+    reverse_edges: dict[str, set[str]] = {}
+    parent_of: dict[str, str] = {}
+    for rel, manifest in manifests.items():
+        if manifest.parent_path is not None:
+            parent_rel = repository_relative_path(manifest.parent_path, root)
+            if parent_rel:
+                parent_of[rel] = parent_rel
+                reverse_edges.setdefault(rel, set()).add(parent_rel)
+        children: set[str] = set()
+        for module in manifest.modules:
+            module_path = Path(module)
+            if module_path.is_absolute() or "\\" in module:
+                parse_errors[rel] = "unsafe Maven module path"
+                break
+            candidate = manifest.path.parent / module_path
+            if candidate.name != "pom.xml":
+                candidate = candidate / "pom.xml"
+            child_rel = repository_relative_path(candidate, root)
+            if not child_rel:
+                parse_errors[rel] = "Maven module escapes the repository"
+                break
+            try:
+                resolve_repository_path(root, child_rel)
+            except (OSError, ValueError) as exc:
+                parse_errors[rel] = str(exc)
+                break
+            children.add(child_rel)
+            reverse_edges.setdefault(child_rel, set()).add(rel)
+        if children:
+            module_children[rel] = children
+
+    ancestor_roots: set[str] = set()
+    for target in target_rel_paths:
+        ancestors = {target}
+        pending = [target]
+        while pending:
+            child = pending.pop()
+            for parent in reverse_edges.get(child, ()):
+                if parent not in ancestors:
+                    ancestors.add(parent)
+                    pending.append(parent)
+        topmost = {item for item in ancestors if not (reverse_edges.get(item, set()) & ancestors)}
+        if not topmost:
+            topmost = {target}
+        ancestor_roots.update(topmost)
+    if len(ancestor_roots) != 1:
+        return [], [
+            f"Group '{getattr(group, 'group_id', '')}': Maven targets do not resolve "
+            "to one deterministic in-repository reactor root."
+        ]
+    reactor_root = next(iter(ancestor_roots))
+
+    authorized: set[str] = set()
+    pending = [reactor_root]
+    while pending:
+        rel = pending.pop()
+        if rel in authorized:
+            continue
+        if rel not in manifests:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': reactor POM "
+                f"'{rel}' could not be parsed."
+            )
+            continue
+        if rel in parse_errors:
+            errors.append(
+                f"Group '{getattr(group, 'group_id', '')}': reactor POM "
+                f"'{rel}' has invalid module metadata."
+            )
+            continue
+        authorized.add(rel)
+        pending.extend(module_children.get(rel, ()))
+        parent = parent_of.get(rel)
+        if parent:
+            pending.append(parent)
+    if not owner_rel_paths <= authorized:
+        errors.append(
+            f"Group '{getattr(group, 'group_id', '')}': Maven property owner "
+            "is outside the authorized reactor/parent chain."
+        )
+    if not target_rel_paths <= authorized:
+        errors.append(
+            f"Group '{getattr(group, 'group_id', '')}': Maven target POM "
+            "is outside the authorized reactor/parent chain."
+        )
+    return ([], errors) if errors else (sorted(authorized), [])
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

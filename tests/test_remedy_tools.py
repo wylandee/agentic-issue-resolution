@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from remediation_engine.contracts.schemas import CommandResult
+import pytest
+
+from remediation_engine.contracts.schemas import CommandResult, NoFixMitigationStage
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
     _make_read_repository_map_tool,
@@ -83,6 +86,83 @@ class TestToolbeltFactories:
             "revert_workspace_file",
             "validate_workaround",
         }
+
+    def test_java_update_toolbelt_exposes_only_atomic_maven_pom_transaction(self):
+        sandbox = MagicMock()
+        tools = build_update_toolbelt(
+            sandbox,
+            set(),
+            ["pom.xml", "module/pom.xml"],
+            {"org.example:library": ["pom.xml", "module/pom.xml"]},
+            allowed_target_versions_by_package={"org.example:library": ["1.2.3"]},
+            allowed_dependency_types_by_package={
+                "org.example:library": ["dependencies", "dependencyManagement"]
+            },
+            project_language=ProjectLanguage.JAVA,
+        )
+
+        assert [tool.name for tool in tools] == ["modify_and_validate_maven_dependency"]
+        with pytest.raises(ValueError, match="pom.xml"):
+            build_update_toolbelt(
+                sandbox,
+                set(),
+                ["package.json"],
+                {"org.example:library": ["package.json"]},
+                project_language=ProjectLanguage.JAVA,
+            )
+
+    def test_java_no_fix_toolbelt_authorizes_only_poms_without_lockfiles(self):
+        sandbox = MagicMock()
+        plan_state = {"recorded": False}
+        tools = build_workaround_toolbelt(
+            sandbox,
+            set(),
+            Path("/dummy/repo/root"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="org.example:library",
+            no_fix_manifest_paths=["module/pom.xml", "pom.xml"],
+            no_fix_package_manager="maven",
+            project_language=ProjectLanguage.JAVA,
+        )
+
+        assert "remove_no_fix_dependency" in {tool.name for tool in tools}
+        assert plan_state["no_fix_package_files"] == ["module/pom.xml", "pom.xml"]
+
+    def test_java_no_fix_without_maven_evidence_does_not_default_to_npm(self):
+        sandbox = MagicMock()
+        plan_state = {}
+        tools = build_workaround_toolbelt(
+            sandbox,
+            set(),
+            Path("/dummy/repo/root"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="org.example:library",
+            no_fix_manifest_paths=["pom.xml"],
+            project_language=ProjectLanguage.JAVA,
+        )
+
+        assert plan_state["no_fix_package_manager"] == ""
+        assert plan_state["no_fix_manifest_paths"] == []
+        assert "remove_no_fix_dependency" not in {tool.name for tool in tools}
+
+    def test_node_no_fix_still_defaults_to_npm_package_removal(self):
+        sandbox = MagicMock()
+        plan_state = {}
+        tools = build_workaround_toolbelt(
+            sandbox,
+            set(),
+            Path("/dummy/repo/root"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="lodash",
+            no_fix_manifest_paths=["package.json"],
+        )
+
+        assert plan_state["no_fix_package_manager"] == "npm"
+        assert plan_state["no_fix_manifest_paths"] == ["package.json"]
+        assert "remove_no_fix_dependency" in {tool.name for tool in tools}
 
     def test_repository_map_supports_full_map_queries_and_paging(self):
         sandbox = MagicMock()

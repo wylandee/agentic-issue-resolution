@@ -8,7 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from remediation_engine.orchestration.graph import build_orchestrator_graph
+from remediation_engine.orchestration.report_context import PackageChange
+from remediation_engine.orchestration.report_diff import _package_changes
 from remediation_engine.orchestration.report_node import (
+    _package_attempt_text,
     finalize_report,
     generate_report,
     run_report_node,
@@ -1536,3 +1539,241 @@ def test_package_removal_attempt_includes_manifest_and_source_changes():
     assert "--- a/package.json" in follow_up
     assert "--- a/package-lock.json" in follow_up
     assert '-    "notevil": "^1.3.3",' in follow_up
+
+
+def _maven_report_state(
+    *,
+    no_fix: bool = False,
+    diff: str = "",
+    include_pom_baseline: bool = False,
+) -> dict:
+    """Build a committed Maven attempt fixture without external services."""
+    coordinate = "org.example:widget"
+    pom_path = "modules/widget/pom.xml"
+    issue = {
+        "package_name": coordinate,
+        "package_version": "1.0.0",
+        "severity": "high",
+        "source": "odc",
+        "ecosystem": "maven",
+        "purl": "pkg:maven/org.example/widget@1.0.0",
+    }
+    group = {
+        "group_id": "group-maven",
+        "vulnerable_component": coordinate,
+        "issue_type": "sca",
+        "sources": ["odc"],
+        "file_path": None,
+        "file_paths": [],
+        "issues": [issue],
+        "localized_issues": [
+            {
+                "issue": issue,
+                "package_manager": "maven",
+                "manifest_file": None,
+                "declaration_type": "dependencyManagement",
+                "version_property_name": "widget.version",
+                "version_property_file": None,
+            }
+        ],
+    }
+    task = {
+        "task_id": "task-maven",
+        "parent_group_id": "group-maven",
+        "parent_task_id": None,
+        "strategy": "CODE_WORKAROUND" if no_fix else "VERSION_BUMP",
+        "strategy_stage": "code_workaround" if no_fix else "maven_latest",
+        "status": "unfixable",
+        "target_package_name": coordinate,
+        "target_dependency_type": "dependencies" if no_fix else "dependencyManagement",
+        "no_fix_stage": "package_removal" if no_fix else None,
+        "qa_policy": "no_fix_package_removal" if no_fix else None,
+        "selected_version": None if no_fix else "1.2.0",
+    }
+    attempt = {
+        "attempt_id": "attempt-maven",
+        "task_id": "task-maven",
+        "target_package_name": coordinate,
+        "target_dependency_type": task["target_dependency_type"],
+        "selected_version": task["selected_version"],
+        "strategy": task["strategy"],
+        "no_fix_stage": task["no_fix_stage"],
+        "target_manifest_paths": [pom_path],
+        "instruction": (
+            f"Remove exact Maven coordinate {coordinate} from the authorized direct dependency;"
+            if no_fix
+            else f"Update {coordinate} through dependencyManagement."
+        ),
+    }
+    summary = {
+        "attempt_id": "attempt-maven",
+        "task_id": "task-maven",
+        "status": "surrender",
+        "summary": "Attempted a package removal."
+        if no_fix
+        else "Attempted a package version update.",
+        "changed_files": [pom_path],
+    }
+    worker_result = {
+        "attempt_id": "attempt-maven",
+        "task_id": "task-maven",
+        "status": "surrender",
+        "changed_files": [pom_path],
+    }
+    if include_pom_baseline:
+        worker_result["replay_plan"] = {
+            "pre_attempt_snapshots": {
+                pom_path: (
+                    "<project><dependencies><dependency>"
+                    "<groupId>org.example</groupId><artifactId>widget</artifactId>"
+                    "<version>1.0.0</version></dependency></dependencies></project>"
+                )
+            }
+        }
+
+    state = _state()
+    state.update(
+        {
+            "initial_valid_groups": [group],
+            "valid_groups": [group],
+            "task_queue": {"task-maven": task},
+            "action_summaries": [summary],
+            "attempt_snapshots_by_id": {"attempt-maven": attempt},
+            "worker_results_by_attempt": {"attempt-maven": worker_result},
+            "diff": diff,
+            "changed_files": [pom_path] if diff else [],
+        }
+    )
+    return state
+
+
+def test_maven_attempt_text_includes_every_changed_pom_path():
+    change = PackageChange(
+        name="org.example:widget",
+        old="1.0.0",
+        new="1.2.0",
+        file="pom.xml; modules/widget/pom.xml",
+        scope="direct",
+        section="dependencyManagement",
+    )
+
+    assert _package_attempt_text(change, "dependencyManagement") == (
+        "Updated org.example:widget 1.0.0 → 1.2.0 via dependencyManagement "
+        "in pom.xml, modules/widget/pom.xml."
+    )
+
+
+def test_maven_attempt_reports_committed_gav_target_and_pom_path():
+    """Maven attempt evidence uses the exact GAV, dependency target, and POM."""
+    pom_diff = (
+        "--- a/modules/widget/pom.xml\n"
+        "+++ b/modules/widget/pom.xml\n"
+        "@@ -1,3 +1,3 @@\n"
+        " <project><dependencies>\n"
+        "-<version>1.0.0</version>\n"
+        "+<version>1.2.0</version>\n"
+        " </dependencies></project>\n"
+    )
+    report = generate_report(_maven_report_state(diff=pom_diff))
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert (
+        "Updated org.example:widget 1.0.0 → 1.2.0 via dependencyManagement "
+        "in modules/widget/pom.xml."
+    ) in follow_up
+    assert "modules/widget/pom.xml" in follow_up
+    assert "widget.version" not in follow_up
+    assert (
+        _package_changes(
+            "--- a/pom.xml\n"
+            "+++ b/pom.xml\n"
+            "@@ -1,3 +1,3 @@\n"
+            " <description><![CDATA[\n"
+            '-  "widget": "1.0.0"\n'
+            '+  "widget": "1.2.0"\n'
+            " ]]></description>\n"
+        )
+        == []
+    )
+
+
+def test_maven_package_removal_uses_real_pom_diff_when_available():
+    """A committed Maven package removal renders its actual POM unified diff."""
+    pom_diff = (
+        "--- a/modules/widget/pom.xml\n"
+        "+++ b/modules/widget/pom.xml\n"
+        "@@ -1,7 +1,2 @@\n"
+        " <project><dependencies>\n"
+        "-  <dependency>\n"
+        "-    <groupId>org.example</groupId>\n"
+        "-    <artifactId>widget</artifactId>\n"
+        "-    <version>1.0.0</version>\n"
+        "-  </dependency>\n"
+        " </dependencies></project>\n"
+    )
+    state = _maven_report_state(no_fix=True, diff=pom_diff)
+    state["task_queue"]["task-maven"]["target_dependency_type"] = "dependencyManagement"
+    state["attempt_snapshots_by_id"]["attempt-maven"]["target_dependency_type"] = (
+        "dependencyManagement"
+    )
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "Removed org.example:widget from the dependency manifest." in follow_up
+    assert "```diff\n--- a/modules/widget/pom.xml" in follow_up
+    assert "-    <artifactId>widget</artifactId>" in follow_up
+    assert "@@ package removal:" not in follow_up
+
+
+def test_maven_package_removal_without_real_pom_diff_uses_generic_description():
+    """POM XML is not synthesized from a snapshot when no real diff is present."""
+    report = generate_report(_maven_report_state(no_fix=True, include_pom_baseline=True))
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "Removed org.example:widget from the dependency manifest." in follow_up
+    assert "--- a/modules/widget/pom.xml" not in follow_up
+    assert "@@ package removal:" not in follow_up
+
+
+def test_maven_package_removal_requires_committed_stage():
+    """Maven prose cannot authorize removal outside the committed removal stage."""
+    state = _maven_report_state(no_fix=True)
+    state["task_queue"]["task-maven"]["no_fix_stage"] = None
+    state["attempt_snapshots_by_id"]["attempt-maven"]["no_fix_stage"] = None
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert "Removed org.example:widget from the dependency manifest." not in follow_up
+    assert "--- a/modules/widget/pom.xml" not in follow_up
+
+
+def test_successful_maven_update_uses_committed_metadata_with_pom_diff():
+    """Maven POM changes retain exact GAV reporting despite XML parser exclusion."""
+    pom_diff = (
+        "--- a/modules/widget/pom.xml\n"
+        "+++ b/modules/widget/pom.xml\n"
+        "@@ -1,4 +1,4 @@\n"
+        "<project><dependencies>\n"
+        "-<version>1.0.0</version>\n"
+        "+<version>1.2.0</version>\n"
+        "</dependencies></project>\n"
+    )
+    state = _maven_report_state(diff=pom_diff)
+    state["task_queue"]["task-maven"]["status"] = "qa_passed"
+    state["action_summaries"][0]["status"] = "success"
+    state["worker_results_by_attempt"]["attempt-maven"]["status"] = "success"
+
+    report = generate_report(state)
+    successful = report.split("## 3. Successful Remediations", 1)[1].split("## 4. References", 1)[0]
+
+    assert "1.0.0 → 1.2.0 via dependencyManagement" in successful
+    assert "modules/widget/pom.xml" in successful

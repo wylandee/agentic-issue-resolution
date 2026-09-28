@@ -24,7 +24,12 @@ from remediation_engine.contracts.schemas import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
-from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
+)
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES, is_maven_group
 
 MAX_RETRIES: int = 3
 """Maximum number of QA-fail-retry cycles before a task is unfixable."""
@@ -39,15 +44,20 @@ _SEVERITY_RANK: dict[str, int] = {
 }
 
 
-def _normalise_security_floor(value: Any) -> tuple[str | None, tuple[int, int, int] | None]:
-    """Normalize one authoritative fixed-version value for comparison.
-
-    The Supervisor accepts only a complete stable semantic version as a
-    security floor.  Ranges, partial versions, prereleases, and prose are not
-    safe authorization data and therefore remain unresolved.
-    """
+def _normalise_security_floor(
+    value: Any,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+) -> tuple[str | None, Any]:
+    """Normalize one authoritative floor using the active ecosystem policy."""
     if value is None:
         return None, None
+    if project_language == ProjectLanguage.JAVA and maven_mode:
+        normalized = str(value).strip()
+        if not is_stable_maven_version(normalized):
+            return None, None
+        return normalized, normalized
     normalized = str(value).strip().lstrip("vV")
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", normalized)
     if match is None:
@@ -57,6 +67,8 @@ def _normalise_security_floor(value: Any) -> tuple[str | None, tuple[int, int, i
 
 def _canonical_security_floor(
     group: VulnerabilityGroup | None,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[str | None, str | None]:
     """Return the validated group security floor and any conflict reason.
 
@@ -80,24 +92,38 @@ def _canonical_security_floor(
     if fix_plan is not None and fix_plan.status != FixPlanStatus.VERSION_FOUND:
         return None, "the fix plan does not provide an authoritative fixed version"
 
+    maven_mode = is_maven_group(group, project_language)
     plan_floor, plan_key = _normalise_security_floor(
-        fix_plan.fixed_version if fix_plan is not None else None
+        fix_plan.fixed_version if fix_plan is not None else None,
+        project_language=project_language,
+        maven_mode=maven_mode,
     )
     if fix_plan is not None and fix_plan.fixed_version is not None and plan_floor is None:
-        return None, "the fix-plan fixed version is not a complete stable semver"
+        expected = "stable Maven version" if maven_mode else "complete stable semver"
+        return None, f"the fix-plan fixed version is not a {expected}"
 
-    member_values: list[tuple[str, tuple[int, int, int]]] = []
+    member_values: list[tuple[str, Any]] = []
     for issue in group.issues or []:
-        value, key = _normalise_security_floor(getattr(issue, "fixed_version", None))
+        value, key = _normalise_security_floor(
+            getattr(issue, "fixed_version", None),
+            project_language=project_language,
+            maven_mode=maven_mode,
+        )
         raw = getattr(issue, "fixed_version", None)
         if raw is None:
             continue
         if value is None or key is None:
-            return None, "a vulnerability fixed version is not a complete stable semver"
+            expected = "stable Maven version" if maven_mode else "complete stable semver"
+            return None, f"a vulnerability fixed version is not a {expected}"
         member_values.append((value, key))
 
+    def compare_keys(left: Any, right: Any) -> int:
+        if maven_mode:
+            return compare_maven_versions(left, right)
+        return (left > right) - (left < right)
+
     if plan_floor is not None and plan_key is not None:
-        conflicting = [value for value, key in member_values if key > plan_key]
+        conflicting = [value for value, key in member_values if compare_keys(key, plan_key) > 0]
         if conflicting:
             return (
                 None,
@@ -107,10 +133,11 @@ def _canonical_security_floor(
         return plan_floor, None
 
     if member_values:
-        # With no aggregate plan, use the highest corroborated member floor so
-        # every grouped finding is covered by one safe version.
-        _value, _key = max(member_values, key=lambda item: item[1])
-        return _value, None
+        highest_value, highest_key = member_values[0]
+        for value, key in member_values[1:]:
+            if compare_keys(key, highest_key) > 0:
+                highest_value, highest_key = value, key
+        return highest_value, None
     return None, "no authoritative security floor is available"
 
 
@@ -232,8 +259,15 @@ def _has_existing_workaround_child(
 def _next_sca_stage(
     stage: SCARemediationStage,
     transitive: bool = False,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
 ) -> SCARemediationStage:
-    """Advance one ordered SCA version strategy stage."""
+    """Advance one ordered SCA stage without changing the Node ladder."""
+    if project_language == ProjectLanguage.JAVA and maven_mode:
+        if stage == SCARemediationStage.OSV_MINIMUM:
+            return SCARemediationStage.MAVEN_LATEST
+        return SCARemediationStage.CODE_WORKAROUND
     if stage == SCARemediationStage.OSV_MINIMUM:
         return SCARemediationStage.NPM_SAME_MAJOR
     if stage == SCARemediationStage.NPM_SAME_MAJOR:
@@ -251,6 +285,8 @@ def _selection_for_stage(stage: SCARemediationStage) -> str | None:
         return "same_major"
     if stage == SCARemediationStage.NPM_LATEST:
         return "latest"
+    if stage == SCARemediationStage.MAVEN_LATEST:
+        return "maven_latest"
     return None
 
 

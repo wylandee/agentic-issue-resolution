@@ -47,6 +47,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
+from remediation_engine.language import ProjectLanguage, resolve_project_language
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
     normalize_workspace_path,
@@ -186,8 +187,12 @@ def normalize_group_paths(
         for localized in group.localized_issues or []:
             old = localized.manifest_file
             new = _repo_relative_path(old, repo_root)
+            old_property_file = localized.version_property_file
+            new_property_file = _repo_relative_path(old_property_file, repo_root)
             if old and old != new:
                 replacements[str(old)] = new or "unknown-manifest"
+            if old_property_file and old_property_file != new_property_file:
+                replacements[str(old_property_file)] = new_property_file or "unknown-property-owner"
             odc_file_path = (
                 repository_relative_path(
                     localized.issue.file_path
@@ -209,7 +214,10 @@ def normalize_group_paths(
                     localized.dependency_ancestry,
                     localized.dependency_versions,
                 )
-            localized_updates: dict[str, Any] = {"manifest_file": new}
+            localized_updates: dict[str, Any] = {
+                "manifest_file": new,
+                "version_property_file": new_property_file,
+            }
             if ancestry != localized.dependency_ancestry:
                 localized_updates.update(
                     {
@@ -311,6 +319,8 @@ class OrchestratorState(TypedDict, total=False):
     --------------------
     workspace_volume:
         Docker named volume shared across builder, remedy agent, and teardown.
+    maven_cache_volume:
+        Run-owned Maven repository volume, separate from the workspace.
 
     Supervisor memory / outputs
     ---------------------------
@@ -328,6 +338,7 @@ class OrchestratorState(TypedDict, total=False):
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
+    project_language: ProjectLanguage
 
     constraints_ledger: Annotated[list[str], operator.add]
     retry_counts: Annotated[dict[str, int], merge_dict_reducer]
@@ -357,6 +368,7 @@ class OrchestratorState(TypedDict, total=False):
     active_target_task_ids: list[str]
 
     workspace_volume: str | None
+    maven_cache_volume: str | None
 
     # Supervisor routing fields
     next_routing_step: str
@@ -404,6 +416,8 @@ class SubagentState(TypedDict, total=False):
 
     repo_root: str
     workspace_volume: str
+    project_language: ProjectLanguage
+    maven_cache_volume: str | None
 
     target_tasks: list[RemediationTask]
     target_groups: list[VulnerabilityGroup]
@@ -436,6 +450,10 @@ def initial_orchestrator_state(
 ) -> dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict."""
     valid_groups = normalize_group_paths(valid_groups, repo_root)
+    project_language = resolve_project_language(
+        Path(repo_root),
+        system_context.primary_language if system_context is not None else None,
+    )
     baseline_scan_identifiers = (
         _scan_identifiers_from_issues(issues)
         if issues is not None
@@ -467,6 +485,8 @@ def initial_orchestrator_state(
         "task_queue": {},
         "active_target_task_ids": [],
         "workspace_volume": None,
+        "maven_cache_volume": None,
+        "project_language": project_language,
         "status": "pending",
         "next_routing_step": "",
         "feedback_by_group": {},
@@ -516,6 +536,8 @@ def initial_update_subagent_state(
     retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot] | None = None,
     messages: Sequence[Any] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_cache_volume: str | None = None,
 ) -> dict[str, Any]:
     """Build the initial update-worker state from committed task inputs."""
     target_tasks_list = list(target_tasks)
@@ -548,6 +570,8 @@ def initial_update_subagent_state(
         "messages": list(messages or []),
         "changed_files": [],
         "errors": [],
+        "project_language": project_language,
+        "maven_cache_volume": maven_cache_volume,
     }
 
 
@@ -560,6 +584,8 @@ def initial_workaround_subagent_state(
     previous_feedback: str | None = None,
     attempt_snapshot: TaskAttemptSnapshot | None = None,
     current_replay_plan: WorkaroundReplayPlan | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_cache_volume: str | None = None,
 ) -> dict[str, Any]:
     """Build a well-formed single-task workaround ``SubagentState`` dict."""
     return {
@@ -571,6 +597,8 @@ def initial_workaround_subagent_state(
         "previous_feedback": previous_feedback,
         "attempt_snapshot": attempt_snapshot,
         "current_replay_plan": current_replay_plan,
+        "project_language": project_language,
+        "maven_cache_volume": maven_cache_volume,
         "messages": [],
         "changed_files": [],
         "errors": [],

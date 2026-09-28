@@ -11,9 +11,12 @@ from typing import Any
 from .report_context import PackageChange, _inline_code_text, _items, _text, _unique_texts, _value
 
 _PACKAGE_FILE_RE = re.compile(
-    r"(?:^|/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml)$",
+    r"(?:^|/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|"
+    r"pnpm-lock\.yaml|pom\.xml)$",
     re.IGNORECASE,
 )
+
+_POM_FILE_RE = re.compile(r"(?:^|/)pom\.xml$", re.IGNORECASE)
 
 _PACKAGE_LINE_RE = re.compile(r'^\s*"(?P<name>(?:@[^" ]+/)?[^" ]+)"\s*:\s*"(?P<version>[^"\n]+)"')
 
@@ -431,6 +434,10 @@ def _package_changes(diff: str) -> list[PackageChange]:
             lockfile_version_candidates.clear()
             continue
         if line.startswith("--- a/") or not _PACKAGE_FILE_RE.search(current_file):
+            continue
+        # POM XML is a package manifest, but it must never enter the npm
+        # JSON/lockfile line parser below.
+        if _POM_FILE_RE.search(current_file):
             continue
         prefix = line[:1]
         content = _diff_content(line)

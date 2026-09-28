@@ -18,7 +18,15 @@ from remediation_engine.contracts.schemas import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
-from remediation_engine.contracts.version_policy import select_version
+from remediation_engine.contracts.version_policy import (
+    MavenRegistryCandidate,
+    RegistryCandidate,
+    compare_maven_versions,
+    is_stable_maven_version,
+    select_maven_version,
+    select_version,
+)
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _canonical_security_floor,
@@ -27,8 +35,13 @@ from remediation_engine.orchestration.supervisor_policy import (
     _task_sort_key,
     instruction_digest,
 )
-from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
+from remediation_engine.orchestration.task_utils import (
+    group_parent_context,
+    is_maven_group,
+    is_transitive_group,
+)
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
+from remediation_engine.tools.maven_registry_tools import fetch_maven_registry_candidates
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -42,6 +55,7 @@ _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
     SCARemediationStage.NPM_LATEST: 2,
+    SCARemediationStage.MAVEN_LATEST: 1,
     SCARemediationStage.PACKAGE_OVERRIDE: 3,
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
@@ -53,32 +67,43 @@ def _supervisor_fetch_registry_candidates(
     package_name: str,
     security_floor: str,
     attempted_versions: set[str],
-) -> list[Any]:
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+) -> list[RegistryCandidate | MavenRegistryCandidate]:
     """Fetch registry candidates as a Supervisor-owned traced operation."""
     inputs = {
         "package_name": package_name,
         "security_floor": security_floor,
         "attempted_versions": attempted_versions,
+        "project_language": project_language.value,
     }
+
+    def fetch() -> list[RegistryCandidate | MavenRegistryCandidate]:
+        if project_language == ProjectLanguage.JAVA and maven_mode:
+            return fetch_maven_registry_candidates(
+                package_name,
+                security_floor,
+                attempted_versions,
+            )
+        return fetch_registry_candidates(package_name, security_floor, attempted_versions)
+
     return invoke_with_trajectory(
         "supervisor.fetch_registry_candidates",
-        lambda: fetch_registry_candidates(
-            package_name,
-            security_floor,
-            attempted_versions,
-        ),
+        fetch,
         inputs,
         run_type="tool",
     )
 
 
-def _normalise_candidate_version(value: Any) -> str:
-    """Normalize a registry version for immutable-pool comparisons."""
-    return str(value).strip().lstrip("vV")
+def _normalise_candidate_version(value: Any, *, maven_mode: bool = False) -> str:
+    """Normalize a registry version without rewriting Maven coordinates."""
+    normalized = str(value).strip()
+    return normalized if maven_mode else normalized.lstrip("vV")
 
 
 def _candidate_version_key(value: Any) -> tuple[int, int, int]:
-    """Return a stable semantic-version sort key for registry report values."""
+    """Return a stable semantic-version sort key for Node report values."""
     parts = _normalise_candidate_version(value).split(".")
     try:
         numbers = tuple(int(part) for part in parts)
@@ -91,14 +116,35 @@ def _select_report_candidate(
     values: Iterable[str],
     stage: SCARemediationStage,
     attempted_versions: set[str],
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
 ) -> str | None:
     """Select an approved report candidate without inventing a version."""
-    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
+    attempted = {
+        _normalise_candidate_version(version, maven_mode=maven_mode)
+        for version in attempted_versions
+    }
     eligible = [
-        _normalise_candidate_version(value)
+        _normalise_candidate_version(value, maven_mode=maven_mode)
         for value in values
-        if _normalise_candidate_version(value) not in attempted
+        if _normalise_candidate_version(value, maven_mode=maven_mode) not in attempted
     ]
+    if project_language == ProjectLanguage.JAVA and maven_mode:
+        eligible = [version for version in eligible if is_stable_maven_version(version)]
+        if not eligible:
+            return None
+        selected = eligible[0]
+        for version in eligible[1:]:
+            try:
+                comparison = compare_maven_versions(version, selected)
+            except ValueError:
+                continue
+            if (stage == SCARemediationStage.OSV_MINIMUM and comparison < 0) or (
+                stage == SCARemediationStage.MAVEN_LATEST and comparison > 0
+            ):
+                selected = version
+        return selected
     if not eligible:
         return None
     return (
@@ -111,6 +157,8 @@ def _select_report_candidate(
 def _approved_candidate_pool(
     diagnostics: UpdateRetryDiagnostics,
     target_package_name: str | None,
+    *,
+    maven_mode: bool = False,
 ) -> tuple[str, ...]:
     """Return the previously committed candidate pool for one target."""
     if (
@@ -121,9 +169,9 @@ def _approved_candidate_pool(
         return ()
     return tuple(
         dict.fromkeys(
-            _normalise_candidate_version(version)
+            _normalise_candidate_version(version, maven_mode=maven_mode)
             for version in diagnostics.candidate_versions_considered
-            if _normalise_candidate_version(version)
+            if _normalise_candidate_version(version, maven_mode=maven_mode)
         )
     )
 
@@ -133,20 +181,34 @@ def _fetch_registry_candidates_for_task(
     security_floor: str,
     attempted_versions: set[str],
     diagnostics: UpdateRetryDiagnostics,
-) -> list[Any]:
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+) -> list[RegistryCandidate | MavenRegistryCandidate]:
     """Revalidate only the task's committed candidate pool on retries."""
-    approved_pool = _approved_candidate_pool(diagnostics, package_name)
+    approved_pool = _approved_candidate_pool(
+        diagnostics,
+        package_name,
+        maven_mode=maven_mode,
+    )
     candidates = _supervisor_fetch_registry_candidates(
         package_name,
         security_floor,
         set() if approved_pool else attempted_versions,
+        project_language=project_language,
+        maven_mode=maven_mode,
     )
     if not approved_pool:
         return candidates
+    approved = set(approved_pool)
     return [
         candidate
         for candidate in candidates
-        if _normalise_candidate_version(getattr(candidate, "version", "")) in set(approved_pool)
+        if _normalise_candidate_version(
+            getattr(candidate, "version", ""),
+            maven_mode=maven_mode,
+        )
+        in approved
     ]
 
 
@@ -186,6 +248,8 @@ def _build_high_level_retry_instruction(
     group: VulnerabilityGroup | None,
     evaluation: QAEvaluation | None,
     diagnostics: UpdateRetryDiagnostics | None,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
     """Synthesize a high-level retry instruction for the update worker."""
     component = group.vulnerable_component if group else task.parent_group_id
@@ -199,6 +263,52 @@ def _build_high_level_retry_instruction(
     dependency_type = task.target_dependency_type or parent_type
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         dependency_type = dependency_type or "overrides"
+    maven_target = is_maven_group(group, project_language)
+    if maven_target:
+        exact_gav = task.target_package_name or component
+        pom_path = next(
+            (
+                localized.manifest_file
+                for localized in group.localized_issues
+                if localized.manifest_file
+                and (
+                    (localized.package_manager or "").strip().lower() == "maven"
+                    or str(getattr(localized.issue, "purl", "") or "")
+                    .strip()
+                    .lower()
+                    .startswith("pkg:maven/")
+                )
+            ),
+            None,
+        )
+        target_type = task.target_dependency_type or "dependencyManagement"
+        if diagnostics and diagnostics.selected_version:
+            if not pom_path:
+                return (
+                    f"No authorized POM is available for exact Maven coordinate {exact_gav}; "
+                    "do not select or edit a release."
+                )
+            return (
+                f'For exact Maven GAV "{exact_gav}", use only Supervisor-selected Maven Central '
+                f'version "{diagnostics.selected_version}". The committed edit target is '
+                f'"{target_type}" in authorized POM "{pom_path}". Invoke '
+                "modify_and_validate_maven_dependency with "
+                f'package_name="{exact_gav}", target_version="{diagnostics.selected_version}", '
+                f'dependency_type="{target_type}", manifest_path="{pom_path}". '
+                "The OSV fixed value is only a security floor. Do not guess a parent version, "
+                "choose a release from web/LLM text, or mutate a parent POM or BOM."
+            )
+        if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND:
+            return (
+                f"Implement a code workaround for exact Maven GAV {exact_gav}; do not change "
+                "a parent POM, BOM, or dependency version."
+            )
+        floor = group.fix_plan.fixed_version if group and group.fix_plan else "the OSV floor"
+        return (
+            f"For exact Maven GAV {exact_gav}, the OSV fixed value {floor} is a security floor "
+            "only. Wait for a Supervisor-approved Maven Central candidate and edit only the "
+            "authorized POM target; do not guess a release, parent version, or mutate a BOM."
+        )
     category = evaluation.failure_category if evaluation else None
     if diagnostics and diagnostics.selected_version:
         manifest = group.file_paths[0] if group and group.file_paths else "package.json"
@@ -439,6 +549,7 @@ def _repair_invalid_planner_plans(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
     violations: list[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Apply a deterministic, fail-closed repair after corrective replanning.
 
@@ -461,14 +572,121 @@ def _repair_invalid_planner_plans(
             continue
         diagnostics = repaired_diagnostics.get(task_id)
         attempted = {
-            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
+            version.strip().lstrip("vV").lower()
+            for version in (diagnostics.attempted_versions if diagnostics else [])
+            if version
         }
-        if diagnostics is not None:
-            attempted.update(
-                version.strip().lstrip("vV").lower()
-                for version in diagnostics.attempted_versions
-                if version
+        group = group_by_id.get(task_queue[task_id].parent_group_id)
+        if is_maven_group(group, project_language) and group is not None:
+            if diagnostics is None:
+                diagnostics = UpdateRetryDiagnostics(task_id=task_id)
+            target_package = group.vulnerable_component or task_queue[task_id].target_package_name
+            target_type = _maven_dependency_type(task_queue[task_id], group)
+            floor, _floor_error = _canonical_security_floor(
+                group,
+                project_language=project_language,
             )
+            approved = tuple(
+                dict.fromkeys(
+                    diagnostics.candidate_versions_considered or plan.candidate_versions_considered
+                )
+            )
+            attempted_maven = set(diagnostics.attempted_versions)
+            stage = plan.strategy_stage
+            selected = None
+            if (
+                floor
+                and target_package
+                and stage
+                in {
+                    SCARemediationStage.OSV_MINIMUM,
+                    SCARemediationStage.MAVEN_LATEST,
+                }
+            ):
+                pool = [
+                    version
+                    for version in approved
+                    if is_stable_maven_version(version)
+                    and not any(
+                        compare_maven_versions(version, attempted) == 0
+                        for attempted in attempted_maven
+                        if is_stable_maven_version(attempted)
+                    )
+                    and compare_maven_versions(version, floor) >= 0
+                ]
+                if stage == SCARemediationStage.MAVEN_LATEST:
+                    latest = plan.latest_version_seen or diagnostics.latest_version_seen
+                    if latest in approved and latest in pool:
+                        selected = latest
+                elif pool:
+                    selected = _select_report_candidate(
+                        pool,
+                        SCARemediationStage.OSV_MINIMUM,
+                        attempted_maven,
+                        project_language=project_language,
+                        maven_mode=True,
+                    )
+                if selected is None and stage == SCARemediationStage.OSV_MINIMUM:
+                    latest = plan.latest_version_seen or diagnostics.latest_version_seen
+                    if latest in approved and latest in pool:
+                        selected = latest
+                        stage = SCARemediationStage.MAVEN_LATEST
+            exhausted = selected is None
+            if exhausted:
+                stage = (
+                    SCARemediationStage.CODE_WORKAROUND
+                    if plan.strategy_stage == SCARemediationStage.CODE_WORKAROUND
+                    else SCARemediationStage.MAVEN_LATEST
+                )
+            diagnostics = diagnostics.model_copy(
+                update={
+                    "strategy_stage": stage,
+                    "selected_version": selected,
+                    "candidate_versions_considered": list(approved),
+                    "candidate_dependency_types": [target_type],
+                    "target_package_name": target_package,
+                    "target_dependency_type": target_type,
+                    "security_floor": floor,
+                    "exhausted_update_path": exhausted,
+                    "parent_package_name": None,
+                    "parent_minimum_version": None,
+                }
+            )
+            repaired_diagnostics[task_id] = diagnostics
+            if exhausted:
+                instruction = (
+                    f"No approved unattempted Maven Central release remains for exact GAV "
+                    f"{target_package}; implement a code workaround without changing a parent POM or BOM."
+                )
+            else:
+                instruction = _build_high_level_retry_instruction(
+                    task_queue[task_id].model_copy(
+                        update={
+                            "strategy_stage": stage,
+                            "target_package_name": target_package,
+                            "target_dependency_type": target_type,
+                        }
+                    ),
+                    group,
+                    None,
+                    diagnostics,
+                    project_language=project_language,
+                )
+            repaired_plans[task_id] = plan.model_copy(
+                update={
+                    "strategy_stage": stage,
+                    "selected_version": selected,
+                    "candidate_versions_considered": list(approved),
+                    "candidate_dependency_types": [target_type],
+                    "exhausted_update_path": exhausted,
+                    "action": "pivot_workaround" if exhausted else "retry_update",
+                    "exact_instruction": instruction,
+                    "target_package_name": target_package,
+                    "target_dependency_type": target_type,
+                    "parent_minimum_version": None,
+                }
+            )
+            continue
 
         candidate = None
         plan_regresses = (
@@ -649,12 +867,166 @@ def _repair_invalid_planner_plans(
     return repaired_diagnostics, repaired_plans
 
 
+def _maven_dependency_type(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+) -> str:
+    """Return only the localized Maven declaration edit target."""
+    if task.target_dependency_type in {"dependencies", "dependencyManagement"}:
+        return task.target_dependency_type
+    for localized in group.localized_issues:
+        if localized.declaration_type in {"dependencies", "dependencyManagement"}:
+            return localized.declaration_type
+    return "dependencyManagement"
+
+
+def _build_maven_retry_plan(
+    task: RemediationTask,
+    diagnostics: UpdateRetryDiagnostics,
+    group: VulnerabilityGroup,
+    *,
+    requested_stage: SCARemediationStage | None,
+) -> SupervisorRetryPlan:
+    """Build an exact-GAV Maven plan without entering npm parent/override paths."""
+    requested = requested_stage or task.strategy_stage
+    effective_stage = (
+        requested
+        if _SCA_STAGE_ORDER.get(requested, 99) >= _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
+        else task.strategy_stage
+    )
+    exact_gav = group.vulnerable_component or task.target_package_name or ""
+    dependency_type = _maven_dependency_type(task, group)
+    security_floor, floor_error = _canonical_security_floor(
+        group,
+        project_language=ProjectLanguage.JAVA,
+    )
+    attempted = set(diagnostics.attempted_versions)
+    candidate_versions: list[str] = []
+    latest_version_seen: str | None = None
+    selected_version: str | None = None
+    failure_reason = floor_error or ""
+    registry_ran = False
+
+    if (
+        effective_stage
+        in {
+            SCARemediationStage.OSV_MINIMUM,
+            SCARemediationStage.MAVEN_LATEST,
+        }
+        and security_floor
+        and exact_gav
+    ):
+        registry_ran = True
+        try:
+            candidates = _fetch_registry_candidates_for_task(
+                exact_gav,
+                security_floor,
+                attempted,
+                diagnostics,
+                project_language=ProjectLanguage.JAVA,
+                maven_mode=True,
+            )
+            candidate_versions = [candidate.version for candidate in candidates]
+            latest_version_seen = next(
+                (
+                    candidate.version
+                    for candidate in candidates
+                    if "maven_latest" in candidate.selection_roles
+                ),
+                None,
+            )
+            selected_version = select_maven_version(
+                candidates,
+                effective_stage,
+                attempted,
+            )
+            if selected_version is None and not failure_reason:
+                failure_reason = (
+                    "No eligible unattempted Maven candidate has the role required "
+                    f"for stage {effective_stage.value}."
+                )
+        except Exception as exc:  # noqa: BLE001
+            failure_reason = f"Deterministic Maven Central planning failed: {exc}"
+
+    approved_pool = _approved_candidate_pool(
+        diagnostics,
+        exact_gav,
+        maven_mode=True,
+    )
+    provenance_versions = list(dict.fromkeys(approved_pool or candidate_versions))
+    if selected_version and selected_version not in set(provenance_versions):
+        selected_version = None
+        failure_reason = "Selected Maven version is outside the committed candidate whitelist."
+    exhausted = selected_version is None and effective_stage in {
+        SCARemediationStage.MAVEN_LATEST,
+        SCARemediationStage.CODE_WORKAROUND,
+    }
+    effective_task = task.model_copy(
+        update={
+            "strategy_stage": effective_stage,
+            "selected_version": selected_version,
+            "target_package_name": exact_gav,
+            "target_dependency_type": dependency_type,
+            "parent_package_name": None,
+            "parent_package_version": None,
+            "parent_minimum_version": None,
+        }
+    )
+    effective_diagnostics = diagnostics.model_copy(
+        update={
+            "strategy_stage": effective_stage,
+            "candidate_versions_considered": provenance_versions,
+            "selected_version": selected_version,
+            "latest_version_seen": latest_version_seen,
+            "registry_query_performed": registry_ran,
+            "exhausted_update_path": exhausted,
+            "target_package_name": exact_gav,
+            "target_dependency_type": dependency_type,
+            "candidate_dependency_types": [dependency_type],
+            "parent_package_name": None,
+            "parent_minimum_version": None,
+            "failure_reason": failure_reason,
+        }
+    )
+    if exhausted:
+        instruction = (
+            f"No eligible Maven Central candidate remains for exact GAV {exact_gav}; "
+            "implement a code workaround without changing a parent POM or BOM."
+        )
+    else:
+        instruction = _build_high_level_retry_instruction(
+            effective_task,
+            group,
+            None,
+            effective_diagnostics,
+            project_language=ProjectLanguage.JAVA,
+        )
+    return SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=effective_stage,
+        selected_version=selected_version,
+        attempted_versions=list(diagnostics.attempted_versions),
+        candidate_versions_considered=provenance_versions,
+        candidate_dependency_types=[dependency_type],
+        latest_version_seen=latest_version_seen,
+        exhausted_update_path=exhausted,
+        package_abandoned=diagnostics.package_abandoned,
+        target_package_name=exact_gav,
+        target_dependency_type=dependency_type,
+        parent_minimum_version=None,
+        action="pivot_workaround" if exhausted else "retry_update",
+        exact_instruction=instruction,
+    )
+
+
 def _build_deterministic_retry_plan(
     task: RemediationTask,
     diagnostics: UpdateRetryDiagnostics,
     group: VulnerabilityGroup | None,
     *,
     requested_stage: SCARemediationStage | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> SupervisorRetryPlan:
     """Build an exact retry plan from committed state and registry facts.
 
@@ -663,12 +1035,22 @@ def _build_deterministic_retry_plan(
     never skips an empty stage, regresses, reuses an attempted version, or
     turns an exhausted update path back into an update retry.
     """
+    if is_maven_group(group, project_language) and group is not None:
+        return _build_maven_retry_plan(
+            task,
+            diagnostics,
+            group,
+            requested_stage=requested_stage,
+        )
     requested = requested_stage or task.strategy_stage
     requested_order = _SCA_STAGE_ORDER.get(requested, 99)
     current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
     effective_stage = requested if requested_order >= current_order else task.strategy_stage
     attempted = set(diagnostics.attempted_versions)
-    security_floor, floor_error = _canonical_security_floor(group)
+    security_floor, floor_error = _canonical_security_floor(
+        group,
+        project_language=project_language,
+    )
     transitive = bool(group and is_transitive_group(group))
     candidate_versions: list[str] = []
     latest_version_seen: str | None = None
@@ -931,6 +1313,7 @@ def _needs_planner(
                     SCARemediationStage.OSV_MINIMUM,
                     SCARemediationStage.NPM_SAME_MAJOR,
                     SCARemediationStage.NPM_LATEST,
+                    SCARemediationStage.MAVEN_LATEST,
                 }
                 or (
                     t.strategy_stage == SCARemediationStage.CODE_WORKAROUND
@@ -959,6 +1342,7 @@ def _run_deterministic_retry_planner(
     *,
     advance_failed_stage: bool = False,
     target_task_ids: Iterable[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Plan retries from state and registry facts.
 
@@ -984,6 +1368,7 @@ def _run_deterministic_retry_planner(
                 SCARemediationStage.OSV_MINIMUM,
                 SCARemediationStage.NPM_SAME_MAJOR,
                 SCARemediationStage.NPM_LATEST,
+                SCARemediationStage.MAVEN_LATEST,
                 SCARemediationStage.CODE_WORKAROUND,
             }
         ),
@@ -999,17 +1384,21 @@ def _run_deterministic_retry_planner(
         if _is_exhausted_update_pivot_candidate(task, diagnostics):
             continue
         group = group_by_id.get(task.parent_group_id)
+        maven_mode = is_maven_group(group, project_language)
         requested_stage = None
         if advance_failed_stage:
             requested_stage = _next_sca_stage(
                 task.strategy_stage,
                 transitive=bool(group and is_transitive_group(group)),
+                project_language=project_language,
+                maven_mode=is_maven_group(group, project_language),
             )
         plan = _build_deterministic_retry_plan(
             task,
             diagnostics,
             group,
             requested_stage=requested_stage,
+            project_language=project_language,
         )
         # An empty stage is deterministic evidence to advance to the next
         # bounded stage, not a request for the worker to inspect the registry.
@@ -1017,18 +1406,33 @@ def _run_deterministic_retry_planner(
         # an exact unattempted version, or with the terminal update pivot.
         while plan.selected_version is None and not plan.exhausted_update_path:
             transitive = bool(group and is_transitive_group(group))
-            next_stage = _next_sca_stage(plan.strategy_stage, transitive=transitive)
+            maven_mode = is_maven_group(group, project_language)
+            next_stage = _next_sca_stage(
+                plan.strategy_stage,
+                transitive=transitive,
+                project_language=project_language,
+                maven_mode=maven_mode,
+            )
             if next_stage == SCARemediationStage.CODE_WORKAROUND:
                 break
             if _SCA_STAGE_ORDER.get(next_stage, 99) <= _SCA_STAGE_ORDER.get(
                 plan.strategy_stage, 99
             ):
                 break
+            if maven_mode:
+                diagnostics = diagnostics.model_copy(
+                    update={
+                        "candidate_versions_considered": plan.candidate_versions_considered,
+                        "target_package_name": plan.target_package_name,
+                        "target_dependency_type": plan.target_dependency_type,
+                    }
+                )
             plan = _build_deterministic_retry_plan(
                 task,
                 diagnostics,
                 group,
                 requested_stage=next_stage,
+                project_language=project_language,
             )
 
         if plan.selected_version is None and not plan.exhausted_update_path:
@@ -1039,7 +1443,11 @@ def _run_deterministic_retry_planner(
             component = group.vulnerable_component if group else task.parent_group_id
             plan = plan.model_copy(
                 update={
-                    "strategy_stage": SCARemediationStage.NPM_LATEST,
+                    "strategy_stage": (
+                        SCARemediationStage.MAVEN_LATEST
+                        if maven_mode
+                        else SCARemediationStage.NPM_LATEST
+                    ),
                     "selected_version": None,
                     "exhausted_update_path": True,
                     "action": "pivot_workaround",

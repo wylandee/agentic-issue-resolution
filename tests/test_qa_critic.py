@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     TaskStatus,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.qa_critic import run_qa_critic_node
 from remediation_engine.orchestration.qa_evaluator import GroupInvestigation
 from remediation_engine.orchestration.qa_types import (
@@ -150,6 +151,28 @@ class TestRunQACriticNode:
         assert result["qa_evaluations"]["task-1"].passed is True
         report = json.loads(result["qa_investigation_report"])
         assert report["evaluations"]["task-1"]["passed"] is True
+
+    def test_java_qa_uses_maven_image_and_run_owned_cache(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        state["project_language"] = ProjectLanguage.JAVA
+        state["maven_cache_volume"] = "agent_maven_repository_test"
+        patches = self._patch_node(group=group)
+
+        with (
+            patches["sandbox"] as sandbox_type,
+            patches["global_exec"],
+            patches["investigators"],
+        ):
+            result = run_qa_critic_node(state)
+
+        sandbox_type.assert_called_once_with(
+            repo_root=None,
+            workspace_volume="test-vol",
+            image="maven:3.9-eclipse-temurin-17",
+            maven_repository_volume="agent_maven_repository_test",
+        )
+        assert result["status"] == "qa_completed"
 
     def test_package_removal_node_skips_only_security_scan(self):
         group = _make_group(fix_plan_status=FixPlanStatus.NO_FIX)

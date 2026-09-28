@@ -1063,3 +1063,148 @@ class TestOsvAliasAndExtractedEvents:
             fixed, snippets = _query_osv_fixed_version(issue)
             assert fixed == "4.0.8"
             assert snippets is None
+
+
+def _make_maven_localized(**localized_overrides) -> LocalizedIssue:
+    issue = _make_vuln_issue(
+        package_name="org.example:widget",
+        package_version="1.2",
+        purl="pkg:maven/org.example/widget@1.2",
+        ecosystem="maven",
+    )
+    defaults = {
+        "manifest_file": "service/pom.xml",
+        "is_direct_dependency": True,
+        "package_manager": "maven",
+        "declaration_type": "dependencies",
+        "localization_confidence": 0.95,
+    }
+    defaults.update(localized_overrides)
+    return LocalizedIssue(issue=issue, **defaults)
+
+
+def test_maven_instruction_names_exact_gav_authorized_pom_and_target():
+    instruction = _build_instruction(
+        "org.example:widget",
+        "2.0",
+        "maven",
+        True,
+        "service/pom.xml",
+        declaration_type="dependencyManagement",
+    )
+
+    assert "org.example:widget" in instruction
+    assert "service/pom.xml" in instruction
+    assert "dependencyManagement" in instruction
+    assert "package.json" not in instruction
+    assert "npm" not in instruction.lower()
+    assert "override" not in instruction.lower()
+
+
+def test_maven_without_authorized_pom_is_explicit_no_fix_without_npm_targets():
+    with (
+        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.fix_planner._serper_search_and_extract") as serper,
+    ):
+        plan = plan_fix(_make_maven_localized(manifest_file=None))
+
+    assert plan["status"] == FixPlanStatus.NO_FIX.value
+    assert "authorized Maven POM" in plan["instruction"]
+    assert "package.json" not in plan["instruction"]
+    assert "npm" not in plan["instruction"].lower()
+    assert "override" not in plan["instruction"].lower()
+    osv.assert_not_called()
+    serper.assert_not_called()
+
+
+def test_maven_serper_version_bump_is_not_authorized():
+    with (
+        patch(
+            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            return_value=(None, None),
+        ),
+        patch(
+            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            return_value={"strategy": "VERSION_BUMP", "fixed_version": "99.0"},
+        ),
+    ):
+        plan = plan_fix(_make_maven_localized())
+
+    assert plan["status"] == FixPlanStatus.NO_FIX.value
+    assert plan["fixed_version"] is None
+    assert "99.0" not in plan["instruction"]
+
+
+def test_maven_osv_fixed_events_use_comparable_version_order():
+    vuln = {
+        "affected": [
+            {
+                "package": {"name": "org.example:widget", "ecosystem": "Maven"},
+                "ranges": [
+                    {
+                        "type": "ECOSYSTEM",
+                        "events": [{"fixed": "2.10"}, {"fixed": "2.9"}],
+                    },
+                    {"type": "SEMVER", "events": [{"fixed": "0.1"}]},
+                    {
+                        "type": "GIT",
+                        "database_specific": {"extracted_events": [{"fixed": "0.2"}]},
+                    },
+                ],
+            }
+        ]
+    }
+    fixed, _snippets = _extract_fixed_from_osv_vuln(
+        vuln,
+        "org.example:widget",
+        ecosystem="Maven",
+    )
+    assert fixed == "2.9"
+    assert _minimum_fixed_version(["2.9", "2.10"], ecosystem="maven") == "2.9"
+
+
+def test_query_osv_passes_maven_ecosystem_and_uses_maven_floor_ordering():
+    issue = _make_vuln_issue(
+        package_name="org.example:widget",
+        package_version="1.0",
+        purl="pkg:maven/org.example/widget@1.0",
+        cve_id="CVE-2024-98765",
+        ecosystem="maven",
+    )
+    response = MagicMock()
+    response.json.return_value = {
+        "results": [
+            {
+                "vulns": [
+                    {
+                        "id": "CVE-2024-98765",
+                        "affected": [
+                            {
+                                "package": {
+                                    "name": "org.example:widget",
+                                    "ecosystem": "Maven",
+                                },
+                                "ranges": [
+                                    {
+                                        "type": "ECOSYSTEM",
+                                        "events": [{"fixed": "2.10"}, {"fixed": "2.9"}],
+                                    },
+                                    {"type": "SEMVER", "events": [{"fixed": "0.1"}]},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    with patch(
+        "remediation_engine.tools.fix_planner.requests.post",
+        return_value=response,
+    ) as post:
+        fixed, snippets = _query_osv_fixed_version(issue)
+
+    assert fixed == "2.9"
+    assert snippets is None
+    query = post.call_args.kwargs["json"]["queries"][0]
+    assert query["package"] == {"name": "org.example:widget", "ecosystem": "Maven"}

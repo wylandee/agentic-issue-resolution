@@ -56,6 +56,7 @@ from .report_diff import (
     _NON_PACKAGE_KEYS,
     _PACKAGE_FILE_RE,
     _PACKAGE_LINE_RE,
+    _POM_FILE_RE,
     _diff_block_paths,
     _diff_change_counts,
     _diff_code_change_details,
@@ -517,6 +518,162 @@ def _task_ids_for_group(context: ReportContext, group_id: str) -> list[str]:
     ]
 
 
+_MAVEN_COORDINATE_RE = re.compile(
+    r"[A-Za-z0-9_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_-]*)*:"
+    r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?\Z"
+)
+
+
+def _is_maven_coordinate(value: Any) -> bool:
+    """Return whether a value is a canonical Maven group:artifact coordinate."""
+    return bool(_MAVEN_COORDINATE_RE.fullmatch(_text(value).strip()))
+
+
+def _is_pom_path(value: Any) -> bool:
+    """Return whether a repository path names a POM manifest."""
+    return bool(_POM_FILE_RE.search(_normalized_path(value)))
+
+
+def _maven_group_coordinate(group: _ReportGroup) -> str:
+    """Return the exact GAV identity carried by a Maven finding group."""
+    component = _text(_value(group, "vulnerable_component")).strip()
+    if _is_maven_coordinate(component):
+        return component
+    issue = _group_issue(group)
+    package = _text(_value(issue, "package_name")).strip()
+    if _is_maven_coordinate(package):
+        return package
+    for localized in _items(_value(group, "localized_issues")):
+        localized_issue = _value(localized, "issue")
+        package = _text(_value(localized_issue, "package_name")).strip()
+        if _is_maven_coordinate(package):
+            return package
+    return ""
+
+
+def _is_maven_group(group: _ReportGroup | None) -> bool:
+    """Return whether group evidence identifies a Maven finding."""
+    if group is None:
+        return False
+    if _maven_group_coordinate(group):
+        return True
+    paths = [
+        *_items(_value(group, "file_paths")),
+        _value(group, "file_path"),
+    ]
+    if any(_is_pom_path(path) for path in paths):
+        return True
+    localized_issues = _items(_value(group, "localized_issues"))
+    issues = [*_items(_value(group, "issues")), _group_issue(group)]
+    for localized in localized_issues:
+        if _text(_value(localized, "package_manager")).strip().casefold() == "maven":
+            return True
+        localized_issue = _value(localized, "issue")
+        if localized_issue is not None:
+            issues.append(localized_issue)
+    for issue in issues:
+        ecosystem = _text(_value(issue, "ecosystem")).strip().casefold()
+        purl = _text(_value(issue, "purl")).strip().casefold()
+        if ecosystem == "maven" or purl.startswith("pkg:maven/"):
+            return True
+    return False
+
+
+def _maven_group_manifest_paths(group: _ReportGroup | None) -> list[str]:
+    """Return only POM paths explicitly attached to localized Maven evidence."""
+    if group is None:
+        return []
+    candidates: list[Any] = [
+        *_items(_value(group, "file_paths")),
+        _value(group, "file_path"),
+    ]
+    for localized in _items(_value(group, "localized_issues")):
+        candidates.extend(
+            (
+                _value(localized, "manifest_file"),
+                _value(localized, "version_property_file"),
+            )
+        )
+        localized_issue = _value(localized, "issue")
+        candidates.append(_value(localized_issue, "file_path"))
+    return _unique_texts(
+        path for value in candidates if (path := _normalized_path(value)) and _is_pom_path(path)
+    )
+
+
+def _report_group_for_id(context: ReportContext, group_id: str) -> _ReportGroup | None:
+    """Find a known report group by its stable identifier."""
+    return next(
+        (
+            item
+            for item in [*context.initial_valid_groups, *context.final_valid_groups]
+            if _text(_value(item, "group_id")) == group_id
+        ),
+        None,
+    )
+
+
+def _maven_committed_attempt_candidates(
+    context: ReportContext,
+    summary: Any,
+    metadata: Any,
+) -> list[Any]:
+    """Return only supervisor-owned records for a Maven attempt."""
+    task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+    attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
+    return [
+        context.attempt_snapshots.get(attempt_id),
+        context.task_queue.get(task_id),
+        context.retry_diagnostics.get(task_id),
+    ]
+
+
+def _is_maven_attempt(
+    context: ReportContext,
+    group_id: str,
+    summary: Any,
+    metadata: Any,
+) -> bool:
+    """Return whether group or committed attempt evidence identifies Maven."""
+    group = _report_group_for_id(context, group_id)
+    if _is_maven_group(group):
+        return True
+    return any(
+        _is_maven_coordinate(_value(item, "target_package_name"))
+        or any(
+            _is_pom_path(_value(item, field_name))
+            for field_name in ("manifest_path", "manifest_file", "pom_path")
+        )
+        or any(_is_pom_path(path) for path in _items(_value(item, "target_manifest_paths")))
+        for item in _maven_committed_attempt_candidates(context, summary, metadata)
+    )
+
+
+def _maven_manifest_path(
+    candidates: Sequence[Any],
+    group: _ReportGroup | None,
+) -> str:
+    """Resolve a POM path from committed attempt or localization evidence."""
+    for item in candidates:
+        for path_value in _items(_value(item, "target_manifest_paths")):
+            path = _normalized_path(path_value)
+            if path and _is_pom_path(path):
+                return path
+        for field_name in ("manifest_path", "target_manifest_path", "manifest_file", "pom_path"):
+            path = _normalized_path(_value(item, field_name))
+            if path and _is_pom_path(path):
+                return path
+        instruction = _text(_value(item, "instruction"))
+        match = re.search(
+            r"\bmanifest_path\s*=\s*[\"'`]?([^\r\n\"'`,;]+?pom\.xml)\b",
+            instruction,
+            re.IGNORECASE,
+        )
+        if match:
+            return _normalized_path(match.group(1))
+    return next(iter(_maven_group_manifest_paths(group)), "")
+
+
 def _group_package_names(group: _ReportGroup) -> set[str]:
     """Return package names that can identify a group in a manifest diff."""
     names: set[str] = set()
@@ -557,15 +714,17 @@ def _dependency_mechanism(
     change: PackageChange | None = None,
 ) -> str:
     """Resolve the manifest mechanism used for a package change."""
-    section = _text(_value(change, "section")).strip().casefold()
-    if section:
-        if "override" in section:
+    section_folded = _text(_value(change, "section")).strip().casefold()
+    if section_folded:
+        if "override" in section_folded:
             return "overrides"
-        if "resolution" in section:
+        if "resolution" in section_folded:
             return "resolutions"
-        if section == "lockfile":
+        if section_folded == "lockfile":
             return "lockfile"
-        return section
+        if section_folded == "dependencymanagement":
+            return "dependencyManagement"
+        return section_folded
 
     for task_id in _task_ids_for_group(context, group_id):
         task = context.task_queue.get(task_id)
@@ -582,6 +741,8 @@ def _dependency_mechanism(
                 return "overrides"
             if "resolution" in value_text:
                 return "resolutions"
+            if value_text == "dependencymanagement":
+                return "dependencyManagement"
             return value_text
         if _text(_value(task, "strategy_stage")).casefold() == "package_override":
             return "overrides"
@@ -596,21 +757,33 @@ def _dependency_mechanism(
 def _package_change_matches_group(change: PackageChange, group: _ReportGroup) -> bool:
     """Return whether a package change identifies the supplied finding group."""
     names = _group_package_names(group)
+    coordinate = _maven_group_coordinate(group)
+    if _is_maven_group(group) or _is_maven_coordinate(change.name):
+        return bool(coordinate and change.name == coordinate)
     return change.name in names or change.name.casefold() in {name.casefold() for name in names}
+
+
+def _package_change_pom_paths(change: PackageChange) -> list[str]:
+    """Return every POM path recorded for one package change."""
+    return [path for path in _package_change_files(change) if _is_pom_path(path)]
 
 
 def _package_change_detail(change: PackageChange, mechanism: str) -> str:
     """Describe the exact manifest entry changed by a package remediation."""
     previous = change.old or "not present"
     current = change.new or "removed"
-    return f"{change.name}: {previous} → {current} via {mechanism}"
+    pom_paths = _package_change_pom_paths(change)
+    location = f" in {', '.join(pom_paths)}" if pom_paths else ""
+    return f"{change.name}: {previous} → {current} via {mechanism}{location}"
 
 
 def _package_attempt_text(change: PackageChange, mechanism: str) -> str:
     """Render a compact package transition for an attempted remediation."""
     previous = change.old or "not present"
     current = change.new or "removed"
-    return f"Updated {change.name} {previous} → {current} via {mechanism}."
+    pom_paths = _package_change_pom_paths(change)
+    location = f" in {', '.join(pom_paths)}" if pom_paths else ""
+    return f"Updated {change.name} {previous} → {current} via {mechanism}{location}."
 
 
 def _required_follow_up_action(
@@ -916,20 +1089,26 @@ def _attempt_package_name(
     metadata: Any,
 ) -> str:
     """Recover the package name associated with one remediation attempt."""
-    for item in _attempt_evidence_candidates(context, summary, metadata):
+    candidates = _attempt_evidence_candidates(context, summary, metadata)
+    group = _report_group_for_id(context, group_id)
+    if _is_maven_attempt(context, group_id, summary, metadata):
+        group_coordinate = _maven_group_coordinate(group) if group is not None else ""
+        committed_candidates = _maven_committed_attempt_candidates(context, summary, metadata)
+        for item in committed_candidates:
+            for field_name in ("target_package_name", "no_fix_package_name", "package_name"):
+                package = _text(_value(item, field_name)).strip()
+                if _is_maven_coordinate(package) and (
+                    not group_coordinate or package == group_coordinate
+                ):
+                    return package
+        return group_coordinate
+
+    for item in candidates:
         for field_name in ("target_package_name", "no_fix_package_name", "package_name"):
             package = _text(_value(item, field_name)).strip()
             if package:
                 return package
 
-    group = next(
-        (
-            item
-            for item in [*context.initial_valid_groups, *context.final_valid_groups]
-            if _text(_value(item, "group_id")) == group_id
-        ),
-        None,
-    )
     if group is not None:
         package = _group_finding_package(group).strip()
         if package and package != "Unspecified finding":
@@ -956,6 +1135,16 @@ def _is_package_removal_attempt(
     metadata: Any,
 ) -> bool:
     """Return whether an attempt is authorized to remove a package manifest entry."""
+    if _is_maven_attempt(context, group_id, summary, metadata):
+        return any(
+            _text(_value(item, "no_fix_stage"))
+            .strip()
+            .casefold()
+            .replace("-", "_")
+            .rsplit(".", 1)[-1]
+            == "package_removal"
+            for item in _maven_committed_attempt_candidates(context, summary, metadata)
+        )
     for item in _attempt_evidence_candidates(context, summary, metadata):
         for field_name in ("qa_policy", "no_fix_stage"):
             value = _text(_value(item, field_name)).strip().casefold().replace("-", "_")
@@ -1004,6 +1193,8 @@ def _manifest_removal_files(files: Sequence[Any]) -> list[str]:
 
 def _manifest_removal_lines(path: str, package: str, content: str) -> list[str]:
     """Extract compact pre-removal lines for one package manifest."""
+    if _is_pom_path(path):
+        return []
     lines = content.splitlines()
     package_pattern = re.compile(rf'^\s*"{re.escape(package)}"\s*:')
     if Path(path).name.casefold() != "package-lock.json":
@@ -1095,9 +1286,16 @@ def _attempt_diff_blocks(
     )
     source_files = [path for path in files if not _PACKAGE_FILE_RE.search(_text(path))]
     selected_files = files if package_removal else source_files
+    maven_removal = package_removal and _is_maven_attempt(
+        context,
+        group_id,
+        summary,
+        metadata,
+    )
+    replay_files = [path for path in selected_files if not (maven_removal and _is_pom_path(path))]
     replay_blocks = _replay_diff_blocks(
         metadata,
-        selected_files,
+        replay_files,
         include_package_files=package_removal,
     )
     blocks = replay_blocks or _unified_diff_blocks(
@@ -1194,8 +1392,13 @@ def _attempt_package_metadata(
     """Recover a package/version operation from committed attempt metadata."""
     task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
     task = context.task_queue.get(task_id)
+    attempt_snapshot_id = (
+        _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id")) or attempt_id
+    )
+    maven_snapshot = context.attempt_snapshots.get(attempt_snapshot_id)
     snapshot = context.attempt_snapshots.get(attempt_id)
     diagnostic = context.retry_diagnostics.get(task_id)
+    maven_candidates = [maven_snapshot, task, diagnostic]
     candidates = [snapshot, summary, metadata, task, diagnostic]
 
     group = next(
@@ -1206,6 +1409,65 @@ def _attempt_package_metadata(
         ),
         None,
     )
+    if _is_maven_attempt(context, group_id, summary, metadata):
+        package = next(
+            (
+                target
+                for item in maven_candidates
+                if _is_maven_coordinate(
+                    target := _text(_value(item, "target_package_name")).strip()
+                )
+            ),
+            _maven_group_coordinate(group) if group is not None else "",
+        )
+        group_coordinate = _maven_group_coordinate(group) if group is not None else ""
+        if not package or (group_coordinate and package != group_coordinate):
+            return None
+
+        selected_version = next(
+            (
+                version
+                for item in maven_candidates
+                if (version := _text(_value(item, "selected_version")).strip())
+            ),
+            "",
+        )
+        dependency_type = next(
+            (
+                value
+                for item in maven_candidates
+                if (value := _text(_value(item, "target_dependency_type")).strip())
+                in {"dependencies", "dependencyManagement"}
+            ),
+            "",
+        )
+        file_path = _maven_manifest_path(maven_candidates, group)
+        if not selected_version or not dependency_type or not file_path:
+            return None
+
+        previous_version = ""
+        if group is not None:
+            issues = [
+                *_items(_value(group, "issues")),
+                *(
+                    _value(localized, "issue")
+                    for localized in _items(_value(group, "localized_issues"))
+                ),
+            ]
+            for issue in issues:
+                if _text(_value(issue, "package_name")).strip() == package:
+                    previous_version = _text(_value(issue, "package_version")).strip()
+                    if previous_version:
+                        break
+            if not previous_version:
+                versions = [
+                    _text(version).strip()
+                    for version in _items(_value(group, "versions"))
+                    if _text(version).strip()
+                ]
+                if len(versions) == 1:
+                    previous_version = versions[0]
+        return package, previous_version, selected_version, dependency_type, file_path
 
     package = ""
     for item in candidates:
@@ -1554,6 +1816,9 @@ def _attempt_files(
         *_items(_value(metadata, "file_changes")),
         *_items(_value(metadata, "files_changed")),
     ]
+    if _is_maven_attempt(context, group_id, summary, metadata):
+        values.extend(_items(_value(summary, "package_removal_files")))
+        values.extend(_items(_value(metadata, "package_removal_files")))
     diagnostics = _value(metadata, "execution_diagnostics")
     values.extend(_items(_value(diagnostics, "validated_files")))
     _, replay_files = _attempt_replay_change_details(metadata)
@@ -1570,6 +1835,19 @@ def _attempt_files(
         )
         if metadata_change is not None and metadata_change[4]:
             files.append(metadata_change[4])
+        if (
+            not files
+            and _is_maven_attempt(context, group_id, summary, metadata)
+            and _is_package_removal_attempt(context, group_id, summary, metadata)
+        ):
+            group = _report_group_for_id(context, group_id)
+            if group is not None:
+                manifest_path = _maven_manifest_path(
+                    _maven_committed_attempt_candidates(context, summary, metadata),
+                    group,
+                )
+                if manifest_path:
+                    files.append(manifest_path)
     attempt_kind = _attempt_kind(
         context,
         group_id,
@@ -1831,9 +2109,12 @@ def _attempt_package_removal_text(
     ):
         return ""
 
-    package = (
-        _attempt_package_name(context, group_id, summary, metadata) or "the vulnerable package"
-    )
+    package = _attempt_package_name(context, group_id, summary, metadata)
+    if _is_maven_attempt(context, group_id, summary, metadata):
+        if not _is_maven_coordinate(package):
+            return ""
+    elif not package:
+        package = "the vulnerable package"
     manifest_files = _manifest_removal_files(files)
     manifest_names = {Path(path).name.casefold() for path in manifest_files}
     if {"package.json", "package-lock.json"}.issubset(manifest_names):
@@ -2018,10 +2299,10 @@ def _successful_remediation_evidence(
     code_summaries: list[str] = []
     diff_blocks: list[str] = []
     successful_attempts = _successful_attempts_for_group(context, group_id)
-    if not package_text and not context.diff.strip():
-        # A successful discovered group may no longer have a final workspace
-        # diff after teardown. Recover the latest QA-accepted package change
-        # from committed attempt metadata only when no final diff exists.
+    if not package_text and (not context.diff.strip() or _is_maven_group(group)):
+        # POM XML is intentionally excluded from npm manifest parsing. When
+        # that leaves no package transition, recover the QA-accepted Maven
+        # operation from its committed attempt metadata.
         for summary, metadata in reversed(successful_attempts):
             if _attempt_kind(context, group_id, summary, metadata) != "Version Update":
                 continue

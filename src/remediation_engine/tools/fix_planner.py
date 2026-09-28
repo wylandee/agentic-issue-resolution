@@ -35,13 +35,19 @@ from __future__ import annotations
 import logging
 import os
 import re
+from functools import cmp_to_key
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 import requests
 from pydantic import BaseModel
 
-from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
+from remediation_engine.contracts.schemas import FixPlanStatus, LocalizedIssue
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
+)
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.tools.package_identity import package_name_from_purl
 
@@ -119,6 +125,27 @@ def _is_npm_issue(issue: Any) -> bool:
     return purl.startswith("pkg:npm/") or purl.startswith("pkg:javascript/")
 
 
+def _is_maven_issue(issue: Any) -> bool:
+    """Return True for Maven PURLs or ecosystem-labelled findings."""
+    ecosystem = str(getattr(issue, "ecosystem", "") or "").strip().lower()
+    purl = str(getattr(issue, "purl", "") or "").strip().lower()
+    return ecosystem == "maven" or purl.startswith("pkg:maven/")
+
+
+def _canonical_maven_coordinate(issue: Any) -> str:
+    """Return the exact group:artifact identity without Node normalization."""
+    purl = getattr(issue, "purl", None)
+    candidate = package_name_from_purl(purl) if purl else None
+    if not candidate:
+        candidate = str(getattr(issue, "package_name", "") or "").strip()
+    parts = candidate.split(":")
+    if len(parts) != 2 or any(
+        not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", part) for part in parts
+    ):
+        return ""
+    return candidate
+
+
 def _package_name_from_issue(issue: Any) -> str:
     """
     Return the canonical package name for network queries.
@@ -162,6 +189,7 @@ def _build_instruction(
     manifest_file: str | None,
     parent_package_name: str | None = None,
     parent_declaration_type: str | None = None,
+    declaration_type: str | None = None,
 ) -> str:
     """
     Generate a terse, actionable instruction for the Remedy agent.
@@ -172,6 +200,15 @@ def _build_instruction(
     """
     manifest_name = os.path.basename(manifest_file) if manifest_file else "package.json"
     pm = (package_manager or "npm").lower()
+    if pm == "maven":
+        target = declaration_type or ("dependencies" if is_direct else "dependencyManagement")
+        return (
+            f'For the exact Maven coordinate "{package_name}", update only the authorized '
+            f'POM "{manifest_file or "no authorized POM"}" under "{target}". The OSV '
+            f'fixed version "{fixed_version}" is a security floor, not release authorization; '
+            "use only a Supervisor-authorized Maven release. Do not change a parent POM "
+            "or BOM solely to remediate this finding."
+        )
 
     if is_direct:
         return _DIRECT_TMPL.format(
@@ -244,10 +281,8 @@ def _extract_osv_workaround_snippets(vuln: dict[str, Any]) -> list[str] | None:
             for value in reference.values()
             if isinstance(value, str) and value.strip()
         ]
-        if not parts:
-            continue
-        combined = " | ".join(parts)
-        _add_snippet(combined)
+        if parts:
+            _add_snippet(" | ".join(parts))
 
     return snippets or None
 
@@ -260,59 +295,76 @@ def _extract_fixed_from_osv_vuln(
     vuln: dict[str, Any],
     package_name: str,
     current_version: str | None = None,
+    ecosystem: str | None = None,
 ) -> tuple[str | None, list[str] | None]:
-    """
-    Walk an OSV vuln object's ``affected[].ranges[].events[]`` to find a
-    non-Git ``fixed`` version.
-
-    Prefers SEMVER ranges; falls back to ECOSYSTEM; checks database_specific
-    extracted_events for GIT ranges before skipping raw commit hashes.
-    """
+    """Extract an OSV fixed version, never imposing SemVer order on Maven."""
     preferred: list[str] = []
     fallback: list[str] = []
+    is_maven = (ecosystem or "").strip().lower() == "maven"
+    force_non_maven = bool(ecosystem and ecosystem.strip().lower() != "maven")
 
     for affected in vuln.get("affected") or []:
-        # Try to match by package name (case-insensitive); skip mismatches
         pkg_info = affected.get("package") or {}
         affected_name = pkg_info.get("name", "")
         if affected_name and affected_name.lower() != package_name.lower():
             continue
-
+        affected_maven = str(pkg_info.get("ecosystem", "")).lower() == "maven"
+        is_maven = is_maven or (affected_maven and not force_non_maven)
         for rng in affected.get("ranges") or []:
             rng_type = (rng.get("type") or "").upper()
             if rng_type == "GIT":
-                db_specific = rng.get("database_specific") or {}
-                extracted = db_specific.get("extracted_events") or []
+                if is_maven:
+                    continue
+                extracted = (rng.get("database_specific") or {}).get("extracted_events") or []
                 for event in extracted:
-                    fixed = event.get("fixed")
-                    if fixed:
-                        fallback.append(str(fixed))
-                continue  # commit hashes are not useful for manifest pins
-
+                    if event.get("fixed"):
+                        fallback.append(str(event["fixed"]))
+                continue
+            if is_maven and rng_type != "ECOSYSTEM":
+                continue
             for event in rng.get("events") or []:
                 fixed = event.get("fixed")
-                if fixed:
-                    if rng_type == "SEMVER":
-                        preferred.append(str(fixed))
-                    else:
-                        fallback.append(str(fixed))
+                if not fixed:
+                    continue
+                if rng_type == "SEMVER":
+                    preferred.append(str(fixed))
+                else:
+                    fallback.append(str(fixed))
 
-    fixed = _minimum_fixed_version(preferred or fallback, current_version=current_version)
+    fixed = _minimum_fixed_version(
+        preferred or fallback,
+        current_version=current_version,
+        ecosystem="maven" if is_maven else ecosystem,
+    )
     if fixed:
         return fixed, None
-
     return None, _extract_osv_workaround_snippets(vuln)
+
+
+def _minimum_maven_fixed_version(versions: list[str]) -> str | None:
+    """Return the lowest valid stable Maven OSV fixed event."""
+    eligible = [
+        str(version).strip()
+        for version in versions
+        if str(version).strip() and is_stable_maven_version(str(version).strip())
+    ]
+    if not eligible:
+        return None
+    try:
+        return min(eligible, key=cmp_to_key(compare_maven_versions))
+    except ValueError:
+        return None
 
 
 def _minimum_fixed_version(
     versions: list[str],
     current_version: str | None = None,
+    ecosystem: str | None = None,
 ) -> str | None:
-    """Return the lowest appropriate semver-like version from a collection of fixes.
+    """Return the appropriate OSV floor using the known ecosystem comparator."""
+    if (ecosystem or "").strip().lower() == "maven":
+        return _minimum_maven_fixed_version(versions)
 
-    If current_version is provided, prioritizes fixes in the same major series
-    (or the lowest fix >= current_version) over lower major backports.
-    """
     parsed: list[tuple[tuple[int, int, int, int, str], str]] = []
     for raw in versions:
         match = re.search(
@@ -341,13 +393,9 @@ def _minimum_fixed_version(
             cur_patch = int(cur_match.group(3) or 0)
             cur_prerelease = cur_match.group(4) or ""
             cur_key = (cur_major, cur_minor, cur_patch, 0 if cur_prerelease else 1, cur_prerelease)
-
-            # 1. Look for same-major fixes that are >= current_version
             same_major = [item for item in parsed if item[0][0] == cur_major and item[0] >= cur_key]
             if same_major:
                 return min(same_major, key=lambda item: item[0])[1]
-
-            # 2. Look for higher major fixes that are >= current_version
             higher_fixes = [item for item in parsed if item[0] >= cur_key]
             if higher_fixes:
                 return min(higher_fixes, key=lambda item: item[0])[1]
@@ -367,7 +415,11 @@ def _fetch_osv_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
+def _query_osv_fixed_version(
+    issue: Any,
+    *,
+    maven_mode: bool | None = None,
+) -> tuple[str | None, list[str] | None]:
     """
     Query the OSV querybatch API for the fixed version.
 
@@ -377,11 +429,14 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
     3. If it only returns vuln IDs, fetch each via GET /v1/vulns/{id}.
     4. Follow aliases (e.g. CVE -> GHSA) to retrieve structured ecosystem fix versions.
     """
-    package_name = _package_name_from_issue(issue)
+    use_maven_policy = _is_maven_issue(issue) if maven_mode is None else maven_mode
+    package_name = (
+        _canonical_maven_coordinate(issue) if use_maven_policy else _package_name_from_issue(issue)
+    )
     if not package_name:
         return None, None
 
-    eco = (issue.ecosystem or "npm").lower()
+    eco = "Maven" if use_maven_policy else (issue.ecosystem or "npm").lower()
     mapping = {
         "npm": "npm",
         "maven": "Maven",
@@ -474,7 +529,14 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
                 vuln_to_process = detail
 
         fixed, snippets = _extract_fixed_from_osv_vuln(
-            vuln_to_process, package_name, current_version=current_version
+            vuln_to_process,
+            package_name,
+            current_version=current_version,
+            ecosystem=(
+                getattr(issue, "ecosystem", None) or "Maven"
+                if use_maven_policy
+                else getattr(issue, "ecosystem", None) or "npm"
+            ),
         )
         if fixed:
             fixed_versions.append(fixed)
@@ -511,7 +573,18 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
                     _consume_vuln(detail)
 
     if fixed_versions:
-        return _minimum_fixed_version(fixed_versions, current_version=current_version), None
+        return (
+            _minimum_fixed_version(
+                fixed_versions,
+                current_version=current_version,
+                ecosystem=(
+                    getattr(issue, "ecosystem", None) or "Maven"
+                    if use_maven_policy
+                    else getattr(issue, "ecosystem", None)
+                ),
+            ),
+            None,
+        )
     return None, (workaround_snippets or None)
 
 
@@ -839,34 +912,39 @@ def _serper_search_and_extract(issue: Any, package_name: str) -> dict[str, Any] 
 
 
 def plan_fix(localized_issue: LocalizedIssue) -> dict:
-    """
-    Plan one SCA finding from OSV advisory data and Serper fallback.
-
-    NPM registry candidate selection intentionally does not happen here.  The
-    supervisor owns the later retry stages so each advisory is classified
-    independently before strategy-aware grouping.
-
-    Returns a plain ``dict`` that mirrors the ``FixPlan`` Pydantic model and
-    is always constructable as one:
-
-        fix_plan = FixPlan(**plan_fix(localized_issue))
-
-    The dict always has keys:
-        status, fixed_version, workaround_snippets, instruction, strategy_used.
-
-    No file I/O or mutations are performed.
-    """
+    """Plan one SCA finding from OSV advisory data and Serper fallback."""
     issue = localized_issue.issue
-    package_name = _package_name_from_issue(issue)
     package_manager = localized_issue.package_manager
+    is_maven = str(package_manager or "").strip().lower() == "maven"
+    package_name = (
+        _canonical_maven_coordinate(issue) if is_maven else _package_name_from_issue(issue)
+    )
     is_direct = localized_issue.is_direct_dependency
     manifest_file = localized_issue.manifest_file
 
-    # Step 1: OSV query
-    osv_result = _query_osv_fixed_version(issue)
+    if is_maven and (
+        not package_name or not manifest_file or Path(manifest_file).name != "pom.xml"
+    ):
+        return {
+            "status": FixPlanStatus.NO_FIX.value,
+            "fixed_version": None,
+            "workaround_snippets": None,
+            "instruction": (
+                f'No authorized Maven POM is available for exact coordinate "{package_name or "unknown group:artifact"}". '
+                "Do not edit an inherited parent POM or BOM solely for this finding."
+            ),
+            "strategy_used": "no_authorized_maven_pom",
+        }
+
+    # Step 1: OSV advisory data. The registry release choice is Supervisor-owned.
+    osv_result = (
+        _query_osv_fixed_version(issue, maven_mode=True)
+        if is_maven
+        else _query_osv_fixed_version(issue)
+    )
     if isinstance(osv_result, tuple) and len(osv_result) == 2:
         fixed, snippets = osv_result
-    else:  # Defensive fallback for integrations that return no OSV result.
+    else:
         fixed, snippets = None, None
 
     if fixed:
@@ -879,6 +957,7 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             strategy="osv_api",
             parent_package_name=localized_issue.parent_package_name,
             parent_declaration_type=localized_issue.parent_declaration_type,
+            declaration_type=localized_issue.declaration_type,
         )
     if snippets:
         return {
@@ -889,11 +968,12 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             "strategy_used": "osv_api",
         }
 
-    # Step 2: Serper web search fallback with LLM page parsing
+    # Non-version workaround discovery can be useful for Maven, but text from
+    # search/LLM results is never accepted as Maven release authorization.
     serper_llm_result = _serper_search_and_extract(issue, package_name)
     if serper_llm_result and isinstance(serper_llm_result, dict):
         strategy = serper_llm_result.get("strategy")
-        if strategy == "VERSION_BUMP" and serper_llm_result.get("fixed_version"):
+        if not is_maven and strategy == "VERSION_BUMP" and serper_llm_result.get("fixed_version"):
             return _version_plan(
                 package_name,
                 serper_llm_result["fixed_version"],
@@ -913,7 +993,6 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
                 "strategy_used": "serper_llm",
             }
 
-    # Step 3: No fix found across all strategies
     return {
         "status": FixPlanStatus.NO_FIX.value,
         "fixed_version": None,
@@ -921,11 +1000,6 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
         "instruction": _NO_FIX_INSTRUCTION,
         "strategy_used": "none",
     }
-
-
-# ---------------------------------------------------------------------------
-# Internal plan builder
-# ---------------------------------------------------------------------------
 
 
 def _version_plan(
@@ -937,6 +1011,7 @@ def _version_plan(
     strategy: str,
     parent_package_name: str | None = None,
     parent_declaration_type: str | None = None,
+    declaration_type: str | None = None,
 ) -> dict:
     """Return a ``version_found`` plan dict."""
     instruction = _build_instruction(
@@ -947,6 +1022,7 @@ def _version_plan(
         manifest_file=manifest_file,
         parent_package_name=parent_package_name,
         parent_declaration_type=parent_declaration_type,
+        declaration_type=declaration_type,
     )
     return {
         "status": FixPlanStatus.VERSION_FOUND.value,

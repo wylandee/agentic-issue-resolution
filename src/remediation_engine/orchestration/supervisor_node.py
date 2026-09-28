@@ -32,6 +32,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.decision_codes import (
@@ -62,6 +63,11 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
+)
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
@@ -128,6 +134,7 @@ from remediation_engine.orchestration.task_utils import (
     build_no_fix_retry_instruction,
     derive_missing_task_qa_policy,
     group_parent_context,
+    is_maven_group,
     is_no_fix_group,
     is_transitive_group,
 )
@@ -215,8 +222,41 @@ def _ordered_update_candidates(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build immutable version and dependency-type candidates for an update attempt."""
+    maven_mode = project_language == ProjectLanguage.JAVA and (
+        maven_mode
+        if maven_mode is not None
+        else bool(
+            task.target_package_name
+            and re.fullmatch(
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*",
+                task.target_package_name,
+            )
+        )
+    )
+
+    def normalize_version(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        version = value.strip()
+        if not maven_mode:
+            return version.lstrip("vV")
+        if not is_stable_maven_version(version):
+            return None
+        floor = diagnostics.security_floor if diagnostics is not None else None
+        if floor:
+            if not is_stable_maven_version(floor):
+                return None
+            try:
+                if compare_maven_versions(version, floor) < 0:
+                    return None
+            except ValueError:
+                return None
+        return version
+
     selected_version = (
         plan.selected_version
         if plan is not None and plan.selected_version
@@ -226,7 +266,9 @@ def _ordered_update_candidates(
         *(diagnostics.attempted_versions if diagnostics else []),
         *(plan.attempted_versions if plan else []),
     ]
-    attempted_versions = {item.strip().lstrip("vV") for item in attempted_version_values if item}
+    attempted_versions = {
+        normalized for item in attempted_version_values if (normalized := normalize_version(item))
+    }
     if plan is not None:
         candidate_versions = list(plan.candidate_versions_considered)
     elif diagnostics is not None:
@@ -238,28 +280,23 @@ def _ordered_update_candidates(
     # Supervisor-approved candidate pool.  Never let a stale task field widen
     # that pool after a planner or registry result has been committed.
     normalized_candidates = [
-        version.strip().lstrip("vV")
-        for version in candidate_versions
-        if isinstance(version, str) and version.strip()
+        normalized for version in candidate_versions if (normalized := normalize_version(version))
     ]
     candidate_pool = set(normalized_candidates)
-    selected_candidate = (
-        selected_version.strip().lstrip("vV")
-        if isinstance(selected_version, str) and selected_version.strip()
-        else None
-    )
-    ordered_versions = (
-        [selected_candidate, *normalized_candidates]
-        if selected_candidate in candidate_pool
-        else normalized_candidates
-    )
+    selected_candidate = normalize_version(selected_version)
+    if maven_mode:
+        ordered_versions = [selected_candidate] if selected_candidate in candidate_pool else []
+    else:
+        ordered_versions = (
+            [selected_candidate, *normalized_candidates]
+            if selected_candidate in candidate_pool
+            else normalized_candidates
+        )
 
     allowed_versions: list[str] = []
     seen_versions: set[str] = set()
     for version in ordered_versions:
-        if not version:
-            continue
-        normalized = version.strip().lstrip("vV")
+        normalized = normalize_version(version)
         if not normalized or normalized in seen_versions:
             continue
         if normalized in attempted_versions:
@@ -282,6 +319,12 @@ def _ordered_update_candidates(
         ]
     else:
         candidate_types = policy_types
+    if maven_mode:
+        candidate_types = [
+            dependency_type
+            for dependency_type in candidate_types
+            if dependency_type in {"dependencies", "dependencyManagement"}
+        ]
     attempted_types = {
         item.strip()
         for item in (diagnostics.attempted_dependency_types if diagnostics else ())
@@ -315,21 +358,38 @@ def _authorize_update_dispatch(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool | None = None,
 ) -> _UpdateDispatchAuthorization | None:
-    """Return a dispatch authorization or reject incomplete update state.
+    """Return a dispatch authorization or reject incomplete update state."""
+    maven_mode = project_language == ProjectLanguage.JAVA and (
+        maven_mode
+        if maven_mode is not None
+        else bool(
+            task.target_package_name
+            and re.fullmatch(
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*",
+                task.target_package_name,
+            )
+        )
+    )
 
-    Update workers may only receive a candidate pool that came from the
-    committed retry plan or retry diagnostics.  A selected task version by
-    itself is not sufficient registry provenance.
-    """
+    def normalize_selected(value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = value.strip()
+        if maven_mode:
+            return normalized if is_stable_maven_version(normalized) else None
+        return normalized.lstrip("vV")
+
     allowed_versions, allowed_dependency_types = _ordered_update_candidates(
         task,
         plan=plan,
         diagnostics=diagnostics,
+        project_language=project_language,
+        maven_mode=maven_mode,
     )
-    if not task.instruction.strip():
-        return None
-    if not allowed_versions:
+    if not task.instruction.strip() or not allowed_versions:
         return None
     expected_package = (
         plan.target_package_name
@@ -349,12 +409,8 @@ def _authorize_update_dispatch(
         return None
     if expected_type and task.target_dependency_type != expected_type:
         return None
-    plan_version = (
-        plan.selected_version.strip().lstrip("vV")
-        if plan is not None and plan.selected_version
-        else None
-    )
-    task_version = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    plan_version = normalize_selected(plan.selected_version if plan is not None else None)
+    task_version = normalize_selected(task.selected_version)
     if plan_version and task_version != plan_version:
         return None
     selected_version = plan_version or task_version
@@ -407,6 +463,27 @@ def _extract_workaround_vulnerability_mechanism(group: VulnerabilityGroup) -> st
     return ""
 
 
+def _maven_attempt_target_paths(
+    group: VulnerabilityGroup | None,
+    project_language: ProjectLanguage,
+) -> list[str]:
+    """Return Maven declaration and version-owner POMs for one attempt."""
+    if group is None or not is_maven_group(group, project_language):
+        return []
+    paths: list[str] = []
+    for localized in getattr(group, "localized_issues", []) or []:
+        if str(getattr(localized, "package_manager", "") or "").strip().lower() != "maven":
+            continue
+        for value in (
+            getattr(localized, "manifest_file", None),
+            getattr(localized, "version_property_file", None),
+        ):
+            path = str(value or "").replace("\\", "/").strip()
+            if path and Path(path).name == "pom.xml" and path not in paths:
+                paths.append(path)
+    return paths
+
+
 def _create_attempt_snapshot(
     task: RemediationTask,
     *,
@@ -417,7 +494,15 @@ def _create_attempt_snapshot(
     workaround_context: WorkaroundContext | None = None,
     allowed_target_versions: Iterable[str] = (),
     allowed_dependency_types: Iterable[str] = (),
+    target_manifest_paths: Iterable[str] = (),
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
+    normalized_target_manifest_paths = list(
+        dict.fromkeys(
+            path
+            for value in target_manifest_paths
+            if (path := str(value).strip().replace("\\", "/"))
+        )
+    )
     normalized_allowed_target_versions = list(
         dict.fromkeys(
             str(value).strip().lstrip("vV")
@@ -460,6 +545,7 @@ def _create_attempt_snapshot(
         allowed_target_versions=normalized_allowed_target_versions,
         target_package_name=task.target_package_name,
         target_dependency_type=task.target_dependency_type,
+        target_manifest_paths=normalized_target_manifest_paths,
         allowed_dependency_types=list(
             dict.fromkeys(
                 str(value).strip() for value in allowed_dependency_types if str(value).strip()
@@ -495,6 +581,7 @@ def _commit_registry_resolution_fallback(
     consistency_events: list[StateConsistencyEvent],
     errors: list[str],
     staged_resolutions: list[_StagedTacticalResolution] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> SupervisorDecision | None:
     """Commit a verified deterministic update when tactical reasoning is absent.
 
@@ -513,7 +600,14 @@ def _commit_registry_resolution_fallback(
         (candidate for candidate in candidate_sets if candidate.strategy == fallback_strategy),
         None,
     )
-    selected = task.selected_version.strip().lstrip("vV") if task.selected_version else None
+    maven_mode = is_maven_group(group, project_language)
+    selected = (
+        task.selected_version.strip()
+        if maven_mode and task.selected_version
+        else task.selected_version.strip().lstrip("vV")
+        if task.selected_version
+        else None
+    )
     effective_stage = task.strategy_stage
     if version_set is None or not version_set.versions:
         # The inventory may prove that the transitive parent has no usable
@@ -565,7 +659,9 @@ def _commit_registry_resolution_fallback(
         )
         else []
     )
-    approved_versions = list(dict.fromkeys(prior_pool or list(version_set.versions)))
+    approved_versions = list(
+        dict.fromkeys(prior_pool or list(version_set.approved_version_pool or version_set.versions))
+    )
     diagnostics_for_commit = diagnostics_for_commit.model_copy(
         update={
             "strategy_stage": effective_stage,
@@ -574,11 +670,19 @@ def _commit_registry_resolution_fallback(
             "target_package_name": version_set.target_package_name,
             "target_dependency_type": target_type,
             "candidate_versions_considered": approved_versions,
-            "candidate_dependency_types": _supervisor_dependency_type_candidates(
-                effective_stage,
-                target_type,
+            "candidate_dependency_types": (
+                [target_type]
+                if maven_mode
+                else _supervisor_dependency_type_candidates(
+                    effective_stage,
+                    target_type,
+                )
             ),
-            "latest_version_seen": version_set.versions[-1],
+            "latest_version_seen": (
+                approved_versions[-1]
+                if maven_mode and approved_versions
+                else version_set.versions[-1]
+            ),
             "registry_query_performed": True,
             "reasoning_summary": (
                 "policy=deterministic_verified_candidate; "
@@ -602,6 +706,7 @@ def _commit_registry_resolution_fallback(
                 group,
                 evaluation,
                 diagnostics_for_commit,
+                project_language=project_language,
             )
         }
     )
@@ -631,6 +736,7 @@ def _commit_registry_resolution_fallback(
         target_package_name=committed.target_package_name,
         target_dependency_type=committed.target_dependency_type,
         parent_minimum_version=committed.parent_minimum_version,
+        latest_version_seen=diagnostics_for_commit.latest_version_seen,
         candidate_versions_considered=approved_versions,
         candidate_dependency_types=list(diagnostics_for_commit.candidate_dependency_types),
         action="retry_update",
@@ -707,6 +813,7 @@ def _apply_tactical_supervisor(
     worker_results_by_attempt: dict[str, WorkerAttemptResult],
     attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot] | None = None,
     *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     target_task_id: str | None = None,
     consistency_events: list[StateConsistencyEvent],
     errors: list[str],
@@ -774,6 +881,7 @@ def _apply_tactical_supervisor(
                 ),
             ),
             prior_attempts=prior_attempts,
+            project_language=project_language,
         )
         if classify_diagnostics(base_context).value == "inconclusive":
             # QA contract/infrastructure/attribution gaps are rerun evidence,
@@ -832,6 +940,7 @@ def _apply_tactical_supervisor(
                 else None
             ),
             prior_attempts=base_context.prior_attempts,
+            project_language=project_language,
         )
         portfolio_escalation_required = _portfolio_escalation_required(
             context,
@@ -862,6 +971,7 @@ def _apply_tactical_supervisor(
                 consistency_events=consistency_events,
                 errors=errors,
                 staged_resolutions=staged_resolutions,
+                project_language=project_language,
             )
         action, verification = propose_and_verify_tactical_action(
             context,
@@ -894,6 +1004,7 @@ def _apply_tactical_supervisor(
                 consistency_events=consistency_events,
                 errors=errors,
                 staged_resolutions=staged_resolutions,
+                project_language=project_language,
             )
         if not verification.accepted:
             detail = verification.reason
@@ -988,7 +1099,9 @@ def _apply_tactical_supervisor(
                 or group.vulnerable_component
                 or "",
                 verification.target_dependency_type or task.target_dependency_type,
+                maven_mode=is_maven_group(group, project_language),
             )
+            or verification.approved_candidate_versions
             or verified_versions
         )
         diagnostics_for_commit = (
@@ -999,11 +1112,23 @@ def _apply_tactical_supervisor(
                 "selected_version": committed.selected_version,
                 "target_package_name": committed.target_package_name,
                 "target_dependency_type": committed.target_dependency_type,
-                "security_floor": _canonical_security_floor(group)[0],
+                "security_floor": _canonical_security_floor(
+                    group,
+                    project_language=project_language,
+                )[0],
                 "candidate_versions_considered": list(dict.fromkeys(approved_versions)),
+                "latest_version_seen": (
+                    approved_versions[-1]
+                    if is_maven_group(group, project_language) and approved_versions
+                    else retry_diagnostics.latest_version_seen
+                    if retry_diagnostics is not None
+                    else None
+                ),
                 "candidate_dependency_types": list(
                     dict.fromkeys(
-                        [
+                        [verification.target_dependency_type]
+                        if is_maven_group(group, project_language)
+                        else [
                             *verification.allowed_dependency_types,
                         ]
                     )
@@ -1027,6 +1152,11 @@ def _apply_tactical_supervisor(
             parent_minimum_version=committed.parent_minimum_version,
             attempted_versions=list(diagnostics_for_commit.attempted_versions),
             candidate_versions_considered=approved_versions,
+            latest_version_seen=(
+                approved_versions[-1]
+                if is_maven_group(group, project_language) and approved_versions
+                else None
+            ),
             candidate_dependency_types=list(verification.allowed_dependency_types),
             action="retry_update",
             exact_instruction=instruction,
@@ -1489,6 +1619,15 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
        unfixable marks, new constraints, and materialized spawn requests.
     10. Return state patch.
     """
+    raw_language = state.get("project_language", ProjectLanguage.NODEJS)
+    try:
+        project_language = (
+            raw_language
+            if isinstance(raw_language, ProjectLanguage)
+            else ProjectLanguage(raw_language)
+        )
+    except (TypeError, ValueError):
+        project_language = ProjectLanguage.NODEJS
     if state.get("post_qa_retriage_limit_reached"):
         decision = SupervisorDecision(
             decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
@@ -1589,7 +1728,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     for group in valid_groups:
         if group.group_id not in existing_group_ids:
             task_id = f"task-{next_task_index}"
-            task_queue[task_id] = build_initial_remediation_task(group, task_id)
+            task_queue[task_id] = build_initial_remediation_task(
+                group,
+                task_id,
+                project_language=project_language,
+            )
             next_task_index += 1
 
     # Keep task-owned planner fields synchronized with the initial OSV plan.
@@ -2275,7 +2418,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task_id=resolved_t_id,
                             strategy_stage=next_stage,
                             security_floor=(
-                                _canonical_security_floor(group)[0] if group is not None else None
+                                _canonical_security_floor(
+                                    group,
+                                    project_language=project_language,
+                                )[0]
+                                if group is not None
+                                else None
                             ),
                             exhausted_update_path=(
                                 task.strategy_stage == SCARemediationStage.CODE_WORKAROUND
@@ -2291,9 +2439,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             update={
                                 "strategy_stage": next_stage,
                                 "security_floor": (
-                                    _canonical_security_floor(group)[0]
-                                    if group is not None
-                                    else prior_diag.security_floor
+                                    _canonical_security_floor(
+                                        group,
+                                        project_language=project_language,
+                                    )[0]
                                 ),
                                 "exhausted_update_path": task.strategy_stage
                                 == SCARemediationStage.CODE_WORKAROUND,
@@ -2461,6 +2610,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     evaluation=target_evaluation,
                     worker_result=target_worker_result,
                     retry_diagnostics=retry_diagnostics_by_task.get(target_task.task_id),
+                    project_language=project_language,
                 )
                 tactical_fallback_requires_stage_advance = (
                     classify_diagnostics(tactical_fallback_context)
@@ -2477,6 +2627,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 retry_plans_by_task,
                 worker_results_by_attempt,
                 attempt_snapshots_by_id,
+                project_language=project_language,
                 target_task_id=target_task_id,
                 consistency_events=consistency_events,
                 errors=errors,
@@ -2502,6 +2653,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             }
             or tactical_fallback_requires_stage_advance,
             target_task_ids=[target_task_id] if target_task_id else None,
+            project_language=project_language,
         )
         planner_violations = _planner_plan_violations(
             parsed_plans,
@@ -2519,6 +2671,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task_queue,
                 group_by_id,
                 violations=planner_violations,
+                project_language=project_language,
             )
             repair_violations = _planner_plan_violations(
                 parsed_plans,
@@ -2896,6 +3049,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         recovery_tasks,
                         group_by_id,
                         recovery_inputs,
+                        project_language=project_language,
                     )
                     retry_diagnostics_by_task.update(recovered_diagnostics)
                     _commit_retry_plans(
@@ -3327,6 +3481,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 task,
                 plan=plan,
                 diagnostics=diagnostics,
+                project_language=project_language,
+                maven_mode=is_maven_group(
+                    group_by_id.get(task.parent_group_id),
+                    project_language,
+                ),
             )
             if authorization is None and task.strategy == RoutingStrategy.VERSION_BUMP:
                 group = group_by_id.get(task.parent_group_id)
@@ -3339,6 +3498,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                         {task_id: task},
                         {task.parent_group_id: group},
                         {task_id: recovery_input},
+                        project_language=project_language,
                     )
                     if not _planner_plan_violations(
                         recovered_plans,
@@ -3359,6 +3519,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task,
                             plan=plan,
                             diagnostics=diagnostics,
+                            project_language=project_language,
+                            maven_mode=is_maven_group(group, project_language),
                         )
             if authorization is not None:
                 update_dispatch_authorizations[task_id] = authorization
@@ -3544,6 +3706,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     task,
                     plan=plan,
                     diagnostics=retry_diagnostics_by_task.get(task_id),
+                    project_language=project_language,
+                    maven_mode=is_maven_group(
+                        group_by_id.get(task.parent_group_id),
+                        project_language,
+                    ),
                 )
                 if update_authorization is None:
                     errors.append(
@@ -3552,6 +3719,10 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     )
                     continue
                 update_dispatch_authorizations[task_id] = update_authorization
+            target_manifest_paths = _maven_attempt_target_paths(
+                group_by_id.get(task.parent_group_id),
+                project_language,
+            )
             task, snapshot = _create_attempt_snapshot(
                 task,
                 dispatch_node=resolved_next_node,
@@ -3569,6 +3740,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     if update_authorization is not None
                     else []
                 ),
+                target_manifest_paths=target_manifest_paths,
             )
             task_queue[task_id] = task
             prior = retry_diagnostics_by_task.get(task_id)
@@ -3576,7 +3748,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 retry_diagnostics_by_task[task_id] = prior.model_copy(
                     update={
                         "committed_attempt_id": snapshot.attempt_id,
-                        "selected_version": task.selected_version,
                         "strategy_stage": task.strategy_stage,
                         "exhausted_update_path": task.exhausted_update_path,
                         "instruction_digest": snapshot.instruction_digest,

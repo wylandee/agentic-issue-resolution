@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from remediation_engine.contracts.schemas import IssueType, VulnerabilityGroup
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.tools.code_map import (
     extract_imports,
     language_for_path,
@@ -104,18 +105,38 @@ def _collect_global_imports(repo_root: Path) -> set[str]:
     return global_imports
 
 
-def analyze_reachability(groups: list[VulnerabilityGroup], repo_root: str | Path) -> None:
+def analyze_reachability(
+    groups: list[VulnerabilityGroup],
+    repo_root: str | Path,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> None:
     """Mutate SCA groups in place with a deterministic reachability signal."""
     root = Path(repo_root).resolve()
     if not root.exists():
         logger.warning("Reachability: repo root does not exist: %s", root)
         return
 
+    maven_groups: set[int] = set()
+    if project_language == ProjectLanguage.JAVA:
+        for group in groups:
+            if group.issue_type != IssueType.SCA:
+                continue
+            if any(
+                (issue.ecosystem or "").strip().lower() == "maven"
+                or (issue.purl or "").strip().lower().startswith("pkg:maven/")
+                for issue in group.issues
+            ):
+                group.is_reachable = None
+                maven_groups.add(id(group))
+        if all(group.issue_type != IssueType.SCA or id(group) in maven_groups for group in groups):
+            return
+
     direct_deps = _load_direct_dependencies(root)
     global_imports = _collect_global_imports(root)
 
     for group in groups:
-        if group.issue_type != IssueType.SCA:
+        if group.issue_type != IssueType.SCA or id(group) in maven_groups:
             continue
 
         component = (group.vulnerable_component or "").strip()

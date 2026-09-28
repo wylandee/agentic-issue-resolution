@@ -182,6 +182,7 @@ class SCARemediationStage(StrEnum):
     OSV_MINIMUM = "osv_minimum"
     NPM_SAME_MAJOR = "npm_same_major"
     NPM_LATEST = "npm_latest"
+    MAVEN_LATEST = "maven_latest"
     PACKAGE_OVERRIDE = "package_override"
     CODE_WORKAROUND = "code_workaround"
 
@@ -681,7 +682,7 @@ class LocalizedIssue(BaseModel):
 
     # Manifest context (SCA)
     manifest_file: str | None = Field(
-        None, description="Repo-relative path to the resolved manifest / lockfile."
+        None, description="Repo-relative path to the resolved manifest / lockfile / POM."
     )
     is_direct_dependency: bool | None = Field(
         None,
@@ -697,9 +698,17 @@ class LocalizedIssue(BaseModel):
     )
     package_manager: str | None = Field(
         None,
-        description="Detected package manager (npm / yarn / pnpm) for the manifest.",
+        description="Detected package manager (npm / yarn / pnpm / maven) for the manifest.",
     )
 
+    version_property_name: str | None = Field(
+        None,
+        description="Maven property supplying the localized dependency version, when applicable.",
+    )
+    version_property_file: str | None = Field(
+        None,
+        description="Repository-relative POM owning the localized Maven version property.",
+    )
     # Dependency ancestry / parent-first transitive remediation context
     dependency_ancestry: list[str] = Field(
         default_factory=list,
@@ -716,7 +725,8 @@ class LocalizedIssue(BaseModel):
         None,
         description=(
             "Manifest declaration section for the localized leaf dependency "
-            "(dependencies, devDependencies, peerDependencies, or optionalDependencies)."
+            "(dependencies, devDependencies, peerDependencies, optionalDependencies, "
+            "or Maven dependencyManagement)."
         ),
     )
     parent_package_name: str | None = Field(
@@ -1819,6 +1829,10 @@ class TaskAttemptSnapshot(BaseModel):
     allowed_target_versions: list[str] = Field(default_factory=list)
     target_package_name: str | None = None
     target_dependency_type: str | None = None
+    target_manifest_paths: list[str] = Field(
+        default_factory=list,
+        description="Repository-relative Maven POM targets committed for this attempt.",
+    )
     allowed_dependency_types: list[str] = Field(default_factory=list)
     parent_minimum_version: str | None = None
     instruction: str = Field(..., min_length=1)

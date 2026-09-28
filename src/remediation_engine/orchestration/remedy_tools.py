@@ -7,8 +7,9 @@ workaround toolbelts used by current Phase 5 dispatches.
 
 from __future__ import annotations
 
-# These imports are the intentional compatibility surface for callers that
-# historically patched or imported tool factories from this facade.
+from remediation_engine.language import ProjectLanguage
+
+# Preserve the compatibility surface for callers that historically patched or imported factories here.
 from ._tool_support import (
     Any,
     DockerSandbox,
@@ -43,6 +44,7 @@ from .tools_manifest import (
     _PackageCheckpoint,
     rollback_pending_package_updates,
 )
+from .tools_manifest_java import _make_modify_and_validate_maven_dependency_tool
 from .tools_validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
@@ -73,13 +75,31 @@ def build_update_toolbelt(
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list:
-    """Build the strict update-only toolbelt."""
-    _normalize_manifest_targets(target_manifest_paths)
-    normalized_package_manifest_paths = _normalize_package_manifest_targets(package_manifest_paths)
+    """Build the strict update-only toolbelt for the resolved run language."""
+    allowed_manifest_names = (
+        ("pom.xml",) if project_language == ProjectLanguage.JAVA else ("package.json",)
+    )
+    _normalize_manifest_targets(target_manifest_paths, allowed_manifest_names)
+    normalized_package_manifest_paths = _normalize_package_manifest_targets(
+        package_manifest_paths,
+        allowed_manifest_names,
+    )
     if package_checkpoints is None:
         package_checkpoints = {}
-    toolbelt = [
+    if project_language == ProjectLanguage.JAVA:
+        return [
+            _make_modify_and_validate_maven_dependency_tool(
+                sandbox,
+                touched_files,
+                normalized_package_manifest_paths,
+                allowed_target_versions_by_package or {},
+                allowed_dependency_types_by_package or {},
+                execution_state=execution_state,
+            )
+        ]
+    return [
         _make_modify_and_validate_npm_dependency_tool(
             sandbox,
             touched_files,
@@ -89,9 +109,8 @@ def build_update_toolbelt(
             allowed_dependency_types_by_package=allowed_dependency_types_by_package,
             execution_state=execution_state,
             package_checkpoints=package_checkpoints,
-        ),
+        )
     ]
-    return toolbelt
 
 
 def build_workaround_toolbelt(
@@ -105,6 +124,7 @@ def build_workaround_toolbelt(
     no_fix_package_name: str | None = None,
     no_fix_manifest_paths: Sequence[str] | None = None,
     no_fix_package_manager: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list:
     """Build the strict workaround-only toolbelt.
 
@@ -143,8 +163,6 @@ def build_workaround_toolbelt(
     plan_state.setdefault("edit_records", [])
     plan_state.setdefault("web_search_performed", False)
     plan_state.setdefault("recorded", False)
-    # The real workaround toolbelt never permits a successful validation with
-    # an inferred smoke target or a skipped QA-targeted test.
     plan_state.setdefault("runtime_smoke_required", True)
     plan_state.setdefault("targeted_test_required", True)
 
@@ -158,20 +176,40 @@ def build_workaround_toolbelt(
         if effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
             plan_state["targeted_test_required"] = bool(preferred_test_files)
 
-    normalized_no_fix_manifests = _normalize_manifest_targets(no_fix_manifest_paths or [])
-    plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
-    plan_state.setdefault(
-        "no_fix_package_files",
-        sorted(
-            set(normalized_no_fix_manifests)
-            | {
-                path
-                for manifest in normalized_no_fix_manifests
-                for path in _package_checkpoint_paths([manifest])
-                if Path(path).name in {"package-lock.json", "npm-shrinkwrap.json"}
-            }
-        ),
-    )
+    if no_fix_package_manager:
+        package_manager = str(no_fix_package_manager).strip().lower()
+    else:
+        package_manager = "npm" if project_language != ProjectLanguage.JAVA else ""
+    if package_manager == "maven" and project_language != ProjectLanguage.JAVA:
+        raise ValueError("Maven package removal requires a Java project run.")
+    plan_state["no_fix_package_manager"] = package_manager
+    if package_manager == "maven":
+        allowed_manifest_names = ("pom.xml",)
+        normalized_no_fix_manifests = _normalize_manifest_targets(
+            no_fix_manifest_paths or [],
+            allowed_manifest_names=allowed_manifest_names,
+        )
+        plan_state["no_fix_manifest_paths"] = normalized_no_fix_manifests
+        plan_state["no_fix_package_files"] = normalized_no_fix_manifests.copy()
+    elif package_manager in {"npm", "yarn", "pnpm"}:
+        allowed_manifest_names = ("package.json",)
+        normalized_no_fix_manifests = _normalize_manifest_targets(
+            no_fix_manifest_paths or [],
+            allowed_manifest_names=allowed_manifest_names,
+        )
+        plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
+        package_files = set(normalized_no_fix_manifests)
+        package_files.update(
+            path
+            for manifest in normalized_no_fix_manifests
+            for path in _package_checkpoint_paths([manifest])
+            if Path(path).name in {"package-lock.json", "npm-shrinkwrap.json"}
+        )
+        plan_state.setdefault("no_fix_package_files", sorted(package_files))
+    else:
+        normalized_no_fix_manifests = []
+        plan_state["no_fix_manifest_paths"] = []
+        plan_state["no_fix_package_files"] = []
 
     toolbelt = [
         _make_record_plan_tool(plan_state),
@@ -191,8 +229,6 @@ def build_workaround_toolbelt(
         and no_fix_package_name
         and normalized_no_fix_manifests
     ):
-        # Keep this tool absent in every other stage. The worker cannot use a
-        # prompt trick to acquire manifest mutation capability.
         toolbelt.insert(
             1,
             _make_remove_no_fix_dependency_tool(
@@ -201,7 +237,7 @@ def build_workaround_toolbelt(
                 plan_state,
                 no_fix_package_name,
                 normalized_no_fix_manifests,
-                no_fix_package_manager or "",
+                package_manager,
             ),
         )
     return toolbelt

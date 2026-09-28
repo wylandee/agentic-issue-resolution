@@ -29,9 +29,11 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration._tool_support import (
     _detect_newline_style,
     _normalise_newlines,
+    _resolve_maven_manifest_scope,
     _restore_newlines,
 )
 from remediation_engine.orchestration.context_manager import ContextManager
@@ -46,6 +48,7 @@ from remediation_engine.orchestration.subagent_runtime import (
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
+    is_maven_group,
 )
 from remediation_engine.orchestration.tools_manifest import (
     _is_allowlisted_no_fix_package_file,
@@ -502,15 +505,32 @@ def _workaround_search_recommendation(
     if isinstance(no_fix_stage, NoFixMitigationStage):
         no_fix_stage = no_fix_stage.value
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+        is_maven = any(
+            str(getattr(issue, "package_manager", "") or "").strip().lower() == "maven"
+            for issue in getattr(target_group, "localized_issues", []) or []
+        )
+        if not is_maven:
+            is_maven = any(
+                str(getattr(getattr(issue, "issue", None), "ecosystem", "") or "").strip().lower()
+                == "maven"
+                for issue in getattr(target_group, "localized_issues", []) or []
+            )
         return _SearchQueryRecommendation(
             scenario="no_fix_package_removal",
             initial_query=_query_parts(
                 component,
-                "package.json manifest imports call sites",
+                (
+                    "authorized pom.xml direct Maven declaration and imports call sites"
+                    if is_maven
+                    else "package.json manifest imports call sites"
+                ),
                 "package removal",
             ),
             rationale=(
-                "Prioritize local manifests, imports, and call sites so the worker can "
+                "Prioritize the exact authorized POM, direct declaration, imports, and call sites "
+                "so the worker removes only the committed Maven GAV and dependent usage."
+                if is_maven
+                else "Prioritize local manifests, imports, and call sites so the worker can "
                 "remove only the authorized direct declaration and its dependent usage."
             ),
             follow_up_query="",
@@ -710,6 +730,58 @@ _WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
         _WORKAROUND_PROHIBITIONS,
     ]
 )
+_MAVEN_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS = """For NO_FIX PACKAGE_REMOVAL,
+record a package-removal plan with package_removal_requested=true. Put only the
+authorized pom.xml paths and affected source files in affected_files, and put
+only source replacements in planned_replacements; use an empty replacement list
+when removal is the only mutation. The public remove_no_fix_dependency tool
+accepts only the exact committed Maven group:artifact and an authorized POM, and
+removes only a direct <dependencies> declaration. Never edit XML manually or
+change dependencyManagement, parents, or BOMs. When source replacements are
+planned, both remove_no_fix_dependency and deterministic_apply_edit_set must
+each succeed before validate_workaround; either may be called first. A
+removal-only plan requires the removal transaction. Remove imports and dependent
+usage only when local inspection shows them. If no direct declaration exists,
+report NOT_APPLICABLE and surrender for vulnerable-code removal."""
+
+_MAVEN_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS = """For NO_FIX
+VULNERABLE_CODE_REMOVAL, keep the Maven dependency declared and perform a
+source-only removal of the vulnerable API and its callers. Never modify pom.xml,
+dependency versions, or test files."""
+
+_MAVEN_EDIT_CHECKPOINT_INSTRUCTIONS = """The workspace is the baseline plus
+previously validated or replayed edit sets. Each deterministic_apply_edit_set is
+provisional until validate_workaround returns PASS. CODE_FAILURE rolls back the
+whole pending set; the next plan must re-include every required change. PASS
+promotes it into the cumulative patch. INFRA_FAILURE or BLOCKED retains the
+pending set for recovery; never re-apply the same patch. Always report
+modified_files cumulatively."""
+
+_MAVEN_PROHIBITIONS = """Never modify tests to make assertions pass. Test and
+spec files are read-only and must not appear in record_plan affected_files or
+planned_replacements. Never manually edit pom.xml, guess dependency versions, or
+use absolute paths. Before source edits or package removal, call record_plan.
+For ordinary workarounds all manifests remain prohibited; only the committed
+Maven remove_no_fix_dependency transaction may change its authorized POMs during
+NO_FIX PACKAGE_REMOVAL."""
+
+
+def _workaround_static_instructions(project_language: ProjectLanguage) -> str:
+    """Return the existing Node prompt or its Maven no-fix-specific counterpart."""
+    if project_language != ProjectLanguage.JAVA:
+        return _WORKAROUND_STATIC_INSTRUCTIONS
+    return "\n\n".join(
+        [
+            _WORKAROUND_COMMON_STATIC_INSTRUCTIONS,
+            _WORKAROUND_INITIAL_MITIGATION_INSTRUCTIONS,
+            _WORKAROUND_QA_REGRESSION_REPAIR_INSTRUCTIONS,
+            _MAVEN_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS,
+            _MAVEN_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS,
+            _MAVEN_EDIT_CHECKPOINT_INSTRUCTIONS,
+            _WORKAROUND_VALIDATION_INSTRUCTIONS,
+            _MAVEN_PROHIBITIONS,
+        ]
+    )
 
 
 def _build_workaround_prompt(
@@ -720,6 +792,8 @@ def _build_workaround_prompt(
     current_replay_plan: WorkaroundReplayPlan | None = None,
     vulnerability_mechanism: str | None = None,
     workaround_context: WorkaroundContext | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    authorized_manifest_paths: Sequence[str] | None = None,
 ) -> str:
     """Build the dynamic human context for one workaround attempt."""
     constraints_ledger = list(constraints_ledger or [])
@@ -777,25 +851,40 @@ def _build_workaround_prompt(
     ]
 
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
-        manifest_paths = [
-            str(path).replace("\\", "/").lstrip("/")
-            for path in [
-                *(getattr(target_group, "file_paths", []) or []),
-                getattr(target_group, "file_path", None),
-                *(
-                    getattr(issue, "manifest_file", None)
-                    for issue in getattr(target_group, "localized_issues", []) or []
-                ),
+        if project_language == ProjectLanguage.JAVA:
+            manifest_paths = [
+                str(path).replace("\\", "/").lstrip("/")
+                for path in (authorized_manifest_paths or [])
+                if str(path).strip()
             ]
-            if str(path).strip()
-        ]
-        sections.extend(
-            [
-                "=== ACTIVE NO_FIX PACKAGE REMOVAL DATA ===",
-                f"Authorized manifest paths: {', '.join(dict.fromkeys(manifest_paths)) or 'none supplied'}",
-                f"Configured vulnerable package: {comp_name}",
+            sections.extend(
+                [
+                    "=== ACTIVE NO_FIX PACKAGE REMOVAL DATA ===",
+                    f"Authorized pom.xml paths: {', '.join(dict.fromkeys(manifest_paths)) or 'none supplied'}",
+                    f"Configured vulnerable Maven GAV: {comp_name}",
+                    "Only remove_no_fix_dependency may remove the exact direct <dependencies> declaration.",
+                ]
+            )
+        else:
+            manifest_paths = [
+                str(path).replace("\\", "/").lstrip("/")
+                for path in [
+                    *(getattr(target_group, "file_paths", []) or []),
+                    getattr(target_group, "file_path", None),
+                    *(
+                        getattr(issue, "manifest_file", None)
+                        for issue in getattr(target_group, "localized_issues", []) or []
+                    ),
+                ]
+                if str(path).strip()
             ]
-        )
+            sections.extend(
+                [
+                    "=== ACTIVE NO_FIX PACKAGE REMOVAL DATA ===",
+                    f"Authorized manifest paths: {', '.join(dict.fromkeys(manifest_paths)) or 'none supplied'}",
+                    f"Configured vulnerable package: {comp_name}",
+                ]
+            )
     elif no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
         sections.append("=== ACTIVE NO_FIX VULNERABLE-CODE REMOVAL DATA ===")
 
@@ -1112,6 +1201,15 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "changed_files": [],
             "errors": ["Workaround Subagent: target_task or target_group is missing from state."],
         }
+    language_value = state.get("project_language", ProjectLanguage.NODEJS)
+    try:
+        project_language = (
+            language_value
+            if isinstance(language_value, ProjectLanguage)
+            else ProjectLanguage(str(language_value))
+        )
+    except ValueError:
+        project_language = ProjectLanguage.NODEJS
 
     if ChatOpenAI is None:
         summaries = _build_surrender_summaries(
@@ -1164,8 +1262,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         # arrives before that reducer update is visible.
         replayed_edit_sets = []
 
+    sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
+    if project_language == ProjectLanguage.JAVA:
+        sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
+        sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+        with DockerSandbox(repo_root=None, **sandbox_options) as sandbox:
             # A replay plan's stage baseline is task-local. Restoring the
             # whole file from that baseline on every retry can erase a
             # different vulnerability group's already-validated edit when
@@ -1280,6 +1382,57 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 plan_state["require_authoritative_evidence"] = True
 
             qa_ev = workaround_ctx.qa_evidence if workaround_ctx else None
+            effective_no_fix_stage = (
+                getattr(workaround_ctx, "no_fix_stage", None)
+                if workaround_ctx is not None
+                else getattr(target_task, "no_fix_stage", None)
+            )
+            if isinstance(effective_no_fix_stage, NoFixMitigationStage):
+                effective_no_fix_stage = effective_no_fix_stage.value
+            package_manager = next(
+                (
+                    str(issue.package_manager).strip().lower()
+                    for issue in getattr(target_group, "localized_issues", []) or []
+                    if getattr(issue, "package_manager", None)
+                ),
+                None,
+            )
+            if package_manager is None:
+                package_manager = (
+                    "maven"
+                    if project_language == ProjectLanguage.JAVA
+                    and is_maven_group(target_group, project_language)
+                    else "npm"
+                    if project_language != ProjectLanguage.JAVA
+                    else ""
+                )
+            no_fix_package_manager = package_manager
+            no_fix_manifest_paths: list[str] = []
+            if effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+                if project_language == ProjectLanguage.JAVA and no_fix_package_manager == "maven":
+                    no_fix_manifest_paths, scope_errors = _resolve_maven_manifest_scope(
+                        target_group,
+                        repo_root,
+                    )
+                    if scope_errors:
+                        plan_state["maven_manifest_scope_errors"] = scope_errors
+                elif no_fix_package_manager in {"npm", "yarn", "pnpm"}:
+                    for candidate in [
+                        *(getattr(target_group, "file_paths", []) or []),
+                        getattr(target_group, "file_path", None),
+                        *(
+                            getattr(issue, "manifest_file", None)
+                            for issue in getattr(target_group, "localized_issues", []) or []
+                        ),
+                    ]:
+                        normalized = str(candidate or "").replace("\\", "/").lstrip("/")
+                        if (
+                            normalized
+                            and Path(normalized).name == "package.json"
+                            and normalized not in no_fix_manifest_paths
+                        ):
+                            no_fix_manifest_paths.append(normalized)
+
             prompt = _build_workaround_prompt(
                 target_task,
                 skinny_group,
@@ -1288,25 +1441,13 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 current_replay_plan,
                 vulnerability_mechanism=vulnerability_mechanism,
                 workaround_context=workaround_ctx,
+                project_language=project_language,
+                authorized_manifest_paths=no_fix_manifest_paths,
             )
             initial_messages = [
-                SystemMessage(content=_WORKAROUND_STATIC_INSTRUCTIONS),
+                SystemMessage(content=_workaround_static_instructions(project_language)),
                 HumanMessage(content=prompt),
             ]
-
-            no_fix_manifest_paths: list[str] = []
-            if getattr(target_task, "no_fix_stage", None) is not None:
-                for candidate in [
-                    *(getattr(target_group, "file_paths", []) or []),
-                    getattr(target_group, "file_path", None),
-                    *(
-                        getattr(issue, "manifest_file", None)
-                        for issue in getattr(target_group, "localized_issues", []) or []
-                    ),
-                ]:
-                    normalized = str(candidate or "").replace("\\", "/").lstrip("/")
-                    if normalized and normalized not in no_fix_manifest_paths:
-                        no_fix_manifest_paths.append(normalized)
 
             toolbelt = build_workaround_toolbelt(
                 sandbox,
@@ -1314,31 +1455,15 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 repo_root,
                 plan_state=plan_state,
                 preferred_test_files=_preferred_targeted_test_files(qa_ev),
-                no_fix_stage=(
-                    getattr(workaround_ctx, "no_fix_stage", None)
-                    if workaround_ctx is not None
-                    else getattr(target_task, "no_fix_stage", None)
-                ),
+                no_fix_stage=effective_no_fix_stage,
                 no_fix_package_name=(
                     getattr(target_group, "vulnerable_component", None)
-                    if getattr(target_task, "no_fix_stage", None) is not None
+                    if effective_no_fix_stage is not None
                     else None
                 ),
-                no_fix_manifest_paths=(
-                    no_fix_manifest_paths
-                    if getattr(target_task, "no_fix_stage", None) is not None
-                    else []
-                ),
-                no_fix_package_manager=(
-                    next(
-                        (
-                            issue.package_manager
-                            for issue in getattr(target_group, "localized_issues", []) or []
-                            if getattr(issue, "package_manager", None)
-                        ),
-                        "npm",
-                    )
-                ),
+                no_fix_manifest_paths=no_fix_manifest_paths,
+                no_fix_package_manager=no_fix_package_manager,
+                project_language=project_language,
             )
             context_manager = ContextManager(toolbelt)
             runtime = run_bounded_subagent_loop(

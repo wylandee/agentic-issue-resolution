@@ -1048,3 +1048,39 @@ class TestSampleODCReport:
         # JSONL has exactly one line per issue
         lines = (tmp_path / "out.jsonl").read_text().strip().split("\n")
         assert len(lines) == len(issues)
+
+
+def test_node_run_keeps_embedded_maven_purl_on_existing_npm_locator(tmp_path, monkeypatch):
+    import remediation_engine.tools.manifest_locator as locator_module
+    from remediation_engine.language import ProjectLanguage
+
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        package_name="commons-io:commons-io",
+        purl="pkg:maven/commons-io/commons-io@2.4",
+        ecosystem="maven",
+    )
+    observed = {}
+
+    def npm_locator(**kwargs):
+        observed.update(kwargs)
+        return {
+            "status": "success",
+            "manifest_file": tmp_path / "package.json",
+            "is_direct": True,
+            "line_number": 2,
+            "package_manager": "npm",
+        }
+
+    monkeypatch.setattr(locator_module, "locate_dependency", npm_locator)
+    localized = locate_from_issue(
+        issue,
+        tmp_path,
+        project_language=ProjectLanguage.NODEJS,
+    )
+
+    assert observed["raw_dependency_name"] == "commons-io:commons-io"
+    assert localized.package_manager == PackageManagerKind.NPM
+    assert localized.manifest_file == "package.json"

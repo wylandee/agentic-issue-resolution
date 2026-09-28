@@ -44,6 +44,25 @@ from remediation_engine.tools.lockfile_closure import (
     build_sliced_lockfile_artifacts,
     resolve_dependency_closure,
 )
+from remediation_engine.tools.maven_manifest_locator import (
+    MavenManifestError,
+    _canonical_gav,
+    _parse_xml_source,
+    _profile_has_target,
+    _raw_properties,
+)
+from remediation_engine.tools.maven_manifest_locator import (
+    _child as _maven_child,
+)
+from remediation_engine.tools.maven_manifest_locator import (
+    _children as _maven_children,
+)
+from remediation_engine.tools.maven_manifest_locator import (
+    _resolve as _resolve_maven_value,
+)
+from remediation_engine.tools.maven_manifest_locator import (
+    _text as _maven_text,
+)
 
 from ._tool_support import _run_readonly
 from .qa_odc import _ODC_HTML_REPORT_NAME, _ODC_REPORT_NAME
@@ -78,6 +97,7 @@ _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 _QA_ACTION_SUMMARY_MAX_CHARS = 1_200
 _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
+_MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
 
 
 def _label_scan_records(
@@ -643,7 +663,7 @@ def _lockfile_versions(value: Any, package: str) -> set[str]:
 
 
 def _manifest_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
-    """Return normalized package.json paths associated with an SCA group."""
+    """Return normalized package manifests authorized by one SCA group."""
     candidates = [
         *(getattr(group, "file_paths", []) or []),
         getattr(group, "file_path", None),
@@ -651,8 +671,28 @@ def _manifest_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
             getattr(issue, "manifest_file", None)
             for issue in (getattr(group, "localized_issues", []) or [])
         ),
+        *(
+            getattr(issue, "version_property_file", None)
+            for issue in (getattr(group, "localized_issues", []) or [])
+        ),
     ]
+    managers = {
+        (getattr(issue, "package_manager", "") or "").strip().lower()
+        for issue in (getattr(group, "localized_issues", []) or [])
+        if (getattr(issue, "package_manager", "") or "").strip()
+    }
     manifests: set[str] = set()
+    if managers == {"maven"}:
+        for raw_path in candidates:
+            raw = str(raw_path or "").strip().split("?", 1)[0].split("#", 1)[0]
+            try:
+                path = _validate_qa_path(raw.replace("\\", "/"))
+            except (ValueError, WorkspacePathError):
+                continue
+            if Path(path).name.casefold() == "pom.xml":
+                manifests.add(path)
+        return tuple(sorted(manifests))
+
     lockfile_names = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}
     for raw_path in candidates:
         path = str(raw_path or "").strip().split("?", 1)[0].split("#", 1)[0]
@@ -841,6 +881,200 @@ def _collect_dependency_package_state(
     )
 
 
+def _maven_coordinates_for_group(group: VulnerabilityGroup) -> tuple[str, str] | None:
+    """Return one canonical Maven group:artifact identity for a group."""
+    coordinates: set[tuple[str, str]] = set()
+    saw_maven_issue = False
+    for localized in group.localized_issues:
+        if (getattr(localized, "package_manager", "") or "").strip().lower() != "maven":
+            continue
+        saw_maven_issue = True
+        coordinate = _canonical_gav(localized.issue)
+        if coordinate is None:
+            return None
+        coordinates.add(coordinate)
+    if not saw_maven_issue or len(coordinates) != 1:
+        return None
+    return next(iter(coordinates))
+
+
+def _maven_direct_dependency_present(
+    source: str,
+    group_id: str,
+    artifact_id: str,
+) -> bool:
+    """Safely determine whether a POM declares the exact direct Maven GAV."""
+    root = _parse_xml_source(source)
+    values = _raw_properties(root)
+    parent = _maven_child(root, "parent")
+    parent_group = _resolve_maven_value(_maven_text(_maven_child(parent, "groupId")), values)
+    parent_artifact = _resolve_maven_value(_maven_text(_maven_child(parent, "artifactId")), values)
+    project_group = _resolve_maven_value(
+        _maven_text(_maven_child(root, "groupId")) or parent_group,
+        values,
+    )
+    project_artifact = _resolve_maven_value(
+        _maven_text(_maven_child(root, "artifactId")),
+        values,
+    )
+    values.update(
+        {
+            "project.groupId": project_group or "",
+            "pom.groupId": project_group or "",
+            "project.artifactId": project_artifact or "",
+            "pom.artifactId": project_artifact or "",
+            "project.parent.groupId": parent_group or "",
+            "pom.parent.groupId": parent_group or "",
+            "project.parent.artifactId": parent_artifact or "",
+            "pom.parent.artifactId": parent_artifact or "",
+        }
+    )
+    if _profile_has_target(root, group_id, artifact_id, values, project_group):
+        return True
+
+    matches = 0
+    for dependencies in _maven_children(root, "dependencies"):
+        for dependency in _maven_children(dependencies, "dependency"):
+            declared_group = _resolve_maven_value(
+                _maven_text(_maven_child(dependency, "groupId")) or project_group,
+                values,
+            )
+            declared_artifact = _resolve_maven_value(
+                _maven_text(_maven_child(dependency, "artifactId")),
+                values,
+            )
+            if declared_group is None or declared_artifact is None:
+                raise MavenManifestError("unresolved Maven dependency coordinates")
+            if declared_group != group_id or declared_artifact != artifact_id:
+                continue
+            if _maven_text(_maven_child(dependency, "classifier")) or _maven_text(
+                _maven_child(dependency, "type")
+            ):
+                raise MavenManifestError("classifier/type Maven declaration is ambiguous")
+            matches += 1
+    if matches > 1:
+        raise MavenManifestError("duplicate Maven group:artifact declaration")
+    return matches > 0
+
+
+_MAVEN_TREE_COORDINATE_RE = re.compile(
+    r"^\s*\[INFO\]\s+(?:(?:\|  )*(?:\+-|\\-)\s+)"
+    r"(?P<group>[^:\s]+):(?P<artifact>[^:\s]+):"
+    r"(?P<type>[^:\s]+):(?P<version>[^:\s]+):(?P<scope>[^:\s]+)(?:\s|$)",
+    re.MULTILINE,
+)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _maven_dependency_tree_state(
+    output: str,
+    group_id: str,
+    artifact_id: str,
+) -> str:
+    """Classify complete Maven text dependency-tree output for one exact GA."""
+    plain_output = _ANSI_ESCAPE_RE.sub("", output)
+    has_goal_marker = bool(
+        re.search(r"maven-dependency-plugin[^\n]*:tree|dependency:tree", plain_output)
+    )
+    coordinates = list(_MAVEN_TREE_COORDINATE_RE.finditer(plain_output))
+    no_dependencies = bool(
+        re.search(
+            r"^\s*\[INFO\]\s+No dependencies(?: found)?\.?\s*$",
+            plain_output,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+    if not has_goal_marker or (not coordinates and not no_dependencies):
+        return "unknown"
+    return (
+        "present"
+        if any(
+            match.group("group") == group_id and match.group("artifact") == artifact_id
+            for match in coordinates
+        )
+        else "absent"
+    )
+
+
+def _collect_maven_group_package_state(
+    sandbox: DockerSandbox,
+    group: VulnerabilityGroup,
+    manifests: Sequence[str],
+    package: str,
+) -> _QAPackageState:
+    """Collect direct-POM and resolved-tree evidence for an authorized Maven target."""
+    coordinate = _maven_coordinates_for_group(group)
+    if (
+        coordinate is None
+        or package != ":".join(coordinate)
+        or not manifests
+        or any(Path(manifest).name.casefold() != "pom.xml" for manifest in manifests)
+    ):
+        diagnostic = "Canonical Maven coordinates or authorized pom.xml paths are unavailable."
+        return _QAPackageState(
+            manifest_state="unknown",
+            graph_state="unknown",
+            diagnostics=(diagnostic,),
+        )
+
+    group_id, artifact_id = coordinate
+    manifest_states: list[str] = []
+    graph_states: list[str] = []
+    diagnostics: list[str] = []
+    for manifest in manifests:
+        try:
+            source = sandbox.read_file(manifest)
+            if not isinstance(source, str) or not source.strip():
+                raise MavenManifestError("authorized POM is unavailable")
+            direct_present = _maven_direct_dependency_present(source, group_id, artifact_id)
+            manifest_states.append("present" if direct_present else "absent")
+        except Exception as exc:  # noqa: BLE001
+            manifest_states.append("unknown")
+            diagnostics.append(f"Maven POM inspection failed for {manifest}: {exc}")
+
+        cwd_path = Path(manifest).parent
+        cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
+        prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+        command = f"{prefix}mvn -B -DoutputType=text dependency:tree"
+        try:
+            command_result = _run_readonly(
+                sandbox,
+                command,
+                timeout=_MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS,
+            )
+            if getattr(command_result, "exit_code", None) != 0:
+                raise RuntimeError(
+                    f"Maven dependency:tree exited with "
+                    f"{getattr(command_result, 'exit_code', None)}"
+                )
+            output = "\n".join(
+                str(getattr(command_result, stream, "") or "") for stream in ("stdout", "stderr")
+            )
+            tree_state = _maven_dependency_tree_state(output, group_id, artifact_id)
+            if tree_state == "unknown":
+                raise RuntimeError("Maven dependency:tree output was incomplete or unparseable")
+            graph_states.append(tree_state)
+        except Exception as exc:  # noqa: BLE001
+            graph_states.append("unknown")
+            diagnostics.append(f"Maven dependency graph inspection failed for {manifest}: {exc}")
+
+    manifest_state = (
+        "unknown"
+        if "unknown" in manifest_states
+        else ("present" if "present" in manifest_states else "absent")
+    )
+    graph_state = (
+        "unknown"
+        if "unknown" in manifest_states or "unknown" in graph_states or not graph_states
+        else ("present" if "present" in graph_states else "absent")
+    )
+    return _QAPackageState(
+        manifest_state=manifest_state,
+        graph_state=graph_state,
+        diagnostics=tuple(diagnostics),
+    )
+
+
 def _collect_group_package_state(
     sandbox: DockerSandbox,
     group: VulnerabilityGroup,
@@ -898,6 +1132,8 @@ def _collect_group_package_state(
             version_evidence_inconclusive=version_evidence_inconclusive,
         )
 
+    if managers == {"maven"}:
+        return _collect_maven_group_package_state(sandbox, group, manifests, package)
     if managers != {"npm"}:
         manager_text = ", ".join(sorted(managers)) if managers else "unknown"
         return _QAPackageState(

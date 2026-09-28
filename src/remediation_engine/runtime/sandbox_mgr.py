@@ -188,20 +188,24 @@ def _workspace_snapshot_archive(snapshot_id: str) -> str:
     return f"/workspace/{_WORKSPACE_SNAPSHOT_DIR}/{snapshot_id}/workspace.tar.gz"
 
 
-def _make_tar_archive(repo_root: Path) -> bytes:
+def _make_tar_archive(
+    repo_root: Path,
+    excluded_dirs: frozenset[str] = frozenset(),
+) -> bytes:
     """
     Create an in-memory tar archive of *repo_root* without dereferencing
     symlinks.
 
-    ``.git`` and ``node_modules`` directories are skipped to avoid streaming
-    large or host-specific data into the Docker daemon.
+    ``.git`` and ``node_modules`` directories are always skipped. Additional
+    language-specific directory names may be excluded by the caller.
     """
     repo_root = repo_root.resolve()
     buf = io.BytesIO()
+    skipped_dirs = _SKIP_DIR_NAMES | excluded_dirs
 
     with tarfile.open(fileobj=buf, mode="w", dereference=False) as tf:
         for dirpath, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
-            dirnames[:] = sorted(dirname for dirname in dirnames if dirname not in _SKIP_DIR_NAMES)
+            dirnames[:] = sorted(dirname for dirname in dirnames if dirname not in skipped_dirs)
 
             current_dir = Path(dirpath)
             rel_dir = current_dir.relative_to(repo_root)
@@ -238,6 +242,11 @@ class DockerSandbox:
         Docker image to use. Defaults to ``node:22``.
     workspace_volume:
         Optional Docker named volume to mount at ``/workspace``.
+    maven_repository_volume:
+        Optional run-owned Maven repository volume mounted at
+        ``/root/.m2/repository``.
+    archive_excluded_dirs:
+        Additional directory names omitted from the initial repository archive.
     """
 
     def __init__(
@@ -246,6 +255,8 @@ class DockerSandbox:
         image: str = _DEFAULT_IMAGE,
         workspace_volume: str | None = None,
         read_cache: WorkspaceReadCache | None = None,
+        maven_repository_volume: str | None = None,
+        archive_excluded_dirs: frozenset[str] = frozenset(),
     ) -> None:
         """Initialize an unopened sandbox configuration.
 
@@ -256,10 +267,18 @@ class DockerSandbox:
                 ``/workspace``.
             read_cache: Optional attempt-scoped cache shared by nested
                 workspace readers. A private cache is created when omitted.
+            maven_repository_volume: Optional named volume mounted at
+                ``/root/.m2/repository``.
+            archive_excluded_dirs: Additional directory names omitted from
+                the initial repository archive.
         """
+        if maven_repository_volume and maven_repository_volume == workspace_volume:
+            raise ValueError("The Maven repository and workspace volumes must be distinct.")
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._image = image
         self._workspace_volume = workspace_volume
+        self._maven_repository_volume = maven_repository_volume
+        self._archive_excluded_dirs = archive_excluded_dirs
         self._container_name = f"sandbox-{uuid.uuid4().hex[:12]}"
         self._container = None
         self._client = None
@@ -308,10 +327,16 @@ class DockerSandbox:
                 "tty": False,
                 "network_mode": "bridge",
             }
+            volumes = {}
             if self._workspace_volume:
-                run_kwargs["volumes"] = {
-                    self._workspace_volume: {"bind": "/workspace", "mode": "rw"}
+                volumes[self._workspace_volume] = {"bind": "/workspace", "mode": "rw"}
+            if self._maven_repository_volume:
+                volumes[self._maven_repository_volume] = {
+                    "bind": "/root/.m2/repository",
+                    "mode": "rw",
                 }
+            if volumes:
+                run_kwargs["volumes"] = volumes
 
             logger.info(
                 "DockerSandbox: starting container %r from image %r.",
@@ -334,7 +359,7 @@ class DockerSandbox:
 
             if self._repo_root is not None:
                 logger.info("DockerSandbox: copying %s into container /workspace.", self._repo_root)
-                archive = _make_tar_archive(self._repo_root)
+                archive = _make_tar_archive(self._repo_root, self._archive_excluded_dirs)
                 self._container.put_archive("/workspace", archive)
                 logger.info("DockerSandbox: repository copied; sandbox ready.")
             else:

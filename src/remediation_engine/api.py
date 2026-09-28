@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contracts.schemas import SystemContext, VulnerabilityGroup, VulnerabilityIssue
+from .language import ProjectLanguage, resolve_project_language
 from .orchestration.graph import run_orchestrator
 from .orchestration.task_utils import terminal_outcome_issues
 from .settings import AppSettings
@@ -59,6 +60,36 @@ class RemediationResult(BaseModel):
     raw_state: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
+def _effective_system_context(
+    system_context: SystemContext | None,
+    repo_root: Path | None,
+) -> SystemContext:
+    """Return a caller-preserving context with one resolved project language."""
+    context = (
+        system_context
+        if system_context is not None
+        else SystemContext(
+            public_facing=True,
+            deployment_os="linux",
+            deployment_architecture="containerized",
+            environment="production",
+        )
+    )
+    requested_language = context.primary_language
+    if repo_root is None and (
+        requested_language is None or requested_language.strip().lower() == "auto"
+    ):
+        # Triage without a repository retains the historical Node.js fallback.
+        requested_language = ProjectLanguage.NODEJS.value
+    language = resolve_project_language(
+        repo_root or Path("."),
+        requested_language,
+    )
+    if context.primary_language is not None and context.primary_language.strip().lower() != "auto":
+        return context
+    return context.model_copy(update={"primary_language": language.value})
+
+
 def triage_issues(
     issues: list[VulnerabilityIssue],
     *,
@@ -78,13 +109,7 @@ def triage_issues(
         Groups whose triage verdict is actionable.
     """
     resolved_settings = settings or AppSettings.from_env()
-    context = system_context or SystemContext(
-        public_facing=True,
-        deployment_os="linux",
-        deployment_architecture="containerized",
-        environment="production",
-        primary_language="javascript/nodejs",
-    )
+    context = _effective_system_context(system_context, repo_root)
     results = run_triage_pipeline(
         issues,
         context,
@@ -115,16 +140,13 @@ def run_remediation(
         through the in-memory model and is excluded from serialization.
     """
     resolved_settings = settings or AppSettings.from_env()
-    # Initial triage belongs to the graph's ``initial_triage`` node.  Passing
-    # an empty group list is intentional: it tells the graph to triage the
-    # supplied issue set exactly once instead of performing a hidden
-    # preprocessing pass here and then reporting ``triage_skipped``.
+    context = _effective_system_context(request.system_context, request.repo_root)
     groups = list(request.valid_groups)
     orchestrator_kwargs: dict[str, Any] = {
         "repo_root": str(request.repo_root),
         "valid_groups": groups,
         "issues": request.issues,
-        "system_context": request.system_context,
+        "system_context": context,
         "settings": resolved_settings,
     }
     state = run_orchestrator(**orchestrator_kwargs)

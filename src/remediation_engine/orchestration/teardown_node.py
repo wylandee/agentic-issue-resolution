@@ -114,7 +114,7 @@ def _container_label(container: Any) -> str:
 
 
 def _force_remove_attached_container(container: Any) -> str | None:
-    """Remove one container attached to the run-owned workspace volume.
+    """Remove one container attached to a run-owned Docker volume.
 
     Args:
         container: Docker SDK container object to remove.
@@ -150,20 +150,12 @@ def _force_remove_attached_container(container: Any) -> str | None:
             return f"container '{label}' removal failed: {retry_error}"
 
 
-def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool, list[str]]:
-    """Remove attached containers before deleting a workspace volume.
-
-    Args:
-        client: Connected Docker SDK client.
-        workspace_volume: Engine-owned named volume to clean up.
-
-    Returns:
-        A removed flag and cleanup errors for the final report.
-
-    Side Effects:
-        Lists all containers attached to the volume, force-removes them, and
-        retries volume removal when the Docker daemon reports a 409 conflict.
-    """
+def _cleanup_named_volume(
+    client: Any,
+    volume_name: str,
+    volume_kind: str,
+) -> tuple[bool, list[str]]:
+    """Remove attached containers before deleting one run-owned volume."""
     errors: list[str] = []
     volume_error: BaseException | None = None
 
@@ -172,14 +164,14 @@ def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool,
             attached = list(
                 client.containers.list(
                     all=True,
-                    filters={"volume": workspace_volume},
+                    filters={"volume": volume_name},
                 )
                 or []
             )
         except Exception as exc:  # noqa: BLE001
             attached = []
             errors.append(
-                f"teardown_node: failed to list containers attached to '{workspace_volume}' - {exc}"
+                f"teardown_node: failed to list containers attached to '{volume_name}' - {exc}"
             )
 
         for container in attached:
@@ -188,7 +180,7 @@ def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool,
                 errors.append(f"teardown_node: {cleanup_error}")
 
         try:
-            client.volumes.get(workspace_volume).remove(force=True)
+            client.volumes.get(volume_name).remove(force=True)
             return True, errors
         except Exception as exc:  # noqa: BLE001
             if _docker_not_found(exc):
@@ -201,9 +193,54 @@ def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool,
 
     if volume_error is not None:
         errors.append(
-            f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {volume_error}"
+            f"teardown_node: failed to remove {volume_kind} volume '{volume_name}' - {volume_error}"
         )
     return False, errors
+
+
+def _cleanup_run_volumes(
+    workspace_volume: str | None,
+    maven_cache_volume: str | None,
+) -> tuple[bool, bool, list[str]]:
+    """Attempt cleanup of both run-owned volumes and report live survivors."""
+    workspace_removed = not bool(workspace_volume)
+    maven_cache_removed = not bool(maven_cache_volume)
+    volumes = [
+        (workspace_volume, "workspace"),
+        (maven_cache_volume, "Maven cache"),
+    ]
+    owned_volumes = [(name, kind) for name, kind in volumes if name]
+    if not owned_volumes:
+        return workspace_removed, maven_cache_removed, []
+
+    errors: list[str] = []
+    client = None
+    try:
+        client = get_docker_client()
+    except Exception as exc:  # noqa: BLE001
+        for name, kind in owned_volumes:
+            errors.append(f"teardown_node: failed to remove {kind} volume '{name}' - {exc}")
+        return workspace_removed, maven_cache_removed, errors
+
+    try:
+        for name, kind in owned_volumes:
+            try:
+                removed, cleanup_errors = _cleanup_named_volume(client, name, kind)
+                errors.extend(cleanup_errors)
+            except Exception as exc:  # noqa: BLE001
+                removed = False
+                errors.append(f"teardown_node: failed to remove {kind} volume '{name}' - {exc}")
+            if kind == "workspace":
+                workspace_removed = removed
+            else:
+                maven_cache_removed = removed
+    finally:
+        try:
+            _close_client(client)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"teardown_node: Docker client close failed - {exc}")
+
+    return workspace_removed, maven_cache_removed, errors
 
 
 def _revert_unfixable_packages_in_json(
@@ -290,24 +327,32 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         state: Current Phase 5 orchestration state.
 
     Returns:
-        A state update containing the diff, cleanup diagnostics, and the
-        workspace volume name when cleanup could not complete.
+        A state update containing the diff, cleanup diagnostics, and any
+        run-owned volume names whose removal could not complete.
 
     Side Effects:
         Reads changed files from the Docker workspace and attempts to remove
-        attached containers and the run-owned workspace volume.
+        attached containers and both run-owned volumes.
     """
     try:
         return _run_teardown_node_impl(state)
     except Exception as exc:  # noqa: BLE001
         logger.exception("teardown_node: unexpected teardown failure.")
+        workspace_removed, maven_cache_removed, cleanup_errors = _cleanup_run_volumes(
+            state.get("workspace_volume"),
+            state.get("maven_cache_volume"),
+        )
         return {
             "status": "completed_with_errors",
-            "workspace_volume": state.get("workspace_volume"),
+            "workspace_volume": (None if workspace_removed else state.get("workspace_volume")),
+            "maven_cache_volume": (
+                None if maven_cache_removed else state.get("maven_cache_volume")
+            ),
             "changed_files": ChangedFilesProjection(),
             "diff": "",
             "errors": list(state.get("errors", []) or [])
-            + [f"teardown_node: unexpected teardown failure - {exc}"],
+            + [f"teardown_node: unexpected teardown failure - {exc}"]
+            + cleanup_errors,
         }
 
 
@@ -338,6 +383,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
     }
     repo_root_str: str = state.get("repo_root", "")
     workspace_volume: str | None = state.get("workspace_volume")
+    maven_cache_volume: str | None = state.get("maven_cache_volume")
     diff_chunks: list[str] = []
     errors: list[str] = []
     changed_files: list[str] = []
@@ -354,8 +400,6 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
             errors.append(f"teardown_node: blocked changed-file path '{raw_path}' - {exc}")
             continue
         normalized_changed_files.add(safe_path)
-    client = None
-    volume_removed = not bool(workspace_volume)
 
     task_queue = state.get("task_queue", {})
     valid_groups = state.get("valid_groups", [])
@@ -505,31 +549,27 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                     logger.exception("teardown_node: diff extraction failed.")
                     errors.append(msg)
     finally:
+        workspace_removed, maven_cache_removed, cleanup_errors = _cleanup_run_volumes(
+            workspace_volume,
+            maven_cache_volume,
+        )
+        errors.extend(cleanup_errors)
         if workspace_volume:
-            try:
-                client = get_docker_client()
-                volume_removed, cleanup_errors = _cleanup_workspace_volume(client, workspace_volume)
-                errors.extend(cleanup_errors)
-                if volume_removed:
-                    logger.info("teardown_node: removed workspace volume %s.", workspace_volume)
-                else:
-                    logger.error(
-                        "teardown_node: workspace volume %s remains after cleanup.",
-                        workspace_volume,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                msg = (
-                    f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {exc}"
+            if workspace_removed:
+                logger.info("teardown_node: removed workspace volume %s.", workspace_volume)
+            else:
+                logger.error(
+                    "teardown_node: workspace volume %s remains after cleanup.",
+                    workspace_volume,
                 )
-                logger.exception("teardown_node: workspace volume cleanup failed.")
-                errors.append(msg)
-            finally:
-                if client is not None:
-                    try:
-                        _close_client(client)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"teardown_node: Docker client close failed - {exc}")
-
+        if maven_cache_volume:
+            if maven_cache_removed:
+                logger.info("teardown_node: removed Maven cache volume %s.", maven_cache_volume)
+            else:
+                logger.error(
+                    "teardown_node: Maven cache volume %s remains after cleanup.",
+                    maven_cache_volume,
+                )
     outcome_issues = terminal_outcome_issues(
         {
             **state,
@@ -546,7 +586,8 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
     result: dict[str, Any] = {
         **barrier_state,
         "status": "completed_with_errors" if terminal_has_errors else "completed",
-        "workspace_volume": None if volume_removed else workspace_volume,
+        "workspace_volume": None if workspace_removed else workspace_volume,
+        "maven_cache_volume": None if maven_cache_removed else maven_cache_volume,
         "changed_files": ChangedFilesProjection(changed_files),
         "diff": "".join(diff_chunks),
     }

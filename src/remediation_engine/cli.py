@@ -98,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=("auto", "odc-json", "semgrep-json", "jsonl"), default="auto"
     )
     triage.add_argument("--repo", type=Path)
+    triage.add_argument("--language", choices=("auto", "nodejs", "java"), default="auto")
     triage.add_argument("--output", type=Path)
     run = sub.add_parser("run", help="run remediation and emit a patch result")
     run.add_argument("input", type=Path)
@@ -107,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--output", type=Path)
     run.add_argument("--patch-out", type=Path)
+    run.add_argument("--language", choices=("auto", "nodejs", "java"), default="auto")
     run.add_argument("--report-out", type=Path)
     return parser
 
@@ -130,7 +132,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_jsonl(args.output, [issue.model_dump(mode="json") for issue in issues])
             return 0
         if args.command == "triage":
-            groups = triage_issues(issues, repo_root=args.repo, settings=settings)
+            groups = triage_issues(
+                issues,
+                repo_root=args.repo,
+                system_context=SystemContext(
+                    public_facing=True,
+                    deployment_os="linux",
+                    deployment_architecture="containerized",
+                    environment="production",
+                    primary_language=args.language,
+                ),
+                settings=settings,
+            )
             _write_json(args.output, [group.model_dump(mode="json") for group in groups])
             return 0
         request = RemediationRequest(
@@ -142,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 deployment_os="linux",
                 deployment_architecture="containerized",
                 environment="production",
-                primary_language="javascript/nodejs",
+                primary_language=args.language,
             ),
         )
         result = run_remediation(request, settings=settings)

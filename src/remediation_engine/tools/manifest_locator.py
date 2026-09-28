@@ -45,11 +45,13 @@ from remediation_engine.contracts import (
 from remediation_engine.contracts.schemas import (
     CWEEntry,  # noqa: F401 â€” re-exported for convenience
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
     repository_relative_path,
     resolve_repository_path,
 )
+from remediation_engine.tools.maven_manifest_locator import locate_maven_from_issue
 from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
@@ -819,6 +821,8 @@ def locate_dependency(
 def locate_from_issue(
     issue: VulnerabilityIssue,
     repo_path: Path,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> LocalizedIssue:
     """
     High-level entry point: accept a typed ``VulnerabilityIssue``, run the
@@ -826,11 +830,16 @@ def locate_from_issue(
 
     No OSV enrichment or fix-instruction generation is performed here.
     """
+    if project_language == ProjectLanguage.JAVA and (
+        (issue.ecosystem or "").strip().lower() == "maven"
+        or (issue.purl or "").strip().lower().startswith("pkg:maven/")
+    ):
+        return locate_maven_from_issue(issue, repo_path)
+
     raw_name = issue.package_name or ""
     odc_file_path = issue.file_path or ""
     raw_payload = issue.raw_payload or {}
     odc_file_path = odc_file_path or raw_payload.get("filePath", "")
-
     result = locate_dependency(
         repo_path=repo_path,
         raw_dependency_name=raw_name,

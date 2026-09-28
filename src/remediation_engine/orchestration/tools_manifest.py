@@ -23,6 +23,7 @@ from ._tool_support import (
     shlex,
     tool,
 )
+from .tools_manifest_java import _remove_maven_no_fix_dependency_transaction
 
 
 @dataclass
@@ -467,21 +468,26 @@ def _is_allowlisted_no_fix_package_file(
     rel_path: str,
     plan_state: Mapping[str, Any] | None,
 ) -> bool:
-    """Return whether a manifest/lockfile is allowed by scoped NO_FIX removal."""
+    """Return whether a package-manager manifest file is allowed in committed removal."""
     if (
         not plan_state
         or plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value
+        or not plan_state.get("package_removal_planned", False)
     ):
         return False
-    if not plan_state.get("package_removal_planned", False):
-        return False
     normalized = rel_path.replace("\\", "/").lstrip("/")
+    manager = str(plan_state.get("no_fix_package_manager", "npm") or "").strip().lower()
+    if manager == "maven":
+        allowlisted_poms = {
+            str(path).replace("\\", "/").lstrip("/")
+            for path in plan_state.get("no_fix_manifest_paths", [])
+        }
+        return Path(normalized).name == "pom.xml" and normalized in allowlisted_poms
     allowlisted = {
         str(path).replace("\\", "/").lstrip("/")
         for path in plan_state.get("no_fix_package_files", [])
     }
-    # The validation contract names the complete manifest/lockfile set even
-    # when npm leaves one of those files byte-for-byte unchanged.
+    # The Node contract names package.json and the complete related lockfile set.
     return normalized in allowlisted
 
 
@@ -515,15 +521,35 @@ def _make_remove_no_fix_dependency_tool(
     manifest_paths: Sequence[str],
     package_manager: str,
 ):
-    """Build the allowlisted package-removal operation for a NO_FIX attempt.
-
-    The operation intentionally supports only npm at present. Unsupported
-    managers fail closed instead of falling back to direct lockfile edits.
-    """
+    """Build the allowlisted package-removal operation for a NO_FIX attempt."""
     normalized_package = str(package_name or "").strip()
-    normalized_manifests = _normalize_manifest_targets(manifest_paths)
     manager = str(package_manager or "").strip().lower()
+    allowed_manifest_names = ("pom.xml",) if manager == "maven" else ("package.json",)
+    normalized_manifests = _normalize_manifest_targets(
+        manifest_paths,
+        allowed_manifest_names=allowed_manifest_names,
+    )
     checkpoint: _PackageCheckpoint | None = None
+
+    if manager == "maven":
+
+        @tool
+        def remove_no_fix_dependency(
+            requested_package: str,
+            manifest_path: str,
+        ) -> str:
+            """Remove only the configured direct Maven dependency transactionally."""
+            return _remove_maven_no_fix_dependency_transaction(
+                sandbox,
+                touched_files,
+                plan_state,
+                normalized_package,
+                normalized_manifests,
+                requested_package,
+                manifest_path,
+            )
+
+        return remove_no_fix_dependency
 
     @tool
     def remove_no_fix_dependency(

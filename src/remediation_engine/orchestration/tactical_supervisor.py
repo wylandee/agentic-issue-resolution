@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cmp_to_key
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -38,7 +39,14 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     WorkerAttemptResult,
 )
-from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.contracts.version_policy import (
+    MavenRegistryCandidate,
+    RegistryCandidate,
+    compare_maven_versions,
+    is_stable_maven_version,
+    select_maven_version,
+)
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.supervisor_planner import (
     _registry_report_versions,
@@ -47,7 +55,11 @@ from remediation_engine.orchestration.supervisor_planner import (
     _supervisor_plan_npm_parent_version,
 )
 from remediation_engine.orchestration.supervisor_policy import _canonical_security_floor
-from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
+from remediation_engine.orchestration.task_utils import (
+    group_parent_context,
+    is_maven_group,
+    is_transitive_group,
+)
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
 
@@ -88,7 +100,14 @@ _MAX_LIST_ITEMS = 10
 _MAX_CANDIDATES = 3
 _MAX_DIAGNOSTIC_BASIS_CHARS = 1200
 _FORBIDDEN_WORKAROUND_TARGET_BASENAMES = frozenset(
-    {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}
+    {
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pom.xml",
+    }
 )
 
 
@@ -182,6 +201,7 @@ class TacticalCandidateSet:
     versions: tuple[str, ...] = ()
     canonical_version: str | None = None
     peer_compatible: bool = True
+    approved_version_pool: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,6 +234,7 @@ class TacticalDiagnosticContext:
     candidate_sets: tuple[TacticalCandidateSet, ...] = ()
     remaining_scanner_identifiers: tuple[str, ...] = ()
     dependency_evidence: Any = None
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS
     repair_feedback: str | None = None
 
 
@@ -230,6 +251,7 @@ class TacticalVerification:
     instruction: str | None = None
     allowed_target_versions: tuple[str, ...] = ()
     allowed_dependency_types: tuple[str, ...] = ()
+    approved_candidate_versions: tuple[str, ...] = ()
 
 
 def _clean(value: Any, *, limit: int = _MAX_CONTEXT_CHARS) -> str:
@@ -351,8 +373,14 @@ def _override_dependency_type(group: VulnerabilityGroup) -> str:
     return "overrides"
 
 
-def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
+def _target_package_name(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
     """Derive the only package that a tactical action may target."""
+    if is_maven_group(group, project_language):
+        return group.vulnerable_component or None
     if task.target_package_name:
         return task.target_package_name
     if is_transitive_group(group):
@@ -361,8 +389,23 @@ def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> st
     return group.vulnerable_component or None
 
 
-def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
+def _target_dependency_type(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
     """Derive the committed dependency declaration type."""
+    if is_maven_group(group, project_language):
+        if task.target_dependency_type in {"dependencies", "dependencyManagement"}:
+            return task.target_dependency_type
+        return next(
+            (
+                localized.declaration_type
+                for localized in group.localized_issues
+                if localized.declaration_type in {"dependencies", "dependencyManagement"}
+            ),
+            "dependencyManagement",
+        )
     if task.target_dependency_type:
         return task.target_dependency_type
     if is_transitive_group(group):
@@ -371,47 +414,47 @@ def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) ->
     return None
 
 
-def _security_floor(_task: RemediationTask, group: VulnerabilityGroup) -> str | None:
+def _security_floor(
+    _task: RemediationTask,
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
     """Return the authoritative group floor, never a selected task version."""
-    floor, _error = _canonical_security_floor(group)
+    floor, _error = _canonical_security_floor(
+        group,
+        project_language=project_language,
+    )
     return floor
 
 
-def _security_floor_error(group: VulnerabilityGroup) -> str | None:
+def _security_floor_error(
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
     """Return a fail-closed floor error when group metadata is unusable."""
-    _floor, error = _canonical_security_floor(group)
-    return error
-
-
-def _attempted_versions(
-    task: RemediationTask,
-    retry_diagnostics: UpdateRetryDiagnostics | None,
-) -> tuple[str, ...]:
-    """Collect normalized attempted versions without treating the current target as attempted."""
-    values = list(getattr(retry_diagnostics, "attempted_versions", []) or [])
-    if retry_diagnostics is not None:
-        for versions in retry_diagnostics.attempted_versions_by_target.values():
-            values.extend(versions)
-    return tuple(
-        dict.fromkeys(str(value).strip().lstrip("vV") for value in values if str(value).strip())
+    _floor, error = _canonical_security_floor(
+        group,
+        project_language=project_language,
     )
+    return error
 
 
 def allowed_tactical_strategies(
     task: RemediationTask,
     group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[TacticalStrategy, ...]:
-    """Return strategies that are semantically valid for the committed task.
-
-    The strategy stage is part of the action contract.  In particular, a
-    package-override stage has an override authorization, not a direct-update
-    authorization, so advertising ``VERSION_BUMP`` there would invite the
-    model to select an action that cannot be verified or dispatched safely.
-    """
+    """Return strategies that are semantically valid for the committed task."""
     if task.no_fix_stage is not None:
         return (TacticalStrategy.CODE_WORKAROUND,)
     if task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (TacticalStrategy.CODE_WORKAROUND,)
+    if is_maven_group(group, project_language):
+        return (
+            (TacticalStrategy.CODE_WORKAROUND,)
+            if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND
+            else (TacticalStrategy.VERSION_BUMP, TacticalStrategy.CODE_WORKAROUND)
+        )
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         return (
             (TacticalStrategy.PACKAGE_OVERRIDE, TacticalStrategy.CODE_WORKAROUND)
@@ -424,6 +467,26 @@ def allowed_tactical_strategies(
     if is_transitive_group(group):
         strategies.insert(1, TacticalStrategy.PACKAGE_OVERRIDE)
     return tuple(strategies)
+
+
+def _attempted_versions(
+    task: RemediationTask,
+    retry_diagnostics: UpdateRetryDiagnostics | None,
+    group: VulnerabilityGroup | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> tuple[str, ...]:
+    """Collect attempted versions without rewriting Maven release strings."""
+    values = list(getattr(retry_diagnostics, "attempted_versions", []) or [])
+    if retry_diagnostics is not None:
+        for versions in retry_diagnostics.attempted_versions_by_target.values():
+            values.extend(versions)
+    maven_mode = is_maven_group(group, project_language)
+    normalized = (
+        str(value).strip() if maven_mode else str(value).strip().lstrip("vV")
+        for value in values
+        if str(value).strip()
+    )
+    return tuple(dict.fromkeys(normalized))
 
 
 def _diagnostic_text(context: TacticalDiagnosticContext) -> str:
@@ -463,8 +526,8 @@ def classify_diagnostics(context: TacticalDiagnosticContext) -> TacticalDiagnost
     if evaluation is not None and (evaluation.contract_error or evaluation.evidence_inconclusive):
         return TacticalDiagnosticKind.INCONCLUSIVE
     if context.task.strategy != RoutingStrategy.CODE_WORKAROUND and (
-        not _security_floor(context.task, context.group)
-        or _security_floor_error(context.group) is not None
+        not _security_floor(context.task, context.group, context.project_language)
+        or _security_floor_error(context.group, context.project_language) is not None
     ):
         return TacticalDiagnosticKind.INCONCLUSIVE
     if evaluation is not None and evaluation.deterministic_gates is not None:
@@ -546,13 +609,16 @@ def build_tactical_context(
     remaining_scanner_identifiers: Sequence[str] = (),
     dependency_evidence: Any = None,
     repair_feedback: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> TacticalDiagnosticContext:
     """Build a deterministic tactical context from committed state and evidence."""
+    maven_mode = is_maven_group(group, project_language)
     normalized_candidate_sets = _normalise_context_candidate_sets(
         task,
         group,
         candidate_versions=candidate_versions,
         candidate_sets=candidate_sets,
+        project_language=project_language,
     )
     return TacticalDiagnosticContext(
         task=task,
@@ -560,13 +626,33 @@ def build_tactical_context(
         evaluation=evaluation,
         worker_result=worker_result,
         retry_diagnostics=retry_diagnostics,
-        candidate_versions=_stable_semver_versions(candidate_versions),
-        candidate_dependency_types=tuple(
-            sorted(
-                {str(value).strip() for value in candidate_dependency_types if str(value).strip()}
+        candidate_versions=(
+            _stable_maven_versions(candidate_versions)
+            if maven_mode
+            else _stable_semver_versions(candidate_versions)
+        ),
+        candidate_dependency_types=(
+            (_target_dependency_type(task, group, project_language),)
+            if maven_mode
+            and _target_dependency_type(task, group, project_language)
+            in {"dependencies", "dependencyManagement"}
+            else tuple(
+                sorted(
+                    {
+                        str(value).strip()
+                        for value in candidate_dependency_types
+                        if str(value).strip()
+                        and (
+                            not maven_mode
+                            or str(value).strip() in {"dependencies", "dependencyManagement"}
+                        )
+                    }
+                )
             )
         ),
-        attempted_versions=tuple(sorted(_attempted_versions(task, retry_diagnostics))),
+        attempted_versions=tuple(
+            sorted(_attempted_versions(task, retry_diagnostics, group, project_language))
+        ),
         prior_attempts=tuple(
             sorted(
                 prior_attempts,
@@ -583,6 +669,7 @@ def build_tactical_context(
                 }
             )
         )[:_MAX_LIST_ITEMS],
+        project_language=project_language,
         dependency_evidence=dependency_evidence,
         repair_feedback=repair_feedback,
     )
@@ -617,7 +704,8 @@ def _portfolio_escalation_required(
 ) -> bool:
     """Require referral when peer conflict has no compatible or source fix."""
     return (
-        diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
+        not is_maven_group(context.group, context.project_language)
+        and diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT
         and not _has_compatible_single_task_candidate(context)
         and not _has_authoritative_workaround_source(context)
     )
@@ -628,7 +716,11 @@ def _allowed_tactical_strategies_for_prompt(
     diagnostic_kind: TacticalDiagnosticKind,
 ) -> tuple[TacticalStrategy, ...]:
     """Return the evidence-aware strategy inventory shown to the model."""
-    allowed = list(allowed_tactical_strategies(context.task, context.group))
+    allowed = list(
+        allowed_tactical_strategies(context.task, context.group, context.project_language)
+    )
+    if is_maven_group(context.group, context.project_language):
+        return tuple(allowed)
     if diagnostic_kind != TacticalDiagnosticKind.PEER_CONFLICT:
         return tuple(allowed)
     if _has_compatible_single_task_candidate(context):
@@ -730,7 +822,7 @@ def _build_supervisor_dynamic_context(
     gates = evaluation.deterministic_gates if evaluation else None
     fix_plan = getattr(group, "fix_plan", None)
     parent_name, parent_version, parent_type = group_parent_context(group)
-    # The registry resolver returns an action inventory.  Empty candidate sets
+    maven_mode = is_maven_group(group, context.project_language)
     # are facts about unavailable actions, not actions that should be exposed to
     # the model.  In particular, once a transitive parent has no compatible
     # candidate but the vulnerable child has override candidates, the prompt
@@ -747,20 +839,23 @@ def _build_supervisor_dynamic_context(
         for candidate in actionable_candidates
     )
     override_only = (
-        is_transitive_group(group) and override_action_available and not parent_action_available
+        not maven_mode
+        and is_transitive_group(group)
+        and override_action_available
+        and not parent_action_available
     )
     hide_parent_context = (
-        task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE or override_only
+        maven_mode or task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE or override_only
     )
-    if hide_parent_context and is_transitive_group(group):
+    if not maven_mode and hide_parent_context and is_transitive_group(group):
         target_package = group.vulnerable_component or "unknown"
         target_type = _override_dependency_type(group)
     elif len(actionable_candidates) > 1:
         target_package = "see available actions"
         target_type = "see available actions"
     else:
-        target_package = _target_package_name(task, group) or "unknown"
-        target_type = _target_dependency_type(task, group) or "unknown"
+        target_package = _target_package_name(task, group, context.project_language) or "unknown"
+        target_type = _target_dependency_type(task, group, context.project_language) or "unknown"
     effective_action = (
         TacticalStrategy.PACKAGE_OVERRIDE.value
         if override_only
@@ -775,7 +870,7 @@ def _build_supervisor_dynamic_context(
         )
     )
     diagnostic_kind = classify_diagnostics(context)
-    security_floor = _security_floor(context.task, context.group)
+    security_floor = _security_floor(context.task, context.group, context.project_language)
     strategies = list(_allowed_tactical_strategies_for_prompt(context, diagnostic_kind))
     portfolio_escalation_required = _portfolio_escalation_required(context, diagnostic_kind)
     if portfolio_escalation_required:
@@ -893,6 +988,21 @@ def _build_supervisor_dynamic_context(
         "- Apply the evidence rules in the static prompt: choose the strategy that best addresses the dominant evidence, compare it with the leading alternative, and include the expected validation signal.",
         "- The old stage ladder is not mandatory when evidence supports an immediate pivot.",
     ]
+    if maven_mode:
+        sections.extend(
+            [
+                "",
+                "## Java/Maven Constraints",
+                f"- Exact vulnerable coordinate: {group.vulnerable_component or 'unknown'}",
+                f"- Authorized POM target: {', '.join(_group_manifest_paths(group)) or 'none'}",
+                f"- Committed dependency edit target: {target_type}",
+                "- Only dependencies or dependencyManagement may be changed.",
+                "- Never guess or upgrade a parent version, mutate a BOM, or choose releases from web/LLM text.",
+                "- Use only the Supervisor-provided Maven Central candidate and exact GAV.",
+                "- At this stage, choose only the recommended role candidate; retain other approved versions for later stages.",
+                "- Never use npm parent planning, overrides, or peer-compatibility strategies.",
+            ]
+        )
     if repair:
         sections.extend(
             [
@@ -929,75 +1039,136 @@ def build_supervisor_messages(
 def registry_candidates_for_context(
     context: TacticalDiagnosticContext,
     *,
-    registry_provider: Callable[..., list[RegistryCandidate]] | None = None,
+    registry_provider: Callable[..., Sequence[RegistryCandidate | MavenRegistryCandidate]]
+    | None = None,
 ) -> tuple[tuple[str, ...], str | None]:
     """Fetch the bounded candidate whitelist for one tactical context."""
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
-    if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+    maven_mode = is_maven_group(context.group, context.project_language)
+    if maven_mode and context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        return (), "Maven targets never use package overrides."
+    if not maven_mode and context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         if not is_transitive_group(context.group) or not context.group.vulnerable_component:
             return (), "Package override requires a transitive vulnerable child."
         package_name = context.group.vulnerable_component
         dependency_type = _override_dependency_type(context.group)
     else:
-        package_name = _target_package_name(context.task, context.group)
-        dependency_type = _target_dependency_type(context.task, context.group)
-    floor = _security_floor(context.task, context.group)
-    floor_error = _security_floor_error(context.group)
+        package_name = _target_package_name(
+            context.task,
+            context.group,
+            context.project_language,
+        )
+        dependency_type = _target_dependency_type(
+            context.task,
+            context.group,
+            context.project_language,
+        )
+    floor = _security_floor(context.task, context.group, context.project_language)
+    floor_error = _security_floor_error(context.group, context.project_language)
     if not package_name or not floor or floor_error is not None:
         return (), (
             "A registry target or security floor is unavailable."
             if not floor_error
             else f"Security floor verification failed: {floor_error}."
         )
-    provider = registry_provider or _supervisor_fetch_registry_candidates
-    approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
+    approved_pool = _approved_candidate_pool(
+        context,
+        package_name,
+        dependency_type,
+        maven_mode=maven_mode,
+    )
+    attempts = _candidate_query_attempts(
+        approved_pool,
+        context.attempted_versions,
+        maven_mode=maven_mode,
+    )
     try:
-        # Positional invocation keeps this seam compatible with the small
-        # deterministic providers used by tests and local integrations while
-        # still passing the exact three Supervisor-owned values.  The real
-        # provider has the same positional contract.
-        candidates = provider(
-            package_name,
-            floor,
-            _candidate_query_attempts(approved_pool, context.attempted_versions),
-        )
+        if registry_provider is not None:
+            candidates = registry_provider(package_name, floor, attempts)
+        elif maven_mode:
+            candidates = _supervisor_fetch_registry_candidates(
+                package_name,
+                floor,
+                attempts,
+                project_language=ProjectLanguage.JAVA,
+                maven_mode=True,
+            )
+        else:
+            candidates = _supervisor_fetch_registry_candidates(package_name, floor, attempts)
     except Exception as exc:  # noqa: BLE001
         return (), f"Registry verification unavailable: {exc}"
     versions = _current_candidate_versions(
         candidates,
         approved_pool=approved_pool,
         attempted_versions=context.attempted_versions,
+        project_language=context.project_language,
+        maven_mode=maven_mode,
+        stage=context.task.strategy_stage,
+        security_floor=floor,
     )
     return versions, None
 
 
 def _eligible_candidate_versions(
-    candidates: Iterable[RegistryCandidate],
+    candidates: Iterable[RegistryCandidate | MavenRegistryCandidate],
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+    stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM,
+    attempted_versions: Iterable[str] = (),
+    security_floor: str | None = None,
 ) -> tuple[str, ...]:
-    """Return the three strategic stable candidates in ascending semver order.
+    """Return only policy-eligible candidates for the active ecosystem stage."""
+    candidates = list(candidates)
+    if project_language == ProjectLanguage.JAVA and maven_mode:
+        eligible: list[MavenRegistryCandidate] = []
+        for candidate in candidates:
+            if not isinstance(candidate, MavenRegistryCandidate):
+                continue
+            if (
+                not candidate.is_stable
+                or not candidate.security_floor_met
+                or not is_stable_maven_version(candidate.version)
+            ):
+                continue
+            if security_floor is not None:
+                try:
+                    if compare_maven_versions(candidate.version, security_floor) < 0:
+                        continue
+                except ValueError:
+                    continue
+            eligible.append(candidate)
+        selected = select_maven_version(
+            eligible,
+            stage,
+            {str(value).strip() for value in attempted_versions},
+        )
+        return (selected,) if selected else ()
 
-    The registry tool applies this policy for production calls.  Repeating the
-    role-aware projection here protects the tactical prompt when a test or
-    legacy provider returns a larger candidate list.
-    """
-    eligible = [
+    node_candidates = [
         candidate
         for candidate in candidates
-        if candidate.is_stable and candidate.security_floor_met and not candidate.already_attempted
+        if isinstance(candidate, RegistryCandidate)
+        and candidate.is_stable
+        and candidate.security_floor_met
+        and not candidate.already_attempted
     ]
-    eligible.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
-    if not eligible:
+    node_candidates.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+    if not node_candidates:
         return ()
-
-    by_version = {candidate.version: candidate for candidate in eligible}
+    by_version = {candidate.version: candidate for candidate in node_candidates}
     osv_minimum = next(
-        (candidate.version for candidate in eligible if "osv_minimum" in candidate.selection_roles),
-        eligible[0].version,
+        (
+            candidate.version
+            for candidate in node_candidates
+            if "osv_minimum" in candidate.selection_roles
+        ),
+        node_candidates[0].version,
     )
     same_major_candidates = [
         candidate
-        for candidate in eligible
+        for candidate in node_candidates
         if candidate.same_major or "same_major" in candidate.selection_roles
     ]
     same_major_latest = (
@@ -1009,8 +1180,12 @@ def _eligible_candidate_versions(
         else None
     )
     npm_latest = next(
-        (candidate.version for candidate in eligible if "npm_latest" in candidate.selection_roles),
-        eligible[-1].version,
+        (
+            candidate.version
+            for candidate in node_candidates
+            if "npm_latest" in candidate.selection_roles
+        ),
+        node_candidates[-1].version,
     )
     strategic_versions = {
         version
@@ -1018,8 +1193,56 @@ def _eligible_candidate_versions(
         if version is not None and version in by_version
     }
     return tuple(
-        candidate.version for candidate in eligible if candidate.version in strategic_versions
+        candidate.version
+        for candidate in node_candidates
+        if candidate.version in strategic_versions
     )[:_MAX_CANDIDATES]
+
+
+def _maven_candidate_pool(
+    candidates: Iterable[RegistryCandidate | MavenRegistryCandidate],
+    *,
+    security_floor: str,
+    approved_pool: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Project stable Maven releases onto the immutable Supervisor pool."""
+    approved = set(approved_pool)
+    versions: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, MavenRegistryCandidate):
+            continue
+        if (
+            not candidate.is_stable
+            or not candidate.security_floor_met
+            or not is_stable_maven_version(candidate.version)
+        ):
+            continue
+        try:
+            if compare_maven_versions(candidate.version, security_floor) < 0:
+                continue
+        except ValueError:
+            continue
+        if approved and candidate.version not in approved:
+            continue
+        versions.append(candidate.version)
+    return _stable_maven_versions(versions)
+
+
+def _stable_maven_versions(values: Iterable[str]) -> tuple[str, ...]:
+    """Validate and Maven-order stable versions without lexical fallbacks."""
+    versions = list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in values
+            if str(value).strip() and is_stable_maven_version(str(value).strip())
+        )
+    )
+    try:
+        versions.sort(key=cmp_to_key(compare_maven_versions))
+    except ValueError:
+        versions = [version for version in versions if is_stable_maven_version(version)]
+        versions.sort(key=cmp_to_key(compare_maven_versions))
+    return tuple(versions[:_MAX_CANDIDATES])
 
 
 def _stable_semver_versions(values: Iterable[str]) -> tuple[str, ...]:
@@ -1042,17 +1265,37 @@ def _candidate_set(
     versions: Sequence[str],
     *,
     peer_compatible: bool = True,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+    preferred_version: str | None = None,
+    approved_version_pool: Sequence[str] = (),
 ) -> TacticalCandidateSet:
     """Build one normalized strategy-specific candidate whitelist."""
-    ordered = _stable_semver_versions(versions)
+    approved_pool: tuple[str, ...] = ()
+    if project_language == ProjectLanguage.JAVA and maven_mode:
+        ordered = tuple(
+            version
+            for version in _stable_maven_versions(versions)
+            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
+        )
+        approved_pool = tuple(
+            version
+            for version in _stable_maven_versions(approved_version_pool)
+            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
+        )
+    else:
+        ordered = _stable_semver_versions(versions)
     return TacticalCandidateSet(
         strategy=strategy,
         target_package_name=package_name,
         dependency_type=dependency_type,
         security_floor=floor,
         versions=ordered,
-        canonical_version=ordered[0] if ordered else None,
+        canonical_version=(
+            preferred_version if preferred_version in ordered else ordered[0] if ordered else None
+        ),
         peer_compatible=peer_compatible,
+        approved_version_pool=approved_pool,
     )
 
 
@@ -1062,26 +1305,25 @@ def _normalise_context_candidate_sets(
     *,
     candidate_versions: Sequence[str],
     candidate_sets: Sequence[TacticalCandidateSet],
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[TacticalCandidateSet, ...]:
-    """Return the single typed candidate authorization representation.
-
-    Older callers may still provide ``candidate_versions`` directly.  Convert
-    that input at the context boundary so prompts and verification never need
-    to consult an untyped version list.
-    """
+    """Return the one typed candidate authorization representation."""
+    maven_mode = is_maven_group(group, project_language)
     normalized = list(candidate_sets)
     if not normalized and candidate_versions:
-        if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE and is_transitive_group(
-            group
+        if (
+            not maven_mode
+            and task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+            and is_transitive_group(group)
         ):
             strategy = TacticalStrategy.PACKAGE_OVERRIDE
             target_package = group.vulnerable_component
             dependency_type = _override_dependency_type(group)
         else:
             strategy = TacticalStrategy.VERSION_BUMP
-            target_package = _target_package_name(task, group)
-            dependency_type = _target_dependency_type(task, group)
-        floor = _security_floor(task, group) or "unresolved"
+            target_package = _target_package_name(task, group, project_language)
+            dependency_type = _target_dependency_type(task, group, project_language)
+        floor = _security_floor(task, group, project_language) or "unresolved"
         if target_package:
             normalized.append(
                 _candidate_set(
@@ -1090,8 +1332,33 @@ def _normalise_context_candidate_sets(
                     dependency_type,
                     floor,
                     candidate_versions,
+                    project_language=project_language,
+                    maven_mode=maven_mode,
                 )
             )
+    if maven_mode:
+        exact_gav = group.vulnerable_component or ""
+        dependency_type = _target_dependency_type(task, group, project_language)
+        floor = _security_floor(task, group, project_language) or "unresolved"
+        normalized = [
+            _candidate_set(
+                candidate.strategy,
+                exact_gav,
+                dependency_type,
+                floor,
+                candidate.versions,
+                project_language=project_language,
+                maven_mode=True,
+                preferred_version=candidate.canonical_version,
+                peer_compatible=False,
+                approved_version_pool=(candidate.approved_version_pool or candidate.versions),
+            )
+            for candidate in normalized
+            if candidate.strategy == TacticalStrategy.VERSION_BUMP
+            and candidate.target_package_name == exact_gav
+            and candidate.dependency_type in {"dependencies", "dependencyManagement"}
+            and candidate.dependency_type == dependency_type
+        ]
     return tuple(
         sorted(
             normalized,
@@ -1104,9 +1371,10 @@ def _normalise_context_candidate_sets(
     )[:_MAX_CANDIDATES]
 
 
-def _normalise_candidate_version(value: Any) -> str:
-    """Return a comparable candidate version without a leading ``v``."""
-    return str(value).strip().lstrip("vV")
+def _normalise_candidate_version(value: Any, *, maven_mode: bool = False) -> str:
+    """Normalize candidates without stripping meaningful Maven qualifiers."""
+    normalized = str(value).strip()
+    return normalized if maven_mode else normalized.lstrip("vV")
 
 
 def _candidate_set_for_action(
@@ -1133,15 +1401,10 @@ def _approved_candidate_pool(
     context: TacticalDiagnosticContext,
     package_name: str,
     dependency_type: str | None,
+    *,
+    maven_mode: bool = False,
 ) -> tuple[str, ...]:
-    """Return the first Supervisor-approved candidate pool for this target.
-
-    Retry-time registry queries are allowed to revalidate the original pool,
-    but they must not widen it by replacing an attempted lowest candidate
-    with a newly discovered version.  The first matching immutable attempt
-    snapshot is the strongest provenance; retry diagnostics are the fallback
-    for callers that have not retained snapshots.
-    """
+    """Return the immutable Supervisor-approved candidate pool for a target."""
     normalized_package = package_name.strip()
     normalized_type = (dependency_type or "").strip()
     for snapshot in context.prior_attempts:
@@ -1157,9 +1420,9 @@ def _approved_candidate_pool(
             continue
         versions = tuple(
             dict.fromkeys(
-                _normalise_candidate_version(version)
+                _normalise_candidate_version(version, maven_mode=maven_mode)
                 for version in snapshot.allowed_target_versions
-                if _normalise_candidate_version(version)
+                if _normalise_candidate_version(version, maven_mode=maven_mode)
             )
         )
         if versions:
@@ -1181,24 +1444,40 @@ def _approved_candidate_pool(
     ):
         return tuple(
             dict.fromkeys(
-                _normalise_candidate_version(version)
+                _normalise_candidate_version(version, maven_mode=maven_mode)
                 for version in diagnostics.candidate_versions_considered
-                if _normalise_candidate_version(version)
+                if _normalise_candidate_version(version, maven_mode=maven_mode)
             )
         )
     return ()
 
 
 def _current_candidate_versions(
-    candidates: Iterable[RegistryCandidate],
+    candidates: Iterable[RegistryCandidate | MavenRegistryCandidate],
     *,
     approved_pool: Sequence[str] = (),
     attempted_versions: Iterable[str] = (),
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_mode: bool = False,
+    stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM,
+    security_floor: str | None = None,
 ) -> tuple[str, ...]:
     """Project registry candidates onto an immutable pool and retry state."""
-    versions = _eligible_candidate_versions(candidates)
-    approved = {_normalise_candidate_version(version) for version in approved_pool}
-    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
+    attempted = {
+        _normalise_candidate_version(version, maven_mode=maven_mode)
+        for version in attempted_versions
+    }
+    versions = _eligible_candidate_versions(
+        candidates,
+        project_language=project_language,
+        maven_mode=maven_mode,
+        stage=stage,
+        attempted_versions=attempted,
+        security_floor=security_floor,
+    )
+    approved = {
+        _normalise_candidate_version(version, maven_mode=maven_mode) for version in approved_pool
+    }
     if approved:
         versions = tuple(version for version in versions if version in approved)
     return tuple(version for version in versions if version not in attempted)
@@ -1207,15 +1486,17 @@ def _current_candidate_versions(
 def _candidate_query_attempts(
     approved_pool: Sequence[str],
     attempted_versions: Iterable[str],
+    *,
+    maven_mode: bool = False,
 ) -> set[str]:
     """Query the registry unfiltered when a prior pool must be revalidated."""
     return (
         set()
         if approved_pool
         else {
-            _normalise_candidate_version(version)
+            _normalise_candidate_version(version, maven_mode=maven_mode)
             for version in attempted_versions
-            if _normalise_candidate_version(version)
+            if _normalise_candidate_version(version, maven_mode=maven_mode)
         }
     )
 
@@ -1223,7 +1504,8 @@ def _candidate_query_attempts(
 def registry_candidate_sets_for_context(
     context: TacticalDiagnosticContext,
     *,
-    registry_provider: Callable[..., list[RegistryCandidate]] | None = None,
+    registry_provider: Callable[..., Sequence[RegistryCandidate | MavenRegistryCandidate]]
+    | None = None,
 ) -> tuple[tuple[TacticalCandidateSet, ...], str | None]:
     """Resolve separate verified whitelists for direct, parent, and child actions.
 
@@ -1234,18 +1516,91 @@ def registry_candidate_sets_for_context(
     """
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
-    floor = _security_floor(context.task, context.group)
-    floor_error = _security_floor_error(context.group)
+    maven_mode = is_maven_group(context.group, context.project_language)
+    floor = _security_floor(context.task, context.group, context.project_language)
+    floor_error = _security_floor_error(context.group, context.project_language)
     if not floor or floor_error is not None:
         return (), (
             "A canonical security floor is unavailable."
             if not floor_error
             else f"Security floor verification failed: {floor_error}."
         )
+    direct_package = _target_package_name(
+        context.task,
+        context.group,
+        context.project_language,
+    )
+    direct_type = _target_dependency_type(
+        context.task,
+        context.group,
+        context.project_language,
+    )
+    if maven_mode:
+        if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+            return (), "Maven targets never use package overrides."
+        if not direct_package or direct_type not in {
+            "dependencies",
+            "dependencyManagement",
+        }:
+            return (), "The exact Maven GAV or committed POM edit target is unavailable."
+        approved_pool = _approved_candidate_pool(
+            context,
+            direct_package,
+            direct_type,
+            maven_mode=True,
+        )
+        attempts = _candidate_query_attempts(
+            approved_pool,
+            context.attempted_versions,
+            maven_mode=True,
+        )
+        try:
+            candidates = (
+                registry_provider(direct_package, floor, attempts)
+                if registry_provider is not None
+                else _supervisor_fetch_registry_candidates(
+                    direct_package,
+                    floor,
+                    attempts,
+                    project_language=ProjectLanguage.JAVA,
+                    maven_mode=True,
+                )
+            )
+            selected = select_maven_version(
+                candidates,
+                context.task.strategy_stage,
+                set(context.attempted_versions),
+            )
+            approved_candidates = _maven_candidate_pool(
+                candidates,
+                security_floor=floor,
+                approved_pool=approved_pool,
+            )
+            if selected not in set(approved_candidates):
+                selected = None
+            versions = (selected,) if selected is not None else ()
+            return (
+                (
+                    _candidate_set(
+                        TacticalStrategy.VERSION_BUMP,
+                        direct_package,
+                        direct_type,
+                        floor,
+                        versions,
+                        project_language=ProjectLanguage.JAVA,
+                        maven_mode=True,
+                        preferred_version=selected,
+                        peer_compatible=False,
+                        approved_version_pool=approved_candidates,
+                    ),
+                ),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (), f"Registry verification unavailable: {exc}"
+
     provider = registry_provider or _supervisor_fetch_registry_candidates
     targets: list[tuple[TacticalStrategy, str | None, str | None]] = []
-    direct_package = _target_package_name(context.task, context.group)
-    direct_type = _target_dependency_type(context.task, context.group)
     if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         if not is_transitive_group(context.group) or not context.group.vulnerable_component:
             return (), "Package override requires a transitive vulnerable child."
@@ -1554,11 +1909,17 @@ def _model_action(
         return None
 
 
-def _normalise_version(value: str | None) -> str | None:
-    """Normalize a version value for exact whitelist comparison."""
+def _normalise_version(
+    value: str | None,
+    *,
+    maven_mode: bool = False,
+) -> str | None:
+    """Normalize a version only under the active package-manager policy."""
     if value is None:
         return None
-    normalized = str(value).strip().lstrip("vV")
+    normalized = str(value).strip()
+    if not maven_mode:
+        normalized = normalized.lstrip("vV")
     return normalized or None
 
 
@@ -1596,11 +1957,53 @@ def _render_instruction(
                 "VALIDATION / SUCCESS CRITERIA: Validate the cumulative source patch, the targeted regression, and the relevant security behavior.",
             ]
         )
-    version = _normalise_version(getattr(action, "target_version", None)) or "unknown"
+    maven_mode = is_maven_group(context.group, context.project_language)
+    version = (
+        _normalise_version(
+            getattr(action, "target_version", None),
+            maven_mode=maven_mode,
+        )
+        or "unknown"
+    )
+    if maven_mode:
+        exact_gav = context.group.vulnerable_component or target_package
+        pom_path = next(
+            (
+                localized.manifest_file
+                for localized in context.group.localized_issues
+                if localized.manifest_file
+                and (localized.package_manager or "").strip().lower() == "maven"
+            ),
+            None,
+        )
+        if not pom_path:
+            return f"No authorized POM is available for exact Maven GAV {exact_gav}; do not edit a release."
+        return "\n".join(
+            [
+                "OBJECTIVE: Apply the Supervisor-approved Maven dependency remediation.",
+                f"AUTHORIZED TARGET: exact Maven GAV {exact_gav}",
+                f"SUPERVISOR-SELECTED VERSION: {version}",
+                f"COMMITTED EDIT TARGET: {target_type}",
+                f"AUTHORIZED POM: {pom_path}",
+                "REQUIRED OPERATION: Invoke modify_and_validate_maven_dependency with "
+                f'package_name="{exact_gav}", target_version="{version}", '
+                f'dependency_type="{target_type}", manifest_path="{pom_path}".',
+                "PROHIBITED: Do not guess parent versions, choose a release from web/LLM text, "
+                "mutate a parent POM or BOM, query a registry, or edit another GAV.",
+                f"QA EVIDENCE: diagnostics={diagnostics}; failed_tests={failed_tests}",
+            ]
+        )
     if strategy == TacticalStrategy.PACKAGE_OVERRIDE:
-        operation = f"Set the vulnerable child {context.group.vulnerable_component} to exact version {version} using {target_type or _override_dependency_type(context.group)}; do not edit the parent declaration."
+        operation = (
+            f"Set the vulnerable child {context.group.vulnerable_component} to exact version "
+            f"{version} using {target_type or _override_dependency_type(context.group)}; "
+            "do not edit the parent declaration."
+        )
     else:
-        operation = f"Update only {target_package} to exact version {version} using dependency type {target_type or 'the committed dependency declaration'}."
+        operation = (
+            f"Update only {target_package} to exact version {version} using dependency type "
+            f"{target_type or 'the committed dependency declaration'}."
+        )
     return "\n".join(
         [
             "OBJECTIVE: Apply the Supervisor-approved dependency remediation.",
@@ -1624,8 +2027,17 @@ def render_update_instruction(
     return _render_instruction(
         context,
         action,
-        target_package=_target_package_name(context.task, context.group) or "unknown",
-        target_type=_target_dependency_type(context.task, context.group),
+        target_package=_target_package_name(
+            context.task,
+            context.group,
+            context.project_language,
+        )
+        or "unknown",
+        target_type=_target_dependency_type(
+            context.task,
+            context.group,
+            context.project_language,
+        ),
         stage=context.task.strategy_stage,
     )
 
@@ -1652,8 +2064,17 @@ def render_workaround_instruction(
     return _render_instruction(
         context,
         action,
-        target_package=_target_package_name(context.task, context.group) or "unknown",
-        target_type=_target_dependency_type(context.task, context.group),
+        target_package=_target_package_name(
+            context.task,
+            context.group,
+            context.project_language,
+        )
+        or "unknown",
+        target_type=_target_dependency_type(
+            context.task,
+            context.group,
+            context.project_language,
+        ),
         stage=SCARemediationStage.CODE_WORKAROUND,
     )
 
@@ -1664,10 +2085,13 @@ def verify_tactical_action(
 ) -> TacticalVerification:
     """Verify a model proposal against committed task and registry facts."""
     diagnostic_kind = classify_diagnostics(context)
+    maven_mode = is_maven_group(context.group, context.project_language)
     portfolio_escalation_required = _portfolio_escalation_required(context, diagnostic_kind)
     compatible_candidate = _has_compatible_single_task_candidate(context)
-    allowed = list(allowed_tactical_strategies(context.task, context.group))
-    if diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT:
+    allowed = list(
+        allowed_tactical_strategies(context.task, context.group, context.project_language)
+    )
+    if not maven_mode and diagnostic_kind == TacticalDiagnosticKind.PEER_CONFLICT:
         if portfolio_escalation_required:
             allowed = [TacticalStrategy.ESCALATE_TO_PORTFOLIO]
         elif TacticalStrategy.ESCALATE_TO_PORTFOLIO not in allowed:
@@ -1715,14 +2139,22 @@ def verify_tactical_action(
     target_package = (
         context.group.vulnerable_component
         if action.selected_strategy == TacticalStrategy.PACKAGE_OVERRIDE
-        else _target_package_name(context.task, context.group)
+        else _target_package_name(
+            context.task,
+            context.group,
+            context.project_language,
+        )
     )
     if not target_package:
         return TacticalVerification(False, "No committed target package is available.")
     target_type = (
         _override_dependency_type(context.group)
         if action.selected_strategy == TacticalStrategy.PACKAGE_OVERRIDE
-        else _target_dependency_type(context.task, context.group)
+        else _target_dependency_type(
+            context.task,
+            context.group,
+            context.project_language,
+        )
     )
     stage = (
         SCARemediationStage.PACKAGE_OVERRIDE
@@ -1795,8 +2227,10 @@ def verify_tactical_action(
             strategy_stage=stage,
             instruction=instruction,
         )
-
-    selected_version = _normalise_version(getattr(action, "target_version", None))
+    selected_version = _normalise_version(
+        getattr(action, "target_version", None),
+        maven_mode=maven_mode,
+    )
     candidate_set = _candidate_set_for_action(
         context,
         action.selected_strategy,
@@ -1816,10 +2250,31 @@ def verify_tactical_action(
             strategy_stage=stage,
         )
     candidates = {
-        _normalise_candidate_version(value)
+        _normalise_candidate_version(value, maven_mode=maven_mode)
         for value in candidate_set.versions
         if str(value).strip()
     }
+    if maven_mode:
+        floor = _security_floor(context.task, context.group, context.project_language)
+        if (
+            target_package != context.group.vulnerable_component
+            or target_type not in {"dependencies", "dependencyManagement"}
+            or candidate_set.target_package_name != context.group.vulnerable_component
+            or candidate_set.dependency_type != target_type
+            or floor is None
+            or selected_version is None
+            or not is_stable_maven_version(selected_version)
+            or compare_maven_versions(selected_version, floor) < 0
+            or selected_version != candidate_set.canonical_version
+        ):
+            return TacticalVerification(
+                False,
+                "Maven action target, POM edit type, or stable security-floor authorization is invalid.",
+                target_package_name=target_package,
+                target_dependency_type=target_type,
+                strategy_stage=stage,
+                allowed_target_versions=candidate_set.versions,
+            )
     if not selected_version or selected_version not in candidates:
         return TacticalVerification(
             False,
@@ -1848,10 +2303,17 @@ def verify_tactical_action(
         selected_version=selected_version,
         instruction=instruction,
         allowed_target_versions=candidate_set.versions,
-        allowed_dependency_types=tuple(
-            dict.fromkeys(
-                value for value in (target_type, *context.candidate_dependency_types) if value
+        allowed_dependency_types=(
+            (target_type,)
+            if maven_mode
+            else tuple(
+                dict.fromkeys(
+                    value for value in (target_type, *context.candidate_dependency_types) if value
+                )
             )
+        ),
+        approved_candidate_versions=(
+            candidate_set.approved_version_pool or candidate_set.versions if maven_mode else ()
         ),
     )
 

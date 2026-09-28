@@ -27,6 +27,8 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
+from remediation_engine.orchestration._tool_support import _resolve_maven_manifest_scope
 from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState
@@ -34,6 +36,7 @@ from remediation_engine.orchestration.subagent_runtime import run_bounded_subage
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
+    is_maven_group,
     is_transitive_group,
 )
 from remediation_engine.orchestration.tools_manifest import rollback_pending_package_updates
@@ -47,6 +50,10 @@ from remediation_engine.tools.repository_map import build_repository_map
 logger = logging.getLogger(__name__)
 
 _UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
+_MAVEN_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_maven_dependency"
+_UPDATE_MANIFEST_TOOL_NAMES = frozenset(
+    {_UPDATE_MANIFEST_TOOL_NAME, _MAVEN_UPDATE_MANIFEST_TOOL_NAME}
+)
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -54,31 +61,38 @@ except ImportError:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment,misc]
 
 
-def _candidate_manifest_paths(group: VulnerabilityGroup) -> list[str]:
-    """Return all candidate manifest paths for one grouped dependency target."""
+def _candidate_manifest_paths(
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> list[str]:
+    """Return manifest and Maven property-owner candidates for one grouped target."""
     candidates: list[str] = []
     seen: set[str] = set()
 
     def add_candidate(value: str | None) -> None:
-        """Add a normalized manifest path once."""
         if not value:
             return
         candidate = value.replace("\\", "/")
-        if candidate in seen:
-            return
-        candidates.append(candidate)
-        seen.add(candidate)
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
 
     for localized_issue in group.localized_issues:
         add_candidate(localized_issue.manifest_file)
+        if project_language == ProjectLanguage.JAVA:
+            add_candidate(getattr(localized_issue, "version_property_file", None))
 
     for file_path in group.file_paths:
-        add_candidate(file_path)
+        if project_language != ProjectLanguage.JAVA or Path(file_path).name == "pom.xml":
+            add_candidate(file_path)
 
-    add_candidate(group.file_path)
+    if project_language != ProjectLanguage.JAVA or Path(group.file_path or "").name == "pom.xml":
+        add_candidate(group.file_path)
 
     for issue in group.issues:
-        if issue.file_path and Path(issue.file_path).name == "package.json":
+        if issue.file_path and Path(issue.file_path).name == (
+            "pom.xml" if project_language == ProjectLanguage.JAVA else "package.json"
+        ):
             add_candidate(issue.file_path)
 
     return candidates
@@ -99,9 +113,15 @@ def _filter_constraints_ledger(
 def _resolve_manifest_targets(
     group: VulnerabilityGroup,
     repo_root: Path,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[list[str], list[str]]:
-    """Resolve all valid package.json targets for one vulnerability group."""
-    candidates = _candidate_manifest_paths(group)
+    """Resolve authorized package manifests without crossing language boundaries."""
+    if project_language == ProjectLanguage.JAVA:
+        if not is_maven_group(group, ProjectLanguage.JAVA):
+            return [], [f"Group '{group.group_id}': Java update tasks must target a Maven finding."]
+        return _resolve_maven_manifest_scope(group, repo_root)
+
+    candidates = _candidate_manifest_paths(group, project_language)
     if not candidates:
         return [], [f"Group '{group.group_id}': no manifest target could be resolved."]
 
@@ -132,11 +152,12 @@ def _resolve_manifest_targets(
 
 def _build_package_manifest_map(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> dict[str, list[str]]:
     """Build a per-package allowlist of manifest paths for tool enforcement."""
     package_manifest_map: dict[str, list[str]] = {}
     for task, group, manifest_paths in resolved_tasks:
-        package_name = _target_package_name(task, group)
+        package_name = _target_package_name(task, group, project_language)
         if not package_name:
             continue
         existing = package_manifest_map.setdefault(package_name, [])
@@ -151,12 +172,13 @@ def _requires_override_remediation(
     diagnostics: UpdateRetryDiagnostics | None = None,
     feedback: str = "",
     previous_outcome: str = "",
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> bool:
     """Return whether the committed stage requires a native package override."""
     del feedback, previous_outcome
+    if project_language == ProjectLanguage.JAVA:
+        return False
     if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
-        # Preserve explicit legacy/direct override evidence, but never let it
-        # override a transitive task that is still editing its parent.
         return bool(diagnostics and diagnostics.used_overrides and not task.parent_package_name)
     return bool(
         diagnostics is None
@@ -166,8 +188,19 @@ def _requires_override_remediation(
     )
 
 
-def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> str:
+def _target_package_name(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
     """Return the Supervisor-owned package target for this task stage."""
+    if project_language == ProjectLanguage.JAVA:
+        coordinate = (group.vulnerable_component or "").strip()
+        if coordinate.count(":") != 1:
+            return ""
+        if task.target_package_name and task.target_package_name.strip() != coordinate:
+            return ""
+        return coordinate
     if isinstance(task.target_package_name, str) and task.target_package_name.strip():
         return task.target_package_name.strip()
     if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
@@ -179,8 +212,27 @@ def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> st
     return (group.vulnerable_component or "").strip()
 
 
-def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
+def _target_dependency_type(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
     """Return the Supervisor-owned manifest declaration type for this task."""
+    if project_language == ProjectLanguage.JAVA:
+        if task.target_dependency_type:
+            return (
+                task.target_dependency_type
+                if task.target_dependency_type in {"dependencies", "dependencyManagement"}
+                else None
+            )
+        return next(
+            (
+                localized.declaration_type
+                for localized in group.localized_issues
+                if localized.declaration_type in {"dependencies", "dependencyManagement"}
+            ),
+            None,
+        )
     if isinstance(task.target_dependency_type, str) and task.target_dependency_type:
         return task.target_dependency_type
     if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
@@ -194,10 +246,6 @@ def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) ->
                 return localized.declaration_type
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         return "overrides"
-    # Direct dependency localization normally supplies declaration_type. Keep
-    # legacy group-based callers executable when that optional enrichment is
-    # absent, while leaving transitive targets fail-closed until their parent
-    # declaration policy is committed.
     if task.strategy == RoutingStrategy.VERSION_BUMP and not is_transitive_group(group):
         return "dependencies"
     return None
@@ -236,7 +284,7 @@ def _has_successful_manifest_transaction_for_package(
         return False
     package_name = _target_package_name(task, group)
     return any(
-        getattr(event, "name", "") == _UPDATE_MANIFEST_TOOL_NAME
+        getattr(event, "name", "") in _UPDATE_MANIFEST_TOOL_NAMES
         and str((getattr(event, "args", {}) or {}).get("package_name", "")).strip() == package_name
         and str(getattr(event, "content", "")).startswith("SUCCESS:")
         for event in tool_events
@@ -245,7 +293,7 @@ def _has_successful_manifest_transaction_for_package(
 
 def _is_executed_manifest_transaction(event: Any) -> bool:
     """Return whether an update event represents an executed transaction."""
-    if getattr(event, "name", "") != _UPDATE_MANIFEST_TOOL_NAME:
+    if getattr(event, "name", "") not in _UPDATE_MANIFEST_TOOL_NAMES:
         return False
     content = str(getattr(event, "content", "")).lstrip()
     return not content.startswith(
@@ -276,6 +324,19 @@ Return control only after every package has one successful combined transaction 
 has exhausted its three attempts and been surrendered."""
 
 
+_MAVEN_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Maven dependency transaction worker.
+The Supervisor alone selects Maven versions and dependency targets. Do not search a
+registry, choose a version, guess a parent/BOM change, or use npm tooling. Update
+only the exact Supervisor-authorized group:artifact coordinate through
+modify_and_validate_maven_dependency, on an authorized in-repository pom.xml and
+only with the committed dependencies or dependencyManagement target. The combined
+transaction edits and synchronizes the authorized POM set atomically. Keep the
+coordinate, target_version, dependency_type, and manifest_path within the current
+task's authorized candidates. Failed transactions roll back automatically; use a
+different Supervisor-approved signature on retry, at most three times per
+coordinate. Never edit source code in this worker."""
+
+
 def _build_update_prompt(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     constraints_ledger: Sequence[str],
@@ -285,8 +346,9 @@ def _build_update_prompt(
     repository_map: str = "(repository map unavailable)",
     allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
     allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
-    """Build the dynamic execution context for the static worker instructions."""
+    """Build the dynamic execution context for the selected language contract."""
     allowed_target_versions_by_task = allowed_target_versions_by_task or {}
     allowed_dependency_types_by_task = allowed_dependency_types_by_task or {}
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
@@ -301,6 +363,16 @@ def _build_update_prompt(
     sections.extend(f"- {item}" for item in constraints_ledger)
     if not constraints_ledger:
         sections.append("- none")
+    if project_language == ProjectLanguage.JAVA:
+        sections.extend(
+            [
+                "",
+                "Java contract: exact Maven GAVs and authorized pom.xml paths only; "
+                "the Supervisor has already committed the version and target type.",
+                "Use modify_and_validate_maven_dependency; never select a version, "
+                "edit an unrelated POM, change a parent/BOM, or use npm/lockfile behavior.",
+            ]
+        )
     for task, group, manifest_paths in resolved_tasks:
         diagnostics = retry_diagnostics_by_task.get(task.task_id)
         allowed_versions = list(allowed_target_versions_by_task.get(task.task_id, ()))
@@ -320,7 +392,7 @@ def _build_update_prompt(
             allowed_types = [
                 value
                 for value in [
-                    _target_dependency_type(task, group),
+                    _target_dependency_type(task, group, project_language),
                     *(diagnostics.candidate_dependency_types if diagnostics else []),
                 ]
                 if value
@@ -330,8 +402,8 @@ def _build_update_prompt(
                 "",
                 f"## Task {task.task_id}",
                 f"- Component: {group.vulnerable_component or 'unknown'}",
-                f"- Edit target: {_target_package_name(task, group)}",
-                f"- Declaration type: {_target_dependency_type(task, group) or 'package dependency'}",
+                f"- Edit target: {_target_package_name(task, group, project_language)}",
+                f"- Declaration type: {_target_dependency_type(task, group, project_language) or 'package dependency'}",
                 f"- Strategy stage: {task.strategy_stage.value}",
                 f"- Parent package: {task.parent_package_name or group.parent_package_name or 'none'}",
                 f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
@@ -758,6 +830,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     previous_action_summaries_by_task = dict(state.get("previous_action_summaries_by_task", {}))
     prior_retry_diagnostics_by_task = dict(state.get("retry_diagnostics_by_task", {}))
     all_task_ids = [t.task_id for t in target_tasks]
+    language_value = state.get("project_language", ProjectLanguage.NODEJS)
+    try:
+        project_language = (
+            language_value
+            if isinstance(language_value, ProjectLanguage)
+            else ProjectLanguage(str(language_value))
+        )
+    except ValueError:
+        project_language = ProjectLanguage.NODEJS
 
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
@@ -798,6 +879,25 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 f"(parent_group_id={task.parent_group_id})."
             )
             continue
+        if project_language == ProjectLanguage.JAVA:
+            if not is_maven_group(group, project_language):
+                resolution_errors.append(
+                    f"Update Subagent: task {task.task_id} is not a Maven target in a Java run."
+                )
+                continue
+            if (
+                not task.target_package_name
+                or task.target_package_name.strip() != (group.vulnerable_component or "").strip()
+            ):
+                resolution_errors.append(
+                    f"Update Subagent: task {task.task_id} does not commit the exact Maven GAV."
+                )
+                continue
+            if task.target_dependency_type not in {"dependencies", "dependencyManagement"}:
+                resolution_errors.append(
+                    f"Update Subagent: task {task.task_id} does not commit an authorized Maven target type."
+                )
+                continue
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is not None:
             if (
@@ -827,6 +927,12 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             snapshot_dependency_types = list(snapshot.allowed_dependency_types)
             if not snapshot_dependency_types and snapshot.target_dependency_type:
                 snapshot_dependency_types = [snapshot.target_dependency_type]
+            if project_language == ProjectLanguage.JAVA:
+                snapshot_dependency_types = [
+                    value
+                    for value in snapshot_dependency_types
+                    if value in {"dependencies", "dependencyManagement"}
+                ]
             allowed_target_versions_by_task[task.task_id] = snapshot_versions
             allowed_dependency_types_by_task[task.task_id] = snapshot_dependency_types
         else:
@@ -842,7 +948,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     if version and version not in attempted_versions
                 )
             )
-            target_type = _target_dependency_type(task, group)
+            target_type = _target_dependency_type(task, group, project_language)
             attempted_types = set(diagnostics.attempted_dependency_types) if diagnostics else set()
             allowed_dependency_types_by_task[task.task_id] = list(
                 dict.fromkeys(
@@ -851,10 +957,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                         target_type,
                         *(diagnostics.candidate_dependency_types if diagnostics else []),
                     ]
-                    if dependency_type and dependency_type not in attempted_types
+                    if dependency_type
+                    and dependency_type not in attempted_types
+                    and (
+                        project_language != ProjectLanguage.JAVA
+                        or dependency_type in {"dependencies", "dependencyManagement"}
+                    )
                 )
             )
-        manifest_paths, errors = _resolve_manifest_targets(group, repo_root)
+        manifest_paths, errors = _resolve_manifest_targets(group, repo_root, project_language)
         resolution_errors.extend(errors)
         if not manifest_paths:
             continue
@@ -939,8 +1050,17 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         repository_map=build_repository_map(repo_root),
         allowed_target_versions_by_task=allowed_target_versions_by_task,
         allowed_dependency_types_by_task=allowed_dependency_types_by_task,
+        project_language=project_language,
     )
-    initial_messages = [SystemMessage(content=_UPDATE_WORKER_STATIC_INSTRUCTIONS)]
+    initial_messages = [
+        SystemMessage(
+            content=(
+                _MAVEN_UPDATE_WORKER_STATIC_INSTRUCTIONS
+                if project_language == ProjectLanguage.JAVA
+                else _UPDATE_WORKER_STATIC_INSTRUCTIONS
+            )
+        )
+    ]
     if state.get("messages"):
         initial_messages.extend(state["messages"])
     initial_messages.append(HumanMessage(content=prompt))
@@ -949,24 +1069,44 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     allowed_dependency_types_by_package: dict[str, set[str]] = {}
     allowed_target_versions_by_package: dict[str, set[str]] = {}
     for task, group, _ in skinny_resolved_tasks:
-        pkg_name = _target_package_name(task, group)
+        pkg_name = _target_package_name(task, group, project_language)
         if pkg_name:
             allowed_versions = allowed_target_versions_by_task.get(task.task_id, [])
-            allowed_target_versions_by_package.setdefault(pkg_name, set()).update(allowed_versions)
             allowed_types = allowed_dependency_types_by_task.get(task.task_id, [])
-            allowed_dependency_types_by_package.setdefault(pkg_name, set()).update(allowed_types)
+            if (
+                project_language == ProjectLanguage.JAVA
+                and pkg_name in allowed_target_versions_by_package
+            ):
+                allowed_target_versions_by_package[pkg_name].intersection_update(allowed_versions)
+                allowed_dependency_types_by_package[pkg_name].intersection_update(allowed_types)
+            else:
+                allowed_target_versions_by_package.setdefault(pkg_name, set()).update(
+                    allowed_versions
+                )
+                allowed_dependency_types_by_package.setdefault(pkg_name, set()).update(
+                    allowed_types
+                )
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
         if pkg_name and _requires_override_remediation(
             task,
             diag,
             feedback_by_task.get(task.task_id, ""),
             previous_action_summaries_by_task.get(task.task_id, ""),
+            project_language,
         ):
             override_required_packages.add(pkg_name)
 
+    sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
+    if project_language == ProjectLanguage.JAVA:
+        sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
+        sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
+
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            package_manifest_map = _build_package_manifest_map(skinny_resolved_tasks)
+        with DockerSandbox(repo_root=None, **sandbox_options) as sandbox:
+            package_manifest_map = _build_package_manifest_map(
+                skinny_resolved_tasks,
+                project_language,
+            )
             toolbelt = build_update_toolbelt(
                 sandbox,
                 touched_files,
@@ -981,6 +1121,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 allowed_dependency_types_by_package=allowed_dependency_types_by_package,
                 execution_state=execution_state,
                 package_checkpoints=package_checkpoints,
+                project_language=project_language,
             )
             try:
                 runtime = run_bounded_subagent_loop(

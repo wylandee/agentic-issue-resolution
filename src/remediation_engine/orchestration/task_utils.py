@@ -29,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
 )
+from remediation_engine.language import ProjectLanguage
 
 TERMINAL_TASK_STATUSES = frozenset(
     {
@@ -338,7 +339,28 @@ def build_no_fix_package_removal_instruction(group: VulnerabilityGroup) -> str:
         A supervisor-owned instruction for the package-removal stage.
     """
     component = (group.vulnerable_component or "the vulnerable package").strip()
-    manifests = ", ".join(_group_manifest_paths(group)) or "the group-authorized manifest paths"
+    manifest_paths = _group_manifest_paths(group)
+    if set(_group_package_managers(group)) == {"maven"}:
+        pom_paths = (
+            ", ".join(
+                path for path in manifest_paths if path.rsplit("/", 1)[-1].casefold() == "pom.xml"
+            )
+            or "the group-authorized pom.xml paths"
+        )
+        return (
+            "NO_FIX MITIGATION — PACKAGE REMOVAL: Attempt to completely remove "
+            f"the exact Maven dependency '{component}' from the application. Inspect only "
+            f"these group-authorized pom.xml paths: {pom_paths}. Use "
+            "remove_no_fix_dependency to remove its direct dependency declaration; do not "
+            "manually edit other POM declarations. Remove imports, source calls, and code "
+            "that depends on the package, then validate that it is absent from the resolved "
+            "Maven dependency tree and that the application still passes its validation "
+            "gates. If the package is transitive and has no safe removable declaration, "
+            "report that failure so the supervisor can advance to the vulnerable-code-"
+            "removal stage."
+        )
+
+    manifests = ", ".join(manifest_paths) or "the group-authorized manifest paths"
     managers = ", ".join(_group_package_managers(group)) or "the detected package manager"
     return (
         "NO_FIX MITIGATION — PACKAGE REMOVAL: Attempt to completely remove "
@@ -513,9 +535,38 @@ def derive_missing_task_qa_policy(
     return None
 
 
+def is_maven_group(
+    group: VulnerabilityGroup | None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> bool:
+    """Return whether this run-localized vulnerability group is a Maven target."""
+    if group is None or project_language != ProjectLanguage.JAVA:
+        return False
+    return any(
+        (getattr(localized, "package_manager", None) or "").strip().lower() == "maven"
+        or (str(getattr(localized.issue, "ecosystem", "") or "").strip().lower() == "maven")
+        or str(getattr(localized.issue, "purl", "") or "").strip().lower().startswith("pkg:maven/")
+        for localized in group.localized_issues
+    ) or any(
+        str(getattr(issue, "ecosystem", "") or "").strip().lower() == "maven"
+        or str(getattr(issue, "purl", "") or "").strip().lower().startswith("pkg:maven/")
+        for issue in group.issues
+    )
+
+
+def _maven_group_dependency_type(group: VulnerabilityGroup) -> str:
+    """Use only localized Maven edit targets, defaulting safely to management."""
+    for localized in group.localized_issues:
+        if localized.declaration_type in {"dependencies", "dependencyManagement"}:
+            return localized.declaration_type
+    return "dependencyManagement"
+
+
 def build_initial_remediation_task(
     group: VulnerabilityGroup,
     task_id: str,
+    *,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> RemediationTask:
     """
     Create an initial Depth-0 ``RemediationTask`` from a vulnerability group.
@@ -549,13 +600,12 @@ def build_initial_remediation_task(
 
     transitive = is_transitive_group(group)
     parent_name, parent_version, parent_type = group_parent_context(group)
+    maven_target = is_maven_group(group, project_language)
     has_parent_target = (
-        strategy == RoutingStrategy.VERSION_BUMP and transitive and bool(parent_name)
-    )
-    target_package_name = (
-        parent_name
-        if has_parent_target
-        else (group.vulnerable_component if strategy == RoutingStrategy.VERSION_BUMP else None)
+        not maven_target
+        and strategy == RoutingStrategy.VERSION_BUMP
+        and transitive
+        and bool(parent_name)
     )
     direct_dependency_type = next(
         (
@@ -565,15 +615,24 @@ def build_initial_remediation_task(
         ),
         None if transitive else "dependencies",
     )
-    target_dependency_type = (
-        parent_type
-        if has_parent_target
-        else (
-            _group_override_dependency_type(group)
-            if transitive and strategy == RoutingStrategy.VERSION_BUMP
-            else direct_dependency_type
+    if maven_target and strategy == RoutingStrategy.VERSION_BUMP:
+        target_package_name = group.vulnerable_component
+        target_dependency_type = _maven_group_dependency_type(group)
+    else:
+        target_package_name = (
+            parent_name
+            if has_parent_target
+            else (group.vulnerable_component if strategy == RoutingStrategy.VERSION_BUMP else None)
         )
-    )
+        target_dependency_type = (
+            parent_type
+            if has_parent_target
+            else (
+                _group_override_dependency_type(group)
+                if transitive and strategy == RoutingStrategy.VERSION_BUMP
+                else direct_dependency_type
+            )
+        )
     if has_parent_target:
         child_version = group.fix_plan.fixed_version if group.fix_plan else None
         declaration = parent_type or "dependencies"
@@ -585,13 +644,11 @@ def build_initial_remediation_task(
             "Do not use a package override unless the parent update stages are exhausted."
         )
     initial_stage = (
-        SCARemediationStage.OSV_MINIMUM
-        if strategy == RoutingStrategy.VERSION_BUMP and has_parent_target
-        else SCARemediationStage.PACKAGE_OVERRIDE
-        if strategy == RoutingStrategy.VERSION_BUMP and transitive
-        else SCARemediationStage.CODE_WORKAROUND
+        SCARemediationStage.CODE_WORKAROUND
         if strategy == RoutingStrategy.CODE_WORKAROUND
         else SCARemediationStage.OSV_MINIMUM
+        if maven_target or has_parent_target or not transitive
+        else SCARemediationStage.PACKAGE_OVERRIDE
     )
 
     return RemediationTask(
@@ -602,8 +659,8 @@ def build_initial_remediation_task(
         strategy_stage=initial_stage,
         target_package_name=target_package_name,
         target_dependency_type=target_dependency_type,
-        parent_package_name=parent_name,
-        parent_package_version=parent_version,
+        parent_package_name=None if maven_target else parent_name,
+        parent_package_version=None if maven_target else parent_version,
         parent_minimum_version=None,
         no_fix_stage=no_fix_stage,
         # A fix-plan version is a security floor, not a registry-verified

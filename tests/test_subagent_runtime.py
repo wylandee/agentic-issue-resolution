@@ -833,3 +833,141 @@ def test_manifest_retry_limit_is_scoped_to_one_package() -> None:
         isinstance(message, HumanMessage) and "exhausted its 3-attempt limit" in message.content
         for message in bound_llm.invoke.call_args_list[4].args[0]
     )
+
+
+def test_maven_update_transactions_are_serialized_and_retry_by_exact_gav() -> None:
+    maven_tool = MagicMock()
+    maven_tool.name = "modify_and_validate_maven_dependency"
+    maven_tool.invoke.side_effect = [
+        "ERROR_CODE: MANIFEST_SYNC_FAILED: Maven dependency resolution failed",
+        "SUCCESS: Updated org.example:library to 2.4.1 through Maven target dependencies.",
+    ]
+    first_args = {
+        "package_name": "org.example:library",
+        "target_version": "2.4.0",
+        "dependency_type": "dependencies",
+        "manifest_path": "modules/service/pom.xml",
+    }
+    retry_args = {
+        **first_args,
+        "target_version": "2.4.1",
+        "dependency_type": "dependencies",
+    }
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": maven_tool.name, "args": first_args, "id": "maven-first"},
+                {"name": maven_tool.name, "args": retry_args, "id": "maven-deferred"},
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": maven_tool.name, "args": retry_args, "id": "maven-retry"}],
+        ),
+        AIMessage(content="Maven transaction completed."),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    execution_state = {}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [maven_tool],
+        [HumanMessage(content="Update the committed Maven dependency.")],
+        set(),
+        execution_state=execution_state,
+    )
+
+    assert [event.name for event in result.tool_events] == [
+        "modify_and_validate_maven_dependency",
+        "modify_and_validate_maven_dependency",
+        "modify_and_validate_maven_dependency",
+    ]
+    assert result.tool_events[1].content.startswith("DEFERRED: manifest tools")
+    assert maven_tool.invoke.call_count == 2
+    assert result.changed_files == ["modules/service/pom.xml"]
+    assert execution_state["manifest_runtime_attempts_by_package"] == {"org.example:library": 2}
+    second_turn = bound_llm.invoke.call_args_list[1].args[0]
+    assert any(
+        isinstance(message, HumanMessage)
+        and "modify_and_validate_maven_dependency" in message.content
+        for message in second_turn
+    )
+    assert any(
+        isinstance(message, HumanMessage)
+        and "Manifest transaction sequencing barrier" in message.content
+        for message in second_turn
+    )
+
+
+def test_only_maven_no_fix_removal_is_serialized() -> None:
+    removal_tool = MagicMock()
+    removal_tool.name = "remove_no_fix_dependency"
+    removal_tool.invoke.return_value = "SUCCESS: removed configured direct dependency"
+    maven_args = {
+        "requested_package": "org.example:library",
+        "manifest_path": "pom.xml",
+    }
+    bound_llm = MagicMock()
+    bound_llm.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": removal_tool.name, "args": maven_args, "id": "maven-remove-1"},
+                {"name": removal_tool.name, "args": maven_args, "id": "maven-remove-2"},
+            ],
+        ),
+        AIMessage(content="Maven removal attempted."),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+
+    maven_result = run_bounded_subagent_loop(
+        llm,
+        [removal_tool],
+        [HumanMessage(content="Remove the committed direct Maven dependency.")],
+        set(),
+    )
+
+    assert maven_result.tool_events[1].content.startswith("DEFERRED:")
+    assert removal_tool.invoke.call_count == 1
+
+    node_removal = MagicMock()
+    node_removal.name = "remove_no_fix_dependency"
+    node_removal.invoke.return_value = "SUCCESS: removed configured direct dependency"
+    node_llm = MagicMock()
+    node_bound = MagicMock()
+    node_bound.invoke.side_effect = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": node_removal.name,
+                    "args": {"requested_package": "lodash", "manifest_path": "package.json"},
+                    "id": "node-remove-1",
+                },
+                {
+                    "name": node_removal.name,
+                    "args": {"requested_package": "axios", "manifest_path": "package.json"},
+                    "id": "node-remove-2",
+                },
+            ],
+        ),
+        AIMessage(content="Node removals attempted."),
+    ]
+    node_llm.bind_tools.return_value = node_bound
+
+    node_result = run_bounded_subagent_loop(
+        node_llm,
+        [node_removal],
+        [HumanMessage(content="Remove the configured npm dependencies.")],
+        set(),
+    )
+
+    assert [event.content for event in node_result.tool_events] == [
+        "SUCCESS: removed configured direct dependency",
+        "SUCCESS: removed configured direct dependency",
+    ]
+    assert node_removal.invoke.call_count == 2

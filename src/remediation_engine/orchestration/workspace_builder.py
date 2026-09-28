@@ -1,9 +1,8 @@
 """
 workspace_builder.py - Shared Docker workspace preparation for remediation workers.
 
-The node creates a named volume, copies the host repository into it, and
-materializes every npm package in that shared workspace. Worker nodes perform
-edits and validation against the initialized volume.
+The node creates the run-owned workspace volume, copies the host repository
+into it, and initializes the selected language toolchain in-place.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.runtime.docker_client import close_docker_client
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
@@ -21,7 +21,7 @@ from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_cli
 logger = logging.getLogger(__name__)
 
 _NPM_INSTALL_COMMAND = "npm install --package-lock=true"
-_NPM_INSTALL_TIMEOUT_SECONDS = 900
+_INSTALL_TIMEOUT_SECONDS = 900
 _INSTALL_LOG_TAIL_LINES = 80
 _SKIP_PACKAGE_DIR_NAMES = frozenset({".git", "node_modules"})
 
@@ -91,7 +91,7 @@ def _install_workspace_dependencies(
             "workspace_builder_node: installing npm dependencies in %s.",
             package_label,
         )
-        result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
+        result = sandbox.run(command, timeout=_INSTALL_TIMEOUT_SECONDS)
         if result.exit_code == 0:
             continue
 
@@ -108,9 +108,9 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node - Workspace Builder.
 
-    Creates a Docker named volume, copies the host repository into it, and
-    installs all discovered npm packages so Specialist workers can edit and
-    validate a fully initialized workspace in-place using native tools.
+    Creates the run-owned workspace volume and, for Java, a separate Maven
+    repository volume. The selected language's toolchain initializes the
+    copied project without mutating the host repository.
     """
     repo_root_str: str = state.get("repo_root", "")
     if not repo_root_str or not Path(repo_root_str).is_dir():
@@ -119,22 +119,32 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
         return {
             "status": "workspace_build_failed",
             "workspace_volume": None,
+            "maven_cache_volume": None,
             "errors": [msg],
         }
 
+    project_language = state.get("project_language", ProjectLanguage.NODEJS)
+    language_config = LANGUAGE_CONFIGS[project_language]
+    is_java = project_language == ProjectLanguage.JAVA
     volume_name = f"agent_workspace_{uuid.uuid4().hex[:8]}"
+    maven_cache_volume = f"agent_maven_repository_{uuid.uuid4().hex[:8]}" if is_java else None
     logger.info("workspace_builder_node: creating workspace volume %s.", volume_name)
 
     client = None
+    creation_step = "workspace"
     try:
         client = get_docker_client()
         client.volumes.create(name=volume_name)
+        if maven_cache_volume is not None:
+            creation_step = "Maven cache"
+            client.volumes.create(name=maven_cache_volume)
     except Exception as exc:  # noqa: BLE001
-        msg = f"workspace_builder_node: failed to create workspace volume - {exc}"
-        logger.exception("workspace_builder_node: workspace volume creation failed.")
+        msg = f"workspace_builder_node: failed to create {creation_step} volume - {exc}"
+        logger.exception("workspace_builder_node: %s volume creation failed.", creation_step)
         return {
             "status": "workspace_build_failed",
-            "workspace_volume": None,
+            "workspace_volume": volume_name if creation_step == "Maven cache" else None,
+            "maven_cache_volume": None,
             "errors": [msg],
         }
     finally:
@@ -142,32 +152,54 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
             _close_client(client)
 
     try:
-        with DockerSandbox(repo_root_str, workspace_volume=volume_name) as sandbox:
+        sandbox_options: dict[str, Any] = {"workspace_volume": volume_name}
+        if is_java:
+            sandbox_options.update(
+                image=language_config.docker_image,
+                maven_repository_volume=maven_cache_volume,
+                archive_excluded_dirs=language_config.excluded_dirs,
+            )
+        with DockerSandbox(repo_root_str, **sandbox_options) as sandbox:
             logger.info(
                 "workspace_builder_node: repository copied into shared volume %s.",
                 volume_name,
             )
-            package_directories = _discover_package_directories(Path(repo_root_str))
-            if package_directories:
-                _install_workspace_dependencies(
-                    sandbox=sandbox,
-                    package_directories=package_directories,
-                )
+            if is_java:
+                command = language_config.install_command
+                logger.info("workspace_builder_node: resolving Maven dependencies in reactor root.")
+                result = sandbox.run(command, timeout=_INSTALL_TIMEOUT_SECONDS)
+                if result.exit_code != 0:
+                    stdout_tail = "\n".join(result.stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
+                    stderr_tail = "\n".join(result.stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
+                    raise RuntimeError(
+                        f"Maven dependency resolution failed in . (exit {result.exit_code}).\n"
+                        f"stdout tail:\n{stdout_tail}\n"
+                        f"stderr tail:\n{stderr_tail}"
+                    )
             else:
-                logger.info(
-                    "workspace_builder_node: no npm package manifests found; "
-                    "skipping dependency installation."
-                )
+                package_directories = _discover_package_directories(Path(repo_root_str))
+                if package_directories:
+                    _install_workspace_dependencies(
+                        sandbox=sandbox,
+                        package_directories=package_directories,
+                    )
+                else:
+                    logger.info(
+                        "workspace_builder_node: no npm package manifests found; "
+                        "skipping dependency installation."
+                    )
     except Exception as exc:  # noqa: BLE001
         msg = f"workspace_builder_node: sandbox setup failed - {exc}"
         logger.exception("workspace_builder_node: repository copy or dependency setup failed.")
         return {
             "status": "workspace_build_failed",
             "workspace_volume": volume_name,
+            "maven_cache_volume": maven_cache_volume,
             "errors": [msg],
         }
 
     return {
         "workspace_volume": volume_name,
+        "maven_cache_volume": maven_cache_volume,
         "status": "workspace_ready",
     }
