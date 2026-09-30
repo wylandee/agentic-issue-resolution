@@ -44,6 +44,7 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     ScanFallbackReason,
     ScanScope,
+    ScannerExecutionStatus,
     VulnerabilityGroup,
 )
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
@@ -96,6 +97,7 @@ def _run_global_execution(
     scan_targets: Sequence[QAScanTarget] | None = None,
     skip_scan: bool = False,
     scan_skip_reason: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _QAExecutionResults:
     """
     Run install, security scan, and unit tests exactly once via direct Python calls.
@@ -105,8 +107,17 @@ def _run_global_execution(
     """
     results = _QAExecutionResults()
 
-    logger.info("qa_critic: [Step 0] running npm install.")
-    install_outcome = _qa_test_parsing_module._run_install(sandbox)
+    install_label = (
+        "npm install"
+        if project_language == ProjectLanguage.NODEJS
+        else "mvn -B -q -DskipTests package"
+    )
+    logger.info("qa_critic: [Step 0] running %s.", install_label)
+    install_outcome = (
+        _qa_test_parsing_module._run_install(sandbox)
+        if project_language == ProjectLanguage.NODEJS
+        else _qa_test_parsing_module._run_install(sandbox, project_language)
+    )
     _qa_test_parsing_module._store_install_outcome(results, install_outcome)
     install_ok = results.install[0]
 
@@ -197,7 +208,9 @@ def _run_global_execution(
                         targets=scan_targets,
                         scan_result=targeted_result,
                         effective_scope=ScanScope.TARGETED,
-                        complete=True,
+                        complete=(
+                            targeted_result.execution_status == ScannerExecutionStatus.SUCCESS
+                        ),
                         closures=closures,
                     )
         except (ClosureResolutionError, OSError, RuntimeError, ValueError) as exc:
@@ -226,7 +239,12 @@ def _run_global_execution(
                 targets=scan_targets,
                 scan_result=results.scan,
                 effective_scope=ScanScope.FULL,
-                complete=False,
+                # A successful full fallback is complete task-level evidence
+                # for covered targets, while remaining attempt-local for
+                # repo-wide reporting.
+                complete=(
+                    fallback_result.execution_status == ScannerExecutionStatus.SUCCESS
+                ),
                 fallback_reason=fallback_reason,
                 closures=closures,
             )
@@ -258,8 +276,13 @@ def _run_global_execution(
             time.monotonic() - scan_started,
         )
 
-    logger.info("qa_critic: [Step 0] running unit tests.")
-    test_outcome = _qa_test_parsing_module._run_unit_tests(sandbox)
+    test_label = "npm test" if project_language == ProjectLanguage.NODEJS else "mvn test"
+    logger.info("qa_critic: [Step 0] running %s.", test_label)
+    test_outcome = (
+        _qa_test_parsing_module._run_unit_tests(sandbox)
+        if project_language == ProjectLanguage.NODEJS
+        else _qa_test_parsing_module._run_unit_tests(sandbox, project_language)
+    )
     _qa_test_parsing_module._store_test_outcome(results, test_outcome)
 
     return results
@@ -457,7 +480,15 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     errors: list[str] = []
     deterministic_test_evidence: QAFailureEvidence | None = None
     sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
-    project_language = state.get("project_language", ProjectLanguage.NODEJS)
+    language_value = state.get("project_language", ProjectLanguage.NODEJS)
+    try:
+        project_language = (
+            language_value
+            if isinstance(language_value, ProjectLanguage)
+            else ProjectLanguage(str(language_value))
+        )
+    except ValueError:
+        project_language = ProjectLanguage.NODEJS
     if project_language == ProjectLanguage.JAVA:
         sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
         sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
@@ -467,14 +498,19 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
             # ------------------------------------------------------------------
             # Step 0: Global Execution (deterministic Python, exactly once)
             # ------------------------------------------------------------------
+            execution_arguments: dict[str, Any] = {
+                "sandbox": sandbox,
+                "workspace_volume": workspace_volume,
+                "target_identifiers": target_identifiers,
+                "baseline_identifiers": baseline_identifiers,
+                "scan_targets": scan_targets,
+                "skip_scan": skip_scan,
+                "scan_skip_reason": "no_fix_package_removal" if skip_scan else None,
+            }
+            if project_language != ProjectLanguage.NODEJS:
+                execution_arguments["project_language"] = project_language
             results = _run_global_execution(
-                sandbox=sandbox,
-                workspace_volume=workspace_volume,
-                target_identifiers=target_identifiers,
-                baseline_identifiers=baseline_identifiers,
-                scan_targets=scan_targets,
-                skip_scan=skip_scan,
-                scan_skip_reason="no_fix_package_removal" if skip_scan else None,
+                **execution_arguments,
             )
             scan_projection = _scan_state_projection(
                 results,

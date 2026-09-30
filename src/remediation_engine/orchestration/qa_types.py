@@ -81,7 +81,7 @@ class _QAExecutionResults:
 
 @dataclass(frozen=True)
 class QAScanTarget:
-    """Task-owned package target and live lockfile context for QA scanning."""
+    """Task-owned package target and live manifest context for QA scanning."""
 
     task_id: str
     group_id: str
@@ -90,6 +90,7 @@ class QAScanTarget:
     manifest_paths: tuple[str, ...]
     dependency_ancestry: tuple[str, ...]
     target_identifiers: frozenset[str]
+    package_manager: str | None = None
 
 
 @dataclass(frozen=True)

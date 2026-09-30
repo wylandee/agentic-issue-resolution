@@ -166,13 +166,13 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
             )
             if is_java:
                 command = language_config.install_command
-                logger.info("workspace_builder_node: resolving Maven dependencies in reactor root.")
+                logger.info("workspace_builder_node: building Maven project in reactor root.")
                 result = sandbox.run(command, timeout=_INSTALL_TIMEOUT_SECONDS)
                 if result.exit_code != 0:
                     stdout_tail = "\n".join(result.stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
                     stderr_tail = "\n".join(result.stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
                     raise RuntimeError(
-                        f"Maven dependency resolution failed in . (exit {result.exit_code}).\n"
+                        f"Maven package build failed in . (exit {result.exit_code}).\n"
                         f"stdout tail:\n{stdout_tail}\n"
                         f"stderr tail:\n{stderr_tail}"
                     )

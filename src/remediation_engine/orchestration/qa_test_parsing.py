@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from remediation_engine.contracts.schemas import QAFailureEvidence
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 from . import _test_normalization
@@ -49,6 +50,7 @@ class _TestSuitePlan:
 
 _NPM_INSTALL_TIMEOUT_SECONDS = 900
 _NPM_TEST_TIMEOUT_SECONDS = 600
+_MAVEN_TEST_TIMEOUT_SECONDS = 900
 _TEST_LOG_TAIL_LINES = 60
 _STDERR_TAIL_LINES = 30
 _INSTALL_LOG_TAIL_LINES = 80
@@ -127,22 +129,29 @@ def _store_test_outcome(results: _QAExecutionResults, outcome: _QATestExecutionO
     _append_qa_log_records(results, "tests", outcome.log_records)
 
 
-def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
-    """Run npm install and retain bounded and raw deterministic evidence.
+def _run_install(
+    sandbox: DockerSandbox,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> _QAInstallOutcome:
+    """Install project dependencies with the language's configured command.
 
     Args:
-        sandbox: Active QA sandbox in which npm should run.
+        sandbox: Active QA sandbox in which dependency installation should run.
+        project_language: Project language selecting the deterministic install command.
 
     Returns:
         A structured install outcome. Raw streams remain private to the
         invocation and are also represented by one immutable log record.
     """
     error: BaseException | None = None
+    command = LANGUAGE_CONFIGS[project_language].install_command
+    label = (
+        "npm install"
+        if project_language == ProjectLanguage.NODEJS
+        else "mvn -B -q -DskipTests package"
+    )
     try:
-        result = sandbox.run(
-            "npm install --package-lock=true",
-            timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
-        )
+        result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
         exit_code = int(getattr(result, "exit_code", 1))
         stdout = _subprocess_text(getattr(result, "stdout", ""))
         stderr = _subprocess_text(getattr(result, "stderr", ""))
@@ -157,14 +166,18 @@ def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
         stderr = _exception_stream(exc, "stderr")
 
     if exit_code == 0:
-        summary = "npm install succeeded."
+        summary = f"{label} succeeded."
         category = None
     else:
-        category = _install_error_category(stdout, stderr, exit_code or 1)
+        category = (
+            _install_error_category(stdout, stderr, exit_code or 1)
+            if project_language == ProjectLanguage.NODEJS
+            else "INSTALL_FAILURE"
+        )
         stdout_tail = "\n".join(stdout.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
         stderr_tail = "\n".join(stderr.splitlines()[-_INSTALL_LOG_TAIL_LINES:])
         summary = (
-            f"npm install FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
+            f"{label} FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
             f"stdout tail:\n{stdout_tail}\n"
             f"stderr tail:\n{stderr_tail}"
         )
@@ -180,7 +193,7 @@ def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
         raw_stderr=stderr,
         log_record=_QALogRecord(
             phase="install",
-            label="npm install",
+            label=label,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
@@ -1419,8 +1432,75 @@ def _run_detected_test_suites(
     )
 
 
-def _run_unit_tests(sandbox: DockerSandbox) -> _QATestExecutionOutcome:
-    """Run workspace tests and retain raw, suite, and normalized evidence."""
+def _run_unit_tests(
+    sandbox: DockerSandbox,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> _QATestExecutionOutcome:
+    """Run the configured language test command and retain deterministic evidence.
+
+    Args:
+        sandbox: Active QA sandbox containing the remediation workspace.
+        project_language: Project language selecting Maven or npm test execution.
+
+    Returns:
+        Structured command outcome with bounded summary and raw output streams.
+    """
+    if project_language == ProjectLanguage.JAVA:
+        command = LANGUAGE_CONFIGS[project_language].test_command
+        error: BaseException | None = None
+        try:
+            result = sandbox.run(command, timeout=_MAVEN_TEST_TIMEOUT_SECONDS)
+            exit_code = int(getattr(result, "exit_code", 1))
+            stdout = _subprocess_text(getattr(result, "stdout", ""))
+            stderr = _subprocess_text(getattr(result, "stderr", ""))
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+            raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
+            try:
+                exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+            stdout = _exception_stream(exc, "stdout")
+            stderr = _exception_stream(exc, "stderr")
+
+        if exit_code == 0:
+            summary = "mvn test passed."
+            failure_count = 0
+        else:
+            combined = f"{stdout}\n{stderr}"
+            stats = re.search(
+                r"Tests run:\s*\d+,\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)",
+                combined,
+                re.IGNORECASE,
+            )
+            failure_count = int(stats.group(1)) + int(stats.group(2)) if stats is not None else None
+            stdout_tail = "\n".join(stdout.splitlines()[-_TEST_LOG_TAIL_LINES:])
+            stderr_tail = "\n".join(stderr.splitlines()[-_STDERR_TAIL_LINES:])
+            summary = (
+                f"mvn test FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
+                f"stdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}"
+            )
+            if error is not None:
+                summary += f"\nerror: {error}"
+        return _QATestExecutionOutcome(
+            ok=exit_code == 0,
+            summary=summary,
+            exit_code=exit_code,
+            failure_count=failure_count,
+            raw_stdout=stdout,
+            raw_stderr=stderr,
+            log_records=(
+                _QALogRecord(
+                    phase="tests",
+                    label="mvn test",
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    error=str(error) if error is not None else None,
+                ),
+            ),
+        )
+
     plans = _detect_test_suite_plans(sandbox)
     if plans and any(plan.runner != "npm_text_fallback" for plan in plans):
         return _run_detected_test_suites(sandbox, plans)

@@ -72,7 +72,7 @@ class TestWorkspaceBuilderNode:
             "status": "workspace_ready",
         }
 
-    def test_java_workspace_uses_maven_image_cache_and_reactor_resolution(self, tmp_path):
+    def test_java_workspace_uses_maven_image_cache_and_builds_reactor(self, tmp_path):
         (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
         client = MagicMock()
         sandbox = _sandbox_mock()
@@ -109,7 +109,7 @@ class TestWorkspaceBuilderNode:
             archive_excluded_dirs=frozenset({"target"}),
         )
         assert [entry.args[0] for entry in sandbox.run.call_args_list] == [
-            "mvn -B -q dependency:resolve"
+            "mvn -B -q -DskipTests package"
         ]
         assert result == {
             "workspace_volume": workspace_volume,

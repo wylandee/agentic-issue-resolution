@@ -373,7 +373,10 @@ def test_maven_qa_package_state_requires_exact_pom_and_dependency_tree_evidence(
     )
     assert absent.manifest_state == "absent"
     assert absent.graph_state == "absent"
-    assert sandbox.commands == ["cd module && mvn -B -DoutputType=text dependency:tree"]
+    assert sandbox.commands == [
+        "cd module && mvn -B -DoutputType=text "
+        "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
+    ]
 
     sandbox.sync_result = CommandResult(
         exit_code=0,
@@ -425,8 +428,10 @@ def test_maven_package_state_includes_authorized_version_property_pom():
     assert state.manifest_state == "absent"
     assert state.graph_state == "absent"
     assert sandbox.commands == [
-        "cd module && mvn -B -DoutputType=text dependency:tree",
-        "cd parent && mvn -B -DoutputType=text dependency:tree",
+        "cd module && mvn -B -DoutputType=text "
+        "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree",
+        "cd parent && mvn -B -DoutputType=text "
+        "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree",
     ]
 
 

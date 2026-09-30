@@ -69,6 +69,7 @@ from remediation_engine.contracts.version_policy import (
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
+from remediation_engine.orchestration._tool_support import _resolve_maven_manifest_scope
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
@@ -409,6 +410,16 @@ def _authorize_update_dispatch(
         return None
     if expected_type and task.target_dependency_type != expected_type:
         return None
+    if maven_mode and (
+        task.target_dependency_type not in {"dependencies", "dependencyManagement"}
+        or task.target_dependency_type not in allowed_dependency_types
+        or (
+            plan is not None
+            and plan.target_dependency_type
+            and plan.target_dependency_type != task.target_dependency_type
+        )
+    ):
+        return None
     plan_version = normalize_selected(plan.selected_version if plan is not None else None)
     task_version = normalize_selected(task.selected_version)
     if plan_version and task_version != plan_version:
@@ -482,6 +493,66 @@ def _maven_attempt_target_paths(
             if path and Path(path).name == "pom.xml" and path not in paths:
                 paths.append(path)
     return paths
+
+
+def _validate_maven_update_target(
+    task: RemediationTask,
+    group: VulnerabilityGroup | None,
+    repo_root: str,
+    project_language: ProjectLanguage,
+) -> tuple[list[str], list[str]]:
+    """Validate the exact Maven target before committing an update attempt.
+
+    Args:
+        task: Supervisor-owned task whose GAV and declaration type will be used.
+        group: Vulnerability group providing the canonical Maven finding.
+        repo_root: Host repository path used by deterministic POM resolution.
+        project_language: Run language, which must be Java for Maven updates.
+
+    Returns:
+        Authorized repository-relative POM paths and validation diagnostics.
+        Empty paths mean the attempt must not be dispatched.
+    """
+    errors: list[str] = []
+    if project_language != ProjectLanguage.JAVA or group is None:
+        return [], [f"Task {task.task_id} has no authorized Maven vulnerability group."]
+    if not is_maven_group(group, project_language):
+        return [], [f"Task {task.task_id} is not backed by a Maven finding."]
+    group_gav = (group.vulnerable_component or "").strip()
+    if not group_gav or task.target_package_name != group_gav:
+        errors.append(f"Task {task.task_id} target package does not match its exact Maven GAV.")
+    if task.target_dependency_type not in {"dependencies", "dependencyManagement"}:
+        errors.append(f"Task {task.task_id} has no authorized Maven declaration type.")
+
+    localized_types = {
+        str(getattr(localized, "declaration_type", "") or "").strip()
+        for localized in group.localized_issues
+        if (
+            str(getattr(localized, "package_manager", "") or "").strip().lower() == "maven"
+            or str(getattr(getattr(localized, "issue", None), "ecosystem", "") or "")
+            .strip()
+            .lower()
+            == "maven"
+            or str(getattr(getattr(localized, "issue", None), "purl", "") or "")
+            .strip()
+            .lower()
+            .startswith("pkg:maven/")
+        )
+    }
+    localized_types.discard("")
+    if task.target_dependency_type not in localized_types:
+        errors.append(
+            f"Task {task.task_id} declaration type does not match its localized Maven finding."
+        )
+    if errors:
+        return [], errors
+    if not repo_root:
+        return [], [f"Task {task.task_id} cannot resolve Maven POMs without repo_root."]
+    try:
+        paths, resolution_errors = _resolve_maven_manifest_scope(group, Path(repo_root))
+    except (OSError, RuntimeError, ValueError) as exc:
+        return [], [f"Task {task.task_id} Maven target validation failed: {exc}"]
+    return paths, resolution_errors
 
 
 def _create_attempt_snapshot(
@@ -2112,6 +2183,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     "instruction_digest": snapshot.instruction_digest,
                     "failure_reason": (
                         " | ".join(result.errors)
+                        or (
+                            result.action_summary.summary
+                            if result.action_summary is not None
+                            else ""
+                        )
                         if result_status == AgentActionStatus.SURRENDER
                         else prior.failure_reason
                     ),
@@ -2182,16 +2258,76 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # immutable snapshot.
                 failed_group = group_by_id.get(task.parent_group_id)
                 transitive_failure = bool(failed_group and is_transitive_group(failed_group))
-                failure_updates: dict[str, Any] = {
-                    "status": TaskStatus.NEEDS_RETRY,
-                    "retry_count": task.retry_count + 1,
-                }
+                failure_reason = " | ".join(result.errors).strip()
+                if not failure_reason and result.action_summary is not None:
+                    failure_reason = result.action_summary.summary.strip()
+                no_execution_progress = (
+                    not attempted_versions
+                    and not raw_executed_versions
+                    and execution.validation_calls == 0
+                    and execution.manifest_transaction_attempts == 0
+                )
+                same_committed_target = (
+                    prior.selected_version == snapshot.selected_version
+                    and prior.target_package_name == snapshot.target_package_name
+                    and prior.target_dependency_type == snapshot.target_dependency_type
+                )
+                repeated_no_progress = bool(
+                    no_execution_progress
+                    and same_committed_target
+                    and failure_reason
+                    and prior.failure_reason.strip() == failure_reason
+                )
+                retryable_failure = execution.retryable_failure and not repeated_no_progress
+                if repeated_no_progress:
+                    details = (
+                        "A second consecutive update attempt failed with the same committed "
+                        "target and error before executing any manifest transaction."
+                    )
+                    consistency_events.append(
+                        _build_consistency_event(
+                            error_code="UPDATE_RETRY_NO_PROGRESS",
+                            task_id=task_id,
+                            expected_attempt_id=current_attempt_id,
+                            received_attempt_id=result.attempt_id,
+                            action="terminalized",
+                            details=details,
+                        )
+                    )
+                    errors.append(
+                        f"supervisor: stopped retrying task {task_id} after repeated "
+                        "same-plan failures with no execution progress."
+                    )
+                elif not execution.retryable_failure:
+                    consistency_events.append(
+                        _build_consistency_event(
+                            error_code="UPDATE_FAILURE_NON_RETRYABLE",
+                            task_id=task_id,
+                            expected_attempt_id=current_attempt_id,
+                            received_attempt_id=result.attempt_id,
+                            action="terminalized",
+                            details=(
+                                failure_reason
+                                or "Worker rejected a deterministic precondition before execution."
+                            ),
+                        )
+                    )
+                if retryable_failure:
+                    failure_updates: dict[str, Any] = {
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    }
+                else:
+                    failure_updates = {
+                        "status": TaskStatus.INCONCLUSIVE,
+                        "retry_count": task.retry_count + 1,
+                    }
                 _commit_task_transition(
                     task_queue,
                     task_id,
                     updates=failure_updates,
                     close_attempt=True,
-                    clear_selected_version=False,
+                    clear_selected_version=not retryable_failure,
                 )
                 if transitive_failure:
                     committed_failure_task = task_queue[task_id]
@@ -2258,7 +2394,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             new_qa_attempt_ids.append(task.current_attempt_id)
             continue
         snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
-        qa_requires_rerun = False
         if (
             qa_result.task_id != task_id
             or qa_result.task_revision != task.task_revision
@@ -2284,29 +2419,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         else:
             qa_evaluations[task_id] = qa_result.evaluation
             qa_result_task_ids.add(task_id)
-            qa_requires_rerun = (
-                qa_result.evaluation.evidence_inconclusive or qa_result.evaluation.contract_error
+            # Consume each valid QA result once. Inconclusive outcomes are
+            # terminalized below instead of reopening the same committed
+            # attempt for an identical QA pass.
+            _commit_task_transition(
+                task_queue,
+                task_id,
+                updates={},
+                close_attempt=True,
+                clear_selected_version=True,
             )
-            if not qa_requires_rerun:
-                # QA closes the worker attempt before any status or stage
-                # change. The next planner proposal must observe a task with
-                # no active worker input; otherwise it can see the new retry
-                # stage paired with the old attempt snapshot.
-                _commit_task_transition(
-                    task_queue,
-                    task_id,
-                    updates={},
-                    close_attempt=True,
-                    clear_selected_version=True,
-                )
-            else:
-                # Keep the committed attempt open so QA can be rerun without
-                # creating a worker retry or losing its provenance.
-                logger.info(
-                    "supervisor: preserving attempt for non-remediation QA rerun on %s.",
-                    task_id,
-                )
-        if not qa_requires_rerun:
             processed_qa_attempt_ids.add(task.current_attempt_id)
             new_qa_attempt_ids.append(task.current_attempt_id)
     auto_new_constraints: list[str] = []
@@ -2326,28 +2448,27 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
                 continue
             if evaluation.contract_error:
-                # A malformed judge response is a QA-contract failure, not a
-                # remediation failure. Requeue QA without advancing the
-                # strategy stage or consuming the worker retry budget.
+                # A malformed judge response cannot authorize remediation or
+                # an identical QA rerun for this committed attempt.
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
-                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
+                    updates={"status": TaskStatus.INCONCLUSIVE},
                 )
                 errors.append(
                     f"supervisor: QA contract error for {resolved_t_id}; "
-                    "requeued QA without consuming a remediation retry."
+                    "marked inconclusive without consuming a remediation retry."
                 )
                 continue
             if evaluation.evidence_inconclusive:
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
-                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
+                    updates={"status": TaskStatus.INCONCLUSIVE},
                 )
                 errors.append(
-                    f"supervisor: dependency evidence inconclusive for {resolved_t_id}; "
-                    "requeued QA without consuming a remediation retry."
+                    f"supervisor: QA evidence inconclusive for {resolved_t_id}; "
+                    "marked inconclusive without consuming a remediation retry."
                 )
                 continue
             if evaluation.passed:
@@ -3469,12 +3590,49 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 if eval_ and eval_.retry_feedback:
                     remapped_feedback_by_task[task_id] = eval_.retry_feedback
     update_dispatch_authorizations: dict[str, _UpdateDispatchAuthorization] = {}
+    maven_target_paths_by_task: dict[str, list[str]] = {}
     if resolved_next_node == "update_subagent":
         dispatchable_update_ids: list[str] = []
         for task_id in resolved_target_task_ids:
             task = task_queue.get(task_id)
             if task is None:
                 continue
+            group = group_by_id.get(task.parent_group_id)
+            maven_mode = is_maven_group(group, project_language)
+            if project_language == ProjectLanguage.JAVA:
+                maven_paths, target_errors = _validate_maven_update_target(
+                    task,
+                    group,
+                    str(state.get("repo_root") or ""),
+                    project_language,
+                )
+                if target_errors or not maven_paths:
+                    detail = "; ".join(
+                        target_errors or ["no authorized Maven POM target was resolved"]
+                    )
+                    errors.append(
+                        f"supervisor: rejected Maven update target for {task_id}: {detail}"
+                    )
+                    consistency_events.append(
+                        _build_consistency_event(
+                            error_code="MAVEN_UPDATE_TARGET_REJECTED",
+                            task_id=task_id,
+                            expected_attempt_id=task.current_attempt_id,
+                            received_attempt_id=None,
+                            action="terminalized",
+                            details=detail,
+                        )
+                    )
+                    _commit_task_transition(
+                        task_queue,
+                        task_id,
+                        updates={"status": TaskStatus.INCONCLUSIVE},
+                        close_attempt=task.current_attempt_id is not None,
+                        clear_selected_version=task.selected_version is not None,
+                        consistency_events=consistency_events,
+                    )
+                    continue
+                maven_target_paths_by_task[task_id] = maven_paths
             plan = retry_plans_by_task.get(task_id)
             diagnostics = retry_diagnostics_by_task.get(task_id)
             authorization = _authorize_update_dispatch(
@@ -3482,46 +3640,45 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 plan=plan,
                 diagnostics=diagnostics,
                 project_language=project_language,
-                maven_mode=is_maven_group(
-                    group_by_id.get(task.parent_group_id),
-                    project_language,
-                ),
+                maven_mode=maven_mode,
             )
-            if authorization is None and task.strategy == RoutingStrategy.VERSION_BUMP:
-                group = group_by_id.get(task.parent_group_id)
-                if group is not None:
-                    recovery_input = diagnostics or UpdateRetryDiagnostics(
-                        task_id=task_id,
-                        strategy_stage=task.strategy_stage,
-                    )
-                    recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
-                        {task_id: task},
-                        {task.parent_group_id: group},
-                        {task_id: recovery_input},
-                        project_language=project_language,
-                    )
-                    if not _planner_plan_violations(
+            if (
+                authorization is None
+                and task.strategy == RoutingStrategy.VERSION_BUMP
+                and group is not None
+            ):
+                recovery_input = diagnostics or UpdateRetryDiagnostics(
+                    task_id=task_id,
+                    strategy_stage=task.strategy_stage,
+                )
+                recovered_diagnostics, recovered_plans = _run_deterministic_retry_planner(
+                    {task_id: task},
+                    {task.parent_group_id: group},
+                    {task_id: recovery_input},
+                    project_language=project_language,
+                )
+                if not _planner_plan_violations(
+                    recovered_plans,
+                    {task_id: task},
+                    recovered_diagnostics,
+                ):
+                    retry_diagnostics_by_task.update(recovered_diagnostics)
+                    _commit_retry_plans(
+                        task_queue,
+                        retry_diagnostics_by_task,
+                        retry_plans_by_task,
                         recovered_plans,
-                        {task_id: task},
-                        recovered_diagnostics,
-                    ):
-                        retry_diagnostics_by_task.update(recovered_diagnostics)
-                        _commit_retry_plans(
-                            task_queue,
-                            retry_diagnostics_by_task,
-                            retry_plans_by_task,
-                            recovered_plans,
-                        )
-                        task = task_queue.get(task_id)
-                        plan = retry_plans_by_task.get(task_id)
-                        diagnostics = retry_diagnostics_by_task.get(task_id)
-                        authorization = _authorize_update_dispatch(
-                            task,
-                            plan=plan,
-                            diagnostics=diagnostics,
-                            project_language=project_language,
-                            maven_mode=is_maven_group(group, project_language),
-                        )
+                    )
+                    task = task_queue.get(task_id)
+                    plan = retry_plans_by_task.get(task_id)
+                    diagnostics = retry_diagnostics_by_task.get(task_id)
+                    authorization = _authorize_update_dispatch(
+                        task,
+                        plan=plan,
+                        diagnostics=diagnostics,
+                        project_language=project_language,
+                        maven_mode=maven_mode,
+                    )
             if authorization is not None:
                 update_dispatch_authorizations[task_id] = authorization
                 dispatchable_update_ids.append(task_id)
@@ -3719,10 +3876,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     )
                     continue
                 update_dispatch_authorizations[task_id] = update_authorization
-            target_manifest_paths = _maven_attempt_target_paths(
-                group_by_id.get(task.parent_group_id),
-                project_language,
-            )
+            target_manifest_paths = maven_target_paths_by_task.get(task_id)
+            if target_manifest_paths is None:
+                target_manifest_paths = _maven_attempt_target_paths(
+                    group_by_id.get(task.parent_group_id),
+                    project_language,
+                )
             task, snapshot = _create_attempt_snapshot(
                 task,
                 dispatch_node=resolved_next_node,

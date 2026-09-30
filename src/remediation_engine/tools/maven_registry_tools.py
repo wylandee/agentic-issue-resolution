@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from functools import cmp_to_key
 from typing import Any
 
@@ -16,6 +17,9 @@ from remediation_engine.contracts.version_policy import (
 
 _MAVEN_SEARCH_URL = "https://search.maven.org/solrsearch/select"
 _REQUEST_TIMEOUT_SECONDS = 15
+_REQUEST_MAX_ATTEMPTS = 3
+_REQUEST_RETRY_BACKOFF_SECONDS = 0.5
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _ROWS_PER_PAGE = 200
 _COORDINATE_PART_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 
@@ -73,16 +77,32 @@ def fetch_maven_registry_candidates(
             "start": start,
             "wt": "json",
         }
+        response = None
+        for attempt in range(_REQUEST_MAX_ATTEMPTS):
+            try:
+                response = requests.get(
+                    _MAVEN_SEARCH_URL,
+                    params=params,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or (
+                    status_code in _RETRYABLE_HTTP_STATUS_CODES
+                )
+                if not retryable or attempt + 1 == _REQUEST_MAX_ATTEMPTS:
+                    raise ValueError(
+                        f"Could not query Maven Central for {package_name} "
+                        f"after {attempt + 1} attempt(s): {exc}"
+                    ) from exc
+                time.sleep(_REQUEST_RETRY_BACKOFF_SECONDS * (2**attempt))
+
         try:
-            response = requests.get(
-                _MAVEN_SEARCH_URL,
-                params=params,
-                timeout=_REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
+            if response is None:
+                raise ValueError("Maven Central request did not produce a response")
             payload: Any = response.json()
-        except requests.RequestException as exc:
-            raise ValueError(f"Could not query Maven Central for {package_name}: {exc}") from exc
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"Maven Central returned invalid JSON for {package_name}: {exc}"

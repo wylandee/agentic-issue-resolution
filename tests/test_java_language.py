@@ -55,7 +55,7 @@ def test_language_configs_preserve_node_contract_and_register_maven_contract() -
     assert java.docker_image == "maven:3.9-eclipse-temurin-17"
     assert java.manifest_names == ("pom.xml",)
     assert java.source_suffixes == frozenset({".java"})
-    assert java.install_command == "mvn -B -q dependency:resolve"
+    assert java.install_command == "mvn -B -q -DskipTests package"
     assert java.compile_command == "mvn -B -q -DskipTests compile"
     assert java.test_command == "mvn -B test -Dsurefire.useFile=false"
     assert java.test_include_patterns == (

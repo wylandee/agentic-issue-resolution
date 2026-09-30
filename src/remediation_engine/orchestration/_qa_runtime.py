@@ -98,6 +98,7 @@ _QA_ACTION_SUMMARY_MAX_CHARS = 1_200
 _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
 _MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
+_MAVEN_DEPENDENCY_TREE_GOAL = "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
 
 
 def _label_scan_records(
@@ -441,15 +442,41 @@ def _build_qa_scan_targets(
         ):
             expected_version = (group.versions or [None])[0]
         ancestry = tuple(name for name in (group.dependency_ancestry or []) if name)
+        package_managers = {
+            (getattr(issue, "package_manager", "") or "").strip().lower()
+            for issue in (getattr(group, "localized_issues", []) or [])
+            if (getattr(issue, "package_manager", "") or "").strip()
+        }
+        package_manager = (
+            next(iter(package_managers))
+            if len(package_managers) == 1
+            else "mixed"
+            if package_managers
+            else None
+        )
+        language_value = getattr(
+            state.get("project_language"), "value", state.get("project_language")
+        )
+        uses_maven = "maven" in package_managers or (
+            not package_managers and str(language_value or "").casefold() == "java"
+        )
+        if uses_maven and package_manager is None:
+            package_manager = "maven"
+        manifest_paths = (
+            _maven_target_manifest_paths(group)
+            if uses_maven
+            else _lockfile_paths_for_group(group)
+        )
         targets.append(
             QAScanTarget(
                 task_id=task.task_id if task is not None else active_id,
                 group_id=group.group_id,
                 target_package=target_package,
                 expected_version=expected_version,
-                manifest_paths=_lockfile_paths_for_group(group),
+                manifest_paths=manifest_paths,
                 dependency_ancestry=ancestry,
                 target_identifiers=frozenset(group_target_identifiers(group)),
+                package_manager=package_manager,
             )
         )
     return targets
@@ -705,6 +732,28 @@ def _manifest_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
             manifests.add(path)
         elif name in lockfile_names:
             manifests.add(str(Path(path).with_name("package.json")))
+    return tuple(sorted(manifests))
+
+
+def _maven_target_manifest_paths(group: VulnerabilityGroup) -> tuple[str, ...]:
+    """Return Maven declaration POMs without adding version-property owners."""
+    candidates = [
+        *(getattr(group, "file_paths", []) or []),
+        getattr(group, "file_path", None),
+        *(
+            getattr(issue, "manifest_file", None)
+            for issue in (getattr(group, "localized_issues", []) or [])
+        ),
+    ]
+    manifests: set[str] = set()
+    for value in candidates:
+        raw = str(value or "").strip().split("?", 1)[0].split("#", 1)[0]
+        try:
+            path = _validate_qa_path(raw.replace("\\", "/"))
+        except (ValueError, WorkspacePathError):
+            continue
+        if Path(path).name.casefold() == "pom.xml":
+            manifests.add(path)
     return tuple(sorted(manifests))
 
 
@@ -964,6 +1013,7 @@ _MAVEN_TREE_COORDINATE_RE = re.compile(
     re.MULTILINE,
 )
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_MAVEN_TREE_GOAL_RE = re.compile(r"(?:maven-dependency-plugin|dependency)(?::[^:\s]+)?:tree")
 
 
 def _maven_dependency_tree_state(
@@ -973,9 +1023,7 @@ def _maven_dependency_tree_state(
 ) -> str:
     """Classify complete Maven text dependency-tree output for one exact GA."""
     plain_output = _ANSI_ESCAPE_RE.sub("", output)
-    has_goal_marker = bool(
-        re.search(r"maven-dependency-plugin[^\n]*:tree|dependency:tree", plain_output)
-    )
+    has_goal_marker = _MAVEN_TREE_GOAL_RE.search(plain_output) is not None
     coordinates = list(_MAVEN_TREE_COORDINATE_RE.finditer(plain_output))
     no_dependencies = bool(
         re.search(
@@ -993,6 +1041,264 @@ def _maven_dependency_tree_state(
             for match in coordinates
         )
         else "absent"
+    )
+
+
+def _maven_dependency_tree_versions(
+    output: str,
+    group_id: str,
+    artifact_id: str,
+) -> set[str] | None:
+    """Return exact resolved Maven versions, or ``None`` for unparseable output."""
+    plain_output = _ANSI_ESCAPE_RE.sub("", output)
+    has_goal_marker = _MAVEN_TREE_GOAL_RE.search(plain_output) is not None
+    coordinates = list(_MAVEN_TREE_COORDINATE_RE.finditer(plain_output))
+    no_dependencies = bool(
+        re.search(
+            r"^\s*\[INFO\]\s+No dependencies(?: found)?\.?\s*$",
+            plain_output,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+    if not has_goal_marker or (not coordinates and not no_dependencies):
+        return None
+    return {
+        version
+        for match in coordinates
+        if match.group("group") == group_id and match.group("artifact") == artifact_id
+        if (version := _normalise_dependency_version(match.group("version"))) is not None
+    }
+
+
+def _maven_target_declaration_version(
+    source: str,
+    group_id: str,
+    artifact_id: str,
+    dependency_type: str,
+) -> tuple[bool, str | None, str | None]:
+    """Read one exact Maven declaration and resolve its literal version if possible."""
+    if dependency_type not in {"dependencies", "dependencyManagement"}:
+        raise MavenManifestError("unsupported authorized Maven declaration type")
+    root = _parse_xml_source(source)
+    values = _raw_properties(root)
+    parent = _maven_child(root, "parent")
+    parent_group = _resolve_maven_value(_maven_text(_maven_child(parent, "groupId")), values)
+    parent_artifact = _resolve_maven_value(_maven_text(_maven_child(parent, "artifactId")), values)
+    project_group = _resolve_maven_value(
+        _maven_text(_maven_child(root, "groupId")) or parent_group,
+        values,
+    )
+    project_artifact = _resolve_maven_value(
+        _maven_text(_maven_child(root, "artifactId")),
+        values,
+    )
+    values.update(
+        {
+            "project.groupId": project_group or "",
+            "pom.groupId": project_group or "",
+            "project.artifactId": project_artifact or "",
+            "pom.artifactId": project_artifact or "",
+            "project.parent.groupId": parent_group or "",
+            "pom.parent.groupId": parent_group or "",
+            "project.parent.artifactId": parent_artifact or "",
+            "pom.parent.artifactId": parent_artifact or "",
+        }
+    )
+    if _profile_has_target(root, group_id, artifact_id, values, project_group):
+        raise MavenManifestError("Maven profile declarations are ambiguous")
+
+    sections: list[Any] = []
+    if dependency_type == "dependencies":
+        sections.extend(_maven_children(root, "dependencies"))
+    else:
+        for management in _maven_children(root, "dependencyManagement"):
+            sections.extend(_maven_children(management, "dependencies"))
+
+    matches: list[Any] = []
+    for section in sections:
+        for dependency in _maven_children(section, "dependency"):
+            declared_group = _resolve_maven_value(
+                _maven_text(_maven_child(dependency, "groupId")) or project_group,
+                values,
+            )
+            declared_artifact = _resolve_maven_value(
+                _maven_text(_maven_child(dependency, "artifactId")),
+                values,
+            )
+            if declared_group is None or declared_artifact is None:
+                raise MavenManifestError("unresolved Maven dependency coordinates")
+            if declared_group != group_id or declared_artifact != artifact_id:
+                continue
+            if _maven_text(_maven_child(dependency, "classifier")) or _maven_text(
+                _maven_child(dependency, "type")
+            ):
+                raise MavenManifestError("classifier/type Maven declaration is ambiguous")
+            matches.append(dependency)
+    if len(matches) > 1:
+        raise MavenManifestError("duplicate Maven group:artifact declaration")
+    if not matches:
+        return False, None, None
+    raw_version = _maven_text(_maven_child(matches[0], "version"))
+    resolved_version = _resolve_maven_value(raw_version, values)
+    return True, raw_version, _normalise_dependency_version(resolved_version)
+
+
+def _collect_maven_version_package_state(
+    sandbox: DockerSandbox,
+    group: VulnerabilityGroup,
+    task: RemediationTask | None,
+    manifests: Sequence[str],
+    expected_version: str | None,
+    *,
+    version_evidence_inconclusive: bool = False,
+) -> _QAPackageState:
+    """Collect authorized POM and resolved-tree evidence for a Maven version bump."""
+    package = str(
+        getattr(task, "target_package_name", None) or group.vulnerable_component or ""
+    ).strip()
+    coordinate = _maven_coordinates_for_group(group)
+    expected = _normalise_dependency_version(
+        None
+        if version_evidence_inconclusive
+        else expected_version or getattr(task, "selected_version", None)
+    )
+    target_type = getattr(task, "target_dependency_type", None)
+    diagnostics: list[str] = []
+    declarations: dict[str, str] = {}
+    declaration_versions: set[str] = set()
+    parsed_manifests: list[str] = []
+    missing_declarations: list[str] = []
+    graph_errors: list[str] = []
+    graph_states: list[str] = []
+    resolved_versions: set[str] = set()
+
+    if coordinate is None or package != ":".join(coordinate):
+        diagnostics.append("Canonical Maven coordinates do not match the committed task target.")
+    if target_type not in {"dependencies", "dependencyManagement"}:
+        diagnostics.append("Supervisor-authorized Maven declaration type is unavailable.")
+    if expected is None:
+        diagnostics.append("Supervisor-selected Maven target version is unavailable.")
+    if not manifests or any(Path(path).name.casefold() != "pom.xml" for path in manifests):
+        diagnostics.append("Authorized Maven POM paths are unavailable or invalid.")
+
+    if coordinate is not None and package == ":".join(coordinate):
+        group_id, artifact_id = coordinate
+        for manifest in manifests:
+            try:
+                source = sandbox.read_file(manifest)
+                if not isinstance(source, str) or not source.strip():
+                    raise MavenManifestError("authorized POM is unavailable")
+                declared, raw_version, resolved_version = _maven_target_declaration_version(
+                    source,
+                    group_id,
+                    artifact_id,
+                    str(target_type or ""),
+                )
+                parsed_manifests.append(manifest)
+                if declared:
+                    declarations[manifest] = raw_version or "(version inherited or managed)"
+                    if resolved_version:
+                        declaration_versions.add(resolved_version)
+                else:
+                    missing_declarations.append(manifest)
+            except Exception as exc:  # noqa: BLE001
+                diagnostics.append(f"Maven POM inspection failed for {manifest}: {exc}")
+
+            cwd_path = Path(manifest).parent
+            cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
+            prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+            command = f"{prefix}mvn -B -DoutputType=text {_MAVEN_DEPENDENCY_TREE_GOAL}"
+            try:
+                command_result = _run_readonly(
+                    sandbox,
+                    command,
+                    timeout=_MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS,
+                )
+                if getattr(command_result, "exit_code", None) != 0:
+                    raise RuntimeError(
+                        "Maven dependency:tree exited with "
+                        f"{getattr(command_result, 'exit_code', None)}"
+                    )
+                output = "\n".join(
+                    str(getattr(command_result, stream, "") or "")
+                    for stream in ("stdout", "stderr")
+                )
+                versions = _maven_dependency_tree_versions(output, group_id, artifact_id)
+                if versions is None:
+                    raise RuntimeError("Maven dependency:tree output was incomplete or unparseable")
+                graph_states.append("present" if versions else "absent")
+                resolved_versions.update(versions)
+            except Exception as exc:  # noqa: BLE001
+                graph_states.append("unknown")
+                graph_errors.append(
+                    f"Maven dependency graph inspection failed for {manifest}: {exc}"
+                )
+
+    diagnostics.extend(graph_errors)
+    if missing_declarations:
+        diagnostics.append(
+            "The exact target declaration was missing from authorized POM(s): "
+            + ", ".join(missing_declarations)
+        )
+    if expected is not None and declaration_versions and declaration_versions != {expected}:
+        diagnostics.append(
+            f"POM declaration versions {sorted(declaration_versions)} do not match "
+            f"Supervisor-selected version {expected}."
+        )
+    if (
+        expected is not None
+        and graph_states
+        and not graph_errors
+        and resolved_versions != {expected}
+    ):
+        diagnostics.append(
+            f"Resolved Maven versions {sorted(resolved_versions) or ['none']} do not exactly "
+            f"match Supervisor-selected version {expected}."
+        )
+
+    if not manifests or not parsed_manifests or graph_errors or expected is None:
+        status = DependencyEvidenceStatus.INCONCLUSIVE
+    elif missing_declarations or (declaration_versions and declaration_versions != {expected}):
+        status = DependencyEvidenceStatus.MISMATCH
+    elif not graph_states:
+        status = DependencyEvidenceStatus.INCONCLUSIVE
+    elif resolved_versions != {expected}:
+        status = DependencyEvidenceStatus.MISMATCH
+    else:
+        status = DependencyEvidenceStatus.VERIFIED
+
+    manifest_state = (
+        "unknown"
+        if not parsed_manifests or len(parsed_manifests) != len(manifests)
+        else "present"
+        if declarations
+        else "absent"
+    )
+    graph_state = (
+        "unknown"
+        if not graph_states or "unknown" in graph_states
+        else "present"
+        if resolved_versions
+        else "absent"
+    )
+    evidence = QADependencyEvidence(
+        status=status,
+        target_package=package,
+        expected_version=expected,
+        manifest_paths=list(manifests),
+        declarations=declarations,
+        resolved_versions=sorted(resolved_versions),
+        evidence_refs=[
+            *(f"{manifest}#/authorized/{target_type}" for manifest in declarations),
+            *(f"{manifest}:mvn-dependency-tree" for manifest in manifests),
+        ],
+        diagnostics=diagnostics,
+    )
+    return _QAPackageState(
+        manifest_state=manifest_state,
+        graph_state=graph_state,
+        diagnostics=tuple(diagnostics),
+        dependency_evidence=evidence,
     )
 
 
@@ -1035,7 +1341,7 @@ def _collect_maven_group_package_state(
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}mvn -B -DoutputType=text dependency:tree"
+        command = f"{prefix}mvn -B -DoutputType=text {_MAVEN_DEPENDENCY_TREE_GOAL}"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -1105,6 +1411,15 @@ def _collect_group_package_state(
     }
 
     if policy == QAPolicy.VERSION_BUMP:
+        if managers == {"maven"}:
+            return _collect_maven_version_package_state(
+                sandbox,
+                group,
+                task,
+                _maven_target_manifest_paths(group),
+                expected_version,
+                version_evidence_inconclusive=version_evidence_inconclusive,
+            )
         if managers and managers != {"npm"}:
             manager_text = ", ".join(sorted(managers))
             diagnostic = f"Unsupported or unknown package manager(s): {manager_text}."
@@ -1684,12 +1999,21 @@ def _resolve_targeted_closures(
     sandbox: DockerSandbox,
     targets: Sequence[QAScanTarget],
 ) -> tuple[list[DependencyClosure], ScanFallbackReason | None, str | None]:
-    """Read live npm lockfiles and resolve the union needed by active tasks."""
+    """Read supported live lockfiles and resolve active task dependency closures."""
     if not targets:
         return [], ScanFallbackReason.MISSING_LOCKFILE, "No active task scan targets were supplied."
 
     by_source: dict[str, list[QAScanTarget]] = {}
     for target in targets:
+        if target.package_manager and target.package_manager != "npm":
+            return (
+                [],
+                ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                (
+                    f"Task {target.task_id} uses unsupported targeted-scan package manager "
+                    f"{target.package_manager!r}; a full scan will be used."
+                ),
+            )
         if not target.manifest_paths:
             return (
                 [],

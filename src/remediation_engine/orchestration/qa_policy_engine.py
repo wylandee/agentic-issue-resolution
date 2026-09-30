@@ -211,8 +211,18 @@ def _evaluate_policy_gates(
         remaining = sorted(group_target_identifiers(group) & remaining_global)
         package_state = results.package_state_by_task.get(task_id, _QAPackageState())
         dependency_evidence = package_state.dependency_evidence
+        scan_evidence = results.scan_evidence
+        scan_evidence_complete = bool(
+            results.scan_skipped and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL
+        ) or bool(
+            scan_evidence is not None
+            and scan_evidence.complete
+            and task_id in scan_evidence.covered_task_ids
+        )
         target_cleared = (
-            effective_scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
+            effective_scanner_status == ScannerExecutionStatus.SUCCESS
+            and scan_evidence_complete
+            and not remaining
         )
         diagnostics: list[str] = []
         if not install_passed:
@@ -221,6 +231,10 @@ def _evaluate_policy_gates(
             diagnostics.append(
                 f"Scanner execution status: {effective_scanner_status.value}. "
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
+            )
+        if policy in _STRICT_SCANNER_QA_POLICIES and not scan_evidence_complete:
+            diagnostics.append(
+                "Scanner evidence is incomplete or does not cover this QA task."
             )
         diagnostics.extend(package_state.diagnostics)
         if policy == QAPolicy.VERSION_BUMP and dependency_evidence is None:
@@ -256,6 +270,7 @@ def _evaluate_policy_gates(
             scanner_execution_status=effective_scanner_status,
             target_remaining_identifiers=remaining,
             target_scanner_cleared=target_cleared,
+            scan_evidence_complete=scan_evidence_complete,
             tests_passed=tests_passed,
             package_manifest_state=package_state.manifest_state,
             package_graph_state=package_state.graph_state,
@@ -321,7 +336,12 @@ def _version_bump_llm_failure_is_relevant(
     test_exonerated: bool,
 ) -> bool:
     """Return whether an LLM failure adds a version-bump policy failure."""
-    if evaluation.passed:
+    if (
+        evaluation.passed
+        or evaluation.evidence_inconclusive
+        or not gates.scan_evidence_complete
+        or gates.scanner_execution_status != ScannerExecutionStatus.SUCCESS
+    ):
         return False
     if evaluation.failure_category == FailureCategory.BREAKING_CHANGE:
         return gates.tests_passed is False and not test_exonerated
@@ -495,7 +515,7 @@ def _apply_policy_decision(
                     "failure_category": FailureCategory.SECURITY_FLAG,
                     "retry_feedback": (
                         "QA result is inconclusive because the structured QA result could not be validated. "
-                        "No remediation retry was consumed. Re-run QA after correcting the judge contract."
+                        "No remediation retry was consumed. Correct the judge contract before a new attempt."
                     ),
                 }
             )
@@ -525,6 +545,10 @@ def _apply_policy_decision(
             gates.dependency_evidence is None
             or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
         )
+        scanner_evidence_inconclusive = policy in _STRICT_SCANNER_QA_POLICIES and (
+            not gates.scan_evidence_complete
+            or gates.scanner_execution_status != ScannerExecutionStatus.SUCCESS
+        )
         if policy == QAPolicy.VERSION_BUMP:
             if _version_bump_llm_failure_is_relevant(
                 current,
@@ -538,12 +562,13 @@ def _apply_policy_decision(
                     )
                 )
         elif not current.passed and not evaluator_test_exonerated:
-            failures.append(
-                (
-                    current.failure_category or FailureCategory.SECURITY_FLAG,
-                    current.retry_feedback or "The structured QA evaluator failed this task.",
+            if not current.evidence_inconclusive and not scanner_evidence_inconclusive:
+                failures.append(
+                    (
+                        current.failure_category or FailureCategory.SECURITY_FLAG,
+                        current.retry_feedback or "The structured QA evaluator failed this task.",
+                    )
                 )
-            )
         if task_id in missing_ids:
             failures.append(
                 (FailureCategory.SECURITY_FLAG, "Structured QA evaluator omitted this task.")
@@ -565,14 +590,7 @@ def _apply_policy_decision(
                 (FailureCategory.SECURITY_FLAG, "Missing or invalid QA policy provenance.")
             )
         if policy in _STRICT_SCANNER_QA_POLICIES:
-            if gates.scanner_execution_status != ScannerExecutionStatus.SUCCESS:
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "Strict scanner policy requires a trustworthy parseable scanner report.",
-                    )
-                )
-            if gates.target_remaining_identifiers:
+            if gates.target_remaining_identifiers and not scanner_evidence_inconclusive:
                 if current.passed or current.failure_category == FailureCategory.BREAKING_CHANGE:
                     errors.append(
                         f"qa_critic guardrail: task '{task_id}' has remaining scanner "
@@ -670,17 +688,21 @@ def _apply_policy_decision(
                 )
             )
 
-        # An unavailable dependency graph is a QA-only rerun when it is the
-        # sole blocker. Preserve actionable install, scanner, test, and
-        # semantic failures so the Supervisor can repair the candidate.
-        if dependency_evidence_inconclusive and not failures:
+        # Unavailable dependency or scan evidence is not a remediation failure.
+        # The Supervisor records it as inconclusive for this attempt rather than
+        # dispatching the same worker or rerunning unchanged QA evidence.
+        if (dependency_evidence_inconclusive or scanner_evidence_inconclusive) and not failures:
+            inconclusive_reason = (
+                "Scanner evidence was unavailable, incomplete, or did not cover this task."
+                if scanner_evidence_inconclusive
+                else "Deterministic dependency evidence was unavailable or incomplete."
+            )
             final[task_id] = QAEvaluation(
                 task_id=task_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
-                    "Deterministic dependency evidence was unavailable or incomplete. "
-                    "Re-run QA evidence collection; no remediation retry should be consumed."
+                    f"{inconclusive_reason} No remediation retry should be consumed."
                 ),
                 failure_evidence=current.failure_evidence,
                 deterministic_gates=gates,

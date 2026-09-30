@@ -484,6 +484,7 @@ def _worker_result_map(
     validation_calls: int = 0,
     manifest_transaction_attempts: int = 0,
     manifest_transaction_attempts_by_task: Mapping[str, int] | None = None,
+    retryable_failure: bool = True,
 ) -> dict[str, WorkerAttemptResult]:
     """Build attempt-correlated worker envelopes without changing task state."""
     summary_by_task = {summary.task_id: summary for summary in summaries}
@@ -527,11 +528,67 @@ def _worker_result_map(
                 validation_calls=validation_calls,
                 validation_passed=task_succeeded,
                 failure_reason=" | ".join(errors),
+                retryable_failure=retryable_failure,
             ),
             instruction_digest=snapshot.instruction_digest,
             errors=list(errors),
         )
     return results
+
+
+def _preflight_result(
+    target_tasks: Sequence[RemediationTask],
+    snapshots: Mapping[str, Any],
+    message: str,
+    errors: Sequence[str],
+    *,
+    retryable_failure: bool = True,
+) -> dict[str, Any]:
+    """Build an attempt-correlated surrender for work rejected before execution.
+
+    Args:
+        target_tasks: Supervisor-authorized tasks included in this dispatch.
+        snapshots: Immutable attempt snapshots keyed by task ID.
+        message: User-readable reason execution did not start or complete.
+        errors: Detailed diagnostics to return to the Supervisor.
+        retryable_failure: Whether a later Supervisor-planned attempt may retry
+            this failure. Deterministic target validation failures are terminal.
+
+    Returns:
+        A worker state patch containing summaries and typed results keyed by
+        committed attempt ID. Tasks without a snapshot receive no typed result.
+    """
+    summaries = _build_surrender_summaries(
+        [task.task_id for task in target_tasks],
+        message,
+    )
+    tagged_summaries = [
+        summary.model_copy(
+            update={
+                "attempt_id": snapshots[summary.task_id].attempt_id,
+                "task_revision": snapshots[summary.task_id].task_revision,
+                "instruction_digest": snapshots[summary.task_id].instruction_digest,
+            }
+        )
+        if summary.task_id in snapshots
+        else summary
+        for summary in summaries
+    ]
+    diagnostics = list(errors) or [message]
+    return {
+        "action_summaries": tagged_summaries,
+        "action_summary": tagged_summaries[0] if tagged_summaries else None,
+        "changed_files": [],
+        "worker_results_by_attempt": _worker_result_map(
+            target_tasks,
+            dict(snapshots),
+            tagged_summaries,
+            succeeded=False,
+            errors=diagnostics,
+            retryable_failure=retryable_failure,
+        ),
+        "errors": diagnostics,
+    }
 
 
 def _changed_files_by_task(
@@ -824,12 +881,12 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
     target_tasks = list(state.get("target_tasks", []))
+    target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
     target_groups = list(state.get("target_groups", []))
     constraints_ledger = list(state.get("constraints_ledger", []))
     feedback_by_task = dict(state.get("feedback_by_task", {}))
     previous_action_summaries_by_task = dict(state.get("previous_action_summaries_by_task", {}))
     prior_retry_diagnostics_by_task = dict(state.get("retry_diagnostics_by_task", {}))
-    all_task_ids = [t.task_id for t in target_tasks]
     language_value = state.get("project_language", ProjectLanguage.NODEJS)
     try:
         project_language = (
@@ -843,31 +900,24 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     repo_root = Path(repo_root_str)
     if not repo_root_str or not repo_root.is_dir():
         msg = f"Update Subagent: repo_root '{repo_root_str}' is not a valid directory."
-        summaries = _build_surrender_summaries(
-            all_task_ids, "Stopped before execution because repo_root was invalid."
+        return _preflight_result(
+            target_tasks,
+            target_attempt_snapshots,
+            "Stopped before execution because repo_root was invalid.",
+            [msg],
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": [msg],
-        }
 
     if not workspace_volume:
         msg = "Update Subagent: workspace_volume is missing from state."
-        summaries = _build_surrender_summaries(
-            all_task_ids, "Stopped before execution because workspace_volume was missing."
+        return _preflight_result(
+            target_tasks,
+            target_attempt_snapshots,
+            "Stopped before execution because workspace_volume was missing.",
+            [msg],
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": [msg],
-        }
 
     resolved_tasks: list[tuple[RemediationTask, VulnerabilityGroup, list[str]]] = []
     resolution_errors: list[str] = []
-    target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
     allowed_target_versions_by_task: dict[str, list[str]] = {}
     allowed_dependency_types_by_task: dict[str, list[str]] = {}
     groups_by_id = {group.group_id: group for group in target_groups}
@@ -898,12 +948,34 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     f"Update Subagent: task {task.task_id} does not commit an authorized Maven target type."
                 )
                 continue
+            localized_target_types = {
+                str(getattr(localized, "declaration_type", "") or "").strip()
+                for localized in group.localized_issues
+                if (
+                    str(getattr(localized, "package_manager", "") or "").strip().lower() == "maven"
+                    or str(getattr(getattr(localized, "issue", None), "ecosystem", "") or "")
+                    .strip()
+                    .lower()
+                    == "maven"
+                    or str(getattr(getattr(localized, "issue", None), "purl", "") or "")
+                    .strip()
+                    .lower()
+                    .startswith("pkg:maven/")
+                )
+            }
+            if task.target_dependency_type not in localized_target_types:
+                resolution_errors.append(
+                    f"Update Subagent: task {task.task_id} target type does not match the "
+                    "localized Maven declaration authorization."
+                )
+                continue
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is not None:
             if (
                 task.current_attempt_id != snapshot.attempt_id
                 or task.task_revision != snapshot.task_revision
                 or task.instruction != snapshot.instruction
+                or task.selected_version != snapshot.selected_version
                 or task.target_package_name != snapshot.target_package_name
                 or task.target_dependency_type != snapshot.target_dependency_type
             ):
@@ -933,6 +1005,18 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     for value in snapshot_dependency_types
                     if value in {"dependencies", "dependencyManagement"}
                 ]
+                normalized_versions = {
+                    value.strip() for value in snapshot_versions if isinstance(value, str)
+                }
+                if (
+                    task.selected_version not in normalized_versions
+                    or task.target_dependency_type not in snapshot_dependency_types
+                ):
+                    resolution_errors.append(
+                        f"Update Subagent: task {task.task_id} snapshot does not authorize "
+                        "its exact Maven version and declaration type."
+                    )
+                    continue
             allowed_target_versions_by_task[task.task_id] = snapshot_versions
             allowed_dependency_types_by_task[task.task_id] = snapshot_dependency_types
         else:
@@ -969,61 +1053,58 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         resolution_errors.extend(errors)
         if not manifest_paths:
             continue
+        if (
+            project_language == ProjectLanguage.JAVA
+            and snapshot is not None
+            and snapshot.target_manifest_paths
+            and set(manifest_paths) != set(snapshot.target_manifest_paths)
+        ):
+            resolution_errors.append(
+                f"Update Subagent: task {task.task_id} resolved Maven POM scope does not match "
+                "the committed attempt target paths."
+            )
+            continue
         resolved_tasks.append((task, group, manifest_paths))
 
     if not resolved_tasks:
-        summaries = _build_surrender_summaries(
-            all_task_ids, "Stopped before execution because no manifest targets could be resolved."
+        return _preflight_result(
+            target_tasks,
+            target_attempt_snapshots,
+            "Stopped before execution because no manifest targets could be resolved.",
+            resolution_errors or ["No authorized manifest targets could be resolved."],
+            retryable_failure=False,
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": resolution_errors,
-        }
 
     if _is_mixed_retry_batch(resolved_tasks):
-        summaries = _build_surrender_summaries(
-            all_task_ids,
-            "Stopped before execution because the supervisor mixed first-pass and retry update tasks in one batch.",
+        batch_error = "Update Subagent: mixed first-pass and retry update tasks are not supported in the same batch."
+        return _preflight_result(
+            [task for task, _group, _paths in resolved_tasks],
+            target_attempt_snapshots,
+            "Stopped before execution because the Supervisor mixed first-pass and retry update tasks in one batch.",
+            [*resolution_errors, batch_error],
+            retryable_failure=False,
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": resolution_errors
-            + [
-                "Update Subagent: mixed first-pass and retry update tasks are not supported in the same batch."
-            ],
-        }
 
-    resolved_task_ids = [t.task_id for t, _, _ in resolved_tasks]
     if ChatOpenAI is None:
         msg = "Update Subagent: 'langchain-openai' is not installed."
-        summaries = _build_surrender_summaries(
-            resolved_task_ids, "Stopped before execution because the LLM client is unavailable."
+        return _preflight_result(
+            [task for task, _group, _paths in resolved_tasks],
+            target_attempt_snapshots,
+            "Stopped before execution because the LLM client is unavailable.",
+            [*resolution_errors, msg],
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": resolution_errors + [msg],
-        }
 
     model_name = get_runtime_settings().update_llm_model
     try:
         llm = ChatOpenAI(model=model_name, temperature=0)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
-        summaries = _build_surrender_summaries(
-            resolved_task_ids, "Stopped before execution because the LLM failed to initialize."
+        return _preflight_result(
+            [task for task, _group, _paths in resolved_tasks],
+            target_attempt_snapshots,
+            "Stopped before execution because the LLM failed to initialize.",
+            [*resolution_errors, msg],
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": resolution_errors + [msg],
-        }
 
     touched_files: set[str] = set()
     package_checkpoints: dict[str, Any] = {}
@@ -1142,15 +1223,12 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     runtime.errors.extend(rollback_errors)
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: sandbox or tool loop failed - {exc}"
-        summaries = _build_surrender_summaries(
-            resolved_task_ids, "Stopped because the sandbox or tool loop failed."
+        return _preflight_result(
+            [task for task, _group, _paths in resolved_tasks],
+            target_attempt_snapshots,
+            "Stopped because the sandbox or tool loop failed.",
+            [*resolution_errors, *cleanup_errors, msg],
         )
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": sorted(touched_files),
-            "errors": resolution_errors + cleanup_errors + [msg],
-        }
 
     package_names = {
         _target_package_name(task, group)

@@ -67,7 +67,7 @@ LANGUAGE_CONFIGS: dict[ProjectLanguage, LanguageConfig] = {
         docker_image="maven:3.9-eclipse-temurin-17",
         manifest_names=("pom.xml",),
         source_suffixes=frozenset({".java"}),
-        install_command="mvn -B -q dependency:resolve",
+        install_command="mvn -B -q -DskipTests package",
         compile_command="mvn -B -q -DskipTests compile",
         test_command="mvn -B test -Dsurefire.useFile=false",
         test_include_patterns=(

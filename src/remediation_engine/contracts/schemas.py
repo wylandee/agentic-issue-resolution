@@ -1608,6 +1608,13 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    scan_evidence_complete: bool | None = Field(
+        default=None,
+        description=(
+            "Whether attempt-local scanner evidence completed successfully and covers this task. "
+            "This does not make the scan authoritative for repo-wide status."
+        ),
+    )
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
@@ -1634,7 +1641,13 @@ class ODCScanEvidence(BaseModel):
     closure_lockfile_keys: list[str] = Field(default_factory=list)
     found_identifiers: list[str] = Field(default_factory=list)
     remaining_target_identifiers: list[str] = Field(default_factory=list)
-    complete: bool = False
+    complete: bool = Field(
+        default=False,
+        description=(
+            "Whether the scan report completed successfully and covers the listed tasks. "
+            "This is attempt-local evidence, not repo-wide authority."
+        ),
+    )
     fallback_reason: ScanFallbackReason | None = None
 
 
@@ -1744,8 +1757,9 @@ class QAEvaluation(BaseModel):
     evidence_inconclusive: bool = Field(
         default=False,
         description=(
-            "True when deterministic evidence collection was unavailable. "
-            "This must be rechecked without consuming a remediation retry."
+            "True when deterministic evidence collection was unavailable. This attempt "
+            "fails closed without consuming a remediation retry; identical QA is not "
+            "scheduled again unless a new attempt or changed evidence is provided."
         ),
     )
 
@@ -1992,6 +2006,13 @@ class WorkerExecutionDiagnostics(BaseModel):
     )
     validation_passed: bool = False
     failure_reason: str = ""
+    retryable_failure: bool = Field(
+        default=True,
+        description=(
+            "Whether the Supervisor may retry this failed worker attempt. False for "
+            "deterministic precondition failures that cannot improve without changed input."
+        ),
+    )
     per_gate_results: dict[str, Any] = Field(default_factory=dict)
     final_selected_targeted_test: str | None = None
     original_to_alternative_test_mapping: dict[str, str] = Field(default_factory=dict)
