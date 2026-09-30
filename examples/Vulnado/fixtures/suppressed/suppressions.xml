@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ch.qos.logback:logback-core (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/ch\.qos\.logback/logback\-core@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for com.fasterxml.jackson.core:jackson-annotations (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/com\.fasterxml\.jackson\.core/jackson\-annotations@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for com.fasterxml.jackson.core:jackson-databind (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/com\.fasterxml\.jackson\.core/jackson\-databind@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.apache.logging.log4j:log4j-api (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.apache\.logging\.log4j/log4j\-api@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.apache.tomcat.embed:tomcat-embed-core (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.apache\.tomcat\.embed/tomcat\-embed\-core@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.apache.tomcat.embed:tomcat-embed-websocket (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.apache\.tomcat\.embed/tomcat\-embed\-websocket@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.hibernate.validator:hibernate-validator (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.hibernate\.validator/hibernate\-validator@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+<!--
+    <suppress>
+        <notes>Keep org.jsoup:jsoup as a selected Vulnado fixture</notes>
+        <packageUrl regex="true">^pkg:maven/org\.jsoup/jsoup@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+-->
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.postgresql:postgresql (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.postgresql/postgresql@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.springframework.boot:spring-boot (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.springframework\.boot/spring\-boot@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.springframework:spring-core (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.springframework/spring\-core@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.springframework:spring-web (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.springframework/spring\-web@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for org.yaml:snakeyaml (maven)</notes>
+        <packageUrl regex="true">^pkg:maven/org\.yaml/snakeyaml@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+</suppressions>
