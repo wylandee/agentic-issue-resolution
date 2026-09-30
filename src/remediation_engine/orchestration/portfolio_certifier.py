@@ -1673,6 +1673,28 @@ def _attach_resolution_certificate(
     # Aggregate timings are observability only; they must not change plan identity.
     certificate_payload.pop("certification_statistics", None)
     certificate_digest = _digest(certificate_payload)
+    certified_dispatch = bool(
+        certificate.status == PackageResolutionStatus.CERTIFIED
+        and solver_plan.status == SolverStatus.OPTIMAL
+        and solver_plan.candidate_catalog_complete
+        and selected is not None
+        and not certificate.unresolved_coverage_ids
+    )
+    batch_by_id = {
+        batch.batch_id: batch for batch in (selected.batches if selected is not None else [])
+    }
+    clusters = [
+        cluster.model_copy(
+            update={
+                "dispatchable": bool(
+                    certified_dispatch
+                    and (batch := batch_by_id.get(cluster.cluster_id)) is not None
+                    and batch.dispatchable
+                )
+            }
+        )
+        for cluster in plan.clusters
+    ]
     final_plan_digest = _digest(
         {
             "base_plan_digest": plan.plan_digest,
@@ -1686,6 +1708,7 @@ def _attach_resolution_certificate(
             "plan_digest": final_plan_digest,
             "resolution_certificate": certificate,
             "solver_plan": solver_plan,
+            "clusters": clusters,
         }
     )
 

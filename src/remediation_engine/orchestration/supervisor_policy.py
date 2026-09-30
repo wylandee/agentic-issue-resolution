@@ -26,6 +26,9 @@ from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES
 MAX_RETRIES: int = 3
 """Maximum number of QA-fail-retry cycles before a task is unfixable."""
 
+MAX_QA_EVIDENCE_RERUNS: int = 1
+"""Maximum same-attempt QA reruns after inconclusive evidence or a bad contract."""
+
 _TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
 _WORKABLE_STATUSES = frozenset({TaskStatus.PENDING, TaskStatus.NEEDS_RETRY})
 _SEVERITY_RANK: dict[str, int] = {
@@ -203,6 +206,7 @@ def _parent_status_for_strategy_pivot(
 
 
 __all__ = [
+    "MAX_QA_EVIDENCE_RERUNS",
     "MAX_RETRIES",
     "_TERMINAL_STATUSES",
     "_WORKABLE_STATUSES",

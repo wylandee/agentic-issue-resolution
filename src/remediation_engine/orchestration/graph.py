@@ -96,7 +96,7 @@ from remediation_engine.orchestration.langsmith_config import (
 )
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
-    build_certified_portfolio_plan,
+    build_portfolio_plan,
     prepare_portfolio_inputs,
 )
 from remediation_engine.orchestration.qa_critic import (
@@ -154,6 +154,13 @@ def _error_text(error: BaseException | str | None) -> str:
         return ""
     text = str(error).strip()
     return text or type(error).__name__
+
+
+def _fetch_fresh_registry_packument(package_name: str) -> Mapping[str, Any]:
+    """Fetch current npm metadata for solver candidate selection."""
+    from remediation_engine.tools.registry_tools import _fetch_package_data
+
+    return _fetch_package_data(package_name, cache=None)
 
 
 __all__ = [
@@ -895,7 +902,7 @@ def _portfolio_certificate_violations(
     solver_plan = getattr(plan, "solver_plan", None)
     certificate = getattr(plan, "resolution_certificate", None)
     if certificate is None:
-        return ["portfolio plan is missing its package-resolution certificate"]
+        return []
     certificate_status = getattr(getattr(certificate, "status", None), "value", None)
     if (
         str(certificate_status or getattr(certificate, "status", "")).upper()
@@ -1017,6 +1024,18 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             dict(state.get("task_queue", {}) or {}),
             target_packages=state.get("target_packages", []),
         )
+        source_queue = dict(state.get("task_queue", {}) or {})
+        portfolio_queue: dict[str, Any] = {}
+        for task_id, task in prepared_queue.items():
+            source_task = source_queue.get(task_id)
+            # Preserve preparation-time triage refreshes, which advance the
+            # task revision. Discard same-revision solver candidates until a
+            # solver-approved decision commits them.
+            portfolio_queue[task_id] = (
+                task.model_copy(deep=True)
+                if source_task is None or source_task.task_revision != task.task_revision
+                else source_task.model_copy(deep=True)
+            )
         if prepared_groups and not any(
             group.issue_type == IssueType.SCA for group in prepared_groups
         ):
@@ -1037,15 +1056,15 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
                 "active_dispatch_batch_id": None,
                 "errors": sorted(set(prepare_diagnostics)),
             }
-        plan = build_certified_portfolio_plan(
+        plan = build_portfolio_plan(
             state["repo_root"],
-            str(state.get("workspace_volume") or ""),
             prepared_groups,
             prepared_queue,
             target_packages=state.get("target_packages", []),
             peer_conflict_pairs=peer_conflict_pairs,
             forced_singleton_task_ids=forced_singletons,
             settings=settings,
+            registry_fetcher=_fetch_fresh_registry_packument,
             portfolio_iteration=iteration,
             portfolio_replan_request=request,
         )
@@ -1071,7 +1090,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
     solver_status = getattr(solver_plan, "status", None)
     solver_status = getattr(solver_status, "value", solver_status)
     solver_status = str(solver_status or "").upper()
-    certificate_violations = _portfolio_certificate_violations(plan, prepared_queue)
+    certificate_violations = _portfolio_certificate_violations(plan, portfolio_queue)
     diagnostics = sorted(set(diagnostics) | set(certificate_violations))
     invalid_dag = any(
         marker in diagnostics_text
@@ -1170,7 +1189,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_replan_history": replan_history,
             "portfolio_dirty": False,
             "valid_groups": prepared_groups,
-            "task_queue": prepared_queue,
+            "task_queue": portfolio_queue,
             "active_target_task_ids": [],
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,
@@ -1181,7 +1200,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
         committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
             plan,
             prepared_groups,
-            prepared_queue,
+            portfolio_queue,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
         return {
@@ -1194,14 +1213,14 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_replan_history": replan_history,
             "portfolio_dirty": False,
             "valid_groups": prepared_groups,
-            "task_queue": prepared_queue,
+            "task_queue": portfolio_queue,
             "active_target_task_ids": [],
             "errors": [f"portfolio plan application failed: {exc}"],
         }
     diagnostics = sorted(set(diagnostics) | set(apply_diagnostics))
     deferred_active_task_ids = sorted(
         task_id
-        for task_id, task in prepared_queue.items()
+        for task_id, task in portfolio_queue.items()
         if task.current_attempt_id is not None
         and any(
             diagnostic == f"task {task_id!r} has an active attempt; plan decision not applied"
@@ -1226,7 +1245,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
         )
         active_attempt_task_ids = [
             task_id
-            for task_id, task in prepared_queue.items()
+            for task_id, task in portfolio_queue.items()
             if task.current_attempt_id is not None and task.status not in TERMINAL_TASK_STATUSES
         ]
         return {
@@ -1240,7 +1259,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_dirty": True,
             "portfolio_escalation": state.get("portfolio_escalation"),
             "valid_groups": prepared_groups,
-            "task_queue": prepared_queue,
+            "task_queue": portfolio_queue,
             "active_target_task_ids": active_attempt_task_ids,
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,

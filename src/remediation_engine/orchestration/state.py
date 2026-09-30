@@ -487,6 +487,9 @@ class OrchestratorState(TypedDict, total=False):
     workspace_rollback_anchors_by_task: Annotated[dict[str, str], replace_dict_reducer]
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
+    # Counts same-attempt QA reruns caused by inconclusive evidence or an
+    # invalid evaluator contract. The Supervisor owns this bounded ledger.
+    qa_rerun_counts_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
     scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
@@ -629,6 +632,7 @@ def initial_orchestrator_state(
         "workspace_rollback_anchors_by_task": {},
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
+        "qa_rerun_counts_by_attempt": {},
         "scan_evidence_by_task": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],

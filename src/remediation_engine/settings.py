@@ -37,7 +37,7 @@ DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
 # Full candidate catalogs are retained up to this resource guard; larger
 # catalogs fail closed instead of being truncated.
-DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 128
+DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 1000
 
 
 @dataclass(frozen=True)

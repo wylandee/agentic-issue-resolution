@@ -366,7 +366,7 @@ def test_default_candidate_guard_accepts_82_release_catalog(tmp_path: Path):
         for candidate in domains[targets[0].occurrence_id]
         if candidate.source == "registry"
     }
-    assert AppSettings().solver_max_candidates_per_target == 128
+    assert AppSettings().solver_max_candidates_per_target == 1000
     assert len(registry_versions) == 82
     assert complete is True
     assert not any("resource guard exceeded" in item for item in diagnostics)

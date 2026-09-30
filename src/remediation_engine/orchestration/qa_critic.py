@@ -4,8 +4,9 @@ qa_critic.py - Agentic QA evaluator node for the Phase 5 orchestrator.
 The QA Critic now follows a single structured-evaluator architecture:
 
   Step 0 â€” Global Execution (deterministic Python):
-    run_dependency_install â†’ run_security_scan â†’ run_unit_tests, called exactly
-    once via direct Python helpers, with no LLM tools involved.
+    run_dependency_install â†’ run_security_scan â†’ run_unit_tests, called
+    exactly once via direct
+    Python helpers, with no LLM tools involved.
 
   Evaluator:
     One bounded read-only tool loop per dispatched task. The model must finish
@@ -29,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -82,9 +83,18 @@ from .qa_policy_engine import (
     _attach_scan_evidence_to_evaluations,
     _extract_deterministic_test_evidence,
 )
-from .qa_types import QAScanTarget, _append_qa_log_records, _QAExecutionResults, _QALogRecord
+from .qa_types import (
+    QAScanTarget,
+    _append_qa_log_records,
+    _QAPackageState,
+    _QAExecutionResults,
+    _QALogRecord,
+)
 
 logger = logging.getLogger(__name__)
+
+# TEMPORARY: disable npm's installed-tree inspection while diagnosing QA results.
+_QA_NPM_LS_ENABLED = False
 
 
 def _run_global_execution(
@@ -95,12 +105,17 @@ def _run_global_execution(
     scan_targets: Sequence[QAScanTarget] | None = None,
     skip_scan: bool = False,
     scan_skip_reason: str | None = None,
+    package_state_collector: Callable[
+        [DockerSandbox, bool], Mapping[str, _QAPackageState]
+    ]
+    | None = None,
 ) -> _QAExecutionResults:
     """
-    Run install, security scan, and unit tests exactly once via direct Python calls.
+    Run install, optional package evidence, security scan, and unit tests in order.
 
-    No LLM tool wrappers are involved â€” execution is deterministic and sequential.
-    Results are stored in a _QAExecutionResults cache for downstream use.
+    Package evidence is collected immediately after install. No LLM tool wrappers
+    are involved; results are stored in a _QAExecutionResults cache for downstream
+    use.
     """
     results = _QAExecutionResults()
 
@@ -108,6 +123,8 @@ def _run_global_execution(
     install_outcome = _qa_test_parsing_module._run_install(sandbox)
     _qa_test_parsing_module._store_install_outcome(results, install_outcome)
     install_ok = results.install[0]
+    if package_state_collector is not None:
+        results.package_state_by_task.update(package_state_collector(sandbox, install_ok))
 
     if skip_scan:
         results.scan_skipped = True
@@ -454,6 +471,41 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
 
     errors: list[str] = []
     deterministic_test_evidence: QAFailureEvidence | None = None
+
+    def collect_package_states(
+        sandbox: DockerSandbox, install_ok: bool
+    ) -> Mapping[str, _QAPackageState]:
+        package_states: dict[str, _QAPackageState] = {}
+        for context in task_contexts:
+            task_id = context.task_id
+            policy = task_policies.get(task_id)
+            if policy not in {
+                QAPolicy.VERSION_BUMP,
+                QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+                QAPolicy.NO_FIX_CODE_REMOVAL,
+            }:
+                continue
+            expected_version = None
+            version_evidence_inconclusive = False
+            if policy == QAPolicy.VERSION_BUMP:
+                expected_version, has_version_evidence = _attempt_version_evidence(
+                    state, context.task
+                )
+                version_evidence_inconclusive = (
+                    has_version_evidence and expected_version is None
+                )
+            package_states[task_id] = _collect_group_package_state(
+                sandbox,
+                source_groups_by_id[context.group.group_id],
+                policy,
+                task=context.task,
+                expected_version=expected_version,
+                version_evidence_inconclusive=version_evidence_inconclusive,
+                inspect_resolved_graph=install_ok and _QA_NPM_LS_ENABLED,
+                npm_ls_disabled=install_ok and not _QA_NPM_LS_ENABLED,
+            )
+        return package_states
+
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
             # ------------------------------------------------------------------
@@ -467,38 +519,17 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 scan_targets=scan_targets,
                 skip_scan=skip_scan,
                 scan_skip_reason="no_fix_package_removal" if skip_scan else None,
+                package_state_collector=(
+                    collect_package_states
+                    if _qa_policy_engine_module._QA_PACKAGE_STATE_CHECKS_ENABLED
+                    else None
+                ),
             )
             scan_projection = _scan_state_projection(
                 results,
                 baseline_identifiers,
                 authoritative=scan_is_authoritative,
             )
-            for context in task_contexts:
-                task_id = context.task_id
-                policy = task_policies.get(task_id)
-                if policy in {
-                    QAPolicy.VERSION_BUMP,
-                    QAPolicy.NO_FIX_PACKAGE_REMOVAL,
-                    QAPolicy.NO_FIX_CODE_REMOVAL,
-                }:
-                    expected_version = None
-                    version_evidence_inconclusive = False
-                    if policy == QAPolicy.VERSION_BUMP:
-                        expected_version, has_version_evidence = _attempt_version_evidence(
-                            state, context.task
-                        )
-                        version_evidence_inconclusive = (
-                            has_version_evidence and expected_version is None
-                        )
-                    results.package_state_by_task[task_id] = _collect_group_package_state(
-                        sandbox,
-                        source_groups_by_id[context.group.group_id],
-                        policy,
-                        task=context.task,
-                        expected_version=expected_version,
-                        version_evidence_inconclusive=version_evidence_inconclusive,
-                    )
-
             # ------------------------------------------------------------------
             # Pipeline completeness guard
             # ------------------------------------------------------------------

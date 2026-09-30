@@ -683,6 +683,8 @@ def _collect_dependency_package_state(
     *,
     lockfiles: Sequence[str] | None = None,
     version_evidence_inconclusive: bool = False,
+    inspect_resolved_graph: bool = True,
+    npm_ls_disabled: bool = False,
 ) -> _QAPackageState:
     """Collect compact deterministic dependency evidence for a version task."""
     package = str(
@@ -710,6 +712,10 @@ def _collect_dependency_package_state(
         diagnostics.append("Authorized package.json manifest paths are unavailable.")
     if expected is None:
         diagnostics.append("Supervisor-selected target version is unavailable.")
+    if not inspect_resolved_graph and npm_ls_disabled:
+        diagnostics.append("npm ls is temporarily disabled; installed graph was not inspected.")
+    elif not inspect_resolved_graph:
+        graph_errors.append("npm ls skipped because npm install failed; resolved graph is unknown.")
 
     for manifest in manifests:
         payload = _workspace_json_file(sandbox, manifest)
@@ -723,6 +729,8 @@ def _collect_dependency_package_state(
         for pointer, value in entries.items():
             declarations[f"{manifest}{pointer}"] = value
 
+        if not inspect_resolved_graph:
+            continue
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
@@ -763,7 +771,7 @@ def _collect_dependency_package_state(
     all_lockfiles_parsed = len(parsed_lockfile_paths) == len(lockfiles)
     graph_state = (
         "unknown"
-        if not all_manifests_parsed or graph_errors
+        if not all_manifests_parsed or graph_errors or not inspect_resolved_graph
         else "present"
         if resolved_versions
         else "absent"
@@ -791,6 +799,7 @@ def _collect_dependency_package_state(
     elif (
         expected is not None
         and all_manifests_parsed
+        and inspect_resolved_graph
         and not graph_errors
         and resolved_versions != {expected}
     ):
@@ -844,6 +853,8 @@ def _collect_group_package_state(
     task: RemediationTask | None = None,
     expected_version: str | None = None,
     version_evidence_inconclusive: bool = False,
+    inspect_resolved_graph: bool = True,
+    npm_ls_disabled: bool = False,
 ) -> _QAPackageState:
     """Collect deterministic dependency state for package-backed QA policies."""
     if policy not in {
@@ -891,6 +902,8 @@ def _collect_group_package_state(
             expected_version,
             lockfiles=lockfiles,
             version_evidence_inconclusive=version_evidence_inconclusive,
+            inspect_resolved_graph=inspect_resolved_graph,
+            npm_ls_disabled=npm_ls_disabled,
         )
 
     if managers != {"npm"}:
@@ -924,7 +937,15 @@ def _collect_group_package_state(
 
     graph_states: list[str] = []
     graph_diagnostics: list[str] = []
-    for manifest, _payload in parsed_manifests:
+    if not inspect_resolved_graph and npm_ls_disabled:
+        graph_diagnostics.append(
+            "npm ls is temporarily disabled; installed graph was not inspected."
+        )
+    elif not inspect_resolved_graph:
+        graph_diagnostics.append(
+            "npm ls skipped because npm install failed; resolved graph is unknown."
+        )
+    for manifest, _payload in (parsed_manifests if inspect_resolved_graph else ()):
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""

@@ -934,13 +934,11 @@ def materialize_synthetic_dependency_tasks(
                 "allowed_dependency_types": ["overrides"],
                 "selected_version": fixed_version,
                 "instruction": (
-                    f'Apply the outer-solver-approved npm override for "{package_name}" '
-                    f"in {manifest_path}."
+                    f'Provisional npm override candidate for "{package_name}" '
+                    f"in {manifest_path}; wait for the solver-approved plan before editing."
                 ),
             }
             if any(getattr(task, key) != value for key, value in updates.items()):
-                if task.task_revision > 0 or task.portfolio_plan_id:
-                    updates["task_revision"] = task.task_revision + 1
                 augmented_queue[task_id] = task.model_copy(update=updates)
     next_task_index = 1
 
@@ -1884,6 +1882,7 @@ def build_portfolio_plan(
     peer_conflict_pairs: Iterable[tuple[str, str]] = (),
     forced_singleton_task_ids: Iterable[str] = (),
     settings: Any | None = None,
+    registry_fetcher: Any | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: Any | None = None,
 ) -> PortfolioPlan:
@@ -1897,6 +1896,7 @@ def build_portfolio_plan(
         peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
         forced_singleton_task_ids: Tasks that must remain singleton batches.
         settings: Solver and registry settings.
+        registry_fetcher: Optional fresh raw-packument fetcher for candidate selection.
         portfolio_iteration: Current outer portfolio iteration.
         portfolio_replan_request: Optional Supervisor replan constraints.
 
@@ -1911,6 +1911,7 @@ def build_portfolio_plan(
         peer_conflict_pairs=peer_conflict_pairs,
         forced_singleton_task_ids=forced_singleton_task_ids,
         settings=settings,
+        registry_fetcher=registry_fetcher,
         portfolio_iteration=portfolio_iteration,
         portfolio_replan_request=portfolio_replan_request,
     )

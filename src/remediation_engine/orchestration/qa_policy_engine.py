@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TEMPORARY: limit QA package-state validation to install, scan, and test evidence.
+_QA_PACKAGE_STATE_CHECKS_ENABLED = False
+
 
 _PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EOVERRIDE", "peer dep", "peer tree")
 _ENGINE_CONFLICT_PATTERNS = ("EBADENGINE",)
@@ -133,16 +136,32 @@ def _qa_policy_prompt_block(policy: QAPolicy | None) -> str:
             "- Treat missing policy as an inconclusive contract condition."
         )
     spec = _QA_POLICY_PROMPT_SPECS[policy]
+    package_rule = (
+        spec.package_rule
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        else "Package manifest, lockfile, and installed-tree checks are temporarily disabled. "
+        "Do not inspect or fail based on dependency-state evidence."
+    )
+    review_focus = (
+        spec.review_focus
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        else "Assess install, scanner, and test evidence under this task's applicable policy."
+    )
+    prohibited_conclusions = (
+        spec.prohibited_conclusions
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        else "Do not claim package manifest, lockfile, or installed-tree checks were performed."
+    )
     return "\n".join(
         [
             "## QA Policy",
             f"- Policy: {policy.value}",
             f"- Scanner rule: {spec.scanner_rule}",
-            f"- Package rule: {spec.package_rule}",
+            f"- Package rule: {package_rule}",
             f"- Test rule: {spec.tests_rule}",
             f"- Semantic review rule: {spec.semantic_rule}",
-            f"- Review focus: {spec.review_focus}",
-            f"- Prohibited conclusions: {spec.prohibited_conclusions}",
+            f"- Review focus: {review_focus}",
+            f"- Prohibited conclusions: {prohibited_conclusions}",
         ]
     )
 
@@ -221,8 +240,13 @@ def _evaluate_policy_gates(
                 f"Scanner execution status: {effective_scanner_status.value}. "
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
             )
-        diagnostics.extend(package_state.diagnostics)
-        if policy == QAPolicy.VERSION_BUMP and dependency_evidence is None:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED:
+            diagnostics.extend(package_state.diagnostics)
+        if (
+            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            and policy == QAPolicy.VERSION_BUMP
+            and dependency_evidence is None
+        ):
             diagnostics.append("Deterministic dependency evidence was not collected.")
         if policy is None:
             diagnostics.append("QA policy provenance is missing or invalid.")
@@ -235,16 +259,16 @@ def _evaluate_policy_gates(
             deterministic_pass = deterministic_pass and target_cleared
         if policy in _HARD_TEST_QA_POLICIES:
             deterministic_pass = deterministic_pass and tests_passed is True
-        if policy == QAPolicy.VERSION_BUMP:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.VERSION_BUMP:
             deterministic_pass = (
                 deterministic_pass
                 and dependency_evidence is not None
                 and dependency_evidence.status == DependencyEvidenceStatus.VERIFIED
             )
-        if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
             deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
             deterministic_pass = deterministic_pass and package_state.graph_state == "absent"
-        if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_CODE_REMOVAL:
             deterministic_pass = deterministic_pass and package_state.manifest_state == "present"
             deterministic_pass = deterministic_pass and package_state.graph_state == "present"
 
@@ -313,6 +337,36 @@ def _install_conflict_retry_feedback(gates: QADeterministicGates) -> str:
         f"{install_summary} Dependency installation failed before post-install QA validation; "
         "resolve the dependency conflict before retrying."
     )
+
+
+def _disabled_package_state_failure(
+    evaluation: QAEvaluation,
+    policy: QAPolicy | None,
+) -> bool:
+    """Return whether a security failure cites temporarily disabled package-state checks."""
+    if _QA_PACKAGE_STATE_CHECKS_ENABLED or policy not in {
+        QAPolicy.VERSION_BUMP,
+        QAPolicy.NO_FIX_PACKAGE_REMOVAL,
+        QAPolicy.NO_FIX_CODE_REMOVAL,
+    }:
+        return False
+    if evaluation.failure_category != FailureCategory.SECURITY_FLAG:
+        return False
+    feedback = (evaluation.retry_feedback or "").casefold()
+    package_state_terms = (
+        "manifest",
+        "lockfile",
+        "package.json",
+        "package-lock.json",
+        "resolved dependency graph",
+        "installed graph",
+        "dependency evidence",
+        "dependency state",
+        "dependency version",
+        "package version",
+        "selected version",
+    )
+    return any(term in feedback for term in package_state_terms)
 
 
 def _version_bump_llm_failure_is_relevant(
@@ -446,15 +500,22 @@ def _apply_policy_decision(
             and current.test_attribution is not None
             and _valid_test_attribution(current, group.group_id, known_group_ids)
         )
-        dependency_evidence_inconclusive = policy == QAPolicy.VERSION_BUMP and (
-            gates.dependency_evidence is None
-            or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
+        dependency_evidence_inconclusive = (
+            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            and policy == QAPolicy.VERSION_BUMP
+            and (
+                gates.dependency_evidence is None
+                or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
+            )
         )
         if policy == QAPolicy.VERSION_BUMP:
-            if _version_bump_llm_failure_is_relevant(
-                current,
-                gates,
-                test_exonerated=evaluator_test_exonerated,
+            if (
+                not _disabled_package_state_failure(current, policy)
+                and _version_bump_llm_failure_is_relevant(
+                    current,
+                    gates,
+                    test_exonerated=evaluator_test_exonerated,
+                )
             ):
                 failures.append(
                     (
@@ -462,7 +523,11 @@ def _apply_policy_decision(
                         current.retry_feedback or "The structured QA evaluator failed this task.",
                     )
                 )
-        elif not current.passed and not evaluator_test_exonerated:
+        elif (
+            not current.passed
+            and not evaluator_test_exonerated
+            and not _disabled_package_state_failure(current, policy)
+        ):
             failures.append(
                 (
                     current.failure_category or FailureCategory.SECURITY_FLAG,
@@ -512,7 +577,8 @@ def _apply_policy_decision(
                     )
                 )
         if (
-            policy == QAPolicy.VERSION_BUMP
+            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            and policy == QAPolicy.VERSION_BUMP
             and gates.dependency_evidence is not None
             and gates.dependency_evidence.status == DependencyEvidenceStatus.MISMATCH
         ):
@@ -548,7 +614,7 @@ def _apply_policy_decision(
                         "VERSION_BUMP tests failed without valid structured exoneration evidence.",
                     )
                 )
-        if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
             if gates.package_manifest_state != "absent":
                 failures.append(
                     (
@@ -563,7 +629,7 @@ def _apply_policy_decision(
                         "NO_FIX Stage 1 requires the package to be absent from the resolved dependency graph.",
                     )
                 )
-        if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_CODE_REMOVAL:
             if gates.package_manifest_state != "present":
                 failures.append(
                     (

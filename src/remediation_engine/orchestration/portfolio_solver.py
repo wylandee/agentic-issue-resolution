@@ -73,6 +73,15 @@ from remediation_engine.tools.registry_cache import (
 
 _STABLE_VERSION = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$")
 _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
+_EVIDENCE_METADATA_FIELDS = (
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "engines",
+    "os",
+    "cpu",
+)
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.QA_PASSED, TaskStatus.UNFIXABLE, TaskStatus.INCONCLUSIVE, TaskStatus.PIVOTED}
 )
@@ -88,7 +97,7 @@ _SEVERITY_RANK = {
 
 @dataclass(frozen=True)
 class _PreparedPortfolioProblem:
-    """One immutable portfolio input bundle reused by every certification solve."""
+    """One immutable portfolio input bundle reused across portfolio solves."""
 
     repo_root: Path
     host_repository_fingerprint: str
@@ -116,6 +125,19 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _catalog_semantic_diagnostics(diagnostics: Iterable[str]) -> list[str]:
+    """Exclude cache persistence failures from registry-evidence identity."""
+    return sorted(
+        {
+            message
+            for message in diagnostics
+            if not message.startswith(
+                ("packument cache persistence failed for ", "write failed for ")
+            )
+        }
+    )
 
 
 def _manifest_path(group: VulnerabilityGroup, repo_root: Path) -> str:
@@ -663,7 +685,7 @@ def _fetch_candidate_packuments(
     *,
     registry_fetcher: PackumentFetcher | None = None,
 ) -> tuple[dict[str, Mapping[str, Any]], bool, str, list[str]]:
-    """Fetch one fresh raw packument per package and persist configured cache entries."""
+    """Fetch fresh raw packuments and best-effort persist configured cache entries."""
     from remediation_engine.tools.registry_tools import _fetch_package_data
 
     cache = RegistryPackumentCache(settings.solver_cache_dir) if settings.solver_cache_dir else None
@@ -676,8 +698,10 @@ def _fetch_candidate_packuments(
             packument = _fetch_package_data(package_name, fetcher=registry_fetcher, cache=None)
             packuments[package_name] = packument
             if cache is not None and not cache.put(package_name, packument):
-                complete = False
-                diagnostics.append(f"packument cache persistence failed for {package_name!r}")
+                diagnostics.append(
+                    f"packument cache persistence failed for {package_name!r}; "
+                    "fresh metadata remains available in memory"
+                )
         except Exception as exc:  # noqa: BLE001
             complete = False
             diagnostics.append(f"fresh packument unavailable for {package_name!r}: {exc}")
@@ -689,7 +713,7 @@ def _fetch_candidate_packuments(
                 name: _digest(packument) for name, packument in sorted(packuments.items())
             },
             "missing_packages": sorted(set(required_names) - set(packuments)),
-            "diagnostics": sorted(set(diagnostics)),
+            "diagnostics": _catalog_semantic_diagnostics(diagnostics),
         }
     )
     return packuments, complete, catalog_digest, sorted(set(diagnostics))
@@ -952,6 +976,49 @@ def _candidate_metadata(
         platform_values("cpu"),
         diagnostics,
     )
+
+
+def _solver_evidence_packument(
+    package_name: str,
+    packument: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project registry metadata to fields used by one-hop solver evidence.
+
+    The complete version-key inventory is retained. Per-version metadata keeps
+    every dependency, peer, runtime, and platform field consumed by
+    :func:`_candidate_metadata`; unrelated fields such as tarball metadata,
+    descriptions, and readmes do not affect the solver's evidence domain.
+
+    Args:
+        package_name: Expected npm package identity.
+        packument: Fresh raw registry metadata.
+
+    Returns:
+        A compact, validated packument projection for evidence-domain analysis.
+
+    Raises:
+        ValueError: If the packument is malformed or lacks a versions mapping.
+    """
+    validated = validate_packument(package_name, packument)
+    raw_versions = validated.get("versions")
+    if not isinstance(raw_versions, Mapping):
+        raise ValueError("registry packument must contain an object-valued versions field")
+    versions: dict[str, Any] = {}
+    for raw_version, metadata in raw_versions.items():
+        if not isinstance(raw_version, str):
+            raise ValueError("registry version keys must be strings")
+        version = raw_version
+        if not isinstance(metadata, Mapping):
+            # Preserve malformed entries so the consumer fails closed instead
+            # of accidentally treating an incomplete projection as evidence.
+            versions[version] = metadata
+            continue
+        versions[version] = {
+            field: metadata[field]
+            for field in _EVIDENCE_METADATA_FIELDS
+            if field in metadata
+        }
+    return {"name": validated.get("name", package_name), "versions": versions}
 
 
 def _supported_dependency_range(version_range: str) -> bool:
@@ -1362,7 +1429,7 @@ def _build_evidence_domains(
     registry_fetcher: PackumentFetcher | None,
     runtime_fingerprint: SolverRuntimeFingerprint | None,
 ) -> tuple[list[SolverEvidenceDomain], str, list[str]]:
-    """Build complete one-hop dependency witnesses without failing mutation catalogs."""
+    """Build one-hop dependency witnesses from complete, compact solver metadata."""
     requirements = _evidence_requirement_keys(snapshot, targets, candidate_domains)
     package_names = sorted({key[1] for key in requirements})
     packuments = dict(existing_packuments)
@@ -1396,9 +1463,16 @@ def _build_evidence_domains(
             )
             continue
         try:
+            validated = _solver_evidence_packument(package_name, packument)
+        except (TypeError, ValueError):
+            diagnostics.append(
+                f"evidence packument failed validation for {package_name!r}; dependency left unmodeled"
+            )
+            continue
+        try:
             payload_size = len(
                 json.dumps(
-                    dict(packument),
+                    validated,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -1412,15 +1486,8 @@ def _build_evidence_domains(
             continue
         if payload_size > DEFAULT_MAX_PAYLOAD_BYTES:
             diagnostics.append(
-                f"evidence packument exceeds {DEFAULT_MAX_PAYLOAD_BYTES} bytes for "
+                f"projected solver metadata exceeds {DEFAULT_MAX_PAYLOAD_BYTES} bytes for "
                 f"{package_name!r}; dependency left unmodeled"
-            )
-            continue
-        try:
-            validated = validate_packument(package_name, packument)
-        except (TypeError, ValueError):
-            diagnostics.append(
-                f"evidence packument failed validation for {package_name!r}; dependency left unmodeled"
             )
             continue
         raw_versions = validated.get("versions")
@@ -1528,7 +1595,7 @@ def _build_evidence_domains(
                 domain.model_dump(mode="json")
                 for domain in sorted(domains, key=lambda item: item.variable_id)
             ],
-            "diagnostics": sorted(set(diagnostics)),
+            "diagnostics": _catalog_semantic_diagnostics(diagnostics),
         }
     )
     return domains, evidence_digest, sorted(set(diagnostics))
@@ -1749,7 +1816,7 @@ def _prepare_portfolio_problem(
             "complete": candidate_catalog_complete,
             "evidence_domain_digest": evidence_domain_digest,
             "evidence_domains": [domain.model_dump(mode="json") for domain in evidence_domains],
-            "diagnostics": sorted(set(diagnostics)),
+            "diagnostics": _catalog_semantic_diagnostics(diagnostics),
         }
     )
     return _PreparedPortfolioProblem(
@@ -1939,10 +2006,15 @@ def build_portfolio_plan(
     peer_conflict_pairs: Iterable[tuple[str, str]] = (),
     forced_singleton_task_ids: Iterable[str] = (),
     settings: AppSettings | None = None,
+    registry_fetcher: PackumentFetcher | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: PortfolioReplanRequest | None = None,
 ) -> Any:
-    """Build a deterministic solver-only plan without network or Docker access."""
+    """Build a solver plan, optionally using fresh registry metadata.
+
+    This path does not run npm or require Docker. A registry fetcher can be
+    supplied when a complete current candidate catalog is required.
+    """
     resolved_settings = settings or AppSettings()
     prepared = _prepare_portfolio_problem(
         repo_root,
@@ -1952,6 +2024,7 @@ def build_portfolio_plan(
         peer_conflict_pairs=tuple(peer_conflict_pairs),
         forced_singleton_task_ids=tuple(forced_singleton_task_ids),
         portfolio_replan_request=portfolio_replan_request,
+        registry_fetcher=registry_fetcher,
         settings=resolved_settings,
     )
     solver_plan = solve_portfolio(
@@ -2022,11 +2095,37 @@ def apply_portfolio_plan(
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
     """Commit solver-approved task decisions to detached task objects.
 
-    The plan's queue revisions and occurrence identity are checked before any
-    decision is committed.  A stale or malformed plan raises ``ValueError`` so
-    the graph boundary can route to teardown rather than partially applying a
-    solver result.
+    Solver status, catalog completeness, queue revisions, and occurrence
+    identity are checked before any decision is committed. If a package-
+    resolution certificate is present, it must match the selected assignment.
+    A stale or malformed plan raises ``ValueError`` so the graph boundary can
+    route to teardown rather than partially applying a solver result.
     """
+    solver_plan = plan.solver_plan
+    certificate = plan.resolution_certificate
+    selected = solver_plan.selected_plan if solver_plan is not None else None
+    certificate_status = getattr(getattr(certificate, "status", None), "value", None)
+    if (
+        solver_plan is None
+        or solver_plan.status != SolverStatus.OPTIMAL
+        or not solver_plan.candidate_catalog_complete
+        or selected is None
+    ):
+        raise ValueError("portfolio task decisions require an OPTIMAL complete solver plan")
+    if certificate is not None and (
+        str(certificate_status or getattr(certificate, "status", "")).upper() != "CERTIFIED"
+        or certificate.portfolio_plan_id != plan.portfolio_plan_id
+        or certificate.solver_input_digest != plan.solver_input_digest
+        or certificate.repository_fingerprint != plan.repository_fingerprint
+        or certificate.workspace_graph_digest != plan.workspace_graph_digest
+        or certificate.candidate_catalog_digest != solver_plan.candidate_catalog_digest
+        or certificate.task_revisions != plan.task_revisions
+        or certificate.candidate_plan_id != selected.candidate_plan_id
+        or certificate.candidate_assignment_digest
+        != _digest(dict(sorted(selected.selected_candidate_versions.items())))
+        or certificate.unresolved_coverage_ids
+    ):
+        raise ValueError("portfolio plan contains a mismatched package-resolution certificate")
     prepared_groups = [group.model_copy(deep=True) for group in groups]
     committed = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
     diagnostics: list[str] = []
@@ -2051,7 +2150,6 @@ def apply_portfolio_plan(
                 f"expected revision {baseline}, current {task.task_revision}"
             )
 
-    selected = plan.solver_plan.selected_plan if plan.solver_plan else None
     selected_decisions = list(getattr(selected, "task_decisions", ()) or ())
     decisions: dict[str, Any] = {}
     for decision in selected_decisions:

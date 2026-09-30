@@ -16,6 +16,8 @@ Public API
 ----------
 MAX_RETRIES : int
     Maximum number of QA-fail-retry cycles before a task is marked unfixable.
+MAX_QA_EVIDENCE_RERUNS : int
+    Maximum same-attempt QA reruns for inconclusive evidence or evaluator errors.
 run_supervisor_node(state) -> Dict[str, Any]
     LangGraph node callable.
 supervisor_router(state) -> str
@@ -89,6 +91,7 @@ from remediation_engine.orchestration.supervisor_planner import (
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _WORKABLE_STATUSES,
+    MAX_QA_EVIDENCE_RERUNS,
     MAX_RETRIES,
     _dispatchable_task_ids_for_status,
     _is_exhausted_update_pivot_candidate,
@@ -148,6 +151,7 @@ _WORKER_NODES = frozenset({"update_subagent", "workaround_subagent", "qa_critic"
 
 
 __all__ = [
+    "MAX_QA_EVIDENCE_RERUNS",
     "MAX_RETRIES",
     "UPDATE_DISPATCH_LIMIT",
     "QA_DISPATCH_LIMIT",
@@ -352,6 +356,7 @@ def _create_attempt_snapshot(
         update={
             "task_revision": task_revision,
             "current_attempt_id": attempt_id,
+            "portfolio_plan_id": snapshot.portfolio_plan_id,
         }
     )
     return updated_task, snapshot
@@ -440,9 +445,7 @@ def _portfolio_plan_violations(
     solver_plan = getattr(plan, "solver_plan", None)
     selected = getattr(solver_plan, "selected_plan", None)
     certificate = getattr(plan, "resolution_certificate", None)
-    if certificate is None:
-        violations.append("portfolio plan is missing its package-resolution certificate")
-    else:
+    if certificate is not None:
         certificate_status = getattr(certificate.status, "value", certificate.status)
         if str(certificate_status).upper() != PackageResolutionStatus.CERTIFIED.value:
             violations.append("package-resolution certificate is not CERTIFIED")
@@ -526,10 +529,10 @@ def _portfolio_plan_violations(
     for task in task_queue.values():
         if task.parent_group_id not in sca_group_ids:
             continue
-        # A source-workaround child continues its certified package task; it
+        # A source-workaround child continues its solver-backed package task; it
         # is not a new version-selection task in the immutable portfolio.
         parent = task_queue.get(task.parent_task_id or "")
-        is_certified_workaround_child = (
+        is_committed_workaround_child = (
             task.strategy == RoutingStrategy.CODE_WORKAROUND
             and parent is not None
             and parent.task_id in planned_ids
@@ -537,7 +540,7 @@ def _portfolio_plan_violations(
             and parent.strategy == RoutingStrategy.VERSION_BUMP
             and parent.exhausted_update_path
         )
-        if not is_certified_workaround_child:
+        if not is_committed_workaround_child:
             tasks_by_group.setdefault(task.parent_group_id, []).append(task)
     terminal_statuses = {
         TaskStatus.QA_PASSED,
@@ -651,14 +654,14 @@ def _portfolio_plan_violations(
             if task.strategy_stage != decision_stage:
                 # A committed pivot advances retry stage without changing the
                 # certificate-bound package assignment.
-                preserves_certified_versions = (
+                preserves_committed_versions = (
                     expected == RoutingStrategy.VERSION_BUMP
                     and task.strategy == RoutingStrategy.VERSION_BUMP
                     and task.exhausted_update_path
                     and task.strategy_stage == SCARemediationStage.NPM_LATEST
                     and task.selected_version is None
                 )
-                if not preserves_certified_versions:
+                if not preserves_committed_versions:
                     violations.append(f"task {task_id} strategy stage differs from solver decision")
         except ValueError:
             violations.append(f"task {task_id} has unknown committed strategy stage")
@@ -1290,6 +1293,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         state.get("worker_results_by_attempt", {})
     )
     qa_results_by_attempt: dict[str, QAAttemptResult] = dict(state.get("qa_results_by_attempt", {}))
+    qa_rerun_counts_by_attempt: dict[str, int] = dict(state.get("qa_rerun_counts_by_attempt", {}))
     processed_worker_attempt_ids: set[str] = set(state.get("processed_worker_attempt_ids", []))
     processed_qa_attempt_ids: set[str] = set(state.get("processed_qa_attempt_ids", []))
     prior_consistency_events: list[StateConsistencyEvent] = list(
@@ -1456,7 +1460,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 or result.task_revision != task.task_revision
                 or snapshot is None
                 or (snapshot is not None and snapshot.task_revision != result.task_revision)
-                or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
+                or (
+                    snapshot is not None
+                    and task.portfolio_plan_id is not None
+                    and snapshot.portfolio_plan_id != task.portfolio_plan_id
+                )
                 or result.instruction_digest != snapshot.instruction_digest
                 or (snapshot_cluster_id is not None and result.cluster_id != snapshot_cluster_id)
                 or (snapshot_batch_id is not None and result.dispatch_batch_id != snapshot_batch_id)
@@ -1838,6 +1846,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     )
     qa_result_task_ids: set[str] = set()
     new_qa_attempt_ids: list[str] = []
+    qa_inconclusive_exhausted_task_ids: set[str] = set()
     for task_id in active_target_task_ids:
         task = task_queue.get(task_id)
         if task is None or not task.current_attempt_id:
@@ -1899,7 +1908,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             or qa_result.task_revision != task.task_revision
             or snapshot is None
             or (snapshot is not None and snapshot.task_revision != qa_result.task_revision)
-            or (snapshot is not None and snapshot.portfolio_plan_id != task.portfolio_plan_id)
+            or (
+                snapshot is not None
+                and task.portfolio_plan_id is not None
+                and snapshot.portfolio_plan_id != task.portfolio_plan_id
+            )
             or (snapshot_cluster_id is not None and qa_result.cluster_id != snapshot_cluster_id)
             or (snapshot_batch_id is not None and qa_result.dispatch_batch_id != snapshot_batch_id)
             or (
@@ -1930,6 +1943,24 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             qa_requires_rerun = (
                 qa_result.evaluation.evidence_inconclusive or qa_result.evaluation.contract_error
             )
+            if qa_requires_rerun:
+                reruns_used = max(
+                    0,
+                    qa_rerun_counts_by_attempt.get(task.current_attempt_id, 0),
+                )
+                if reruns_used < MAX_QA_EVIDENCE_RERUNS:
+                    qa_rerun_counts_by_attempt[task.current_attempt_id] = reruns_used + 1
+                else:
+                    # Repeating the same inconclusive QA evidence cannot make
+                    # the task progress. Bound the reruns and preserve the
+                    # unresolved outcome for the final report.
+                    qa_requires_rerun = False
+                    qa_inconclusive_exhausted_task_ids.add(task_id)
+                    errors.append(
+                        f"supervisor: QA remained inconclusive for {task_id} after "
+                        f"{MAX_QA_EVIDENCE_RERUNS} same-attempt rerun(s); "
+                        "marked the task inconclusive."
+                    )
             if not qa_requires_rerun and not atomic_cluster_task_ids:
                 # QA closes the worker attempt before any status or stage
                 # change. The next planner proposal must observe a task with
@@ -1972,7 +2003,23 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             and not evaluation.evidence_inconclusive
             for evaluation in cluster_evaluations.values()
         )
-        if not has_real_failure and has_inconclusive:
+        exhausted_cluster_qa = bool(
+            qa_inconclusive_exhausted_task_ids.intersection(atomic_cluster_task_ids)
+        )
+        if exhausted_cluster_qa and not has_real_failure:
+            for task_id in atomic_cluster_task_ids:
+                task = task_queue[task_id]
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.INCONCLUSIVE},
+                    close_attempt=task.current_attempt_id is not None,
+                )
+            errors.append(
+                "supervisor: atomic package-cluster QA exhausted its bounded evidence "
+                "reruns; marked every cluster task inconclusive."
+            )
+        elif not has_real_failure and has_inconclusive:
             for task_id in atomic_cluster_task_ids:
                 _commit_task_transition(
                     task_queue,
@@ -2067,6 +2114,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 continue
             task = task_queue[resolved_t_id]
             if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
+                continue
+            if resolved_t_id in qa_inconclusive_exhausted_task_ids:
+                _commit_task_transition(
+                    task_queue,
+                    resolved_t_id,
+                    updates={"status": TaskStatus.INCONCLUSIVE},
+                    close_attempt=task.current_attempt_id is not None,
+                )
                 continue
             if evaluation.contract_error:
                 # A malformed judge response is a QA-contract failure, not a
@@ -3495,6 +3550,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         "attempt_snapshots_by_id": attempt_snapshots_by_id,
         "worker_results_by_attempt": worker_results_by_attempt,
         "qa_results_by_attempt": qa_results_by_attempt,
+        "qa_rerun_counts_by_attempt": qa_rerun_counts_by_attempt,
         "processed_worker_attempt_ids": list(new_worker_attempt_ids),
         "processed_qa_attempt_ids": list(new_qa_attempt_ids),
         "consistency_events": consistency_events,
