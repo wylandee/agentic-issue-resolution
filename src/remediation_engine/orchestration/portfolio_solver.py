@@ -45,6 +45,7 @@ from remediation_engine.contracts.solver_models import (
     SolverVersionCandidate,
 )
 from remediation_engine.settings import AppSettings
+from remediation_engine.solver.cpsat import _as_domain as _normalize_solver_candidate_domain
 from remediation_engine.solver.cpsat import solve_portfolio
 from remediation_engine.solver.graph import (
     _dependency_order_kind,
@@ -1014,9 +1015,7 @@ def _solver_evidence_packument(
             versions[version] = metadata
             continue
         versions[version] = {
-            field: metadata[field]
-            for field in _EVIDENCE_METADATA_FIELDS
-            if field in metadata
+            field: metadata[field] for field in _EVIDENCE_METADATA_FIELDS if field in metadata
         }
     return {"name": validated.get("name", package_name), "versions": versions}
 
@@ -1166,7 +1165,7 @@ def _candidate_domains(
     transitive_compatible_versions: Mapping[str, set[str]] | None = None,
     packuments: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, list[SolverVersionCandidate]], bool, str]:
-    """Prepare complete, candidate-specific registry domains without pruning."""
+    """Prepare candidate-specific registry domains with goal-directed pruning."""
     groups_by_task = {
         task.task_id: next(
             (group for group in groups if group.group_id == task.parent_group_id), None
@@ -1251,7 +1250,6 @@ def _candidate_domains(
             if version:
                 add_candidate(_candidate(str(version), source=source, floor=floor))
 
-        eligible_registry_count = 0
         packument: Mapping[str, Any] | None = None
         if target.eligible_for_atomic_update and target.target_package_name:
             package_name = target.target_package_name
@@ -1332,22 +1330,20 @@ def _candidate_domains(
                             os=os_values,
                             cpu=cpu_values,
                         )
-                        retained = add_candidate(candidate)
-                        if retained is not None and retained.meets_security_floor:
-                            eligible_registry_count += 1
-                    if eligible_registry_count > limit:
-                        complete = False
-                        completeness_diagnostics.append(
-                            f"eligible release catalog for {package_name!r} has "
-                            f"{eligible_registry_count} versions, exceeding resource guard {limit}"
-                        )
+                        add_candidate(candidate)
 
         dedup: dict[str, SolverVersionCandidate] = {}
         for value in sorted(values, key=lambda item: (item.semver_key, item.version, item.source)):
             existing = dedup.get(value.version)
             if existing is None or (existing.source != "registry" and value.source == "registry"):
                 dedup[value.version] = value
-        ordered = list(dedup.values())
+        ordered = _normalize_solver_candidate_domain(
+            target,
+            {target.occurrence_id: list(dedup.values())},
+            max_candidates=limit,
+            security_floor=floor,
+            diagnostics=diagnostics,
+        )
         domains[target.occurrence_id] = ordered
         if not ordered and target.eligible_for_atomic_update:
             diagnostics.append(f"empty candidate domain for {target.occurrence_id}")
@@ -1746,12 +1742,11 @@ def _prepare_portfolio_problem(
 
     required_names = _required_candidate_package_names(targets, findings)
     packuments: dict[str, Mapping[str, Any]] = {}
-    packument_complete = False
     packument_digest = _digest({"required_packages": required_names, "fresh_snapshot": False})
     if registry_fetcher is not None:
         (
             packuments,
-            packument_complete,
+            _,
             packument_digest,
             packument_diagnostics,
         ) = _fetch_candidate_packuments(
@@ -1806,8 +1801,16 @@ def _prepare_portfolio_problem(
         evidence_domains=evidence_domains,
     )
     diagnostics.extend(subgraph.diagnostics)
+    mutation_catalog_available = all(
+        bool(target.target_package_name) and target.target_package_name in packuments
+        for target in targets
+        if target.eligible_for_atomic_update
+    )
+    # Completeness is about every package the solver may mutate.  Missing or
+    # oversized third-party evidence witnesses relax dependency constraints,
+    # but do not invalidate the target release catalogs.
     candidate_catalog_complete = (
-        registry_fetcher is not None and packument_complete and domain_complete
+        registry_fetcher is not None and mutation_catalog_available and domain_complete
     )
     candidate_catalog_digest = _digest(
         {
@@ -2107,11 +2110,11 @@ def apply_portfolio_plan(
     certificate_status = getattr(getattr(certificate, "status", None), "value", None)
     if (
         solver_plan is None
-        or solver_plan.status != SolverStatus.OPTIMAL
+        or solver_plan.status not in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
         or not solver_plan.candidate_catalog_complete
         or selected is None
     ):
-        raise ValueError("portfolio task decisions require an OPTIMAL complete solver plan")
+        raise ValueError("portfolio task decisions require an accepted complete solver plan")
     if certificate is not None and (
         str(certificate_status or getattr(certificate, "status", "")).upper() != "CERTIFIED"
         or certificate.portfolio_plan_id != plan.portfolio_plan_id
@@ -2123,7 +2126,6 @@ def apply_portfolio_plan(
         or certificate.candidate_plan_id != selected.candidate_plan_id
         or certificate.candidate_assignment_digest
         != _digest(dict(sorted(selected.selected_candidate_versions.items())))
-        or certificate.unresolved_coverage_ids
     ):
         raise ValueError("portfolio plan contains a mismatched package-resolution certificate")
     prepared_groups = [group.model_copy(deep=True) for group in groups]
@@ -2223,6 +2225,11 @@ def apply_portfolio_plan(
             updates["strategy"] = RoutingStrategy.VERSION_BUMP
         elif decision_strategy in {"code_workaround", "workaround", "no_fix"}:
             updates["strategy"] = RoutingStrategy.CODE_WORKAROUND
+            if decision_strategy == "no_fix" and task.no_fix_stage is None:
+                # No catalog-backed package fix or authorized workaround exists.
+                # Keep this coverage unresolved and terminalize only this task so
+                # viable packages in the certified partial plan can proceed.
+                updates["status"] = TaskStatus.UNFIXABLE
         if decision.selected_version is not None:
             updates["selected_version"] = decision.selected_version
         allowed = list(

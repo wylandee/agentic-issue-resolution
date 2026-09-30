@@ -450,7 +450,7 @@ class SolverRuntimeFingerprint(_SolverModel):
 
 
 class PackageResolutionStatus(StrEnum):
-    """Outcome of strict package-manager certification."""
+    """Outcome of package-manager certification for a solver assignment."""
 
     CERTIFIED = "CERTIFIED"
     REJECTED = "REJECTED"
@@ -594,7 +594,7 @@ class CertificationStatistics(_SolverModel):
 
 
 class PackageResolutionCertificate(_SolverModel):
-    """Immutable evidence for one complete package-resolution assignment."""
+    """Immutable evidence for one package-resolved assignment and its coverage."""
 
     status: PackageResolutionStatus
     portfolio_plan_id: str = Field(..., min_length=1)
@@ -687,8 +687,6 @@ class PackageResolutionCertificate(_SolverModel):
             for right in range(left + 1, 3)
         ):
             raise ValueError("certificate coverage IDs must be classified exactly once.")
-        if self.status == PackageResolutionStatus.CERTIFIED and self.unresolved_coverage_ids:
-            raise ValueError("certified package resolution cannot contain unresolved coverage.")
         return self
 
 

@@ -35,9 +35,9 @@ DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 # from exhausting process resources.  Deployments with larger repositories can
 # raise it explicitly through REMEDY_SOLVER_MAX_MODEL_VARIABLES.
 DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
-# Full candidate catalogs are retained up to this resource guard; larger
-# catalogs fail closed instead of being truncated.
-DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 1000
+# Candidate catalogs above this per-target bound are pruned to the installed
+# version, security floor, and latest release from each eligible minor branch.
+DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 256
 
 
 @dataclass(frozen=True)

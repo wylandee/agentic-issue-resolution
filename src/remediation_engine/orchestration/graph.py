@@ -96,7 +96,7 @@ from remediation_engine.orchestration.langsmith_config import (
 )
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
-    build_portfolio_plan,
+    build_certified_portfolio_plan,
     prepare_portfolio_inputs,
 )
 from remediation_engine.orchestration.qa_critic import (
@@ -896,13 +896,15 @@ def _record_portfolio_replan_attempt(
 def _portfolio_certificate_violations(
     plan: Any,
     task_queue: Mapping[str, Any],
+    *,
+    accept_feasible: bool = False,
 ) -> list[str]:
     """Validate the resolver certificate against its committed immutable plan."""
     violations: list[str] = []
     solver_plan = getattr(plan, "solver_plan", None)
     certificate = getattr(plan, "resolution_certificate", None)
     if certificate is None:
-        return []
+        return ["portfolio plan is missing its package-resolution certificate"]
     certificate_status = getattr(getattr(certificate, "status", None), "value", None)
     if (
         str(certificate_status or getattr(certificate, "status", "")).upper()
@@ -913,8 +915,9 @@ def _portfolio_certificate_violations(
         return sorted(set([*violations, "portfolio plan is missing its solver plan"]))
     status = getattr(solver_plan, "status", None)
     status = getattr(status, "value", status)
-    if str(status or "").upper() != "OPTIMAL":
-        violations.append("certified dispatch requires an OPTIMAL solver status")
+    solver_status = str(status or "").upper()
+    if solver_status != "OPTIMAL" and not (accept_feasible and solver_status == "FEASIBLE"):
+        violations.append("certified dispatch requires an accepted solver status")
     if not getattr(solver_plan, "candidate_catalog_complete", False):
         violations.append("certified dispatch requires a complete candidate catalog")
     if getattr(certificate, "portfolio_plan_id", None) != getattr(plan, "portfolio_plan_id", None):
@@ -935,9 +938,6 @@ def _portfolio_certificate_violations(
         solver_plan, "candidate_catalog_digest", None
     ):
         violations.append("package-resolution certificate candidate catalog digest is stale")
-    if list(getattr(certificate, "unresolved_coverage_ids", ()) or ()):
-        violations.append("package-resolution certificate contains unresolved coverage")
-
     revisions = dict(getattr(plan, "task_revisions", {}) or {})
     if dict(getattr(certificate, "task_revisions", {}) or {}) != revisions:
         violations.append("package-resolution certificate task revisions are stale")
@@ -1056,8 +1056,9 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
                 "active_dispatch_batch_id": None,
                 "errors": sorted(set(prepare_diagnostics)),
             }
-        plan = build_portfolio_plan(
+        plan = build_certified_portfolio_plan(
             state["repo_root"],
+            state.get("workspace_volume") or "",
             prepared_groups,
             prepared_queue,
             target_packages=state.get("target_packages", []),
@@ -1090,7 +1091,10 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
     solver_status = getattr(solver_plan, "status", None)
     solver_status = getattr(solver_status, "value", solver_status)
     solver_status = str(solver_status or "").upper()
-    certificate_violations = _portfolio_certificate_violations(plan, portfolio_queue)
+    accept_feasible = bool(getattr(settings, "solver_accept_feasible", True))
+    certificate_violations = _portfolio_certificate_violations(
+        plan, portfolio_queue, accept_feasible=accept_feasible
+    )
     diagnostics = sorted(set(diagnostics) | set(certificate_violations))
     invalid_dag = any(
         marker in diagnostics_text
@@ -1120,32 +1124,13 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             f"{sorted(cluster.cluster_id for cluster in all_non_dispatchable_clusters)!r}"
         )
         diagnostics_text = "\n".join(diagnostics).lower()
-    selected_plan = getattr(solver_plan, "selected_plan", None)
-    no_fix_task_ids = [
-        decision.task_id
-        for decision in (getattr(selected_plan, "task_decisions", None) or [])
-        if str(decision.selected_strategy).lower().replace("-", "_") == "no_fix"
-        and (
-            (task := prepared_queue.get(decision.task_id)) is None
-            or task.status
-            not in {
-                TaskStatus.QA_PASSED,
-                TaskStatus.UNFIXABLE,
-                TaskStatus.INCONCLUSIVE,
-                TaskStatus.PIVOTED,
-            }
-        )
-    ]
     multiple_active_tasks = any(
         "multiple nonterminal tasks" in diagnostic for diagnostic in plan_diagnostics
     )
-    blocked = (
-        multiple_active_tasks
-        or bool(no_fix_task_ids)
-        or bool(hard_overflow_clusters)
-        or bool(certificate_violations)
+    blocked = multiple_active_tasks or bool(hard_overflow_clusters) or bool(certificate_violations)
+    failed_status = solver_status != "OPTIMAL" and not (
+        accept_feasible and solver_status == "FEASIBLE"
     )
-    failed_status = solver_status != "OPTIMAL"
     if blocked or invalid_dag or failed_status:
         errors = list(diagnostics)
         if multiple_active_tasks:
@@ -1161,11 +1146,6 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             )
         if failed_status:
             errors.append(f"portfolio solver returned non-dispatchable status {solver_status}.")
-        if no_fix_task_ids:
-            errors.append(
-                "portfolio node blocked dispatch because the solver left unresolved "
-                f"no-fix tasks: {sorted(no_fix_task_ids)!r}."
-            )
         failure_state = (
             "portfolio_native_error"
             if solver_status == "NATIVE_ERROR"

@@ -333,9 +333,15 @@ def _as_domain(
     candidate_domains: Mapping[str, Sequence[SolverVersionCandidate]],
     *,
     max_candidates: int,
+    security_floor: str | None,
     diagnostics: list[str],
 ) -> list[SolverVersionCandidate]:
-    """Normalize candidate identity without silently pruning a release."""
+    """Normalize and goal-directly bound one target's candidate domain.
+
+    The installed version is always retained as the status-quo assignment.
+    Large catalogs retain the security floor and the newest patch release from
+    each minor branch at or above that floor.
+    """
     raw = candidate_domains.get(target.occurrence_id)
     if raw is None:
         raw = candidate_domains.get(target.task_id, ())
@@ -358,13 +364,57 @@ def _as_domain(
             continue
         seen.add(candidate.version)
         unique.append(candidate)
+
+    installed_version = str(target.installed_version or "").strip().lstrip("vV")
+    if installed_version and installed_version not in seen:
+        installed_key = _version_key(installed_version)
+        unique.append(
+            SolverVersionCandidate(
+                version=installed_version,
+                semver_key=installed_key or (),
+                source="current",
+                meets_security_floor=_at_least(installed_version, security_floor),
+            )
+        )
+        seen.add(installed_version)
+        if installed_key is None:
+            _diagnostic(
+                diagnostics,
+                f"installed version {installed_version!r} is non-semver; retained only as "
+                f"the status-quo candidate for {target.occurrence_id}",
+            )
+
     if len(unique) > max_candidates:
+        baseline_versions = {installed_version} if installed_version in seen else set()
+        floor_version = str(security_floor or "").strip().lstrip("vV")
+        retained_versions = set(baseline_versions)
+        if floor_version in seen:
+            retained_versions.add(floor_version)
+
+        latest_by_minor: dict[tuple[int, int], SolverVersionCandidate] = {}
+        for candidate in unique:
+            if not candidate.meets_security_floor or not _at_least(
+                candidate.version, security_floor
+            ):
+                continue
+            version_key = _version_key(candidate.version)
+            if version_key is None:
+                continue
+            branch = (version_key[0], version_key[1])
+            previous = latest_by_minor.get(branch)
+            if previous is None or _candidate_key(candidate) > _candidate_key(previous):
+                latest_by_minor[branch] = candidate
+        branch_candidates = sorted(latest_by_minor.values(), key=_candidate_key, reverse=True)
+        room = max(0, max_candidates - len(retained_versions))
+        retained_versions.update(candidate.version for candidate in branch_candidates[:room])
+        unique = [candidate for candidate in unique if candidate.version in retained_versions]
         _diagnostic(
             diagnostics,
-            f"candidate resource guard exceeded for {target.occurrence_id}: "
-            f"{len(unique)}>{max_candidates}; domain was not truncated",
+            f"candidate catalog pruned for {target.occurrence_id}: "
+            f"{len(candidates)}>{max_candidates}; retained installed, security-floor, "
+            "and latest-per-minor candidates",
         )
-    return unique
+    return sorted(unique, key=_candidate_key)
 
 
 def _floor_for_target(
@@ -574,6 +624,13 @@ def _compatible_alternatives(
     return compatible
 
 
+def _assignment_value(solver_or_snapshot: Any, variable: Any) -> int:
+    """Read one integer variable value from a live solver or saved assignment."""
+    if isinstance(solver_or_snapshot, Mapping):
+        return int(solver_or_snapshot[int(variable.Index())])
+    return int(solver_or_snapshot.Value(variable))
+
+
 def _project_candidate_plan(
     solver: Any,
     *,
@@ -596,13 +653,16 @@ def _project_candidate_plan(
 ) -> tuple[SolverCandidatePlan, dict[str, int]]:
     """Project one CP-SAT assignment into the immutable candidate contract."""
     selected_indices = {
-        occurrence_id: int(solver.Value(variable)) for occurrence_id, variable in vars_by_id.items()
+        occurrence_id: _assignment_value(solver, variable)
+        for occurrence_id, variable in vars_by_id.items()
     }
     covered_values = {
-        finding_id: bool(solver.Value(value)) for finding_id, value in findings_covered.items()
+        finding_id: bool(_assignment_value(solver, value))
+        for finding_id, value in findings_covered.items()
     }
     workaround_values = {
-        finding_id: bool(solver.Value(value)) for finding_id, value in findings_workaround.items()
+        finding_id: bool(_assignment_value(solver, value))
+        for finding_id, value in findings_workaround.items()
     }
     compatible_alternatives_by_target = {
         target.occurrence_id: _compatible_alternatives(
@@ -941,9 +1001,12 @@ def _candidate_relations_complete(
     subgraph: SolverSubgraph,
     domains: Mapping[str, Sequence[SolverVersionCandidate]],
     diagnostics: list[str],
+    *,
+    pruned_candidate_versions: Mapping[str, set[str]] | None = None,
 ) -> bool:
-    """Require one valid physical relation for every published requirement."""
+    """Require relations for every retained candidate and its requirements."""
     by_source_candidate: dict[tuple[str, str], list[SolverCandidateRelation]] = {}
+    intentionally_pruned = pruned_candidate_versions or {}
     complete = True
     for relation in subgraph.candidate_relations:
         source_candidates = domains.get(relation.source_occurrence_id, ())
@@ -956,6 +1019,10 @@ def _candidate_relations_complete(
             None,
         )
         if candidate is None:
+            if relation.source_candidate_version in intentionally_pruned.get(
+                relation.source_occurrence_id, set()
+            ):
+                continue
             complete = False
             _diagnostic(
                 diagnostics,
@@ -1143,19 +1210,72 @@ def _solve_lexicographic(
     solver: Any,
     *,
     vars_by_id: Mapping[str, Any],
-    metrics: Sequence[tuple[Any, bool]],
+    findings_covered: Mapping[str, Any],
+    findings_workaround: Mapping[str, Any],
+    metrics: Sequence[tuple[str, Any, bool]],
     top_k: int,
     timeout_seconds: float,
     accepted_feasible: bool,
     project: Callable[[Any, int, SolverStatus], tuple[SolverCandidatePlan, dict[str, int]]],
     observations: list[dict[str, Any]],
+    diagnostics: list[str],
 ) -> tuple[list[SolverCandidatePlan], SolverStatus | None]:
-    """Enumerate top-K assignments without changing the primary solve status."""
+    """Enumerate lexicographic assignments and retain incumbents across stages.
+
+    If a later objective stage becomes infeasible or times out after an earlier
+    stage produced an assignment, restore that model snapshot, constrain the
+    failed objective to be no worse than the saved assignment, and continue
+    with lower-priority metrics. Such a recovered candidate is feasible but
+    cannot be reported as globally optimal.
+    """
     candidate_plans: list[SolverCandidatePlan] = []
     forbidden_assignments: list[dict[str, int]] = []
     primary_status: SolverStatus | None = None
     deadline = time.monotonic() + max(0.001, timeout_seconds)
     ordered_occurrences = sorted(vars_by_id)
+
+    def stage_diagnostic(message: str) -> None:
+        """Retain stage diagnostics even when earlier diagnostics filled the cap."""
+        message = str(message).strip()[:_MAX_DIAGNOSTIC_LENGTH]
+        if not message or message in diagnostics:
+            return
+        if len(diagnostics) >= _MAX_DIAGNOSTICS:
+            diagnostics.pop()
+        diagnostics.append(message)
+
+    def snapshot_values(solver_instance: Any) -> dict[int, int]:
+        """Capture every value needed to project a candidate plan later."""
+        variables = [
+            *vars_by_id.values(),
+            *findings_covered.values(),
+            *findings_workaround.values(),
+        ]
+        return {
+            int(variable.Index()): int(solver_instance.Value(variable))
+            for variable in variables
+        }
+
+    def read_metric(solver_instance: Any, expression: Any) -> int:
+        """Read an objective expression, including constant-only metrics."""
+        try:
+            return int(solver_instance.Value(expression))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return int(expression)
+
+    def metric_values(solver_instance: Any) -> dict[str, int]:
+        """Evaluate every lexicographic objective on one saved assignment."""
+        return {
+            name: read_metric(solver_instance, expression)
+            for name, expression, _maximize in metrics
+        }
+
+    def add_no_worse_bound(model: Any, expression: Any, maximize: bool, value: int) -> None:
+        """Preserve an incumbent metric without requiring an exact lock."""
+        if maximize:
+            model.Add(expression >= value)
+        else:
+            model.Add(expression <= value)
+
     for alternative_index in range(top_k):
         model = base_model.Clone()
         for assignment in forbidden_assignments:
@@ -1163,44 +1283,144 @@ def _solve_lexicographic(
                 [vars_by_id[occurrence_id] for occurrence_id in ordered_occurrences],
                 [[assignment[occurrence_id] for occurrence_id in ordered_occurrences]],
             )
-        final_status = SolverStatus.OPTIMAL
-        for expression, maximize in metrics:
+        candidate_status = SolverStatus.OPTIMAL
+        latest_assignment: dict[int, int] | None = None
+        latest_metric_values: dict[str, int] = {}
+        latest_model_snapshot: Any | None = None
+        recovered_stage = False
+        abandon_alternative = False
+
+        for stage_index, (metric_name, expression, maximize) in enumerate(metrics):
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                remaining = 0.001
             model.ClearObjective()
             if maximize:
                 model.Maximize(expression)
             else:
                 model.Minimize(expression)
-            solver.parameters.max_time_in_seconds = max(0.001, remaining)
-            status_code = solver.Solve(model)
-            status = _record_solver_result(cp_model, solver, status_code, observations)
+
+            if remaining <= 0:
+                status = SolverStatus.UNKNOWN
+                stage_wall_time = 0.0
+                objective_value = None
+                best_objective_bound = None
+                stage_diagnostic(
+                    f"lexicographic candidate {alternative_index + 1} stage "
+                    f"{stage_index + 1}/{len(metrics)} '{metric_name}' timed out before solve",
+                )
+            else:
+                solver.parameters.max_time_in_seconds = max(0.001, remaining)
+                status_code = solver.Solve(model)
+                status = _record_solver_result(cp_model, solver, status_code, observations)
+                observation = observations[-1]
+                stage_wall_time = float(observation.get("wall_time_seconds") or 0.0)
+                objective_value = observation.get("objective_value")
+                best_objective_bound = observation.get("best_objective_bound")
+
+            direction = "maximize" if maximize else "minimize"
+            value_text = "n/a"
+            if status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}:
+                stage_metric_value = read_metric(solver, expression)
+                value_text = str(stage_metric_value)
+            stage_diagnostic(
+                f"lexicographic candidate {alternative_index + 1} stage "
+                f"{stage_index + 1}/{len(metrics)} '{metric_name}' {direction}: "
+                f"{status.value}; metric={value_text}; "
+                f"objective={objective_value if objective_value is not None else 'n/a'}; "
+                f"bound={best_objective_bound if best_objective_bound is not None else 'n/a'}; "
+                f"wall={stage_wall_time:.3f}s",
+            )
+
             if status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}:
-                final_status = status
-                break
+                if latest_assignment is None:
+                    if candidate_plans:
+                        stage_diagnostic(
+                            "no further lexicographic candidate is feasible; retaining "
+                            "the completed candidate plan",
+                        )
+                        abandon_alternative = True
+                        break
+                    stage_diagnostic(
+                        f"lexicographic stage '{metric_name}' failed before any "
+                        "candidate assignment was available",
+                    )
+                    return candidate_plans, status
+                if candidate_plans:
+                    stage_diagnostic(
+                        f"lexicographic candidate {alternative_index + 1} stopped at "
+                        f"stage '{metric_name}'; retaining previously completed candidate(s)",
+                    )
+                    abandon_alternative = True
+                    break
+                if not accepted_feasible:
+                    stage_diagnostic(
+                        "lexicographic recovery requires a FEASIBLE plan, but "
+                        "solver_accept_feasible is disabled",
+                    )
+                    return candidate_plans, SolverStatus.UNKNOWN
+
+                # The most recent saved assignment is a witness that this
+                # restored model remains feasible. Preserve its value for the
+                # failed objective, then continue with lower-priority metrics.
+                fallback_value = latest_metric_values[metric_name]
+                model = latest_model_snapshot.Clone()
+                add_no_worse_bound(model, expression, maximize, fallback_value)
+                latest_model_snapshot = model.Clone()
+                candidate_status = SolverStatus.FEASIBLE
+                recovered_stage = True
+                bound = ">=" if maximize else "<="
+                stage_diagnostic(
+                    f"restored candidate snapshot after stage '{metric_name}' returned "
+                    f"{status.value}; preserving {metric_name} {bound} {fallback_value} "
+                    "and continuing with the next objective",
+                )
+                continue
+
             if status == SolverStatus.FEASIBLE:
                 if not accepted_feasible:
+                    stage_diagnostic(
+                        "feasible lexicographic stage rejected by "
+                        "solver_accept_feasible=false",
+                    )
                     if candidate_plans:
-                        return candidate_plans, primary_status
+                        abandon_alternative = True
+                        break
                     return candidate_plans, SolverStatus.UNKNOWN
-                final_status = SolverStatus.FEASIBLE
-            try:
-                metric_value = int(solver.Value(expression))
-            except (TypeError, ValueError):
-                metric_value = int(expression)
-            model.Add(expression == metric_value)
-        if final_status in {SolverStatus.INFEASIBLE, SolverStatus.UNKNOWN}:
-            if not candidate_plans:
-                return candidate_plans, final_status
+                candidate_status = SolverStatus.FEASIBLE
+
+            latest_assignment = snapshot_values(solver)
+            latest_metric_values = metric_values(solver)
+            metric_value = latest_metric_values[metric_name]
+            if status == SolverStatus.OPTIMAL:
+                # Exact locks preserve a proven lexicographic optimum.
+                model.Add(expression == metric_value)
+            else:
+                # An unproven incumbent must not worsen while lower-priority
+                # metrics are optimized.
+                add_no_worse_bound(model, expression, maximize, metric_value)
+            latest_model_snapshot = model.Clone()
+
+        if abandon_alternative:
             break
+        if latest_assignment is None:
+            # All metrics are present in the model, so this is defensive only.
+            if candidate_plans:
+                break
+            return candidate_plans, SolverStatus.UNKNOWN
+        if recovered_stage:
+            candidate_status = SolverStatus.FEASIBLE
         if primary_status is None:
-            primary_status = final_status
-        candidate, selected_indices = project(solver, alternative_index, final_status)
+            primary_status = candidate_status
+        candidate, selected_indices = project(
+            latest_assignment, alternative_index, candidate_status
+        )
         candidate_plans.append(candidate)
         if not ordered_occurrences:
             break
         forbidden_assignments.append(selected_indices)
+        if recovered_stage or candidate_status == SolverStatus.FEASIBLE:
+            # Once a candidate required fallback recovery, later alternatives
+            # cannot improve the certified primary assignment reliably.
+            break
     return candidate_plans, primary_status
 
 
@@ -1252,20 +1472,32 @@ def solve_portfolio(
         ),
     )
     max_variables = max(1, int(_setting(settings, "solver_max_model_variables", 10_000)))
-    domains: dict[str, list[SolverVersionCandidate]] = {
-        target.occurrence_id: _as_domain(
-            target,
-            candidate_domains,
-            max_candidates=max_candidates,
-            diagnostics=diagnostics,
-        )
-        for target in targets
-        if target.eligible_for_atomic_update
-    }
     floors = {
         target.occurrence_id: _floor_for_target(target, findings, diagnostics) for target in targets
     }
     eligible = [target for target in targets if target.eligible_for_atomic_update]
+    domains: dict[str, list[SolverVersionCandidate]] = {}
+    pruned_candidate_versions: dict[str, set[str]] = {}
+    for target in eligible:
+        raw_domain = candidate_domains.get(target.occurrence_id)
+        if raw_domain is None:
+            raw_domain = candidate_domains.get(target.task_id, ())
+        raw_versions = {
+            candidate.version
+            for candidate in raw_domain or ()
+            if isinstance(candidate, SolverVersionCandidate)
+        }
+        domain = _as_domain(
+            target,
+            candidate_domains,
+            max_candidates=max_candidates,
+            security_floor=floors[target.occurrence_id],
+            diagnostics=diagnostics,
+        )
+        domains[target.occurrence_id] = domain
+        removed_versions = raw_versions - {candidate.version for candidate in domain}
+        if removed_versions:
+            pruned_candidate_versions[target.occurrence_id] = removed_versions
     validated_conflicts, exact_conflict_assignments, conflict_diagnostics = (
         _validate_forbidden_conflicts(forbidden_conflicts, eligible, domains)
     )
@@ -1273,21 +1505,13 @@ def solve_portfolio(
         [*forbidden_assignments, *exact_conflict_assignments], eligible, domains
     )
     diagnostics.extend([*forbidden_diagnostics, *conflict_diagnostics])
-    candidate_relations_complete = _candidate_relations_complete(subgraph, domains, diagnostics)
+    candidate_relations_complete = _candidate_relations_complete(
+        subgraph,
+        domains,
+        diagnostics,
+        pruned_candidate_versions=pruned_candidate_versions,
+    )
     candidate_catalog_complete = bool(candidate_catalog_complete)
-    oversized_domains = [
-        (target.occurrence_id, len(domains.get(target.occurrence_id, ())))
-        for target in eligible
-        if len(domains.get(target.occurrence_id, ())) > max_candidates
-    ]
-    if oversized_domains:
-        candidate_catalog_complete = False
-        for occurrence_id, size in oversized_domains:
-            _diagnostic(
-                diagnostics,
-                f"candidate resource guard exceeded for {occurrence_id}: {size}>{max_candidates}; "
-                "no candidates were pruned",
-            )
     for target in targets:
         if target.eligible_for_atomic_update and not domains.get(target.occurrence_id):
             _diagnostic(
@@ -1366,7 +1590,6 @@ def solve_portfolio(
         or not candidate_relations_complete
         or forbidden_diagnostics
         or conflict_diagnostics
-        or oversized_domains
     ):
         if not getattr(subgraph, "valid", True):
             _diagnostic(diagnostics, "invalid solver subgraph; no dispatchable plan")
@@ -1464,6 +1687,22 @@ def solve_portfolio(
     for finding in finding_list:
         finding_by_target.setdefault(finding.target_occurrence_id, []).append(finding)
     model = cp_model.CpModel()
+
+    def installed_index(occurrence_id: str) -> int | None:
+        """Return the status-quo candidate index for one mutation target."""
+        target = target_by_id.get(occurrence_id)
+        if target is None or not target.installed_version:
+            return None
+        installed_version = target.installed_version.strip().lstrip("vV")
+        return next(
+            (
+                index
+                for index, candidate in enumerate(domains.get(occurrence_id, ()))
+                if candidate.version == installed_version
+            ),
+            None,
+        )
+
     for target in eligible:
         values = domains[target.occurrence_id]
         target_findings = [
@@ -1487,8 +1726,9 @@ def solve_portfolio(
                 )
             )
         ]
+        has_floor_candidate = bool(allowed)
         if (
-            not allowed
+            not has_floor_candidate
             and floor_required
             and target_requirements
             and all(
@@ -1499,6 +1739,22 @@ def solve_portfolio(
             # A validated workaround is allowed to replace a version bump
             # when the registry domain cannot satisfy the security floor.
             allowed = list(range(len(values)))
+        elif not has_floor_candidate:
+            baseline_index = installed_index(target.occurrence_id)
+            if baseline_index is not None:
+                # Keep the status quo available when there is no secure release.
+                allowed = [baseline_index]
+                _diagnostic(
+                    diagnostics,
+                    f"no candidate meets the security floor for {target.occurrence_id}; "
+                    "retaining the installed version",
+                )
+        else:
+            baseline_index = installed_index(target.occurrence_id)
+            if baseline_index is not None and baseline_index not in allowed:
+                # Keep the status quo available as a portfolio escape hatch when
+                # otherwise-safe upgrades conflict with another package constraint.
+                allowed.append(baseline_index)
         if not allowed:
             _diagnostic(
                 diagnostics, f"security floor removes every candidate for {target.occurrence_id}"
@@ -1515,6 +1771,46 @@ def solve_portfolio(
         vars_by_id[target.occurrence_id] = model.NewIntVarFromDomain(
             cp_model.Domain.FromValues(allowed), f"occurrence_{len(vars_by_id):04d}"
         )
+
+    def add_resilient_pair_constraint(
+        left_id: str,
+        right_id: str,
+        pairs: Sequence[tuple[int, int]],
+        diagnostic: str,
+    ) -> None:
+        """Constrain compatible candidates while preserving the baseline pair."""
+        normalized_pairs = set(pairs)
+        left_baseline = installed_index(left_id)
+        right_baseline = installed_index(right_id)
+        if not pairs and (left_baseline is None or right_baseline is None):
+            _diagnostic(
+                diagnostics,
+                f"{diagnostic}; baseline unavailable, leaving peer relation relaxed",
+            )
+            return
+        if left_baseline is not None and right_baseline is not None:
+            normalized_pairs.add((left_baseline, right_baseline))
+        if not pairs:
+            _diagnostic(diagnostics, diagnostic)
+
+        allowed_left = {left for left, _right in pairs}
+        allowed_right = {right for _left, right in pairs}
+        if left_baseline is not None:
+            allowed_left.add(left_baseline)
+        if right_baseline is not None:
+            allowed_right.add(right_baseline)
+        for index, _candidate in enumerate(domains[left_id]):
+            if index not in allowed_left:
+                model.Add(vars_by_id[left_id] != index)
+        for index, _candidate in enumerate(domains[right_id]):
+            if index not in allowed_right:
+                model.Add(vars_by_id[right_id] != index)
+
+        if normalized_pairs:
+            model.AddAllowedAssignments(
+                [vars_by_id[left_id], vars_by_id[right_id]], sorted(normalized_pairs)
+            )
+
     evidence_vars_by_id: dict[str, Any] = {}
     if evidence_model_enabled:
         for evidence_index, evidence_domain in enumerate(
@@ -1559,9 +1855,11 @@ def solve_portfolio(
         ]
         model.AddForbiddenAssignments(literal_variables, [literal_indices])
 
-    # Peer constraints are the solver's hard package compatibility ranges.
-    # Runtime, ancestry, and pinned edges remain in the graph for ordering and
-    # atomic batching; their installed ranges are not candidate constraints.
+    # Peer constraints and range-bearing graph edges are the solver's hard
+    # package compatibility requirements. Range-free workspace and scope edges
+    # remain useful for grouping and ordering, but adding them as compatibility
+    # tables would materialize every pair in two candidate domains even though
+    # every pair is allowed.
     peer_by_pair: dict[tuple[str, str], SolverPeerConstraint] = {
         (peer.source_occurrence_id, peer.target_occurrence_id): peer
         for peer in subgraph.peer_constraints
@@ -1575,12 +1873,15 @@ def solve_portfolio(
         if edge.is_optional:
             continue
         if edge.edge_kind in {"workspace", "scope", "peer", "strict_peer", "peer_conflict"}:
+            peer = peer_by_pair.get((edge.source_occurrence_id, edge.target_occurrence_id))
+            if not edge.version_range and peer is None:
+                continue
             relations.append(
                 (
                     edge.source_occurrence_id,
                     edge.target_occurrence_id,
                     edge.version_range,
-                    peer_by_pair.get((edge.source_occurrence_id, edge.target_occurrence_id)),
+                    peer,
                 )
             )
     seen_relations: set[tuple[str, str, str | None]] = set()
@@ -1609,11 +1910,13 @@ def solve_portfolio(
             diagnostics=diagnostics,
             candidate_relations=subgraph.candidate_relations,
         )
-        if not pairs:
-            _diagnostic(diagnostics, f"no compatible candidate pair for {source_id}->{target_id}")
-            model.AddBoolOr([])
-        else:
-            model.AddAllowedAssignments([vars_by_id[source_id], vars_by_id[target_id]], pairs)
+        add_resilient_pair_constraint(
+            source_id,
+            target_id,
+            pairs,
+            f"no compatible candidate pair for {source_id}->{target_id}; "
+            "retaining installed baseline",
+        )
     for relation in subgraph.candidate_relations:
         if (
             relation.is_optional
@@ -1656,11 +1959,13 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
-        if not pairs:
-            _diagnostic(diagnostics, f"no compatible candidate pair for {source_id}->{target_id}")
-            model.AddBoolOr([])
-        else:
-            model.AddAllowedAssignments([vars_by_id[source_id], vars_by_id[target_id]], pairs)
+        add_resilient_pair_constraint(
+            source_id,
+            target_id,
+            pairs,
+            f"no compatible candidate pair for {source_id}->{target_id}; "
+            "retaining installed baseline",
+        )
     for relation in subgraph.candidate_relations:
         if (
             relation.is_optional
@@ -1675,9 +1980,11 @@ def solve_portfolio(
         source_variable = vars_by_id[source_id]
         evidence_domain = evidence_domains_by_id[relation.evidence_variable_id]
         if not evidence_domain.candidate_versions:
-            for source_index, source_candidate in enumerate(domains[source_id]):
-                if source_candidate.version == relation.source_candidate_version:
-                    model.Add(source_variable != source_index)
+            _diagnostic(
+                diagnostics,
+                f"dependency witness {relation.package_name!r} is unmodeled; "
+                f"relaxed constraint for {source_id}@{relation.source_candidate_version}",
+            )
             continue
         evidence_variable = evidence_vars_by_id.get(relation.evidence_variable_id)
         if evidence_variable is None:
@@ -1720,10 +2027,36 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
-        if not allowed_pairs:
-            model.AddBoolOr([])
+        source_baseline = installed_index(source_id)
+        if source_baseline is not None:
+            allowed_pairs.extend(
+                (source_baseline, evidence_index)
+                for evidence_index in range(len(evidence_domain.candidate_versions))
+            )
+        if allowed_pairs:
+            model.AddAllowedAssignments(
+                [source_variable, evidence_variable], sorted(set(allowed_pairs))
+            )
+        elif source_baseline is not None:
+            source_target = target_by_id[source_id]
+            installed_version = str(source_target.installed_version or "").strip().lstrip("vV")
+            for source_index, source_candidate in enumerate(domains[source_id]):
+                if (
+                    source_candidate.version == relation.source_candidate_version
+                    and source_candidate.version != installed_version
+                ):
+                    model.Add(source_variable != source_index)
+            _diagnostic(
+                diagnostics,
+                f"dependency witness {relation.package_name!r} has no compatible release; "
+                f"disqualified non-baseline candidate {relation.source_candidate_version!r}",
+            )
         else:
-            model.AddAllowedAssignments([source_variable, evidence_variable], allowed_pairs)
+            _diagnostic(
+                diagnostics,
+                f"dependency witness {relation.package_name!r} has no compatible release; "
+                "constraint left relaxed because no installed baseline is available",
+            )
 
     for relation in subgraph.candidate_relations:
         if (
@@ -1738,22 +2071,23 @@ def solve_portfolio(
             continue
         physical_peer = evidence_by_id.get(relation.target_occurrence_id)
         if physical_peer is None or not physical_peer.installed_version:
-            return make_plan(
-                status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
-                diagnostics=[
-                    *diagnostics,
-                    f"modeled peer {relation.package_name!r} has no physical version",
-                ],
+            _diagnostic(
+                diagnostics,
+                f"modeled peer {relation.package_name!r} has no physical version; "
+                "peer constraint left unmodeled",
             )
-        allowed_indices: list[tuple[int]] = []
+            continue
+        source_target = target_by_id[relation.source_occurrence_id]
+        installed_version = str(source_target.installed_version or "").strip().lstrip("vV")
+        if installed_index(relation.source_occurrence_id) is None:
+            _diagnostic(
+                diagnostics,
+                f"installed baseline is unavailable for {relation.source_occurrence_id}; "
+                f"physical peer {relation.package_name!r} left unmodeled",
+            )
+            continue
         for source_index, source_candidate in enumerate(domains[relation.source_occurrence_id]):
             if source_candidate.version != relation.source_candidate_version:
-                allowed_indices.append((source_index,))
                 continue
             matched = _range_matches(relation.version_range, physical_peer.installed_version)
             if matched is None:
@@ -1770,13 +2104,15 @@ def solve_portfolio(
                     ],
                 )
             if matched:
-                allowed_indices.append((source_index,))
-        if not allowed_indices:
-            model.AddBoolOr([])
-        else:
-            model.AddAllowedAssignments(
-                [vars_by_id[relation.source_occurrence_id]], allowed_indices
-            )
+                continue
+            if source_candidate.version == installed_version:
+                _diagnostic(
+                    diagnostics,
+                    f"installed baseline {installed_version!r} conflicts with physical peer "
+                    f"{relation.package_name!r}; retaining baseline fallback",
+                )
+                continue
+            model.Add(vars_by_id[relation.source_occurrence_id] != source_index)
 
     findings_covered: dict[str, Any] = {}
     findings_version: dict[str, Any] = {}
@@ -1824,9 +2160,6 @@ def solve_portfolio(
             # workaround carries the plan IDs that authorize it.
             model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        vulnerable_occurrence = evidence_by_id.get(finding.vulnerable_occurrence_id)
-        if vulnerable_occurrence is not None and vulnerable_occurrence.is_direct:
-            model.Add(covered == 1)
         coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
 
     candidate_literals: dict[str, list[Any]] = {}
@@ -1896,12 +2229,12 @@ def solve_portfolio(
     distance_expression = sum(distance_terms)
     stable_expression = sum(stable_terms)
     metrics = (
-        (coverage_expression, True),
-        (unresolved_expression, False),
-        (workaround_expression, False),
-        (changed_expression, False),
-        (distance_expression, False),
-        (stable_expression, False),
+        ("coverage", coverage_expression, True),
+        ("unresolved", unresolved_expression, False),
+        ("workaround", workaround_expression, False),
+        ("changed", changed_expression, False),
+        ("distance", distance_expression, False),
+        ("stability", stable_expression, False),
     )
     objective_terms: list[Any] = [
         weight_coverage * coverage_expression,
@@ -1961,12 +2294,15 @@ def solve_portfolio(
                 base_model,
                 solver,
                 vars_by_id=vars_by_id,
+                findings_covered=findings_covered,
+                findings_workaround=findings_workaround,
                 metrics=metrics,
                 top_k=top_k,
                 timeout_seconds=float(_setting(settings, "solver_timeout_seconds", 10)),
                 accepted_feasible=accepted_feasible,
                 project=project,
                 observations=observations,
+                diagnostics=diagnostics,
             )
         else:
             for alternative_index in range(top_k):

@@ -88,8 +88,8 @@ def test_candidate_limit_default_and_override(monkeypatch):
     variable = "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET"
     monkeypatch.delenv(variable, raising=False)
 
-    assert AppSettings().solver_max_candidates_per_target == 1000
-    assert AppSettings.from_env().solver_max_candidates_per_target == 1000
+    assert AppSettings().solver_max_candidates_per_target == 256
+    assert AppSettings.from_env().solver_max_candidates_per_target == 256
 
     monkeypatch.setenv(variable, "96")
     assert AppSettings.from_env().solver_max_candidates_per_target == 96

@@ -13,7 +13,7 @@ import math
 import shlex
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -72,14 +72,13 @@ from remediation_engine.tools.npm_graph import (
     check_npm_range,
     load_npm_graph_snapshot,
     load_npm_graph_snapshot_from_documents,
-    make_occurrence_id,
     resolve_lockfile_dependency_package,
 )
 from remediation_engine.tools.registry_cache import PackumentFetcher
 
-_STRICT_NPM_INSTALL = (
+_NPM_INSTALL = (
     "npm install --package-lock-only --ignore-scripts --no-audit --no-fund "
-    "--strict-peer-deps --engine-strict=true --legacy-peer-deps=false --force=false"
+    "--legacy-peer-deps --engine-strict=true --force=false"
 )
 
 
@@ -835,6 +834,9 @@ def _validate_candidate_relations(
     pruned_occurrence_ids: set[str],
 ) -> None:
     """Check required candidate dependency and peer ranges in a resolved lockfile."""
+    prepared_occurrences = {
+        occurrence.occurrence_id: occurrence for occurrence in prepared.npm_snapshot.occurrences
+    }
     for relation in prepared.subgraph.candidate_relations:
         if not relation.is_range_supported:
             continue
@@ -844,23 +846,38 @@ def _validate_candidate_relations(
             continue
         if assignment.get(relation.source_occurrence_id) != relation.source_candidate_version:
             continue
+        expected_source = prepared_occurrences.get(relation.source_occurrence_id)
+        if expected_source is None:
+            raise _CertificationUnknown(
+                f"prepared source occurrence {relation.source_occurrence_id!r} is missing"
+            )
+        source_matches = [
+            occurrence
+            for occurrence in snapshot.occurrences
+            if occurrence.manifest_path == expected_source.manifest_path
+            and occurrence.package_name == expected_source.package_name
+        ]
+        selected_version = (
+            str(assignment.get(relation.source_occurrence_id, "")).strip().lstrip("vV")
+        )
         source = next(
             (
                 occurrence
-                for occurrence in snapshot.occurrences
-                if occurrence.occurrence_id == relation.source_occurrence_id
+                for occurrence in source_matches
+                if occurrence.installed_version
+                and occurrence.installed_version.strip().lstrip("vV") == selected_version
             ),
-            None,
+            source_matches[0] if len(source_matches) == 1 else None,
         )
         if source is None and relation.source_occurrence_id in pruned_occurrence_ids:
             continue
         if source is None:
             raise _CertificationUnknown(
-                f"resolved graph omitted prepared source occurrence "
-                f"{relation.source_occurrence_id!r}"
+                "resolved graph omitted prepared source package "
+                f"({expected_source.manifest_path!r}, {expected_source.package_name!r})"
             )
         package = resolve_lockfile_dependency_package(
-            snapshot, relation.source_occurrence_id, relation.package_name
+            snapshot, source.occurrence_id, relation.package_name
         )
         if package is None:
             raise _reject_assignment(
@@ -886,30 +903,17 @@ def _validate_candidate_relations(
                 f"invalid required range {relation.version_range!r} for {relation.package_name!r}"
             )
         if not checked.matches:
-            if relation.target_occurrence_id is not None:
-                actual_occurrence = next(
-                    (
-                        occurrence
-                        for occurrence in snapshot.occurrences
-                        if occurrence.manifest_path == package.manifest_path
-                        and occurrence.package_name == package.package_name
-                        and occurrence.lockfile_package_key == package.package_key
-                    ),
-                    None,
+            expected_target = prepared_occurrences.get(relation.target_occurrence_id or "")
+            if (
+                expected_target is not None
+                and expected_target.manifest_path == package.manifest_path
+                and expected_target.package_name == package.package_name
+            ):
+                literal_ids = _task_backed_literal_ids(
+                    prepared,
+                    assignment,
+                    (relation.source_occurrence_id, relation.target_occurrence_id),
                 )
-                actual_target_id = (
-                    actual_occurrence.occurrence_id
-                    if actual_occurrence is not None
-                    else make_occurrence_id(
-                        package.manifest_path, package.package_name, package.package_key
-                    )
-                )
-                if actual_target_id == relation.target_occurrence_id:
-                    literal_ids = _task_backed_literal_ids(
-                        prepared,
-                        assignment,
-                        (relation.source_occurrence_id, relation.target_occurrence_id),
-                    )
             reason_code = (
                 SolverCandidateRejectionReason.PEER_CONFLICT
                 if relation.kind == "peer"
@@ -995,13 +999,16 @@ def _validate_final_coverage(
     assignment: Mapping[str, str],
 ) -> tuple[list[str], list[str], list[str]]:
     """Validate every known occurrence and reject newly introduced vulnerable copies."""
-    resolved_by_id = {occurrence.occurrence_id: occurrence for occurrence in snapshot.occurrences}
-    original_ids_by_package: dict[tuple[str, str], set[str]] = {}
+    original_occurrences = {
+        occurrence.occurrence_id: occurrence for occurrence in prepared.npm_snapshot.occurrences
+    }
+    original_versions_by_package: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     floors_by_package: dict[tuple[str, str], list[str]] = {}
     for occurrence in prepared.npm_snapshot.occurrences:
-        original_ids_by_package.setdefault(
-            (occurrence.manifest_path, occurrence.package_name), set()
-        ).add(occurrence.occurrence_id)
+        if occurrence.installed_version:
+            original_versions_by_package[(occurrence.manifest_path, occurrence.package_name)][
+                occurrence.installed_version.strip().lstrip("vV")
+            ] += 1
     for finding in prepared.findings:
         floor = _vulnerable_fixed_version(prepared, finding)
         if floor:
@@ -1013,9 +1020,14 @@ def _validate_final_coverage(
             floors_by_package.setdefault(
                 (target.manifest_path, finding.vulnerable_package), []
             ).append(floor)
+    resolved_versions_by_package: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     for occurrence in snapshot.occurrences:
         key = (occurrence.manifest_path, occurrence.package_name)
-        if occurrence.occurrence_id in original_ids_by_package.get(key, set()):
+        version = str(occurrence.installed_version or "").strip().lstrip("vV")
+        resolved_versions_by_package[key][version] += 1
+        if resolved_versions_by_package[key][version] <= original_versions_by_package.get(
+            key, Counter()
+        ).get(version, 0):
             continue
         floors = floors_by_package.get(key, ())
         if not floors:
@@ -1051,22 +1063,33 @@ def _validate_final_coverage(
     workaround: list[str] = []
     unresolved: list[str] = []
     for finding in prepared.findings:
-        occurrence = resolved_by_id.get(finding.vulnerable_occurrence_id)
+        prepared_occurrence = original_occurrences.get(finding.vulnerable_occurrence_id)
+        if prepared_occurrence is None:
+            raise _CertificationUnknown(
+                f"prepared vulnerable occurrence {finding.vulnerable_occurrence_id!r} is missing"
+            )
+        key = (prepared_occurrence.manifest_path, finding.vulnerable_package)
+        occurrences = [
+            occurrence
+            for occurrence in snapshot.occurrences
+            if (occurrence.manifest_path, occurrence.package_name) == key
+        ]
         floor = _vulnerable_fixed_version(prepared, finding)
-        if occurrence is None:
+        if not occurrences:
             covered.append(finding.coverage_id)
             continue
         if floor:
-            if not occurrence.installed_version:
-                raise _CertificationUnknown(
-                    f"known vulnerable occurrence {occurrence.occurrence_id!r} has no version"
-                )
-            checked = check_npm_range(f">={floor}", occurrence.installed_version)
-            if checked.matches is None:
-                raise _CertificationUnknown(
-                    f"invalid vulnerable floor {floor!r} for {occurrence.occurrence_id!r}"
-                )
-            if checked.matches:
+            below_floor = False
+            for occurrence in occurrences:
+                if not occurrence.installed_version:
+                    raise _CertificationUnknown(f"known vulnerable package {key!r} has no version")
+                checked = check_npm_range(f">={floor}", occurrence.installed_version)
+                if checked.matches is None:
+                    raise _CertificationUnknown(
+                        f"invalid vulnerable floor {floor!r} for package {key!r}"
+                    )
+                below_floor = below_floor or not checked.matches
+            if not below_floor:
                 covered.append(finding.coverage_id)
                 continue
         if _authorized_workaround(finding, prepared, selected_plan):
@@ -1175,7 +1198,7 @@ def _peer_conflict_rejection(
             "kind": "npm_peer_conflict",
             "peer_conflicts": _peer_evidence_payload(peer_evidence),
         },
-        summary="strict npm resolution rejected the assignment with a peer conflict",
+        summary="npm resolution rejected the assignment with a peer conflict",
     )
 
 
@@ -1284,7 +1307,7 @@ def _certify_assignment(
                         f"batch {batch_id!r} has no affected npm workspace directory"
                     )
                 for workspace_dir in workspace_dirs:
-                    command = f"cd {shlex.quote(workspace_dir)} && {_STRICT_NPM_INSTALL}"
+                    command = f"cd {shlex.quote(workspace_dir)} && {_NPM_INSTALL}"
                     metrics["strict_install_invocations"] += 1
                     package_manager_started = time.monotonic()
                     try:
@@ -1292,7 +1315,7 @@ def _certify_assignment(
                             sandbox,
                             command,
                             deadline,
-                            "strict npm resolution",
+                            "npm resolution",
                             allow_nonzero=True,
                         )
                     finally:
@@ -1321,11 +1344,10 @@ def _certify_assignment(
                                     "exit_code": result.exit_code,
                                 },
                                 summary=(
-                                    "strict npm resolution rejected the complete assignment "
-                                    f"({category})"
+                                    f"npm resolution rejected the complete assignment ({category})"
                                 ),
                             )
-                        raise _CertificationUnknown(f"strict npm installation failed ({category})")
+                        raise _CertificationUnknown(f"npm installation failed ({category})")
 
                 documents = _read_npm_documents(sandbox, scratch_prefix, deadline, metrics=metrics)
                 resolved_snapshot = load_npm_graph_snapshot_from_documents(documents)
@@ -1380,13 +1402,6 @@ def _certify_assignment(
         covered, workaround, unresolved = _validate_final_coverage(
             prepared, resolved_snapshot, selected_plan, assignment
         )
-        if unresolved:
-            raise _reject_assignment(
-                assignment,
-                SolverCandidateRejectionReason.COVERAGE_UNRESOLVED,
-                evidence={"kind": "coverage_unresolved", "coverage_ids": sorted(unresolved)},
-                summary="strict npm resolution left known coverage unresolved",
-            )
         status = PackageResolutionStatus.CERTIFIED
     except _AssignmentRejected as exc:
         diagnostics.append(exc.conflict.summary)
@@ -1562,8 +1577,11 @@ def _attach_resolution_certificate(
 
     selected = solver_plan.selected_plan
     if certificate.status == PackageResolutionStatus.CERTIFIED:
-        if solver_plan.status != SolverStatus.OPTIMAL or selected is None:
-            raise ValueError("a certified certificate requires an OPTIMAL selected solver plan")
+        if (
+            solver_plan.status not in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+            or selected is None
+        ):
+            raise ValueError("a certified certificate requires an accepted selected solver plan")
         if not solver_plan.candidate_catalog_complete:
             raise ValueError("a certified certificate requires a complete candidate catalog")
         if certificate.candidate_plan_id != selected.candidate_plan_id:
@@ -1675,10 +1693,9 @@ def _attach_resolution_certificate(
     certificate_digest = _digest(certificate_payload)
     certified_dispatch = bool(
         certificate.status == PackageResolutionStatus.CERTIFIED
-        and solver_plan.status == SolverStatus.OPTIMAL
+        and solver_plan.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
         and solver_plan.candidate_catalog_complete
         and selected is not None
-        and not certificate.unresolved_coverage_ids
     )
     batch_by_id = {
         batch.batch_id: batch for batch in (selected.batches if selected is not None else [])
@@ -2031,12 +2048,18 @@ def build_certified_portfolio_plan(
                     )
                     return _attach_resolution_certificate(plan, certificate)
 
-                if solver_plan.status != SolverStatus.OPTIMAL or not solver_plan.candidate_plans:
+                accepted_solver_statuses = {SolverStatus.OPTIMAL}
+                if resolved_settings.solver_accept_feasible:
+                    accepted_solver_statuses.add(SolverStatus.FEASIBLE)
+                if (
+                    solver_plan.status not in accepted_solver_statuses
+                    or not solver_plan.candidate_plans
+                ):
                     return unknown_certificate(
                         solver_plan,
                         [
                             *solver_plan.diagnostics,
-                            "certified portfolio requires individually OPTIMAL solver candidates",
+                            "certified portfolio requires accepted solver candidates",
                         ],
                         assignment=last_rejected_assignment,
                         candidate_plan_id=last_rejected_plan_id,
@@ -2050,12 +2073,13 @@ def build_certified_portfolio_plan(
                 }
                 restart_after_learned_cut = False
                 for candidate in solver_plan.candidate_plans:
-                    if candidate.status != SolverStatus.OPTIMAL:
+                    if candidate.status not in accepted_solver_statuses:
                         return unknown_certificate(
                             solver_plan,
                             [
                                 *solver_plan.diagnostics,
-                                f"candidate {candidate.candidate_plan_id!r} is not individually OPTIMAL",
+                                "candidate "
+                                f"{candidate.candidate_plan_id!r} has an unaccepted solver status",
                             ],
                             assignment=candidate.selected_candidate_versions,
                             candidate_plan_id=candidate.candidate_plan_id,
@@ -2103,7 +2127,7 @@ def build_certified_portfolio_plan(
                         if conflict is None or conflict.assignment_digest != assignment_digest:
                             return unknown_certificate(
                                 candidate_solver_plan,
-                                ["strict resolver rejection lacked matching typed evidence"],
+                                ["npm resolver rejection lacked matching typed evidence"],
                                 assignment=assignment,
                                 candidate_plan_id=selected_plan.candidate_plan_id,
                                 result=result,

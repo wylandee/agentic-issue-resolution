@@ -450,8 +450,11 @@ def _portfolio_plan_violations(
         if str(certificate_status).upper() != PackageResolutionStatus.CERTIFIED.value:
             violations.append("package-resolution certificate is not CERTIFIED")
         solver_status = getattr(getattr(solver_plan, "status", None), "value", None)
-        if str(solver_status or getattr(solver_plan, "status", "")).upper() != "OPTIMAL":
-            violations.append("certified dispatch requires an OPTIMAL solver status")
+        if str(solver_status or getattr(solver_plan, "status", "")).upper() not in {
+            "OPTIMAL",
+            "FEASIBLE",
+        }:
+            violations.append("certified dispatch requires an accepted solver status")
         if not getattr(solver_plan, "candidate_catalog_complete", False):
             violations.append("certified dispatch requires a complete candidate catalog")
         certificate_fields = {
@@ -508,8 +511,6 @@ def _portfolio_plan_violations(
             certificate_covered = set(certificate.covered_coverage_ids)
             certificate_workaround = set(certificate.workaround_coverage_ids)
             certificate_unresolved = set(certificate.unresolved_coverage_ids)
-            if certificate_unresolved:
-                violations.append("package-resolution certificate contains unresolved coverage")
             if certificate_covered != expected_covered:
                 violations.append("package-resolution certificate covered-coverage set is stale")
             if certificate_workaround != expected_workaround:
