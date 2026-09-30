@@ -786,7 +786,9 @@ def _impl__missing_retry_revised_instructions(
             continue
         # Retry workers are execution-only: a retry instruction is invalid
         # unless it carries both the strategy stage and a concrete semver.
-        if "strategy stage" not in instruction.lower() or not re.search(
+        stage = getattr(task.strategy_stage, "value", task.strategy_stage)
+        stage_marker = f"strategy stage {stage}".lower()
+        if stage_marker not in instruction.lower() or not re.search(
             r"(?<!\d)v?\d+\.\d+\.\d+(?!\d)", instruction
         ):
             missing.append(task_id)

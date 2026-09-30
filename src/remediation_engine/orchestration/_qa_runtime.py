@@ -727,7 +727,7 @@ def _collect_dependency_package_state(
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -933,7 +933,7 @@ def _collect_group_package_state(
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
         try:
             command_result = _run_readonly(
                 sandbox,

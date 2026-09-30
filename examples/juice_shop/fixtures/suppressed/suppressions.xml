@@ -37,6 +37,18 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+    <suppress>
+        <notes>Suppress all vulnerabilities for @sigstore/verify (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/%40sigstore%2Fverify@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for sigstore (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/sigstore@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
 <!--
     <suppress>
         <notes>Keep @tootallnate/once as a selected Juice Shop fixture</notes>
@@ -61,12 +73,6 @@
         <notes>Suppress all vulnerabilities for commons-io:commons-io (maven)</notes>
         <packageUrl regex="true">^pkg:maven/commons-io/commons-io@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
-    </suppress>
-
-    <suppress>
-        <notes>Suppress all vulnerabilities for blaze.jar</notes>
-        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
-        <cpe>cpe:/a:apache:ivy</cpe>
     </suppress>
 
     <suppress>
@@ -224,12 +230,6 @@
     </suppress>
 
     <suppress>
-        <notes>Suppress all vulnerabilities for moment (npm)</notes>
-        <packageUrl regex="true">^pkg:npm/moment@.*$</packageUrl>
-        <vulnerabilityName regex="true">.*</vulnerabilityName>
-    </suppress>
-
-    <suppress>
         <notes>Suppress all vulnerabilities for morgan (npm)</notes>
         <packageUrl regex="true">^pkg:npm/morgan@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
@@ -321,6 +321,12 @@
         <notes>Suppress all vulnerabilities for ws (npm)</notes>
         <packageUrl regex="true">^pkg:npm/ws@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for blaze.jar</notes>
+        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
+        <cpe>cpe:/a:apache:ivy</cpe>
     </suppress>
 
 </suppressions>

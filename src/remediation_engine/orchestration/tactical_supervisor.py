@@ -1604,6 +1604,7 @@ def _render_instruction(
     return "\n".join(
         [
             "OBJECTIVE: Apply the Supervisor-approved dependency remediation.",
+            f"STRATEGY STAGE {stage.value}",
             f"AUTHORIZED TARGET: {target_package}",
             f"EXACT VERSION OR HYPOTHESIS: {version}",
             f"DECLARATION TYPE: {target_type or 'committed dependency declaration'}",
