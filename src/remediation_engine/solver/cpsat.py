@@ -763,7 +763,10 @@ def _build_decision(
         finding_workaround.get(item.coverage_id, False) for item in requirements
     )
     preferred_strategy = target.strategy.replace("-", "_").lower()
-    if preferred_strategy in {"code_workaround", "workaround"}:
+    if target.is_terminal:
+        strategy = preferred_strategy
+        route = preferred_strategy
+    elif preferred_strategy in {"code_workaround", "workaround"}:
         if all_by_workaround:
             strategy = "code_workaround"
             route = "code_workaround"
@@ -1251,8 +1254,7 @@ def _solve_lexicographic(
             *findings_workaround.values(),
         ]
         return {
-            int(variable.Index()): int(solver_instance.Value(variable))
-            for variable in variables
+            int(variable.Index()): int(solver_instance.Value(variable)) for variable in variables
         }
 
     def read_metric(solver_instance: Any, expression: Any) -> int:
@@ -1378,8 +1380,7 @@ def _solve_lexicographic(
             if status == SolverStatus.FEASIBLE:
                 if not accepted_feasible:
                     stage_diagnostic(
-                        "feasible lexicographic stage rejected by "
-                        "solver_accept_feasible=false",
+                        "feasible lexicographic stage rejected by solver_accept_feasible=false",
                     )
                     if candidate_plans:
                         abandon_alternative = True
@@ -2135,7 +2136,18 @@ def solve_portfolio(
                 if candidate.meets_security_floor
                 and _at_least(candidate.version, finding.fixed_version)
             ]
-        if occurrence_var is not None and good_indices:
+        target = target_by_id.get(finding.target_occurrence_id)
+        terminal_status = (
+            target.terminal_status if target is not None and target.is_terminal else None
+        )
+        if terminal_status is not None:
+            status_quo_covered = (
+                terminal_status == "qa_passed"
+                and finding.fixed_version is not None
+                and _at_least(target.installed_version, finding.fixed_version)
+            )
+            model.Add(version_bool == int(status_quo_covered))
+        elif occurrence_var is not None and good_indices:
             literals = []
             for index in good_indices:
                 literal = model.NewBoolVar(f"finding_{finding.coverage_id}_version_{index}")
@@ -2146,19 +2158,23 @@ def solve_portfolio(
         else:
             model.Add(version_bool == 0)
         has_workaround = finding.workaround_available and bool(finding.workaround_plan_ids)
-        preferred_strategy = (
-            target_by_id[finding.target_occurrence_id].strategy.replace("-", "_").lower()
-            if finding.target_occurrence_id in target_by_id
-            else ""
-        )
-        if preferred_strategy in {"code_workaround", "workaround", "no_fix"}:
+        preferred_strategy = target.strategy.replace("-", "_").lower() if target is not None else ""
+        if terminal_status is not None:
+            terminal_workaround = (
+                terminal_status == "qa_passed"
+                and preferred_strategy in {"code_workaround", "workaround"}
+                and has_workaround
+            )
+            model.Add(workaround == int(terminal_workaround))
+        elif preferred_strategy in {"code_workaround", "workaround", "no_fix"}:
             model.Add(version_bool == 0)
-        if not has_workaround or preferred_strategy == "no_fix":
-            model.Add(workaround == 0)
-        elif preferred_strategy in {"code_workaround", "workaround"}:
-            # A workaround target is only dispatchable when every selected
-            # workaround carries the plan IDs that authorize it.
-            model.Add(workaround == 1)
+        if terminal_status is None:
+            if not has_workaround or preferred_strategy == "no_fix":
+                model.Add(workaround == 0)
+            elif preferred_strategy in {"code_workaround", "workaround"}:
+                # A workaround target is only dispatchable when every selected
+                # workaround carries the plan IDs that authorize it.
+                model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
         coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
 

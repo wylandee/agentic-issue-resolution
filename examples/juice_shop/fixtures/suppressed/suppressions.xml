@@ -1,21 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
 
-<!--
     <suppress>
-        <notes>Keep @angular/common as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/common (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcommon@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
-<!--
     <suppress>
-        <notes>Keep @angular/compiler as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/compiler (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcompiler@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
 <!--
     <suppress>
@@ -91,11 +87,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for decompress (npm)</notes>
+        <notes>Keep decompress as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/decompress@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for diff (npm)</notes>
@@ -205,11 +203,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for minimatch (npm)</notes>
+        <notes>Keep minimatch as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/minimatch@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for moment.js (javascript)</notes>
@@ -271,11 +271,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for socket.io-parser (npm)</notes>
+        <notes>Keep socket.io-parser as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/socket\.io-parser@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for tar (npm)</notes>

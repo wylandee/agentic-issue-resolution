@@ -650,6 +650,8 @@ def _portfolio_plan_violations(
         for field_name, expected_value in expected_identity.items():
             if getattr(decision, field_name, None) != expected_value:
                 violations.append(f"task {task_id} solver identity field {field_name} is invalid")
+        if task.status in terminal_statuses:
+            continue
         try:
             decision_stage = SCARemediationStage(decision.strategy_stage)
             if task.strategy_stage != decision_stage:
@@ -708,6 +710,20 @@ def _portfolio_plan_is_stale(
         if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
             violations.append("repository fingerprint differs from committed portfolio plan")
     return bool(violations)
+
+
+def _nonterminal_sca_task_ids(
+    task_queue: dict[str, RemediationTask],
+    group_by_id: dict[str, VulnerabilityGroup],
+) -> list[str]:
+    """Return sorted nonterminal tasks whose parent group is SCA."""
+    return sorted(
+        task_id
+        for task_id, task in task_queue.items()
+        if task.status not in _TERMINAL_STATUSES
+        and (group := group_by_id.get(task.parent_group_id)) is not None
+        and group.issue_type == IssueType.SCA
+    )
 
 
 def _build_multi_package_action(
@@ -1312,9 +1328,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # The outer Portfolio Orchestrator is the only owner of task creation,
     # synthetic dependency materialization, and version selection.
     raw_task_queue: dict[str, RemediationTask] = dict(state.get("task_queue", {}))
+    task_statuses_at_entry = {task_id: task.status for task_id, task in raw_task_queue.items()}
     task_queue: dict[str, RemediationTask] = {
         task_id: task.model_copy() for task_id, task in raw_task_queue.items()
     }
+    pending_request_at_entry = state.get("portfolio_replan_request")
+    unfixable_replan_cleared = bool(
+        isinstance(pending_request_at_entry, PortfolioReplanRequest)
+        and pending_request_at_entry.reason == "UNFIXABLE_REPLAN"
+        and not _nonterminal_sca_task_ids(task_queue, group_by_id)
+    )
     active_target_task_ids = _recover_active_target_task_ids(
         state.get("active_target_task_ids") or [],
         task_queue,
@@ -1343,23 +1366,37 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
         for task in task_queue.values()
     )
-    if plan_violations and not has_open_attempt:
+    post_qa_triage_pending = bool(
+        state.get("triage_required")
+        and state.get("status") in {"qa_completed", "qa_failed", "final_scan_completed"}
+    )
+    if (
+        plan_violations
+        and not has_open_attempt
+        and not unfixable_replan_cleared
+        and not post_qa_triage_pending
+    ):
         source_plan_id = (
             getattr(committed_plan, "portfolio_plan_id", None)
             if committed_plan is not None
             else None
         )
-        request = PortfolioReplanRequest(
-            reason="; ".join(plan_violations)[:2000],
-            triggering_attempt_id=next(
-                (
-                    task.current_attempt_id
-                    for task in task_queue.values()
-                    if task.current_attempt_id
+        pending_request = state.get("portfolio_replan_request")
+        request = (
+            pending_request
+            if isinstance(pending_request, PortfolioReplanRequest)
+            else PortfolioReplanRequest(
+                reason="; ".join(plan_violations)[:2000],
+                triggering_attempt_id=next(
+                    (
+                        task.current_attempt_id
+                        for task in task_queue.values()
+                        if task.current_attempt_id
+                    ),
+                    None,
                 ),
-                None,
-            ),
-            source_portfolio_plan_id=source_plan_id,
+                source_portfolio_plan_id=source_plan_id,
+            )
         )
         decision = SupervisorDecision(
             decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
@@ -2466,6 +2503,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     portfolio_replan_required = bool(
         state.get("portfolio_plan") is not None
         and not active_attempt_is_open
+        and not unfixable_replan_cleared
         and _portfolio_plan_is_stale(
             state.get("portfolio_plan"),
             task_queue,
@@ -3275,6 +3313,130 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         resolved_target_task_ids = []
         remapped_feedback_by_task = {}
 
+    # Replan only on an entry-to-final UNFIXABLE status edge.  Revision changes
+    # are deliberately ignored because status-only transitions may not revise
+    # the task input.
+    newly_unfixable_sca_task_ids = sorted(
+        task_id
+        for task_id, task in task_queue.items()
+        if task.status == TaskStatus.UNFIXABLE
+        and task_statuses_at_entry.get(task_id) != TaskStatus.UNFIXABLE
+        and (group := group_by_id.get(task.parent_group_id)) is not None
+        and group.issue_type == IssueType.SCA
+    )
+    remaining_nonterminal_sca_task_ids = _nonterminal_sca_task_ids(task_queue, group_by_id)
+    unfixable_replan_required = bool(
+        newly_unfixable_sca_task_ids and remaining_nonterminal_sca_task_ids
+    )
+    pending_unfixable_replan = bool(
+        isinstance(portfolio_replan_request, PortfolioReplanRequest)
+        and portfolio_replan_request.reason == "UNFIXABLE_REPLAN"
+    )
+    if unfixable_replan_required and not isinstance(
+        portfolio_replan_request, PortfolioReplanRequest
+    ):
+        portfolio_replan_request = PortfolioReplanRequest(
+            reason="UNFIXABLE_REPLAN",
+            source_portfolio_plan_id=(
+                committed_plan.portfolio_plan_id if committed_plan is not None else None
+            ),
+        )
+    if pending_unfixable_replan and not remaining_nonterminal_sca_task_ids:
+        portfolio_replan_request = None
+        pending_unfixable_replan = False
+        unfixable_replan_cleared = True
+
+    replan_after_unfixable = bool(
+        remaining_nonterminal_sca_task_ids
+        and (unfixable_replan_required or pending_unfixable_replan)
+    )
+    suppress_unfixable_replan_without_sca = bool(
+        not remaining_nonterminal_sca_task_ids
+        and (unfixable_replan_cleared or newly_unfixable_sca_task_ids)
+    )
+    if (
+        suppress_unfixable_replan_without_sca
+        and resolved_next_node == "portfolio"
+        and not portfolio_escalation
+        and not isinstance(portfolio_replan_request, PortfolioReplanRequest)
+    ):
+        decision = _deterministic_routing(
+            task_queue,
+            group_by_id,
+            qa_evaluations,
+            retry_diagnostics_by_task,
+            action_summaries=action_summaries,
+            active_target_task_ids=active_target_task_ids,
+            current_status=str(state.get("status") or ""),
+            triage_required=bool(state.get("triage_required")),
+            workspace_volume=state.get("workspace_volume"),
+            final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+            portfolio_plan=state.get("portfolio_plan"),
+        )
+        resolved_next_node = decision.next_node
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            list(decision.target_task_ids),
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
+        )
+        remapped_feedback_by_task = {
+            task_id: feedback
+            for task_id, feedback in decision.feedback_by_task.items()
+            if task_id in set(resolved_target_task_ids)
+        }
+    elif replan_after_unfixable and resolved_next_node != "triage":
+        open_attempt_task_ids = sorted(
+            task_id
+            for task_id, task in task_queue.items()
+            if task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
+        )
+        if open_attempt_task_ids:
+            if resolved_next_node != "qa_critic":
+                cluster_id = (
+                    state.get("active_cluster_id") if len(open_attempt_task_ids) > 1 else None
+                )
+                decision = SupervisorDecision(
+                    decision_code=(
+                        DecisionCode.QA_READY_BATCH
+                        if len(open_attempt_task_ids) > 1
+                        else DecisionCode.QA_READY
+                    ),
+                    next_node="qa_critic",
+                    target_task_ids=open_attempt_task_ids,
+                    cluster_id=cluster_id,
+                    instructions=(
+                        "Reconcile the existing open attempt before rebuilding the portfolio."
+                    ),
+                    decision_reason=(
+                        "UNFIXABLE_REPLAN is deferred until the open attempt barrier is clear."
+                    ),
+                )
+                resolved_next_node = "qa_critic"
+                resolved_target_task_ids = open_attempt_task_ids
+                remapped_feedback_by_task = {}
+        else:
+            task_diagnostic = (
+                f"Newly unfixable SCA task(s) {newly_unfixable_sca_task_ids}; "
+                if newly_unfixable_sca_task_ids
+                else "A pending UNFIXABLE_REPLAN; "
+            )
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+                next_node="portfolio",
+                target_task_ids=[],
+                instructions=("Rebuild the outer portfolio plan before dispatching another task."),
+                decision_reason=(
+                    f"{task_diagnostic}remaining nonterminal SCA task(s) "
+                    f"{remaining_nonterminal_sca_task_ids} require replanning."
+                ),
+            )
+            resolved_next_node = "portfolio"
+            resolved_target_task_ids = []
+            remapped_feedback_by_task = {}
+
     # Commit the exact input snapshot before exposing worker targets to the
     # graph. QA reuses the current worker attempt; update/workaround dispatches
     # always receive a new attempt identity.
@@ -3489,14 +3651,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # attempt-correlated audit record.
     errors = list(dict.fromkeys(error for error in errors if error not in prior_error_messages))
 
-    portfolio_dirty = bool(state.get("portfolio_dirty", False)) or portfolio_dispatch_rejected
-    if state.get("portfolio_plan") is not None:
+    portfolio_dirty = (
+        bool(state.get("portfolio_dirty", False))
+        or portfolio_dispatch_rejected
+        or unfixable_replan_required
+        or pending_unfixable_replan
+    )
+    if state.get("portfolio_plan") is not None and not suppress_unfixable_replan_without_sca:
         portfolio_dirty = portfolio_dirty or _portfolio_plan_is_stale(
             state.get("portfolio_plan"),
             task_queue,
             valid_groups,
             state.get("repo_root"),
         )
+    if unfixable_replan_cleared and not portfolio_dispatch_rejected and not portfolio_escalation:
+        portfolio_dirty = False
     if portfolio_dirty and not isinstance(portfolio_replan_request, PortfolioReplanRequest):
         stale_reasons = _portfolio_plan_violations(
             committed_plan,

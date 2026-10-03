@@ -23,23 +23,29 @@ from remediation_engine.contracts.schemas import (
     PeerConflictEvidence,
     RemediationTask,
     Severity,
+    TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
+    PortfolioReplanRequest,
     SolverCandidateCutKind,
     SolverCandidateRejectionReason,
     SolverCandidateRelation,
+    SolverFindingRequirement,
     SolverRuntimeFingerprint,
     SolverStatus,
     SolverTarget,
 )
 from remediation_engine.orchestration.portfolio_certifier import (
+    _assert_workspace_matches_host,
     _AssignmentRejected,
     _AssignmentResult,
+    _authorized_workaround,
     _candidate_conflict,
     _CertificationUnknown,
+    _last_qa_passed_prefix_digest,
     _peer_conflict_literal_ids,
     _peer_conflict_rejection,
     _read_npm_documents,
@@ -50,6 +56,7 @@ from remediation_engine.orchestration.portfolio_certifier import (
 )
 from remediation_engine.orchestration.portfolio_solver import (
     _build_evidence_domains,
+    _build_targets_and_findings,
     _digest,
     _prepare_portfolio_problem,
 )
@@ -105,6 +112,9 @@ class _FakeSandbox:
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def cleanup_workspace_snapshots(self) -> None:
         return None
 
     def read_file(self, file_path: str) -> str | None:
@@ -258,14 +268,20 @@ class _FakeSandbox:
             self.state.install_assignments.append((express_version, jwt_version))
             jwt_range = "^8.1.0" if express_version == "6.1.1" else "^9.0.0"
             packages: dict[str, dict[str, Any]] = {
-                "": {"name": "app", "dependencies": dict(dependencies)},
-                "node_modules/express-jwt": {
+                "": {"name": "app", "dependencies": dict(dependencies)}
+            }
+            if "express-jwt" in dependencies:
+                packages["node_modules/express-jwt"] = {
                     "version": express_version,
                     "dependencies": {"jsonwebtoken": jwt_range},
-                },
-                "node_modules/jsonwebtoken": {"version": jwt_version},
-            }
-            if express_version == "6.1.1":
+                }
+            if "jsonwebtoken" in dependencies:
+                packages["node_modules/jsonwebtoken"] = {"version": jwt_version}
+            for package_name, version in sorted(dependencies.items()):
+                if package_name in {"express-jwt", "jsonwebtoken"}:
+                    continue
+                packages[f"node_modules/{package_name}"] = {"version": str(version)}
+            if "express-jwt" in dependencies and express_version == "6.1.1":
                 packages["node_modules/express-jwt/node_modules/jsonwebtoken"] = {
                     "version": "8.5.1"
                 }
@@ -405,6 +421,8 @@ def _run_fake_certifier(
     state: _FakeSandboxState | None = None,
     registry_fetcher: Any | None = None,
     solver_top_k: int = 1,
+    prior_portfolio_plan: Any | None = None,
+    portfolio_replan_request: PortfolioReplanRequest | None = None,
 ):
     state = state or _FakeSandboxState(files)
     factory = _FakeSandboxFactory(state)
@@ -422,10 +440,404 @@ def _run_fake_certifier(
         groups,
         task_queue,
         settings=settings,
+        portfolio_replan_request=portfolio_replan_request,
+        prior_portfolio_plan=prior_portfolio_plan,
         registry_fetcher=registry_fetcher or _registry_packument_fetcher,
         sandbox_factory=factory,
     )
     return plan, state, factory
+
+
+def _certified_prior_plan(
+    task_queue: dict[str, RemediationTask],
+    host_fingerprint: str,
+    batches: list[Any],
+    phases: list[Any],
+    batch_prefix_graph_digests: dict[str, str],
+    selected_candidate_versions: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    task_revisions = {task_id: task.task_revision for task_id, task in sorted(task_queue.items())}
+    selected = SimpleNamespace(
+        candidate_plan_id="prior-candidate",
+        selected_candidate_versions=dict(selected_candidate_versions or {}),
+        batches=batches,
+        phases=phases,
+    )
+    solver_plan = SimpleNamespace(
+        status=SolverStatus.OPTIMAL,
+        candidate_catalog_complete=True,
+        candidate_catalog_digest="prior-catalog",
+        selected_plan=selected,
+    )
+    certificate = SimpleNamespace(
+        status=PackageResolutionStatus.CERTIFIED,
+        portfolio_plan_id="prior-plan",
+        solver_input_digest="prior-input",
+        repository_fingerprint=host_fingerprint,
+        workspace_graph_digest="prior-workspace",
+        candidate_catalog_digest="prior-catalog",
+        candidate_plan_id="prior-candidate",
+        candidate_assignment_digest=_digest(
+            dict(sorted(selected.selected_candidate_versions.items()))
+        ),
+        task_revisions=task_revisions,
+        batch_prefix_graph_digests=batch_prefix_graph_digests,
+    )
+    return SimpleNamespace(
+        plan_id="prior-plan",
+        portfolio_plan_id="prior-plan",
+        solver_input_digest="prior-input",
+        repository_fingerprint=host_fingerprint,
+        workspace_graph_digest="prior-workspace",
+        task_revisions=task_revisions,
+        solver_plan=solver_plan,
+        resolution_certificate=certificate,
+        clusters=[],
+        cluster_order=[],
+        task_order=[],
+        task_to_cluster={},
+        diagnostics=[],
+    )
+
+
+def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
+    task_queue = {
+        "task-a": RemediationTask(
+            task_id="task-a",
+            parent_group_id="group-a",
+            strategy="version_bump",
+            status=TaskStatus.QA_PASSED,
+        ),
+        "task-b": RemediationTask(
+            task_id="task-b",
+            parent_group_id="group-b",
+            strategy="version_bump",
+            status=TaskStatus.UNFIXABLE,
+        ),
+        "task-c": RemediationTask(
+            task_id="task-c",
+            parent_group_id="group-c",
+            strategy="version_bump",
+            status=TaskStatus.QA_PASSED,
+        ),
+        "task-d": RemediationTask(
+            task_id="task-d",
+            parent_group_id="group-d",
+            strategy="version_bump",
+            status=TaskStatus.QA_PASSED,
+        ),
+    }
+    batches = [
+        SimpleNamespace(
+            batch_id="batch-a",
+            task_ids=["task-a"],
+            dispatchable=True,
+            mutations=[object()],
+        ),
+        SimpleNamespace(
+            batch_id="batch-terminal",
+            task_ids=["task-b"],
+            dispatchable=False,
+            mutations=[],
+        ),
+        SimpleNamespace(
+            batch_id="batch-c",
+            task_ids=["task-c"],
+            dispatchable=True,
+            mutations=[object()],
+        ),
+        SimpleNamespace(
+            batch_id="batch-d",
+            task_ids=["task-d"],
+            dispatchable=True,
+            mutations=[object()],
+        ),
+    ]
+    phases = [
+        SimpleNamespace(phase_number=1, batch_ids=["batch-a", "batch-terminal"]),
+        SimpleNamespace(phase_number=2, batch_ids=["batch-c"]),
+    ]
+    prior_plan = _certified_prior_plan(
+        task_queue,
+        "host-fingerprint",
+        batches,
+        phases,
+        {
+            "batch-a": "prefix-a",
+            "batch-c": "prefix-c",
+            "batch-d": "prefix-d",
+        },
+    )
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+
+    assert (
+        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint")
+        == "prefix-d"
+    )
+    task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.PENDING})
+    assert (
+        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint")
+        == "prefix-a"
+    )
+    task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.QA_PASSED})
+    task_queue["task-b"] = task_queue["task-b"].model_copy(update={"status": TaskStatus.PENDING})
+    assert (
+        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint") is None
+    )
+    assert (
+        _last_qa_passed_prefix_digest(
+            prior_plan,
+            task_queue,
+            request.model_copy(update={"source_portfolio_plan_id": "wrong-plan"}),
+            "host-fingerprint",
+        )
+        is None
+    )
+    assert (
+        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "different-host-fingerprint")
+        is None
+    )
+
+
+def test_workspace_manifest_drift_requires_exact_certified_prefix_digest():
+    host_documents = {
+        "package.json": json.dumps({"dependencies": {"foo": "1.0.0"}}),
+    }
+    workspace_documents = {
+        "package.json": json.dumps({"dependencies": {"foo": "2.0.0"}}),
+    }
+    host_snapshot = load_npm_graph_snapshot_from_documents(host_documents)
+    workspace_snapshot = load_npm_graph_snapshot_from_documents(workspace_documents)
+
+    with pytest.raises(_CertificationUnknown, match="manifest contents differ"):
+        _assert_workspace_matches_host(host_snapshot, workspace_snapshot, workspace_documents)
+
+    _assert_workspace_matches_host(
+        host_snapshot,
+        workspace_snapshot,
+        workspace_documents,
+        qa_passed_prefix_digest=workspace_snapshot.repository_fingerprint,
+    )
+    with pytest.raises(_CertificationUnknown, match="manifest contents differ"):
+        _assert_workspace_matches_host(
+            host_snapshot,
+            workspace_snapshot,
+            workspace_documents,
+            qa_passed_prefix_digest="unrelated-prefix",
+        )
+
+    different_path_documents = {
+        "workspace/package.json": json.dumps({"dependencies": {"foo": "2.0.0"}}),
+    }
+    different_path_snapshot = load_npm_graph_snapshot_from_documents(different_path_documents)
+    with pytest.raises(_CertificationUnknown, match="manifest paths differ"):
+        _assert_workspace_matches_host(
+            host_snapshot,
+            different_path_snapshot,
+            different_path_documents,
+            qa_passed_prefix_digest=different_path_snapshot.repository_fingerprint,
+        )
+
+
+def test_unmatched_certified_prefix_fails_closed_on_live_manifest_drift(tmp_path: Path):
+    root, files, groups, task_queue = _certifier_fixture(tmp_path)
+    task_queue["task-jsonwebtoken"] = task_queue["task-jsonwebtoken"].model_copy(
+        update={"status": TaskStatus.QA_PASSED}
+    )
+    host_fingerprint = load_npm_graph_snapshot(root).repository_fingerprint
+    batch = SimpleNamespace(
+        batch_id="batch-prior",
+        task_ids=["task-jsonwebtoken"],
+        dispatchable=True,
+        mutations=[object()],
+    )
+    prior_plan = _certified_prior_plan(
+        task_queue,
+        host_fingerprint,
+        [batch],
+        [SimpleNamespace(phase_number=1, batch_ids=["batch-prior"])],
+        {"batch-prior": "not-the-live-prefix"},
+    )
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    state = _FakeSandboxState(files)
+    manifest = json.loads(state.files["package.json"])
+    manifest["dependencies"]["jsonwebtoken"] = "9.0.2"
+    state.files["package.json"] = json.dumps(manifest, sort_keys=True) + "\n"
+    lockfile = json.loads(state.files["package-lock.json"])
+    lockfile["packages"]["node_modules/jsonwebtoken"]["version"] = "9.0.2"
+    state.files["package-lock.json"] = json.dumps(lockfile, sort_keys=True) + "\n"
+
+    plan, state, _factory = _run_fake_certifier(
+        root,
+        files,
+        groups,
+        task_queue,
+        state=state,
+        prior_portfolio_plan=prior_plan,
+        portfolio_replan_request=request,
+    )
+
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.status == SolverStatus.UNKNOWN
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.UNKNOWN
+    assert any(
+        "workspace package manifest contents differ from the host" in item
+        for item in plan.resolution_certificate.diagnostics
+    )
+    assert state.install_assignments == []
+
+
+def test_outer_replan_does_not_reuse_prior_resolver_cuts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from remediation_engine.orchestration import portfolio_certifier
+
+    root, files, groups, task_queue = _certifier_fixture(tmp_path)
+    host_fingerprint = load_npm_graph_snapshot(root).repository_fingerprint
+    batch = SimpleNamespace(
+        batch_id="batch-prior",
+        task_ids=["task-jsonwebtoken"],
+        dispatchable=True,
+        mutations=[object()],
+    )
+    prior_plan = _certified_prior_plan(
+        task_queue,
+        host_fingerprint,
+        [batch],
+        [SimpleNamespace(phase_number=1, batch_ids=["batch-prior"])],
+        {"batch-prior": "stale-prefix"},
+    )
+    prior_plan.resolution_certificate.rejected_assignment_digests = ["stale-assignment"]
+    prior_plan.resolution_certificate.rejection_conflicts = ["stale-conflict"]
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    calls: list[dict[str, Any]] = []
+    solve = portfolio_certifier.solve_portfolio
+
+    def record_solver_call(*args: Any, **kwargs: Any):
+        calls.append(dict(kwargs))
+        return solve(*args, **kwargs)
+
+    monkeypatch.setattr(portfolio_certifier, "solve_portfolio", record_solver_call)
+
+    _run_fake_certifier(
+        root,
+        files,
+        groups,
+        task_queue,
+        prior_portfolio_plan=prior_plan,
+        portfolio_replan_request=request,
+    )
+
+    assert calls
+    assert calls[0].get("forbidden_assignments", []) == []
+    assert calls[0].get("forbidden_conflicts", []) == []
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected"),
+    [
+        ("qa_passed", True),
+        ("unfixable", False),
+        ("inconclusive", False),
+        ("pivoted", False),
+    ],
+)
+def test_terminal_workaround_authorization_requires_qa_pass(terminal_status, expected):
+    target = SolverTarget(
+        occurrence_id="package.json::foo",
+        task_id="task-1",
+        group_id="group-1",
+        package_name="foo",
+        target_package_name="foo",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/foo",
+        installed_version="1.0.0",
+        strategy="code_workaround",
+        eligible_for_atomic_update=False,
+        is_terminal=True,
+        terminal_status=terminal_status,
+    )
+    finding = SolverFindingRequirement(
+        finding_id="finding-1",
+        ghsa_id="GHSA-AAAA-BBBB-CCCC",
+        vulnerable_package="foo",
+        target_occurrence_id=target.occurrence_id,
+        vulnerable_occurrence_id=target.occurrence_id,
+        fixed_version="2.0.0",
+        workaround_available=True,
+        workaround_plan_ids=["fix-plan-1"],
+    )
+    prepared = SimpleNamespace(targets=[target])
+    selected_plan = SimpleNamespace(
+        task_decisions=[
+            SimpleNamespace(
+                task_id=target.task_id,
+                selected_strategy="code_workaround",
+                selected_plan_issue_ids=["fix-plan-1"],
+            )
+        ]
+    )
+
+    assert _authorized_workaround(finding, prepared, selected_plan) is expected
+
+
+def test_terminal_failed_batch_is_skipped_and_kept_unresolved(tmp_path: Path):
+    root, _files, groups, task_queue = _certifier_fixture(tmp_path)
+    task_queue["task-jsonwebtoken"] = task_queue["task-jsonwebtoken"].model_copy(
+        update={"status": TaskStatus.UNFIXABLE}
+    )
+
+    plan, state, _factory = _run_fake_certifier(root, _files, groups, task_queue)
+
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    terminal_batch = next(
+        batch for batch in selected.batches if "task-jsonwebtoken" in batch.task_ids
+    )
+    assert terminal_batch.dispatchable is False
+    assert terminal_batch.mutations == []
+    assert terminal_batch.unresolved_coverage_ids
+    assert set(plan.resolution_certificate.unresolved_coverage_ids) == set(
+        terminal_batch.unresolved_coverage_ids
+    )
+    assert plan.resolution_certificate.covered_coverage_ids == []
+    assert terminal_batch.batch_id not in plan.resolution_certificate.batch_prefix_graph_digests
+    assert len(state.install_assignments) == 1
+
+
+def test_terminal_only_replan_remains_unknown_without_executable_batches(tmp_path: Path):
+    root, _files, groups, task_queue = _certifier_fixture(tmp_path)
+    task_queue = {
+        task_id: task.model_copy(update={"status": TaskStatus.UNFIXABLE})
+        for task_id, task in task_queue.items()
+    }
+
+    plan, state, _factory = _run_fake_certifier(root, _files, groups, task_queue)
+
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.status == SolverStatus.UNKNOWN
+    assert plan.solver_plan.selected_plan is None
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.UNKNOWN
+    assert any(
+        "no executable package batch" in item for item in plan.resolution_certificate.diagnostics
+    )
+    assert state.install_assignments == []
 
 
 def test_metadata_discovery_prunes_compiled_outputs():
@@ -1806,3 +2218,267 @@ def test_malformed_resolved_metadata_is_unknown_without_learning(tmp_path: Path)
     assert plan.resolution_certificate.rejection_conflicts == []
     assert state.archive is None
     assert not any(path.startswith(".remedy-plan-cert/") for path in state.files)
+
+
+def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from unittest.mock import MagicMock
+
+    from remediation_engine.orchestration.graph import run_portfolio_node
+    from remediation_engine.orchestration.state import initial_orchestrator_state
+    from remediation_engine.orchestration.supervisor_node import MAX_RETRIES, run_supervisor_node
+    from remediation_engine.orchestration.teardown_node import run_teardown_node
+
+    def make_group(package_name: str, cve_id: str) -> VulnerabilityGroup:
+        issue = VulnerabilityIssue(
+            source=IssueSource.SYNTHETIC,
+            issue_type=IssueType.SCA,
+            severity=Severity.HIGH,
+            cve_id=cve_id,
+            package_name=package_name,
+            package_version="1.0.0",
+            file_path="package.json",
+        )
+        localized = LocalizedIssue(
+            issue=issue,
+            manifest_file="package.json",
+            package_manager="npm",
+            declaration_type="dependencies",
+            is_direct_dependency=True,
+            localization_confidence=1.0,
+        )
+        fix_plan = FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="2.0.0",
+            instruction=f"Update {package_name} to the fixed release.",
+            strategy_used="osv_api",
+        )
+        return group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+
+    def lockfile_for(dependencies: dict[str, str]) -> dict[str, Any]:
+        packages: dict[str, dict[str, Any]] = {
+            "": {"name": "app", "dependencies": dict(dependencies)}
+        }
+        packages.update(
+            {
+                f"node_modules/{package_name}": {"version": version}
+                for package_name, version in dependencies.items()
+            }
+        )
+        return {"name": "app", "lockfileVersion": 3, "packages": packages}
+
+    groups = [
+        make_group("foo", "CVE-2026-71001"),
+        make_group("bar", "CVE-2026-71002"),
+        make_group("baz", "CVE-2026-71003"),
+    ]
+    host_dependencies = {"foo": "1.0.0", "bar": "1.0.0", "baz": "1.0.0"}
+    host_manifest = {"name": "app", "dependencies": host_dependencies}
+    host_lockfile = lockfile_for(host_dependencies)
+    _write_fixture(tmp_path, "package.json", host_manifest)
+    _write_fixture(tmp_path, "package-lock.json", host_lockfile)
+
+    prefix_dependencies = {"foo": "2.0.0", "bar": "1.0.0", "baz": "1.0.0"}
+    workspace_files = {
+        "package.json": json.dumps(
+            {"name": "app", "dependencies": prefix_dependencies},
+            sort_keys=True,
+        )
+        + "\n",
+        "package-lock.json": json.dumps(
+            lockfile_for(prefix_dependencies),
+            sort_keys=True,
+        )
+        + "\n",
+    }
+    workspace_state = _FakeSandboxState(workspace_files)
+    prefix_snapshot = load_npm_graph_snapshot_from_documents(workspace_files)
+    assert not prefix_snapshot.diagnostics
+    host_fingerprint = load_npm_graph_snapshot(tmp_path).repository_fingerprint
+
+    task_a = build_initial_remediation_task(groups[0], "task-a").model_copy(
+        update={
+            "status": TaskStatus.QA_PASSED,
+            "selected_version": "2.0.0",
+            "allowed_target_versions": ["2.0.0"],
+        }
+    )
+    task_b = build_initial_remediation_task(groups[1], "task-b").model_copy(
+        update={
+            "status": TaskStatus.NEEDS_RETRY,
+            "retry_count": MAX_RETRIES,
+        }
+    )
+    task_c = build_initial_remediation_task(groups[2], "task-c")
+    task_queue = {task.task_id: task for task in (task_a, task_b, task_c)}
+    targets, _findings, target_diagnostics = _build_targets_and_findings(
+        prefix_snapshot, groups, task_queue
+    )
+    assert {target.package_name for target in targets} == {"foo", "bar", "baz"}
+    assert not target_diagnostics, target_diagnostics
+    prior_batch = SimpleNamespace(
+        batch_id="batch-task-a",
+        task_ids=["task-a"],
+        dispatchable=True,
+        mutations=[object()],
+    )
+    foo_occurrence = next(
+        occurrence.occurrence_id
+        for occurrence in prefix_snapshot.occurrences
+        if occurrence.package_name == "foo"
+    )
+    prior_plan = _certified_prior_plan(
+        task_queue,
+        host_fingerprint,
+        [prior_batch],
+        [SimpleNamespace(phase_number=1, batch_ids=["batch-task-a"])],
+        {"batch-task-a": prefix_snapshot.repository_fingerprint},
+        selected_candidate_versions={foo_occurrence: "2.0.0"},
+    )
+    state = initial_orchestrator_state(str(tmp_path), groups)
+    state.update(
+        {
+            "repo_root": str(tmp_path),
+            "valid_groups": groups,
+            "task_queue": task_queue,
+            "portfolio_plan": prior_plan,
+            "portfolio_solver_plan": prior_plan.solver_plan,
+            "portfolio_iteration": 1,
+            "portfolio_dirty": False,
+            "workspace_volume": "workspace-volume-test",
+            "status": "supervisor_entered",
+        }
+    )
+    with monkeypatch.context() as supervisor_guards:
+        supervisor_guards.setattr(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            lambda *args, **kwargs: [],
+        )
+        supervisor_guards.setattr(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            lambda *args, **kwargs: False,
+        )
+        first_supervisor = run_supervisor_node(state)
+
+    assert first_supervisor["next_routing_step"] == "portfolio"
+    assert first_supervisor["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert first_supervisor["task_queue"]["task-b"].status == TaskStatus.UNFIXABLE
+    request = first_supervisor["portfolio_replan_request"]
+    assert request.reason == "UNFIXABLE_REPLAN"
+    assert request.source_portfolio_plan_id == "prior-plan"
+    state.update(first_supervisor)
+
+    settings = AppSettings(
+        solver_certification_timeout_seconds=60,
+        solver_timeout_seconds=5,
+        solver_top_k=1,
+        solver_num_search_workers=1,
+        solver_max_candidates_per_target=64,
+        solver_cache_dir=tmp_path / "registry-cache",
+    )
+    real_builder = build_certified_portfolio_plan
+
+    def fetch_packument(package_name: str) -> dict[str, Any]:
+        return {
+            "name": package_name,
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+        }
+
+    sandbox_factory = _FakeSandboxFactory(workspace_state)
+
+    def build_with_fake_workspace(*args: Any, **kwargs: Any) -> Any:
+        kwargs["settings"] = settings
+        kwargs["registry_fetcher"] = fetch_packument
+        kwargs["sandbox_factory"] = sandbox_factory
+        return real_builder(*args, **kwargs)
+
+    with monkeypatch.context() as portfolio_seams:
+        portfolio_seams.setattr(
+            "remediation_engine.orchestration.graph.get_runtime_settings",
+            lambda: settings,
+        )
+        portfolio_seams.setattr(
+            "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
+            build_with_fake_workspace,
+        )
+        portfolio_result = run_portfolio_node(state)
+
+    assert portfolio_result["status"] == "portfolio_ready", "\n".join(
+        portfolio_result.get("errors", [])
+    )
+    assert portfolio_result["portfolio_replan_request"] is None
+    plan = portfolio_result["portfolio_plan"]
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED
+    assert plan.portfolio_plan_id != "prior-plan"
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    batch_by_task = {task_id: batch for batch in selected.batches for task_id in batch.task_ids}
+    assert batch_by_task["task-a"].dispatchable is False
+    assert batch_by_task["task-a"].mutations == []
+    assert batch_by_task["task-b"].dispatchable is False
+    assert batch_by_task["task-b"].mutations == []
+    assert batch_by_task["task-c"].dispatchable is True
+    assert batch_by_task["task-c"].mutations
+    coverage_by_task = {
+        task_id: set(batch.coverage_finding_ids)
+        for batch in selected.batches
+        for task_id in batch.task_ids
+    }
+    certified_coverage = set(plan.resolution_certificate.covered_coverage_ids)
+    unresolved_coverage = set(plan.resolution_certificate.unresolved_coverage_ids)
+    assert coverage_by_task["task-a"] <= certified_coverage
+    assert coverage_by_task["task-b"] <= unresolved_coverage
+    assert coverage_by_task["task-c"] <= certified_coverage
+    committed_queue = portfolio_result["task_queue"]
+    assert committed_queue["task-a"].status == TaskStatus.QA_PASSED
+    assert committed_queue["task-b"].status == TaskStatus.UNFIXABLE
+    assert committed_queue["task-c"].selected_version == "2.0.0"
+    assert committed_queue["task-b"].portfolio_plan_id == plan.portfolio_plan_id
+    assert committed_queue["task-b"].task_revision == plan.planned_task_revisions["task-b"]
+
+    next_supervisor = run_supervisor_node({**state, **portfolio_result})
+    assert next_supervisor["next_routing_step"] == "update_subagent"
+    assert next_supervisor["active_target_task_ids"] == ["task-c"]
+
+    final_queue = dict(next_supervisor["task_queue"])
+    final_queue["task-c"] = final_queue["task-c"].model_copy(
+        update={"status": TaskStatus.QA_PASSED, "current_attempt_id": None}
+    )
+    changed_manifest = json.loads(workspace_state.files["package.json"])
+    changed_manifest["dependencies"].update({"bar": "9.9.9", "baz": "2.0.0"})
+    workspace_state.files["package.json"] = json.dumps(changed_manifest, sort_keys=True) + "\n"
+    changed_lockfile = json.loads(workspace_state.files["package-lock.json"])
+    changed_lockfile["packages"][""]["dependencies"] = dict(changed_manifest["dependencies"])
+    changed_lockfile["packages"]["node_modules/bar"]["version"] = "9.9.9"
+    changed_lockfile["packages"]["node_modules/baz"]["version"] = "2.0.0"
+    workspace_state.files["package-lock.json"] = json.dumps(changed_lockfile, sort_keys=True) + "\n"
+    teardown_state = {**state, **portfolio_result, **next_supervisor}
+    teardown_state.update(
+        {
+            "task_queue": final_queue,
+            "changed_files": ["package.json", "package-lock.json"],
+            "final_full_scan_completed": True,
+        }
+    )
+    docker_client = MagicMock()
+    with monkeypatch.context() as teardown_seams:
+        teardown_seams.setattr(
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            sandbox_factory,
+        )
+        teardown_seams.setattr(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            lambda: docker_client,
+        )
+        teardown_result = run_teardown_node(teardown_state)
+
+    assert teardown_result["task_queue"]["task-b"].status == TaskStatus.UNFIXABLE
+    assert teardown_result["task_queue"]["task-c"].status == TaskStatus.QA_PASSED
+    assert teardown_result["changed_files"] == ["package-lock.json", "package.json"]
+    assert "9.9.9" not in teardown_result["diff"]
+    assert '"foo": "2.0.0"' in teardown_result["diff"]
+    assert '"baz": "2.0.0"' in teardown_result["diff"]
+    assert json.loads((tmp_path / "package.json").read_text(encoding="utf-8")) == host_manifest
+    assert json.loads((tmp_path / "package-lock.json").read_text(encoding="utf-8")) == host_lockfile

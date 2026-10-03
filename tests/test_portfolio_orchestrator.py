@@ -17,6 +17,7 @@ from remediation_engine.contracts import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    RoutingStrategy,
     Severity,
     SupervisorDecision,
     TaskCluster,
@@ -1841,6 +1842,69 @@ def test_apply_synthesizes_major_migration_instruction_when_missing(tmp_path: Pa
         "while preserving behavior; do not change the solver-approved package or version."
         in committed["task-1"].instruction
     )
+
+
+def test_terminal_plan_audits_failed_task_without_rewriting_worker_inputs(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"foo": "1.0.0", "bar": "1.0.0"}},
+    )
+    foo = _group("foo", "package.json")
+    bar = _group("bar", "package.json")
+    groups = [foo, bar]
+    queue = _tasks(foo, bar)
+    terminal_before = queue["task-1"].model_copy(
+        update={
+            "status": TaskStatus.UNFIXABLE,
+            "strategy": RoutingStrategy.CODE_WORKAROUND,
+            "selected_version": "1.8.0",
+            "allowed_target_versions": ["1.8.0"],
+            "allowed_dependency_types": ["peerDependencies"],
+            "target_dependency_type": "peerDependencies",
+            "instruction": "Preserve the terminal task's committed worker input.",
+        }
+    )
+    queue["task-1"] = terminal_before
+
+    def fetch_packument(package_name: str) -> dict[str, object]:
+        return {
+            "name": package_name,
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+        }
+
+    plan = build_portfolio_plan(
+        tmp_path,
+        groups,
+        queue,
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+        registry_fetcher=fetch_packument,
+    )
+
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    decisions = {decision.task_id: decision for decision in selected.task_decisions}
+    assert "task-1" in plan.task_ids
+    assert plan.task_strategies["task-1"] == RoutingStrategy.CODE_WORKAROUND
+    assert decisions["task-1"].selected_strategy == "code_workaround"
+    assert decisions["task-1"].selected_version is None
+    assert decisions["task-1"].allowed_alternative_versions == []
+    assert plan.planned_task_revisions["task-1"] == terminal_before.task_revision + 1
+
+    _committed_groups, committed, diagnostics = apply_portfolio_plan(plan, groups, queue)
+
+    assert diagnostics == []
+    terminal_after = committed["task-1"]
+    assert terminal_after.status == TaskStatus.UNFIXABLE
+    assert terminal_after.strategy == terminal_before.strategy
+    assert terminal_after.selected_version == terminal_before.selected_version
+    assert terminal_after.allowed_target_versions == terminal_before.allowed_target_versions
+    assert terminal_after.allowed_dependency_types == terminal_before.allowed_dependency_types
+    assert terminal_after.target_dependency_type == terminal_before.target_dependency_type
+    assert terminal_after.instruction == terminal_before.instruction
+    assert terminal_after.portfolio_plan_id == plan.portfolio_plan_id
+    assert terminal_after.task_revision == plan.planned_task_revisions["task-1"]
+    assert _portfolio_plan_violations(plan, committed, groups) == []
 
 
 def test_supervisor_rejects_stale_resolution_certificate():

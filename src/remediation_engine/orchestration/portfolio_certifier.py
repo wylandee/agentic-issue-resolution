@@ -24,12 +24,14 @@ from remediation_engine.contracts.schemas import (
     PackageMutation,
     PortfolioPlan,
     RemediationTask,
+    TaskStatus,
     VulnerabilityGroup,
 )
 from remediation_engine.contracts.solver_models import (
     CertificationStatistics,
     PackageResolutionCertificate,
     PackageResolutionStatus,
+    PortfolioReplanRequest,
     SolverBatch,
     SolverCandidateConflict,
     SolverCandidateCutKind,
@@ -54,6 +56,10 @@ from remediation_engine.orchestration.portfolio_solver import (
 from remediation_engine.orchestration.qa_test_parsing import (
     _install_error_category,
     parse_peer_conflict_evidence,
+)
+from remediation_engine.orchestration.task_utils import (
+    TERMINAL_TASK_STATUSES,
+    effective_group_status,
 )
 from remediation_engine.orchestration.tools_manifest import (
     _capture_package_checkpoint,
@@ -502,12 +508,92 @@ def _lockfile_pair_conflict(snapshot: NpmGraphSnapshot) -> str | None:
     return None
 
 
+def _last_qa_passed_prefix_digest(
+    prior_plan: PortfolioPlan | None,
+    task_queue: Mapping[str, RemediationTask],
+    request: PortfolioReplanRequest | None,
+    host_repository_fingerprint: str,
+) -> str | None:
+    """Return the last certified batch prefix whose task groups passed QA."""
+    if prior_plan is None or request is None or not host_repository_fingerprint:
+        return None
+    prior_plan_id = prior_plan.portfolio_plan_id
+    if request.source_portfolio_plan_id != prior_plan_id:
+        return None
+    certificate = prior_plan.resolution_certificate
+    solver_plan = prior_plan.solver_plan
+    selected = solver_plan.selected_plan if solver_plan is not None else None
+    if (
+        certificate is None
+        or certificate.status != PackageResolutionStatus.CERTIFIED
+        or certificate.portfolio_plan_id != prior_plan_id
+        or certificate.solver_input_digest != prior_plan.solver_input_digest
+        or certificate.repository_fingerprint != prior_plan.repository_fingerprint
+        or certificate.repository_fingerprint != host_repository_fingerprint
+        or certificate.workspace_graph_digest != prior_plan.workspace_graph_digest
+        or certificate.task_revisions != prior_plan.task_revisions
+        or solver_plan is None
+        or solver_plan.status not in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+        or not solver_plan.candidate_catalog_complete
+        or certificate.candidate_catalog_digest != solver_plan.candidate_catalog_digest
+        or selected is None
+        or certificate.candidate_plan_id != selected.candidate_plan_id
+        or certificate.candidate_assignment_digest
+        != _digest(dict(sorted(selected.selected_candidate_versions.items())))
+    ):
+        return None
+
+    batches = list(selected.batches)
+    batches_by_id = {batch.batch_id: batch for batch in batches}
+    if len(batches_by_id) != len(batches):
+        return None
+    ordered_batch_ids: list[str] = []
+    seen_batch_ids: set[str] = set()
+    for phase in sorted(selected.phases, key=lambda item: item.phase_number):
+        for batch_id in phase.batch_ids:
+            if batch_id not in batches_by_id or batch_id in seen_batch_ids:
+                return None
+            ordered_batch_ids.append(batch_id)
+            seen_batch_ids.add(batch_id)
+    ordered_batch_ids.extend(sorted(set(batches_by_id) - seen_batch_ids))
+
+    last_prefix_digest: str | None = None
+    for batch_id in ordered_batch_ids:
+        batch = batches_by_id[batch_id]
+        if not batch.task_ids or len(set(batch.task_ids)) != len(batch.task_ids):
+            return None
+        if not batch.dispatchable:
+            if batch.mutations or any(
+                (task := task_queue.get(task_id)) is None
+                or task.status not in TERMINAL_TASK_STATUSES
+                for task_id in batch.task_ids
+            ):
+                return None
+            continue
+
+        member_tasks = [task_queue.get(task_id) for task_id in batch.task_ids]
+        if any(task is None for task in member_tasks):
+            return None
+        member_group_ids = {task.parent_group_id for task in member_tasks if task is not None}
+        if not member_group_ids or any(
+            effective_group_status(task_queue, group_id) != TaskStatus.QA_PASSED.value
+            for group_id in member_group_ids
+        ):
+            break
+        prefix_digest = certificate.batch_prefix_graph_digests.get(batch_id)
+        if not prefix_digest:
+            break
+        last_prefix_digest = prefix_digest
+    return last_prefix_digest
+
+
 def _assert_workspace_matches_host(
     host_snapshot: NpmGraphSnapshot,
     workspace_snapshot: NpmGraphSnapshot,
     workspace_documents: Mapping[str, str],
+    qa_passed_prefix_digest: str | None = None,
 ) -> None:
-    """Require the isolated workspace to preserve every host package manifest."""
+    """Require host manifests or one independently verified QA-passed prefix."""
     if host_snapshot.diagnostics:
         raise _CertificationUnknown(
             "host npm graph is malformed or unsupported: " + " | ".join(host_snapshot.diagnostics)
@@ -529,7 +615,10 @@ def _assert_workspace_matches_host(
         raise _CertificationUnknown(
             "workspace package manifest paths differ from the host repository snapshot"
         )
-    if _manifest_fingerprints(workspace_snapshot) != _manifest_fingerprints(host_snapshot):
+    if _manifest_fingerprints(workspace_snapshot) != _manifest_fingerprints(host_snapshot) and (
+        qa_passed_prefix_digest is None
+        or workspace_snapshot.repository_fingerprint != qa_passed_prefix_digest
+    ):
         raise _CertificationUnknown(
             "workspace package manifest contents differ from the host repository snapshot"
         )
@@ -980,6 +1069,11 @@ def _authorized_workaround(
     )
     if target is None:
         return False
+    if target.is_terminal and (
+        target.terminal_status != "qa_passed"
+        or target.strategy.replace("-", "_").lower() not in {"code_workaround", "workaround"}
+    ):
+        return False
     decision = next(
         (item for item in selected_plan.task_decisions if item.task_id == target.task_id),
         None,
@@ -1063,6 +1157,21 @@ def _validate_final_coverage(
     workaround: list[str] = []
     unresolved: list[str] = []
     for finding in prepared.findings:
+        target = next(
+            (
+                item
+                for item in prepared.targets
+                if item.occurrence_id == finding.target_occurrence_id
+            ),
+            None,
+        )
+        if target is None:
+            raise _CertificationUnknown(
+                f"finding {finding.coverage_id!r} has no prepared solver target"
+            )
+        if target.is_terminal and target.terminal_status != "qa_passed":
+            unresolved.append(finding.coverage_id)
+            continue
         prepared_occurrence = original_occurrences.get(finding.vulnerable_occurrence_id)
         if prepared_occurrence is None:
             raise _CertificationUnknown(
@@ -1284,10 +1393,27 @@ def _certify_assignment(
         ordered_batch_ids.extend(
             batch_id for batch_id in sorted(batches_by_id) if batch_id not in set(ordered_batch_ids)
         )
-        if any(not batch.dispatchable for batch in selected_plan.batches):
-            raise _CertificationUnknown("selected plan contains a non-dispatchable batch")
+        audit_only_batch_ids: set[str] = set()
+        executable_batch_count = 0
+        for batch in selected_plan.batches:
+            if batch.dispatchable:
+                executable_batch_count += 1
+                continue
+            terminal_only_batch = bool(batch.task_ids) and all(
+                (target := targets_by_task.get(task_id)) is not None and target.is_terminal
+                for task_id in batch.task_ids
+            )
+            if batch.mutations or not terminal_only_batch:
+                raise _CertificationUnknown(
+                    "selected plan contains a non-dispatchable batch that is not terminal-only"
+                )
+            audit_only_batch_ids.add(batch.batch_id)
+        if executable_batch_count == 0:
+            raise _CertificationUnknown("selected plan contains no executable package batch")
 
         for batch_id in ordered_batch_ids:
+            if batch_id in audit_only_batch_ids:
+                continue
             batch = batches_by_id[batch_id]
             solver_mutations, scratch_mutations, checkpoint, touched_files = _stage_batch_mutations(
                 sandbox, scratch_prefix, batch, deadline
@@ -1786,7 +1912,8 @@ def build_certified_portfolio_plan(
     forced_singleton_task_ids: Iterable[str] = (),
     settings: AppSettings | None = None,
     portfolio_iteration: int = 0,
-    portfolio_replan_request: Any | None = None,
+    portfolio_replan_request: PortfolioReplanRequest | None = None,
+    prior_portfolio_plan: PortfolioPlan | None = None,
     registry_fetcher: PackumentFetcher | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
 ) -> PortfolioPlan:
@@ -1803,6 +1930,7 @@ def build_certified_portfolio_plan(
         settings: Explicit runtime settings, including the certification deadline.
         portfolio_iteration: Outer portfolio iteration number.
         portfolio_replan_request: Optional Supervisor-owned replan constraints.
+        prior_portfolio_plan: Current committed plan for verifying an earlier QA-passed prefix.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
 
@@ -1822,6 +1950,12 @@ def build_certified_portfolio_plan(
     queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
     host_snapshot = load_npm_graph_snapshot(root)
     host_fingerprint = host_snapshot.repository_fingerprint
+    qa_passed_prefix_digest = _last_qa_passed_prefix_digest(
+        prior_portfolio_plan,
+        queue,
+        portfolio_replan_request,
+        host_fingerprint,
+    )
     host_diagnostics = _host_lockfile_diagnostics(host_snapshot)
     host_prepared = _prepare_portfolio_problem(
         root,
@@ -1891,7 +2025,12 @@ def build_certified_portfolio_plan(
                 runtime = _read_runtime_fingerprint(sandbox, deadline)
                 live_documents = _read_npm_documents(sandbox, "", deadline, metrics=metrics)
                 workspace_snapshot = load_npm_graph_snapshot_from_documents(live_documents)
-                _assert_workspace_matches_host(host_snapshot, workspace_snapshot, live_documents)
+                _assert_workspace_matches_host(
+                    host_snapshot,
+                    workspace_snapshot,
+                    live_documents,
+                    qa_passed_prefix_digest=qa_passed_prefix_digest,
+                )
                 lock_diagnostic = _lockfile_pair_conflict(workspace_snapshot)
                 if lock_diagnostic:
                     raise _CertificationUnknown(lock_diagnostic)

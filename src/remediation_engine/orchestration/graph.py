@@ -1068,6 +1068,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             registry_fetcher=_fetch_fresh_registry_packument,
             portfolio_iteration=iteration,
             portfolio_replan_request=request,
+            prior_portfolio_plan=state.get("portfolio_plan") if request is not None else None,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
         return {

@@ -300,10 +300,23 @@ def _lockfile_packages_for_finding(
     package_name: str,
     issue: Any | None,
     group: VulnerabilityGroup,
+    *,
+    include_current_versions: bool = False,
 ) -> list[NpmLockfilePackage]:
-    """Resolve every matching physical lockfile occurrence for one finding."""
+    """Resolve matching physical lockfile occurrences for one finding.
+
+    QA-passed tasks may point at a graph already upgraded beyond the scanner's
+    original package version, so their current physical occurrences remain
+    evidence even when that old version is no longer present.
+    """
     issue_version = str(getattr(issue, "package_version", "") or "").strip().lstrip("=vV")
-    raw_versions = [issue_version] if issue_version else list(group.versions or [])
+    raw_versions = (
+        []
+        if include_current_versions
+        else [issue_version]
+        if issue_version
+        else list(group.versions or [])
+    )
     expected_versions = {
         str(value).strip().lstrip("=vV") for value in raw_versions if value and str(value).strip()
     }
@@ -357,16 +370,31 @@ def _finding_occurrences(
     package_name: str,
     issue: Any,
     group: VulnerabilityGroup,
+    *,
+    include_current_versions: bool = False,
 ) -> list[str]:
-    """Return all evidence IDs matching one finding, without guessing a copy."""
-    packages = _lockfile_packages_for_finding(snapshot, manifest_path, package_name, issue, group)
+    """Return all physical finding occurrences without guessing a copy."""
+    packages = _lockfile_packages_for_finding(
+        snapshot,
+        manifest_path,
+        package_name,
+        issue,
+        group,
+        include_current_versions=include_current_versions,
+    )
     if packages:
         return sorted(
             {_occurrence_id_for_lockfile_package(snapshot, package) for package in packages}
         )
 
     issue_version = str(getattr(issue, "package_version", "") or "").strip().lstrip("=vV")
-    raw_versions = [issue_version] if issue_version else list(group.versions or [])
+    raw_versions = (
+        []
+        if include_current_versions
+        else [issue_version]
+        if issue_version
+        else list(group.versions or [])
+    )
     expected_versions = {
         str(value).strip().lstrip("=vV") for value in raw_versions if value and str(value).strip()
     }
@@ -603,6 +631,7 @@ def _build_targets_and_findings(
             dependency_ancestry=dependency_ancestry,
             finding_ids=sorted(set(finding_ids)),
             is_terminal=task.status in _TERMINAL_STATUSES,
+            terminal_status=(task.status.value if task.status in _TERMINAL_STATUSES else None),
             has_open_attempt=task.current_attempt_id is not None,
         )
         targets.append(target)
@@ -621,7 +650,12 @@ def _build_targets_and_findings(
             )
             workaround_plan_ids = _workaround_plan_ids(group, issue)
             vulnerable_occurrence_ids = _finding_occurrences(
-                snapshot, manifest_path, package_name, issue, group
+                snapshot,
+                manifest_path,
+                package_name,
+                issue,
+                group,
+                include_current_versions=task.status == TaskStatus.QA_PASSED,
             )
             if not vulnerable_occurrence_ids:
                 vulnerable_occurrence_ids = [
@@ -1907,8 +1941,10 @@ def _project_prepared_portfolio_plan(
         task_id: queue[task_id].task_revision for task_id in task_order if task_id in queue
     }
     decision_by_task = {decision.task_id: decision for decision in decisions}
+    terminal_task_ids = {target.task_id for target in subgraph.targets if target.is_terminal}
     planned_task_revisions = {
-        task_id: revision + (1 if task_id in decision_by_task else 0)
+        task_id: revision
+        + (1 if task_id in decision_by_task or task_id in terminal_task_ids else 0)
         for task_id, revision in current_task_revisions.items()
     }
     task_strategies: dict[str, RoutingStrategy] = {}
@@ -1917,7 +1953,9 @@ def _project_prepared_portfolio_plan(
         decision = decision_by_task.get(task_id)
         if task is None:
             continue
-        if decision is not None and str(decision.selected_strategy).lower().replace("-", "_") in {
+        if task_id in terminal_task_ids:
+            task_strategies[task_id] = task.strategy
+        elif decision is not None and str(decision.selected_strategy).lower().replace("-", "_") in {
             "code_workaround",
             "workaround",
             "no_fix",
@@ -2163,6 +2201,10 @@ def apply_portfolio_plan(
         task = committed[task_id]
         decision = decisions.get(task_id)
         if decision is None:
+            if task.status in _TERMINAL_STATUSES:
+                raise ValueError(
+                    f"portfolio plan has no audit decision for terminal task {task_id!r}"
+                )
             if task.current_attempt_id is not None:
                 diagnostics.append(
                     f"task {task_id!r} has an active attempt; plan decision not applied"
@@ -2218,6 +2260,14 @@ def apply_portfolio_plan(
                 )
         if task.current_attempt_id is not None:
             diagnostics.append(f"task {task_id!r} has an active attempt; plan decision not applied")
+            continue
+        if task.status in _TERMINAL_STATUSES:
+            committed[task_id] = task.model_copy(
+                update={
+                    "portfolio_plan_id": plan_id,
+                    "task_revision": task.task_revision + 1,
+                }
+            )
             continue
         updates: dict[str, Any] = {}
         decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")

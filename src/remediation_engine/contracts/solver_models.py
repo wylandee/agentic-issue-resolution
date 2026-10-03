@@ -196,6 +196,7 @@ class SolverTarget(_SolverModel):
     finding_ids: list[str] = Field(default_factory=list)
     is_terminal: bool = False
     has_open_attempt: bool = False
+    terminal_status: str | None = None
 
     @field_validator(
         "occurrence_id",
@@ -231,6 +232,25 @@ class SolverTarget(_SolverModel):
     @classmethod
     def _lists(cls, value: Any, info: Any) -> list[str]:
         return _unique_strings(value, info.field_name)
+
+    @model_validator(mode="after")
+    def _terminal_provenance(self) -> SolverTarget:
+        allowed_terminal_statuses = {
+            "qa_passed",
+            "unfixable",
+            "inconclusive",
+            "pivoted",
+        }
+        if self.is_terminal:
+            if self.terminal_status not in allowed_terminal_statuses:
+                raise ValueError("terminal targets require a supported terminal_status.")
+        elif self.terminal_status is not None:
+            raise ValueError("non-terminal targets must not have terminal_status.")
+        if (self.is_terminal or self.has_open_attempt) and self.eligible_for_atomic_update:
+            raise ValueError(
+                "terminal or open-attempt targets cannot be eligible for atomic update."
+            )
+        return self
 
 
 class SolverFindingRequirement(_SolverModel):

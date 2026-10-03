@@ -10,6 +10,7 @@ Tests have been updated to use the task-centric architecture:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -45,7 +46,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
-from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _create_attempt_snapshot,
@@ -214,25 +215,25 @@ def _base_state(groups, **overrides) -> dict:
     return state
 
 
-@pytest.fixture(autouse=True)
-def _mock_deterministic_registry(monkeypatch):
-    """Keep Supervisor retry tests inside the deterministic registry boundary."""
-
-    def candidates(_package_name, _security_floor, _attempted_versions=None):
-        return [
-            RegistryCandidate(
-                version="2.0.0",
-                semver_key=(2, 0, 0),
-                security_floor_met=True,
-                is_stable=True,
-                same_major=False,
-                already_attempted=False,
-            )
-        ]
-
+def _keep_portfolio_current(monkeypatch):
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        candidates,
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+        lambda *args, **kwargs: False,
+    )
+
+
+def _portfolio_stub():
+    return SimpleNamespace(
+        portfolio_plan_id="portfolio-current",
+        clusters=[],
+        cluster_order=[],
+        task_order=[],
+        task_to_cluster={},
+        diagnostics=[],
     )
 
 
@@ -1343,18 +1344,6 @@ def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(
         status=TaskStatus.NEEDS_RETRY,
         retry_count=1,
     ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_SAME_MAJOR})
-    attempted_candidate = RegistryCandidate(
-        version="2.17.7",
-        semver_key=(2, 17, 7),
-        security_floor_met=True,
-        is_stable=True,
-        same_major=True,
-        already_attempted=True,
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        lambda *_args, **_kwargs: [attempted_candidate],
-    )
     state = _base_state(
         [group],
         task_queue={"task-1": task},
@@ -2229,6 +2218,7 @@ class TestRunSupervisorNodeTargetGuardrails:
             {"task-1": task1, "task-2": task2},
         ) == ["task-1"]
 
+
 class TestRunSupervisorMaxRetries:
     def test_max_retries_marks_task_unfixable_and_removes_from_targets(self):
         g1 = _sca_group("g1")
@@ -2297,6 +2287,178 @@ class TestRunSupervisorMaxRetries:
         assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-3"].status == TaskStatus.UNFIXABLE
         mock_chat.assert_not_called()
+
+
+def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2"), _sca_group("g3")]
+    task1 = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=MAX_RETRIES,
+    )
+    task2 = _make_task("task-2", "g2")
+    task3 = _make_task("task-3", "g3")
+    state = _base_state(
+        groups,
+        task_queue={"task-3": task3, "task-1": task1, "task-2": task2},
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    result = run_supervisor_node(state)
+
+    request = result["portfolio_replan_request"]
+    assert request.reason == "UNFIXABLE_REPLAN"
+    assert request.source_portfolio_plan_id == "portfolio-current"
+    assert request.peer_conflict_pairs == []
+    assert request.forced_singleton_task_ids == []
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "portfolio"
+    assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert result["active_target_task_ids"] == []
+    assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+    assert result["task_queue"]["task-2"].current_attempt_id is None
+    assert result["task_queue"]["task-3"].current_attempt_id is None
+    assert result["supervisor_audit"].reasoning == (
+        "Newly unfixable SCA task(s) ['task-1']; remaining nonterminal SCA task(s) "
+        "['task-2', 'task-3'] require replanning."
+    )
+
+
+def test_existing_unfixable_sca_does_not_trigger_another_replan(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            "task-2": _make_task("task-2", "g2").model_copy(
+                update={"instruction": "Update the package to an approved version."}
+            ),
+        },
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["portfolio_replan_request"] is None
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-2"]
+
+
+def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    open_task = _make_task(
+        "task-open",
+        "g2",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "instruction": "Verify the committed package update.",
+        }
+    )
+    snapshots = {}
+    open_task, snapshot = _create_attempt_snapshot(
+        open_task,
+        dispatch_node="update_subagent",
+        snapshots_by_id=snapshots,
+        state_revision=1,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=["dependencies"],
+    )
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            open_task.task_id: open_task,
+        },
+        active_target_task_ids=[open_task.task_id],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["portfolio_replan_request"] == request
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == [open_task.task_id]
+    assert result["task_queue"][open_task.task_id].current_attempt_id == snapshot.attempt_id
+
+
+def test_pending_unfixable_replan_routes_when_attempt_barrier_is_clear(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            "task-2": _make_task("task-2", "g2"),
+        },
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["portfolio_replan_request"] == request
+    assert result["next_routing_step"] == "portfolio"
+    assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert result["active_target_task_ids"] == []
+
+
+def test_unfixable_replan_clears_without_remaining_nonterminal_sca(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sast_group("g2")]
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-sca": _make_task("task-sca", "g1", status=TaskStatus.UNFIXABLE),
+            "task-sast": _make_task(
+                "task-sast",
+                "g2",
+                strategy=RoutingStrategy.CODE_WORKAROUND,
+            ).model_copy(update={"instruction": "Apply the committed source workaround."}),
+        },
+        portfolio_replan_request=request,
+        portfolio_dirty=True,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_dirty"] is False
+    assert result["next_routing_step"] != "portfolio"
+
+
+def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
+    request = PortfolioReplanRequest(
+        reason="PEER_CONFLICT_ESCALATION",
+        peer_conflict_pairs=[("task-1", "task-2")],
+        forced_singleton_task_ids=["task-2"],
+    )
+    state = _base_state(
+        [_sca_group("g1")],
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        lambda *args, **kwargs: ["committed plan is stale"],
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["next_routing_step"] == "portfolio"
+    assert result["portfolio_replan_request"] == request
 
 
 # ===========================================================================
