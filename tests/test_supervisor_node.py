@@ -45,6 +45,7 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
@@ -233,6 +234,7 @@ def _mock_deterministic_registry(monkeypatch):
     monkeypatch.setattr(
         "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
         candidates,
+        raising=False,
     )
 
 
@@ -2229,6 +2231,7 @@ class TestRunSupervisorNodeTargetGuardrails:
             {"task-1": task1, "task-2": task2},
         ) == ["task-1"]
 
+
 class TestRunSupervisorMaxRetries:
     def test_max_retries_marks_task_unfixable_and_removes_from_targets(self):
         g1 = _sca_group("g1")
@@ -3007,3 +3010,216 @@ class TestBugFixes:
 
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
+
+
+def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
+    """Build one attempt-correlated two-task atomic QA failure."""
+    group_a = _sca_group("g-atomic-a")
+    group_b = _sca_group("g-atomic-b")
+    cluster_id = "cluster-atomic"
+    dispatch_batch_id = "batch-atomic"
+    action_digest = "atomic-action-digest"
+    source_plan_id = "portfolio-source"
+    tasks = {}
+    snapshots = {}
+    workers = {}
+    qa_results = {}
+    for suffix, group, retry_count in (
+        ("a", group_a, 1),
+        ("b", group_b, 0),
+    ):
+        task_id = f"task-{suffix}"
+        attempt_id = f"attempt-{suffix}"
+        instruction = f"Update test-pkg-{suffix} to 1.2.3."
+        task = _make_task(
+            task_id,
+            group.group_id,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+            retry_count=retry_count,
+        ).model_copy(
+            update={
+                "task_revision": 4,
+                "current_attempt_id": attempt_id,
+                "portfolio_plan_id": source_plan_id,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "selected_version": "1.2.3",
+                "allowed_target_versions": ["1.2.3", "1.3.0"],
+                "target_package_name": f"test-pkg-{suffix}",
+                "target_dependency_type": "dependencies",
+                "instruction": instruction,
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            portfolio_plan_id=source_plan_id,
+            qa_policy=task.qa_policy,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            target_package_name=task.target_package_name,
+            target_dependency_type=task.target_dependency_type,
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+        )
+        evaluation = QAEvaluation(
+            task_id=task_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="the atomic candidate failed deterministic tests",
+        )
+        tasks[task_id] = task
+        snapshots[attempt_id] = snapshot
+        workers[attempt_id] = WorkerAttemptResult(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            status=AgentActionStatus.SUCCESS,
+            execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+            instruction_digest=snapshot.instruction_digest,
+        )
+        qa_results[attempt_id] = QAAttemptResult(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            qa_policy_source="attempt_snapshot",
+            evaluation=evaluation,
+        )
+
+    responsible_task_ids = ["task-b"]
+    attempt_ids_by_task = {"task-a": "attempt-a", "task-b": "attempt-b"}
+    record = {
+        "status": "IDENTIFIED",
+        "responsible_task_ids": responsible_task_ids,
+        "tested_subsets": [["task-b"]],
+        "executions": 1,
+        "candidate_restored": True,
+        "cluster_id": cluster_id,
+        "dispatch_batch_id": dispatch_batch_id,
+        "action_digest": action_digest,
+        "source_portfolio_plan_id": source_plan_id,
+        "attempt_ids_by_task": attempt_ids_by_task,
+    }
+    escalation = {
+        "reason": "DELTA_ISOLATION_ATTRIBUTION",
+        "forced_singleton_task_ids": ["task-b"],
+        "triggering_attempt_id": "attempt-b",
+        "source_portfolio_plan_id": source_plan_id,
+    }
+    if delta_case == "stale_attempt":
+        record["attempt_ids_by_task"] = {
+            **attempt_ids_by_task,
+            "task-b": "attempt-old",
+        }
+    elif delta_case == "foreign_forced_task":
+        escalation["forced_singleton_task_ids"] = ["task-foreign"]
+    elif delta_case == "stale_source":
+        record["source_portfolio_plan_id"] = "portfolio-old"
+        escalation["source_portfolio_plan_id"] = "portfolio-old"
+
+    state = _base_state(
+        [group_a, group_b],
+        status="qa_completed",
+        task_queue=tasks,
+        active_target_task_ids=["task-a", "task-b"],
+        active_cluster_id=cluster_id,
+        active_dispatch_batch_id=dispatch_batch_id,
+        attempt_snapshots_by_id=snapshots,
+        worker_results_by_attempt=workers,
+        qa_results_by_attempt=qa_results,
+        delta_isolation_by_cluster=(
+            {cluster_id: record} if delta_case != "ordinary_failure" else {}
+        ),
+        portfolio_escalation=(escalation if delta_case != "ordinary_failure" else None),
+    )
+    return state, tasks, snapshots
+
+
+def test_atomic_cluster_delta_isolation_charges_only_validated_blame():
+    state, original_tasks, snapshots = _atomic_cluster_delta_failure_state()
+    approved_inputs = {
+        task_id: (
+            task.selected_version,
+            list(task.allowed_target_versions),
+            task.target_package_name,
+            task.target_dependency_type,
+            task.instruction,
+        )
+        for task_id, task in original_tasks.items()
+    }
+
+    result = run_supervisor_node(state)
+
+    blamed = result["task_queue"]["task-b"]
+    unblamed = result["task_queue"]["task-a"]
+    assert blamed.status == TaskStatus.NEEDS_RETRY
+    assert blamed.retry_count == original_tasks["task-b"].retry_count + 1
+    assert blamed.current_attempt_id is None
+    assert blamed.task_revision > original_tasks["task-b"].task_revision
+    assert unblamed.status == TaskStatus.PENDING
+    assert unblamed.retry_count == original_tasks["task-a"].retry_count
+    assert unblamed.current_attempt_id is None
+    assert unblamed.task_revision > original_tasks["task-a"].task_revision
+    assert (
+        unblamed.selected_version,
+        unblamed.allowed_target_versions,
+        unblamed.target_package_name,
+        unblamed.target_dependency_type,
+        unblamed.instruction,
+    ) == approved_inputs["task-a"]
+    assert set(snapshots) == {"attempt-a", "attempt-b"}
+    request = result["portfolio_replan_request"]
+    assert isinstance(request, PortfolioReplanRequest)
+    assert request.reason == "DELTA_ISOLATION_ATTRIBUTION"
+    assert request.forced_singleton_task_ids == ["task-b"]
+    assert request.triggering_attempt_id == "attempt-b"
+    assert request.source_portfolio_plan_id == "portfolio-source"
+    assert result["next_routing_step"] == "portfolio"
+
+
+def test_atomic_cluster_without_delta_attribution_keeps_all_member_retry_behavior():
+    state, original_tasks, _snapshots = _atomic_cluster_delta_failure_state(
+        delta_case="ordinary_failure"
+    )
+
+    result = run_supervisor_node(state)
+
+    for task_id, task in original_tasks.items():
+        committed = result["task_queue"][task_id]
+        assert committed.status == TaskStatus.NEEDS_RETRY
+        assert committed.retry_count == task.retry_count + 1
+        assert committed.current_attempt_id != task.current_attempt_id
+        assert committed.task_revision > task.task_revision
+
+
+@pytest.mark.parametrize(
+    "delta_case",
+    ["stale_attempt", "foreign_forced_task", "stale_source"],
+)
+def test_atomic_cluster_stale_delta_provenance_retries_every_member(delta_case):
+    state, original_tasks, _snapshots = _atomic_cluster_delta_failure_state(delta_case=delta_case)
+
+    result = run_supervisor_node(state)
+
+    for task_id, task in original_tasks.items():
+        committed = result["task_queue"][task_id]
+        assert committed.status == TaskStatus.NEEDS_RETRY
+        assert committed.retry_count == task.retry_count + 1
+        assert committed.current_attempt_id is None
+        assert committed.task_revision > task.task_revision
+    assert result["portfolio_escalation"]["forced_singleton_task_ids"] == []
+    request = result["portfolio_replan_request"]
+    assert request.forced_singleton_task_ids == []
+    assert request.triggering_attempt_id is None
+    assert request.source_portfolio_plan_id is None

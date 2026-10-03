@@ -31,7 +31,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -1003,6 +1003,98 @@ def _commit_task_transition(
             allow_breaking_change_pivot=allow_breaking_change_pivot,
             consistency_events=consistency_events,
         )
+
+
+def _validated_delta_isolation_blame(
+    portfolio_escalation: Mapping[str, Any] | None,
+    delta_isolation_by_cluster: Mapping[str, Any],
+    atomic_cluster_task_ids: list[str],
+    task_queue: Mapping[str, RemediationTask],
+    attempt_snapshots_by_id: Mapping[str, TaskAttemptSnapshot],
+) -> str | None:
+    """Return one blamed task only when delta provenance matches the attempts."""
+    if (
+        not isinstance(portfolio_escalation, Mapping)
+        or portfolio_escalation.get("reason") != "DELTA_ISOLATION_ATTRIBUTION"
+        or len(atomic_cluster_task_ids) <= 1
+        or len(atomic_cluster_task_ids) != len(set(atomic_cluster_task_ids))
+    ):
+        return None
+
+    current_snapshots: list[TaskAttemptSnapshot] = []
+    attempt_ids_by_task: dict[str, str] = {}
+    for task_id in atomic_cluster_task_ids:
+        task = task_queue.get(task_id)
+        if task is None or not task.current_attempt_id:
+            return None
+        snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+        if (
+            snapshot is None
+            or snapshot.attempt_id != task.current_attempt_id
+            or snapshot.task_id != task_id
+            or snapshot.dispatch_node != "update_subagent"
+        ):
+            return None
+        current_snapshots.append(snapshot)
+        attempt_ids_by_task[task_id] = task.current_attempt_id
+
+    def common_nonempty_text(attribute: str) -> str | None:
+        values = [getattr(snapshot, attribute, None) for snapshot in current_snapshots]
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            return None
+        unique_values = set(values)
+        return next(iter(unique_values)) if len(unique_values) == 1 else None
+
+    cluster_id = common_nonempty_text("cluster_id")
+    dispatch_batch_id = common_nonempty_text("dispatch_batch_id")
+    action_digest = common_nonempty_text("action_digest")
+    source_portfolio_plan_id = common_nonempty_text("portfolio_plan_id")
+    if None in {cluster_id, dispatch_batch_id, action_digest, source_portfolio_plan_id}:
+        return None
+
+    current_cluster_task_ids = {
+        task_id
+        for task_id, task in task_queue.items()
+        if task.current_attempt_id
+        and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id)) is not None
+        and snapshot.cluster_id == cluster_id
+        and snapshot.dispatch_node == "update_subagent"
+    }
+    if current_cluster_task_ids != set(atomic_cluster_task_ids):
+        return None
+
+    record = delta_isolation_by_cluster.get(cluster_id)
+    if (
+        not isinstance(record, Mapping)
+        or record.get("status") != "IDENTIFIED"
+        or record.get("candidate_restored") is not True
+        or record.get("cluster_id") != cluster_id
+        or record.get("dispatch_batch_id") != dispatch_batch_id
+        or record.get("action_digest") != action_digest
+        or record.get("source_portfolio_plan_id") != source_portfolio_plan_id
+        or record.get("attempt_ids_by_task") != attempt_ids_by_task
+    ):
+        return None
+
+    responsible_task_ids = record.get("responsible_task_ids")
+    forced_singleton_task_ids = portfolio_escalation.get("forced_singleton_task_ids")
+    if (
+        not isinstance(responsible_task_ids, (list, tuple))
+        or len(responsible_task_ids) != 1
+        or not isinstance(forced_singleton_task_ids, (list, tuple))
+        or len(forced_singleton_task_ids) != 1
+        or forced_singleton_task_ids != responsible_task_ids
+    ):
+        return None
+    blamed_task_id = responsible_task_ids[0]
+    if not isinstance(blamed_task_id, str) or blamed_task_id not in set(atomic_cluster_task_ids):
+        return None
+    if (
+        portfolio_escalation.get("triggering_attempt_id") != attempt_ids_by_task[blamed_task_id]
+        or portfolio_escalation.get("source_portfolio_plan_id") != source_portfolio_plan_id
+    ):
+        return None
+    return blamed_task_id
 
 
 def _validate_committed_state(
@@ -1985,6 +2077,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             processed_qa_attempt_ids.add(task.current_attempt_id)
             new_qa_attempt_ids.append(task.current_attempt_id)
     portfolio_escalation = state.get("portfolio_escalation")
+    validated_delta_blame_task_id: str | None = None
     if atomic_cluster_task_ids and state.get("status") in {"qa_completed", "qa_failed"}:
         cluster_evaluations = {
             task_id: qa_evaluations.get(task_id) for task_id in atomic_cluster_task_ids
@@ -2066,21 +2159,67 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     "peer_conflict_pairs": sorted(peer_pairs),
                     "evidence": [peer_evidence[key] for key in sorted(peer_evidence)],
                 }
+            validated_delta_blame_task_id = _validated_delta_isolation_blame(
+                portfolio_escalation if isinstance(portfolio_escalation, Mapping) else None,
+                state.get("delta_isolation_by_cluster") or {},
+                atomic_cluster_task_ids,
+                task_queue,
+                attempt_snapshots_by_id,
+            )
+            if (
+                isinstance(portfolio_escalation, Mapping)
+                and portfolio_escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
+                and validated_delta_blame_task_id is None
+            ):
+                portfolio_escalation = {
+                    **portfolio_escalation,
+                    "forced_singleton_task_ids": [],
+                    "triggering_attempt_id": None,
+                    "source_portfolio_plan_id": None,
+                }
             for task_id in atomic_cluster_task_ids:
                 task = task_queue[task_id]
+                if task_id == validated_delta_blame_task_id:
+                    updates = {
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    }
+                elif validated_delta_blame_task_id is not None:
+                    updates = {"status": TaskStatus.PENDING}
+                else:
+                    updates = {
+                        "status": TaskStatus.NEEDS_RETRY,
+                        "retry_count": task.retry_count + 1,
+                    }
                 _commit_task_transition(
                     task_queue,
                     task_id,
-                    updates={
-                        "status": TaskStatus.NEEDS_RETRY,
-                        "retry_count": task.retry_count + 1,
-                    },
+                    updates=updates,
                     close_attempt=True,
                 )
-            errors.append(
-                "supervisor: atomic package-cluster QA failure kept every member non-passed."
-            )
-    portfolio_replan_request = state.get("portfolio_replan_request")
+            if validated_delta_blame_task_id is not None:
+                errors.append(
+                    "supervisor: delta attribution charged the blamed task and requeued "
+                    "untested cluster peers."
+                )
+            else:
+                errors.append(
+                    "supervisor: atomic package-cluster QA failure kept every member non-passed."
+                )
+    if (
+        isinstance(portfolio_escalation, Mapping)
+        and portfolio_escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
+    ):
+        if validated_delta_blame_task_id is None:
+            portfolio_escalation = {
+                **portfolio_escalation,
+                "forced_singleton_task_ids": [],
+                "triggering_attempt_id": None,
+                "source_portfolio_plan_id": None,
+            }
+        portfolio_replan_request = None
+    else:
+        portfolio_replan_request = state.get("portfolio_replan_request")
     if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
         escalation = portfolio_escalation
         if isinstance(escalation, dict) and escalation.get("reason"):
@@ -2092,9 +2231,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     triggering_attempt_id=escalation.get("triggering_attempt_id"),
                     triggering_scan_id=escalation.get("triggering_scan_id"),
                     source_portfolio_plan_id=(
-                        committed_plan.portfolio_plan_id
-                        if committed_plan is not None
-                        else escalation.get("source_portfolio_plan_id")
+                        escalation.get("source_portfolio_plan_id")
+                        if escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
+                        else (
+                            committed_plan.portfolio_plan_id
+                            if committed_plan is not None
+                            else escalation.get("source_portfolio_plan_id")
+                        )
                     ),
                 )
             except Exception:  # noqa: BLE001

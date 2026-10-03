@@ -509,13 +509,12 @@ def _apply_policy_decision(
             )
         )
         if policy == QAPolicy.VERSION_BUMP:
-            if (
-                not _disabled_package_state_failure(current, policy)
-                and _version_bump_llm_failure_is_relevant(
-                    current,
-                    gates,
-                    test_exonerated=evaluator_test_exonerated,
-                )
+            if not _disabled_package_state_failure(
+                current, policy
+            ) and _version_bump_llm_failure_is_relevant(
+                current,
+                gates,
+                test_exonerated=evaluator_test_exonerated,
             ):
                 failures.append(
                     (

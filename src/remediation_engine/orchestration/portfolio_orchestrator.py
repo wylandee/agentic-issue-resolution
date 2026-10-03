@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -19,7 +19,9 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    MultiPackageAction,
     PackageFixPlanCandidate,
+    PackageMutation,
     PortfolioPlan,
     RemediationTask,
     RoutingStrategy,
@@ -42,6 +44,8 @@ from remediation_engine.orchestration.portfolio_solver import (
 from remediation_engine.orchestration.portfolio_solver import (
     prepare_portfolio_inputs as _prepare_solver_portfolio_inputs,
 )
+from remediation_engine.orchestration.task_utils import group_parent_context
+from remediation_engine.settings import DEFAULT_MAX_DELTA_CANARY_PROBES
 from remediation_engine.tools.npm_graph import npm_range_contains
 
 _TERMINAL_STATUSES = frozenset(
@@ -1464,19 +1468,236 @@ def _stable_task_key(task_id: str, nodes: dict[str, _PackageNode]) -> tuple[str,
     return node.manifest_path, node.package_name, task_id
 
 
+def _has_package_token(package_name: str, error_logs: str) -> bool:
+    """Return whether error logs contain one complete package token."""
+    normalized_name = package_name.strip()
+    if not normalized_name or not error_logs:
+        return False
+
+    package_pattern = re.compile(
+        rf"(?<![A-Za-z0-9._-]){re.escape(normalized_name)}(?![A-Za-z0-9._-])",
+        re.IGNORECASE,
+    )
+    scoped_spans = [
+        match.span() for match in re.finditer(r"@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", error_logs)
+    ]
+    for match in package_pattern.finditer(error_logs):
+        if normalized_name.startswith("@") or not any(
+            start <= match.start() and match.end() <= end for start, end in scoped_spans
+        ):
+            return True
+    return False
+
+
+def _version_major_minor(version: str | None) -> tuple[int, int] | None:
+    """Parse the major/minor release numbers from one exact version."""
+    if not version:
+        return None
+    normalized = version.strip()
+    if not _EXACT_VERSION_RE.fullmatch(normalized):
+        return None
+    if normalized[0] in "=vV":
+        normalized = normalized[1:]
+    release = re.match(r"^(\d+)\.(\d+)\.\d+", normalized)
+    if release is None:
+        return None
+    return int(release.group(1)), int(release.group(2))
+
+
+def score_suspect_package(
+    package_name: str,
+    target_version: str,
+    base_version: str | None,
+    error_logs: str,
+) -> int:
+    """Score one mutated package using deterministic log and version evidence.
+
+    Args:
+        package_name: Exact package name from the proposed package mutation.
+        target_version: Mutation target version, not a task-selected hint.
+        base_version: Known installed version; invalid or absent values add no
+            version evidence.
+        error_logs: Combined QA error text to search for a package token.
+
+    Returns:
+        An integer suspicion score: 10 points for one case-insensitive,
+        complete package-token match; otherwise 3 points for a major-version
+        increase or 1 point for a same-major minor increase. Patch-only,
+        unchanged, downgrade, and invalid-version changes add no points.
+
+    This function is deterministic and performs no I/O or version selection.
+    """
+    score = 10 if _has_package_token(package_name, error_logs) else 0
+    target_release = _version_major_minor(target_version)
+    base_release = _version_major_minor(base_version)
+    if target_release is None or base_release is None:
+        return score
+    if target_release[0] > base_release[0]:
+        return score + 3
+    if target_release[0] == base_release[0] and target_release[1] > base_release[1]:
+        return score + 1
+    return score
+
+
+def _fallback_group_installed_version(
+    task: RemediationTask,
+    package_name: str,
+    groups_by_id: Mapping[str, VulnerabilityGroup],
+) -> str | None:
+    """Return an exact, unambiguous group baseline for a mutation package."""
+    if package_name == task.parent_package_name and task.parent_package_version is not None:
+        return task.parent_package_version
+
+    group = groups_by_id.get(task.parent_group_id)
+    if group is None:
+        return None
+    if package_name in group.dependency_versions:
+        return group.dependency_versions[package_name]
+
+    parent_name, parent_version, _ = group_parent_context(group)
+    if parent_name == package_name and parent_version is not None:
+        return parent_version
+
+    if package_name == group.vulnerable_component:
+        versions = set(group.versions)
+        if len(versions) == 1:
+            return next(iter(versions))
+    return None
+
+
+def rank_suspect_tasks_by_suspicion(
+    tasks: Sequence[RemediationTask],
+    action: MultiPackageAction,
+    error_logs: str,
+    groups_by_id: Mapping[str, VulnerabilityGroup] | None = None,
+    installed_versions_by_task: Mapping[str, str | None] | None = None,
+) -> list[tuple[RemediationTask, int]]:
+    """Rank mutated tasks by deterministic QA suspicion evidence.
+
+    Args:
+        tasks: Candidate tasks from the failed atomic dispatch.
+        action: Committed package mutations whose exact targets are scored.
+        error_logs: Aggregated QA diagnostics used for package-token evidence.
+        groups_by_id: Optional group evidence for an unambiguous installed
+            version fallback when no solver decision is supplied for a task.
+        installed_versions_by_task: Optional current-plan solver baselines.
+            A present key with a missing or invalid value deliberately prevents
+            fallback to weaker group evidence.
+
+    Returns:
+        ``(task, score)`` pairs sorted by descending score, then ascending
+        ``task_id``. Tasks with missing or duplicated mutations receive score
+        zero rather than being matched heuristically.
+
+    This function is pure: it performs no I/O, mutates no inputs, and never
+    selects or changes a remediation version.
+    """
+    mutations_by_task: dict[str, list[PackageMutation]] = defaultdict(list)
+    for mutation in action.package_mutations:
+        mutations_by_task[mutation.task_id].append(mutation)
+
+    groups = groups_by_id or {}
+    installed_versions = installed_versions_by_task or {}
+    ranked: list[tuple[RemediationTask, int]] = []
+    for task in tasks:
+        mutations = mutations_by_task.get(task.task_id, [])
+        if len(mutations) != 1:
+            ranked.append((task, 0))
+            continue
+        mutation = mutations[0]
+        if task.task_id in installed_versions:
+            base_version = installed_versions[task.task_id]
+        else:
+            base_version = _fallback_group_installed_version(task, mutation.package_name, groups)
+        ranked.append(
+            (
+                task,
+                score_suspect_package(
+                    mutation.package_name,
+                    mutation.target_version,
+                    base_version,
+                    error_logs,
+                ),
+            )
+        )
+    return sorted(ranked, key=lambda item: (-item[1], item[0].task_id))
+
+
 def isolate_delta_failure(
     task_ids: Iterable[str],
     probe: Callable[[tuple[str, ...]], Literal["PASS", "FAIL", "INCONCLUSIVE"]],
+    *,
+    ranked_suspect_task_ids: Sequence[str] | None = None,
+    max_canary_probes: int | None = None,
 ) -> DeltaIsolationResult:
-    """Bisect a failing cluster using deterministic subset probes.
+    """Attribute a failed package cluster with legacy or bounded canaries.
 
-    The supplied probe must start each subset from the same baseline. The
-    algorithm performs at most ``2N - 1`` probes for ``N <= 10`` and never
-    turns attribution into a QA pass.
+    With both new options omitted, the legacy exhaustive subset check and
+    recursive bisection remain unchanged and are limited to ten tasks. If
+    either option is supplied, only singleton canaries run: ranked IDs retain
+    their supplied order (or normalized task IDs are sorted when only a budget
+    is given), and the default/explicit positive budget caps those callbacks.
+    Bounded mode accepts at most ``MAX_MULTI_PACKAGE_ACTION_SIZE`` tasks,
+    never probes the full subset, and does not bisect an inconclusive run.
+    Its ``executions`` count singleton callbacks only.
+
+    The supplied probe must start each callback from the same baseline. Neither
+    mode turns attribution into a QA pass.
     """
     ordered = tuple(dict.fromkeys(sorted(str(task_id) for task_id in task_ids)))
     if not ordered:
         return DeltaIsolationResult("INCONCLUSIVE", diagnostic="no package tasks supplied")
+
+    bounded_mode = ranked_suspect_task_ids is not None or max_canary_probes is not None
+    if bounded_mode:
+        if len(ordered) > MAX_MULTI_PACKAGE_ACTION_SIZE:
+            return DeltaIsolationResult(
+                "INCONCLUSIVE",
+                diagnostic=(
+                    f"bounded delta isolation is limited to {MAX_MULTI_PACKAGE_ACTION_SIZE} tasks"
+                ),
+            )
+        budget = DEFAULT_MAX_DELTA_CANARY_PROBES if max_canary_probes is None else max_canary_probes
+        if budget <= 0:
+            return DeltaIsolationResult(
+                "INCONCLUSIVE", diagnostic="canary probe budget must be positive"
+            )
+        if ranked_suspect_task_ids is None:
+            candidates = ordered
+        else:
+            valid_task_ids = set(ordered)
+            candidates = tuple(
+                dict.fromkeys(
+                    str(task_id)
+                    for task_id in ranked_suspect_task_ids
+                    if str(task_id) in valid_task_ids
+                )
+            )
+            if not candidates:
+                return DeltaIsolationResult(
+                    "INCONCLUSIVE",
+                    diagnostic="no valid ranked suspects supplied",
+                )
+
+        tested: list[tuple[str, ...]] = []
+        for task_id in candidates[:budget]:
+            subset = (task_id,)
+            tested.append(subset)
+            if probe(subset) == "FAIL":
+                return DeltaIsolationResult(
+                    "IDENTIFIED",
+                    responsible_task_ids=subset,
+                    tested_subsets=tuple(tested),
+                    executions=len(tested),
+                    diagnostic="singleton canary failed",
+                )
+        return DeltaIsolationResult(
+            "INCONCLUSIVE",
+            tested_subsets=tuple(tested),
+            executions=len(tested),
+            diagnostic="no singleton failure found within the canary probe budget",
+        )
+
     if len(ordered) > 10:
         return DeltaIsolationResult(
             "INCONCLUSIVE", diagnostic="delta isolation is bounded at ten tasks"
@@ -1932,8 +2153,10 @@ __all__ = [
     "apply_portfolio_plan",
     "build_portfolio_plan",
     "build_certified_portfolio_plan",
+    "rank_suspect_tasks_by_suspicion",
     "isolate_delta_failure",
     "materialize_synthetic_dependency_tasks",
     "prepare_portfolio_inputs",
+    "score_suspect_package",
     "repository_fingerprint",
 ]

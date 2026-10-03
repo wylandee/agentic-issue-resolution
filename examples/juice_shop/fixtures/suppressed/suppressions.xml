@@ -1,29 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
 
-<!--
     <suppress>
-        <notes>Keep @angular/common as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/common (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcommon@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
-<!--
     <suppress>
-        <notes>Keep @angular/compiler as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/compiler (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcompiler@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
-<!--
     <suppress>
-        <notes>Keep @angular/core as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/core (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcore@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for @babel/core (npm)</notes>
@@ -157,11 +151,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for http-cache-semantics (npm)</notes>
+        <notes>Keep http-cache-semantics as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/http-cache-semantics@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for js-yaml (npm)</notes>
@@ -169,11 +165,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for jsonwebtoken (npm)</notes>
+        <notes>Keep jsonwebtoken as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/jsonwebtoken@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for jws (npm)</notes>
@@ -259,17 +257,21 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for serialize-javascript (npm)</notes>
+        <notes>Keep serialize-javascript as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/serialize-javascript@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for socket.io (npm)</notes>
+        <notes>Keep socket.io as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/socket\.io@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for socket.io-parser (npm)</notes>
@@ -295,11 +297,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for uuid (npm)</notes>
+        <notes>Keep uuid as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/uuid@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for vite (npm)</notes>

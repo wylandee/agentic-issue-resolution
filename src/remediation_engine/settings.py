@@ -39,6 +39,8 @@ DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
 # version, security floor, and latest release from each eligible minor branch.
 DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 256
 
+DEFAULT_MAX_DELTA_CANARY_PROBES = 2
+
 
 @dataclass(frozen=True)
 class AppSettings:
@@ -78,6 +80,7 @@ class AppSettings:
     # Development-only safety valve. Production remains unlimited by default.
     remedy_retriage_limit_enabled: bool = False
     remedy_retriage_limit: int = DEFAULT_REMEDY_RETRIAGE_LIMIT
+    max_delta_canary_probes: int = DEFAULT_MAX_DELTA_CANARY_PROBES
 
     @classmethod
     def from_env(cls) -> AppSettings:
@@ -151,5 +154,10 @@ class AppSettings:
                 "REMEDY_RETRIAGE_LIMIT",
                 DEFAULT_REMEDY_RETRIAGE_LIMIT,
                 minimum=0,
+            ),
+            max_delta_canary_probes=_env_int(
+                "REMEDY_MAX_DELTA_CANARY_PROBES",
+                DEFAULT_MAX_DELTA_CANARY_PROBES,
+                minimum=1,
             ),
         )

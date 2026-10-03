@@ -11,20 +11,24 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     FailureCategory,
     MultiPackageAction,
+    PackageMutation,
     QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     StateConsistencyEvent,
 )
 from remediation_engine.orchestration import qa_test_parsing as _qa_test_parsing
-from remediation_engine.orchestration.portfolio_orchestrator import isolate_delta_failure
+from remediation_engine.orchestration.portfolio_orchestrator import (
+    isolate_delta_failure,
+    rank_suspect_tasks_by_suspicion,
+)
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
@@ -379,84 +383,348 @@ def _restore_workspace_snapshot(
     return []
 
 
+def _action_mutations_by_task(
+    action: MultiPackageAction,
+    target_tasks: list[RemediationTask],
+) -> dict[str, PackageMutation] | None:
+    """Return one exact mutation per active task, or reject the action."""
+    target_ids = [task.task_id for task in target_tasks]
+    if len(target_ids) != len(set(target_ids)):
+        return None
+    mutations_by_task: dict[str, list[PackageMutation]] = {}
+    for mutation in action.package_mutations:
+        mutations_by_task.setdefault(mutation.task_id, []).append(mutation)
+    if set(mutations_by_task) != set(target_ids) or any(
+        len(mutations_by_task[task_id]) != 1 for task_id in target_ids
+    ):
+        return None
+    return {task_id: mutations_by_task[task_id][0] for task_id in target_ids}
+
+
+def _delta_field(value: Any, name: str) -> Any:
+    """Read a diagnostic or provenance field from a model or mapping."""
+    return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+
+
+def _collect_delta_isolation_error_text(
+    result: Mapping[str, Any],
+    target_task_ids: Sequence[str],
+) -> str:
+    """Collect structured QA diagnostics in stable source and task order."""
+    entries: list[str] = []
+
+    def append_text(value: Any) -> None:
+        if isinstance(value, str):
+            values = (value,)
+        elif isinstance(value, (list, tuple)):
+            values = value
+        else:
+            return
+        entries.extend(item.strip() for item in values if isinstance(item, str) and item.strip())
+
+    append_text(result.get("errors"))
+    append_text(result.get("diagnostics"))
+    errors_by_task = result.get("qa_errors_by_task")
+    if isinstance(errors_by_task, Mapping):
+        for task_id in sorted(set(target_task_ids)):
+            append_text(errors_by_task.get(task_id))
+
+    evaluations = result.get("qa_evaluations")
+    if isinstance(evaluations, Mapping):
+        for task_id in sorted(set(target_task_ids)):
+            evaluation = evaluations.get(task_id)
+            if evaluation is None:
+                continue
+            failure_evidence = _delta_field(evaluation, "failure_evidence")
+            deterministic_gates = _delta_field(evaluation, "deterministic_gates")
+            test_attribution = _delta_field(evaluation, "test_attribution")
+            for value in (
+                _delta_field(failure_evidence, "raw_excerpt"),
+                _delta_field(failure_evidence, "exact_diagnostics"),
+                _delta_field(failure_evidence, "failed_tests"),
+                _delta_field(deterministic_gates, "diagnostics"),
+                _delta_field(test_attribution, "failed_tests"),
+                _delta_field(evaluation, "retry_feedback"),
+            ):
+                append_text(value)
+    return "\n".join(entries)
+
+
+def _delta_isolation_provenance(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    action: MultiPackageAction,
+) -> dict[str, Any]:
+    """Describe the common committed dispatch that owns one canary budget."""
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    ordered_tasks = sorted(target_tasks, key=lambda task: task.task_id)
+    attempt_ids_by_task = {task.task_id: task.current_attempt_id for task in ordered_tasks}
+    current_snapshots = [
+        snapshots.get(task.current_attempt_id) if task.current_attempt_id else None
+        for task in ordered_tasks
+    ]
+    source_portfolio_plan_id: str | None = None
+    if current_snapshots and all(snapshot is not None for snapshot in current_snapshots):
+        source_plan_ids = {
+            _delta_field(snapshot, "portfolio_plan_id") for snapshot in current_snapshots
+        }
+        if len(source_plan_ids) == 1:
+            source_portfolio_plan_id = next(iter(source_plan_ids))
+    return {
+        "cluster_id": state.get("active_cluster_id") or action.cluster_id,
+        "dispatch_batch_id": state.get("active_dispatch_batch_id") or action.dispatch_batch_id,
+        "action_digest": _graph_module().instruction_digest(action.model_dump_json()),
+        "source_portfolio_plan_id": source_portfolio_plan_id,
+        "attempt_ids_by_task": attempt_ids_by_task,
+    }
+
+
+def _solver_installed_versions_by_task(
+    state: OrchestratorState,
+    target_tasks: list[RemediationTask],
+    mutations_by_task: Mapping[str, PackageMutation],
+    provenance: Mapping[str, Any],
+) -> dict[str, str | None]:
+    """Return only solver baselines tied to the current committed plan."""
+    plan = state.get("portfolio_plan")
+    plan_id = _delta_field(plan, "portfolio_plan_id")
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    if (
+        plan is None
+        or not plan_id
+        or plan_id != provenance.get("source_portfolio_plan_id")
+        or any(
+            (snapshot := snapshots.get(task.current_attempt_id)) is None
+            or _delta_field(snapshot, "portfolio_plan_id") != plan_id
+            for task in target_tasks
+        )
+    ):
+        return {}
+
+    solver_plan = _delta_field(plan, "solver_plan")
+    selected_plan = _delta_field(solver_plan, "selected_plan")
+    decisions = _delta_field(selected_plan, "task_decisions") or ()
+    decisions_by_task: dict[str, list[Any]] = {}
+    for decision in decisions:
+        decisions_by_task.setdefault(_delta_field(decision, "task_id"), []).append(decision)
+
+    installed_versions: dict[str, str | None] = {}
+    for task in target_tasks:
+        task_decisions = decisions_by_task.get(task.task_id, [])
+        if len(task_decisions) != 1:
+            continue
+        decision = task_decisions[0]
+        mutation = mutations_by_task[task.task_id]
+        target_package_name = _delta_field(decision, "target_package_name")
+        if (
+            _delta_field(decision, "task_id") == task.task_id
+            and target_package_name == task.target_package_name
+            and target_package_name == mutation.package_name
+        ):
+            installed_versions[task.task_id] = _delta_field(decision, "installed_version")
+    return installed_versions
+
+
 def run_delta_isolation_canaries(
     state: OrchestratorState,
     target_tasks: list[RemediationTask],
     action: MultiPackageAction,
     qa_probe: Callable[[Any, MultiPackageAction], Literal["PASS", "FAIL", "INCONCLUSIVE"]],
+    *,
+    ranked_tasks: Sequence[RemediationTask] | None = None,
+    max_canary_probes: int | None = None,
 ) -> dict[str, Any]:
-    """Run bounded subset canaries against a shared Docker baseline.
+    """Run singleton canaries from the retained pre-worker workspace baseline.
 
-    ``qa_probe`` is an injected deterministic QA adapter. Every invocation is
-    restored to the same baseline before and after the committed mutation
-    subset, and restore failures are reported as inconclusive.
+    The live full candidate is archived before probing. Each singleton starts
+    from the immutable dispatch snapshot and restores the full candidate in a
+    ``finally`` block; the dispatch snapshot remains owned by QA finalization.
     """
     task_ids = tuple(sorted(task.task_id for task in target_tasks))
+    mutations_by_task = _action_mutations_by_task(action, target_tasks)
+    if mutations_by_task is None:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": [],
+            "executions": 0,
+            "diagnostic": "action mutations do not uniquely match active tasks",
+            "candidate_restored": True,
+        }
     workspace_volume = state.get("workspace_volume")
     if len(task_ids) <= 1 or not workspace_volume:
         return {
             "status": "INCONCLUSIVE",
             "diagnostic": "delta isolation requires a cluster workspace",
+            "candidate_restored": True,
         }
-    baseline_id = (
-        "delta-baseline-"
-        + hashlib.sha256(f"{action.cluster_id}:{','.join(task_ids)}".encode()).hexdigest()[:24]
-    )
     snapshots = state.get("attempt_snapshots_by_id") or {}
     snapshot_id = _workspace_snapshot_id(target_tasks, snapshots)
     if snapshot_id is None:
-        return {"status": "INCONCLUSIVE", "diagnostic": "cluster attempt metadata is incomplete"}
+        return {
+            "status": "INCONCLUSIVE",
+            "diagnostic": "cluster attempt metadata is incomplete",
+            "candidate_restored": True,
+        }
+    candidate_digest = hashlib.sha256(f"{snapshot_id}:{','.join(task_ids)}".encode()).hexdigest()[
+        :24
+    ]
+    candidate_snapshot_id = f"delta-candidate-{candidate_digest}"
+    ranked_task_ids = [task.task_id for task in ranked_tasks] if ranked_tasks is not None else None
+    isolation = None
+    candidate_snapshot_created = False
+    candidate_restored = True
+    candidate_restore_error: str | None = None
+    candidate_removal_error: str | None = None
+    unexpected_error: str | None = None
+
     try:
         with _graph_module().DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
-            sandbox.create_workspace_snapshot(baseline_id)
-
-            def probe(subset: tuple[str, ...]) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
-                mutations = [
-                    mutation for mutation in action.package_mutations if mutation.task_id in subset
-                ]
-                subset_action = action.model_copy(update={"package_mutations": mutations})
-                outcome: Literal["PASS", "FAIL", "INCONCLUSIVE"] = "INCONCLUSIVE"
-                try:
-                    sandbox.restore_workspace_snapshot(baseline_id)
-                    touched_files: set[str] = set()
-                    applied, _error = apply_multi_package_action(
-                        sandbox,
-                        subset_action,
-                        touched_files,
-                    )
-                    outcome = "INCONCLUSIVE" if not applied else qa_probe(sandbox, subset_action)
-                except Exception:  # noqa: BLE001 - canary infrastructure is inconclusive
-                    outcome = "INCONCLUSIVE"
-                finally:
-                    try:
-                        sandbox.restore_workspace_snapshot(baseline_id)
-                    except Exception:
-                        # A canary that cannot restore its shared baseline is
-                        # never safe to attribute. The outer cleanup still
-                        # gets a chance to report/remove the baseline archive.
-                        outcome = "INCONCLUSIVE"
-                return outcome
-
-            isolation = isolate_delta_failure(task_ids, probe)
             try:
-                sandbox.restore_workspace_snapshot(baseline_id)
-                sandbox.remove_workspace_snapshot(baseline_id)
-            except Exception as exc:  # noqa: BLE001
-                return {
-                    "status": "INCONCLUSIVE",
-                    "diagnostic": f"delta baseline cleanup failed: {exc}",
-                    "executions": isolation.executions,
-                }
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "INCONCLUSIVE", "diagnostic": f"delta isolation unavailable: {exc}"}
+                sandbox.create_workspace_snapshot(candidate_snapshot_id)
+                candidate_snapshot_created = True
+            except Exception as exc:  # noqa: BLE001 - candidate remains untouched
+                candidate_restore_error = f"candidate snapshot creation failed: {exc}"
+
+            if candidate_snapshot_created:
+
+                def restore_candidate() -> bool:
+                    nonlocal candidate_restored, candidate_restore_error
+                    try:
+                        sandbox.restore_workspace_snapshot(candidate_snapshot_id)
+                    except Exception as exc:  # noqa: BLE001 - never attribute corruption
+                        candidate_restored = False
+                        candidate_restore_error = str(exc)
+                        log.exception(
+                            "Delta-isolation candidate restore failed for %s.",
+                            candidate_snapshot_id,
+                        )
+                        return False
+                    candidate_restored = True
+                    candidate_restore_error = None
+                    return True
+
+                def probe(
+                    subset: tuple[str, ...],
+                ) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
+                    nonlocal candidate_restored
+                    outcome: Literal["PASS", "FAIL", "INCONCLUSIVE"] = "INCONCLUSIVE"
+                    candidate_restored = False
+                    try:
+                        sandbox.restore_workspace_snapshot(snapshot_id)
+                        subset_action = action.model_copy(
+                            update={
+                                "package_mutations": [
+                                    mutations_by_task[task_id] for task_id in subset
+                                ]
+                            }
+                        )
+                        applied, _error = apply_multi_package_action(
+                            sandbox,
+                            subset_action,
+                            set(),
+                        )
+                        if applied:
+                            outcome = qa_probe(sandbox, subset_action)
+                    except Exception:  # noqa: BLE001 - one failed probe consumes one slot
+                        outcome = "INCONCLUSIVE"
+                        log.exception("Delta-isolation singleton probe failed.")
+                    finally:
+                        if not restore_candidate():
+                            outcome = "INCONCLUSIVE"
+                    return outcome
+
+                try:
+                    isolation = isolate_delta_failure(
+                        task_ids,
+                        probe,
+                        ranked_suspect_task_ids=ranked_task_ids,
+                        max_canary_probes=max_canary_probes,
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup must still run
+                    unexpected_error = str(exc)
+                    log.exception("Delta-isolation runner failed unexpectedly.")
+                finally:
+                    candidate_was_restored = candidate_restored
+                    final_restore_succeeded = restore_candidate()
+                    if final_restore_succeeded:
+                        try:
+                            sandbox.remove_workspace_snapshot(candidate_snapshot_id)
+                        except Exception as exc:  # noqa: BLE001 - preserve full candidate
+                            candidate_removal_error = str(exc)
+                            log.exception(
+                                "Delta-isolation candidate archive removal failed for %s.",
+                                candidate_snapshot_id,
+                            )
+                    elif candidate_was_restored:
+                        # No mutation followed the last successful per-probe
+                        # restore, so retain that verified candidate state.
+                        candidate_restored = True
+    except Exception as exc:  # noqa: BLE001 - preserve QA's failed result
+        unexpected_error = unexpected_error or str(exc)
+        log.exception("Delta-isolation Docker sandbox failed.")
+
+    if not candidate_snapshot_created:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": [],
+            "executions": 0,
+            "diagnostic": candidate_restore_error or "candidate snapshot creation failed",
+            "candidate_restored": True,
+        }
+    tested_subsets = (
+        [list(subset) for subset in isolation.tested_subsets] if isolation is not None else []
+    )
+    executions = isolation.executions if isolation is not None else 0
+    if not candidate_restored:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": tested_subsets,
+            "executions": executions,
+            "diagnostic": (
+                "full candidate workspace could not be restored"
+                + (f": {candidate_restore_error}" if candidate_restore_error else "")
+            ),
+            "candidate_restored": False,
+        }
+    if candidate_removal_error:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": tested_subsets,
+            "executions": executions,
+            "diagnostic": f"candidate archive cleanup failed: {candidate_removal_error}",
+            "candidate_restored": True,
+        }
+    if unexpected_error:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": tested_subsets,
+            "executions": executions,
+            "diagnostic": f"delta isolation failed unexpectedly: {unexpected_error}",
+            "candidate_restored": True,
+        }
+    if isolation is None:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": [],
+            "executions": 0,
+            "diagnostic": "delta isolation did not produce a result",
+            "candidate_restored": True,
+        }
     return {
         "status": isolation.status,
         "responsible_task_ids": list(isolation.responsible_task_ids),
-        "tested_subsets": [list(subset) for subset in isolation.tested_subsets],
+        "tested_subsets": tested_subsets,
         "executions": isolation.executions,
         "diagnostic": isolation.diagnostic,
+        "candidate_restored": True,
     }
 
 
@@ -1105,8 +1373,9 @@ def _maybe_run_delta_isolation(
     target_tasks: list[RemediationTask],
     result: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Run canary attribution when a cluster test failure is ambiguous."""
-    if len(target_tasks) <= 1 or state.get("active_multi_package_action") is None:
+    """Run suspicion-ranked canaries when an atomic test failure is ambiguous."""
+    action = state.get("active_multi_package_action")
+    if len(target_tasks) <= 1 or not isinstance(action, MultiPackageAction):
         return None
     evaluations = result.get("qa_evaluations") or {}
     if not evaluations:
@@ -1131,6 +1400,55 @@ def _maybe_run_delta_isolation(
     ):
         return None
 
+    provenance = _delta_isolation_provenance(state, target_tasks, action)
+    cluster_key = str(provenance.get("cluster_id") or "unknown")
+    previous_results = state.get("delta_isolation_by_cluster") or {}
+    previous = previous_results.get(cluster_key)
+    provenance_fields = (
+        "cluster_id",
+        "dispatch_batch_id",
+        "action_digest",
+        "source_portfolio_plan_id",
+        "attempt_ids_by_task",
+    )
+    if isinstance(previous, Mapping) and all(
+        previous.get(field) == provenance[field] for field in provenance_fields
+    ):
+        return dict(previous)
+
+    mutations_by_task = _action_mutations_by_task(action, target_tasks)
+    if mutations_by_task is None:
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": [],
+            "executions": 0,
+            "diagnostic": "action mutations do not uniquely match active tasks",
+            "candidate_restored": True,
+            **provenance,
+        }
+
+    target_task_ids = [task.task_id for task in target_tasks]
+    error_logs = _collect_delta_isolation_error_text(result, target_task_ids)
+    groups_by_id = {group.group_id: group for group in state.get("valid_groups", []) or []}
+    installed_versions_by_task = _solver_installed_versions_by_task(
+        state,
+        target_tasks,
+        mutations_by_task,
+        provenance,
+    )
+    ranked_tasks = [
+        task
+        for task, _score in rank_suspect_tasks_by_suspicion(
+            target_tasks,
+            action,
+            error_logs,
+            groups_by_id,
+            installed_versions_by_task,
+        )
+    ]
+    max_canary_probes = _graph_module().get_runtime_settings().max_delta_canary_probes
+
     def qa_probe(
         sandbox: Any, _action: MultiPackageAction
     ) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
@@ -1143,10 +1461,16 @@ def _maybe_run_delta_isolation(
     isolation = run_delta_isolation_canaries(
         state,
         target_tasks,
-        state["active_multi_package_action"],
+        action,
         qa_probe,
+        ranked_tasks=ranked_tasks,
+        max_canary_probes=max_canary_probes,
     )
-    return isolation
+    return {
+        **isolation,
+        **provenance,
+        "candidate_restored": isolation.get("candidate_restored", True),
+    }
 
 
 def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
@@ -1261,7 +1585,10 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     delta_isolation = _maybe_run_delta_isolation(state, target_tasks, result)
     if delta_isolation is not None:
         result = {**result, "delta_isolation": delta_isolation}
-        if delta_isolation.get("status") == "INCONCLUSIVE":
+        if (
+            delta_isolation.get("status") == "INCONCLUSIVE"
+            and delta_isolation.get("candidate_restored") is True
+        ):
             result["qa_evaluations"] = {
                 task_id: (
                     evaluation.model_copy(
@@ -1355,12 +1682,20 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     }
     if delta_isolation is not None:
         out["delta_isolation_by_cluster"] = {
-            str(state.get("active_cluster_id") or "unknown"): delta_isolation
+            str(delta_isolation.get("cluster_id") or "unknown"): delta_isolation
         }
         if delta_isolation.get("status") == "IDENTIFIED":
+            responsible_task_ids = list(delta_isolation.get("responsible_task_ids", []))
+            blamed_task_id = responsible_task_ids[0] if len(responsible_task_ids) == 1 else None
             out["portfolio_escalation"] = {
                 "reason": "DELTA_ISOLATION_ATTRIBUTION",
-                "forced_singleton_task_ids": list(delta_isolation.get("responsible_task_ids", [])),
+                "forced_singleton_task_ids": responsible_task_ids,
+                "triggering_attempt_id": (
+                    (delta_isolation.get("attempt_ids_by_task") or {}).get(blamed_task_id)
+                    if blamed_task_id is not None
+                    else None
+                ),
+                "source_portfolio_plan_id": delta_isolation.get("source_portfolio_plan_id"),
             }
             out["portfolio_dirty"] = True
             out["portfolio_plan"] = None

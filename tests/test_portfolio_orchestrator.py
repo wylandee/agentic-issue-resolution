@@ -12,11 +12,14 @@ import pytest
 from remediation_engine.cli import _solve_output
 from remediation_engine.contracts import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
+    DependencyParentContext,
     FixPlan,
     FixPlanStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
+    MultiPackageAction,
+    PackageMutation,
     Severity,
     SupervisorDecision,
     TaskCluster,
@@ -37,6 +40,8 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
     isolate_delta_failure,
     materialize_synthetic_dependency_tasks,
     prepare_portfolio_inputs,
+    rank_suspect_tasks_by_suspicion,
+    score_suspect_package,
 )
 from remediation_engine.orchestration.portfolio_solver import (
     _build_targets_and_findings,
@@ -1205,6 +1210,147 @@ def test_delta_isolation_preserves_interaction_and_ambiguity():
     assert ambiguous.executions <= 3
 
 
+def test_bounded_delta_isolation_probes_only_the_ranked_budgeted_singletons():
+    probed = []
+    result = isolate_delta_failure(
+        ["task-d", "task-c", "task-b", "task-a"],
+        lambda subset: probed.append(subset) or "PASS",
+        ranked_suspect_task_ids=["task-c", "outside", "task-d", "task-b", "task-a"],
+        max_canary_probes=2,
+    )
+
+    assert result.status == "INCONCLUSIVE"
+    assert result.tested_subsets == (("task-c",), ("task-d",))
+    assert result.executions == 2
+    assert probed == [("task-c",), ("task-d",)]
+
+
+def test_bounded_delta_isolation_stops_on_first_ranked_failure():
+    probed = []
+    result = isolate_delta_failure(
+        ["task-a", "task-b", "task-c"],
+        lambda subset: probed.append(subset) or "FAIL",
+        ranked_suspect_task_ids=["task-b", "task-a", "task-c"],
+        max_canary_probes=3,
+    )
+
+    assert result.status == "IDENTIFIED"
+    assert result.responsible_task_ids == ("task-b",)
+    assert result.tested_subsets == (("task-b",),)
+    assert result.executions == 1
+    assert probed == [("task-b",)]
+
+
+def test_bounded_delta_isolation_counts_inconclusive_probes_against_budget():
+    probed = []
+    outcomes = iter(("INCONCLUSIVE", "FAIL"))
+    result = isolate_delta_failure(
+        ["task-a", "task-b"],
+        lambda subset: probed.append(subset) or next(outcomes),
+        ranked_suspect_task_ids=["task-a", "task-b"],
+        max_canary_probes=2,
+    )
+
+    assert result.status == "IDENTIFIED"
+    assert result.responsible_task_ids == ("task-b",)
+    assert result.tested_subsets == (("task-a",), ("task-b",))
+    assert result.executions == 2
+    assert probed == [("task-a",), ("task-b",)]
+
+
+def test_bounded_delta_isolation_uses_configured_default_budget():
+    probed = []
+    result = isolate_delta_failure(
+        ["task-a", "task-b", "task-c"],
+        lambda subset: probed.append(subset) or "PASS",
+        ranked_suspect_task_ids=["task-a", "task-b", "task-c"],
+    )
+
+    assert result.status == "INCONCLUSIVE"
+    assert result.tested_subsets == (("task-a",), ("task-b",))
+    assert result.executions == 2
+    assert probed == [("task-a",), ("task-b",)]
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_bounded_delta_isolation_rejects_nonpositive_budgets_without_probing(budget):
+    probed = []
+    result = isolate_delta_failure(
+        ["task-a"],
+        lambda subset: probed.append(subset) or "FAIL",
+        max_canary_probes=budget,
+    )
+
+    assert result.status == "INCONCLUSIVE"
+    assert result.executions == 0
+    assert result.tested_subsets == ()
+    assert probed == []
+
+
+def test_bounded_delta_isolation_rejects_empty_ranks_and_uses_sorted_budget_only():
+    probed = []
+    empty_rank = isolate_delta_failure(
+        ["task-a", "task-b"],
+        lambda subset: probed.append(subset) or "FAIL",
+        ranked_suspect_task_ids=[],
+    )
+    sorted_budget = isolate_delta_failure(
+        ["task-b", "task-a"],
+        lambda subset: probed.append(subset) or "PASS",
+        max_canary_probes=1,
+    )
+
+    assert empty_rank.status == "INCONCLUSIVE"
+    assert empty_rank.executions == 0
+    assert empty_rank.tested_subsets == ()
+    assert sorted_budget.tested_subsets == (("task-a",),)
+    assert sorted_budget.executions == 1
+    assert probed == [("task-a",)]
+
+
+@pytest.mark.parametrize("task_count", [11, 20, 30])
+def test_bounded_delta_isolation_accepts_up_to_contract_task_limit(task_count):
+    task_ids = [f"task-{index:02}" for index in range(task_count)]
+    probed = []
+    result = isolate_delta_failure(
+        task_ids,
+        lambda subset: probed.append(subset) or "FAIL",
+        ranked_suspect_task_ids=[task_ids[-1]],
+        max_canary_probes=1,
+    )
+
+    assert result.status == "IDENTIFIED"
+    assert result.responsible_task_ids == (task_ids[-1],)
+    assert result.executions == 1
+    assert probed == [(task_ids[-1],)]
+
+
+def test_bounded_delta_isolation_rejects_above_contract_task_limit_without_probing():
+    probed = []
+    result = isolate_delta_failure(
+        [f"task-{index:02}" for index in range(MAX_MULTI_PACKAGE_ACTION_SIZE + 1)],
+        lambda subset: probed.append(subset) or "FAIL",
+        max_canary_probes=1,
+    )
+
+    assert result.status == "INCONCLUSIVE"
+    assert result.executions == 0
+    assert result.tested_subsets == ()
+    assert probed == []
+
+
+def test_legacy_delta_isolation_keeps_ten_task_guard_without_new_options():
+    probed = []
+    result = isolate_delta_failure(
+        [f"task-{index:02}" for index in range(11)],
+        lambda subset: probed.append(subset) or "FAIL",
+    )
+
+    assert result.status == "INCONCLUSIVE"
+    assert result.executions == 0
+    assert probed == []
+
+
 def test_active_cluster_with_internal_dependencies_is_dispatchable(tmp_path: Path):
     _write_manifest(
         tmp_path,
@@ -2059,3 +2205,219 @@ def test_scoped_transitive_findings_become_override_solver_tasks(tmp_path: Path)
         assert task.selected_version == "2.0.0"
         assert task.portfolio_plan_id == plan.portfolio_plan_id
         assert '"overrides"' in task.instruction
+
+
+def _suspicion_mutation(task_id: str, package_name: str, target_version: str):
+    return PackageMutation(
+        task_id=task_id,
+        package_name=package_name,
+        target_version=target_version,
+        dependency_type="dependencies",
+    )
+
+
+def _suspicion_action(*mutations: PackageMutation) -> MultiPackageAction:
+    return MultiPackageAction(
+        cluster_id="cluster-test" if len(mutations) > 1 else None,
+        selected_strategy="version_bump",
+        package_mutations=list(mutations),
+        rationale="deterministic suspicion scoring test",
+    )
+
+
+@pytest.mark.parametrize(
+    ("package_name", "error_logs", "expected_score"),
+    [
+        ("lodash", "Failed while loading LODASH!", 10),
+        ("foo", "foo foo foo", 10),
+        ("foo", "xfoo foo-bar foo.bar foo_bar /node_modules/foo@1.2.3", 10),
+        ("foo", "xfoo foo-bar foo.bar foo_bar", 0),
+        ("name", "failure in @scope/name", 0),
+        ("scope", "failure in @scope/name", 0),
+        ("@Scope/Name", "failure in /node_modules/@SCOPE/NAME@2.0.0", 10),
+    ],
+)
+def test_suspicion_package_match_requires_a_case_insensitive_complete_token(
+    package_name, error_logs, expected_score
+):
+    assert score_suspect_package(package_name, "1.0.0", "1.0.0", error_logs) == expected_score
+
+
+@pytest.mark.parametrize(
+    ("target_version", "base_version", "expected_score"),
+    [
+        ("3.0.0", "2.9.9", 3),
+        ("1.3.0", "1.2.9", 1),
+        ("1.2.4", "1.2.3", 0),
+        ("1.2.3", "1.2.3", 0),
+        ("1.2.3", "1.3.0", 0),
+        ("2.0.0", "3.0.0", 0),
+        ("invalid", "1.0.0", 0),
+        ("v2.0.0-rc.1", "=1.9.9+build.3", 3),
+    ],
+)
+def test_suspicion_version_points_use_major_then_minor_only(
+    target_version, base_version, expected_score
+):
+    assert score_suspect_package("pkg", target_version, base_version, "") == expected_score
+
+
+def test_suspicion_ranking_orders_log_and_version_evidence_then_task_id():
+    specifications = [
+        ("task-error-major", "error-major", "3.0.0", "1.0.0"),
+        ("task-error-minor", "error-minor", "1.3.0", "1.2.0"),
+        ("task-major", "major-only", "2.0.0", "1.0.0"),
+        ("task-minor", "minor-only", "1.3.0", "1.2.0"),
+        ("task-patch", "patch-only", "1.2.4", "1.2.3"),
+        ("task-tie-z", "tie-z", "1.2.4", "1.2.3"),
+        ("task-tie-a", "tie-a", "1.2.4", "1.2.3"),
+    ]
+    tasks = []
+    groups = {}
+    mutations = []
+    for task_id, package_name, target, base in specifications:
+        group = _group(package_name, "package.json", package_version=base, fixed_version=target)
+        task = build_initial_remediation_task(group, task_id)
+        task.selected_version = "99.0.0"
+        tasks.append(task)
+        groups[group.group_id] = group
+        mutations.append(_suspicion_mutation(task_id, package_name, target))
+
+    ranked = rank_suspect_tasks_by_suspicion(
+        tasks,
+        _suspicion_action(*mutations),
+        "ERROR-MAJOR failed; error-minor failed",
+        groups,
+    )
+
+    assert [task.task_id for task, _ in ranked] == [
+        "task-error-major",
+        "task-error-minor",
+        "task-major",
+        "task-minor",
+        "task-patch",
+        "task-tie-a",
+        "task-tie-z",
+    ]
+    assert [score for _, score in ranked] == [13, 11, 3, 1, 0, 0, 0]
+
+
+def test_suspicion_ranking_prefers_present_solver_baselines_over_group_fallback():
+    group = _group("pkg", "package.json", package_version="1.9.0", fixed_version="2.1.0")
+    task = build_initial_remediation_task(group, "task-pkg")
+    task.selected_version = "99.0.0"
+    action = _suspicion_action(_suspicion_mutation("task-pkg", "pkg", "2.1.0"))
+    groups = {group.group_id: group}
+
+    exact_solver_baseline = rank_suspect_tasks_by_suspicion(
+        [task], action, "", groups, {"task-pkg": "2.0.0"}
+    )
+    unavailable_solver_baseline = rank_suspect_tasks_by_suspicion(
+        [task], action, "", groups, {"task-pkg": "unknown"}
+    )
+    absent_solver_baseline = rank_suspect_tasks_by_suspicion(
+        [task], action, "", groups, {"task-pkg": None}
+    )
+    group_fallback = rank_suspect_tasks_by_suspicion([task], action, "", groups)
+
+    assert exact_solver_baseline[0][1] == 1
+    assert unavailable_solver_baseline[0][1] == 0
+    assert absent_solver_baseline[0][1] == 0
+    assert group_fallback[0][1] == 3
+
+
+def test_suspicion_ranking_uses_only_exact_unambiguous_group_fallbacks():
+    parent_group = _group("child", "package.json", package_version="1.0.0")
+    parent_group.dependency_versions = {"parent": "2.0.0"}
+    parent_task = build_initial_remediation_task(parent_group, "task-parent")
+    parent_task.parent_package_name = "parent"
+    parent_task.parent_package_version = "1.9.0"
+    parent_action = _suspicion_action(_suspicion_mutation("task-parent", "parent", "2.1.0"))
+    parent_score = rank_suspect_tasks_by_suspicion(
+        [parent_task],
+        parent_action,
+        "",
+        {parent_group.group_id: parent_group},
+    )[0][1]
+
+    dependency_group = _group("child", "package.json", package_version="1.0.0")
+    dependency_group.dependency_versions = {"child": "2.0.0", "other": "1.0.0"}
+    dependency_task = build_initial_remediation_task(dependency_group, "task-dependency")
+    dependency_score = rank_suspect_tasks_by_suspicion(
+        [dependency_task],
+        _suspicion_action(_suspicion_mutation("task-dependency", "child", "2.1.0")),
+        "",
+        {dependency_group.group_id: dependency_group},
+    )[0][1]
+
+    context_group = _group("child", "package.json", package_version="1.0.0").model_copy(
+        update={
+            "parent_package_name": None,
+            "parent_package_version": None,
+            "parent_contexts": [
+                DependencyParentContext(package_name="parent", package_version="2.0.0")
+            ],
+        }
+    )
+    context_task = build_initial_remediation_task(context_group, "task-context")
+    context_task.parent_package_name = None
+    context_task.parent_package_version = None
+    context_score = rank_suspect_tasks_by_suspicion(
+        [context_task],
+        _suspicion_action(_suspicion_mutation("task-context", "parent", "2.1.0")),
+        "",
+        {context_group.group_id: context_group},
+    )[0][1]
+
+    unique_group = _group("child", "package.json", package_version="1.0.0")
+    unique_task = build_initial_remediation_task(unique_group, "task-unique")
+    unique_score = rank_suspect_tasks_by_suspicion(
+        [unique_task],
+        _suspicion_action(_suspicion_mutation("task-unique", "child", "2.0.0")),
+        "",
+        {unique_group.group_id: unique_group},
+    )[0][1]
+    ambiguous_group = unique_group.model_copy(update={"versions": ["1.0.0", "1.1.0"]})
+    ambiguous_task = build_initial_remediation_task(ambiguous_group, "task-ambiguous")
+    ambiguous_score = rank_suspect_tasks_by_suspicion(
+        [ambiguous_task],
+        _suspicion_action(_suspicion_mutation("task-ambiguous", "child", "2.0.0")),
+        "",
+        {ambiguous_group.group_id: ambiguous_group},
+    )[0][1]
+    missing_group_task = build_initial_remediation_task(unique_group, "task-missing-group")
+    missing_group_score = rank_suspect_tasks_by_suspicion(
+        [missing_group_task],
+        _suspicion_action(_suspicion_mutation("task-missing-group", "child", "2.0.0")),
+        "",
+    )[0][1]
+
+    assert parent_score == 3
+    assert dependency_score == 1
+    assert context_score == 1
+    assert unique_score == 3
+    assert ambiguous_score == 0
+    assert missing_group_score == 0
+
+
+def test_suspicion_ranking_scores_missing_or_duplicate_mutations_as_zero():
+    group = _group("pkg", "package.json", package_version="1.0.0", fixed_version="2.0.0")
+    task = build_initial_remediation_task(group, "task-pkg")
+    missing_mutation = rank_suspect_tasks_by_suspicion(
+        [task],
+        _suspicion_action(_suspicion_mutation("other-task", "other", "2.0.0")),
+        "pkg failed",
+        {group.group_id: group},
+    )
+    duplicate_mutation = rank_suspect_tasks_by_suspicion(
+        [task],
+        _suspicion_action(
+            _suspicion_mutation("task-pkg", "pkg", "2.0.0"),
+            _suspicion_mutation("task-pkg", "other", "2.0.0"),
+        ),
+        "pkg failed",
+        {group.group_id: group},
+    )
+
+    assert missing_mutation == [(task, 0)]
+    assert duplicate_mutation == [(task, 0)]

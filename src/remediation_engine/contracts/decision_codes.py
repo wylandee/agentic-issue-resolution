@@ -47,6 +47,7 @@ VALID_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("optimistically_fixed", "qa_passed"),
         ("optimistically_fixed", "needs_retry"),
         ("optimistically_fixed", "inconclusive"),
+        ("optimistically_fixed", "pending"),
         # The final NO_FIX mitigation stage is terminalized directly after
         # its QA failure; there is no third worker stage to dispatch.
         ("optimistically_fixed", "unfixable"),

@@ -93,3 +93,25 @@ def test_candidate_limit_default_and_override(monkeypatch):
 
     monkeypatch.setenv(variable, "96")
     assert AppSettings.from_env().solver_max_candidates_per_target == 96
+
+
+def test_delta_canary_probe_budget_default_and_override(monkeypatch):
+    variable = "REMEDY_MAX_DELTA_CANARY_PROBES"
+    monkeypatch.delenv(variable, raising=False)
+
+    assert AppSettings().max_delta_canary_probes == 2
+    assert AppSettings.from_env().max_delta_canary_probes == 2
+
+    monkeypatch.setenv(variable, "5")
+    assert AppSettings.from_env().max_delta_canary_probes == 5
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("0", "must be at least 1"), ("not-an-integer", "must be an integer")],
+)
+def test_delta_canary_probe_budget_requires_positive_integer(monkeypatch, value, message):
+    monkeypatch.setenv("REMEDY_MAX_DELTA_CANARY_PROBES", value)
+
+    with pytest.raises(ValueError, match=message):
+        AppSettings.from_env()

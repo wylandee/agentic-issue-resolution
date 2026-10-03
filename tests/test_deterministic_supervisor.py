@@ -188,6 +188,7 @@ def test_transition_table_accepts_worker_and_qa_edges_and_rejects_terminal_edges
     assert validate_transition(TaskStatus.PENDING, TaskStatus.OPTIMISTICALLY_FIXED)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.UNFIXABLE)
+    assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.QA_PASSED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.PENDING, TaskStatus.QA_PASSED)
 

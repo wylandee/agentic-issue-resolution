@@ -4,6 +4,7 @@ Tests for the Phase 5 LangGraph orchestrator wiring.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,8 +20,13 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    MultiPackageAction,
+    PackageMutation,
+    QADeterministicGates,
     QAEvaluation,
+    QAFailureEvidence,
     QAPolicy,
+    QATestAttribution,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
@@ -38,6 +44,7 @@ from remediation_engine.orchestration import (
     orchestrator_engine,
     run_orchestrator,
 )
+from remediation_engine.orchestration import graph_wrappers as _graph_wrappers
 from remediation_engine.orchestration.graph import (
     MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _finish_workspace_attempt_snapshot,
@@ -51,6 +58,8 @@ from remediation_engine.orchestration.graph import (
 )
 from remediation_engine.orchestration.supervisor_node import instruction_digest, run_supervisor_node
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.settings import AppSettings
+from remediation_engine.triage.grouper import group_issues
 
 
 def _issue(issue_type: IssueType, file_path: str | None = None) -> VulnerabilityIssue:
@@ -1892,3 +1901,1440 @@ class TestPhase5Exports:
             ("attempt-sibling-baseline",),
         ]
         assert result["workspace_rollback_anchors_by_task"] == {}
+
+
+class _DeltaSandbox:
+    """In-memory archive adapter for delta-isolation workspace tests."""
+
+    def __init__(
+        self,
+        workspace: dict[str, str],
+        archives: dict[str, dict[str, str]],
+        *,
+        fail_candidate_restore: bool = False,
+        fail_candidate_remove: bool = False,
+        fail_snapshot_create: bool = False,
+        fail_preworker_restore_once: bool = False,
+    ) -> None:
+        self.workspace = workspace
+        self.archives = archives
+        self.fail_candidate_restore = fail_candidate_restore
+        self.fail_candidate_remove = fail_candidate_remove
+        self.fail_preworker_restore_once = fail_preworker_restore_once
+        self.preworker_restore_failed = False
+        self.fail_snapshot_create = fail_snapshot_create
+        self.events: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def create_workspace_snapshot(self, snapshot_id: str) -> None:
+        self.events.append(("create", snapshot_id, dict(self.workspace)))
+        if self.fail_snapshot_create and snapshot_id.startswith("delta-candidate-"):
+            raise RuntimeError("candidate archive unavailable")
+        self.archives[snapshot_id] = dict(self.workspace)
+
+    def restore_workspace_snapshot(self, snapshot_id: str) -> None:
+        self.events.append(("restore_attempt", snapshot_id))
+        if self.fail_candidate_restore and snapshot_id.startswith("delta-candidate-"):
+            raise RuntimeError("candidate archive cannot be restored")
+        if (
+            self.fail_preworker_restore_once
+            and snapshot_id.startswith("batch-")
+            and not self.preworker_restore_failed
+        ):
+            self.preworker_restore_failed = True
+            raise RuntimeError("pre-worker archive temporarily unavailable")
+        if snapshot_id not in self.archives:
+            raise RuntimeError(f"missing archive {snapshot_id}")
+        self.workspace.clear()
+        self.workspace.update(self.archives[snapshot_id])
+        self.events.append(("restored", snapshot_id, dict(self.workspace)))
+
+    def remove_workspace_snapshot(self, snapshot_id: str) -> None:
+        self.events.append(("remove_attempt", snapshot_id))
+        if self.fail_candidate_remove and snapshot_id.startswith("delta-candidate-"):
+            raise RuntimeError("candidate archive cannot be removed")
+        self.archives.pop(snapshot_id, None)
+        self.events.append(("removed", snapshot_id))
+
+
+def _delta_test_setup(tmp_path, *, batch_id="batch-delta", attempt_prefix="attempt-delta"):
+    groups = [
+        _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+    ]
+    cluster_id = "cluster-delta"
+    portfolio_plan_id = "portfolio-delta"
+    tasks = []
+    for suffix, group in zip(("a", "b"), groups, strict=True):
+        task_id = f"task-{suffix}"
+        task = build_initial_remediation_task(group, task_id).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": f"{attempt_prefix}-{task_id}",
+                "selected_version": "2.0.0",
+                "target_package_name": f"pkg-{suffix}",
+                "target_dependency_type": "dependencies",
+                "instruction": f"Update pkg-{suffix} to 2.0.0.",
+            }
+        )
+        tasks.append(task)
+    action = MultiPackageAction(
+        cluster_id=cluster_id,
+        dispatch_batch_id=batch_id,
+        selected_strategy="version_bump",
+        package_mutations=[
+            PackageMutation(
+                task_id=task.task_id,
+                package_name=task.target_package_name,
+                target_version="2.0.0",
+                dependency_type="dependencies",
+            )
+            for task in tasks
+        ],
+        rationale="test atomic delta isolation",
+    )
+    action_digest = instruction_digest(action.model_dump_json())
+    snapshots = {}
+    for task in tasks:
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=task.current_attempt_id,
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=batch_id,
+            action_digest=action_digest,
+            portfolio_plan_id=portfolio_plan_id,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            target_package_name=task.target_package_name,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        snapshots[snapshot.attempt_id] = snapshot
+    decisions = [
+        SimpleNamespace(
+            task_id=task.task_id,
+            target_package_name=task.target_package_name,
+            installed_version="1.0.0",
+        )
+        for task in tasks
+    ]
+    state = _initial_state(tmp_path, groups)
+    state.update(
+        {
+            "workspace_volume": "workspace-delta",
+            "task_queue": {task.task_id: task for task in tasks},
+            "active_target_task_ids": ["task-b", "task-a"],
+            "active_cluster_id": cluster_id,
+            "active_dispatch_batch_id": batch_id,
+            "active_multi_package_action": action,
+            "attempt_snapshots_by_id": snapshots,
+            "portfolio_plan": SimpleNamespace(
+                portfolio_plan_id=portfolio_plan_id,
+                solver_plan=SimpleNamespace(
+                    selected_plan=SimpleNamespace(task_decisions=decisions)
+                ),
+            ),
+            "delta_isolation_by_cluster": {},
+        }
+    )
+    return state, tasks, action, groups, snapshots
+
+
+def _failed_delta_qa_result(tasks):
+    evaluations = {}
+    errors_by_task = {}
+    for task in tasks:
+        suffix = task.task_id[-1]
+        package_name = task.target_package_name
+        evaluations[task.task_id] = QAEvaluation(
+            task_id=task.task_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback=f"{suffix} retry feedback",
+            failure_evidence=QAFailureEvidence(
+                raw_excerpt=f"{package_name} raw excerpt",
+                exact_diagnostics=[f"{suffix} exact diagnostic 1", f"{suffix} exact diagnostic 2"],
+                failed_tests=[f"{suffix} failed test"],
+            ),
+            deterministic_gates=QADeterministicGates(
+                status="fail",
+                install_passed=True,
+                scanner_execution_status="success",
+                tests_passed=False,
+                diagnostics=[f"{suffix} gate diagnostic"],
+            ),
+            test_attribution=QATestAttribution(
+                verdict="inconclusive",
+                failed_tests=[f"{suffix} attributed failed test"],
+            ),
+        )
+        errors_by_task[task.task_id] = [f"{suffix} QA error"]
+    return {
+        "qa_evaluations": evaluations,
+        "qa_errors_by_task": errors_by_task,
+        "qa_investigation_report": "excluded investigation report",
+        "eval_status": "some_failed",
+        "status": "qa_completed",
+        "errors": [],
+    }
+
+
+def _apply_fake_delta_action(sandbox, action, touched_files):
+    package_names = []
+    for mutation in action.package_mutations:
+        sandbox.workspace[mutation.package_name] = mutation.target_version
+        package_names.append(mutation.package_name)
+        touched_files.add("package.json")
+    sandbox.events.append(("applied", tuple(package_names), dict(sandbox.workspace)))
+    return True, None
+
+
+def test_delta_isolation_canaries_probe_baseline_singletons_and_restore_full_candidate(
+    tmp_path, monkeypatch
+):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives)
+    observations = []
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    def qa_probe(active_sandbox, subset_action):
+        package_names = tuple(mutation.package_name for mutation in subset_action.package_mutations)
+        observations.append((package_names, dict(active_sandbox.workspace)))
+        return "FAIL" if package_names == ("pkg-b",) else "PASS"
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        qa_probe,
+        ranked_tasks=tasks,
+        max_canary_probes=2,
+    )
+
+    candidate_id = (
+        "delta-candidate-" + hashlib.sha256(b"batch-delta:task-a,task-b").hexdigest()[:24]
+    )
+    assert result["status"] == "IDENTIFIED"
+    assert result["responsible_task_ids"] == ["task-b"]
+    assert result["candidate_restored"] is True
+    assert result["executions"] == 2
+    assert observations == [
+        (("pkg-a",), {"pkg-a": "2.0.0", "pkg-b": "1.0.0"}),
+        (("pkg-b",), {"pkg-a": "1.0.0", "pkg-b": "2.0.0"}),
+    ]
+    candidate_restores = [
+        event for event in sandbox.events if event[0] == "restored" and event[1] == candidate_id
+    ]
+    assert len(candidate_restores) == 3
+    assert all(event[2] == candidate for event in candidate_restores)
+    assert sandbox.workspace == candidate
+    assert archives["batch-delta"] == baseline
+    assert candidate_id not in archives
+    assert sandbox.events.index(("removed", candidate_id)) > max(
+        index
+        for index, event in enumerate(sandbox.events)
+        if event[0] == "restored" and event[1] == candidate_id
+    )
+
+
+def test_delta_isolation_candidate_restore_failure_rolls_back_original_qa_failure(
+    tmp_path, monkeypatch
+):
+    state, tasks, _action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives, fail_candidate_restore=True)
+    original_qa = _failed_delta_qa_result(tasks)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        lambda _state: original_qa,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=1,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        lambda _sandbox: SimpleNamespace(ok=False),
+    )
+
+    result = run_qa_critic_from_orchestrator(state)
+
+    isolation = result["delta_isolation_by_cluster"]["cluster-delta"]
+    assert isolation["status"] == "INCONCLUSIVE"
+    assert isolation["candidate_restored"] is False
+    assert isolation["responsible_task_ids"] == []
+    assert isolation["executions"] == 1
+    assert (
+        result["qa_results_by_attempt"]["attempt-delta-task-a"].evaluation.evidence_inconclusive
+        is False
+    )
+    assert (
+        result["qa_results_by_attempt"]["attempt-delta-task-a"].evaluation.retry_feedback
+        == "a retry feedback"
+    )
+    assert sandbox.workspace == baseline
+    assert "batch-delta" not in archives
+    assert any(snapshot_id.startswith("delta-candidate-") for snapshot_id in archives)
+    assert not any(
+        event[0] == "removed" and event[1].startswith("delta-candidate-")
+        for event in sandbox.events
+    )
+
+
+def test_delta_isolation_archive_removal_failure_clears_attribution(tmp_path, monkeypatch):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives, fail_candidate_remove=True)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        lambda _sandbox, _action: "FAIL",
+        ranked_tasks=tasks,
+        max_canary_probes=1,
+    )
+
+    assert result["status"] == "INCONCLUSIVE"
+    assert result["candidate_restored"] is True
+    assert result["responsible_task_ids"] == []
+    assert result["executions"] == 1
+    assert sandbox.workspace == candidate
+    assert "batch-delta" in archives
+    assert any(snapshot_id.startswith("delta-candidate-") for snapshot_id in archives)
+
+
+def test_delta_isolation_snapshot_creation_failure_never_probes(tmp_path, monkeypatch):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    archives = {"batch-delta": {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    sandbox = _DeltaSandbox(candidate.copy(), archives, fail_snapshot_create=True)
+    qa_calls = []
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        lambda *_args: qa_calls.append(True) or "FAIL",
+        ranked_tasks=tasks,
+        max_canary_probes=2,
+    )
+
+    assert result["status"] == "INCONCLUSIVE"
+    assert result["candidate_restored"] is True
+    assert result["executions"] == 0
+    assert qa_calls == []
+    assert sandbox.workspace == candidate
+    assert archives == {"batch-delta": {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}}
+
+
+def test_delta_isolation_error_aggregation_settings_and_dispatch_provenance(tmp_path, monkeypatch):
+    state, tasks, action, groups, _snapshots = _delta_test_setup(tmp_path)
+    result = _failed_delta_qa_result(tasks)
+    result.update(
+        {
+            "errors": "top-level error",
+            "diagnostics": ("top diagnostic", None, " ", 99, "second diagnostic"),
+            "qa_errors_by_task": {
+                "task-b": ("b QA error", 12, "b second QA error"),
+                "task-a": ["a QA error", None, "a second QA error"],
+            },
+            "qa_investigation_report": "do-not-include this report transcript",
+        }
+    )
+    expected_entries = [
+        "top-level error",
+        "top diagnostic",
+        "second diagnostic",
+        "a QA error",
+        "a second QA error",
+        "b QA error",
+        "b second QA error",
+        "pkg-a raw excerpt",
+        "a exact diagnostic 1",
+        "a exact diagnostic 2",
+        "a failed test",
+        "a gate diagnostic",
+        "a attributed failed test",
+        "a retry feedback",
+        "pkg-b raw excerpt",
+        "b exact diagnostic 1",
+        "b exact diagnostic 2",
+        "b failed test",
+        "b gate diagnostic",
+        "b attributed failed test",
+        "b retry feedback",
+    ]
+    expected_error_text = "\n".join(expected_entries)
+    ranked_task_ids = []
+    captured = {}
+
+    def ranker(active_tasks, active_action, error_logs, groups_by_id, installed_by_task):
+        captured["error_logs"] = error_logs
+        captured["groups"] = groups_by_id
+        captured["installed_versions"] = installed_by_task
+        return [(tasks[1], 13), (tasks[0], 3)]
+
+    def canaries(
+        active_state,
+        active_tasks,
+        active_action,
+        qa_probe,
+        *,
+        ranked_tasks,
+        max_canary_probes,
+    ):
+        captured["ranked_task_ids"] = [task.task_id for task in ranked_tasks]
+        captured["max_canary_probes"] = max_canary_probes
+        ranked_task_ids.extend(captured["ranked_task_ids"])
+        return {
+            "status": "INCONCLUSIVE",
+            "responsible_task_ids": [],
+            "tested_subsets": [["task-b"]],
+            "executions": 1,
+            "diagnostic": "budget exhausted",
+            "candidate_restored": True,
+        }
+
+    monkeypatch.setattr(_graph_wrappers, "rank_suspect_tasks_by_suspicion", ranker)
+    monkeypatch.setattr(_graph_wrappers, "run_delta_isolation_canaries", canaries)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(max_delta_canary_probes=1),
+    )
+
+    isolation = _graph_wrappers._maybe_run_delta_isolation(state, tasks, result)
+
+    assert captured["error_logs"] == expected_error_text
+    assert "do-not-include" not in captured["error_logs"]
+    assert captured["groups"] == {group.group_id: group for group in groups}
+    assert captured["installed_versions"] == {
+        "task-a": "1.0.0",
+        "task-b": "1.0.0",
+    }
+    assert ranked_task_ids == ["task-b", "task-a"]
+    assert captured["max_canary_probes"] == 1
+    assert isolation["status"] == "INCONCLUSIVE"
+    assert isolation["candidate_restored"] is True
+    assert isolation["cluster_id"] == "cluster-delta"
+    assert isolation["dispatch_batch_id"] == "batch-delta"
+    assert isolation["action_digest"] == instruction_digest(action.model_dump_json())
+    assert isolation["source_portfolio_plan_id"] == "portfolio-delta"
+    assert isolation["attempt_ids_by_task"] == {
+        "task-a": "attempt-delta-task-a",
+        "task-b": "attempt-delta-task-b",
+    }
+
+
+def test_delta_isolation_solver_baselines_require_one_matching_current_portfolio_plan(
+    tmp_path,
+):
+    state, tasks, action, _groups, snapshots = _delta_test_setup(tmp_path)
+    mutations_by_task = _graph_wrappers._action_mutations_by_task(action, tasks)
+    provenance = _graph_wrappers._delta_isolation_provenance(state, tasks, action)
+
+    state["portfolio_plan"].solver_plan.selected_plan.task_decisions[0].installed_version = None
+    state["portfolio_plan"].solver_plan.selected_plan.task_decisions[
+        1
+    ].installed_version = "unknown"
+    matching_versions = _graph_wrappers._solver_installed_versions_by_task(
+        state, tasks, mutations_by_task, provenance
+    )
+    assert matching_versions == {"task-a": None, "task-b": "unknown"}
+
+    stale_snapshot = snapshots[tasks[0].current_attempt_id].model_copy(
+        update={"portfolio_plan_id": "portfolio-stale"}
+    )
+    state["attempt_snapshots_by_id"][stale_snapshot.attempt_id] = stale_snapshot
+    stale_provenance = _graph_wrappers._delta_isolation_provenance(state, tasks, action)
+    assert (
+        _graph_wrappers._solver_installed_versions_by_task(
+            state, tasks, mutations_by_task, stale_provenance
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("malformation", ["missing", "duplicate"])
+def test_delta_isolation_action_task_id_mismatch_is_rejected_before_any_probe(
+    tmp_path, monkeypatch, malformation
+):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    if malformation == "missing":
+        mutations = action.package_mutations[:1]
+    else:
+        mutations = [
+            action.package_mutations[0],
+            PackageMutation(
+                task_id=tasks[0].task_id,
+                package_name="pkg-extra",
+                target_version="2.0.0",
+                dependency_type="dependencies",
+            ),
+        ]
+    malformed_action = MultiPackageAction(
+        cluster_id=action.cluster_id,
+        dispatch_batch_id=action.dispatch_batch_id,
+        selected_strategy=action.selected_strategy,
+        package_mutations=mutations,
+        rationale=action.rationale,
+    )
+    state["active_multi_package_action"] = malformed_action
+    ranker = MagicMock()
+    canaries = MagicMock()
+    apply_action = MagicMock()
+    sandbox = MagicMock()
+    monkeypatch.setattr(_graph_wrappers, "rank_suspect_tasks_by_suspicion", ranker)
+    monkeypatch.setattr(_graph_wrappers, "run_delta_isolation_canaries", canaries)
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", apply_action)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+
+    isolation = _graph_wrappers._maybe_run_delta_isolation(
+        state, tasks, _failed_delta_qa_result(tasks)
+    )
+
+    assert isolation["status"] == "INCONCLUSIVE"
+    assert isolation["candidate_restored"] is True
+    assert isolation["executions"] == 0
+    assert isolation["tested_subsets"] == []
+    ranker.assert_not_called()
+    canaries.assert_not_called()
+    apply_action.assert_not_called()
+    sandbox.create_workspace_snapshot.assert_not_called()
+
+
+def test_qa_delta_isolation_attribution_projects_provenance_and_escalates_only_after_restore(
+    tmp_path, monkeypatch
+):
+    state, tasks, _action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives)
+    qa_result = _failed_delta_qa_result(tasks)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        lambda _state: qa_result,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=2,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+
+    def run_unit_tests(active_sandbox):
+        blame_b = (
+            active_sandbox.workspace["pkg-b"] == "2.0.0"
+            and active_sandbox.workspace["pkg-a"] == "1.0.0"
+        )
+        return SimpleNamespace(ok=not blame_b)
+
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        run_unit_tests,
+    )
+
+    result = run_qa_critic_from_orchestrator(state)
+
+    isolation = result["delta_isolation_by_cluster"]["cluster-delta"]
+    assert isolation["status"] == "IDENTIFIED"
+    assert isolation["responsible_task_ids"] == ["task-b"]
+    assert isolation["candidate_restored"] is True
+    assert isolation["executions"] == 2
+    assert result["portfolio_escalation"] == {
+        "reason": "DELTA_ISOLATION_ATTRIBUTION",
+        "forced_singleton_task_ids": ["task-b"],
+        "triggering_attempt_id": "attempt-delta-task-b",
+        "source_portfolio_plan_id": "portfolio-delta",
+    }
+    assert result["portfolio_dirty"] is True
+    assert result["portfolio_plan"] is None
+    assert all(
+        not result["qa_results_by_attempt"][
+            f"attempt-delta-{task.task_id}"
+        ].evaluation.evidence_inconclusive
+        for task in tasks
+    )
+    assert sandbox.workspace == baseline
+    assert "batch-delta" not in archives
+
+
+def test_same_dispatch_delta_isolation_qa_rerun_reuses_isolation_and_new_dispatch_gets_budget(
+    tmp_path, monkeypatch
+):
+    state, tasks, _action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives)
+    apply_calls = []
+    qa_critic_calls = []
+
+    def qa_critic(active_state):
+        qa_critic_calls.append(True)
+        return _failed_delta_qa_result(
+            [
+                active_state["task_queue"][task_id]
+                for task_id in active_state["active_target_task_ids"]
+            ]
+        )
+
+    def apply_action(active_sandbox, action, touched_files):
+        apply_calls.append(tuple(mutation.task_id for mutation in action.package_mutations))
+        return _apply_fake_delta_action(active_sandbox, action, touched_files)
+
+    monkeypatch.setattr("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=1,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", apply_action)
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+
+    first = run_qa_critic_from_orchestrator(state)
+    rerun_state = {
+        **state,
+        "delta_isolation_by_cluster": first["delta_isolation_by_cluster"],
+    }
+    second = run_qa_critic_from_orchestrator(rerun_state)
+
+    assert first["delta_isolation_by_cluster"]["cluster-delta"]["executions"] == 1
+    assert (
+        second["delta_isolation_by_cluster"]["cluster-delta"]
+        == first["delta_isolation_by_cluster"]["cluster-delta"]
+    )
+    assert len(apply_calls) == 1
+    assert (
+        len(
+            [
+                event
+                for event in sandbox.events
+                if event[0] == "create" and event[1].startswith("delta-candidate-")
+            ]
+        )
+        == 1
+    )
+
+    fresh_state, fresh_tasks, _fresh_action, _fresh_groups, _fresh_snapshots = _delta_test_setup(
+        tmp_path,
+        batch_id="batch-fresh",
+        attempt_prefix="attempt-fresh",
+    )
+    fresh_state["delta_isolation_by_cluster"] = first["delta_isolation_by_cluster"]
+    archives["batch-fresh"] = baseline.copy()
+    sandbox.workspace.clear()
+    sandbox.workspace.update(candidate)
+    fresh = run_qa_critic_from_orchestrator(fresh_state)
+
+    assert fresh["delta_isolation_by_cluster"]["cluster-delta"]["executions"] == 1
+    assert len(apply_calls) == 2
+    assert len(qa_critic_calls) == 3
+    assert (
+        len(
+            [
+                event
+                for event in sandbox.events
+                if event[0] == "create" and event[1].startswith("delta-candidate-")
+            ]
+        )
+        == 2
+    )
+    assert fresh["delta_isolation_by_cluster"]["cluster-delta"]["attempt_ids_by_task"] == {
+        "task-a": "attempt-fresh-task-a",
+        "task-b": "attempt-fresh-task-b",
+    }
+
+
+def test_delta_isolation_preworker_restore_failure_consumes_slot_and_continues(
+    tmp_path, monkeypatch
+):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(
+        candidate.copy(),
+        archives,
+        fail_preworker_restore_once=True,
+    )
+    qa_subsets = []
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    def qa_probe(active_sandbox, subset_action):
+        task_ids = tuple(mutation.task_id for mutation in subset_action.package_mutations)
+        qa_subsets.append((task_ids, dict(active_sandbox.workspace)))
+        return "FAIL"
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        qa_probe,
+        ranked_tasks=tasks,
+        max_canary_probes=2,
+    )
+
+    assert result["status"] == "IDENTIFIED"
+    assert result["responsible_task_ids"] == ["task-b"]
+    assert result["tested_subsets"] == [["task-a"], ["task-b"]]
+    assert result["executions"] == 2
+    assert qa_subsets == [(("task-b",), {"pkg-a": "1.0.0", "pkg-b": "2.0.0"})]
+    assert sandbox.workspace == candidate
+    assert archives["batch-delta"] == baseline
+    assert not any(snapshot_id.startswith("delta-candidate-") for snapshot_id in archives)
+
+
+def test_delta_isolation_probe_exception_consumes_slot_before_later_failure(tmp_path, monkeypatch):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    sandbox = _DeltaSandbox(candidate.copy(), archives)
+    qa_subsets = []
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    def qa_probe(active_sandbox, subset_action):
+        task_ids = tuple(mutation.task_id for mutation in subset_action.package_mutations)
+        qa_subsets.append(task_ids)
+        if task_ids == ("task-a",):
+            raise RuntimeError("unit-test runner failed")
+        return "FAIL"
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        qa_probe,
+        ranked_tasks=tasks,
+        max_canary_probes=2,
+    )
+
+    assert result["status"] == "IDENTIFIED"
+    assert result["responsible_task_ids"] == ["task-b"]
+    assert result["tested_subsets"] == [["task-a"], ["task-b"]]
+    assert result["executions"] == 2
+    assert qa_subsets == [("task-a",), ("task-b",)]
+    assert sandbox.workspace == candidate
+    assert archives["batch-delta"] == baseline
+
+
+@pytest.fixture
+def socket_stack_delta_case(tmp_path):
+    """Build one atomic three-package case from the canonical baseline issues."""
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "juice_shop"
+        / "fixtures"
+        / "baseline_issues.jsonl"
+    )
+    target_packages = {"socket.io", "engine.io", "socket.io-parser"}
+    baseline_issues = []
+    for line in fixture_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        issue = VulnerabilityIssue.model_validate_json(line)
+        if issue.package_name in target_packages:
+            baseline_issues.append(issue)
+    groups = group_issues(baseline_issues)
+    groups_by_package = {group.vulnerable_component: group for group in groups}
+    assert set(groups_by_package) == target_packages
+    assert {
+        package_name: len(group.issues) for package_name, group in groups_by_package.items()
+    } == {"socket.io": 1, "engine.io": 3, "socket.io-parser": 4}
+
+    package_plan = [
+        ("task-a", "socket.io", "3.1.2", "4.8.1"),
+        ("task-b", "engine.io", "4.1.2", "6.6.7"),
+        ("task-c", "socket.io-parser", "4.0.5", "4.2.6"),
+    ]
+    cluster_id = "cluster-socket-stack"
+    dispatch_batch_id = "batch-socket-stack"
+    portfolio_plan_id = "portfolio-socket-stack"
+    tasks = []
+    for task_id, package_name, _installed_version, target_version in package_plan:
+        task = build_initial_remediation_task(
+            groups_by_package[package_name],
+            task_id,
+        ).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": f"attempt-{task_id}",
+                "portfolio_plan_id": portfolio_plan_id,
+                "strategy": RoutingStrategy.VERSION_BUMP,
+                "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                "no_fix_stage": None,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "status": TaskStatus.OPTIMISTICALLY_FIXED,
+                "retry_count": 0,
+                "selected_version": target_version,
+                "allowed_target_versions": [target_version],
+                "allowed_dependency_types": ["overrides"],
+                "target_package_name": package_name,
+                "target_dependency_type": "overrides",
+                "instruction": (
+                    f"Apply the committed package override for {package_name} "
+                    f"at exact version {target_version}."
+                ),
+            }
+        )
+        tasks.append(task)
+
+    action = MultiPackageAction(
+        cluster_id=cluster_id,
+        dispatch_batch_id=dispatch_batch_id,
+        selected_strategy="package_override",
+        package_mutations=[
+            PackageMutation(
+                task_id=task.task_id,
+                package_name=task.target_package_name,
+                target_version=task.selected_version,
+                dependency_type="overrides",
+            )
+            for task in tasks
+        ],
+        rationale="Exercise bounded delta isolation on the Socket.IO dependency stack.",
+    )
+    action_digest = instruction_digest(action.model_dump_json())
+    snapshots = {}
+    worker_results = {}
+    for task in tasks:
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=task.current_attempt_id,
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            portfolio_plan_id=portfolio_plan_id,
+            qa_policy=task.qa_policy,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            target_package_name=task.target_package_name,
+            target_dependency_type=task.target_dependency_type,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        snapshots[snapshot.attempt_id] = snapshot
+        worker_results[snapshot.attempt_id] = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            status=AgentActionStatus.SUCCESS,
+            execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+            instruction_digest=snapshot.instruction_digest,
+        )
+
+    solver_decisions = [
+        SimpleNamespace(
+            task_id=task_id,
+            target_package_name=package_name,
+            installed_version=installed_version,
+        )
+        for task_id, package_name, installed_version, _target_version in package_plan
+    ]
+    state = _initial_state(tmp_path, groups)
+    state.update(
+        {
+            "workspace_volume": "workspace-socket-stack",
+            "task_queue": {task.task_id: task for task in tasks},
+            "active_target_task_ids": [task.task_id for task in tasks],
+            "active_cluster_id": cluster_id,
+            "active_dispatch_batch_id": dispatch_batch_id,
+            "active_multi_package_action": action,
+            "attempt_snapshots_by_id": snapshots,
+            "worker_results_by_attempt": worker_results,
+            "portfolio_plan": SimpleNamespace(
+                portfolio_plan_id=portfolio_plan_id,
+                solver_plan=SimpleNamespace(
+                    selected_plan=SimpleNamespace(task_decisions=solver_decisions)
+                ),
+            ),
+            "delta_isolation_by_cluster": {},
+        }
+    )
+    baseline = {
+        package_name: installed_version
+        for _task_id, package_name, installed_version, _target_version in package_plan
+    }
+    candidate = {
+        package_name: target_version
+        for _task_id, package_name, _installed_version, target_version in package_plan
+    }
+    return SimpleNamespace(
+        state=state,
+        groups=groups,
+        tasks=tasks,
+        action=action,
+        snapshots=snapshots,
+        baseline=baseline,
+        candidate=candidate,
+        cluster_id=cluster_id,
+        dispatch_batch_id=dispatch_batch_id,
+        portfolio_plan_id=portfolio_plan_id,
+    )
+
+
+def _socket_stack_failed_qa_result(tasks):
+    """Return unattributed failing QA evidence for the baseline-backed cluster."""
+    result = _failed_delta_qa_result(tasks)
+    for task in tasks:
+        package_name = task.target_package_name
+        raw_excerpt = (
+            f"{package_name} parser/transport integration failure"
+            if package_name in {"socket.io", "socket.io-parser"}
+            else "shared transport integration failure"
+        )
+        result["qa_evaluations"][task.task_id] = result["qa_evaluations"][task.task_id].model_copy(
+            update={
+                "failure_evidence": QAFailureEvidence(
+                    raw_excerpt=raw_excerpt,
+                    exact_diagnostics=["atomic test batch failed"],
+                    failed_tests=["shared Socket.IO integration test"],
+                    attempt_id=task.current_attempt_id,
+                    task_revision=task.task_revision,
+                ),
+                "deterministic_gates": QADeterministicGates(
+                    status="fail",
+                    install_passed=True,
+                    scanner_execution_status="success",
+                    tests_passed=False,
+                    diagnostics=["unit-test gate failed"],
+                ),
+                "test_attribution": QATestAttribution(
+                    verdict="inconclusive",
+                    failed_tests=["shared Socket.IO integration test"],
+                ),
+            }
+        )
+    return result
+
+
+def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
+    socket_stack_delta_case, monkeypatch
+):
+    case = socket_stack_delta_case
+    sandbox = _DeltaSandbox(
+        case.candidate.copy(),
+        {case.dispatch_batch_id: case.baseline.copy()},
+    )
+    qa_observations = []
+    qa_result = _socket_stack_failed_qa_result(case.tasks)
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        lambda _state: qa_result,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=2,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "apply_multi_package_action",
+        _apply_fake_delta_action,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+
+    def run_unit_tests(active_sandbox):
+        changed_packages = [
+            package_name
+            for package_name, target_version in case.candidate.items()
+            if active_sandbox.workspace[package_name] == target_version
+        ]
+        qa_observations.append((tuple(changed_packages), dict(active_sandbox.workspace)))
+        return SimpleNamespace(ok=changed_packages == ["socket.io"])
+
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        run_unit_tests,
+    )
+
+    qa_output = run_qa_critic_from_orchestrator(case.state)
+
+    isolation = qa_output["delta_isolation_by_cluster"][case.cluster_id]
+    assert isolation["status"] == "IDENTIFIED"
+    assert isolation["responsible_task_ids"] == ["task-c"]
+    assert isolation["tested_subsets"] == [["task-a"], ["task-c"]]
+    assert isolation["executions"] == 2
+    assert isolation["candidate_restored"] is True
+    assert isolation["dispatch_batch_id"] == case.dispatch_batch_id
+    assert isolation["source_portfolio_plan_id"] == case.portfolio_plan_id
+    assert isolation["attempt_ids_by_task"] == {
+        task.task_id: task.current_attempt_id for task in case.tasks
+    }
+    assert qa_observations == [
+        (
+            ("socket.io",),
+            {
+                "socket.io": "4.8.1",
+                "engine.io": "4.1.2",
+                "socket.io-parser": "4.0.5",
+            },
+        ),
+        (
+            ("socket.io-parser",),
+            {
+                "socket.io": "3.1.2",
+                "engine.io": "4.1.2",
+                "socket.io-parser": "4.2.6",
+            },
+        ),
+    ]
+    assert sandbox.workspace == case.baseline
+    assert case.dispatch_batch_id not in sandbox.archives
+    assert not any(snapshot_id.startswith("delta-candidate-") for snapshot_id in sandbox.archives)
+
+    supervisor_state = {
+        **case.state,
+        **qa_output,
+        "portfolio_plan": None,
+    }
+    supervisor_output = run_supervisor_node(supervisor_state)
+
+    assert supervisor_output["task_queue"]["task-a"].status == TaskStatus.PENDING
+    assert supervisor_output["task_queue"]["task-a"].retry_count == 0
+    assert supervisor_output["task_queue"]["task-b"].status == TaskStatus.PENDING
+    assert supervisor_output["task_queue"]["task-b"].retry_count == 0
+    assert supervisor_output["task_queue"]["task-c"].status == TaskStatus.NEEDS_RETRY
+    assert supervisor_output["task_queue"]["task-c"].retry_count == 1
+    assert all(
+        supervisor_output["task_queue"][task.task_id].current_attempt_id is None
+        for task in case.tasks
+    )
+    request = supervisor_output["portfolio_replan_request"]
+    assert isinstance(request, PortfolioReplanRequest)
+    assert request.forced_singleton_task_ids == ["task-c"]
+    assert request.triggering_attempt_id == case.tasks[2].current_attempt_id
+    assert request.source_portfolio_plan_id == case.portfolio_plan_id
+    assert supervisor_output["next_routing_step"] == "portfolio"
+
+    stale_record = {
+        **isolation,
+        "attempt_ids_by_task": {
+            **isolation["attempt_ids_by_task"],
+            "task-c": "attempt-stale",
+        },
+    }
+    stale_supervisor_output = run_supervisor_node(
+        {
+            **supervisor_state,
+            "delta_isolation_by_cluster": {case.cluster_id: stale_record},
+        }
+    )
+    for task in case.tasks:
+        committed = stale_supervisor_output["task_queue"][task.task_id]
+        assert committed.status == TaskStatus.NEEDS_RETRY
+        assert committed.retry_count == task.retry_count + 1
+        assert committed.current_attempt_id is None
+    stale_request = stale_supervisor_output["portfolio_replan_request"]
+    assert stale_request.forced_singleton_task_ids == []
+    assert stale_request.triggering_attempt_id is None
+    assert stale_request.source_portfolio_plan_id is None
+
+
+def _socket_stack_new_dispatch(case, *, batch_id, attempt_prefix):
+    """Copy the Socket.IO fixture into a distinct committed dispatch."""
+    tasks = [
+        task.model_copy(
+            update={
+                "task_revision": task.task_revision + 1,
+                "current_attempt_id": f"{attempt_prefix}-{task.task_id}",
+            }
+        )
+        for task in case.tasks
+    ]
+    action = MultiPackageAction(
+        cluster_id=case.cluster_id,
+        dispatch_batch_id=batch_id,
+        selected_strategy=case.action.selected_strategy,
+        package_mutations=list(case.action.package_mutations),
+        rationale=case.action.rationale,
+    )
+    action_digest = instruction_digest(action.model_dump_json())
+    snapshots = {}
+    decisions = []
+    for task in tasks:
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=task.current_attempt_id,
+            task_id=task.task_id,
+            state_revision=2,
+            task_revision=task.task_revision,
+            attempt_number=2,
+            cluster_id=case.cluster_id,
+            dispatch_batch_id=batch_id,
+            action_digest=action_digest,
+            portfolio_plan_id=case.portfolio_plan_id,
+            qa_policy=task.qa_policy,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            target_package_name=task.target_package_name,
+            target_dependency_type=task.target_dependency_type,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        snapshots[snapshot.attempt_id] = snapshot
+        decisions.append(
+            SimpleNamespace(
+                task_id=task.task_id,
+                target_package_name=task.target_package_name,
+                installed_version=case.baseline[task.target_package_name],
+            )
+        )
+    state = {
+        **case.state,
+        "task_queue": {task.task_id: task for task in tasks},
+        "active_target_task_ids": [task.task_id for task in tasks],
+        "active_dispatch_batch_id": batch_id,
+        "active_multi_package_action": action,
+        "attempt_snapshots_by_id": {**case.snapshots, **snapshots},
+        "portfolio_plan": SimpleNamespace(
+            portfolio_plan_id=case.portfolio_plan_id,
+            solver_plan=SimpleNamespace(selected_plan=SimpleNamespace(task_decisions=decisions)),
+        ),
+    }
+    return SimpleNamespace(
+        state=state,
+        tasks=tasks,
+        action=action,
+        snapshots=snapshots,
+        batch_id=batch_id,
+    )
+
+
+def test_socket_stack_fixture_reuses_same_attempt_budget_and_resets_for_new_dispatch(
+    socket_stack_delta_case, monkeypatch
+):
+    case = socket_stack_delta_case
+    sandbox = _DeltaSandbox(
+        case.candidate.copy(),
+        {case.dispatch_batch_id: case.baseline.copy()},
+    )
+    qa_calls = []
+    apply_calls = []
+
+    def qa_critic(scoped_state):
+        qa_calls.append(True)
+        active_tasks = [
+            scoped_state["task_queue"][task_id]
+            for task_id in scoped_state["active_target_task_ids"]
+        ]
+        return _socket_stack_failed_qa_result(active_tasks)
+
+    def apply_action(active_sandbox, action, touched_files):
+        apply_calls.append(tuple(mutation.task_id for mutation in action.package_mutations))
+        return _apply_fake_delta_action(active_sandbox, action, touched_files)
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        qa_critic,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=2,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", apply_action)
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+
+    first = run_qa_critic_from_orchestrator(case.state)
+    same_attempt = run_qa_critic_from_orchestrator(
+        {
+            **case.state,
+            "delta_isolation_by_cluster": first["delta_isolation_by_cluster"],
+        }
+    )
+    first_record = first["delta_isolation_by_cluster"][case.cluster_id]
+
+    assert first_record["status"] == "INCONCLUSIVE"
+    assert first_record["candidate_restored"] is True
+    assert first_record["executions"] == 2
+    assert same_attempt["delta_isolation_by_cluster"][case.cluster_id] == first_record
+    assert len(apply_calls) == 2
+    assert (
+        len(
+            [
+                event
+                for event in sandbox.events
+                if event[0] == "create" and event[1].startswith("delta-candidate-")
+            ]
+        )
+        == 1
+    )
+
+    fresh_case = _socket_stack_new_dispatch(
+        case,
+        batch_id="batch-socket-stack-fresh",
+        attempt_prefix="attempt-fresh",
+    )
+    fresh_case.state["delta_isolation_by_cluster"] = first["delta_isolation_by_cluster"]
+    sandbox.archives[fresh_case.batch_id] = case.baseline.copy()
+    sandbox.workspace.clear()
+    sandbox.workspace.update(case.candidate)
+
+    fresh = run_qa_critic_from_orchestrator(fresh_case.state)
+    fresh_record = fresh["delta_isolation_by_cluster"][case.cluster_id]
+
+    assert fresh_record["status"] == "INCONCLUSIVE"
+    assert fresh_record["candidate_restored"] is True
+    assert fresh_record["executions"] == 2
+    assert fresh_record["dispatch_batch_id"] == fresh_case.batch_id
+    assert fresh_record["action_digest"] != first_record["action_digest"]
+    assert fresh_record["attempt_ids_by_task"] == {
+        task.task_id: task.current_attempt_id for task in fresh_case.tasks
+    }
+    assert len(apply_calls) == 4
+    assert len(qa_calls) == 3
+    assert (
+        len(
+            [
+                event
+                for event in sandbox.events
+                if event[0] == "create" and event[1].startswith("delta-candidate-")
+            ]
+        )
+        == 2
+    )
+
+
+def test_socket_stack_candidate_restore_failure_clears_blame(socket_stack_delta_case, monkeypatch):
+    case = socket_stack_delta_case
+    sandbox = _DeltaSandbox(
+        case.candidate.copy(),
+        {case.dispatch_batch_id: case.baseline.copy()},
+        fail_candidate_restore=True,
+    )
+    qa_result = _socket_stack_failed_qa_result(case.tasks)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        lambda _state: qa_result,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(
+            max_delta_canary_probes=2,
+            remedy_disable_post_qa_triage=True,
+        ),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "apply_multi_package_action",
+        _apply_fake_delta_action,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        lambda _sandbox: SimpleNamespace(ok=False),
+    )
+
+    result = run_qa_critic_from_orchestrator(case.state)
+    isolation = result["delta_isolation_by_cluster"][case.cluster_id]
+
+    assert isolation["status"] == "INCONCLUSIVE"
+    assert isolation["candidate_restored"] is False
+    assert isolation["responsible_task_ids"] == []
+    assert (
+        result["qa_results_by_attempt"]["attempt-task-a"].evaluation.evidence_inconclusive is False
+    )
+    assert result["qa_results_by_attempt"]["attempt-task-a"].evaluation.retry_feedback == (
+        "a retry feedback"
+    )
+    assert sandbox.workspace == case.baseline
+    assert case.dispatch_batch_id not in sandbox.archives
+    assert any(snapshot_id.startswith("delta-candidate-") for snapshot_id in sandbox.archives)
+
+
+@pytest.mark.parametrize("malformation", ["missing", "duplicate"])
+def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
+    socket_stack_delta_case, monkeypatch, malformation
+):
+    case = socket_stack_delta_case
+    if malformation == "missing":
+        mutations = case.action.package_mutations[:2]
+    else:
+        duplicate = PackageMutation(
+            task_id="task-a",
+            package_name="socket.io-shadow",
+            target_version="4.8.1",
+            dependency_type="overrides",
+        )
+        mutations = [
+            case.action.package_mutations[0],
+            duplicate,
+            case.action.package_mutations[1],
+        ]
+    malformed_action = MultiPackageAction(
+        cluster_id=case.action.cluster_id,
+        dispatch_batch_id=case.action.dispatch_batch_id,
+        selected_strategy=case.action.selected_strategy,
+        package_mutations=mutations,
+        rationale=case.action.rationale,
+    )
+    malformed_state = {
+        **case.state,
+        "active_multi_package_action": malformed_action,
+    }
+    ranker = MagicMock()
+    canaries = MagicMock()
+    apply_action = MagicMock()
+    sandbox = MagicMock()
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "rank_suspect_tasks_by_suspicion",
+        ranker,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "run_delta_isolation_canaries",
+        canaries,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "apply_multi_package_action",
+        apply_action,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+
+    result = _graph_wrappers._maybe_run_delta_isolation(
+        malformed_state,
+        case.tasks,
+        _socket_stack_failed_qa_result(case.tasks),
+    )
+
+    assert result["status"] == "INCONCLUSIVE"
+    assert result["candidate_restored"] is True
+    assert result["executions"] == 0
+    assert result["tested_subsets"] == []
+    ranker.assert_not_called()
+    canaries.assert_not_called()
+    apply_action.assert_not_called()
+    sandbox.create_workspace_snapshot.assert_not_called()

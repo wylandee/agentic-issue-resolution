@@ -86,9 +86,9 @@ from .qa_policy_engine import (
 from .qa_types import (
     QAScanTarget,
     _append_qa_log_records,
-    _QAPackageState,
     _QAExecutionResults,
     _QALogRecord,
+    _QAPackageState,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,9 +105,7 @@ def _run_global_execution(
     scan_targets: Sequence[QAScanTarget] | None = None,
     skip_scan: bool = False,
     scan_skip_reason: str | None = None,
-    package_state_collector: Callable[
-        [DockerSandbox, bool], Mapping[str, _QAPackageState]
-    ]
+    package_state_collector: Callable[[DockerSandbox, bool], Mapping[str, _QAPackageState]]
     | None = None,
 ) -> _QAExecutionResults:
     """
@@ -491,9 +489,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 expected_version, has_version_evidence = _attempt_version_evidence(
                     state, context.task
                 )
-                version_evidence_inconclusive = (
-                    has_version_evidence and expected_version is None
-                )
+                version_evidence_inconclusive = has_version_evidence and expected_version is None
             package_states[task_id] = _collect_group_package_state(
                 sandbox,
                 source_groups_by_id[context.group.group_id],

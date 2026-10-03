@@ -1251,8 +1251,7 @@ def _solve_lexicographic(
             *findings_workaround.values(),
         ]
         return {
-            int(variable.Index()): int(solver_instance.Value(variable))
-            for variable in variables
+            int(variable.Index()): int(solver_instance.Value(variable)) for variable in variables
         }
 
     def read_metric(solver_instance: Any, expression: Any) -> int:
@@ -1378,8 +1377,7 @@ def _solve_lexicographic(
             if status == SolverStatus.FEASIBLE:
                 if not accepted_feasible:
                     stage_diagnostic(
-                        "feasible lexicographic stage rejected by "
-                        "solver_accept_feasible=false",
+                        "feasible lexicographic stage rejected by solver_accept_feasible=false",
                     )
                     if candidate_plans:
                         abandon_alternative = True

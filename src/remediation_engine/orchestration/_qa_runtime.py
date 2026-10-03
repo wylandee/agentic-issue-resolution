@@ -945,7 +945,7 @@ def _collect_group_package_state(
         graph_diagnostics.append(
             "npm ls skipped because npm install failed; resolved graph is unknown."
         )
-    for manifest, _payload in (parsed_manifests if inspect_resolved_graph else ()):
+    for manifest, _payload in parsed_manifests if inspect_resolved_graph else ():
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
