@@ -2091,6 +2091,61 @@ def _source_migration_instruction(
     )
 
 
+def _version_bump_instruction(
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    package_name: str,
+    target_version: str,
+    manifest_path: str,
+    dependency_type: str | None,
+) -> str:
+    """Build an instruction that names the exact solver-approved package version.
+
+    Args:
+        task: Finding-backed task whose package target was selected.
+        group: Vulnerability group providing any transitive-child context.
+        package_name: Exact package name selected for mutation.
+        target_version: Version selected by the certified solver plan.
+        manifest_path: Manifest containing the dependency declaration.
+        dependency_type: Dependency section selected for the mutation.
+
+    Returns:
+        A deterministic version-bump instruction with no stale fix-plan version.
+    """
+    declaration = (
+        dependency_type
+        or task.target_dependency_type
+        or group.parent_declaration_type
+        or "dependencies"
+    ).strip()
+    parent_name = (task.parent_package_name or group.parent_package_name or "").strip()
+    child_name = (group.vulnerable_component or "").strip()
+    if parent_name == package_name and child_name and child_name != package_name:
+        child_floor = (
+            group.fix_plan.fixed_version.strip()
+            if group.fix_plan and group.fix_plan.fixed_version
+            else next(
+                (
+                    str(issue.fixed_version).strip()
+                    for issue in group.issues
+                    if issue.fixed_version and str(issue.fixed_version).strip()
+                ),
+                None,
+            )
+        )
+        child_floor_text = f' to at least "{child_floor}"' if child_floor else ""
+        return (
+            f'Update directly declared parent "{package_name}" in {declaration} to the exact '
+            f'solver-approved version "{target_version}" so it resolves transitive package '
+            f'"{child_name}"{child_floor_text}. '
+            "Do not choose a different version or use a package override."
+        )
+    return (
+        f'Update "{package_name}" in {manifest_path} ({declaration}) to the exact '
+        f'solver-approved version "{target_version}". Do not select a different version.'
+    )
+
+
 def apply_portfolio_plan(
     plan: Any,
     groups: Iterable[VulnerabilityGroup],
@@ -2292,6 +2347,15 @@ def apply_portfolio_plan(
             updates["instruction"] = instruction
         elif decision.dependency_type in _OVERRIDE_DEPENDENCY_TYPES and decision.selected_version:
             updates["instruction"] = _override_instruction(
+                expected_package,
+                decision.selected_version,
+                expected_manifest,
+                decision.dependency_type,
+            )
+        elif decision_strategy in {"version_bump", "versionbump"} and decision.selected_version:
+            updates["instruction"] = _version_bump_instruction(
+                task,
+                group,
                 expected_package,
                 decision.selected_version,
                 expected_manifest,

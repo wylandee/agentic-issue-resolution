@@ -32,6 +32,7 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionCertificate,
     PackageResolutionStatus,
     SolverRuntimeFingerprint,
+    SolverStatus,
 )
 from remediation_engine.orchestration.graph import _portfolio_certificate_violations
 from remediation_engine.orchestration.portfolio_orchestrator import (
@@ -163,6 +164,29 @@ def _attach_test_resolution_certificate(plan):
             "resolution_certificate": certificate,
         }
     )
+
+
+def _apply_single_solver_decision(group, task, decision):
+    plan_id = f"instruction-sync-{task.task_id}"
+    plan = SimpleNamespace(
+        plan_id=plan_id,
+        portfolio_plan_id=plan_id,
+        task_ids=[task.task_id],
+        task_revisions={task.task_id: task.task_revision},
+        resolution_certificate=None,
+        solver_plan=SimpleNamespace(
+            status=SolverStatus.OPTIMAL,
+            candidate_catalog_complete=True,
+            selected_plan=SimpleNamespace(task_decisions=[decision]),
+        ),
+    )
+    _groups, committed, diagnostics = apply_portfolio_plan(
+        plan,
+        [group],
+        {task.task_id: task},
+    )
+    assert diagnostics == []
+    return committed[task.task_id]
 
 
 def test_shared_cve_across_packages_keeps_finding_records_distinct(tmp_path: Path):
@@ -1933,7 +1957,10 @@ def test_apply_maps_solver_no_fix_to_code_workaround(tmp_path: Path):
         portfolio_plan_id="portfolio-no-fix",
         task_ids=["task-1"],
         task_revisions={"task-1": task.task_revision},
+        resolution_certificate=None,
         solver_plan=SimpleNamespace(
+            status=SolverStatus.OPTIMAL,
+            candidate_catalog_complete=True,
             selected_plan=SimpleNamespace(task_decisions=[decision]),
         ),
     )
@@ -1942,6 +1969,91 @@ def test_apply_maps_solver_no_fix_to_code_workaround(tmp_path: Path):
 
     assert diagnostics == []
     assert committed["task-1"].strategy.value == "code_workaround"
+
+
+def test_apply_syncs_direct_instruction_to_solver_selected_version(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"fixture-package": "1.0.0"}},
+    )
+    group = _group(
+        "fixture-package", "package.json", package_version="1.0.0", fixed_version="2.0.0"
+    )
+    task = _tasks(group)["task-1"].model_copy(
+        update={"instruction": 'Update "fixture-package" in package.json to version "2.0.0".'}
+    )
+    decision = SimpleNamespace(
+        task_id=task.task_id,
+        selected_strategy="version_bump",
+        selected_version="2.1.4",
+        allowed_alternative_versions=["2.1.5"],
+        allowed_dependency_types=["dependencies"],
+        selected_plan_issue_ids=[],
+        dependency_type="dependencies",
+        strategy_stage="osv_minimum",
+        exact_instruction=None,
+        requires_source_migration=False,
+        installed_version="1.0.0",
+        target_occurrence_id=make_occurrence_id("package.json", "fixture-package"),
+        target_group_id=group.group_id,
+        target_package_name="fixture-package",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/fixture-package",
+    )
+
+    committed = _apply_single_solver_decision(group, task, decision)
+
+    assert committed.selected_version == "2.1.4"
+    assert 'exact solver-approved version "2.1.4"' in committed.instruction
+    assert "2.0.0" not in committed.instruction
+    assert "2.1.5" not in committed.instruction
+
+
+def test_apply_syncs_transitive_parent_instruction_to_solver_version(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"parent-package": "1.0.0"}},
+    )
+    group = _group(
+        "transitive-package",
+        "package.json",
+        package_version="1.0.0",
+        fixed_version="2.0.0",
+    ).model_copy(
+        update={
+            "parent_package_name": "parent-package",
+            "parent_package_version": "1.0.0",
+            "parent_declaration_type": "dependencies",
+            "dependency_versions": {"parent-package": "1.0.0"},
+        }
+    )
+    task = _tasks(group)["task-1"]
+    decision = SimpleNamespace(
+        task_id=task.task_id,
+        selected_strategy="version_bump",
+        selected_version="1.5.0",
+        allowed_alternative_versions=[],
+        allowed_dependency_types=["dependencies"],
+        selected_plan_issue_ids=[],
+        dependency_type="dependencies",
+        strategy_stage="osv_minimum",
+        exact_instruction=None,
+        requires_source_migration=False,
+        installed_version="1.0.0",
+        target_occurrence_id=make_occurrence_id("package.json", "parent-package"),
+        target_group_id=group.group_id,
+        target_package_name="parent-package",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/parent-package",
+    )
+
+    committed = _apply_single_solver_decision(group, task, decision)
+
+    assert 'exact solver-approved version "1.5.0"' in committed.instruction
+    assert 'transitive package "transitive-package" to at least "2.0.0"' in committed.instruction
+    assert "minimum compatible released version" not in committed.instruction
 
 
 def test_apply_synthesizes_major_migration_instruction_when_missing(tmp_path: Path):
@@ -1972,7 +2084,10 @@ def test_apply_synthesizes_major_migration_instruction_when_missing(tmp_path: Pa
         portfolio_plan_id="portfolio-major-upgrade",
         task_ids=["task-1"],
         task_revisions={"task-1": task.task_revision},
+        resolution_certificate=None,
         solver_plan=SimpleNamespace(
+            status=SolverStatus.OPTIMAL,
+            candidate_catalog_complete=True,
             selected_plan=SimpleNamespace(task_decisions=[decision]),
         ),
     )

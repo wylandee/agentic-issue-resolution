@@ -131,6 +131,7 @@ from remediation_engine.tools.npm_graph import (
     load_npm_graph_snapshot,
     lockfile_key_matches_package,
     make_occurrence_id,
+    npm_range_contains,
 )
 
 logger = logging.getLogger(__name__)
@@ -832,6 +833,15 @@ def _peer_conflict_escalation(
     for evidence in gates.peer_conflicts:
         requester = evidence.requester_package.strip()
         peer = evidence.peer_package.strip()
+        # ERESOLVE output can include compatible peer edges alongside the
+        # actual conflict; do not turn those satisfied edges into task pairs.
+        if (
+            requester
+            and evidence.required_range
+            and evidence.observed_version
+            and npm_range_contains(evidence.required_range, evidence.observed_version) is True
+        ):
+            continue
         requester_id = package_to_task.get(requester)
         if requester_id is None and task_id in leaf_ids:
             current = task_queue.get(task_id)

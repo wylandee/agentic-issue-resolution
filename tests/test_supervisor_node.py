@@ -25,7 +25,9 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    PeerConflictEvidence,
     QAAttemptResult,
+    QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
@@ -54,6 +56,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _materialize_spawn_requests,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
+    _peer_conflict_escalation,
     _repair_invalid_planner_plans,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
@@ -2688,6 +2691,100 @@ class TestBugFixes:
         assert (
             decision.feedback_by_task.get("task-1") == "Peer dependency conflict with body-parser"
         )
+
+    def test_peer_conflict_escalation_ignores_satisfied_peer_evidence(self):
+        compiler_group_id = "group-compiler"
+        compiler_cli_group_id = "group-compiler-cli"
+        compiler_group = _sca_group(compiler_group_id).model_copy(
+            update={"vulnerable_component": "@angular/compiler", "file_paths": ["package.json"]}
+        )
+        compiler_cli_group = _sca_group(compiler_cli_group_id).model_copy(
+            update={
+                "vulnerable_component": "@angular/compiler-cli",
+                "file_paths": ["package.json"],
+            }
+        )
+        compiler_task = _make_task("task-compiler", compiler_group_id).model_copy(
+            update={"target_package_name": "@angular/compiler"}
+        )
+        compiler_cli_task = _make_task("task-cli", compiler_cli_group_id).model_copy(
+            update={"target_package_name": "@angular/compiler-cli"}
+        )
+        task_queue = {
+            compiler_task.task_id: compiler_task,
+            compiler_cli_task.task_id: compiler_cli_task,
+        }
+        groups = {
+            compiler_group.group_id: compiler_group,
+            compiler_cli_group.group_id: compiler_cli_group,
+        }
+        gates = QADeterministicGates(
+            status="fail",
+            install_passed=False,
+            scanner_execution_status="success",
+            tests_passed=False,
+            peer_conflicts=[
+                PeerConflictEvidence(
+                    requester_package="@angular/compiler-cli",
+                    requester_version="22.2.1",
+                    peer_package="@angular/compiler",
+                    required_range="22.2.1",
+                    observed_version="22.2.1",
+                ),
+                PeerConflictEvidence(
+                    requester_package="@angular/build",
+                    requester_version="21.2.12",
+                    peer_package="@angular/compiler",
+                    required_range="^21.0.0",
+                    observed_version="22.2.1",
+                ),
+            ],
+        )
+        evaluation = QAEvaluation(
+            task_id=compiler_task.task_id,
+            passed=False,
+            failure_category=FailureCategory.PEER_CONFLICT,
+            retry_feedback="npm install ERESOLVE",
+            deterministic_gates=gates,
+        )
+
+        escalation, unresolved = _peer_conflict_escalation(
+            compiler_task.task_id,
+            evaluation,
+            task_queue,
+            groups,
+        )
+
+        assert escalation is None
+        assert unresolved == [
+            "peer escalation for @angular/build -> @angular/compiler has no existing "
+            "eligible active package task"
+        ]
+
+        actual_conflict = PeerConflictEvidence(
+            requester_package="@angular/compiler-cli",
+            requester_version="22.2.1",
+            peer_package="@angular/compiler",
+            required_range="^21.0.0",
+            observed_version="22.2.1",
+        )
+        actual_conflict_evaluation = evaluation.model_copy(
+            update={
+                "deterministic_gates": gates.model_copy(
+                    update={"peer_conflicts": [actual_conflict]}
+                )
+            }
+        )
+        actual_escalation, actual_unresolved = _peer_conflict_escalation(
+            compiler_task.task_id,
+            actual_conflict_evaluation,
+            task_queue,
+            groups,
+        )
+
+        assert actual_escalation is not None
+        assert actual_escalation["peer_conflict_pairs"] == [("task-cli", "task-compiler")]
+        assert actual_unresolved == []
 
     def test_bug2_materialize_spawn_requests_replaces_triage_strategy_bucket(self):
         group_id = "sca:package.json:express"
