@@ -23,6 +23,7 @@ from typing import Any
 from remediation_engine.contracts.schemas import (
     PackageMutation,
     PortfolioPlan,
+    QAAttemptResult,
     RemediationTask,
     TaskStatus,
     VulnerabilityGroup,
@@ -32,6 +33,7 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionCertificate,
     PackageResolutionStatus,
     PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
     SolverBatch,
     SolverCandidateConflict,
     SolverCandidateCutKind,
@@ -508,83 +510,295 @@ def _lockfile_pair_conflict(snapshot: NpmGraphSnapshot) -> str | None:
     return None
 
 
-def _last_qa_passed_prefix_digest(
+def _last_qa_passed_prefix_provenance(
     prior_plan: PortfolioPlan | None,
     task_queue: Mapping[str, RemediationTask],
     request: PortfolioReplanRequest | None,
     host_repository_fingerprint: str,
-) -> str | None:
-    """Return the last certified batch prefix whose task groups passed QA."""
-    if prior_plan is None or request is None or not host_repository_fingerprint:
+    *,
+    qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    diagnostics: list[str] | None = None,
+) -> QAPassedWorkspacePrefix | None:
+    """Return the verified workspace prefix represented by QA-passed batches.
+
+    Args:
+        prior_plan: Previously committed and certified portfolio plan.
+        task_queue: Current Supervisor-owned task projection.
+        request: Typed request that identifies the source plan.
+        host_repository_fingerprint: Fingerprint of current host manifests.
+        diagnostics: Optional list receiving why a trusted prefix was unavailable.
+
+    Returns:
+        Provenance for the last exact QA-passed prefix, or ``None`` when no
+        prefix can be independently verified.
+    """
+
+    def reject(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics.append(f"QA-passed workspace prefix not trusted: {reason}")
+
+    if request is None:
+        return None
+    if prior_plan is None:
+        reject("the source portfolio plan is unavailable")
+        return None
+    if not host_repository_fingerprint:
+        reject("the current host repository fingerprint is unavailable")
         return None
     prior_plan_id = prior_plan.portfolio_plan_id
     if request.source_portfolio_plan_id != prior_plan_id:
+        reject(
+            "request source plan ID "
+            f"{request.source_portfolio_plan_id!r} does not match committed plan {prior_plan_id!r}"
+        )
         return None
     certificate = prior_plan.resolution_certificate
     solver_plan = prior_plan.solver_plan
-    selected = solver_plan.selected_plan if solver_plan is not None else None
-    if (
-        certificate is None
-        or certificate.status != PackageResolutionStatus.CERTIFIED
-        or certificate.portfolio_plan_id != prior_plan_id
-        or certificate.solver_input_digest != prior_plan.solver_input_digest
-        or certificate.repository_fingerprint != prior_plan.repository_fingerprint
-        or certificate.repository_fingerprint != host_repository_fingerprint
-        or certificate.workspace_graph_digest != prior_plan.workspace_graph_digest
-        or certificate.task_revisions != prior_plan.task_revisions
-        or solver_plan is None
-        or solver_plan.status not in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
-        or not solver_plan.candidate_catalog_complete
-        or certificate.candidate_catalog_digest != solver_plan.candidate_catalog_digest
-        or selected is None
-        or certificate.candidate_plan_id != selected.candidate_plan_id
-        or certificate.candidate_assignment_digest
-        != _digest(dict(sorted(selected.selected_candidate_versions.items())))
-    ):
+    if certificate is None:
+        reject("the source plan has no package-resolution certificate")
         return None
+    if certificate.status != PackageResolutionStatus.CERTIFIED:
+        reject(f"the source certificate status is {certificate.status!s}, not CERTIFIED")
+        return None
+    if certificate.portfolio_plan_id != prior_plan_id:
+        reject("the source certificate is bound to a different portfolio plan ID")
+        return None
+    if certificate.solver_input_digest != prior_plan.solver_input_digest:
+        reject("the source certificate solver-input digest is stale")
+        return None
+    if certificate.repository_fingerprint != prior_plan.repository_fingerprint:
+        reject("the source certificate repository fingerprint differs from its plan")
+        return None
+    if certificate.repository_fingerprint != host_repository_fingerprint:
+        reject("the source plan was certified against a different host repository")
+        return None
+    if certificate.workspace_graph_digest != prior_plan.workspace_graph_digest:
+        reject("the source certificate workspace graph digest differs from its plan")
+        return None
+    if certificate.task_revisions != prior_plan.task_revisions:
+        reject("the source certificate task revisions differ from its plan")
+        return None
+    if solver_plan is None:
+        reject("the source plan has no solver plan")
+        return None
+    if solver_plan.status not in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}:
+        reject(f"the source solver status is {solver_plan.status!s}, not accepted")
+        return None
+    if not solver_plan.candidate_catalog_complete:
+        reject("the source solver candidate catalog was incomplete")
+        return None
+    if certificate.candidate_catalog_digest != solver_plan.candidate_catalog_digest:
+        reject("the source certificate candidate catalog digest is stale")
+        return None
+    selected = solver_plan.selected_plan
+    if selected is None:
+        reject("the source solver plan has no selected assignment")
+        return None
+    expected_assignment_digest = _digest(dict(sorted(selected.selected_candidate_versions.items())))
+    if certificate.candidate_plan_id != selected.candidate_plan_id:
+        reject("the source certificate candidate plan ID differs from its selected plan")
+        return None
+    if certificate.candidate_assignment_digest != expected_assignment_digest:
+        reject("the source certificate candidate assignment digest is stale")
+        return None
+
+    last_prefix_digest: str | None = None
+    last_prefix_batch_ids: list[str] = []
+    last_prefix_task_ids: list[str] = []
+    inherited_prefix = getattr(certificate, "workspace_prefix_provenance", None)
+    if inherited_prefix is not None:
+        if inherited_prefix.certified_by_portfolio_plan_id != prior_plan_id:
+            reject("the inherited workspace prefix is bound to a different portfolio plan")
+            return None
+        invalid_task_ids = [
+            task_id
+            for task_id in inherited_prefix.task_ids
+            if (task := task_queue.get(task_id)) is None
+            or getattr(task.status, "value", task.status) != TaskStatus.QA_PASSED.value
+        ]
+        if invalid_task_ids:
+            reject(
+                "the inherited workspace prefix references tasks that are not QA_PASSED: "
+                f"{invalid_task_ids}"
+            )
+            return None
+        last_prefix_digest = inherited_prefix.graph_digest
+        last_prefix_batch_ids = list(inherited_prefix.batch_ids)
+        last_prefix_task_ids = list(inherited_prefix.task_ids)
 
     batches = list(selected.batches)
     batches_by_id = {batch.batch_id: batch for batch in batches}
     if len(batches_by_id) != len(batches):
+        reject("the source solver plan contains duplicate batch IDs")
         return None
     ordered_batch_ids: list[str] = []
     seen_batch_ids: set[str] = set()
     for phase in sorted(selected.phases, key=lambda item: item.phase_number):
         for batch_id in phase.batch_ids:
             if batch_id not in batches_by_id or batch_id in seen_batch_ids:
+                reject(f"phase order contains an unknown or duplicate batch {batch_id!r}")
                 return None
             ordered_batch_ids.append(batch_id)
             seen_batch_ids.add(batch_id)
     ordered_batch_ids.extend(sorted(set(batches_by_id) - seen_batch_ids))
 
-    last_prefix_digest: str | None = None
+    def qa_workspace_digest_for_batch(batch: SolverBatch) -> str | None:
+        """Return one source-plan-bound, successful QA graph for a batch."""
+        if not qa_results_by_attempt:
+            return None
+        digests_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
+        for attempt_id, qa_result in qa_results_by_attempt.items():
+            result_attempt_id = (
+                qa_result.get("attempt_id")
+                if isinstance(qa_result, Mapping)
+                else qa_result.attempt_id
+            )
+            task_id = (
+                qa_result.get("task_id") if isinstance(qa_result, Mapping) else qa_result.task_id
+            )
+            if result_attempt_id != attempt_id or task_id not in digests_by_task:
+                continue
+            result_plan_id = (
+                qa_result.get("portfolio_plan_id")
+                if isinstance(qa_result, Mapping)
+                else qa_result.portfolio_plan_id
+            )
+            result_revision = (
+                qa_result.get("task_revision")
+                if isinstance(qa_result, Mapping)
+                else qa_result.task_revision
+            )
+            if result_plan_id != prior_plan_id or result_revision != certificate.task_revisions.get(
+                task_id
+            ):
+                continue
+            evaluation = (
+                qa_result.get("evaluation")
+                if isinstance(qa_result, Mapping)
+                else qa_result.evaluation
+            )
+            passed = (
+                evaluation.get("passed")
+                if isinstance(evaluation, Mapping)
+                else getattr(evaluation, "passed", False)
+            )
+            digest = (
+                qa_result.get("workspace_graph_digest")
+                if isinstance(qa_result, Mapping)
+                else qa_result.workspace_graph_digest
+            )
+            if passed and isinstance(digest, str) and digest.strip():
+                digests_by_task[task_id].add(digest.strip())
+        if any(len(task_digests) != 1 for task_digests in digests_by_task.values()):
+            return None
+        batch_digests = {next(iter(task_digests)) for task_digests in digests_by_task.values()}
+        return next(iter(batch_digests)) if len(batch_digests) == 1 else None
+
+    diagnostic_start = len(diagnostics) if diagnostics is not None else 0
     for batch_id in ordered_batch_ids:
         batch = batches_by_id[batch_id]
         if not batch.task_ids or len(set(batch.task_ids)) != len(batch.task_ids):
+            reject(f"batch {batch_id!r} has no task IDs or duplicate task IDs")
             return None
         if not batch.dispatchable:
-            if batch.mutations or any(
-                (task := task_queue.get(task_id)) is None
-                or task.status not in TERMINAL_TASK_STATUSES
+            invalid_terminal_members = [
+                task_id
                 for task_id in batch.task_ids
-            ):
+                if (task := task_queue.get(task_id)) is None
+                or task.status not in TERMINAL_TASK_STATUSES
+            ]
+            if batch.mutations or invalid_terminal_members:
+                reject(
+                    f"non-dispatchable batch {batch_id!r} is not a mutation-free "
+                    f"terminal-only batch (invalid members: {invalid_terminal_members})"
+                )
                 return None
             continue
 
         member_tasks = [task_queue.get(task_id) for task_id in batch.task_ids]
         if any(task is None for task in member_tasks):
+            reject(f"batch {batch_id!r} references a task missing from the current queue")
             return None
         member_group_ids = {task.parent_group_id for task in member_tasks if task is not None}
-        if not member_group_ids or any(
-            effective_group_status(task_queue, group_id) != TaskStatus.QA_PASSED.value
+        if not member_group_ids:
+            reject(f"batch {batch_id!r} has no member groups")
+            return None
+        non_qa_groups = sorted(
+            group_id
             for group_id in member_group_ids
-        ):
+            if effective_group_status(task_queue, group_id) != TaskStatus.QA_PASSED.value
+        )
+        if non_qa_groups:
+            if diagnostics is not None:
+                if last_prefix_batch_ids:
+                    diagnostics.append(
+                        f"QA-passed workspace prefix ends at batch "
+                        f"{last_prefix_batch_ids[-1]!r}; batch {batch_id!r} has "
+                        f"non-passed groups {non_qa_groups}"
+                    )
+                else:
+                    diagnostics.append(
+                        f"QA-passed workspace prefix stops before batch {batch_id!r}: "
+                        f"groups {non_qa_groups} are not QA_PASSED"
+                    )
             break
-        prefix_digest = certificate.batch_prefix_graph_digests.get(batch_id)
+        qa_workspace_digest = qa_workspace_digest_for_batch(batch)
+        resolver_prefix_digest = certificate.batch_prefix_graph_digests.get(batch_id)
+        prefix_digest = qa_workspace_digest or resolver_prefix_digest
+        if (
+            qa_workspace_digest is not None
+            and resolver_prefix_digest is not None
+            and qa_workspace_digest != resolver_prefix_digest
+            and diagnostics is not None
+        ):
+            diagnostics.append(
+                f"QA-passed workspace fingerprint for batch {batch_id!r} differs from "
+                "the resolver-predicted prefix; using the attempt-bound QA fingerprint"
+            )
         if not prefix_digest:
+            if diagnostics is not None:
+                diagnostics.append(
+                    f"QA-passed workspace prefix stops at batch {batch_id!r}: "
+                    "the certified prefix graph digest is missing"
+                )
             break
         last_prefix_digest = prefix_digest
-    return last_prefix_digest
+        last_prefix_batch_ids = list(dict.fromkeys([*last_prefix_batch_ids, batch_id]))
+        last_prefix_task_ids = list(dict.fromkeys([*last_prefix_task_ids, *batch.task_ids]))
+
+    if (
+        last_prefix_digest is None
+        and diagnostics is not None
+        and len(diagnostics) == diagnostic_start
+    ):
+        reject("the source plan contains no executable QA-passed batch prefix")
+    if last_prefix_digest is None:
+        return None
+    return QAPassedWorkspacePrefix(
+        graph_digest=last_prefix_digest,
+        certified_by_portfolio_plan_id=prior_plan_id,
+        batch_ids=last_prefix_batch_ids,
+        task_ids=last_prefix_task_ids,
+    )
+
+
+def _last_qa_passed_prefix_digest(
+    prior_plan: PortfolioPlan | None,
+    task_queue: Mapping[str, RemediationTask],
+    request: PortfolioReplanRequest | None,
+    host_repository_fingerprint: str,
+    *,
+    diagnostics: list[str] | None = None,
+) -> str | None:
+    """Return only the graph digest from verified QA-passed prefix provenance."""
+    prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        task_queue,
+        request,
+        host_repository_fingerprint,
+        diagnostics=diagnostics,
+    )
+    return prefix.graph_digest if prefix is not None else None
 
 
 def _assert_workspace_matches_host(
@@ -615,12 +829,17 @@ def _assert_workspace_matches_host(
         raise _CertificationUnknown(
             "workspace package manifest paths differ from the host repository snapshot"
         )
+    workspace_fingerprint = workspace_snapshot.repository_fingerprint
     if _manifest_fingerprints(workspace_snapshot) != _manifest_fingerprints(host_snapshot) and (
-        qa_passed_prefix_digest is None
-        or workspace_snapshot.repository_fingerprint != qa_passed_prefix_digest
+        qa_passed_prefix_digest is None or workspace_fingerprint != qa_passed_prefix_digest
     ):
+        if qa_passed_prefix_digest is None:
+            detail = "no certified QA-passed workspace prefix digest was available"
+        else:
+            detail = "the live fingerprint did not match the certified QA-passed prefix"
         raise _CertificationUnknown(
-            "workspace package manifest contents differ from the host repository snapshot"
+            "workspace package manifest contents differ from the host repository snapshot; "
+            f"{detail}"
         )
 
 
@@ -1060,17 +1279,17 @@ def _authorized_workaround(
     prepared: _PreparedPortfolioProblem,
     selected_plan: SolverCandidatePlan,
 ) -> bool:
-    """Return whether a committed decision authorizes this exact finding's workaround."""
+    """Return whether this finding has an already-QA-passed authorized workaround."""
     if not finding.workaround_available or not finding.workaround_plan_ids:
         return False
     target = next(
         (item for item in prepared.targets if item.occurrence_id == finding.target_occurrence_id),
         None,
     )
-    if target is None:
-        return False
-    if target.is_terminal and (
-        target.terminal_status != "qa_passed"
+    if (
+        target is None
+        or not target.is_terminal
+        or target.terminal_status != "qa_passed"
         or target.strategy.replace("-", "_").lower() not in {"code_workaround", "workaround"}
     ):
         return False
@@ -1636,6 +1855,7 @@ def _make_certificate(
     candidate_plan_id: str | None = None,
     rejection_conflicts: Sequence[SolverCandidateConflict] = (),
     certification_statistics: CertificationStatistics | None = None,
+    workspace_prefix_provenance: QAPassedWorkspacePrefix | None = None,
 ) -> PackageResolutionCertificate:
     """Bind one resolver result to the selected plan and current task revisions."""
     unresolved = (
@@ -1676,6 +1896,7 @@ def _make_certificate(
         batch_prefix_graph_digests=(
             dict(result.batch_prefix_graph_digests) if result is not None else {}
         ),
+        workspace_prefix_provenance=workspace_prefix_provenance,
         diagnostics=sorted(set([*diagnostics, *(result.diagnostics if result else ())])),
     )
 
@@ -1914,6 +2135,7 @@ def build_certified_portfolio_plan(
     portfolio_iteration: int = 0,
     portfolio_replan_request: PortfolioReplanRequest | None = None,
     prior_portfolio_plan: PortfolioPlan | None = None,
+    qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
     registry_fetcher: PackumentFetcher | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
 ) -> PortfolioPlan:
@@ -1931,6 +2153,7 @@ def build_certified_portfolio_plan(
         portfolio_iteration: Outer portfolio iteration number.
         portfolio_replan_request: Optional Supervisor-owned replan constraints.
         prior_portfolio_plan: Current committed plan for verifying an earlier QA-passed prefix.
+        qa_results_by_attempt: Attempt-correlated QA evidence from the source plan.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
 
@@ -1950,11 +2173,19 @@ def build_certified_portfolio_plan(
     queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
     host_snapshot = load_npm_graph_snapshot(root)
     host_fingerprint = host_snapshot.repository_fingerprint
-    qa_passed_prefix_digest = _last_qa_passed_prefix_digest(
+    prefix_diagnostics: list[str] = []
+    qa_passed_prefix_provenance = _last_qa_passed_prefix_provenance(
         prior_portfolio_plan,
         queue,
         portfolio_replan_request,
         host_fingerprint,
+        qa_results_by_attempt=qa_results_by_attempt,
+        diagnostics=prefix_diagnostics,
+    )
+    qa_passed_prefix_digest = (
+        qa_passed_prefix_provenance.graph_digest
+        if qa_passed_prefix_provenance is not None
+        else None
     )
     host_diagnostics = _host_lockfile_diagnostics(host_snapshot)
     host_prepared = _prepare_portfolio_problem(
@@ -1977,6 +2208,13 @@ def build_certified_portfolio_plan(
         **values: Any,
     ) -> PackageResolutionCertificate:
         """Attach invocation-local aggregate measurements to one certificate."""
+        if (
+            values.get("status") == PackageResolutionStatus.CERTIFIED
+            and qa_passed_prefix_provenance is not None
+        ):
+            values["workspace_prefix_provenance"] = qa_passed_prefix_provenance.model_copy(
+                update={"certified_by_portfolio_plan_id": plan.portfolio_plan_id}
+            )
         return _make_certificate(
             plan,
             prepared_problem,
@@ -2069,14 +2307,25 @@ def build_certified_portfolio_plan(
                         queue,
                         target_packages=target_packages,
                         peer_conflict_pairs=tuple(peer_conflict_pairs),
-                        forced_singleton_task_ids=tuple(forced_singleton_task_ids),
-                        portfolio_replan_request=portfolio_replan_request,
-                        npm_snapshot=workspace_snapshot,
                         repository_fingerprint=host_fingerprint,
+                        registry_fetcher=(
+                            _timed_registry_fetcher(registry_fetcher, deadline)
+                            if registry_fetcher is not None
+                            else None
+                        ),
                         settings=resolved_settings,
                         runtime_fingerprint=runtime,
                     )
-                diagnostics = sorted(set([*host_diagnostics, *prepared.diagnostics, str(exc)]))
+                diagnostics = sorted(
+                    set(
+                        [
+                            *host_diagnostics,
+                            *prepared.diagnostics,
+                            *prefix_diagnostics,
+                            str(exc),
+                        ]
+                    )
+                )
                 unknown_solver = _unknown_solver_plan(prepared, diagnostics)
                 unknown_plan = _project_prepared_portfolio_plan(
                     prepared, unknown_solver, portfolio_iteration=portfolio_iteration

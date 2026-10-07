@@ -599,6 +599,13 @@ def _portfolio_plan_violations(
         )
         if task.strategy != expected:
             violations.append(f"task {task_id} strategy is outside solver decision")
+        non_mutating_workaround = (
+            task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and decision_strategy in {"code_workaround", "workaround"}
+            and decision.selected_version is None
+            and not decision.allowed_alternative_versions
+            and bool(decision.selected_plan_issue_ids)
+        )
         group = groups_by_id.get(task.parent_group_id)
         expected_package = (
             (task.target_package_name or group.vulnerable_component or "").strip()
@@ -633,10 +640,11 @@ def _portfolio_plan_violations(
             violations.append(
                 f"task {task_id} solver identity field lockfile_package_key is invalid"
             )
-        elif (
+        elif task.status not in terminal_statuses and (
             decision_occurrence == physical_occurrence
             and physical_occurrence != direct_occurrence
             and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
+            and not non_mutating_workaround
         ):
             violations.append(
                 f"task {task_id} nested lockfile target requires a package-manager override"
@@ -668,6 +676,19 @@ def _portfolio_plan_violations(
                     violations.append(f"task {task_id} strategy stage differs from solver decision")
         except ValueError:
             violations.append(f"task {task_id} has unknown committed strategy stage")
+        if non_mutating_workaround:
+            if (
+                task.selected_version is not None
+                or task.allowed_target_versions
+                or task.allowed_dependency_types
+                or task.target_dependency_type is not None
+            ):
+                violations.append(
+                    f"task {task_id} non-mutating workaround has package mutation inputs"
+                )
+            if task.selected_plan_issue_ids != decision.selected_plan_issue_ids:
+                violations.append(f"task {task_id} workaround plan IDs differ from solver decision")
+            continue
         approved_versions = [
             str(value).strip().lstrip("vV").lower()
             for value in ([decision.selected_version] + list(decision.allowed_alternative_versions))

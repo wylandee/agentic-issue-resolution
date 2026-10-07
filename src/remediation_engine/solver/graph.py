@@ -308,6 +308,23 @@ def _supported(
     if target.has_open_attempt:
         return False, "task has an open attempt; no new mutation assigned", False
     if not target.eligible_for_atomic_update:
+        strategy = _text(target.strategy).lower().replace("-", "_")
+        decision_strategy = (
+            _text(decision.selected_strategy).lower().replace("-", "_")
+            if decision is not None
+            else ""
+        )
+        if (
+            target.is_finding_backed
+            and decision is not None
+            and strategy in {"code_workaround", "workaround"}
+            and decision_strategy in {"code_workaround", "workaround"}
+            and bool(decision.selected_plan_issue_ids)
+            and decision.selected_version is None
+        ):
+            # The Supervisor may dispatch an authorized source workaround
+            # without assigning a package mutation variable.
+            return False, None, True
         return False, "target is unsupported or ambiguous for atomic update", False
     if decision is None:
         return False, "missing solver task decision; retained as singleton", True

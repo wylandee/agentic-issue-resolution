@@ -13,13 +13,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep @angular/core as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @angular/core (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcore@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for @babel/core (npm)</notes>
@@ -81,11 +79,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for crypto-js (npm)</notes>
+        <notes>Keep crypto-js as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/crypto-js@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
 <!--
     <suppress>
@@ -113,17 +113,21 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for esbuild (npm)</notes>
+        <notes>Keep esbuild as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
+        <notes>Keep express-jwt as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for file-type (npm)</notes>
@@ -137,11 +141,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for got (npm)</notes>
+        <notes>Keep got as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>
@@ -173,11 +179,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for jws (npm)</notes>
+        <notes>Keep jws as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/jws@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for lodash (javascript)</notes>
@@ -203,13 +211,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep minimatch as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for minimatch (npm)</notes>
         <packageUrl regex="true">^pkg:npm/minimatch@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for moment.js (javascript)</notes>
@@ -271,13 +277,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep socket.io-parser as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for socket.io-parser (npm)</notes>
         <packageUrl regex="true">^pkg:npm/socket\.io-parser@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for tar (npm)</notes>

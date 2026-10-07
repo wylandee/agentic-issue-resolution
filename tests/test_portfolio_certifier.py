@@ -21,6 +21,9 @@ from remediation_engine.contracts.schemas import (
     LocalizedIssue,
     PackageMutation,
     PeerConflictEvidence,
+    QAAttemptResult,
+    QAEvaluation,
+    QAPolicy,
     RemediationTask,
     Severity,
     TaskStatus,
@@ -30,6 +33,7 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
     SolverCandidateCutKind,
     SolverCandidateRejectionReason,
     SolverCandidateRelation,
@@ -46,6 +50,7 @@ from remediation_engine.orchestration.portfolio_certifier import (
     _candidate_conflict,
     _CertificationUnknown,
     _last_qa_passed_prefix_digest,
+    _last_qa_passed_prefix_provenance,
     _peer_conflict_literal_ids,
     _peer_conflict_rejection,
     _read_npm_documents,
@@ -59,11 +64,13 @@ from remediation_engine.orchestration.portfolio_solver import (
     _build_targets_and_findings,
     _digest,
     _prepare_portfolio_problem,
+    apply_portfolio_plan,
 )
 from remediation_engine.orchestration.qa_test_parsing import (
     _install_error_category,
     parse_peer_conflict_evidence,
 )
+from remediation_engine.orchestration.supervisor_node import _portfolio_plan_violations
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import solve_portfolio
@@ -281,6 +288,9 @@ class _FakeSandbox:
                 if package_name in {"express-jwt", "jsonwebtoken"}:
                     continue
                 packages[f"node_modules/{package_name}"] = {"version": str(version)}
+            if "download" in dependencies:
+                packages["node_modules/download"]["dependencies"] = {"decompress": "^4.2.1"}
+                packages["node_modules/decompress"] = {"version": "4.2.1"}
             if "express-jwt" in dependencies and express_version == "6.1.1":
                 packages["node_modules/express-jwt/node_modules/jsonwebtoken"] = {
                     "version": "8.5.1"
@@ -455,6 +465,7 @@ def _certified_prior_plan(
     phases: list[Any],
     batch_prefix_graph_digests: dict[str, str],
     selected_candidate_versions: dict[str, str] | None = None,
+    workspace_prefix_provenance: QAPassedWorkspacePrefix | None = None,
 ) -> SimpleNamespace:
     task_revisions = {task_id: task.task_revision for task_id, task in sorted(task_queue.items())}
     selected = SimpleNamespace(
@@ -482,8 +493,10 @@ def _certified_prior_plan(
         ),
         task_revisions=task_revisions,
         batch_prefix_graph_digests=batch_prefix_graph_digests,
+        workspace_prefix_provenance=workspace_prefix_provenance,
     )
     return SimpleNamespace(
+        task_ids=sorted(task_queue),
         plan_id="prior-plan",
         portfolio_plan_id="prior-plan",
         solver_input_digest="prior-input",
@@ -584,9 +597,18 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
     )
     task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.QA_PASSED})
     task_queue["task-b"] = task_queue["task-b"].model_copy(update={"status": TaskStatus.PENDING})
+    prefix_diagnostics: list[str] = []
     assert (
-        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint") is None
+        _last_qa_passed_prefix_digest(
+            prior_plan,
+            task_queue,
+            request,
+            "host-fingerprint",
+            diagnostics=prefix_diagnostics,
+        )
+        is None
     )
+    assert any("batch-terminal" in item for item in prefix_diagnostics)
     assert (
         _last_qa_passed_prefix_digest(
             prior_plan,
@@ -600,6 +622,129 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
         _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "different-host-fingerprint")
         is None
     )
+
+
+def test_inherited_qa_passed_prefix_survives_terminal_batch_projection():
+    task_queue = {
+        "task-a": RemediationTask(
+            task_id="task-a",
+            parent_group_id="group-a",
+            strategy="version_bump",
+            status=TaskStatus.QA_PASSED,
+        ),
+        "task-b": RemediationTask(
+            task_id="task-b",
+            parent_group_id="group-b",
+            strategy="version_bump",
+            status=TaskStatus.UNFIXABLE,
+        ),
+        "task-c": RemediationTask(
+            task_id="task-c",
+            parent_group_id="group-c",
+            strategy="version_bump",
+            status=TaskStatus.NEEDS_RETRY,
+        ),
+    }
+    batches = [
+        SimpleNamespace(
+            batch_id="batch-a",
+            task_ids=["task-a"],
+            dispatchable=False,
+            mutations=[],
+        ),
+        SimpleNamespace(
+            batch_id="batch-b",
+            task_ids=["task-b"],
+            dispatchable=False,
+            mutations=[],
+        ),
+        SimpleNamespace(
+            batch_id="batch-c",
+            task_ids=["task-c"],
+            dispatchable=True,
+            mutations=[object()],
+        ),
+    ]
+    prior_plan = _certified_prior_plan(
+        task_queue,
+        "host-fingerprint",
+        batches,
+        [
+            SimpleNamespace(phase_number=1, batch_ids=["batch-a", "batch-b"]),
+            SimpleNamespace(phase_number=2, batch_ids=["batch-c"]),
+        ],
+        {"batch-c": "prefix-c"},
+        workspace_prefix_provenance=QAPassedWorkspacePrefix(
+            graph_digest="prefix-a",
+            certified_by_portfolio_plan_id="prior-plan",
+            batch_ids=["batch-a"],
+            task_ids=["task-a"],
+        ),
+    )
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+
+    prefix = _last_qa_passed_prefix_provenance(prior_plan, task_queue, request, "host-fingerprint")
+    assert prefix is not None
+    assert prefix.graph_digest == "prefix-a"
+    assert prefix.batch_ids == ["batch-a"]
+    assert prefix.task_ids == ["task-a"]
+
+    task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.QA_PASSED})
+    extended_prefix = _last_qa_passed_prefix_provenance(
+        prior_plan, task_queue, request, "host-fingerprint"
+    )
+    assert extended_prefix is not None
+    assert extended_prefix.graph_digest == "prefix-c"
+    assert extended_prefix.batch_ids == ["batch-a", "batch-c"]
+    assert extended_prefix.task_ids == ["task-a", "task-c"]
+
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-c",
+        task_id="task-c",
+        task_revision=task_queue["task-c"].task_revision,
+        portfolio_plan_id="prior-plan",
+        workspace_graph_digest="qa-prefix-c",
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(task_id="task-c", passed=True),
+    )
+    observed_prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        task_queue,
+        request,
+        "host-fingerprint",
+        qa_results_by_attempt={"attempt-c": qa_result},
+    )
+    assert observed_prefix is not None
+    assert observed_prefix.graph_digest == "qa-prefix-c"
+
+    stale_qa_result = qa_result.model_copy(update={"portfolio_plan_id": "another-plan"})
+    stale_prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        task_queue,
+        request,
+        "host-fingerprint",
+        qa_results_by_attempt={"attempt-c": stale_qa_result},
+    )
+    assert stale_prefix is not None
+    assert stale_prefix.graph_digest == "prefix-c"
+
+    task_queue["task-a"] = task_queue["task-a"].model_copy(update={"status": TaskStatus.PENDING})
+    diagnostics: list[str] = []
+    assert (
+        _last_qa_passed_prefix_provenance(
+            prior_plan,
+            task_queue,
+            request,
+            "host-fingerprint",
+            diagnostics=diagnostics,
+        )
+        is None
+    )
+    assert any("inherited workspace prefix" in item for item in diagnostics)
 
 
 def test_workspace_manifest_drift_requires_exact_certified_prefix_digest():
@@ -665,6 +810,15 @@ def test_unmatched_certified_prefix_fails_closed_on_live_manifest_drift(tmp_path
         reason="UNFIXABLE_REPLAN",
         source_portfolio_plan_id="prior-plan",
     )
+    fresh_packuments: list[str] = []
+
+    def fetch_fresh_packument(package_name: str) -> dict[str, Any]:
+        fresh_packuments.append(package_name)
+        return {
+            "name": package_name,
+            "versions": {"1.0.0": {}, "2.0.0": {}, "9.0.2": {}},
+        }
+
     state = _FakeSandboxState(files)
     manifest = json.loads(state.files["package.json"])
     manifest["dependencies"]["jsonwebtoken"] = "9.0.2"
@@ -681,6 +835,7 @@ def test_unmatched_certified_prefix_fails_closed_on_live_manifest_drift(tmp_path
         state=state,
         prior_portfolio_plan=prior_plan,
         portfolio_replan_request=request,
+        registry_fetcher=fetch_fresh_packument,
     )
 
     assert plan.solver_plan is not None
@@ -692,6 +847,11 @@ def test_unmatched_certified_prefix_fails_closed_on_live_manifest_drift(tmp_path
         for item in plan.resolution_certificate.diagnostics
     )
     assert state.install_assignments == []
+    assert fresh_packuments
+    assert any(
+        "live fingerprint did not match the certified QA-passed prefix" in item
+        for item in plan.resolution_certificate.diagnostics
+    )
 
 
 def test_outer_replan_does_not_reuse_prior_resolver_cuts(
@@ -790,6 +950,193 @@ def test_terminal_workaround_authorization_requires_qa_pass(terminal_status, exp
     )
 
     assert _authorized_workaround(finding, prepared, selected_plan) is expected
+
+
+def test_active_transitive_workaround_keeps_physical_target_and_other_mutations(tmp_path: Path):
+    issue = VulnerabilityIssue(
+        source=IssueSource.SYNTHETIC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-70010",
+        package_name="decompress",
+        package_version="4.2.1",
+        file_path="package.json",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        is_direct_dependency=False,
+        localization_confidence=1.0,
+        dependency_ancestry=["download", "decompress"],
+        dependency_versions={"download": "8.0.0", "decompress": "4.2.1"},
+        parent_package_name="download",
+        parent_package_version="8.0.0",
+        parent_declaration_type="dependencies",
+    )
+    workaround_plan = FixPlan(
+        status=FixPlanStatus.WORKAROUND_FOUND,
+        instruction="Apply the authorized archive extraction workaround.",
+        strategy_used="WORKAROUND",
+        workaround_snippets=["Use a path-contained extraction destination."],
+    )
+    decompress_group = group_issues(
+        [issue],
+        sca_issue_plans=[(localized, workaround_plan)],
+    )[0]
+
+    foo_issue = VulnerabilityIssue(
+        source=IssueSource.SYNTHETIC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-70011",
+        package_name="foo",
+        package_version="1.0.0",
+        file_path="package.json",
+    )
+    foo_localized = LocalizedIssue(
+        issue=foo_issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        declaration_type="dependencies",
+        is_direct_dependency=True,
+        localization_confidence=1.0,
+    )
+    foo_plan = FixPlan(
+        status=FixPlanStatus.VERSION_FOUND,
+        fixed_version="2.0.0",
+        instruction="Update foo to its fixed version.",
+        strategy_used="osv_api",
+    )
+    foo_group = group_issues([foo_issue], sca_issue_plans=[(foo_localized, foo_plan)])[0]
+
+    manifest = {
+        "name": "app",
+        "dependencies": {"download": "8.0.0", "foo": "1.0.0"},
+    }
+    lockfile = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"name": "app", "dependencies": dict(manifest["dependencies"])},
+            "node_modules/download": {
+                "version": "8.0.0",
+                "dependencies": {"decompress": "^4.2.1"},
+            },
+            "node_modules/decompress": {"version": "4.2.1"},
+            "node_modules/foo": {"version": "1.0.0"},
+        },
+    }
+    files = {
+        "package.json": _write_fixture(tmp_path, "package.json", manifest),
+        "package-lock.json": _write_fixture(tmp_path, "package-lock.json", lockfile),
+    }
+    groups = [decompress_group, foo_group]
+    workaround_task = build_initial_remediation_task(decompress_group, "task-decompress")
+    foo_task = build_initial_remediation_task(foo_group, "task-foo")
+    task_queue = {task.task_id: task for task in (workaround_task, foo_task)}
+
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    targets, findings, diagnostics = _build_targets_and_findings(snapshot, groups, task_queue)
+    physical_id = make_occurrence_id(
+        "package.json",
+        "decompress",
+        "node_modules/decompress",
+    )
+    decompress_target = next(item for item in targets if item.task_id == "task-decompress")
+    decompress_finding = next(item for item in findings if item.vulnerable_package == "decompress")
+    assert diagnostics == []
+    assert decompress_target.occurrence_id == physical_id
+    assert decompress_target.eligible_for_atomic_update is False
+    assert decompress_finding.target_occurrence_id == physical_id
+    assert decompress_finding.vulnerable_occurrence_id == physical_id
+
+    def registry_fetcher(package_name: str) -> dict[str, Any]:
+        return {
+            "name": package_name,
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+        }
+
+    plan, sandbox_state, _factory = _run_fake_certifier(
+        tmp_path,
+        files,
+        groups,
+        task_queue,
+        registry_fetcher=registry_fetcher,
+    )
+
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    workaround_decision = next(
+        item for item in selected.task_decisions if item.task_id == "task-decompress"
+    )
+    assert workaround_decision.selected_strategy == "code_workaround"
+    assert workaround_decision.selected_version is None
+    assert workaround_decision.selected_plan_issue_ids == [str(issue.id)]
+    batches_by_task = {task_id: batch for batch in selected.batches for task_id in batch.task_ids}
+    workaround_batch = batches_by_task["task-decompress"]
+    assert workaround_batch.dispatchable is True
+    assert workaround_batch.mutations == []
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED
+    assert decompress_finding.coverage_id in plan.resolution_certificate.unresolved_coverage_ids
+    foo_coverage = {item.coverage_id for item in findings if item.vulnerable_package == "foo"}
+    assert foo_coverage <= set(plan.resolution_certificate.covered_coverage_ids)
+    assert any("npm install --package-lock-only" in command for command in sandbox_state.commands)
+
+    committed_groups, committed_queue, diagnostics = apply_portfolio_plan(
+        plan,
+        groups,
+        task_queue,
+    )
+    assert diagnostics == []
+    committed_workaround = committed_queue["task-decompress"]
+    assert committed_workaround.strategy.value == "code_workaround"
+    assert committed_workaround.status == TaskStatus.PENDING
+    assert committed_workaround.instruction == workaround_task.instruction
+    assert committed_workaround.target_package_name is None
+    assert committed_workaround.target_dependency_type is None
+    assert committed_workaround.selected_version is None
+    assert committed_workaround.portfolio_plan_id == plan.portfolio_plan_id
+    assert _portfolio_plan_violations(plan, committed_queue, committed_groups) == []
+
+
+def test_active_workaround_is_not_certified_before_qa_pass():
+    target = SolverTarget(
+        occurrence_id="package.json::decompress::node_modules/decompress",
+        task_id="task-decompress",
+        group_id="group-decompress",
+        package_name="decompress",
+        target_package_name="decompress",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/decompress",
+        installed_version="4.2.1",
+        strategy="code_workaround",
+        eligible_for_atomic_update=False,
+    )
+    finding = SolverFindingRequirement(
+        finding_id="finding-decompress",
+        ghsa_id="GHSA-AAAA-BBBB-CCCC",
+        vulnerable_package="decompress",
+        target_occurrence_id=target.occurrence_id,
+        vulnerable_occurrence_id=target.occurrence_id,
+        workaround_available=True,
+        workaround_plan_ids=["fix-plan-decompress"],
+    )
+    prepared = SimpleNamespace(targets=[target])
+    selected_plan = SimpleNamespace(
+        task_decisions=[
+            SimpleNamespace(
+                task_id=target.task_id,
+                selected_strategy="code_workaround",
+                selected_plan_issue_ids=["fix-plan-decompress"],
+            )
+        ]
+    )
+
+    assert _authorized_workaround(finding, prepared, selected_plan) is False
 
 
 def test_terminal_failed_batch_is_skipped_and_kept_unresolved(tmp_path: Path):
@@ -2334,8 +2681,18 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
         host_fingerprint,
         [prior_batch],
         [SimpleNamespace(phase_number=1, batch_ids=["batch-task-a"])],
-        {"batch-task-a": prefix_snapshot.repository_fingerprint},
+        {"batch-task-a": "resolver-predicted-prefix"},
         selected_candidate_versions={foo_occurrence: "2.0.0"},
+    )
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-task-a",
+        task_id="task-a",
+        task_revision=task_a.task_revision,
+        portfolio_plan_id="prior-plan",
+        workspace_graph_digest=prefix_snapshot.repository_fingerprint,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(task_id="task-a", passed=True),
     )
     state = initial_orchestrator_state(str(tmp_path), groups)
     state.update(
@@ -2343,6 +2700,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             "repo_root": str(tmp_path),
             "valid_groups": groups,
             "task_queue": task_queue,
+            "qa_results_by_attempt": {"attempt-task-a": qa_result},
             "portfolio_plan": prior_plan,
             "portfolio_solver_plan": prior_plan.solver_plan,
             "portfolio_iteration": 1,
@@ -2437,6 +2795,24 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
     assert committed_queue["task-c"].selected_version == "2.0.0"
     assert committed_queue["task-b"].portfolio_plan_id == plan.portfolio_plan_id
     assert committed_queue["task-b"].task_revision == plan.planned_task_revisions["task-b"]
+
+    workspace_prefix = plan.resolution_certificate.workspace_prefix_provenance
+    assert workspace_prefix is not None
+    assert workspace_prefix.graph_digest == prefix_snapshot.repository_fingerprint
+    assert workspace_prefix.certified_by_portfolio_plan_id == plan.portfolio_plan_id
+    assert workspace_prefix.batch_ids == ["batch-task-a"]
+    assert workspace_prefix.task_ids == ["task-a"]
+    retained_prefix = _last_qa_passed_prefix_provenance(
+        plan,
+        committed_queue,
+        PortfolioReplanRequest(
+            reason="UNFIXABLE_REPLAN",
+            source_portfolio_plan_id=plan.portfolio_plan_id,
+        ),
+        host_fingerprint,
+    )
+    assert retained_prefix is not None
+    assert retained_prefix.graph_digest == prefix_snapshot.repository_fingerprint
 
     next_supervisor = run_supervisor_node({**state, **portfolio_result})
     assert next_supervisor["next_routing_step"] == "update_subagent"

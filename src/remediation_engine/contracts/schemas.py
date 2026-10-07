@@ -2039,6 +2039,16 @@ class QAAttemptResult(BaseModel):
     attempt_id: str = Field(..., min_length=1)
     task_id: str = Field(..., min_length=1)
     task_revision: int = Field(default=0, ge=0)
+    portfolio_plan_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Portfolio plan whose committed attempt was evaluated.",
+    )
+    workspace_graph_digest: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Exact npm workspace graph observed after successful QA gates.",
+    )
     cluster_id: str | None = Field(default=None)
     dispatch_batch_id: str | None = Field(default=None)
     action_digest: str | None = Field(default=None)

@@ -1637,6 +1637,7 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            portfolio_plan_id="plan-qa",
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1665,6 +1666,10 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.DockerSandbox",
                 return_value=sandbox,
             ),
+            patch(
+                "remediation_engine.orchestration.graph_wrappers._qa_workspace_graph_digest",
+                return_value="qa-workspace-digest",
+            ),
         ):
             result = run_qa_critic_from_orchestrator(state)
 
@@ -1673,6 +1678,8 @@ class TestPhase5GraphIntegration:
         qa_result = result["qa_results_by_attempt"]["attempt-pass"]
         assert qa_result.qa_policy == task.qa_policy
         assert qa_result.qa_policy_source == "attempt_snapshot"
+        assert qa_result.workspace_graph_digest == "qa-workspace-digest"
+        assert qa_result.portfolio_plan_id == "plan-qa"
 
     def test_regression_retries_keep_first_pre_task_baseline(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

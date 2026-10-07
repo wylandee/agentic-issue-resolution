@@ -613,6 +613,25 @@ class CertificationStatistics(_SolverModel):
         return dict(sorted(result.items()))
 
 
+class QAPassedWorkspacePrefix(_SolverModel):
+    """Verified QA-passed workspace prefix carried across portfolio replans."""
+
+    graph_digest: str = Field(..., min_length=1)
+    certified_by_portfolio_plan_id: str = Field(..., min_length=1)
+    batch_ids: list[str] = Field(..., min_length=1)
+    task_ids: list[str] = Field(..., min_length=1)
+
+    @field_validator("graph_digest", "certified_by_portfolio_plan_id", mode="before")
+    @classmethod
+    def _required_prefix_text(cls, value: Any, info: Any) -> str:
+        return _required_text(value, info.field_name)
+
+    @field_validator("batch_ids", "task_ids", mode="before")
+    @classmethod
+    def _prefix_ids(cls, value: Any, info: Any) -> list[str]:
+        return _unique_strings(value, info.field_name)
+
+
 class PackageResolutionCertificate(_SolverModel):
     """Immutable evidence for one package-resolved assignment and its coverage."""
 
@@ -637,6 +656,7 @@ class PackageResolutionCertificate(_SolverModel):
         default_factory=CertificationStatistics
     )
     batch_prefix_graph_digests: dict[str, str] = Field(default_factory=dict)
+    workspace_prefix_provenance: QAPassedWorkspacePrefix | None = None
     diagnostics: list[str] = Field(default_factory=list)
 
     @field_validator(
@@ -707,6 +727,12 @@ class PackageResolutionCertificate(_SolverModel):
             for right in range(left + 1, 3)
         ):
             raise ValueError("certificate coverage IDs must be classified exactly once.")
+        if (
+            self.workspace_prefix_provenance is not None
+            and self.workspace_prefix_provenance.certified_by_portfolio_plan_id
+            != self.portfolio_plan_id
+        ):
+            raise ValueError("workspace prefix provenance must be bound to this portfolio plan.")
         return self
 
 
@@ -1393,6 +1419,7 @@ __all__ = [
     "ArbitrationResult",
     "PackageResolutionCertificate",
     "PackageResolutionStatus",
+    "QAPassedWorkspacePrefix",
     "SolverPackageOccurrence",
     "SolverCandidateRelation",
     "SolverDependencyRequirement",

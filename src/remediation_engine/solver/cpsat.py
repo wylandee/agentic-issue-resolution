@@ -808,6 +808,10 @@ def _build_decision(
             if strategy == "code_workaround" and finding_workaround.get(finding.coverage_id, False)
         }
     )
+    non_mutating_workaround = (
+        preferred_strategy in {"code_workaround", "workaround"}
+        and not target.eligible_for_atomic_update
+    )
     stage = requirements[0].strategy_stage if requirements else "osv_minimum"
     selected_version = (
         selected.version if selected is not None and strategy == "version_bump" else None
@@ -832,7 +836,7 @@ def _build_decision(
         selected_route=route,
         selected_version=selected_version,
         allowed_alternative_versions=alternatives,
-        allowed_dependency_types=[target.dependency_type],
+        allowed_dependency_types=([] if non_mutating_workaround else [target.dependency_type]),
         strategy_stage=stage,
         selected_plan_issue_ids=selected_plan_ids,
         instruction_source="deterministic_solver",
@@ -844,7 +848,7 @@ def _build_decision(
         target_package_name=target.target_package_name,
         manifest_path=target.manifest_path,
         lockfile_package_key=target.lockfile_package_key,
-        dependency_type=target.dependency_type,
+        dependency_type=None if non_mutating_workaround else target.dependency_type,
     )
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
@@ -45,6 +46,46 @@ def _graph_module():
     from remediation_engine.orchestration import graph
 
     return graph
+
+
+def _qa_workspace_graph_digest(workspace_volume: str | None) -> str | None:
+    """Return the exact npm graph remaining after successful QA.
+
+    Args:
+        workspace_volume: Shared workspace volume used by the QA attempt.
+
+    Returns:
+        The fingerprint of all package manifests and npm lockfiles, or ``None``
+        if the workspace cannot be read or contains unsupported npm metadata.
+    """
+    if not workspace_volume:
+        return None
+
+    try:
+        from remediation_engine.orchestration.portfolio_certifier import _read_npm_documents
+        from remediation_engine.tools.npm_graph import load_npm_graph_snapshot_from_documents
+
+        with _graph_module().DockerSandbox(
+            repo_root=None, workspace_volume=workspace_volume
+        ) as sandbox:
+            documents = _read_npm_documents(
+                sandbox,
+                "",
+                time.monotonic() + 60.0,
+            )
+        if not any(path.rsplit("/", 1)[-1] == "package.json" for path in documents):
+            return None
+        snapshot = load_npm_graph_snapshot_from_documents(documents)
+    except Exception as exc:  # noqa: BLE001 - QA digest is optional, but must fail closed
+        log.warning("Could not fingerprint QA workspace graph: %s", exc)
+        return None
+    if snapshot.diagnostics:
+        log.warning(
+            "Could not trust QA workspace graph fingerprint: %s",
+            " | ".join(snapshot.diagnostics),
+        )
+        return None
+    return snapshot.repository_fingerprint
 
 
 def _dispatch_boundary_rejection(
@@ -1290,6 +1331,19 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         workspace_snapshot_id,
         result,
     )
+
+    qa_evaluations = result.get("qa_evaluations", {}) or {}
+    qa_workspace_graph_digest = None
+    if (
+        result.get("status") == "qa_completed"
+        and not (result.get("errors") or snapshot_cleanup_errors)
+        and active_task_ids
+        and all(
+            (evaluation := qa_evaluations.get(task_id)) is not None and evaluation.passed
+            for task_id in active_task_ids
+        )
+    ):
+        qa_workspace_graph_digest = _qa_workspace_graph_digest(state.get("workspace_volume"))
     scan_evidence = result.get("scan_evidence")
     scan_was_skipped = bool(result.get("scan_skipped"))
     attempt_scan_is_authoritative = not scan_was_skipped and (
@@ -1393,10 +1447,17 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         )
         if attempt_policy is None or task.qa_policy != attempt_policy:
             raise ValueError(f"qa_critic: missing or contradictory QA policy for task {task_id}")
+        attempt_portfolio_plan_id = (
+            attempt_snapshot.get("portfolio_plan_id")
+            if isinstance(attempt_snapshot, Mapping)
+            else attempt_snapshot.portfolio_plan_id
+        )
         qa_results_by_attempt[attempt_id] = QAAttemptResult(
             attempt_id=attempt_id,
             task_id=task_id,
             task_revision=task.task_revision,
+            portfolio_plan_id=attempt_portfolio_plan_id,
+            workspace_graph_digest=qa_workspace_graph_digest,
             cluster_id=attempt_snapshot.cluster_id,
             dispatch_batch_id=attempt_snapshot.dispatch_batch_id,
             action_digest=attempt_snapshot.action_digest,

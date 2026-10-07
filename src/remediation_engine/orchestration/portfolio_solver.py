@@ -422,23 +422,50 @@ def _finding_occurrences(
     return sorted({occurrence.occurrence_id for occurrence in candidates})
 
 
-def _representative_override_package(
+def _representative_lockfile_package(
     snapshot: NpmGraphSnapshot,
     manifest_path: str,
     package_name: str,
     group: VulnerabilityGroup,
+    *,
+    parent_occurrence_id: str | None = None,
+    include_current_versions: bool = False,
 ) -> NpmLockfilePackage | None:
-    """Choose one stable mutation identity without narrowing finding coverage."""
+    """Choose a stable physical occurrence for one finding group.
+
+    Prefer the package reachable from its directly declared parent when that
+    occurrence is also supported by the finding's version/ancestry evidence.
+    Otherwise use the group's most specific ancestry, then stable lockfile-key
+    ordering. With ``include_current_versions`` enabled, allow a QA-passed task's
+    already-upgraded physical occurrence even when the scanner's old version is
+    no longer present. This identity is evidence-only for code-workaround tasks.
+    """
     by_identity: dict[tuple[str, str | None], NpmLockfilePackage] = {}
     issues = list(group.issues) or [None]
     for issue in issues:
         for package in _lockfile_packages_for_finding(
-            snapshot, manifest_path, package_name, issue, group
+            snapshot,
+            manifest_path,
+            package_name,
+            issue,
+            group,
+            include_current_versions=include_current_versions,
         ):
             by_identity.setdefault((package.package_key, package.version), package)
     candidates = list(by_identity.values())
     if not candidates:
         return None
+    if parent_occurrence_id:
+        parent_package = resolve_lockfile_dependency_package(
+            snapshot,
+            parent_occurrence_id,
+            package_name,
+        )
+        if parent_package is not None:
+            parent_identity = (parent_package.package_key, parent_package.version)
+            for package in candidates:
+                if (package.package_key, package.version) == parent_identity:
+                    return package
     ancestry = next(
         (_issue_dependency_ancestry(group, issue) for issue in issues if issue is not None),
         normalize_dependency_ancestry(group.dependency_ancestry),
@@ -531,12 +558,33 @@ def _build_targets_and_findings(
         manager = _group_manager(group)
         record = records.get((manifest_path, target_name))
         override_action = task.target_dependency_type in _OVERRIDE_DEPENDENCY_TYPES
+        parent_name = (task.parent_package_name or group.parent_package_name or "").strip()
+        parent_record = records.get((manifest_path, parent_name)) if parent_name else None
+        transitive_workaround = task.strategy == RoutingStrategy.CODE_WORKAROUND and bool(
+            parent_name
+            or group.parent_contexts
+            or group.dependency_ancestry
+            or any(localized.is_direct_dependency is False for localized in group.localized_issues)
+        )
         nested_package = (
-            _representative_override_package(snapshot, manifest_path, target_name, group)
-            if record is None and target_name == package_name and override_action
+            _representative_lockfile_package(
+                snapshot,
+                manifest_path,
+                target_name,
+                group,
+                parent_occurrence_id=parent_record.occurrence_id if parent_record else None,
+                include_current_versions=task.status == TaskStatus.QA_PASSED,
+            )
+            if record is None
+            and target_name == package_name
+            and (override_action or transitive_workaround)
             else None
         )
-        target_mapped = record is not None or override_action
+        target_mapped = (
+            record is not None
+            or override_action
+            or (transitive_workaround and nested_package is not None)
+        )
         if not package_name or not target_name or not manifest_path or manager not in {"", "npm"}:
             diagnostics.append(f"task {task.task_id!r} has an unsupported or ambiguous npm target")
             target_mapped = False
@@ -544,7 +592,7 @@ def _build_targets_and_findings(
             diagnostics.append(
                 f"task {task.task_id!r} does not map to a direct declaration or supported override"
             )
-        if record is None and not override_action:
+        if record is None and not override_action and nested_package is None:
             diagnostics.append(
                 f"task {task.task_id!r} has no direct declaration or supported override target"
             )
@@ -623,8 +671,10 @@ def _build_targets_and_findings(
                 and task.current_attempt_id is None
                 and (
                     target_strategy == "no_fix"
-                    or task.strategy == RoutingStrategy.VERSION_BUMP
-                    or has_version_evidence
+                    or (
+                        task.strategy != RoutingStrategy.CODE_WORKAROUND
+                        and (task.strategy == RoutingStrategy.VERSION_BUMP or has_version_evidence)
+                    )
                 )
             ),
             workspace_id=_workspace_id(snapshot, manifest_path),
@@ -2227,6 +2277,14 @@ def apply_portfolio_plan(
             decision_lockfile_key,
         )
         decision_occurrence = str(decision.target_occurrence_id or "")
+        decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")
+        non_mutating_workaround = (
+            task.strategy == RoutingStrategy.CODE_WORKAROUND
+            and decision_strategy in {"code_workaround", "workaround"}
+            and decision.selected_version is None
+            and not decision.allowed_alternative_versions
+            and bool(decision.selected_plan_issue_ids)
+        )
         if not lockfile_key_matches_package(decision_lockfile_key, expected_package):
             raise ValueError(
                 f"portfolio decision for task {task_id!r} has invalid lockfile_package_key "
@@ -2236,14 +2294,6 @@ def apply_portfolio_plan(
             raise ValueError(
                 f"portfolio decision for task {task_id!r} has invalid target occurrence "
                 f"{decision_occurrence!r}"
-            )
-        if (
-            decision_occurrence == physical_occurrence
-            and physical_occurrence != direct_occurrence
-            and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
-        ):
-            raise ValueError(
-                f"nested lockfile target for task {task_id!r} requires a package override"
             )
         identity_values = {
             "target_group_id": expected_group_id,
@@ -2261,10 +2311,30 @@ def apply_portfolio_plan(
         if task.current_attempt_id is not None:
             diagnostics.append(f"task {task_id!r} has an active attempt; plan decision not applied")
             continue
+        # Terminal decisions are audit-only: verify identity, then skip checks
+        # that govern package mutations rather than reopening the task.
         if task.status in _TERMINAL_STATUSES:
             committed[task_id] = task.model_copy(
                 update={
                     "portfolio_plan_id": plan_id,
+                    "task_revision": task.task_revision + 1,
+                }
+            )
+            continue
+        if (
+            decision_occurrence == physical_occurrence
+            and physical_occurrence != direct_occurrence
+            and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
+            and not non_mutating_workaround
+        ):
+            raise ValueError(
+                f"nested lockfile target for task {task_id!r} requires a package override"
+            )
+        if non_mutating_workaround:
+            committed[task_id] = task.model_copy(
+                update={
+                    "portfolio_plan_id": plan_id,
+                    "selected_plan_issue_ids": list(decision.selected_plan_issue_ids),
                     "task_revision": task.task_revision + 1,
                 }
             )
