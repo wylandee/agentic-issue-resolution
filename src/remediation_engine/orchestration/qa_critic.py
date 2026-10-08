@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -44,16 +45,14 @@ from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
     QAPolicy,
     ScanFallbackReason,
+    ScannerExecutionStatus,
     ScanScope,
     VulnerabilityGroup,
 )
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.tools.lockfile_closure import (
-    ClosureResolutionError,
-    DependencyClosure,
-)
+from remediation_engine.tools.lockfile_closure import TargetPackageResolution
 
 from . import qa_evaluator as _qa_evaluator_module
 from . import qa_odc as _qa_odc_module
@@ -70,7 +69,7 @@ from ._qa_runtime import (
     _derive_qa_task_policies,
     _derive_qa_task_strategies,
     _resolve_action_summary_task_ids,
-    _resolve_targeted_closures,
+    _resolve_targeted_packages,
     _scan_evidence,
     _scan_state_projection,
     _store_scan_outcome,
@@ -89,6 +88,8 @@ from .qa_types import (
     _QAExecutionResults,
     _QALogRecord,
     _QAPackageState,
+    _scan_result_value,
+    _SecurityScanResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,22 +172,41 @@ def _run_global_execution(
             )
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
-        closures: list[DependencyClosure] = []
+        target_packages: list[TargetPackageResolution] = []
+        covered_task_ids: list[str] = []
         targeted_subdir: str | None = None
-        fallback_reason: ScanFallbackReason | None = None
+        incomplete_reason: ScanFallbackReason | None = None
+        incomplete_detail: str | None = None
+        targeted_result: _SecurityScanResult | None = None
+        scanner_coverage_complete = False
         try:
             if _targeted_extra_args_conflict():
-                fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                incomplete_detail = "ODC_EXTRA_ARGS conflicts with safe targeted scan scope."
             else:
-                closures, fallback_reason, resolution_detail = _resolve_targeted_closures(
-                    sandbox,
-                    scan_targets,
-                )
-                if resolution_detail:
-                    logger.info("qa_critic: targeted scan fallback: %s", resolution_detail)
-            if fallback_reason is None:
+                resolution_batch = _resolve_targeted_packages(sandbox, scan_targets)
+                target_packages = list(resolution_batch.target_packages)
+                results.scan_target_failures_by_task = {
+                    task_id: (failure.reason, failure.detail)
+                    for task_id, failure in resolution_batch.failures_by_task.items()
+                }
+                if resolution_batch.fallback_detail:
+                    logger.info(
+                        "qa_critic: some targeted packages could not be resolved: %s",
+                        resolution_batch.fallback_detail,
+                    )
+                if not target_packages:
+                    incomplete_reason = (
+                        resolution_batch.fallback_reason
+                        or ScanFallbackReason.NO_MATCHING_TARGET
+                    )
+                    incomplete_detail = (
+                        resolution_batch.fallback_detail
+                        or "No task target resolved to a scannable package."
+                    )
+            if incomplete_reason is None and target_packages:
                 targeted_subdir = ".odc-targeted"
-                _write_targeted_artifacts(sandbox, closures)
+                _write_targeted_artifacts(sandbox, target_packages)
                 targeted_result = _qa_odc_module._run_targeted_security_scan(
                     sandbox,
                     workspace_volume,
@@ -194,55 +214,113 @@ def _run_global_execution(
                     baseline,
                     targeted_subdir,
                 )
-                if (
-                    not targeted_result.ok
-                    and not targeted_result.found_identifiers
-                    and not targeted_result.remaining_identifiers
-                ):
-                    _append_qa_log_records(results, "scan", targeted_result.scan_records)
-                    fallback_reason = (
+                if targeted_result.execution_status != ScannerExecutionStatus.SUCCESS:
+                    incomplete_reason = (
                         ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
-                        if "report" in targeted_result.summary.lower()
+                        if targeted_result.execution_status == ScannerExecutionStatus.UNPARSEABLE
                         else ScanFallbackReason.TARGETED_SCAN_FAILED
                     )
+                    incomplete_detail = targeted_result.summary
+                elif targeted_result.reported_packages is None:
+                    incomplete_reason = ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
+                    incomplete_detail = "ODC report did not contain parseable package identities."
                 else:
-                    _store_scan_outcome(results, targeted_result, label="odc:targeted")
-                    results.scan_evidence = _scan_evidence(
-                        targets=scan_targets,
-                        scan_result=targeted_result,
-                        effective_scope=ScanScope.TARGETED,
-                        complete=True,
-                        closures=closures,
+                    expected_packages: list[tuple[str, str]] = []
+                    seen_physical_entries: set[tuple[str, str, str]] = set()
+                    for resolution in target_packages:
+                        node = resolution.target_node
+                        if node is None:
+                            continue
+                        physical_identity = (
+                            resolution.source_lockfile,
+                            node.lockfile_key,
+                            node.version,
+                        )
+                        if physical_identity in seen_physical_entries:
+                            continue
+                        seen_physical_entries.add(physical_identity)
+                        expected_packages.append((node.package_name.casefold(), node.version))
+                    missing_packages = Counter(expected_packages) - Counter(
+                        targeted_result.reported_packages
                     )
-        except (ClosureResolutionError, OSError, RuntimeError, ValueError) as exc:
+                    if missing_packages:
+                        missing_text = ", ".join(
+                            f"{name}@{version} (missing {count})"
+                            for (name, version), count in sorted(missing_packages.items())
+                        )
+                        incomplete_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
+                        incomplete_detail = (
+                            "ODC report did not enumerate every targeted package occurrence: "
+                            f"{missing_text}."
+                        )
+                    else:
+                        scanner_coverage_complete = True
+                        covered_task_ids = list(resolution_batch.covered_task_ids)
+                        if resolution_batch.failures_by_task:
+                            incomplete_reason = resolution_batch.fallback_reason
+                            incomplete_detail = resolution_batch.fallback_detail
+
+            if scanner_coverage_complete and targeted_result is not None:
+                _store_scan_outcome(results, targeted_result, label="odc:targeted")
+                results.scan_evidence = _scan_evidence(
+                    targets=scan_targets,
+                    scan_result=targeted_result,
+                    effective_scope=ScanScope.TARGETED,
+                    complete=not results.scan_target_failures_by_task,
+                    fallback_reason=(
+                        resolution_batch.fallback_reason
+                        if results.scan_target_failures_by_task
+                        else None
+                    ),
+                    target_packages=target_packages,
+                    covered_task_ids=covered_task_ids,
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("qa_critic: targeted scan setup failed — %s", exc)
-            fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+            incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+            incomplete_detail = str(exc)
         finally:
             if targeted_subdir is not None:
                 _cleanup_targeted_artifacts(sandbox)
 
-        if fallback_reason is not None:
-            if baseline_identifiers is None:
-                fallback_result = _qa_odc_module._run_security_scan(
-                    sandbox,
-                    workspace_volume,
-                    target_identifiers,
+        if not scanner_coverage_complete:
+            incomplete_reason = incomplete_reason or ScanFallbackReason.TARGETED_SCAN_FAILED
+            summary = (
+                "INCONCLUSIVE: targeted Dependency-Check evidence is incomplete. "
+                f"Reason: {incomplete_detail or incomplete_reason.value}"
+            )
+            if targeted_result is None:
+                incomplete_result = _SecurityScanResult(
+                    False,
+                    summary,
+                    set(),
+                    set(),
+                    set(),
+                    execution_status=ScannerExecutionStatus.NOT_RUN,
                 )
             else:
-                fallback_result = _qa_odc_module._run_security_scan(
-                    sandbox,
-                    workspace_volume,
-                    target_identifiers,
-                    baseline,
+                execution_status = targeted_result.execution_status
+                if execution_status == ScannerExecutionStatus.SUCCESS:
+                    execution_status = ScannerExecutionStatus.UNPARSEABLE
+                incomplete_result = replace(
+                    targeted_result,
+                    ok=False,
+                    summary=summary,
+                    remaining_identifiers=set(),
+                    found_identifiers=set(),
+                    new_identifiers=set(),
+                    found_issues=[],
+                    execution_status=execution_status,
                 )
-            _store_scan_outcome(results, fallback_result, label="odc:fallback-full")
+            _store_scan_outcome(results, incomplete_result, label="odc:targeted")
             results.scan_evidence = _scan_evidence(
                 targets=scan_targets,
-                scan_result=results.scan,
-                effective_scope=ScanScope.FULL,
+                scan_result=incomplete_result,
+                effective_scope=ScanScope.TARGETED,
                 complete=False,
-                fallback_reason=fallback_reason,
-                closures=closures,
+                fallback_reason=incomplete_reason,
+                target_packages=target_packages,
+                covered_task_ids=[],
             )
 
     if results.scan_skipped:
@@ -254,8 +332,8 @@ def _run_global_execution(
         )
     elif results.scan_evidence is not None:
         logger.info(
-            "qa_critic: scan requested_scope=%s effective_scope=%s tasks=%d closure_packages=%d "
-            "fallback_reason=%s duration_seconds=%.3f",
+            "qa_critic: scan requested_scope=%s effective_scope=%s tasks=%d target_packages=%d "
+            "incomplete_reason=%s duration_seconds=%.3f",
             results.scan_evidence.requested_scope.value,
             results.scan_evidence.effective_scope.value,
             len(results.scan_evidence.covered_task_ids),
@@ -268,7 +346,7 @@ def _run_global_execution(
     else:
         logger.info(
             "qa_critic: scan requested_scope=full effective_scope=full tasks=0 "
-            "closure_packages=0 fallback_reason=None duration_seconds=%.3f",
+            "target_packages=0 fallback_reason=None duration_seconds=%.3f",
             time.monotonic() - scan_started,
         )
 
@@ -566,6 +644,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     failed_evals,
                     results.scan_evidence,
                     task_contexts,
+                    task_failures=results.scan_target_failures_by_task,
                 )
                 return {
                     "qa_evaluations": failed_evals,
@@ -575,6 +654,74 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     "errors": errors,
                     "changed_files": [],
                     "qa_investigation_report": "",
+                    "scan_evidence": results.scan_evidence,
+                    **scan_projection,
+                }
+
+            if (
+                results.scan_evidence is not None
+                and not results.scan_evidence.complete
+                and not results.scan_evidence.covered_task_ids
+            ):
+                reason = (
+                    results.scan_evidence.fallback_reason.value
+                    if results.scan_evidence.fallback_reason
+                    else "targeted evidence incomplete"
+                )
+                detail = (
+                    "Targeted ODC did not provide verifiable package coverage "
+                    f"({reason}); QA cannot confirm the target CVE status."
+                )
+                scan_summary = str(_scan_result_value(results.scan, "summary", "") or "").strip()
+                if scan_summary:
+                    detail = f"{detail} {scan_summary}"
+                errors.append(f"qa_critic: {detail}")
+                deterministic_gates, _gate_errors = _qa_policy_engine_module._evaluate_policy_gates(
+                    task_contexts,
+                    results,
+                    task_policies,
+                )
+                inconclusive_evaluations = {
+                    context.task_id: QAEvaluation(
+                        task_id=context.task_id,
+                        passed=False,
+                        failure_category=FailureCategory.SECURITY_FLAG,
+                        retry_feedback=(
+                            f"{detail} Correct the targeted scan evidence and re-run QA; "
+                            "this result does not consume a remediation retry."
+                        ),
+                        evidence_inconclusive=True,
+                        deterministic_gates=deterministic_gates.get(context.task_id),
+                    )
+                    for context in task_contexts
+                }
+                inconclusive_evaluations = _attach_scan_evidence_to_evaluations(
+                    inconclusive_evaluations,
+                    results.scan_evidence,
+                    task_contexts,
+                    task_failures=results.scan_target_failures_by_task,
+                )
+                report = json.dumps(
+                    {
+                        "scan_evidence_inconclusive": detail,
+                        "evaluations": {
+                            task_id: evaluation.model_dump(mode="json")
+                            for task_id, evaluation in sorted(inconclusive_evaluations.items())
+                        },
+                        "scan_projection": scan_projection,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                return {
+                    "qa_evaluations": inconclusive_evaluations,
+                    "eval_status": "failures_detected",
+                    "status": "qa_completed",
+                    "scan_skipped": results.scan_skipped,
+                    "errors": errors,
+                    "changed_files": candidate_changed_files,
+                    "qa_investigation_report": report,
                     "scan_evidence": results.scan_evidence,
                     **scan_projection,
                 }
@@ -650,29 +797,65 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         qa_evaluations,
         results.scan_evidence,
         task_contexts,
+        task_failures=results.scan_target_failures_by_task,
     )
+    for task_id, (reason, detail) in results.scan_target_failures_by_task.items():
+        current = qa_evaluations.get(task_id)
+        if current is None:
+            continue
+        failure_detail = (
+            f"Task {task_id} targeted package could not be scanned "
+            f"({reason.value}): {detail}"
+        )
+        errors.append(f"qa_critic: {failure_detail}")
+        inconclusive_gates = current.deterministic_gates
+        if inconclusive_gates is not None:
+            inconclusive_gates = inconclusive_gates.model_copy(
+                update={
+                    "status": "fail",
+                    "scanner_execution_status": ScannerExecutionStatus.NOT_RUN,
+                    "target_remaining_identifiers": [],
+                    "target_scanner_cleared": None,
+                    "diagnostics": [*inconclusive_gates.diagnostics, failure_detail],
+                }
+            )
+        qa_evaluations[task_id] = QAEvaluation(
+            task_id=task_id,
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback=(
+                f"{failure_detail} QA is inconclusive and this result does not consume a "
+                "remediation retry. Make the target package resolvable for targeted ODC, "
+                "or provide valid evidence that the task no longer requires scanning."
+            ),
+            deterministic_gates=inconclusive_gates,
+            evidence_inconclusive=True,
+            scan_evidence=current.scan_evidence,
+        )
+    qa_errors_by_task = {
+        task_id: list(investigation.errors)
+        for task_id, investigation in investigations_by_task.items()
+    }
+    for task_id, (_reason, detail) in results.scan_target_failures_by_task.items():
+        qa_errors_by_task.setdefault(task_id, []).append(detail)
     qa_investigation_reports_by_task = {
         task_id: json.dumps(
             {
                 "task_id": task_id,
                 "group_id": investigation.group_id,
                 "evaluation": (
-                    investigation.evaluation.model_dump(mode="json")
-                    if investigation.evaluation is not None
+                    qa_evaluations[task_id].model_dump(mode="json")
+                    if task_id in qa_evaluations
                     else None
                 ),
                 "tool_transcript": investigation.tool_transcript,
-                "errors": investigation.errors,
+                "errors": qa_errors_by_task.get(task_id, []),
             },
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
         for task_id, investigation in sorted(investigations_by_task.items())
-    }
-    qa_errors_by_task = {
-        task_id: list(investigation.errors)
-        for task_id, investigation in investigations_by_task.items()
     }
     all_passed = all(evaluation.passed for evaluation in qa_evaluations.values())
     eval_status = "all_passed" if all_passed else "failures_detected"

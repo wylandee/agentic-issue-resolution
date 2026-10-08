@@ -19,13 +19,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep @babel/core as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for @babel/core (npm)</notes>
         <packageUrl regex="true">^pkg:npm/%40babel%2Fcore@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for @cyclonedx/cyclonedx-npm (npm)</notes>
@@ -45,11 +43,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for base64url (npm)</notes>
+        <notes>Keep base64url as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/base64url@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for underscore.js (javascript)</notes>
@@ -111,13 +111,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep esbuild as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for esbuild (npm)</notes>
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
@@ -125,13 +123,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep file-type as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for file-type (npm)</notes>
         <packageUrl regex="true">^pkg:npm/file-type@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for form-data (npm)</notes>
@@ -151,13 +147,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep hono as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for hono (npm)</notes>
         <packageUrl regex="true">^pkg:npm/hono@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for http-cache-semantics (npm)</notes>
@@ -177,11 +171,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for jws (npm)</notes>
+        <notes>Keep jws as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/jws@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for lodash (javascript)</notes>
@@ -303,13 +299,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep vite as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for vite (npm)</notes>
         <packageUrl regex="true">^pkg:npm/vite@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for ws (npm)</notes>

@@ -104,7 +104,7 @@ class ScanScope(str, Enum):  # noqa: UP042
 
 
 class ScanFallbackReason(str, Enum):  # noqa: UP042
-    """Reason a requested targeted scan used the full-scan fallback."""
+    """Reason a requested targeted scan could not provide complete evidence."""
 
     UNSUPPORTED_PACKAGE_MANAGER = "unsupported_package_manager"
     MISSING_LOCKFILE = "missing_lockfile"
@@ -114,6 +114,7 @@ class ScanFallbackReason(str, Enum):  # noqa: UP042
     INCOMPLETE_CLOSURE = "incomplete_closure"
     TARGETED_SCAN_FAILED = "targeted_scan_failed"
     TARGETED_REPORT_UNPARSEABLE = "targeted_report_unparseable"
+    TARGET_PACKAGE_NOT_REPORTED = "target_package_not_reported"
 
 
 class RoutingStrategy(StrEnum):
@@ -1536,8 +1537,19 @@ class ODCScanEvidence(BaseModel):
     effective_scope: ScanScope
     authoritative: bool = False
     covered_task_ids: list[str] = Field(default_factory=list)
-    closure_package_names: list[str] = Field(default_factory=list)
-    closure_lockfile_keys: list[str] = Field(default_factory=list)
+    closure_package_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Package names represented by the task-scoped scan inputs. Each input now "
+            "contains only its selected target package."
+        ),
+    )
+    closure_lockfile_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Original physical package-lock keys selected for the task-scoped scan inputs."
+        ),
+    )
     found_identifiers: list[str] = Field(default_factory=list)
     remaining_target_identifiers: list[str] = Field(default_factory=list)
     complete: bool = False

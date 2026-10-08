@@ -183,14 +183,19 @@ source-review tools. It returns a typed terminal decision for the task.
 `qa_policy_engine` applies deterministic gates, attaches test/scan evidence,
 and rejects decisions that are not backed by the required evidence.
 
-For supported npm `package-lock.json` workspaces, QA may resolve the active
-task's target from the live volume, build a temporary exact-key dependency
-closure with `tools/lockfile_closure.py`, and run a targeted ODC scan. Nested
-package keys, optional/peer edges, and dependency ancestry are preserved.
-Unsupported package managers, missing or ambiguous lockfiles, incomplete
-closures, and targeted scan/report failures use the full-scan fallback. A
-scoped NO_FIX package-removal policy can skip the per-task scan only when its
-other deterministic install/test and package-state gates are satisfied.
+For supported npm `package-lock.json` workspaces, QA resolves every matching
+physical target package entry from the live volume and builds a separate
+one-package project for each entry. The selected installed version and
+dependency ancestry narrow the candidates when they identify a specific nested
+copy; each synthetic lockfile contains only its target package and no dependency
+edges. QA requires the ODC report to enumerate every targeted package occurrence
+at the expected version before it can confirm target CVE status. Unsupported
+package managers, missing or invalid lockfiles, unresolvable targets, and
+incomplete or unparseable reports produce inconclusive QA and do not consume a
+remediation retry. They never trigger a full-scan fallback. The authoritative
+final full scan checks the complete workspace. A scoped NO_FIX package-removal
+policy can skip the per-task scan only when its other deterministic
+install/test and package-state gates are satisfied.
 
 Targeted per-task scans and evaluator decisions are attempt-local evidence.
 They do not establish repository-wide security status and do not independently

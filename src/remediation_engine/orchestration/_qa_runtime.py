@@ -14,7 +14,7 @@ import logging
 import re
 import shlex
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,9 +40,9 @@ from remediation_engine.runtime.path_policy import (
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.tools.lockfile_closure import (
-    DependencyClosure,
-    build_sliced_lockfile_artifacts,
-    resolve_dependency_closure,
+    TargetPackageResolution,
+    build_target_only_lockfile_artifacts,
+    resolve_target_packages,
 )
 
 from .qa_odc import _ODC_HTML_REPORT_NAME, _ODC_REPORT_NAME
@@ -77,6 +77,25 @@ _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 _QA_ACTION_SUMMARY_MAX_CHARS = 1_200
 _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
+
+
+@dataclass(frozen=True)
+class _TargetedPackageResolutionFailure:
+    """Task-scoped reason and diagnostic for a target that could not be resolved."""
+
+    reason: ScanFallbackReason
+    detail: str
+
+
+@dataclass(frozen=True)
+class _TargetedPackageBatch:
+    """Successfully resolved packages and isolated failures from a batch lookup."""
+
+    target_packages: tuple[TargetPackageResolution, ...]
+    covered_task_ids: tuple[str, ...]
+    failures_by_task: Mapping[str, _TargetedPackageResolutionFailure]
+    fallback_reason: ScanFallbackReason | None = None
+    fallback_detail: str | None = None
 
 
 def _label_scan_records(
@@ -1429,128 +1448,204 @@ def _targeted_extra_args_conflict() -> bool:
     )
 
 
-def _closure_fallback_reason(reason: str | None) -> ScanFallbackReason:
-    """Map pure resolver diagnostics to the typed QA fallback vocabulary."""
+def _target_resolution_fallback_reason(reason: str | None) -> ScanFallbackReason:
+    """Map target-selection diagnostics to the typed QA fallback vocabulary."""
     return {
         "no_matching_target": ScanFallbackReason.NO_MATCHING_TARGET,
         "multiple_targets": ScanFallbackReason.MULTIPLE_TARGETS,
-        "incomplete_closure": ScanFallbackReason.INCOMPLETE_CLOSURE,
         "invalid_lockfile": ScanFallbackReason.INVALID_LOCKFILE,
-    }.get(reason or "", ScanFallbackReason.INCOMPLETE_CLOSURE)
+    }.get(reason or "", ScanFallbackReason.TARGETED_SCAN_FAILED)
 
 
-def _merge_dependency_closures(
-    source_lockfile: str,
-    closures: Sequence[DependencyClosure],
-) -> DependencyClosure:
-    """Union complete closures from one lockfile without losing physical keys."""
-    node_map = {node.lockfile_key: node for closure in closures for node in closure.nodes}
-    return DependencyClosure(
-        source_lockfile=source_lockfile,
-        root_keys=tuple(sorted({key for closure in closures for key in closure.root_keys})),
-        nodes=tuple(node_map[key] for key in sorted(node_map)),
-        includes_optional=any(closure.includes_optional for closure in closures),
-        includes_peer=any(closure.includes_peer for closure in closures),
-        complete=all(closure.complete for closure in closures),
-        lockfile_version=closures[0].lockfile_version,
-    )
-
-
-def _resolve_targeted_closures(
+def _resolve_targeted_packages(
     sandbox: DockerSandbox,
     targets: Sequence[QAScanTarget],
-) -> tuple[list[DependencyClosure], ScanFallbackReason | None, str | None]:
-    """Read live npm lockfiles and resolve the union needed by active tasks."""
-    if not targets:
-        return [], ScanFallbackReason.MISSING_LOCKFILE, "No active task scan targets were supplied."
+) -> _TargetedPackageBatch:
+    """Resolve batch targets independently so one failure does not block later targets.
 
-    by_source: dict[str, list[QAScanTarget]] = {}
+    Lockfiles are read and parsed once per path. A task is included only when all
+    of its declared lockfile paths resolve successfully; failures are retained
+    per task while resolution continues for the rest of the batch.
+    """
+    if not targets:
+        return _TargetedPackageBatch(
+            target_packages=(),
+            covered_task_ids=(),
+            failures_by_task={},
+            fallback_reason=ScanFallbackReason.MISSING_LOCKFILE,
+            fallback_detail="No active task scan targets were supplied.",
+        )
+
+    lockfile_cache: dict[
+        str,
+        tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None],
+    ] = {}
+
+    def load_lockfile(
+        source_lockfile: str,
+    ) -> tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None]:
+        """Read and validate one npm package-lock file, caching both success and failure."""
+        if source_lockfile in lockfile_cache:
+            return lockfile_cache[source_lockfile]
+        try:
+            raw_lockfile = sandbox.read_file(source_lockfile)
+            if raw_lockfile is None:
+                result = (
+                    None,
+                    None,
+                    ScanFallbackReason.MISSING_LOCKFILE,
+                    f"Live workspace lockfile {source_lockfile} could not be read.",
+                )
+            else:
+                lockfile = json.loads(raw_lockfile)
+                packages = lockfile.get("packages") if isinstance(lockfile, Mapping) else None
+                lockfile_version = (
+                    lockfile.get("lockfileVersion") if isinstance(lockfile, Mapping) else None
+                )
+                if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
+                    result = (
+                        None,
+                        None,
+                        ScanFallbackReason.INVALID_LOCKFILE,
+                        f"Live workspace lockfile {source_lockfile} lacks a supported packages map.",
+                    )
+                else:
+                    result = (packages, lockfile_version, None, None)
+        except (OSError, RuntimeError) as exc:
+            result = (
+                None,
+                None,
+                ScanFallbackReason.MISSING_LOCKFILE,
+                f"Live workspace lockfile {source_lockfile} could not be read: {exc}",
+            )
+        except (TypeError, ValueError) as exc:
+            result = (
+                None,
+                None,
+                ScanFallbackReason.INVALID_LOCKFILE,
+                f"Live workspace lockfile {source_lockfile} is not valid JSON: {exc}",
+            )
+        lockfile_cache[source_lockfile] = result
+        return result
+
+    resolved_packages: list[TargetPackageResolution] = []
+    covered_task_ids: list[str] = []
+    failures_by_task: dict[str, _TargetedPackageResolutionFailure] = {}
     for target in targets:
         if not target.manifest_paths:
-            return (
-                [],
+            failures_by_task[target.task_id] = _TargetedPackageResolutionFailure(
                 ScanFallbackReason.MISSING_LOCKFILE,
-                (f"Task {target.task_id} has no supported lockfile path."),
+                f"Task {target.task_id} has no supported lockfile path.",
             )
-        for source_lockfile in target.manifest_paths:
-            source_lockfile = _validate_qa_path(source_lockfile)
-            if Path(source_lockfile).name.lower() != "package-lock.json":
-                return (
-                    [],
-                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
-                    (f"Task {target.task_id} uses unsupported lockfile {source_lockfile}."),
+            continue
+
+        task_resolutions: list[TargetPackageResolution] = []
+        task_failure: _TargetedPackageResolutionFailure | None = None
+        for raw_source_lockfile in target.manifest_paths:
+            try:
+                source_lockfile = _validate_qa_path(raw_source_lockfile)
+            except ValueError as exc:
+                task_failure = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.MISSING_LOCKFILE,
+                    f"Task {target.task_id} has an invalid lockfile path: {exc}",
                 )
-            by_source.setdefault(source_lockfile, []).append(target)
+                break
+            if Path(source_lockfile).name.lower() != "package-lock.json":
+                task_failure = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                    f"Task {target.task_id} uses unsupported lockfile {source_lockfile}.",
+                )
+                break
 
-    merged: list[DependencyClosure] = []
-    for source_lockfile, source_targets in sorted(by_source.items()):
-        raw_lockfile = sandbox.read_file(source_lockfile)
-        if raw_lockfile is None:
-            return (
-                [],
-                ScanFallbackReason.MISSING_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} could not be read."),
+            packages, lockfile_version, lockfile_reason, lockfile_detail = load_lockfile(
+                source_lockfile
             )
-        try:
-            lockfile = json.loads(raw_lockfile)
-        except (TypeError, json.JSONDecodeError) as exc:
-            return (
-                [],
-                ScanFallbackReason.INVALID_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} is not valid JSON: {exc}"),
-            )
-        packages = lockfile.get("packages") if isinstance(lockfile, Mapping) else None
-        lockfile_version = (
-            lockfile.get("lockfileVersion") if isinstance(lockfile, Mapping) else None
-        )
-        if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
-            return (
-                [],
-                ScanFallbackReason.INVALID_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} lacks a supported packages map."),
-            )
+            if lockfile_reason is not None or packages is None or lockfile_version is None:
+                task_failure = _TargetedPackageResolutionFailure(
+                    lockfile_reason or ScanFallbackReason.INVALID_LOCKFILE,
+                    lockfile_detail or f"Task {target.task_id} lockfile could not be resolved.",
+                )
+                break
 
-        closures: list[DependencyClosure] = []
-        for target in source_targets:
-            closure = resolve_dependency_closure(
+            resolutions, resolution_error = resolve_target_packages(
                 packages,
                 source_lockfile=source_lockfile,
                 target_package=target.target_package,
                 target_version=target.expected_version,
                 dependency_ancestry=target.dependency_ancestry,
-                include_optional=True,
-                include_peer=True,
                 lockfile_version=lockfile_version,
             )
-            if not closure.complete:
-                return (
-                    [],
-                    _closure_fallback_reason(closure.fallback_reason),
+            if resolution_error or not resolutions:
+                reason = _target_resolution_fallback_reason(resolution_error)
+                task_failure = _TargetedPackageResolutionFailure(
+                    reason,
                     (
-                        f"Task {target.task_id} closure failed for {source_lockfile}: "
-                        f"{closure.fallback_reason or 'unknown reason'}"
+                        f"Task {target.task_id} target selection failed for {source_lockfile}: "
+                        f"{resolution_error or 'unknown reason'}"
                     ),
                 )
-            closures.append(closure)
-        merged.append(_merge_dependency_closures(source_lockfile, closures))
-    return merged, None, None
+                break
+            task_resolutions.extend(resolutions)
+
+        if task_failure is not None:
+            failures_by_task[target.task_id] = task_failure
+            logger.info(
+                "qa_critic: skipping target package for %s: %s",
+                target.task_id,
+                task_failure.detail,
+            )
+            continue
+        if not task_resolutions:
+            failures_by_task[target.task_id] = _TargetedPackageResolutionFailure(
+                ScanFallbackReason.NO_MATCHING_TARGET,
+                f"Task {target.task_id} did not resolve to any package-lock entry.",
+            )
+            continue
+        covered_task_ids.append(target.task_id)
+        resolved_packages.extend(task_resolutions)
+
+    first_failure = next(iter(failures_by_task.values()), None)
+    return _TargetedPackageBatch(
+        target_packages=tuple(resolved_packages),
+        covered_task_ids=tuple(sorted(set(covered_task_ids))),
+        failures_by_task=failures_by_task,
+        fallback_reason=first_failure.reason if first_failure else None,
+        fallback_detail=(
+            "; ".join(failure.detail for failure in failures_by_task.values())
+            if failures_by_task
+            else None
+        ),
+    )
 
 
 def _write_targeted_artifacts(
     sandbox: DockerSandbox,
-    closures: Sequence[DependencyClosure],
+    target_packages: Sequence[TargetPackageResolution],
 ) -> tuple[str, list[str], list[str]]:
-    """Write synthetic package roots and return scan path plus closure metadata."""
+    """Write one-package scan projects and return their package metadata."""
     targeted_subdir = ".odc-targeted"
     package_names: set[str] = set()
     lockfile_keys: set[str] = set()
-    for index, closure in enumerate(closures):
-        artifacts = build_sliced_lockfile_artifacts(closure)
-        subdir = f"{targeted_subdir}/{index:03d}"
+    seen_packages: set[tuple[str, str, str]] = set()
+    artifact_index = 0
+    for resolution in target_packages:
+        node = resolution.target_node
+        if not resolution.complete or node is None:
+            raise ValueError(resolution.fallback_reason or "incomplete_target")
+        identity = (resolution.source_lockfile, node.lockfile_key, node.version)
+        if identity in seen_packages:
+            continue
+        seen_packages.add(identity)
+
+        artifacts = build_target_only_lockfile_artifacts(resolution)
+        subdir = f"{targeted_subdir}/{artifact_index:03d}"
+        artifact_index += 1
         for filename, content in artifacts.items():
             sandbox.write_file(_validate_qa_path(f"{subdir}/{filename}"), content)
-        package_names.update(node.package_name for node in closure.nodes)
-        lockfile_keys.update(node.lockfile_key for node in closure.nodes)
+        package_names.add(node.package_name)
+        lockfile_keys.add(node.lockfile_key)
+    if not seen_packages:
+        raise ValueError("no_target_packages")
     return targeted_subdir, sorted(package_names), sorted(lockfile_keys)
 
 
@@ -1569,19 +1664,32 @@ def _scan_evidence(
     effective_scope: ScanScope,
     complete: bool,
     fallback_reason: ScanFallbackReason | None = None,
-    closures: Sequence[DependencyClosure] = (),
+    target_packages: Sequence[TargetPackageResolution] = (),
+    covered_task_ids: Sequence[str] | None = None,
 ) -> ODCScanEvidence:
     """Build typed, attempt-local ODC evidence from a scan result."""
     return ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
         effective_scope=effective_scope,
         authoritative=False,
-        covered_task_ids=sorted({target.task_id for target in targets}),
+        covered_task_ids=sorted(
+            set(covered_task_ids)
+            if covered_task_ids is not None
+            else {target.task_id for target in targets}
+        ),
         closure_package_names=sorted(
-            {node.package_name for closure in closures for node in closure.nodes}
+            {
+                resolution.target_node.package_name
+                for resolution in target_packages
+                if resolution.target_node is not None
+            }
         ),
         closure_lockfile_keys=sorted(
-            {node.lockfile_key for closure in closures for node in closure.nodes}
+            {
+                resolution.target_node.lockfile_key
+                for resolution in target_packages
+                if resolution.target_node is not None
+            }
         ),
         found_identifiers=sorted(
             _scan_result_value(scan_result, "found_identifiers", set()) or set()

@@ -538,8 +538,8 @@ def _reconcile_authoritative_statuses(
 ) -> dict[str, str]:
     """Reopen targeted successes contradicted by an authoritative scan.
 
-    Targeted QA can cover one manifest or dependency closure while the final
-    scan covers the whole repository.  A successful task therefore cannot
+    Targeted QA covers only the exact target package or packages while the
+    final scan covers the whole repository. A successful task therefore cannot
     remain a successful report row when the authoritative scan still contains
     one of that group's original vulnerability identifiers.
     """

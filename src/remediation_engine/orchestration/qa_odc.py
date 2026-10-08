@@ -15,9 +15,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from packageurl import PackageURL
+
 from remediation_engine.contracts.schemas import ScannerExecutionStatus, VulnerabilityIssue
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 from .qa_types import (
     _exception_stream,
@@ -451,6 +454,49 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("qa_critic: failed to parse ODC vulnerabilities â€” %s", exc)
         return None
+
+
+def _parse_report_package_identities(report_text: str) -> list[tuple[str, str]] | None:
+    """Extract npm package name/version pairs ODC actually enumerated.
+
+    Args:
+        report_text: Raw ODC JSON report.
+
+    Returns:
+        The npm package identities reported by ODC, preserving occurrences, or
+        ``None`` when the report does not contain a parseable dependency list.
+        An empty list is a valid
+        report that did not enumerate any npm packages.
+    """
+    try:
+        report = json.loads(report_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
+        return None
+
+    identities: list[tuple[str, str]] = []
+    for dependency in report["dependencies"]:
+        if not isinstance(dependency, dict):
+            continue
+        packages = dependency.get("packages") or []
+        if not isinstance(packages, list):
+            continue
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            purl = package.get("id")
+            if not isinstance(purl, str) or not purl.startswith("pkg:npm/"):
+                continue
+            try:
+                parsed = PackageURL.from_string(purl)
+            except Exception:  # noqa: BLE001 - malformed scanner evidence is ignored
+                continue
+            package_name = package_name_from_purl(purl)
+            version = str(parsed.version or "").strip()
+            if parsed.type == "npm" and package_name and version:
+                identities.append((package_name.casefold(), version))
+    return identities
 
 
 def _odc_command(
@@ -933,6 +979,9 @@ def _run_targeted_security_scan(
     report_text = _read_report_from_workspace(sandbox, report_dir)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
+    reported_packages = (
+        _parse_report_package_identities(report_text) if report_text is not None else None
+    )
     if found_issues is None and found_identifiers is not None:
         found_issues = []
     if exit_code != 0 and (found_identifiers is None or found_issues is None):
@@ -1018,6 +1067,7 @@ def _run_targeted_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
+                reported_packages=reported_packages,
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -1037,6 +1087,7 @@ def _run_targeted_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
+            reported_packages=reported_packages,
         ),
         exit_code=exit_code,
         stdout=stdout,

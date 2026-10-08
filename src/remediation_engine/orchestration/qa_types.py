@@ -11,6 +11,7 @@ from remediation_engine.contracts.schemas import (
     PeerConflictEvidence,
     QADependencyEvidence,
     RemediationTask,
+    ScanFallbackReason,
     ScannerExecutionStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -46,6 +47,7 @@ class _SecurityScanResult:
     raw_stderr: str | None = None
     diagnostic_log_path: str | None = None
     scan_records: tuple[_QALogRecord, ...] = ()
+    reported_packages: list[tuple[str, str]] | None = None
 
 
 @dataclass
@@ -76,6 +78,9 @@ class _QAExecutionResults:
     test_raw_stderr: str | None = None
     log_records: dict[str, tuple[_QALogRecord, ...]] = field(default_factory=dict)
     scan_evidence: ODCScanEvidence | None = None
+    scan_target_failures_by_task: dict[str, tuple[ScanFallbackReason, str]] = field(
+        default_factory=dict
+    )
     package_state_by_task: dict[str, _QAPackageState] = field(default_factory=dict)
     scan_skipped: bool = False
     scan_skip_reason: str | None = None

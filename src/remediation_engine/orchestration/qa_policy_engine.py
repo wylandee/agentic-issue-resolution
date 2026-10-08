@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
     QAPolicy,
     QASemanticSecurityReview,
+    ScanFallbackReason,
     ScannerExecutionStatus,
     SecurityReviewVerdict,
     TestAttributionVerdict,
@@ -911,6 +912,7 @@ def _attach_scan_evidence_to_evaluations(
     evaluations: dict[str, QAEvaluation],
     evidence: ODCScanEvidence | None,
     task_contexts: list[QATaskContext],
+    task_failures: Mapping[str, tuple[ScanFallbackReason, str]] | None = None,
 ) -> dict[str, QAEvaluation]:
     """Attach task-scoped projections of attempt-local scan evidence."""
     if evidence is None:
@@ -931,12 +933,24 @@ def _attach_scan_evidence_to_evaluations(
             enriched[task_id] = evaluation
             continue
         target_ids = group_target_identifiers(group)
+        task_failure = (task_failures or {}).get(task_id)
+        task_coverage_complete = task_failure is None and (
+            evidence.complete or task_id in evidence.covered_task_ids
+        )
         scoped_evidence = evidence.model_copy(
             update={
                 "covered_task_ids": [task_id],
                 "found_identifiers": sorted(set(evidence.found_identifiers) & target_ids),
                 "remaining_target_identifiers": sorted(
                     set(evidence.remaining_target_identifiers) & target_ids
+                ),
+                "complete": task_coverage_complete,
+                "fallback_reason": (
+                    None
+                    if task_coverage_complete
+                    else task_failure[0]
+                    if task_failure is not None
+                    else evidence.fallback_reason
                 ),
             }
         )

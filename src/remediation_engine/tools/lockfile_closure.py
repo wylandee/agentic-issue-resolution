@@ -1,8 +1,10 @@
-"""Deterministic npm package-lock dependency closure resolution.
+"""Deterministic npm package-lock target selection and scan artifacts.
 
 The resolver intentionally contains no Docker or subprocess code.  QA reads a
 live lockfile from the workspace volume, passes its decoded ``packages`` map
-here, and owns materialising the returned artifact files.
+here, and owns materialising the returned artifact files. Targeted QA scans
+select each matching exact package node; the dependency-closure helpers remain
+available for callers that need the package's transitive graph.
 """
 
 from __future__ import annotations
@@ -45,6 +47,22 @@ class DependencyClosure:
     complete: bool
     fallback_reason: str | None = None
     lockfile_version: int = 3
+
+
+@dataclass(frozen=True)
+class TargetPackageResolution:
+    """Selection result for one exact target entry in an npm lockfile."""
+
+    source_lockfile: str
+    target_node: LockfilePackageNode | None
+    lockfile_version: int
+    candidate_keys: tuple[str, ...] = ()
+    fallback_reason: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Return whether one unambiguous target package was selected."""
+        return self.target_node is not None and self.fallback_reason is None
 
 
 def _package_name_from_key(lockfile_key: str, metadata: Mapping[str, Any]) -> str:
@@ -97,6 +115,158 @@ def _closure_failure(
     )
 
 
+def resolve_target_package(
+    packages: Mapping[str, Any],
+    *,
+    source_lockfile: str = "package-lock.json",
+    target_package: str,
+    target_version: str | None = None,
+    dependency_ancestry: Sequence[str] = (),
+    lockfile_version: int = 3,
+) -> TargetPackageResolution:
+    """Select one exact package-lock entry without traversing its dependencies.
+
+    Args:
+        packages: The npm lockfile ``packages`` object.
+        source_lockfile: Workspace-relative source path for evidence.
+        target_package: Package controlled by the current remediation task.
+        target_version: Expected installed version after the worker edit.
+        dependency_ancestry: Scanner/group ancestry used to disambiguate nested
+            copies of the same package.
+        lockfile_version: Original package-lock format version.
+
+    Returns:
+        A resolution containing the selected package node, or a stable fallback
+        reason when the lockfile is invalid, the target is absent, or multiple
+        entries remain ambiguous.
+    """
+    resolutions, reason = resolve_target_packages(
+        packages,
+        source_lockfile=source_lockfile,
+        target_package=target_package,
+        target_version=target_version,
+        dependency_ancestry=dependency_ancestry,
+        lockfile_version=lockfile_version,
+    )
+    if reason:
+        return TargetPackageResolution(
+            source_lockfile=source_lockfile,
+            target_node=None,
+            lockfile_version=lockfile_version,
+            fallback_reason=reason,
+        )
+    if len(resolutions) != 1:
+        return TargetPackageResolution(
+            source_lockfile=source_lockfile,
+            target_node=None,
+            lockfile_version=lockfile_version,
+            candidate_keys=tuple(
+                sorted(
+                    resolution.target_node.lockfile_key
+                    for resolution in resolutions
+                    if resolution.target_node is not None
+                )
+            ),
+            fallback_reason="multiple_targets",
+        )
+    return resolutions[0]
+
+
+def resolve_target_packages(
+    packages: Mapping[str, Any],
+    *,
+    source_lockfile: str = "package-lock.json",
+    target_package: str,
+    target_version: str | None = None,
+    dependency_ancestry: Sequence[str] = (),
+    lockfile_version: int = 3,
+) -> tuple[list[TargetPackageResolution], str | None]:
+    """Resolve every exact lockfile entry matching a task-owned package.
+
+    A matching physical occurrence is independently scannable, so duplicate
+    nested copies are returned as separate resolutions. Dependency ancestry
+    still narrows candidates when it distinguishes one path.
+
+    Args:
+        packages: The npm lockfile ``packages`` object.
+        source_lockfile: Workspace-relative source path for evidence.
+        target_package: Package controlled by the current remediation task.
+        target_version: Optional installed version to restrict matching entries.
+        dependency_ancestry: Scanner/group ancestry used to narrow nested copies.
+        lockfile_version: Original package-lock format version.
+
+    Returns:
+        Matching exact package entries and an optional stable failure reason.
+        The result is empty when the lockfile is invalid or no target matches.
+    """
+    if (
+        not isinstance(packages, Mapping)
+        or not packages
+        or lockfile_version not in {2, 3}
+        or any(
+            not isinstance(key, str) or not isinstance(value, Mapping)
+            for key, value in packages.items()
+        )
+    ):
+        return [], "invalid_lockfile"
+
+    target_package = target_package.strip()
+    if not target_package:
+        return [], "no_matching_target"
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for key, metadata in packages.items():
+        version = str(metadata.get("version") or "").strip()
+        package_name = _package_name_from_key(key, metadata)
+        if package_name != target_package or not version:
+            continue
+        if target_version and version != target_version:
+            continue
+        candidates.append((key, dict(metadata)))
+
+    if not candidates:
+        return [], "no_matching_target"
+
+    ancestry_names = [name.strip() for name in dependency_ancestry if name and name.strip()]
+
+    def ancestry_score(key: str) -> int:
+        """Score physical nesting against the logical ancestry hint."""
+        key_names = [part for part in key.split("/node_modules/") if part]
+        if key_names and key_names[0].startswith("node_modules/"):
+            key_names[0] = key_names[0].removeprefix("node_modules/")
+        score = 0
+        start = 0
+        for name in ancestry_names:
+            try:
+                index = key_names.index(name, start)
+            except ValueError:
+                continue
+            score += 1
+            start = index + 1
+        return score
+
+    candidate_scores = {key: ancestry_score(key) for key, _ in candidates}
+    best_score = max(candidate_scores.values(), default=0)
+    if best_score:
+        candidates = [item for item in candidates if candidate_scores[item[0]] == best_score]
+
+    candidate_keys = tuple(sorted(key for key, _ in candidates))
+    return [
+        TargetPackageResolution(
+            source_lockfile=source_lockfile,
+            target_node=LockfilePackageNode(
+                lockfile_key=key,
+                package_name=_package_name_from_key(key, metadata),
+                version=str(metadata.get("version") or ""),
+                metadata=deepcopy(metadata),
+            ),
+            lockfile_version=lockfile_version,
+            candidate_keys=candidate_keys,
+        )
+        for key, metadata in candidates
+    ], None
+
+
 def resolve_dependency_closure(
     packages: Mapping[str, Any],
     *,
@@ -125,120 +295,27 @@ def resolve_dependency_closure(
         fallback reason.  Circular references are handled by the visited set
         and are not failures.
     """
-    if not isinstance(packages, Mapping) or not packages:
+    resolution = resolve_target_package(
+        packages,
+        source_lockfile=source_lockfile,
+        target_package=target_package,
+        target_version=target_version,
+        dependency_ancestry=dependency_ancestry,
+        lockfile_version=lockfile_version,
+    )
+    if not resolution.complete or resolution.target_node is None:
         return _closure_failure(
             source_lockfile=source_lockfile,
-            root_keys=(),
+            root_keys=resolution.candidate_keys,
             nodes={},
             includes_optional=include_optional,
             includes_peer=include_peer,
-            reason="invalid_lockfile",
-            lockfile_version=lockfile_version,
-        )
-    if lockfile_version not in {2, 3}:
-        return _closure_failure(
-            source_lockfile=source_lockfile,
-            root_keys=(),
-            nodes={},
-            includes_optional=include_optional,
-            includes_peer=include_peer,
-            reason="invalid_lockfile",
-            lockfile_version=lockfile_version,
-        )
-
-    if any(
-        not isinstance(key, str) or not isinstance(value, Mapping)
-        for key, value in packages.items()
-    ):
-        return _closure_failure(
-            source_lockfile=source_lockfile,
-            root_keys=(),
-            nodes={},
-            includes_optional=include_optional,
-            includes_peer=include_peer,
-            reason="invalid_lockfile",
-            lockfile_version=lockfile_version,
-        )
-
-    target_package = target_package.strip()
-    if not target_package:
-        return _closure_failure(
-            source_lockfile=source_lockfile,
-            root_keys=(),
-            nodes={},
-            includes_optional=include_optional,
-            includes_peer=include_peer,
-            reason="no_matching_target",
-            lockfile_version=lockfile_version,
-        )
-
-    candidates: list[tuple[str, dict[str, Any]]] = []
-    for key, metadata in packages.items():
-        if not isinstance(key, str) or not isinstance(metadata, Mapping):
-            continue
-        version = str(metadata.get("version") or "").strip()
-        package_name = _package_name_from_key(key, metadata)
-        if package_name != target_package or not version:
-            continue
-        if target_version and version != target_version:
-            continue
-        candidates.append((key, dict(metadata)))
-
-    if not candidates:
-        return _closure_failure(
-            source_lockfile=source_lockfile,
-            root_keys=(),
-            nodes={},
-            includes_optional=include_optional,
-            includes_peer=include_peer,
-            reason="no_matching_target",
-            lockfile_version=lockfile_version,
-        )
-
-    ancestry_names = [name.strip() for name in dependency_ancestry if name and name.strip()]
-
-    def ancestry_score(key: str) -> int:
-        """Score physical nesting against the logical ancestry hint."""
-        key_names = [part for part in key.split("/node_modules/") if part]
-        if key_names and key_names[0].startswith("node_modules/"):
-            key_names[0] = key_names[0].removeprefix("node_modules/")
-        if not ancestry_names:
-            return 0
-        score = 0
-        start = 0
-        for name in ancestry_names:
-            try:
-                index = key_names.index(name, start)
-            except ValueError:
-                continue
-            score += 1
-            start = index + 1
-        return score
-
-    candidate_scores = {key: ancestry_score(key) for key, _ in candidates}
-    best_score = max(candidate_scores.values(), default=0)
-    if best_score:
-        candidates = [item for item in candidates if candidate_scores[item[0]] == best_score]
-
-    if len(candidates) > 1:
-        return _closure_failure(
-            source_lockfile=source_lockfile,
-            root_keys=tuple(sorted(key for key, _ in candidates)),
-            nodes={},
-            includes_optional=include_optional,
-            includes_peer=include_peer,
-            reason="multiple_targets",
+            reason=resolution.fallback_reason or "invalid_lockfile",
             lockfile_version=lockfile_version,
         )
 
     node_map: dict[str, LockfilePackageNode] = {
-        key: LockfilePackageNode(
-            lockfile_key=key,
-            package_name=_package_name_from_key(key, metadata),
-            version=str(metadata.get("version") or ""),
-            metadata=deepcopy(dict(metadata)),
-        )
-        for key, metadata in candidates
+        resolution.target_node.lockfile_key: resolution.target_node
     }
     queue = list(sorted(node_map))
     visited: set[str] = set()
@@ -398,10 +475,91 @@ def build_sliced_lockfile_artifacts(
     }
 
 
+def build_target_only_lockfile_artifacts(
+    resolution: TargetPackageResolution,
+) -> dict[str, str]:
+    """Build a synthetic npm project containing only the selected target.
+
+    The exact package entry is selected from the live lockfile first, including
+    nested-copy disambiguation. The synthetic lockfile then places that one
+    package at the project's root and removes its dependency edges so ODC does
+    not scan its transitive dependencies during task-scoped QA.
+
+    Args:
+        resolution: Complete exact target selection from a live npm lockfile.
+
+    Returns:
+        The project manifest, lockfile, and installed package manifest for the
+        one-package scan project. The minimal ``node_modules`` entry lets ODC
+        enumerate the selected package without installing its dependency tree.
+
+    Raises:
+        ValueError: If the target selection is incomplete or invalid.
+    """
+    node = resolution.target_node
+    if not resolution.complete or node is None:
+        raise ValueError(resolution.fallback_reason or "incomplete_target")
+
+    target_name = node.package_name
+    target_version = node.version
+    root_dependencies = {target_name: target_version}
+    root_name = "remediation-engine-targeted-scan"
+    root_version = "0.0.0"
+    target_metadata = deepcopy(node.metadata)
+    for category in (
+        "dependencies",
+        "optionalDependencies",
+        "peerDependencies",
+        "peerDependenciesMeta",
+    ):
+        target_metadata.pop(category, None)
+
+    package_key = f"node_modules/{target_name}"
+    packages = {
+        "": {
+            "name": root_name,
+            "version": root_version,
+            "dependencies": root_dependencies,
+        },
+        package_key: target_metadata,
+    }
+    package_json = {
+        "name": root_name,
+        "version": root_version,
+        "private": True,
+        "dependencies": root_dependencies,
+    }
+    installed_package_json = {
+        "name": target_name,
+        "version": target_version,
+    }
+    lockfile = {
+        "name": root_name,
+        "version": root_version,
+        "lockfileVersion": resolution.lockfile_version,
+        "requires": True,
+        "packages": packages,
+    }
+    return {
+        "package.json": json.dumps(package_json, indent=2, sort_keys=True) + "\n",
+        "package-lock.json": json.dumps(lockfile, indent=2, sort_keys=True) + "\n",
+        f"node_modules/{target_name}/package.json": json.dumps(
+            installed_package_json,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    }
+
+
 __all__ = [
     "ClosureResolutionError",
     "DependencyClosure",
     "LockfilePackageNode",
+    "TargetPackageResolution",
     "build_sliced_lockfile_artifacts",
+    "build_target_only_lockfile_artifacts",
     "resolve_dependency_closure",
+    "resolve_target_package",
+    "resolve_target_packages",
 ]
