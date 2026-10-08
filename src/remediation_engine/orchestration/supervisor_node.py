@@ -42,6 +42,7 @@ from remediation_engine.contracts.decision_codes import (
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    MavenTargetOperation,
     NoFixMitigationStage,
     QAAttemptResult,
     QAEvaluation,
@@ -549,7 +550,13 @@ def _validate_maven_update_target(
     if not repo_root:
         return [], [f"Task {task.task_id} cannot resolve Maven POMs without repo_root."]
     try:
-        paths, resolution_errors = _resolve_maven_manifest_scope(group, Path(repo_root))
+        paths, resolution_errors = _resolve_maven_manifest_scope(
+            group,
+            Path(repo_root),
+            allow_dependency_management_creation=(
+                task.target_dependency_type == "dependencyManagement"
+            ),
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return [], [f"Task {task.task_id} Maven target validation failed: {exc}"]
     return paths, resolution_errors
@@ -566,6 +573,7 @@ def _create_attempt_snapshot(
     allowed_target_versions: Iterable[str] = (),
     allowed_dependency_types: Iterable[str] = (),
     target_manifest_paths: Iterable[str] = (),
+    maven_target_operation: MavenTargetOperation | None = None,
 ) -> tuple[RemediationTask, TaskAttemptSnapshot]:
     normalized_target_manifest_paths = list(
         dict.fromkeys(
@@ -616,6 +624,7 @@ def _create_attempt_snapshot(
         allowed_target_versions=normalized_allowed_target_versions,
         target_package_name=task.target_package_name,
         target_dependency_type=task.target_dependency_type,
+        maven_target_operation=maven_target_operation,
         target_manifest_paths=normalized_target_manifest_paths,
         allowed_dependency_types=list(
             dict.fromkeys(
@@ -2290,7 +2299,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task_id=task_id,
                             expected_attempt_id=current_attempt_id,
                             received_attempt_id=result.attempt_id,
-                            action="terminalized",
+                            action="rejected",
                             details=details,
                         )
                     )
@@ -2305,7 +2314,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task_id=task_id,
                             expected_attempt_id=current_attempt_id,
                             received_attempt_id=result.attempt_id,
-                            action="terminalized",
+                            action="rejected",
                             details=(
                                 failure_reason
                                 or "Worker rejected a deterministic precondition before execution."
@@ -2703,13 +2712,94 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             else None
         )
         target_task = task_queue.get(target_task_id) if target_task_id else None
-        if target_task is None or target_task.no_fix_stage is not None:
+        if (
+            target_task is not None
+            and target_task.status == TaskStatus.PENDING
+            and target_task.strategy == RoutingStrategy.VERSION_BUMP
+            and target_task.selected_version is None
+            and is_maven_group(
+                group_by_id.get(target_task.parent_group_id),
+                project_language,
+            )
+        ):
+            # A first Maven update must have a registry-backed candidate
+            # committed before optional tactical reasoning can pivot it to a
+            # workaround or dispatch validation can reject it as candidate-less.
+            target_group = group_by_id[target_task.parent_group_id]
+            planner_input = retry_diagnostics_by_task.get(
+                target_task.task_id,
+                UpdateRetryDiagnostics(
+                    task_id=target_task.task_id,
+                    strategy_stage=target_task.strategy_stage,
+                ),
+            )
+            planned_diagnostics, planned_plans = _run_deterministic_retry_planner(
+                {target_task.task_id: target_task},
+                {target_task.parent_group_id: target_group},
+                {target_task.task_id: planner_input},
+                target_task_ids=[target_task.task_id],
+                project_language=project_language,
+                include_initial_maven=True,
+            )
+            planner_violations = _planner_plan_violations(
+                planned_plans,
+                {target_task.task_id: target_task},
+                planned_diagnostics,
+            )
+            if planner_violations:
+                errors.extend(
+                    f"supervisor: initial Maven planning: {violation}"
+                    for violation in planner_violations
+                )
+                planned_diagnostics, planned_plans = _repair_invalid_planner_plans(
+                    planned_plans,
+                    planned_diagnostics,
+                    {target_task.task_id: target_task},
+                    {target_task.parent_group_id: target_group},
+                    violations=planner_violations,
+                    project_language=project_language,
+                )
+                repair_violations = _planner_plan_violations(
+                    planned_plans,
+                    {target_task.task_id: target_task},
+                    planned_diagnostics,
+                )
+                if repair_violations:
+                    errors.extend(
+                        f"supervisor: initial Maven planning repair: {violation}"
+                        for violation in repair_violations
+                    )
+            if not _planner_plan_violations(
+                planned_plans,
+                {target_task.task_id: target_task},
+                planned_diagnostics,
+            ):
+                retry_diagnostics_by_task.update(planned_diagnostics)
+                _commit_retry_plans(
+                    task_queue,
+                    retry_diagnostics_by_task,
+                    retry_plans_by_task,
+                    planned_plans,
+                )
+            decision = _deterministic_routing(
+                task_queue,
+                group_by_id,
+                qa_evaluations,
+                retry_diagnostics_by_task,
+                action_summaries=action_summaries,
+                active_target_task_ids=active_target_task_ids,
+                current_status=str(state.get("status") or ""),
+                triage_required=bool(state.get("triage_required")),
+                workspace_volume=state.get("workspace_volume"),
+                final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+            )
+        if decision is None and (target_task is None or target_task.no_fix_stage is not None):
             # NO_FIX and unsupported/multi-task decisions are deterministic
             # state-machine transitions.  They are never handed to the
             # tactical classifier, and their target is the only task that may
             # be considered this turn.
             decision = deterministic_target_decision
-        else:
+        elif decision is None:
             target_group = group_by_id.get(target_task.parent_group_id)
             target_evaluation = qa_evaluations.get(target_task.task_id)
             target_worker_result = next(
@@ -3619,7 +3709,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                             task_id=task_id,
                             expected_attempt_id=task.current_attempt_id,
                             received_attempt_id=None,
-                            action="terminalized",
+                            action="rejected",
                             details=detail,
                         )
                     )
@@ -3656,6 +3746,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     {task.parent_group_id: group},
                     {task_id: recovery_input},
                     project_language=project_language,
+                    include_initial_maven=True,
                 )
                 if not _planner_plan_violations(
                     recovered_plans,
@@ -3900,6 +3991,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     else []
                 ),
                 target_manifest_paths=target_manifest_paths,
+                maven_target_operation=(
+                    MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+                    if project_language == ProjectLanguage.JAVA
+                    and task.target_dependency_type == "dependencyManagement"
+                    else MavenTargetOperation.UPDATE_DECLARATION
+                    if project_language == ProjectLanguage.JAVA
+                    else None
+                ),
             )
             task_queue[task_id] = task
             prior = retry_diagnostics_by_task.get(task_id)

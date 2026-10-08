@@ -542,8 +542,16 @@ def _normalize_package_manifest_targets(
 def _resolve_maven_manifest_scope(
     group: Any,
     repo_root: Path,
+    *,
+    allow_dependency_management_creation: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Resolve exact Maven targets and only their in-repository reactor/parent scope."""
+    """Resolve Maven targets and their in-repository reactor/parent scope.
+
+    Missing exact declarations are accepted only for a Supervisor-authorized
+    dependency-management operation. A versionless direct declaration may use
+    this operation because Maven can inherit its version from dependency
+    management; an explicit direct version remains outside that authorization.
+    """
     root = Path(repo_root).resolve()
     coordinate = str(getattr(group, "vulnerable_component", "")).strip()
     if not re.fullmatch(
@@ -654,6 +662,18 @@ def _resolve_maven_manifest_scope(
             errors.append(
                 f"Group '{getattr(group, 'group_id', '')}': ambiguous Maven target '{rel}': {exc}."
             )
+            continue
+        ensure_managed = allow_dependency_management_creation and dependency_types == {
+            "dependencyManagement"
+        }
+        if dependency is None and ensure_managed:
+            continue
+        if (
+            dependency is not None
+            and ensure_managed
+            and dependency.dependency_type == "dependencies"
+            and dependency.declared_version is None
+        ):
             continue
         if dependency is None or dependency.dependency_type not in dependency_types:
             errors.append(

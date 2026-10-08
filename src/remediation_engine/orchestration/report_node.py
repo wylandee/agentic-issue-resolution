@@ -44,6 +44,7 @@ from .report_context import (
     _reconciliation_ids,
     _report_group_status,
     _scan_evidence_state,
+    _task_queue_fallback_groups,
     _text,
     _unique_texts,
     _user_friendly_status,
@@ -300,26 +301,7 @@ def _report_groups(context: ReportContext) -> list[_ReportGroup]:
         seen.add(group_id)
         groups.append(group)
 
-    for _task_id, task in sorted(context.task_queue.items(), key=lambda item: str(item[0])):
-        group_id = _text(_value(task, "parent_group_id"))
-        if not group_id or group_id in seen:
-            continue
-        if _group_status(context.task_queue, group_id) != "qa_passed":
-            continue
-        package = _text(_value(task, "target_package_name")).strip()
-        if not package:
-            package = _text(_value(task, "parent_package_name")).strip()
-        groups.append(
-            {
-                "group_id": group_id,
-                "vulnerable_component": package or "Unspecified finding",
-                "issue_type": "sca",
-                "sources": ["task_queue"],
-                "file_path": "package.json",
-                "issues": [],
-            }
-        )
-        seen.add(group_id)
+    groups.extend(_task_queue_fallback_groups(context.task_queue, seen))
     return sorted(groups, key=lambda item: _text(_value(item, "group_id")))
 
 
@@ -2232,14 +2214,32 @@ def _render_summary(context: ReportContext) -> str:
     )
     total_vulnerability_groups = len(unique_statuses)
     actionable = max(total_vulnerability_groups, fixed + follow_up)
-    sentence = (
-        f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
-        f"**{follow_up} require follow-up review.**"
-    )
+    if context.group_reconciliation_incomplete and not total_vulnerability_groups:
+        sentence = (
+            "Remediation coverage could not be determined for "
+            f"**{context.original_scanner_findings} scanner findings** because they were not "
+            "reconciled to vulnerability groups."
+        )
+        total_groups_value = "Unavailable (group reconciliation incomplete)"
+    elif context.group_reconciliation_incomplete:
+        sentence = (
+            f"**{fixed} of {actionable} tracked remediation groups** were successfully remediated. "
+            f"**{follow_up} require follow-up review.** Scanner findings could not be fully "
+            "reconciled to these groups."
+        )
+        total_groups_value = (
+            f"{total_vulnerability_groups} tracked from task queue; coverage incomplete"
+        )
+    else:
+        sentence = (
+            f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
+            f"**{follow_up} require follow-up review.**"
+        )
+        total_groups_value = total_vulnerability_groups
     metrics = [
         ("Run ID", context.run_id),
         ("Total findings (CVEs and GHSAs)", context.original_scanner_findings),
-        ("Total vulnerability groups", total_vulnerability_groups),
+        ("Total vulnerability groups", total_groups_value),
         ("Successfully remediated vulnerability groups", fixed),
         ("Vulnerability groups requiring follow-up", follow_up),
         ("Run duration", _format_duration(context.duration_seconds)),

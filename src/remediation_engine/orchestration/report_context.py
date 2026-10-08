@@ -73,6 +73,7 @@ class ReportContext:
     new_groups_inconclusive: int | None = None
     new_groups_pending: int | None = None
     workaround_replay_plans: dict[str, Any] = field(default_factory=dict)
+    group_reconciliation_incomplete: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,49 @@ def _reconciliation_ids(reconciliation: Mapping[str, Any], *names: str) -> list[
 def _group_tree(task_queue: Mapping[str, Any], group_id: str) -> list[Any]:
     """Return the root task and all pivot descendants for one group."""
     return task_group_lineage(task_queue, group_id)
+
+
+def _task_queue_fallback_groups(
+    task_queue: Mapping[str, Any],
+    represented_group_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build report group projections for root tasks missing from triage output.
+
+    Args:
+        task_queue: Authoritative task-ID to task mapping.
+        represented_group_ids: Group IDs already represented by triage groups.
+
+    Returns:
+        Stable synthetic group projections for task roots without a triage
+        group. Child tasks are represented through their root's task lineage.
+    """
+    tasks = {str(task_id): task for task_id, task in task_queue.items()}
+    represented = set(represented_group_ids or ())
+    groups: list[dict[str, Any]] = []
+    for _task_id, task in sorted(tasks.items()):
+        parent_task_id = _text(_value(task, "parent_task_id"))
+        if parent_task_id and parent_task_id in tasks:
+            continue
+        group_id = _text(_value(task, "parent_group_id"))
+        if not group_id or group_id in represented:
+            continue
+        package = (
+            _text(_value(task, "target_package_name")).strip()
+            or _text(_value(task, "parent_package_name")).strip()
+            or "Unspecified finding"
+        )
+        groups.append(
+            {
+                "group_id": group_id,
+                "vulnerable_component": package,
+                "issue_type": "sca",
+                "sources": ["task_queue"],
+                "file_path": "unavailable (task queue fallback)",
+                "issues": [],
+            }
+        )
+        represented.add(group_id)
+    return groups
 
 
 def _group_status(task_queue: Mapping[str, Any], group_id: str) -> str:
@@ -572,10 +616,17 @@ def _build_context(
         initial_groups = _items(state.get("valid_groups"))
     final_groups = _items(state.get("valid_groups"))
     task_queue = _mapping(state.get("task_queue"))
+    issues = _items(state.get("issues"))
+    if not issues:
+        issues = [issue for group in initial_groups for issue in _items(_value(group, "issues"))]
     initial_group_ids = {_text(_value(group, "group_id")) for group in initial_groups}
+    represented_group_ids = initial_group_ids | {
+        _text(_value(group, "group_id")) for group in final_groups
+    }
     all_groups = initial_groups + [
         group for group in final_groups if _text(_value(group, "group_id")) not in initial_group_ids
     ]
+    all_groups.extend(_task_queue_fallback_groups(task_queue, represented_group_ids))
     statuses = {
         _text(_value(group, "group_id")): _group_status(
             task_queue, _text(_value(group, "group_id"))
@@ -590,9 +641,6 @@ def _build_context(
     outcome_issues = terminal_outcome_issues(state)
     if outcome_issues and status == "completed":
         status = "completed_with_errors"
-    issues = _items(state.get("issues"))
-    if not issues:
-        issues = [issue for group in initial_groups for issue in _items(_value(group, "issues"))]
     final_scan = state.get("final_full_scan_result")
     final_scan_issues = _value(final_scan, "found_issues")
     post_scan_issues = (
@@ -728,6 +776,7 @@ def _build_context(
         groups_inconclusive=counts["inconclusive"],
         groups_pending=counts["pending"],
         groups_retriage_discovered=new_group_metrics["discovered"],
+        group_reconciliation_incomplete=bool(issues) and not initial_groups,
         consistency_events=_items(state.get("consistency_events")),
         error_strings=[
             f"{record.source}/{record.code}: {record.message}" for record in error_records

@@ -109,7 +109,7 @@ class TestWorkspaceBuilderNode:
             archive_excluded_dirs=frozenset({"target"}),
         )
         assert [entry.args[0] for entry in sandbox.run.call_args_list] == [
-            "mvn -B -q -DskipTests package"
+            "mvn -B -q -DskipTests clean package"
         ]
         assert result == {
             "workspace_volume": workspace_volume,

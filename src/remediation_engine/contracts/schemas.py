@@ -187,6 +187,13 @@ class SCARemediationStage(StrEnum):
     CODE_WORKAROUND = "code_workaround"
 
 
+class MavenTargetOperation(StrEnum):
+    """Supervisor-authorized operation for a Maven target declaration."""
+
+    UPDATE_DECLARATION = "update_declaration"
+    ENSURE_DEPENDENCY_MANAGEMENT = "ensure_dependency_management"
+
+
 class NoFixMitigationStage(StrEnum):
     """Ordered mitigation stages for a ``NO_FIX`` vulnerability group.
 
@@ -1843,6 +1850,14 @@ class TaskAttemptSnapshot(BaseModel):
     allowed_target_versions: list[str] = Field(default_factory=list)
     target_package_name: str | None = None
     target_dependency_type: str | None = None
+    maven_target_operation: MavenTargetOperation | None = Field(
+        default=None,
+        description=(
+            "Supervisor-committed Maven edit operation. ENSURE_DEPENDENCY_MANAGEMENT "
+            "may add the exact target GAV to dependencyManagement when no managed "
+            "declaration exists."
+        ),
+    )
     target_manifest_paths: list[str] = Field(
         default_factory=list,
         description="Repository-relative Maven POM targets committed for this attempt.",

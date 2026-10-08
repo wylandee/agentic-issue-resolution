@@ -19,6 +19,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from remediation_engine.contracts.schemas import (
+    MavenTargetOperation,
     NoFixMitigationStage,
     WorkaroundExecutionPhase,
 )
@@ -715,6 +716,7 @@ def _make_modify_and_validate_maven_dependency_tool(
     allowed_target_versions_by_package: Mapping[str, Iterable[str]],
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]],
     execution_state: dict[str, Any] | None = None,
+    maven_target_operations_by_package: Mapping[str, Iterable[str]] | None = None,
 ):
     """Create the sole worker-visible Maven dependency update tool."""
     allowed_paths_by_coordinate = _normalize_paths_by_package(package_manifest_paths)
@@ -729,6 +731,13 @@ def _make_modify_and_validate_maven_dependency_tool(
             str(value).strip() for value in ([values] if isinstance(values, str) else values)
         }
         for key, values in allowed_dependency_types_by_package.items()
+    }
+    approved_operations = {
+        str(key).strip(): {
+            str(getattr(value, "value", value)).strip()
+            for value in ([values] if isinstance(values, str) else values)
+        }
+        for key, values in (maven_target_operations_by_package or {}).items()
     }
     state = execution_state if execution_state is not None else {}
 
@@ -761,7 +770,7 @@ def _make_modify_and_validate_maven_dependency_tool(
         dependency_type: str,
         manifest_path: str,
     ) -> str:
-        """Atomically edit only the Supervisor-approved exact Maven GAV and sync it."""
+        """Apply the committed Maven operation to the exact approved GAV atomically."""
         coordinate = str(package_name or "").strip()
         gav = _safe_gav(coordinate)
         if gav is None:
@@ -801,6 +810,27 @@ def _make_modify_and_validate_maven_dependency_tool(
             return _error(
                 "TARGET_NOT_ALLOWED",
                 "dependency_type is not the committed Supervisor target type.",
+            )
+        operations = approved_operations.get(
+            coordinate,
+            {MavenTargetOperation.UPDATE_DECLARATION.value},
+        )
+        if len(operations) != 1:
+            return _error(
+                "TARGET_NOT_ALLOWED",
+                "Maven edit operation is missing or ambiguous in the committed authorization.",
+            )
+        operation = next(iter(operations))
+        if operation not in {
+            MavenTargetOperation.UPDATE_DECLARATION.value,
+            MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT.value,
+        } or (
+            operation == MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT.value
+            and kind != "dependencyManagement"
+        ):
+            return _error(
+                "TARGET_NOT_ALLOWED",
+                "Maven edit operation is not authorized for the committed declaration type.",
             )
 
         with _coordinate_lock(coordinate):
@@ -899,6 +929,11 @@ def _make_modify_and_validate_maven_dependency_tool(
                             contents[changed_path] = after
                             changed = changed or after != before
                     else:
+                        if operation != MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT.value:
+                            raise MavenManifestError(
+                                "no managed declaration exists and the Supervisor did not "
+                                "authorize creating one"
+                            )
                         before = contents[root_path]
                         after = add_dependency_management_entry(
                             before, group_id, artifact_id, version

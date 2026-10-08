@@ -148,7 +148,7 @@ def _run_install(
     label = (
         "npm install"
         if project_language == ProjectLanguage.NODEJS
-        else "mvn -B -q -DskipTests package"
+        else "mvn -B -q -DskipTests clean package"
     )
     try:
         result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)

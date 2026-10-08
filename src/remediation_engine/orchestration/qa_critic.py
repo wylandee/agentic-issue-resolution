@@ -110,7 +110,7 @@ def _run_global_execution(
     install_label = (
         "npm install"
         if project_language == ProjectLanguage.NODEJS
-        else "mvn -B -q -DskipTests package"
+        else "mvn -B -q -DskipTests clean package"
     )
     logger.info("qa_critic: [Step 0] running %s.", install_label)
     install_outcome = (

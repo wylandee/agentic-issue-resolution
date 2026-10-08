@@ -76,6 +76,7 @@ def build_update_toolbelt(
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    maven_target_operations_by_package: Mapping[str, Iterable[str]] | None = None,
 ) -> list:
     """Build the strict update-only toolbelt for the resolved run language."""
     allowed_manifest_names = (
@@ -97,6 +98,7 @@ def build_update_toolbelt(
                 allowed_target_versions_by_package or {},
                 allowed_dependency_types_by_package or {},
                 execution_state=execution_state,
+                maven_target_operations_by_package=maven_target_operations_by_package or {},
             )
         ]
     return [

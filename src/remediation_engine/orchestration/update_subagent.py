@@ -18,6 +18,7 @@ from langsmith import traceable
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    MavenTargetOperation,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -114,12 +115,18 @@ def _resolve_manifest_targets(
     group: VulnerabilityGroup,
     repo_root: Path,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    *,
+    allow_dependency_management_creation: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Resolve authorized package manifests without crossing language boundaries."""
     if project_language == ProjectLanguage.JAVA:
         if not is_maven_group(group, ProjectLanguage.JAVA):
             return [], [f"Group '{group.group_id}': Java update tasks must target a Maven finding."]
-        return _resolve_maven_manifest_scope(group, repo_root)
+        return _resolve_maven_manifest_scope(
+            group,
+            repo_root,
+            allow_dependency_management_creation=allow_dependency_management_creation,
+        )
 
     candidates = _candidate_manifest_paths(group, project_language)
     if not candidates:
@@ -326,15 +333,17 @@ has exhausted its three attempts and been surrendered."""
 
 _MAVEN_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Maven dependency transaction worker.
 The Supervisor alone selects Maven versions and dependency targets. Do not search a
-registry, choose a version, guess a parent/BOM change, or use npm tooling. Update
-only the exact Supervisor-authorized group:artifact coordinate through
-modify_and_validate_maven_dependency, on an authorized in-repository pom.xml and
-only with the committed dependencies or dependencyManagement target. The combined
-transaction edits and synchronizes the authorized POM set atomically. Keep the
-coordinate, target_version, dependency_type, and manifest_path within the current
-task's authorized candidates. Failed transactions roll back automatically; use a
-different Supervisor-approved signature on retry, at most three times per
-coordinate. Never edit source code in this worker."""
+registry, choose a version, change the project parent version or an unrelated BOM,
+or use npm tooling. Update only the exact Supervisor-authorized group:artifact
+coordinate through modify_and_validate_maven_dependency, on an authorized
+in-repository pom.xml and only with the committed dependencies or
+dependencyManagement target. For a dependencyManagement target, the committed
+operation may allow the tool to add that exact GAV when no managed declaration
+exists. The combined transaction edits and synchronizes the authorized POM set
+atomically. Keep the coordinate, target_version, dependency_type, and manifest_path
+within the current task's authorized candidates. Failed transactions roll back
+automatically; use a different Supervisor-approved signature on retry, at most
+three times per coordinate. Never edit source code in this worker."""
 
 
 def _build_update_prompt(
@@ -370,7 +379,10 @@ def _build_update_prompt(
                 "Java contract: exact Maven GAVs and authorized pom.xml paths only; "
                 "the Supervisor has already committed the version and target type.",
                 "Use modify_and_validate_maven_dependency; never select a version, "
-                "edit an unrelated POM, change a parent/BOM, or use npm/lockfile behavior.",
+                "edit an unrelated POM, change the project parent version or an "
+                "unrelated BOM, or use npm/lockfile behavior. A committed "
+                "dependencyManagement operation may add only the exact target GAV "
+                "to the authorized reactor root when no managed declaration exists.",
             ]
         )
     for task, group, manifest_paths in resolved_tasks:
@@ -920,6 +932,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     resolution_errors: list[str] = []
     allowed_target_versions_by_task: dict[str, list[str]] = {}
     allowed_dependency_types_by_task: dict[str, list[str]] = {}
+    maven_target_operations_by_task: dict[str, MavenTargetOperation] = {}
     groups_by_id = {group.group_id: group for group in target_groups}
     for task in target_tasks:
         group = groups_by_id.get(task.parent_group_id)
@@ -983,6 +996,19 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     f"Update Subagent: committed attempt snapshot does not match task {task.task_id}."
                 )
                 continue
+            if project_language == ProjectLanguage.JAVA:
+                expected_maven_operation = (
+                    MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+                    if task.target_dependency_type == "dependencyManagement"
+                    else MavenTargetOperation.UPDATE_DECLARATION
+                )
+                if snapshot.maven_target_operation != expected_maven_operation:
+                    resolution_errors.append(
+                        f"Update Subagent: task {task.task_id} snapshot does not commit "
+                        "the Maven operation required by its exact declaration type."
+                    )
+                    continue
+                maven_target_operations_by_task[task.task_id] = snapshot.maven_target_operation
             task = task.model_copy(
                 update={
                     "strategy_stage": snapshot.strategy_stage,
@@ -1020,6 +1046,10 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             allowed_target_versions_by_task[task.task_id] = snapshot_versions
             allowed_dependency_types_by_task[task.task_id] = snapshot_dependency_types
         else:
+            if project_language == ProjectLanguage.JAVA:
+                maven_target_operations_by_task[task.task_id] = (
+                    MavenTargetOperation.UPDATE_DECLARATION
+                )
             diagnostics = prior_retry_diagnostics_by_task.get(task.task_id)
             attempted_versions = set(diagnostics.attempted_versions) if diagnostics else set()
             allowed_target_versions_by_task[task.task_id] = list(
@@ -1049,7 +1079,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     )
                 )
             )
-        manifest_paths, errors = _resolve_manifest_targets(group, repo_root, project_language)
+        manifest_paths, errors = _resolve_manifest_targets(
+            group,
+            repo_root,
+            project_language,
+            allow_dependency_management_creation=(
+                maven_target_operations_by_task.get(task.task_id)
+                == MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+            ),
+        )
         resolution_errors.extend(errors)
         if not manifest_paths:
             continue
@@ -1149,6 +1187,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     override_required_packages: set[str] = set()
     allowed_dependency_types_by_package: dict[str, set[str]] = {}
     allowed_target_versions_by_package: dict[str, set[str]] = {}
+    maven_target_operations_by_package: dict[str, set[MavenTargetOperation]] = {}
     for task, group, _ in skinny_resolved_tasks:
         pkg_name = _target_package_name(task, group, project_language)
         if pkg_name:
@@ -1167,6 +1206,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 allowed_dependency_types_by_package.setdefault(pkg_name, set()).update(
                     allowed_types
                 )
+            if project_language == ProjectLanguage.JAVA:
+                operation = maven_target_operations_by_task.get(task.task_id)
+                if operation is not None:
+                    if pkg_name in maven_target_operations_by_package:
+                        maven_target_operations_by_package[pkg_name].intersection_update(
+                            {operation}
+                        )
+                    else:
+                        maven_target_operations_by_package[pkg_name] = {operation}
         diag = prior_retry_diagnostics_by_task.get(task.task_id)
         if pkg_name and _requires_override_remediation(
             task,
@@ -1200,6 +1248,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 allowed_target_versions_by_package=allowed_target_versions_by_package,
                 override_required_packages=override_required_packages,
                 allowed_dependency_types_by_package=allowed_dependency_types_by_package,
+                maven_target_operations_by_package=maven_target_operations_by_package,
                 execution_state=execution_state,
                 package_checkpoints=package_checkpoints,
                 project_language=project_language,

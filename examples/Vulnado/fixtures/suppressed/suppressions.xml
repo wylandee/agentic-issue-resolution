@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for ch.qos.logback:logback-core (maven)</notes>
+        <notes>Keep ch.qos.logback:logback-core as a selected Vulnado fixture</notes>
         <packageUrl regex="true">^pkg:maven/ch\.qos\.logback/logback\-core@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for com.fasterxml.jackson.core:jackson-annotations (maven)</notes>
@@ -48,13 +50,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep org.jsoup:jsoup as a selected Vulnado fixture</notes>
+        <notes>Suppress all vulnerabilities for org.jsoup:jsoup (maven)</notes>
         <packageUrl regex="true">^pkg:maven/org\.jsoup/jsoup@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
 
     <suppress>

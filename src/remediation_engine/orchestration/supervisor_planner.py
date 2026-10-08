@@ -296,7 +296,9 @@ def _build_high_level_retry_instruction(
                 f'package_name="{exact_gav}", target_version="{diagnostics.selected_version}", '
                 f'dependency_type="{target_type}", manifest_path="{pom_path}". '
                 "The OSV fixed value is only a security floor. Do not guess a parent version, "
-                "choose a release from web/LLM text, or mutate a parent POM or BOM."
+                "choose a release from web/LLM text, or change the project parent version "
+                "or an unrelated BOM. The committed dependencyManagement operation may "
+                "add this exact GAV to the authorized reactor root if it has no managed entry."
             )
         if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND:
             return (
@@ -1343,6 +1345,7 @@ def _run_deterministic_retry_planner(
     advance_failed_stage: bool = False,
     target_task_ids: Iterable[str] | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    include_initial_maven: bool = False,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
     """Plan retries from state and registry facts.
 
@@ -1352,6 +1355,9 @@ def _run_deterministic_retry_planner(
     ``target_task_ids`` optionally narrows planning to the task selected by
     deterministic routing, preventing registry work for tasks that are not
     active yet.
+    ``include_initial_maven`` allows the Supervisor to plan a pending Maven
+    version bump before tactical reasoning or dispatch authorization. Initial
+    Maven updates need the same registry-backed candidate whitelist as retries.
     """
     updated_diagnostics = dict(retry_diagnostics_by_task)
     plans: dict[str, SupervisorRetryPlan] = {}
@@ -1360,8 +1366,7 @@ def _run_deterministic_retry_planner(
         (
             task
             for task in task_queue.values()
-            if task.status == TaskStatus.NEEDS_RETRY
-            and task.strategy == RoutingStrategy.VERSION_BUMP
+            if task.strategy == RoutingStrategy.VERSION_BUMP
             and (target_ids is None or task.task_id in target_ids)
             and task.strategy_stage
             in {
@@ -1371,6 +1376,18 @@ def _run_deterministic_retry_planner(
                 SCARemediationStage.MAVEN_LATEST,
                 SCARemediationStage.CODE_WORKAROUND,
             }
+            and (
+                task.status == TaskStatus.NEEDS_RETRY
+                or (
+                    include_initial_maven
+                    and task.status == TaskStatus.PENDING
+                    and not task.selected_version
+                    and is_maven_group(
+                        group_by_id.get(task.parent_group_id),
+                        project_language,
+                    )
+                )
+            )
         ),
         key=lambda task: _task_sort_key(task, group_by_id),
     )
@@ -1458,23 +1475,30 @@ def _run_deterministic_retry_planner(
                 }
             )
         plans[task.task_id] = plan
+        security_floor = diagnostics.security_floor or (
+            group_by_id[task.parent_group_id].fix_plan.fixed_version
+            if task.parent_group_id in group_by_id
+            and group_by_id[task.parent_group_id].fix_plan is not None
+            else None
+        )
+        maven_registry_query_attempted = bool(
+            maven_mode
+            and security_floor
+            and plan.target_package_name
+            and plan.strategy_stage
+            in {SCARemediationStage.OSV_MINIMUM, SCARemediationStage.MAVEN_LATEST}
+        )
         updated_diagnostics[task.task_id] = diagnostics.model_copy(
             update={
                 "strategy_stage": plan.strategy_stage,
-                "security_floor": diagnostics.security_floor
-                or (
-                    group_by_id[task.parent_group_id].fix_plan.fixed_version
-                    if task.parent_group_id in group_by_id
-                    and group_by_id[task.parent_group_id].fix_plan is not None
-                    else None
-                ),
+                "security_floor": security_floor,
                 "selected_version": plan.selected_version,
                 "candidate_versions_considered": plan.candidate_versions_considered,
                 "latest_version_seen": plan.latest_version_seen,
-                "registry_query_performed": bool(
-                    group_by_id.get(task.parent_group_id)
-                    and group_by_id[task.parent_group_id].fix_plan
-                    and group_by_id[task.parent_group_id].fix_plan.fixed_version
+                "registry_query_performed": (
+                    diagnostics.registry_query_performed or maven_registry_query_attempted
+                    if maven_mode
+                    else bool(security_floor)
                 ),
                 "exhausted_update_path": plan.exhausted_update_path,
                 "target_package_name": plan.target_package_name,
