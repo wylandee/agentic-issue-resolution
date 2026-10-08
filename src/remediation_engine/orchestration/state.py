@@ -50,6 +50,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
     SolverRemediationPlan,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
@@ -485,6 +486,9 @@ class OrchestratorState(TypedDict, total=False):
     # This is an authoritative projection of immutable task baselines. A
     # merge reducer would leave removed snapshot IDs stale in state.
     workspace_rollback_anchors_by_task: Annotated[dict[str, str], replace_dict_reducer]
+    # Latest cumulative workspace state accepted by scoped QA. Its snapshot is
+    # retained until teardown so a replan can restore the exact fingerprint.
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
     # Counts same-attempt QA reruns caused by inconclusive evidence or an
@@ -630,6 +634,7 @@ def initial_orchestrator_state(
         "retry_plans_by_task": {},
         "attempt_snapshots_by_id": {},
         "workspace_rollback_anchors_by_task": {},
+        "qa_passed_workspace_prefix": None,
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
         "qa_rerun_counts_by_attempt": {},

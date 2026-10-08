@@ -2049,6 +2049,11 @@ class QAAttemptResult(BaseModel):
         min_length=1,
         description="Exact npm workspace graph observed after successful QA gates.",
     )
+    workspace_snapshot_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Retained snapshot of the exact workspace observed after successful QA gates.",
+    )
     cluster_id: str | None = Field(default=None)
     dispatch_batch_id: str | None = Field(default=None)
     action_digest: str | None = Field(default=None)

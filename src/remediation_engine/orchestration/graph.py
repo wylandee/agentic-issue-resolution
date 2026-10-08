@@ -1070,6 +1070,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             portfolio_replan_request=request,
             prior_portfolio_plan=state.get("portfolio_plan") if request is not None else None,
             qa_results_by_attempt=state.get("qa_results_by_attempt") or {},
+            qa_passed_workspace_prefix=state.get("qa_passed_workspace_prefix"),
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
         return {
@@ -1248,7 +1249,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             "active_multi_package_action": None,
             "errors": [*diagnostics, reconcile_reason],
         }
-    return {
+    result_state = {
         "status": "portfolio_ready",
         "next_routing_step": "supervisor",
         "portfolio_plan": plan,
@@ -1266,6 +1267,13 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
         "active_multi_package_action": None,
         "errors": diagnostics,
     }
+    certified_prefix = getattr(
+        getattr(plan, "resolution_certificate", None),
+        "workspace_prefix_provenance",
+        None,
+    )
+    result_state["qa_passed_workspace_prefix"] = certified_prefix
+    return result_state
 
 
 def route_after_portfolio(state: OrchestratorState) -> str:

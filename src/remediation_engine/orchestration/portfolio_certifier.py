@@ -517,6 +517,7 @@ def _last_qa_passed_prefix_provenance(
     host_repository_fingerprint: str,
     *,
     qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     diagnostics: list[str] | None = None,
 ) -> QAPassedWorkspacePrefix | None:
     """Return the verified workspace prefix represented by QA-passed batches.
@@ -526,6 +527,7 @@ def _last_qa_passed_prefix_provenance(
         task_queue: Current Supervisor-owned task projection.
         request: Typed request that identifies the source plan.
         host_repository_fingerprint: Fingerprint of current host manifests.
+        qa_passed_workspace_prefix: Latest cumulative workspace checkpoint recorded by QA.
         diagnostics: Optional list receiving why a trusted prefix was unavailable.
 
     Returns:
@@ -545,6 +547,14 @@ def _last_qa_passed_prefix_provenance(
     if not host_repository_fingerprint:
         reject("the current host repository fingerprint is unavailable")
         return None
+    if isinstance(qa_passed_workspace_prefix, Mapping):
+        try:
+            qa_passed_workspace_prefix = QAPassedWorkspacePrefix.model_validate(
+                qa_passed_workspace_prefix
+            )
+        except Exception as exc:  # noqa: BLE001 - invalid persisted state is untrusted evidence
+            reject(f"the latest QA workspace checkpoint is malformed: {exc}")
+            qa_passed_workspace_prefix = None
     prior_plan_id = prior_plan.portfolio_plan_id
     if request.source_portfolio_plan_id != prior_plan_id:
         reject(
@@ -602,7 +612,29 @@ def _last_qa_passed_prefix_provenance(
         reject("the source certificate candidate assignment digest is stale")
         return None
 
+    if qa_passed_workspace_prefix is not None:
+        if qa_passed_workspace_prefix.certified_by_portfolio_plan_id != prior_plan_id:
+            reject("the latest QA workspace checkpoint is bound to a different portfolio plan")
+            return None
+        evidence_errors = _qa_prefix_evidence_errors(
+            qa_passed_workspace_prefix,
+            task_queue,
+            qa_results_by_attempt or {},
+        )
+        if evidence_errors:
+            reject(
+                "the latest QA workspace checkpoint does not match its QA evidence: "
+                f"{evidence_errors}"
+            )
+            return None
+        # Prefer QA's latest full-batch checkpoint over the older prefix copied
+        # into the source plan's certificate.
+        return qa_passed_workspace_prefix
+
     last_prefix_digest: str | None = None
+    last_prefix_attempt_ids_by_task: dict[str, str] = {}
+    last_prefix_task_revisions: dict[str, int] = {}
+    last_prefix_snapshot_attempt_id: str | None = None
     last_prefix_batch_ids: list[str] = []
     last_prefix_task_ids: list[str] = []
     inherited_prefix = getattr(certificate, "workspace_prefix_provenance", None)
@@ -610,21 +642,43 @@ def _last_qa_passed_prefix_provenance(
         if inherited_prefix.certified_by_portfolio_plan_id != prior_plan_id:
             reject("the inherited workspace prefix is bound to a different portfolio plan")
             return None
-        invalid_task_ids = [
-            task_id
-            for task_id in inherited_prefix.task_ids
-            if (task := task_queue.get(task_id)) is None
-            or getattr(task.status, "value", task.status) != TaskStatus.QA_PASSED.value
-        ]
-        if invalid_task_ids:
+        if inherited_prefix.qa_attempt_ids_by_task:
+            evidence_errors = _qa_prefix_evidence_errors(
+                inherited_prefix,
+                task_queue,
+                qa_results_by_attempt or {},
+            )
+        else:
+            invalid_task_ids = [
+                task_id
+                for task_id in inherited_prefix.task_ids
+                if (task := task_queue.get(task_id)) is None
+                or getattr(task.status, "value", task.status) != TaskStatus.QA_PASSED.value
+                or (
+                    task_id in inherited_prefix.task_revisions
+                    and task.task_revision != inherited_prefix.task_revisions[task_id]
+                )
+            ]
+            evidence_errors = (
+                ["legacy workspace prefix no longer matches the current task revisions"]
+                if invalid_task_ids
+                else []
+            )
+            if inherited_prefix.snapshot_id:
+                evidence_errors.append("retained snapshot has no immutable QA attempt provenance")
+        if evidence_errors:
             reject(
-                "the inherited workspace prefix references tasks that are not QA_PASSED: "
-                f"{invalid_task_ids}"
+                f"the inherited workspace prefix does not match its QA evidence: {evidence_errors}"
             )
             return None
         last_prefix_digest = inherited_prefix.graph_digest
         last_prefix_batch_ids = list(inherited_prefix.batch_ids)
         last_prefix_task_ids = list(inherited_prefix.task_ids)
+    last_prefix_snapshot_id = inherited_prefix.snapshot_id if inherited_prefix is not None else None
+    if inherited_prefix is not None:
+        last_prefix_attempt_ids_by_task = dict(inherited_prefix.qa_attempt_ids_by_task)
+        last_prefix_task_revisions = dict(inherited_prefix.task_revisions)
+        last_prefix_snapshot_attempt_id = inherited_prefix.snapshot_attempt_id
 
     batches = list(selected.batches)
     batches_by_id = {batch.batch_id: batch for batch in batches}
@@ -642,11 +696,16 @@ def _last_qa_passed_prefix_provenance(
             seen_batch_ids.add(batch_id)
     ordered_batch_ids.extend(sorted(set(batches_by_id) - seen_batch_ids))
 
-    def qa_workspace_digest_for_batch(batch: SolverBatch) -> str | None:
-        """Return one source-plan-bound, successful QA graph for a batch."""
+    def qa_workspace_checkpoint_for_batch(
+        batch: SolverBatch,
+    ) -> tuple[str, str | None, dict[str, str], dict[str, int], str | None] | None:
+        """Return one source-plan-bound successful QA checkpoint for a batch."""
         if not qa_results_by_attempt:
             return None
         digests_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
+        snapshots_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
+        attempts_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
+        revisions_by_task: dict[str, set[int]] = {task_id: set() for task_id in batch.task_ids}
         for attempt_id, qa_result in qa_results_by_attempt.items():
             result_attempt_id = (
                 qa_result.get("attempt_id")
@@ -689,10 +748,54 @@ def _last_qa_passed_prefix_provenance(
             )
             if passed and isinstance(digest, str) and digest.strip():
                 digests_by_task[task_id].add(digest.strip())
-        if any(len(task_digests) != 1 for task_digests in digests_by_task.values()):
+                attempts_by_task[task_id].add(attempt_id)
+                if isinstance(result_revision, int):
+                    revisions_by_task[task_id].add(result_revision)
+                snapshot_id = (
+                    qa_result.get("workspace_snapshot_id")
+                    if isinstance(qa_result, Mapping)
+                    else qa_result.workspace_snapshot_id
+                )
+                if isinstance(snapshot_id, str) and snapshot_id.strip():
+                    snapshots_by_task[task_id].add(snapshot_id.strip())
+        if any(
+            len(task_digests) != 1
+            or len(attempts_by_task[task_id]) != 1
+            or len(revisions_by_task[task_id]) != 1
+            for task_id, task_digests in digests_by_task.items()
+        ):
             return None
         batch_digests = {next(iter(task_digests)) for task_digests in digests_by_task.values()}
-        return next(iter(batch_digests)) if len(batch_digests) == 1 else None
+        if len(batch_digests) != 1:
+            return None
+        batch_snapshot_ids = {
+            next(iter(task_snapshot_ids))
+            for task_snapshot_ids in snapshots_by_task.values()
+            if len(task_snapshot_ids) == 1
+        }
+        snapshot_id = (
+            next(iter(batch_snapshot_ids))
+            if len(batch_snapshot_ids) == 1
+            and all(len(task_snapshot_ids) == 1 for task_snapshot_ids in snapshots_by_task.values())
+            else None
+        )
+        task_attempt_ids = {
+            task_id: next(iter(task_attempts))
+            for task_id, task_attempts in attempts_by_task.items()
+        }
+        task_revisions = {
+            task_id: next(iter(revisions)) for task_id, revisions in revisions_by_task.items()
+        }
+        snapshot_attempt_id = (
+            task_attempt_ids[sorted(task_attempt_ids)[0]] if snapshot_id is not None else None
+        )
+        return (
+            next(iter(batch_digests)),
+            snapshot_id,
+            task_attempt_ids,
+            task_revisions,
+            snapshot_attempt_id,
+        )
 
     diagnostic_start = len(diagnostics) if diagnostics is not None else 0
     for batch_id in ordered_batch_ids:
@@ -742,7 +845,10 @@ def _last_qa_passed_prefix_provenance(
                         f"groups {non_qa_groups} are not QA_PASSED"
                     )
             break
-        qa_workspace_digest = qa_workspace_digest_for_batch(batch)
+        qa_workspace_checkpoint = qa_workspace_checkpoint_for_batch(batch)
+        qa_workspace_digest = (
+            qa_workspace_checkpoint[0] if qa_workspace_checkpoint is not None else None
+        )
         resolver_prefix_digest = certificate.batch_prefix_graph_digests.get(batch_id)
         prefix_digest = qa_workspace_digest or resolver_prefix_digest
         if (
@@ -763,6 +869,17 @@ def _last_qa_passed_prefix_provenance(
                 )
             break
         last_prefix_digest = prefix_digest
+        last_prefix_snapshot_id = (
+            qa_workspace_checkpoint[1]
+            if qa_workspace_checkpoint is not None and qa_workspace_digest is not None
+            else None
+        )
+        if qa_workspace_checkpoint is not None:
+            last_prefix_attempt_ids_by_task.update(qa_workspace_checkpoint[2])
+            last_prefix_task_revisions.update(qa_workspace_checkpoint[3])
+            last_prefix_snapshot_attempt_id = qa_workspace_checkpoint[4]
+        else:
+            last_prefix_snapshot_attempt_id = None
         last_prefix_batch_ids = list(dict.fromkeys([*last_prefix_batch_ids, batch_id]))
         last_prefix_task_ids = list(dict.fromkeys([*last_prefix_task_ids, *batch.task_ids]))
 
@@ -779,6 +896,14 @@ def _last_qa_passed_prefix_provenance(
         certified_by_portfolio_plan_id=prior_plan_id,
         batch_ids=last_prefix_batch_ids,
         task_ids=last_prefix_task_ids,
+        task_revisions=(last_prefix_task_revisions if last_prefix_snapshot_id is not None else {}),
+        qa_attempt_ids_by_task=(
+            last_prefix_attempt_ids_by_task if last_prefix_snapshot_id is not None else {}
+        ),
+        snapshot_id=last_prefix_snapshot_id,
+        snapshot_attempt_id=(
+            last_prefix_snapshot_attempt_id if last_prefix_snapshot_id is not None else None
+        ),
     )
 
 
@@ -788,6 +913,7 @@ def _last_qa_passed_prefix_digest(
     request: PortfolioReplanRequest | None,
     host_repository_fingerprint: str,
     *,
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     diagnostics: list[str] | None = None,
 ) -> str | None:
     """Return only the graph digest from verified QA-passed prefix provenance."""
@@ -796,6 +922,7 @@ def _last_qa_passed_prefix_digest(
         task_queue,
         request,
         host_repository_fingerprint,
+        qa_passed_workspace_prefix=qa_passed_workspace_prefix,
         diagnostics=diagnostics,
     )
     return prefix.graph_digest if prefix is not None else None
@@ -2101,6 +2228,86 @@ def _host_lockfile_diagnostics(snapshot: NpmGraphSnapshot) -> list[str]:
     return sorted(set(diagnostics))
 
 
+def _qa_prefix_evidence_errors(
+    prefix: QAPassedWorkspacePrefix,
+    task_queue: Mapping[str, RemediationTask],
+    qa_results_by_attempt: Mapping[str, QAAttemptResult],
+) -> list[str]:
+    """Validate a checkpoint against its immutable, attempt-correlated QA evidence.
+
+    Current task revisions may advance when a certified replan rebinds terminal
+    tasks to a new portfolio plan. The checkpoint remains valid only when every
+    task is still QA-passed and its recorded attempt and QA revision still match
+    the stored result, and the designated result identifies the exact snapshot
+    and workspace digest being restored.
+
+    Args:
+        prefix: Cumulative QA-passed workspace checkpoint under review.
+        task_queue: Current Supervisor-owned task projection.
+        qa_results_by_attempt: QA evidence indexed by immutable attempt ID.
+
+    Returns:
+        A list of provenance errors. An empty list means the checkpoint matches
+        its recorded QA evidence.
+    """
+
+    def value(record: Any, field_name: str) -> Any:
+        if isinstance(record, Mapping):
+            return record.get(field_name)
+        return getattr(record, field_name, None)
+
+    errors: list[str] = []
+    task_ids = set(prefix.task_ids)
+    attempt_ids = prefix.qa_attempt_ids_by_task
+    revisions = prefix.task_revisions
+    if set(attempt_ids) != task_ids:
+        errors.append("task-to-attempt mapping does not cover the checkpoint task IDs")
+    if set(revisions) != task_ids:
+        errors.append("QA task revisions do not cover the checkpoint task IDs")
+    if not prefix.snapshot_id or not prefix.snapshot_attempt_id:
+        errors.append("the checkpoint does not identify an exact QA-passed workspace snapshot")
+    elif prefix.snapshot_attempt_id not in set(attempt_ids.values()):
+        errors.append("snapshot attempt is not one of the checkpoint task attempts")
+
+    for task_id in prefix.task_ids:
+        task = task_queue.get(task_id)
+        if task is None:
+            errors.append(f"task {task_id!r} is missing from the current task queue")
+            continue
+        if getattr(task.status, "value", task.status) != TaskStatus.QA_PASSED.value:
+            errors.append(f"task {task_id!r} is no longer QA_PASSED")
+        attempt_id = attempt_ids.get(task_id)
+        if not attempt_id:
+            continue
+        current_attempt_id = task.current_attempt_id
+        if current_attempt_id is not None and current_attempt_id != attempt_id:
+            errors.append(f"task {task_id!r} has a different active attempt")
+        result = qa_results_by_attempt.get(attempt_id)
+        if result is None:
+            errors.append(f"QA result for task {task_id!r} attempt {attempt_id!r} is missing")
+            continue
+        if value(result, "attempt_id") != attempt_id or value(result, "task_id") != task_id:
+            errors.append(f"QA result identity does not match task {task_id!r}")
+            continue
+        if value(result, "task_revision") != revisions.get(task_id):
+            errors.append(f"QA result revision does not match task {task_id!r}")
+        evaluation = value(result, "evaluation")
+        if value(evaluation, "passed") is not True:
+            errors.append(f"QA result for task {task_id!r} did not pass")
+
+    if prefix.snapshot_attempt_id:
+        snapshot_result = qa_results_by_attempt.get(prefix.snapshot_attempt_id)
+        if snapshot_result is None:
+            errors.append("QA result for the checkpoint snapshot attempt is missing")
+        else:
+            if value(snapshot_result, "workspace_snapshot_id") != prefix.snapshot_id:
+                errors.append("checkpoint snapshot ID differs from its QA attempt evidence")
+            if value(snapshot_result, "workspace_graph_digest") != prefix.graph_digest:
+                errors.append("checkpoint graph digest differs from its QA attempt evidence")
+
+    return errors
+
+
 def _timed_registry_fetcher(
     registry_fetcher: PackumentFetcher | None,
     deadline: float,
@@ -2136,6 +2343,7 @@ def build_certified_portfolio_plan(
     portfolio_replan_request: PortfolioReplanRequest | None = None,
     prior_portfolio_plan: PortfolioPlan | None = None,
     qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     registry_fetcher: PackumentFetcher | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
 ) -> PortfolioPlan:
@@ -2154,6 +2362,7 @@ def build_certified_portfolio_plan(
         portfolio_replan_request: Optional Supervisor-owned replan constraints.
         prior_portfolio_plan: Current committed plan for verifying an earlier QA-passed prefix.
         qa_results_by_attempt: Attempt-correlated QA evidence from the source plan.
+        qa_passed_workspace_prefix: Latest cumulative QA-passed workspace checkpoint.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
 
@@ -2180,6 +2389,7 @@ def build_certified_portfolio_plan(
         portfolio_replan_request,
         host_fingerprint,
         qa_results_by_attempt=qa_results_by_attempt,
+        qa_passed_workspace_prefix=qa_passed_workspace_prefix,
         diagnostics=prefix_diagnostics,
     )
     qa_passed_prefix_digest = (
@@ -2208,6 +2418,9 @@ def build_certified_portfolio_plan(
         **values: Any,
     ) -> PackageResolutionCertificate:
         """Attach invocation-local aggregate measurements to one certificate."""
+        values["diagnostics"] = sorted(
+            set([*(values.get("diagnostics") or ()), *prefix_diagnostics])
+        )
         if (
             values.get("status") == PackageResolutionStatus.CERTIFIED
             and qa_passed_prefix_provenance is not None
@@ -2261,6 +2474,16 @@ def build_certified_portfolio_plan(
         ):
             try:
                 runtime = _read_runtime_fingerprint(sandbox, deadline)
+                if (
+                    portfolio_replan_request is not None
+                    and qa_passed_prefix_provenance is not None
+                    and qa_passed_prefix_provenance.snapshot_id
+                ):
+                    sandbox.restore_workspace_snapshot(qa_passed_prefix_provenance.snapshot_id)
+                    prefix_diagnostics.append(
+                        "restored the shared workspace from the latest QA-passed snapshot "
+                        f"{qa_passed_prefix_provenance.snapshot_id!r} before portfolio replan"
+                    )
                 live_documents = _read_npm_documents(sandbox, "", deadline, metrics=metrics)
                 workspace_snapshot = load_npm_graph_snapshot_from_documents(live_documents)
                 _assert_workspace_matches_host(

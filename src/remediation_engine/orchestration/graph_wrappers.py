@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
@@ -23,7 +24,9 @@ from remediation_engine.contracts.schemas import (
     RemediationTask,
     RoutingStrategy,
     StateConsistencyEvent,
+    TaskStatus,
 )
+from remediation_engine.contracts.solver_models import QAPassedWorkspacePrefix
 from remediation_engine.orchestration import qa_test_parsing as _qa_test_parsing
 from remediation_engine.orchestration.portfolio_orchestrator import isolate_delta_failure
 from remediation_engine.orchestration.state import (
@@ -48,11 +51,17 @@ def _graph_module():
     return graph
 
 
-def _qa_workspace_graph_digest(workspace_volume: str | None) -> str | None:
-    """Return the exact npm graph remaining after successful QA.
+def _qa_workspace_graph_digest(
+    workspace_volume: str | None,
+    *,
+    sandbox: Any | None = None,
+) -> str | None:
+    """Return the exact npm graph fingerprint for a QA-passed workspace.
 
     Args:
-        workspace_volume: Shared workspace volume used by the QA attempt.
+        workspace_volume: Shared Docker volume mounted at ``/workspace``.
+        sandbox: Optional open sandbox. Supplying it binds the fingerprint
+            read to the same workspace session used to create the checkpoint.
 
     Returns:
         The fingerprint of all package manifests and npm lockfiles, or ``None``
@@ -65,27 +74,66 @@ def _qa_workspace_graph_digest(workspace_volume: str | None) -> str | None:
         from remediation_engine.orchestration.portfolio_certifier import _read_npm_documents
         from remediation_engine.tools.npm_graph import load_npm_graph_snapshot_from_documents
 
-        with _graph_module().DockerSandbox(
-            repo_root=None, workspace_volume=workspace_volume
-        ) as sandbox:
+        if sandbox is not None:
             documents = _read_npm_documents(
                 sandbox,
                 "",
                 time.monotonic() + 60.0,
             )
+        else:
+            with _graph_module().DockerSandbox(
+                repo_root=None, workspace_volume=workspace_volume
+            ) as active_sandbox:
+                documents = _read_npm_documents(
+                    active_sandbox,
+                    "",
+                    time.monotonic() + 60.0,
+                )
         if not any(path.rsplit("/", 1)[-1] == "package.json" for path in documents):
             return None
-        snapshot = load_npm_graph_snapshot_from_documents(documents)
-    except Exception as exc:  # noqa: BLE001 - QA digest is optional, but must fail closed
+        graph_snapshot = load_npm_graph_snapshot_from_documents(documents)
+    except Exception as exc:  # noqa: BLE001 - QA digest is optional, provenance fails closed
         log.warning("Could not fingerprint QA workspace graph: %s", exc)
         return None
-    if snapshot.diagnostics:
+    if graph_snapshot.diagnostics:
         log.warning(
             "Could not trust QA workspace graph fingerprint: %s",
-            " | ".join(snapshot.diagnostics),
+            " | ".join(graph_snapshot.diagnostics),
         )
         return None
-    return snapshot.repository_fingerprint
+    return graph_snapshot.repository_fingerprint
+
+
+def _create_qa_passed_workspace_snapshot(
+    state: OrchestratorState,
+    attempt_ids: list[str],
+) -> tuple[str | None, str | None, list[str]]:
+    """Retain the exact cumulative workspace that passed scoped QA.
+
+    Args:
+        state: Current orchestrator state with the shared workspace volume.
+        attempt_ids: Attempts whose complete QA batch passed.
+
+    Returns:
+        The verified graph digest, retained snapshot ID, and any capture errors.
+    """
+    workspace_volume = state.get("workspace_volume")
+    if not workspace_volume or not attempt_ids:
+        return None, None, []
+    snapshot_id = f"qa-passed-{uuid.uuid4().hex}"
+    try:
+        with _graph_module().DockerSandbox(
+            repo_root=None, workspace_volume=workspace_volume
+        ) as sandbox:
+            graph_digest = _qa_workspace_graph_digest(workspace_volume, sandbox=sandbox)
+            if graph_digest is None:
+                return None, None, []
+            sandbox.create_workspace_snapshot(snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - QA remains usable, provenance fails closed
+        message = f"graph: could not retain QA-passed workspace snapshot {snapshot_id}: {exc}"
+        log.exception("QA-passed workspace snapshot creation failed for %s.", snapshot_id)
+        return None, None, [message]
+    return graph_digest, snapshot_id, []
 
 
 def _dispatch_boundary_rejection(
@@ -1333,17 +1381,147 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     )
 
     qa_evaluations = result.get("qa_evaluations", {}) or {}
-    qa_workspace_graph_digest = None
-    if (
+    qa_workspace_graph_digest: str | None = None
+    snapshots = state.get("attempt_snapshots_by_id") or {}
+    qa_workspace_snapshot_id: str | None = None
+    qa_snapshot_errors: list[str] = []
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None
+    qa_batch_passed = (
         result.get("status") == "qa_completed"
-        and not (result.get("errors") or snapshot_cleanup_errors)
-        and active_task_ids
+        and bool(active_task_ids)
         and all(
             (evaluation := qa_evaluations.get(task_id)) is not None and evaluation.passed
             for task_id in active_task_ids
         )
-    ):
-        qa_workspace_graph_digest = _qa_workspace_graph_digest(state.get("workspace_volume"))
+    )
+    if qa_batch_passed and not (result.get("errors") or snapshot_cleanup_errors):
+        qa_attempt_ids = [
+            task_queue[task_id].current_attempt_id
+            for task_id in active_task_ids
+            if task_queue.get(task_id) is not None and task_queue[task_id].current_attempt_id
+        ]
+        (
+            qa_workspace_graph_digest,
+            qa_workspace_snapshot_id,
+            qa_snapshot_errors,
+        ) = _create_qa_passed_workspace_snapshot(state, qa_attempt_ids)
+    if qa_workspace_snapshot_id is not None:
+        attempt_snapshots = [
+            snapshots.get(task_queue[task_id].current_attempt_id)
+            for task_id in active_task_ids
+            if task_id in task_queue and task_queue[task_id].current_attempt_id
+        ]
+        attempt_plan_ids = [
+            snapshot.get("portfolio_plan_id")
+            if isinstance(snapshot, Mapping)
+            else snapshot.portfolio_plan_id
+            for snapshot in attempt_snapshots
+            if snapshot is not None
+        ]
+        source_plan_ids = {plan_id for plan_id in attempt_plan_ids if plan_id}
+        if (
+            len(attempt_snapshots) == len(active_task_ids)
+            and all(attempt_snapshots)
+            and len(source_plan_ids) == 1
+            and all(plan_id for plan_id in attempt_plan_ids)
+        ):
+            source_plan_id = next(iter(source_plan_ids))
+            previous_prefix = state.get("qa_passed_workspace_prefix")
+            if isinstance(previous_prefix, Mapping):
+                try:
+                    previous_prefix = QAPassedWorkspacePrefix.model_validate(previous_prefix)
+                except Exception as exc:  # noqa: BLE001 - invalid state is untrusted provenance
+                    log.warning("Ignoring malformed QA-passed workspace checkpoint: %s", exc)
+                    previous_prefix = None
+            elif previous_prefix is not None and not isinstance(
+                previous_prefix, QAPassedWorkspacePrefix
+            ):
+                log.warning("Ignoring QA-passed workspace checkpoint with an invalid type")
+                previous_prefix = None
+            has_prior_prefix_for_plan = (
+                previous_prefix is not None
+                and previous_prefix.certified_by_portfolio_plan_id == source_plan_id
+            )
+            previous_prefix_tasks_valid = False
+            if has_prior_prefix_for_plan:
+                from remediation_engine.orchestration.portfolio_certifier import (
+                    _qa_prefix_evidence_errors,
+                )
+
+                previous_prefix_tasks_valid = not _qa_prefix_evidence_errors(
+                    previous_prefix,
+                    task_queue,
+                    state.get("qa_results_by_attempt") or {},
+                )
+            if previous_prefix_tasks_valid:
+                previous_batch_ids = list(previous_prefix.batch_ids)
+                previous_task_ids = list(previous_prefix.task_ids)
+                previous_task_revisions = dict(previous_prefix.task_revisions)
+                previous_qa_attempt_ids_by_task = dict(previous_prefix.qa_attempt_ids_by_task)
+            else:
+                previous_batch_ids = []
+                previous_task_ids = []
+                previous_task_revisions = {}
+                previous_qa_attempt_ids_by_task = {}
+            passed_task_ids = {
+                task_id
+                for task_id, task in task_queue.items()
+                if getattr(task.status, "value", task.status) == TaskStatus.QA_PASSED.value
+            }
+            untracked_passed_task_ids = sorted(
+                passed_task_ids - set(previous_task_ids) - set(active_task_ids)
+            )
+            prior_prefix_is_safe = not has_prior_prefix_for_plan or previous_prefix_tasks_valid
+            if not untracked_passed_task_ids and prior_prefix_is_safe:
+                batch_ids = {
+                    snapshot.get("dispatch_batch_id")
+                    if isinstance(snapshot, Mapping)
+                    else snapshot.dispatch_batch_id
+                    for snapshot in attempt_snapshots
+                    if snapshot is not None
+                }
+                batch_ids.discard(None)
+                batch_ids.discard("")
+                if not batch_ids:
+                    batch_ids.add(
+                        "qa-batch-"
+                        + hashlib.sha256("\n".join(sorted(active_task_ids)).encode()).hexdigest()[
+                            :16
+                        ]
+                    )
+                qa_attempt_ids_by_task = {
+                    task_id: task_queue[task_id].current_attempt_id
+                    for task_id in active_task_ids
+                    if task_queue[task_id].current_attempt_id
+                }
+                task_revisions_by_task = {
+                    task_id: (
+                        snapshot.get("task_revision")
+                        if isinstance(snapshot, Mapping)
+                        else snapshot.task_revision
+                    )
+                    for task_id, snapshot in zip(
+                        active_task_ids,
+                        attempt_snapshots,
+                        strict=True,
+                    )
+                }
+                qa_passed_workspace_prefix = QAPassedWorkspacePrefix(
+                    graph_digest=qa_workspace_graph_digest,
+                    certified_by_portfolio_plan_id=source_plan_id,
+                    batch_ids=list(dict.fromkeys([*previous_batch_ids, *sorted(batch_ids)])),
+                    task_ids=list(dict.fromkeys([*previous_task_ids, *sorted(active_task_ids)])),
+                    task_revisions={
+                        **previous_task_revisions,
+                        **task_revisions_by_task,
+                    },
+                    qa_attempt_ids_by_task={
+                        **previous_qa_attempt_ids_by_task,
+                        **qa_attempt_ids_by_task,
+                    },
+                    snapshot_id=qa_workspace_snapshot_id,
+                    snapshot_attempt_id=next(iter(qa_attempt_ids_by_task.values()), None),
+                )
     scan_evidence = result.get("scan_evidence")
     scan_was_skipped = bool(result.get("scan_skipped"))
     attempt_scan_is_authoritative = not scan_was_skipped and (
@@ -1405,7 +1583,9 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         ),
         "triage_required": triage_required,
         "status": result.get("status", "qa_completed"),
-        "errors": list(result.get("errors", []) or []) + snapshot_cleanup_errors,
+        "errors": (
+            list(result.get("errors", []) or []) + snapshot_cleanup_errors + qa_snapshot_errors
+        ),
     }
     if delta_isolation is not None:
         out["delta_isolation_by_cluster"] = {
@@ -1423,7 +1603,6 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     evaluations = result.get("qa_evaluations", {}) or {}
     reports_by_task = result.get("qa_investigation_reports_by_task", {}) or {}
     errors_by_task = result.get("qa_errors_by_task", {}) or {}
-    snapshots = state.get("attempt_snapshots_by_id") or {}
     scan_evidence_by_task: dict[str, Any] = {}
     for task_id in active_task_ids:
         task = task_queue[task_id]
@@ -1455,9 +1634,14 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         qa_results_by_attempt[attempt_id] = QAAttemptResult(
             attempt_id=attempt_id,
             task_id=task_id,
-            task_revision=task.task_revision,
+            task_revision=(
+                attempt_snapshot.get("task_revision")
+                if isinstance(attempt_snapshot, Mapping)
+                else attempt_snapshot.task_revision
+            ),
             portfolio_plan_id=attempt_portfolio_plan_id,
             workspace_graph_digest=qa_workspace_graph_digest,
+            workspace_snapshot_id=qa_workspace_snapshot_id,
             cluster_id=attempt_snapshot.cluster_id,
             dispatch_batch_id=attempt_snapshot.dispatch_batch_id,
             action_digest=attempt_snapshot.action_digest,
@@ -1471,6 +1655,10 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             scan_evidence_by_task[task_id] = evaluation.scan_evidence
     if qa_results_by_attempt:
         out["qa_results_by_attempt"] = qa_results_by_attempt
+    if qa_batch_passed or qa_passed_workspace_prefix is not None:
+        # Clear an older checkpoint when a newer all-passed QA batch cannot
+        # produce complete provenance; retaining it would omit those changes.
+        out["qa_passed_workspace_prefix"] = qa_passed_workspace_prefix
     if scan_evidence_by_task:
         out["scan_evidence_by_task"] = scan_evidence_by_task
     # Emit the complete projection so the replace reducer can clear anchors
