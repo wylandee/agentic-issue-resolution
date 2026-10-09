@@ -109,6 +109,8 @@ class _FakeSandboxState:
         self.archive_create_count = 0
         self.extraction_paths: list[str] = []
         self.batch_read_calls = 0
+        self.workspace_snapshots: dict[str, dict[str, str]] = {}
+        self.restored_workspace_snapshot_ids: list[str] = []
 
 
 class _FakeSandbox:
@@ -123,6 +125,13 @@ class _FakeSandbox:
 
     def cleanup_workspace_snapshots(self) -> None:
         return None
+
+    def restore_workspace_snapshot(self, snapshot_id: str) -> None:
+        self.state.restored_workspace_snapshot_ids.append(snapshot_id)
+        snapshot = self.state.workspace_snapshots.get(snapshot_id)
+        if snapshot is None:
+            raise RuntimeError(f"unknown workspace snapshot {snapshot_id!r}")
+        self.state.files = dict(snapshot)
 
     def read_file(self, file_path: str) -> str | None:
         path = str(file_path).replace("\\", "/").strip("/")
@@ -711,12 +720,22 @@ def test_inherited_qa_passed_prefix_survives_terminal_batch_projection():
         qa_policy_source="attempt_snapshot",
         evaluation=QAEvaluation(task_id="task-c", passed=True),
     )
+    attempt_snapshots_by_id = {
+        "attempt-c": SimpleNamespace(
+            attempt_id="attempt-c",
+            task_id="task-c",
+            task_revision=task_queue["task-c"].task_revision,
+            portfolio_plan_id="prior-plan",
+            dispatch_node="update_subagent",
+        )
+    }
     observed_prefix = _last_qa_passed_prefix_provenance(
         prior_plan,
         task_queue,
         request,
         "host-fingerprint",
         qa_results_by_attempt={"attempt-c": qa_result},
+        attempt_snapshots_by_id=attempt_snapshots_by_id,
     )
     assert observed_prefix is not None
     assert observed_prefix.graph_digest == "qa-prefix-c"
@@ -728,6 +747,7 @@ def test_inherited_qa_passed_prefix_survives_terminal_batch_projection():
         request,
         "host-fingerprint",
         qa_results_by_attempt={"attempt-c": stale_qa_result},
+        attempt_snapshots_by_id=attempt_snapshots_by_id,
     )
     assert stale_prefix is not None
     assert stale_prefix.graph_digest == "prefix-c"
@@ -745,6 +765,79 @@ def test_inherited_qa_passed_prefix_survives_terminal_batch_projection():
         is None
     )
     assert any("inherited workspace prefix" in item for item in diagnostics)
+
+
+def test_qa_checkpoint_uses_attempt_revision_and_snapshot():
+    source_task = RemediationTask(
+        task_id="task-a",
+        parent_group_id="group-a",
+        strategy="version_bump",
+        status=TaskStatus.QA_PASSED,
+        task_revision=2,
+    )
+    prior_plan = _certified_prior_plan(
+        {"task-a": source_task},
+        "host-fingerprint",
+        [
+            SimpleNamespace(
+                batch_id="batch-a",
+                task_ids=["task-a"],
+                dispatchable=True,
+                mutations=[object()],
+            )
+        ],
+        [SimpleNamespace(phase_number=1, batch_ids=["batch-a"])],
+        {"batch-a": "resolver-predicted-prefix"},
+    )
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    current_task = source_task.model_copy(update={"task_revision": 5})
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-task-a",
+        task_id="task-a",
+        task_revision=4,
+        portfolio_plan_id="prior-plan",
+        workspace_graph_digest="qa-passed-workspace-fingerprint",
+        workspace_snapshot_id="qa-passed-task-a",
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(task_id="task-a", passed=True),
+    )
+
+    attempt_snapshots_by_id = {
+        "attempt-task-a": SimpleNamespace(
+            attempt_id="attempt-task-a",
+            task_id="task-a",
+            task_revision=4,
+            portfolio_plan_id="prior-plan",
+            dispatch_node="update_subagent",
+        )
+    }
+    unbound_prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        {"task-a": current_task},
+        request,
+        "host-fingerprint",
+        qa_results_by_attempt={"attempt-task-a": qa_result},
+    )
+    assert unbound_prefix is not None
+    assert unbound_prefix.graph_digest == "resolver-predicted-prefix"
+    assert unbound_prefix.snapshot_id is None
+
+    prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        {"task-a": current_task},
+        request,
+        "host-fingerprint",
+        qa_results_by_attempt={"attempt-task-a": qa_result},
+        attempt_snapshots_by_id=attempt_snapshots_by_id,
+    )
+
+    assert prefix is not None
+    assert prefix.graph_digest == "qa-passed-workspace-fingerprint"
+    assert prefix.snapshot_id == "qa-passed-task-a"
 
 
 def test_workspace_manifest_drift_requires_exact_certified_prefix_digest():
@@ -2690,10 +2783,19 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
         task_revision=task_a.task_revision,
         portfolio_plan_id="prior-plan",
         workspace_graph_digest=prefix_snapshot.repository_fingerprint,
+        workspace_snapshot_id="qa-snapshot-task-a",
         qa_policy=QAPolicy.VERSION_BUMP,
         qa_policy_source="attempt_snapshot",
         evaluation=QAEvaluation(task_id="task-a", passed=True),
     )
+    attempt_snapshot = SimpleNamespace(
+        attempt_id="attempt-task-a",
+        task_id="task-a",
+        task_revision=task_a.task_revision,
+        portfolio_plan_id="prior-plan",
+        dispatch_node="update_subagent",
+    )
+    workspace_state.workspace_snapshots["qa-snapshot-task-a"] = dict(workspace_files)
     state = initial_orchestrator_state(str(tmp_path), groups)
     state.update(
         {
@@ -2701,6 +2803,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             "valid_groups": groups,
             "task_queue": task_queue,
             "qa_results_by_attempt": {"attempt-task-a": qa_result},
+            "attempt_snapshots_by_id": {"attempt-task-a": attempt_snapshot},
             "portfolio_plan": prior_plan,
             "portfolio_solver_plan": prior_plan.solver_plan,
             "portfolio_iteration": 1,
@@ -2762,6 +2865,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             build_with_fake_workspace,
         )
         portfolio_result = run_portfolio_node(state)
+    assert workspace_state.restored_workspace_snapshot_ids == ["qa-snapshot-task-a"]
 
     assert portfolio_result["status"] == "portfolio_ready", "\n".join(
         portfolio_result.get("errors", [])
@@ -2799,6 +2903,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
     workspace_prefix = plan.resolution_certificate.workspace_prefix_provenance
     assert workspace_prefix is not None
     assert workspace_prefix.graph_digest == prefix_snapshot.repository_fingerprint
+    assert workspace_prefix.snapshot_id == "qa-snapshot-task-a"
     assert workspace_prefix.certified_by_portfolio_plan_id == plan.portfolio_plan_id
     assert workspace_prefix.batch_ids == ["batch-task-a"]
     assert workspace_prefix.task_ids == ["task-a"]
@@ -2810,6 +2915,8 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             source_portfolio_plan_id=plan.portfolio_plan_id,
         ),
         host_fingerprint,
+        qa_results_by_attempt={"attempt-task-a": qa_result},
+        attempt_snapshots_by_id={"attempt-task-a": attempt_snapshot},
     )
     assert retained_prefix is not None
     assert retained_prefix.graph_digest == prefix_snapshot.repository_fingerprint

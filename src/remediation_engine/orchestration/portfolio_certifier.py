@@ -517,6 +517,7 @@ def _last_qa_passed_prefix_provenance(
     host_repository_fingerprint: str,
     *,
     qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    attempt_snapshots_by_id: Mapping[str, Any] | None = None,
     qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     diagnostics: list[str] | None = None,
 ) -> QAPassedWorkspacePrefix | None:
@@ -528,6 +529,7 @@ def _last_qa_passed_prefix_provenance(
         request: Typed request that identifies the source plan.
         host_repository_fingerprint: Fingerprint of current host manifests.
         qa_passed_workspace_prefix: Latest cumulative workspace checkpoint recorded by QA.
+        attempt_snapshots_by_id: Immutable Supervisor attempts indexed by ID.
         diagnostics: Optional list receiving why a trusted prefix was unavailable.
 
     Returns:
@@ -700,7 +702,7 @@ def _last_qa_passed_prefix_provenance(
         batch: SolverBatch,
     ) -> tuple[str, str | None, dict[str, str], dict[str, int], str | None] | None:
         """Return one source-plan-bound successful QA checkpoint for a batch."""
-        if not qa_results_by_attempt:
+        if not qa_results_by_attempt or attempt_snapshots_by_id is None:
             return None
         digests_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
         snapshots_by_task: dict[str, set[str]] = {task_id: set() for task_id in batch.task_ids}
@@ -727,8 +729,44 @@ def _last_qa_passed_prefix_provenance(
                 if isinstance(qa_result, Mapping)
                 else qa_result.task_revision
             )
-            if result_plan_id != prior_plan_id or result_revision != certificate.task_revisions.get(
-                task_id
+            if result_plan_id != prior_plan_id:
+                continue
+            attempt_snapshot = attempt_snapshots_by_id.get(attempt_id)
+            if attempt_snapshot is None:
+                continue
+            # The certificate holds pre-commit revisions; the immutable attempt
+            # identifies the revision that QA actually evaluated.
+            snapshot_attempt_id = (
+                attempt_snapshot.get("attempt_id")
+                if isinstance(attempt_snapshot, Mapping)
+                else getattr(attempt_snapshot, "attempt_id", None)
+            )
+            snapshot_task_id = (
+                attempt_snapshot.get("task_id")
+                if isinstance(attempt_snapshot, Mapping)
+                else getattr(attempt_snapshot, "task_id", None)
+            )
+            snapshot_revision = (
+                attempt_snapshot.get("task_revision")
+                if isinstance(attempt_snapshot, Mapping)
+                else getattr(attempt_snapshot, "task_revision", None)
+            )
+            snapshot_plan_id = (
+                attempt_snapshot.get("portfolio_plan_id")
+                if isinstance(attempt_snapshot, Mapping)
+                else getattr(attempt_snapshot, "portfolio_plan_id", None)
+            )
+            snapshot_dispatch_node = (
+                attempt_snapshot.get("dispatch_node")
+                if isinstance(attempt_snapshot, Mapping)
+                else getattr(attempt_snapshot, "dispatch_node", None)
+            )
+            if (
+                snapshot_attempt_id != attempt_id
+                or snapshot_task_id != task_id
+                or snapshot_revision != result_revision
+                or snapshot_plan_id != prior_plan_id
+                or snapshot_dispatch_node not in {"update_subagent", "workaround_subagent"}
             ):
                 continue
             evaluation = (
@@ -913,6 +951,8 @@ def _last_qa_passed_prefix_digest(
     request: PortfolioReplanRequest | None,
     host_repository_fingerprint: str,
     *,
+    qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    attempt_snapshots_by_id: Mapping[str, Any] | None = None,
     qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     diagnostics: list[str] | None = None,
 ) -> str | None:
@@ -922,6 +962,8 @@ def _last_qa_passed_prefix_digest(
         task_queue,
         request,
         host_repository_fingerprint,
+        qa_results_by_attempt=qa_results_by_attempt,
+        attempt_snapshots_by_id=attempt_snapshots_by_id,
         qa_passed_workspace_prefix=qa_passed_workspace_prefix,
         diagnostics=diagnostics,
     )
@@ -2343,6 +2385,7 @@ def build_certified_portfolio_plan(
     portfolio_replan_request: PortfolioReplanRequest | None = None,
     prior_portfolio_plan: PortfolioPlan | None = None,
     qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
+    attempt_snapshots_by_id: Mapping[str, Any] | None = None,
     qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     registry_fetcher: PackumentFetcher | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
@@ -2362,6 +2405,7 @@ def build_certified_portfolio_plan(
         portfolio_replan_request: Optional Supervisor-owned replan constraints.
         prior_portfolio_plan: Current committed plan for verifying an earlier QA-passed prefix.
         qa_results_by_attempt: Attempt-correlated QA evidence from the source plan.
+        attempt_snapshots_by_id: Supervisor-committed attempts indexed by attempt ID.
         qa_passed_workspace_prefix: Latest cumulative QA-passed workspace checkpoint.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
@@ -2389,6 +2433,7 @@ def build_certified_portfolio_plan(
         portfolio_replan_request,
         host_fingerprint,
         qa_results_by_attempt=qa_results_by_attempt,
+        attempt_snapshots_by_id=attempt_snapshots_by_id,
         qa_passed_workspace_prefix=qa_passed_workspace_prefix,
         diagnostics=prefix_diagnostics,
     )

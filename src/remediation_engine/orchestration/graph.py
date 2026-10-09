@@ -1070,6 +1070,7 @@ def run_portfolio_node(state: OrchestratorState) -> dict[str, Any]:
             portfolio_replan_request=request,
             prior_portfolio_plan=state.get("portfolio_plan") if request is not None else None,
             qa_results_by_attempt=state.get("qa_results_by_attempt") or {},
+            attempt_snapshots_by_id=state.get("attempt_snapshots_by_id") or {},
             qa_passed_workspace_prefix=state.get("qa_passed_workspace_prefix"),
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at graph boundary
