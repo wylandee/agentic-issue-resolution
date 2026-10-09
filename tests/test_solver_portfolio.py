@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from remediation_engine.contracts.solver_models import (
     SolverCandidateConflict,
@@ -57,6 +58,47 @@ def _target(task_id: str = "task-1", occurrence_id: str = "package.json::foo") -
         lockfile_package_key="node_modules/foo",
         installed_version="1.0.0",
         finding_ids=["GHSA-AAAA-BBBB-CCCC"],
+    )
+
+
+def _terminal_target(
+    terminal_status: str = "unfixable",
+    *,
+    task_id: str = "task-terminal",
+    occurrence_id: str = "package.json::terminal",
+    strategy: str = "version_bump",
+    installed_version: str = "2.0.0",
+) -> SolverTarget:
+    payload = _target(task_id, occurrence_id).model_dump()
+    payload.update(
+        {
+            "is_terminal": True,
+            "terminal_status": terminal_status,
+            "eligible_for_atomic_update": False,
+            "strategy": strategy,
+            "installed_version": installed_version,
+        }
+    )
+    return SolverTarget.model_validate(payload)
+
+
+def _finding_for_target(
+    target: SolverTarget,
+    finding_id: str,
+    fixed_version: str,
+    *,
+    workaround_plan_ids: list[str] | None = None,
+) -> SolverFindingRequirement:
+    return SolverFindingRequirement(
+        finding_id=finding_id,
+        ghsa_id="GHSA-AAAA-BBBB-CCCC",
+        severity="HIGH",
+        vulnerable_package=target.package_name,
+        target_occurrence_id=target.occurrence_id,
+        vulnerable_occurrence_id=target.occurrence_id,
+        fixed_version=fixed_version,
+        workaround_available=bool(workaround_plan_ids),
+        workaround_plan_ids=workaround_plan_ids or [],
     )
 
 
@@ -763,11 +805,117 @@ def test_unknown_explicit_peer_conflict_invalidates_the_subgraph():
     assert any("external or unknown" in diagnostic for diagnostic in subgraph.diagnostics)
 
 
+def test_solver_target_requires_terminal_provenance_and_excludes_mutations():
+    payload = _target().model_dump()
+    with pytest.raises(ValidationError, match="terminal targets require"):
+        SolverTarget.model_validate(
+            {**payload, "is_terminal": True, "eligible_for_atomic_update": False}
+        )
+    with pytest.raises(ValidationError, match="supported terminal_status"):
+        _terminal_target("pending")
+    with pytest.raises(ValidationError, match="non-terminal targets"):
+        SolverTarget.model_validate({**payload, "terminal_status": "unfixable"})
+    with pytest.raises(ValidationError, match="cannot be eligible"):
+        SolverTarget.model_validate({**payload, "has_open_attempt": True})
+
+    terminal = _terminal_target("pivoted")
+    assert terminal.eligible_for_atomic_update is False
+
+
+def test_qa_passed_terminal_coverage_uses_only_verified_status_quo():
+    target = _terminal_target(
+        "qa_passed",
+        strategy="version_bump",
+        installed_version="2.0.0",
+    )
+    covered = _finding_for_target(target, "finding-covered", "1.2.0")
+    unresolved = _finding_for_target(target, "finding-unresolved", "3.0.0")
+
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[covered, unresolved]),
+        {},
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    assert result.selected_plan is not None
+    assert result.selected_plan.coverage_ids == [covered.coverage_id]
+    assert result.selected_plan.unresolved_ids == [unresolved.coverage_id]
+    assert target.occurrence_id not in result.selected_plan.selected_candidate_versions
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_strategy == "version_bump"
+    assert decision.selected_version is None
+    assert decision.allowed_alternative_versions == []
+
+
+def test_qa_passed_terminal_workaround_requires_retained_authorized_plan():
+    target = _terminal_target(
+        "qa_passed",
+        strategy="code_workaround",
+        installed_version="1.0.0",
+    )
+    finding = _finding_for_target(
+        target,
+        "finding-workaround",
+        "2.0.0",
+        workaround_plan_ids=["fix-plan-1"],
+    )
+
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[finding]),
+        {},
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.selected_plan is not None
+    assert result.selected_plan.coverage_ids == [finding.coverage_id]
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_strategy == "code_workaround"
+    assert decision.selected_version is None
+    assert decision.allowed_alternative_versions == []
+    assert decision.selected_plan_issue_ids == ["fix-plan-1"]
+
+
+@pytest.mark.parametrize("terminal_status", ["unfixable", "inconclusive", "pivoted"])
+def test_failed_terminal_tasks_receive_no_finding_credit(terminal_status: str):
+    target = _terminal_target(
+        terminal_status,
+        strategy="code_workaround",
+        installed_version="2.0.0",
+    )
+    finding = _finding_for_target(
+        target,
+        f"finding-{terminal_status}",
+        "1.2.0",
+        workaround_plan_ids=["fix-plan-1"],
+    )
+
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[finding]),
+        {},
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    assert result.selected_plan is not None
+    assert result.selected_plan.coverage_ids == []
+    assert result.selected_plan.unresolved_ids == [finding.coverage_id]
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_strategy == "code_workaround"
+    assert decision.selected_version is None
+    assert decision.allowed_alternative_versions == []
+    assert decision.selected_plan_issue_ids == []
+
+
 def test_terminal_target_is_retained_but_not_dispatchable():
-    target = _target().model_copy(update={"is_terminal": True})
+    target = _terminal_target(
+        "qa_passed",
+        task_id="task-1",
+        occurrence_id="package.json::foo",
+    )
     batches, _edges, diagnostics = cluster_packages(
         _solver_subgraph(targets=[target]),
-        [SolverTaskDecision(task_id=target.task_id, selected_version="2.0.0")],
+        [SolverTaskDecision(task_id=target.task_id)],
     )
     assert diagnostics == ["task 'task-1': terminal task retained as non-dispatchable singleton"]
     assert len(batches) == 1

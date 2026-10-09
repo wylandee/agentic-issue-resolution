@@ -46,6 +46,7 @@ from remediation_engine.orchestration import (
 )
 from remediation_engine.orchestration import graph_wrappers as _graph_wrappers
 from remediation_engine.orchestration.graph import (
+    MAX_PORTFOLIO_ITERATIONS,
     MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _finish_workspace_attempt_snapshot,
     _record_portfolio_replan_attempt,
@@ -245,7 +246,7 @@ def test_supervisor_recovers_worker_result_after_portfolio_cleared_active_target
 
 
 def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
-    reason = "committed portfolio plan has stale task revision"
+    reason = "UNFIXABLE_REPLAN"
     state = {
         "repo_root": str(tmp_path),
         "portfolio_iteration": 3,
@@ -267,6 +268,30 @@ def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
     assert result["portfolio_replan_history"] == {reason: MAX_PORTFOLIO_REPLAN_ATTEMPTS}
     assert reason in result["errors"][0]
     assert route_after_portfolio(result) == "teardown"
+
+
+def test_unfixable_replan_respects_total_iteration_guard(tmp_path):
+    reason = "UNFIXABLE_REPLAN"
+    state = {
+        "repo_root": str(tmp_path),
+        "portfolio_iteration": MAX_PORTFOLIO_ITERATIONS,
+        "portfolio_replan_request": PortfolioReplanRequest(reason=reason),
+        "portfolio_replan_history": {},
+        "portfolio_plan": object(),
+        "portfolio_solver_plan": object(),
+        "valid_groups": [],
+        "task_queue": {},
+    }
+
+    with patch("remediation_engine.orchestration.graph.prepare_portfolio_inputs") as prepare:
+        result = run_portfolio_node(state)
+
+    prepare.assert_not_called()
+    assert result["status"] == "portfolio_replan_guarded"
+    assert result["next_routing_step"] == "teardown"
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_iteration"] == MAX_PORTFOLIO_ITERATIONS + 1
+    assert reason in result["errors"][0]
 
 
 def test_portfolio_replan_guard_normalizes_changing_plan_ids_and_revisions():
@@ -316,6 +341,17 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
     )
     state = _initial_state(tmp_path, [group])
     state["task_queue"] = {"task-1": task}
+    previous_plan = SimpleNamespace(portfolio_plan_id="portfolio-old")
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="portfolio-old",
+    )
+    state.update(
+        {
+            "portfolio_plan": previous_plan,
+            "portfolio_replan_request": request,
+        }
+    )
     monkeypatch.setattr(
         "remediation_engine.orchestration.graph.get_runtime_settings",
         lambda: SimpleNamespace(),
@@ -324,9 +360,10 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
         "remediation_engine.orchestration.graph.prepare_portfolio_inputs",
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
+    build_plan = MagicMock(return_value=candidate_plan)
     monkeypatch.setattr(
         "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
-        lambda *args, **kwargs: candidate_plan,
+        build_plan,
     )
     apply_plan = MagicMock()
     monkeypatch.setattr(
@@ -335,6 +372,8 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
     )
 
     result = run_portfolio_node(state)
+    build_plan.assert_called_once()
+    assert build_plan.call_args.kwargs["prior_portfolio_plan"] is previous_plan
 
     assert result["status"] == "portfolio_unknown"
     assert result["next_routing_step"] == "teardown"
@@ -1607,6 +1646,7 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            portfolio_plan_id="plan-qa",
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1635,6 +1675,10 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.DockerSandbox",
                 return_value=sandbox,
             ),
+            patch(
+                "remediation_engine.orchestration.graph_wrappers._qa_workspace_graph_digest",
+                return_value="qa-workspace-digest",
+            ),
         ):
             result = run_qa_critic_from_orchestrator(state)
 
@@ -1643,6 +1687,8 @@ class TestPhase5GraphIntegration:
         qa_result = result["qa_results_by_attempt"]["attempt-pass"]
         assert qa_result.qa_policy == task.qa_policy
         assert qa_result.qa_policy_source == "attempt_snapshot"
+        assert qa_result.workspace_graph_digest == "qa-workspace-digest"
+        assert qa_result.portfolio_plan_id == "plan-qa"
 
     def test_regression_retries_keep_first_pre_task_baseline(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

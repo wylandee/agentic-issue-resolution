@@ -20,6 +20,8 @@ from remediation_engine.contracts import (
     LocalizedIssue,
     MultiPackageAction,
     PackageMutation,
+    PortfolioPlan,
+    RoutingStrategy,
     Severity,
     SupervisorDecision,
     TaskCluster,
@@ -303,6 +305,75 @@ def test_one_finding_covers_every_matching_physical_occurrence(tmp_path: Path):
     assert batch.unresolved_coverage_ids == []
 
 
+def test_qa_passed_terminal_override_uses_current_physical_occurrence(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "app",
+            "dependencies": {"sass": "1.99.0"},
+            "overrides": {"immutable": "5.1.8"},
+        },
+    )
+    nested_key = "node_modules/sass/node_modules/immutable"
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "dependencies": {"sass": "1.99.0"}},
+                "node_modules/sass": {
+                    "version": "1.99.0",
+                    "dependencies": {"immutable": "^5.1.5"},
+                },
+                nested_key: {"version": "5.1.8"},
+            },
+        },
+    )
+    group = _group(
+        "immutable",
+        "package.json",
+        package_version="5.1.5",
+        fixed_version="5.1.8",
+    ).model_copy(
+        update={
+            "parent_package_name": "sass",
+            "parent_declaration_type": "dependencies",
+            "dependency_ancestry": ["sass", "immutable"],
+            "dependency_versions": {"sass": "1.99.0", "immutable": "^5.1.5"},
+        }
+    )
+    task = _tasks(group)["task-1"].model_copy(
+        update={
+            "status": TaskStatus.QA_PASSED,
+            "selected_version": "5.1.8",
+            "allowed_target_versions": ["5.1.8"],
+            "target_package_name": "immutable",
+            "target_dependency_type": "overrides",
+            "allowed_dependency_types": ["overrides"],
+        }
+    )
+
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    targets, findings, diagnostics = _build_targets_and_findings(
+        snapshot,
+        [group],
+        {"task-1": task},
+    )
+
+    expected_occurrence = make_occurrence_id("package.json", "immutable", nested_key)
+    target = targets[0]
+    assert diagnostics == []
+    assert target.occurrence_id == expected_occurrence
+    assert target.lockfile_package_key == nested_key
+    assert target.installed_version == "5.1.8"
+    assert target.is_terminal is True
+    assert target.eligible_for_atomic_update is False
+    assert findings[0].target_occurrence_id == expected_occurrence
+
+
 def test_candidate_catalog_keeps_complete_candidate_metadata_without_truncation(tmp_path: Path):
     _write_manifest(
         tmp_path,
@@ -409,6 +480,11 @@ def test_candidate_packuments_are_force_fetched_once_and_cached(tmp_path: Path):
         return {"name": package_name, "versions": {"1.0.0": {}}}
 
     settings = AppSettings(solver_cache_dir=tmp_path / "registry-cache")
+    cache = RegistryPackumentCache(settings.solver_cache_dir)
+    assert cache.put(
+        "a-package",
+        {"name": "a-package", "versions": {"0.1.0": {}}},
+    )
     packuments, complete, catalog_digest, diagnostics = _fetch_candidate_packuments(
         ["z-package", "a-package", "z-package"],
         settings,
@@ -419,6 +495,7 @@ def test_candidate_packuments_are_force_fetched_once_and_cached(tmp_path: Path):
     assert complete is True
     assert diagnostics == []
     assert len(catalog_digest) == 64
+    assert packuments["a-package"]["versions"] == {"1.0.0": {}}
     cache = RegistryPackumentCache(settings.solver_cache_dir)
     assert cache.get("a-package") == packuments["a-package"]
     assert cache.get("z-package") == packuments["z-package"]
@@ -2104,6 +2181,69 @@ def test_apply_synthesizes_major_migration_instruction_when_missing(tmp_path: Pa
     )
 
 
+def test_terminal_plan_audits_failed_task_without_rewriting_worker_inputs(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"foo": "1.0.0", "bar": "1.0.0"}},
+    )
+    foo = _group("foo", "package.json")
+    bar = _group("bar", "package.json")
+    groups = [foo, bar]
+    queue = _tasks(foo, bar)
+    terminal_before = queue["task-1"].model_copy(
+        update={
+            "status": TaskStatus.UNFIXABLE,
+            "strategy": RoutingStrategy.CODE_WORKAROUND,
+            "selected_version": "1.8.0",
+            "allowed_target_versions": ["1.8.0"],
+            "allowed_dependency_types": ["peerDependencies"],
+            "target_dependency_type": "peerDependencies",
+            "instruction": "Preserve the terminal task's committed worker input.",
+        }
+    )
+    queue["task-1"] = terminal_before
+
+    def fetch_packument(package_name: str) -> dict[str, object]:
+        return {
+            "name": package_name,
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+        }
+
+    plan = build_portfolio_plan(
+        tmp_path,
+        groups,
+        queue,
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+        registry_fetcher=fetch_packument,
+    )
+
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    decisions = {decision.task_id: decision for decision in selected.task_decisions}
+    assert "task-1" in plan.task_ids
+    assert plan.task_strategies["task-1"] == RoutingStrategy.CODE_WORKAROUND
+    assert decisions["task-1"].selected_strategy == "code_workaround"
+    assert decisions["task-1"].selected_version is None
+    assert decisions["task-1"].allowed_alternative_versions == []
+    assert plan.planned_task_revisions["task-1"] == terminal_before.task_revision + 1
+
+    _committed_groups, committed, diagnostics = apply_portfolio_plan(plan, groups, queue)
+
+    assert diagnostics == []
+    terminal_after = committed["task-1"]
+    assert terminal_after.status == TaskStatus.UNFIXABLE
+    assert terminal_after.strategy == terminal_before.strategy
+    assert terminal_after.selected_version == terminal_before.selected_version
+    assert terminal_after.allowed_target_versions == terminal_before.allowed_target_versions
+    assert terminal_after.allowed_dependency_types == terminal_before.allowed_dependency_types
+    assert terminal_after.target_dependency_type == terminal_before.target_dependency_type
+    assert terminal_after.instruction == terminal_before.instruction
+    assert terminal_after.portfolio_plan_id == plan.portfolio_plan_id
+    assert terminal_after.task_revision == plan.planned_task_revisions["task-1"]
+    assert _portfolio_plan_violations(plan, committed, groups) == []
+
+
 def test_supervisor_rejects_stale_resolution_certificate():
     assignment_digest = hashlib.sha256(
         json.dumps({}, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -2536,3 +2676,142 @@ def test_suspicion_ranking_scores_missing_or_duplicate_mutations_as_zero():
 
     assert missing_mutation == [(task, 0)]
     assert duplicate_mutation == [(task, 0)]
+
+
+def test_portfolio_order_dispatches_workaround_before_later_version_update():
+    first_group = _group("decompress", "package.json")
+    second_group = _group("immutable", "frontend/package.json")
+    groups = [first_group, second_group]
+    queue = _tasks(*groups)
+    queue["task-1"] = queue["task-1"].model_copy(
+        update={"strategy": RoutingStrategy.CODE_WORKAROUND}
+    )
+
+    workaround_cluster = TaskCluster(
+        cluster_id="workaround-first",
+        task_ids=["task-1"],
+        reason="Earlier code workaround batch.",
+        atomic=False,
+    )
+    update_cluster = TaskCluster(
+        cluster_id="version-update-second",
+        task_ids=["task-2"],
+        reason="Later version update batch.",
+        atomic=False,
+    )
+    plan = PortfolioPlan(
+        plan_id="ordered-workaround-test",
+        portfolio_plan_id="ordered-workaround-test",
+        repository_fingerprint="host-fingerprint",
+        graph_digest="workspace-graph",
+        plan_digest="ordered-plan",
+        task_ids=["task-1", "task-2"],
+        clusters=[workaround_cluster, update_cluster],
+        cluster_order=["workaround-first", "version-update-second"],
+        task_order=["task-1", "task-2"],
+        task_to_cluster={
+            "task-1": "workaround-first",
+            "task-2": "version-update-second",
+        },
+        task_revisions={task_id: task.task_revision for task_id, task in queue.items()},
+        task_strategies={task_id: task.strategy for task_id, task in queue.items()},
+    )
+    group_by_id = {group.group_id: group for group in groups}
+
+    first_decision = _deterministic_routing(
+        queue,
+        group_by_id,
+        {},
+        {},
+        portfolio_plan=plan,
+    )
+
+    assert first_decision.decision_code.value == "WORKAROUND_DISPATCH"
+    assert first_decision.next_node == "workaround_subagent"
+    assert first_decision.target_task_ids == ["task-1"]
+
+    after_workaround_qa = {
+        task_id: task.model_copy(update={"status": TaskStatus.QA_PASSED})
+        if task_id == "task-1"
+        else task
+        for task_id, task in queue.items()
+    }
+    second_decision = _deterministic_routing(
+        after_workaround_qa,
+        group_by_id,
+        {},
+        {},
+        portfolio_plan=plan,
+    )
+
+    assert second_decision.decision_code.value == "NEW_VERSION_BUMP"
+    assert second_decision.next_node == "update_subagent"
+    assert second_decision.target_task_ids == ["task-2"]
+
+
+def test_terminal_nested_workaround_applies_and_passes_plan_validation():
+    group = _group("decompress", "package.json")
+    task = _tasks(group)["task-1"].model_copy(
+        update={
+            "status": TaskStatus.UNFIXABLE,
+            "strategy": RoutingStrategy.CODE_WORKAROUND,
+            "selected_version": None,
+            "allowed_target_versions": [],
+            "allowed_dependency_types": [],
+            "target_dependency_type": None,
+            "instruction": "Preserve the terminal workaround task.",
+        }
+    )
+    lockfile_key = "node_modules/download/node_modules/decompress"
+    decision = SimpleNamespace(
+        task_id=task.task_id,
+        selected_strategy="code_workaround",
+        selected_version=None,
+        allowed_alternative_versions=[],
+        selected_plan_issue_ids=[],
+        dependency_type=None,
+        target_group_id=group.group_id,
+        target_package_name="decompress",
+        manifest_path="package.json",
+        lockfile_package_key=lockfile_key,
+        target_occurrence_id=make_occurrence_id(
+            "package.json",
+            "decompress",
+            lockfile_key,
+        ),
+    )
+    plan = SimpleNamespace(
+        plan_id="portfolio-terminal-audit",
+        portfolio_plan_id="portfolio-terminal-audit",
+        task_ids=[task.task_id],
+        task_revisions={task.task_id: task.task_revision},
+        planned_task_revisions={task.task_id: task.task_revision + 1},
+        task_strategies={task.task_id: task.strategy},
+        clusters=[],
+        diagnostics=[],
+        resolution_certificate=None,
+        solver_plan=SimpleNamespace(
+            status=SolverStatus.OPTIMAL,
+            candidate_catalog_complete=True,
+            selected_plan=SimpleNamespace(
+                candidate_plan_id="candidate-terminal-audit",
+                selected_candidate_versions={},
+                task_decisions=[decision],
+            ),
+        ),
+    )
+
+    _groups, committed, diagnostics = apply_portfolio_plan(plan, [group], {task.task_id: task})
+
+    assert diagnostics == []
+    terminal_after = committed[task.task_id]
+    assert terminal_after.status == TaskStatus.UNFIXABLE
+    assert terminal_after.strategy == RoutingStrategy.CODE_WORKAROUND
+    assert terminal_after.selected_version is None
+    assert terminal_after.allowed_target_versions == []
+    assert terminal_after.allowed_dependency_types == []
+    assert terminal_after.target_dependency_type is None
+    assert terminal_after.instruction == task.instruction
+    assert terminal_after.portfolio_plan_id == plan.portfolio_plan_id
+    assert terminal_after.task_revision == task.task_revision + 1
+    assert _portfolio_plan_violations(plan, committed, [group]) == []

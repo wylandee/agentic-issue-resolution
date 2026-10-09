@@ -54,7 +54,11 @@ def _portfolio_cluster_targets(
     qa: bool,
     preferred_ids: list[str] | None = None,
 ) -> tuple[str | None, list[str]]:
-    """Return one ready cluster from the Supervisor-owned portfolio plan."""
+    """Return the first active cluster only when its next action is ready.
+
+    A blocked head cluster is returned with no targets so callers can prevent
+    fallback routing from dispatching a later batch out of portfolio order.
+    """
     if portfolio_plan is None:
         return None, []
     preferred = set(preferred_ids or [])
@@ -94,36 +98,44 @@ def _portfolio_cluster_targets(
 
     for cluster_id in ordered_cluster_ids:
         cluster = clusters_by_id.get(cluster_id)
-        if not getattr(cluster, "dispatchable", True):
-            logger.warning(
-                "portfolio cluster %s is non-dispatchable; preserving its hard-unit rejection",
-                cluster_id,
-            )
-            continue
-        if cluster is None or not upstreams_terminal(cluster):
-            continue
+        if cluster is None:
+            return cluster_id, []
         tasks = [task_queue.get(task_id) for task_id in cluster.task_ids]
         if any(task is None for task in tasks):
-            continue
+            return cluster_id, []
         concrete_tasks = [task for task in tasks if task is not None]
+        if all(task.status in _TERMINAL_STATUSES for task in concrete_tasks):
+            continue
+        if not getattr(cluster, "dispatchable", True) or not upstreams_terminal(cluster):
+            logger.warning(
+                "portfolio head cluster %s is blocked; preserving later batches",
+                cluster_id,
+            )
+            return cluster_id, []
         if qa:
             if all(task.status == TaskStatus.OPTIMISTICALLY_FIXED for task in concrete_tasks):
                 return cluster_id, list(cluster.task_ids)
-            continue
-        if any(
-            task.exhausted_update_path
-            or _has_existing_workaround_child(task, task_queue)
-            or _is_exhausted_update_pivot_candidate(task, None)
-            for task in concrete_tasks
+            return cluster_id, []
+        if any(task.status in _TERMINAL_STATUSES for task in concrete_tasks):
+            return cluster_id, []
+        if any(task.current_attempt_id is not None for task in concrete_tasks):
+            return cluster_id, []
+        if not all(task.status in _WORKABLE_STATUSES for task in concrete_tasks):
+            return cluster_id, []
+        if any(_has_existing_workaround_child(task, task_queue) for task in concrete_tasks):
+            return cluster_id, []
+        strategies = {task.strategy for task in concrete_tasks}
+        if len(strategies) != 1 or not strategies.issubset(
+            {RoutingStrategy.VERSION_BUMP, RoutingStrategy.CODE_WORKAROUND}
         ):
-            continue
-        if all(
-            task.status in _WORKABLE_STATUSES
-            and task.strategy == RoutingStrategy.VERSION_BUMP
-            and task.current_attempt_id is None
-            for task in concrete_tasks
-        ):
-            return cluster_id, list(cluster.task_ids)
+            return cluster_id, []
+        if strategies == {RoutingStrategy.CODE_WORKAROUND} and len(concrete_tasks) != 1:
+            logger.warning(
+                "portfolio workaround cluster %s has multiple tasks; preserving later batches",
+                cluster_id,
+            )
+            return cluster_id, []
+        return cluster_id, list(cluster.task_ids)
     return None, []
 
 
@@ -255,13 +267,18 @@ def _deterministic_routing(
         qa=True,
         preferred_ids=list(active_target_task_ids or []),
     )
-    if portfolio_cluster_id and len(portfolio_qa_targets) > 1:
+    if portfolio_cluster_id and portfolio_qa_targets:
+        is_batch = len(portfolio_qa_targets) > 1
         return SupervisorDecision(
-            decision_code=DecisionCode.QA_READY_BATCH,
+            decision_code=(DecisionCode.QA_READY_BATCH if is_batch else DecisionCode.QA_READY),
             next_node="qa_critic",
             target_task_ids=portfolio_qa_targets,
-            cluster_id=portfolio_cluster_id,
-            instructions="Run QA atomically across the completed package cluster.",
+            cluster_id=portfolio_cluster_id if is_batch else None,
+            instructions=(
+                "Run QA atomically across the completed package cluster."
+                if is_batch
+                else "Run QA on the next completed portfolio task."
+            ),
             decision_reason=(
                 f"All package tasks in cluster '{portfolio_cluster_id}' are ready for QA."
             ),
@@ -282,7 +299,7 @@ def _deterministic_routing(
         group_by_id=group_by_id,
         limit=QA_DISPATCH_LIMIT,
     )
-    if all_qa_ready:
+    if all_qa_ready and portfolio_cluster_id is None:
         return SupervisorDecision(
             decision_code=DecisionCode.QA_READY_BATCH,
             next_node="qa_critic",
@@ -293,6 +310,13 @@ def _deterministic_routing(
 
     # Collect tasks that still need work
     workable = [t for t in non_terminal if t.status in _WORKABLE_STATUSES]
+
+    portfolio_work_cluster_id, portfolio_work_targets = _portfolio_cluster_targets(
+        portfolio_plan,
+        task_queue,
+        qa=False,
+    )
+    portfolio_work_target_ids = set(portfolio_work_targets)
 
     # NO_FIX is a deterministic same-task state machine.  Keep it ahead of
     # generic workaround routing so an untrusted decision cannot skip a
@@ -312,6 +336,11 @@ def _deterministic_routing(
                     task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
                     and task.status == TaskStatus.NEEDS_RETRY
                 )
+            )
+            and (
+                portfolio_plan is None
+                or task.task_id not in portfolio_plan.task_ids
+                or task.task_id in portfolio_work_target_ids
             )
         ],
         key=lambda task: _task_sort_key(task, group_by_id),
@@ -354,6 +383,11 @@ def _deterministic_routing(
                 retry_diagnostics_by_task.get(task.task_id),
             )
             and not _has_existing_workaround_child(task, task_queue)
+            and (
+                portfolio_plan is None
+                or task.task_id not in portfolio_plan.task_ids
+                or task.task_id in portfolio_work_target_ids
+            )
         ],
         key=lambda task: _task_sort_key(task, group_by_id),
     )
@@ -396,11 +430,45 @@ def _deterministic_routing(
             ),
         )
 
-    portfolio_cluster_id, portfolio_update_targets = _portfolio_cluster_targets(
-        portfolio_plan,
-        task_queue,
-        qa=False,
-    )
+    portfolio_cluster_id = portfolio_work_cluster_id
+    portfolio_update_targets = portfolio_work_targets
+    if portfolio_cluster_id and portfolio_update_targets:
+        target = task_queue[portfolio_update_targets[0]]
+        if target.strategy == RoutingStrategy.CODE_WORKAROUND:
+            if target.no_fix_stage is not None or target.retry_count >= MAX_RETRIES:
+                return SupervisorDecision(
+                    decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
+                    next_node="teardown",
+                    target_task_ids=[],
+                    instructions="Stop safely; the committed workaround batch cannot be dispatched.",
+                    decision_reason=(
+                        f"Portfolio head cluster '{portfolio_cluster_id}' contains a "
+                        f"non-dispatchable workaround task '{target.task_id}'."
+                    ),
+                )
+            evaluation = qa_evaluations.get(target.task_id)
+            feedback_by_task: dict[str, str] = {}
+            revised_instructions: dict[str, str] = {}
+            if evaluation and evaluation.retry_feedback:
+                feedback_by_task[target.task_id] = evaluation.retry_feedback
+            if target.status == TaskStatus.NEEDS_RETRY and evaluation:
+                revised_instructions[target.task_id] = _build_workaround_retry_instruction(
+                    target,
+                    evaluation,
+                    group_by_id.get(target.parent_group_id),
+                )
+            return SupervisorDecision(
+                decision_code=DecisionCode.WORKAROUND_DISPATCH,
+                next_node="workaround_subagent",
+                target_task_ids=[target.task_id],
+                feedback_by_task=feedback_by_task,
+                revised_instructions=revised_instructions,
+                instructions="Apply the next committed portfolio code workaround.",
+                decision_reason=(
+                    f"Dispatching the ordered workaround task '{target.task_id}' "
+                    f"from cluster '{portfolio_cluster_id}'."
+                ),
+            )
     if portfolio_cluster_id and len(portfolio_update_targets) > 1:
         return SupervisorDecision(
             decision_code=DecisionCode.ATOMIC_CLUSTER_DISPATCH,
@@ -456,6 +524,22 @@ def _deterministic_routing(
                 f"from cluster '{portfolio_cluster_id}' before dependent clusters."
             ),
         )
+    if portfolio_plan is not None:
+        active_planned_tasks = [
+            task_queue[task_id]
+            for task_id in portfolio_plan.task_ids
+            if task_id in task_queue and task_queue[task_id].status not in _TERMINAL_STATUSES
+        ]
+        if portfolio_cluster_id is not None or active_planned_tasks:
+            return SupervisorDecision(
+                decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
+                next_node="teardown",
+                target_task_ids=[],
+                instructions="Stop safely; do not dispatch past the committed portfolio head.",
+                decision_reason=(
+                    "The committed portfolio head is not dispatchable; later batches remain blocked."
+                ),
+            )
 
     retry_version_bump = sorted(
         [

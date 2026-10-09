@@ -196,6 +196,7 @@ class SolverTarget(_SolverModel):
     finding_ids: list[str] = Field(default_factory=list)
     is_terminal: bool = False
     has_open_attempt: bool = False
+    terminal_status: str | None = None
 
     @field_validator(
         "occurrence_id",
@@ -231,6 +232,25 @@ class SolverTarget(_SolverModel):
     @classmethod
     def _lists(cls, value: Any, info: Any) -> list[str]:
         return _unique_strings(value, info.field_name)
+
+    @model_validator(mode="after")
+    def _terminal_provenance(self) -> SolverTarget:
+        allowed_terminal_statuses = {
+            "qa_passed",
+            "unfixable",
+            "inconclusive",
+            "pivoted",
+        }
+        if self.is_terminal:
+            if self.terminal_status not in allowed_terminal_statuses:
+                raise ValueError("terminal targets require a supported terminal_status.")
+        elif self.terminal_status is not None:
+            raise ValueError("non-terminal targets must not have terminal_status.")
+        if (self.is_terminal or self.has_open_attempt) and self.eligible_for_atomic_update:
+            raise ValueError(
+                "terminal or open-attempt targets cannot be eligible for atomic update."
+            )
+        return self
 
 
 class SolverFindingRequirement(_SolverModel):
@@ -593,6 +613,62 @@ class CertificationStatistics(_SolverModel):
         return dict(sorted(result.items()))
 
 
+class QAPassedWorkspacePrefix(_SolverModel):
+    """Verified QA-passed workspace checkpoint carried across portfolio replans."""
+
+    graph_digest: str = Field(..., min_length=1)
+    certified_by_portfolio_plan_id: str = Field(..., min_length=1)
+    batch_ids: list[str] = Field(..., min_length=1)
+    task_ids: list[str] = Field(..., min_length=1)
+    task_revisions: dict[str, int] = Field(
+        default_factory=dict,
+        description="Task revisions evaluated by the QA attempts represented in this checkpoint.",
+    )
+    qa_attempt_ids_by_task: dict[str, str] = Field(
+        default_factory=dict,
+        description="Immutable QA attempt that passed for each task in the checkpoint.",
+    )
+    snapshot_id: str | None = Field(
+        default=None,
+        description="Retained workspace snapshot containing the exact QA-passed graph.",
+    )
+    snapshot_attempt_id: str | None = Field(
+        default=None,
+        description="QA attempt whose evidence identifies the retained cumulative snapshot.",
+    )
+
+    @field_validator("graph_digest", "certified_by_portfolio_plan_id", mode="before")
+    @classmethod
+    def _required_prefix_text(cls, value: Any, info: Any) -> str:
+        return _required_text(value, info.field_name)
+
+    @field_validator("batch_ids", "task_ids", mode="before")
+    @classmethod
+    def _prefix_ids(cls, value: Any, info: Any) -> list[str]:
+        return _unique_strings(value, info.field_name)
+
+    @field_validator("qa_attempt_ids_by_task", mode="before")
+    @classmethod
+    def _qa_attempt_ids(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("qa_attempt_ids_by_task must be a mapping.")
+        cleaned: dict[str, str] = {}
+        for task_id, attempt_id in value.items():
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError("qa_attempt_ids_by_task keys must be non-empty strings.")
+            if not isinstance(attempt_id, str) or not attempt_id.strip():
+                raise ValueError("qa_attempt_ids_by_task values must be non-empty strings.")
+            cleaned[task_id.strip()] = attempt_id.strip()
+        return dict(sorted(cleaned.items()))
+
+    @field_validator("snapshot_id", "snapshot_attempt_id", mode="before")
+    @classmethod
+    def _optional_snapshot_provenance(cls, value: Any, info: Any) -> str | None:
+        return _optional_text(value, info.field_name)
+
+
 class PackageResolutionCertificate(_SolverModel):
     """Immutable evidence for one package-resolved assignment and its coverage."""
 
@@ -617,6 +693,7 @@ class PackageResolutionCertificate(_SolverModel):
         default_factory=CertificationStatistics
     )
     batch_prefix_graph_digests: dict[str, str] = Field(default_factory=dict)
+    workspace_prefix_provenance: QAPassedWorkspacePrefix | None = None
     diagnostics: list[str] = Field(default_factory=list)
 
     @field_validator(
@@ -687,6 +764,12 @@ class PackageResolutionCertificate(_SolverModel):
             for right in range(left + 1, 3)
         ):
             raise ValueError("certificate coverage IDs must be classified exactly once.")
+        if (
+            self.workspace_prefix_provenance is not None
+            and self.workspace_prefix_provenance.certified_by_portfolio_plan_id
+            != self.portfolio_plan_id
+        ):
+            raise ValueError("workspace prefix provenance must be bound to this portfolio plan.")
         return self
 
 
@@ -1373,6 +1456,7 @@ __all__ = [
     "ArbitrationResult",
     "PackageResolutionCertificate",
     "PackageResolutionStatus",
+    "QAPassedWorkspacePrefix",
     "SolverPackageOccurrence",
     "SolverCandidateRelation",
     "SolverDependencyRequirement",

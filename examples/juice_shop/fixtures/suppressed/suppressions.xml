@@ -81,17 +81,21 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for crypto-js (npm)</notes>
+        <notes>Keep crypto-js as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/crypto-js@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for decompress (npm)</notes>
+        <notes>Keep decompress as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/decompress@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for diff (npm)</notes>
@@ -111,17 +115,21 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for esbuild (npm)</notes>
+        <notes>Keep esbuild as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
+        <notes>Keep express-jwt as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for file-type (npm)</notes>
@@ -135,11 +143,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for got (npm)</notes>
+        <notes>Keep got as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>
