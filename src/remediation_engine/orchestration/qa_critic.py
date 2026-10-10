@@ -197,8 +197,7 @@ def _run_global_execution(
                     )
                 if not target_packages:
                     incomplete_reason = (
-                        resolution_batch.fallback_reason
-                        or ScanFallbackReason.NO_MATCHING_TARGET
+                        resolution_batch.fallback_reason or ScanFallbackReason.NO_MATCHING_TARGET
                     )
                     incomplete_detail = (
                         resolution_batch.fallback_detail
@@ -803,31 +802,45 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         current = qa_evaluations.get(task_id)
         if current is None:
             continue
+        # A no-match skip stays inconclusive, but is distinct from scanner failure
+        # so the delta-isolation gate can evaluate the remaining package batch.
+        skip_target = reason == ScanFallbackReason.NO_MATCHING_TARGET
         failure_detail = (
-            f"Task {task_id} targeted package could not be scanned "
-            f"({reason.value}): {detail}"
+            f"Task {task_id} targeted package scan skipped ({reason.value}): {detail}"
+            if skip_target
+            else f"Task {task_id} targeted package could not be scanned ({reason.value}): {detail}"
         )
-        errors.append(f"qa_critic: {failure_detail}")
+        if not skip_target:
+            errors.append(f"qa_critic: {failure_detail}")
         inconclusive_gates = current.deterministic_gates
         if inconclusive_gates is not None:
             inconclusive_gates = inconclusive_gates.model_copy(
                 update={
                     "status": "fail",
-                    "scanner_execution_status": ScannerExecutionStatus.NOT_RUN,
+                    "scanner_execution_status": (
+                        ScannerExecutionStatus.SKIPPED
+                        if skip_target
+                        else ScannerExecutionStatus.NOT_RUN
+                    ),
                     "target_remaining_identifiers": [],
                     "target_scanner_cleared": None,
                     "diagnostics": [*inconclusive_gates.diagnostics, failure_detail],
                 }
             )
+        retry_feedback = (
+            f"{failure_detail} This skipped target is not evidence that the "
+            "vulnerability was cleared. QA remains inconclusive and does not consume "
+            "a remediation retry."
+            if skip_target
+            else f"{failure_detail} QA is inconclusive and this result does not consume a "
+            "remediation retry. Make the target package resolvable for targeted ODC, "
+            "or provide valid evidence that the task no longer requires scanning."
+        )
         qa_evaluations[task_id] = QAEvaluation(
             task_id=task_id,
             passed=False,
             failure_category=FailureCategory.SECURITY_FLAG,
-            retry_feedback=(
-                f"{failure_detail} QA is inconclusive and this result does not consume a "
-                "remediation retry. Make the target package resolvable for targeted ODC, "
-                "or provide valid evidence that the task no longer requires scanning."
-            ),
+            retry_feedback=retry_feedback,
             deterministic_gates=inconclusive_gates,
             evidence_inconclusive=True,
             scan_evidence=current.scan_evidence,
@@ -836,8 +849,13 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         task_id: list(investigation.errors)
         for task_id, investigation in investigations_by_task.items()
     }
-    for task_id, (_reason, detail) in results.scan_target_failures_by_task.items():
-        qa_errors_by_task.setdefault(task_id, []).append(detail)
+    for task_id, (reason, detail) in results.scan_target_failures_by_task.items():
+        recorded_detail = (
+            f"targeted package scan skipped ({reason.value}): {detail}"
+            if reason == ScanFallbackReason.NO_MATCHING_TARGET
+            else detail
+        )
+        qa_errors_by_task.setdefault(task_id, []).append(recorded_detail)
     qa_investigation_reports_by_task = {
         task_id: json.dumps(
             {

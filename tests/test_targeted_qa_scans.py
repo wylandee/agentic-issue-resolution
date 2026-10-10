@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from remediation_engine.contracts.schemas import (
     ODCScanEvidence,
     ScanFallbackReason,
+    ScannerExecutionStatus,
     ScanScope,
 )
 from remediation_engine.orchestration.qa_critic import _run_global_execution
@@ -98,6 +99,8 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
         {"CVE-2026-0001"},
         set(),
         [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_packages=[("a", "1.0.0")],
     )
     with (
         patch(
@@ -138,7 +141,65 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
 
 
-def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
+def test_no_matching_target_skips_only_that_package_from_batch() -> None:
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = _lockfile()
+    missing_target = QAScanTarget(
+        task_id="task-2",
+        group_id="group-2",
+        target_package="missing",
+        expected_version="1.0.0",
+        manifest_paths=("package-lock.json",),
+        dependency_ancestry=(),
+        target_identifiers=frozenset({"CVE-2026-0002"}),
+    )
+    targeted_result = _SecurityScanResult(
+        True,
+        "ok",
+        set(),
+        {"CVE-2026-0001"},
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_packages=[("a", "1.0.0")],
+    )
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
+        ) as targeted_scan,
+        patch("remediation_engine.orchestration.qa_odc._run_security_scan") as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001", "CVE-2026-0002"},
+            {"CVE-2026-0001", "CVE-2026-0002"},
+            scan_targets=[_target(), missing_target],
+        )
+
+    targeted_scan.assert_called_once()
+    full_scan.assert_not_called()
+    assert results.scan is not None
+    assert results.scan.execution_status == ScannerExecutionStatus.SUCCESS
+    assert results.scan_target_failures_by_task["task-2"][0] == (
+        ScanFallbackReason.NO_MATCHING_TARGET
+    )
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.covered_task_ids == ["task-1"]
+    assert results.scan_evidence.complete is False
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.NO_MATCHING_TARGET
+
+
+def test_multiple_target_occurrences_are_scanned_independently() -> None:
     sandbox = MagicMock()
     sandbox.read_file.return_value = json.dumps(
         {
@@ -150,19 +211,26 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
             },
         }
     )
-    full_result = _SecurityScanResult(True, "full", set(), set(), set(), [])
+    targeted_result = _SecurityScanResult(
+        True,
+        "targeted",
+        set(),
+        {"CVE-2026-0001"},
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_packages=[("a", "1.0.0"), ("a", "1.0.0")],
+    )
     with (
         patch(
             "remediation_engine.orchestration.qa_test_parsing._run_install",
             return_value=_install_outcome(),
         ),
         patch(
-            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan"
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
         ) as targeted_scan,
-        patch(
-            "remediation_engine.orchestration.qa_odc._run_security_scan",
-            return_value=full_result,
-        ) as full_scan,
+        patch("remediation_engine.orchestration.qa_odc._run_security_scan") as full_scan,
         patch(
             "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
             return_value=_test_outcome(),
@@ -177,11 +245,13 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
         )
 
     assert results.scan is not None
-    assert [record.label for record in results.scan.scan_records] == ["odc:fallback-full"]
-    targeted_scan.assert_not_called()
-    full_scan.assert_called_once()
+    assert results.scan.execution_status == ScannerExecutionStatus.SUCCESS
+    assert [record.label for record in results.scan.scan_records] == ["odc:targeted"]
+    targeted_scan.assert_called_once()
+    full_scan.assert_not_called()
     evidence: ODCScanEvidence = results.scan_evidence
-    assert evidence.effective_scope == ScanScope.FULL
-    assert evidence.fallback_reason == ScanFallbackReason.MULTIPLE_TARGETS
-    assert evidence.complete is False
-    sandbox.run.assert_not_called()
+    assert evidence.effective_scope == ScanScope.TARGETED
+    assert evidence.fallback_reason is None
+    assert evidence.complete is True
+    assert evidence.covered_task_ids == ["task-1"]
+    sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)

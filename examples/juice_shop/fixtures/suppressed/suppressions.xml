@@ -81,21 +81,17 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep crypto-js as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for crypto-js (npm)</notes>
         <packageUrl regex="true">^pkg:npm/crypto-js@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
-<!--
     <suppress>
-        <notes>Keep decompress as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for decompress (npm)</notes>
         <packageUrl regex="true">^pkg:npm/decompress@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for diff (npm)</notes>
@@ -123,13 +119,11 @@
     </suppress>
 -->
 
-<!--
     <suppress>
-        <notes>Keep express-jwt as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
         <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for file-type (npm)</notes>

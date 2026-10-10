@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     QATestAttribution,
     RoutingStrategy,
+    ScannerExecutionStatus,
     SCARemediationStage,
     Severity,
     TaskAttemptSnapshot,
@@ -2318,9 +2319,19 @@ def test_delta_isolation_snapshot_creation_failure_never_probes(tmp_path, monkey
     assert archives == {"batch-delta": {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}}
 
 
-def test_delta_isolation_error_aggregation_settings_and_dispatch_provenance(tmp_path, monkeypatch):
+def test_delta_isolation_accepts_skipped_scan_and_preserves_provenance(tmp_path, monkeypatch):
     state, tasks, action, groups, _snapshots = _delta_test_setup(tmp_path)
     result = _failed_delta_qa_result(tasks)
+    task_a_evaluation = result["qa_evaluations"]["task-a"]
+    assert task_a_evaluation.deterministic_gates is not None
+    result["qa_evaluations"]["task-a"] = task_a_evaluation.model_copy(
+        update={
+            "deterministic_gates": task_a_evaluation.deterministic_gates.model_copy(
+                update={"scanner_execution_status": ScannerExecutionStatus.SKIPPED}
+            )
+        }
+    )
+
     result.update(
         {
             "errors": "top-level error",

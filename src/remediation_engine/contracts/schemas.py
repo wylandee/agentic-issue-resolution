@@ -151,6 +151,8 @@ class ScannerExecutionStatus(StrEnum):
     TIMEOUT = "timeout"
     UNPARSEABLE = "unparseable"
     NOT_RUN = "not_run"
+    # A skipped scan does not imply that the target vulnerability was cleared.
+    SKIPPED = "skipped"
 
 
 class DependencyEvidenceStatus(StrEnum):
