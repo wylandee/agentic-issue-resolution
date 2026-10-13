@@ -162,6 +162,10 @@ class TestTriageNodeIntegration:
         with (
             patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws,
             patch("remediation_engine.orchestration.graph.run_supervisor_node") as mock_supervisor,
+            patch(
+                "remediation_engine.orchestration.graph.run_portfolio_node",
+                return_value={"status": "portfolio_ready"},
+            ),
             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown,
         ):
             graph = build_orchestrator_graph()

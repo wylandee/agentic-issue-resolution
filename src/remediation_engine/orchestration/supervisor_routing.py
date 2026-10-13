@@ -204,8 +204,6 @@ def _deterministic_routing(
     active_target_task_ids: list[str] | None = None,
     current_status: str = "",
     triage_required: bool = False,
-    workspace_volume: str | None = None,
-    final_full_scan_completed: bool = False,
     portfolio_plan: PortfolioPlan | None = None,
 ) -> SupervisorDecision:
     """
@@ -215,16 +213,17 @@ def _deterministic_routing(
     """
     tasks = sorted(task_queue.values(), key=lambda task: _task_sort_key(task, group_by_id))
     non_terminal = [t for t in tasks if t.status not in _TERMINAL_STATUSES]
-    # Post-QA triage is a Supervisor-owned handoff.  It must run before
-    # teardown even when the current task queue is already terminal, because
-    # the global scan may have discovered a new package vulnerability.
-    if triage_required and current_status in {"qa_completed", "qa_failed", "final_scan_completed"}:
+    # Defer incremental scan triage until ordinary remediation work is exhausted.
+    if not non_terminal and triage_required:
         return SupervisorDecision(
             decision_code=DecisionCode.TRIAGE_REQUIRED,
             next_node="triage",
             target_task_ids=[],
-            instructions="Re-triage the complete parseable post-remediation scan before the next remediation decision.",
-            decision_reason="QA produced a parseable scan and marked post-QA triage as required.",
+            instructions="Route cumulative accepted scan findings to post-remediation triage.",
+            decision_reason=(
+                "No actionable remediation tasks remain and accepted scans contain "
+                "baseline-absent or remaining target findings."
+            ),
         )
 
     if not group_by_id and not task_queue:
@@ -236,16 +235,9 @@ def _deterministic_routing(
             decision_reason="Deterministic routing found no valid groups.",
         )
 
-    # All tasks are terminal â†’ authoritative full scan, then teardown.
+    # No final full-workspace scan node remains; terminal tasks go to triage
+    # when accepted incremental findings exist, otherwise directly to teardown.
     if not non_terminal:
-        if workspace_volume and task_queue and not final_full_scan_completed:
-            return SupervisorDecision(
-                decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
-                next_node="final_full_scan",
-                target_task_ids=[],
-                instructions="Run the authoritative full Dependency-Check scan before teardown.",
-                decision_reason="All remediation tasks are terminal and the final full scan is not complete.",
-            )
         return SupervisorDecision(
             decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
             next_node="teardown",

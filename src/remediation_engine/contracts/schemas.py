@@ -1515,6 +1515,10 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    target_package_absent: bool = Field(
+        default=False,
+        description="Complete task-owned lockfile evidence proves the SCA target is absent.",
+    )
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
@@ -1530,6 +1534,42 @@ class QADeterministicGates(BaseModel):
     )
 
 
+class PackageScanOccurrence(BaseModel):
+    """One exact package occurrence represented by an ODC scan."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_input_path: str
+    package_name: str
+    version: str
+    lockfile_key: str | None = None
+    occurrence_index: int = Field(default=0, ge=0)
+    found_identifiers: list[str] = Field(default_factory=list)
+    found_issues: list[VulnerabilityIssue] = Field(default_factory=list)
+
+
+class TaskScanRecord(BaseModel):
+    """Complete incremental scan result committed for one QA-passed task."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str
+    attempt_id: str
+    task_revision: int = Field(ge=0)
+    new_identifiers: list[str] = Field(default_factory=list)
+    found_identifiers: list[str] = Field(default_factory=list)
+    remaining_target_identifiers: list[str] = Field(default_factory=list)
+    found_issues: list[VulnerabilityIssue] = Field(default_factory=list)
+    closure_package_names: list[str] = Field(default_factory=list)
+    closure_lockfile_keys: list[str] = Field(default_factory=list)
+    covered_input_paths: list[str] = Field(default_factory=list)
+    covered_occurrences: list[PackageScanOccurrence] = Field(default_factory=list)
+    removed_occurrence_keys: list[str] = Field(default_factory=list)
+    inventory_updates: dict[str, str] = Field(default_factory=dict)
+    complete: bool
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class ODCScanEvidence(BaseModel):
     """Typed evidence describing one ODC scan and its authority boundary."""
 
@@ -1541,10 +1581,7 @@ class ODCScanEvidence(BaseModel):
     covered_task_ids: list[str] = Field(default_factory=list)
     closure_package_names: list[str] = Field(
         default_factory=list,
-        description=(
-            "Package names represented by the task-scoped scan inputs. Each input now "
-            "contains only its selected target package."
-        ),
+        description=("Every package represented by each targeted dependency closure."),
     )
     closure_lockfile_keys: list[str] = Field(
         default_factory=list,
@@ -1552,19 +1589,57 @@ class ODCScanEvidence(BaseModel):
             "Original physical package-lock keys selected for the task-scoped scan inputs."
         ),
     )
-    found_identifiers: list[str] = Field(default_factory=list)
-    remaining_target_identifiers: list[str] = Field(default_factory=list)
-    complete: bool = False
+    found_identifiers: list[str] = Field(
+        default_factory=list,
+        description="Identifiers found across scanned package occurrences.",
+    )
+    new_identifiers: list[str] = Field(default_factory=list)
+    found_issues: list[VulnerabilityIssue] = Field(default_factory=list)
+    remaining_target_identifiers: list[str] = Field(
+        default_factory=list,
+        description="Task-original target identifiers still present in scanned occurrences.",
+    )
+    covered_input_paths: list[str] = Field(default_factory=list)
+    covered_occurrences: list[PackageScanOccurrence] = Field(default_factory=list)
+    removed_occurrence_keys: list[str] = Field(default_factory=list)
+    inventory_updates: dict[str, str] = Field(default_factory=dict)
+    inventory_removals: list[str] = Field(default_factory=list)
+    scan_performed: bool = True
+    scan_skip_reason: str | None = Field(
+        default=None,
+        description="Why a task's targeted scan was skipped because its package was absent.",
+    )
+    complete: bool = Field(
+        default=False,
+        description="Whether every changed ODC input for the attempt was covered.",
+    )
     fallback_reason: ScanFallbackReason | None = None
 
 
+class IncrementalScanRecord(BaseModel):
+    """Latest complete report-wide scan snapshot for one dependency input."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_input_path: str = Field(..., min_length=1)
+    task_ids: list[str] = Field(default_factory=list)
+    attempt_ids: list[str] = Field(default_factory=list)
+    found_identifiers: list[str] = Field(default_factory=list)
+    new_identifiers: list[str] = Field(default_factory=list)
+    found_issues: list[VulnerabilityIssue] = Field(default_factory=list)
+    complete: bool
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class FinalFullScanResult(BaseModel):
-    """Authoritative full-workspace ODC result used before teardown."""
+    """Legacy-shaped projection of full or incremental ODC findings."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     completed: bool = False
     authoritative: bool = True
+    coverage_scope: Literal["full_workspace", "incremental_dependency_inputs"] = "full_workspace"
+    coverage_complete: bool | None = None
     found_identifiers: list[str] = Field(default_factory=list)
     remaining_target_identifiers: list[str] = Field(default_factory=list)
     new_identifiers: list[str] = Field(default_factory=list)
@@ -2080,6 +2155,20 @@ class QAAttemptResult(BaseModel):
         description="Policy provenance must be the immutable attempt snapshot.",
     )
     evaluation: QAEvaluation
+    batch_scan_evidence: ODCScanEvidence | None = Field(
+        default=None,
+        description=(
+            "Report-wide scan evidence for the QA batch, separate from the "
+            "task-scoped evidence on the evaluation."
+        ),
+    )
+    batch_scan_candidate_retained: bool = Field(
+        default=False,
+        description=(
+            "Whether the candidate workspace used for the batch scan remains live "
+            "after QA finalization."
+        ),
+    )
     investigation_report: str = ""
     errors: list[str] = Field(default_factory=list)
 
@@ -2485,7 +2574,6 @@ class SupervisorDecision(BaseModel):
     - ``qa_critic`` accepts one or more ``target_task_ids`` for reusable batch QA;
       the current Supervisor dispatch policy narrows this to one target.
     - ``triage`` is a graph-level handoff and does not target a task.
-    - ``final_full_scan`` is a graph-level handoff and does not target a task.
     - ``teardown`` requires empty ``target_task_ids``.
     - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
     """
@@ -2506,8 +2594,8 @@ class SupervisorDecision(BaseModel):
         "update_subagent",
         "workaround_subagent",
         "qa_critic",
-        "triage",
         "final_full_scan",
+        "triage",
         "teardown",
     ] = Field(
         ...,
@@ -2616,7 +2704,7 @@ class SupervisorDecision(BaseModel):
             raise ValueError("cluster_id is only valid for update_subagent or qa_critic.")
         if node == "qa_critic" and len(targets) < 1:
             raise ValueError("qa_critic requires at least 1 target_task_id.")
-        if node in {"final_full_scan", "teardown"} and targets:
+        if node == "teardown" and targets:
             raise ValueError(f"{node} must have empty target_task_ids, got {targets}.")
         overlap = set(unfixable) & set(targets)
         if overlap:
@@ -2824,3 +2912,17 @@ class RemediationTask(BaseModel):
         default=None,
         description="Committed outer portfolio plan authorizing the task input.",
     )
+
+    remediation_action: str | None = Field(
+        default=None,
+        description=(
+            "Supervisor-authored workerless completion action; not a worker instruction "
+            "or worker/QA envelope field."
+        ),
+    )
+
+    @field_validator("remediation_action", mode="before")
+    @classmethod
+    def _normalize_remediation_action(cls, value: Any) -> str | None:
+        """Trim an optional Supervisor-authored completion action."""
+        return _trim_optional_contract_text(value, "remediation_action")

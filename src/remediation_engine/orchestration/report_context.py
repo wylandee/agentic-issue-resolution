@@ -58,6 +58,9 @@ class ReportContext:
     attempt_snapshots: dict[str, Any]
     retry_diagnostics: dict[str, Any]
     final_full_scan_result: Any
+    scan_coverage_scope: str
+    scan_coverage_complete: bool | None
+    scan_evidence_state: str
     triage_required: bool
     post_remediation_scan_issues: list[Any]
     post_remediation_scan_identifiers: list[str]
@@ -99,7 +102,8 @@ class ErrorRecord:
 
 _KNOWN_ERROR_SOURCES = {
     "docker",
-    "final_full_scan",
+    "incremental_scan",
+    "post_remediation_scan",
     "odc",
     "qa_critic",
     "report_node",
@@ -307,7 +311,7 @@ def _classify_error(source: str, message: str, explicit_code: str | None) -> str
         return explicit_code.upper()
     lowered = message.lower()
     if ("timeout" in lowered or "timed out" in lowered) and (
-        source in {"final_full_scan", "odc", "qa_critic"}
+        source in {"incremental_scan", "post_remediation_scan", "odc", "qa_critic"}
         or "odc" in lowered
         or "dependency-check" in lowered
         or "dependency check" in lowered
@@ -335,10 +339,10 @@ def _classify_error(source: str, message: str, explicit_code: str | None) -> str
 def _error_records(state: Mapping[str, Any]) -> list[ErrorRecord]:
     """Collect critical errors by normalized message/code with source counts."""
     candidates = _items(state.get("errors"))
-    final_scan = state.get("final_full_scan_result")
-    scan_error = _value(final_scan, "error")
+    scan_summary = state.get("final_full_scan_result")
+    scan_error = _value(scan_summary, "error")
     if scan_error:
-        candidates.append(f"final_full_scan: {scan_error}")
+        candidates.append(f"post_remediation_scan: {scan_error}")
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for candidate in candidates:
@@ -365,21 +369,28 @@ def _error_records(state: Mapping[str, Any]) -> list[ErrorRecord]:
 
 
 def _scan_evidence_state(final_scan: Any, new_status: str = "") -> str:
-    """Classify authoritative post-remediation scan evidence.
+    """Classify full-scan authority or incremental-input coverage separately."""
+    if final_scan is None:
+        normalized_new_status = new_status.strip().lower()
+        if normalized_new_status in {"scan_failed", "failed"}:
+            return "failed"
+        return "not_scanned"
 
-    Returns `complete` only when the scan produced a usable result,
-    `failed` when it explicitly failed, and `not_scanned` when no
-    authoritative result is available.
-    """
     status = _text(_value(final_scan, "status")).strip().lower()
+    coverage_scope = _text(_value(final_scan, "coverage_scope")).strip().lower()
+    if coverage_scope == "incremental_dependency_inputs":
+        coverage_complete = _value(final_scan, "coverage_complete")
+        completed = _value(final_scan, "completed")
+        if coverage_complete is True and completed is not False:
+            return "incremental_complete"
+        return "incremental_incomplete"
+
     normalized_new_status = new_status.strip().lower()
     if status in {"scan_failed", "failed", "error", "timeout"} or normalized_new_status in {
         "scan_failed",
         "failed",
     }:
         return "failed"
-    if final_scan is None:
-        return "not_scanned"
     if _value(final_scan, "authoritative") is False:
         return "not_scanned"
     completed = _value(final_scan, "completed")
@@ -536,15 +547,18 @@ def _reconcile_authoritative_statuses(
     new_status: str,
     remaining_identifiers: Sequence[str],
 ) -> dict[str, str]:
-    """Reopen targeted successes contradicted by an authoritative scan.
+    """Reopen targeted successes contradicted by a repository-wide scan.
 
-    Targeted QA covers only the exact target package or packages while the
-    final scan covers the whole repository. A successful task therefore cannot
-    remain a successful report row when the authoritative scan still contains
-    one of that group's original vulnerability identifiers.
+    Incremental dependency scans are intentionally excluded: their evidence
+    cannot determine whether unrelated groups outside scanned closures remain
+    vulnerable.
     """
     result = dict(statuses)
     if _scan_evidence_state(final_scan, new_status) != "complete":
+        return result
+    if _text(_value(final_scan, "coverage_scope"), "full_workspace") != "full_workspace":
+        return result
+    if _value(final_scan, "authoritative") is False:
         return result
     remaining = {identifier.casefold() for identifier in remaining_identifiers}
     if not remaining:
@@ -677,9 +691,11 @@ def _build_context(
         "reappeared_group_ids",
         "final_scan_reopened_group_ids",
     )
-    if scan_evidence_state == "complete" and (
-        discovered_ids or (not triage_required and not new_identifiers)
-    ):
+    scan_findings_usable = scan_evidence_state in {
+        "complete",
+        "incremental_complete",
+    } or (scan_evidence_state == "incremental_incomplete" and bool(new_identifiers))
+    if scan_findings_usable and (discovered_ids or (not triage_required and not new_identifiers)):
         discovered_status_counts = Counter(
             statuses.get(group_id, "pending") for group_id in discovered_ids
         )
@@ -760,6 +776,12 @@ def _build_context(
         attempt_snapshots=_mapping(state.get("attempt_snapshots_by_id")),
         retry_diagnostics=_mapping(state.get("retry_diagnostics_by_task")),
         final_full_scan_result=final_scan,
+        scan_coverage_scope=_text(
+            _value(final_scan, "coverage_scope"),
+            "full_workspace" if final_scan is not None else "unknown",
+        ),
+        scan_coverage_complete=_value(final_scan, "coverage_complete"),
+        scan_evidence_state=scan_evidence_state,
         triage_required=triage_required,
         post_remediation_scan_issues=post_scan_issues,
         post_remediation_scan_identifiers=post_scan_identifiers,

@@ -106,14 +106,6 @@ def test_decision_codes_cover_fixed_priority_routes():
     )
     assert (
         _route(
-            {"t": _task("t", "g", status=TaskStatus.QA_PASSED)},
-            [_group("g")],
-            workspace_volume="workspace-volume",
-        ).decision_code
-        == DecisionCode.FINAL_FULL_SCAN_REQUIRED
-    )
-    assert (
-        _route(
             {"t": _task("t", "g", status=TaskStatus.OPTIMISTICALLY_FIXED)}, [_group("g")]
         ).decision_code
         == DecisionCode.QA_READY_BATCH
@@ -245,6 +237,53 @@ def test_commit_rejects_unscoped_retry_to_pass_transition():
         queue,
         task.task_id,
         updates={"status": TaskStatus.QA_PASSED},
+        consistency_events=events,
+    )
+
+    assert queue[task.task_id] == task
+    assert events and events[0].error_code == "INVALID_TRANSITION"
+
+
+def test_verified_absent_pass_transition_is_explicitly_scoped() -> None:
+    for status in (TaskStatus.PENDING, TaskStatus.NEEDS_RETRY):
+        task = _task("task-1", "g", status=status)
+        queue = {task.task_id: task}
+        events = []
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            consistency_events=events,
+        )
+
+        assert queue[task.task_id] == task
+        assert events and events[0].error_code == "INVALID_TRANSITION"
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            allow_verified_absent_target_pass=True,
+        )
+
+        assert queue[task.task_id].status == TaskStatus.QA_PASSED
+        assert queue[task.task_id].current_attempt_id is None
+        assert queue[task.task_id].selected_version is None
+
+
+def test_verified_absent_pass_opt_in_rejects_live_attempts() -> None:
+    task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
+        update={"current_attempt_id": "attempt-live", "selected_version": "1.2.3"}
+    )
+    queue = {task.task_id: task}
+    events = []
+
+    _commit_task_transition(
+        queue,
+        task.task_id,
+        updates={"status": TaskStatus.QA_PASSED},
+        allow_verified_absent_target_pass=True,
         consistency_events=events,
     )
 

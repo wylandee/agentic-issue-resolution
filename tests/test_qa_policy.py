@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     ODCScanEvidence,
+    PackageScanOccurrence,
     QAAttemptResult,
     QADependencyEvidence,
     QAEvaluation,
@@ -26,6 +27,7 @@ from remediation_engine.contracts.schemas import (
     QATestAttribution,
     RemediationTask,
     RoutingStrategy,
+    ScanFallbackReason,
     ScannerExecutionStatus,
     ScanScope,
     SecurityReviewVerdict,
@@ -129,6 +131,45 @@ def _results(
     return results
 
 
+def _absence_evidence(task_id: str = "task-1") -> ODCScanEvidence:
+    """Build complete task-owned evidence for an absent SCA target."""
+    return ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[task_id],
+        scan_performed=False,
+        scan_skip_reason="no_matching_target",
+        complete=True,
+    )
+
+
+def _absence_results(
+    *,
+    install: tuple[bool, str] = (True, "install ok"),
+    remaining: set[str] | None = None,
+    tests: tuple[bool, str] | None = (True, "tests ok"),
+    evidence: ODCScanEvidence | None = None,
+) -> _QAExecutionResults:
+    """Build execution results whose scanner work was skipped for a proven absent target."""
+    results = _results(
+        install=install,
+        scanner_status=ScannerExecutionStatus.NOT_RUN,
+        tests=tests,
+    )
+    remaining_ids = set(remaining or set())
+    results.scan = _SecurityScanResult(
+        ok=True,
+        summary="Targeted ODC skipped because the target package was absent.",
+        remaining_identifiers=remaining_ids,
+        found_identifiers=remaining_ids,
+        new_identifiers=set(),
+        execution_status=ScannerExecutionStatus.NOT_RUN,
+    )
+    results.scan_evidence_by_task["task-1"] = evidence or _absence_evidence()
+    results.scan_target_skipped_by_task["task-1"] = "no_matching_target"
+    return results
+
+
 def _semantic_review() -> QASemanticSecurityReview:
     return QASemanticSecurityReview(
         verdict=SecurityReviewVerdict.PASS,
@@ -199,6 +240,85 @@ def test_scan_evidence_projection_is_isolated_by_task_id() -> None:
     assert enriched["task-2"].scan_evidence.remaining_target_identifiers == ["CVE-2025-0002"]
 
 
+def test_task_specific_scan_evidence_preserves_new_ids_and_closure_metadata() -> None:
+    group_one = _group("group-1", identifier="CVE-2025-0001")
+    group_two = _group("group-2", identifier="CVE-2025-0002")
+    context_one = _task_context(group_one, task_id="task-1")
+    context_two = _task_context(group_two, task_id="task-2")
+    evaluations = {
+        "task-1": QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Retry task one.",
+        ),
+        "task-2": QAEvaluation(
+            task_id="task-2",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Retry task two.",
+        ),
+    }
+    shared_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1", "task-2"],
+        complete=True,
+    )
+    evidence_by_task = {
+        "task-1": ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-1"],
+            closure_package_names=["express", "body-parser"],
+            closure_lockfile_keys=["node_modules/express", "node_modules/body-parser"],
+            found_identifiers=["CVE-2025-0001", "GHSA-2026-ABCD-EFGH-IJKL"],
+            new_identifiers=["GHSA-2026-ABCD-EFGH-IJKL"],
+            remaining_target_identifiers=["CVE-2025-0001"],
+            covered_occurrences=[
+                PackageScanOccurrence(
+                    source_input_path="package-lock.json",
+                    package_name="body-parser",
+                    version="2.2.0",
+                    lockfile_key="node_modules/body-parser",
+                    found_identifiers=["GHSA-2026-ABCD-EFGH-IJKL"],
+                )
+            ],
+            complete=True,
+        ),
+        "task-2": ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-2"],
+            closure_package_names=["helmet"],
+            closure_lockfile_keys=["node_modules/helmet"],
+            found_identifiers=["CVE-2025-0002"],
+            remaining_target_identifiers=["CVE-2025-0002"],
+            complete=True,
+        ),
+    }
+
+    enriched = _attach_scan_evidence_to_evaluations(
+        evaluations,
+        shared_evidence,
+        [context_one, context_two],
+        evidence_by_task=evidence_by_task,
+    )
+
+    task_one_evidence = enriched["task-1"].scan_evidence
+    task_two_evidence = enriched["task-2"].scan_evidence
+    assert task_one_evidence is not None
+    assert task_one_evidence.found_identifiers == [
+        "CVE-2025-0001",
+        "GHSA-2026-ABCD-EFGH-IJKL",
+    ]
+    assert task_one_evidence.new_identifiers == ["GHSA-2026-ABCD-EFGH-IJKL"]
+    assert task_one_evidence.closure_package_names == ["express", "body-parser"]
+    assert task_two_evidence is not None
+    assert task_two_evidence.closure_package_names == ["helmet"]
+    assert task_two_evidence.found_identifiers == ["CVE-2025-0002"]
+
+
 def _investigation() -> GroupInvestigation:
     return GroupInvestigation(
         group_id="g1",
@@ -223,18 +343,22 @@ def _evaluate(
     context = _task_context(group, policy=policy)
     if package_state is not None:
         results.package_state_by_task[context.task_id] = package_state
-    gates, _ = _evaluate_policy_gates(
-        [context],
-        results,
-        {context.task_id: policy},
-    )
-    evaluations, _ = _apply_policy_decision(
-        [context],
-        [evaluation],
-        gates,
-        {context.task_id: policy},
-        {context.task_id: investigation} if investigation is not None else None,
-    )
+    with patch(
+        "remediation_engine.orchestration.qa_policy_engine._QA_PACKAGE_STATE_CHECKS_ENABLED",
+        package_state is not None,
+    ):
+        gates, _ = _evaluate_policy_gates(
+            [context],
+            results,
+            {context.task_id: policy},
+        )
+        evaluations, _ = _apply_policy_decision(
+            [context],
+            [evaluation],
+            gates,
+            {context.task_id: policy},
+            {context.task_id: investigation} if investigation is not None else None,
+        )
     return evaluations[context.task_id]
 
 
@@ -256,6 +380,116 @@ def test_version_bump_scanner_is_group_scoped() -> None:
     )
     assert evaluations["task-1"].passed is True
     assert evaluations["task-2"].failure_category == FailureCategory.SECURITY_FLAG
+
+
+def test_missing_target_skip_satisfies_policy_and_python_owned_qa() -> None:
+    group = _group("g1")
+    context = _task_context(group)
+    results = _absence_results()
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates[context.task_id].status == "pass"
+    assert gates[context.task_id].scanner_execution_status == ScannerExecutionStatus.SUCCESS
+    assert gates[context.task_id].target_scanner_cleared is True
+    assert gates[context.task_id].target_package_absent is True
+    assert any("target package absent" in item for item in gates[context.task_id].diagnostics)
+
+    evaluations, _ = _apply_policy_decision(
+        [context],
+        [
+            QAEvaluation(
+                task_id=context.task_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Package-specific evidence cannot be collected.",
+            )
+        ],
+        gates,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+    assert evaluations[context.task_id].passed is True
+
+
+@pytest.mark.parametrize(
+    ("evidence_updates", "has_task_failure"),
+    [
+        ({"complete": False}, False),
+        ({"covered_task_ids": []}, False),
+        ({"scan_skip_reason": None}, False),
+        ({}, True),
+    ],
+    ids=["incomplete", "uncovered", "wrong-skip-reason", "task-failure"],
+)
+def test_target_absence_requires_complete_task_owned_evidence(
+    evidence_updates: dict[str, object],
+    has_task_failure: bool,
+) -> None:
+    context = _task_context(_group("g1"))
+    evidence = _absence_evidence().model_copy(update=evidence_updates)
+    results = _absence_results(evidence=evidence)
+    if has_task_failure:
+        results.scan_target_failures_by_task[context.task_id] = (
+            ScanFallbackReason.INVALID_LOCKFILE,
+            "A supported lockfile could not be resolved.",
+        )
+
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates[context.task_id].target_package_absent is False
+
+
+@pytest.mark.parametrize(
+    ("policy", "install", "tests"),
+    [
+        (QAPolicy.VERSION_BUMP, (False, "install failed"), (True, "tests ok")),
+        (QAPolicy.VERSION_BUMP, (True, "install ok"), (False, "tests failed")),
+        (QAPolicy.INITIAL_CODE_WORKAROUND, (True, "install ok"), (False, "tests failed")),
+    ],
+    ids=["install-failed", "version-bump-tests-failed", "hard-tests-failed"],
+)
+def test_target_absence_does_not_waive_install_or_required_tests(
+    policy: QAPolicy,
+    install: tuple[bool, str],
+    tests: tuple[bool, str],
+) -> None:
+    context = _task_context(_group("g1"), policy=policy)
+    results = _absence_results(install=install, tests=tests)
+    gates, _ = _evaluate_policy_gates([context], results, {context.task_id: policy})
+
+    evaluations, _ = _apply_policy_decision(
+        [context],
+        [QAEvaluation(task_id=context.task_id, passed=True)],
+        gates,
+        {context.task_id: policy},
+    )
+
+    assert evaluations[context.task_id].passed is False
+
+
+def test_target_absence_does_not_clear_remaining_target_identifiers() -> None:
+    context = _task_context(_group("g1"))
+    results = _absence_results(remaining={"CVE-2025-0001"})
+    policy = QAPolicy.VERSION_BUMP
+    gates, _ = _evaluate_policy_gates([context], results, {context.task_id: policy})
+
+    evaluations, _ = _apply_policy_decision(
+        [context],
+        [QAEvaluation(task_id=context.task_id, passed=True)],
+        gates,
+        {context.task_id: policy},
+    )
+
+    assert gates[context.task_id].target_package_absent is True
+    assert gates[context.task_id].target_scanner_cleared is False
+    assert evaluations[context.task_id].passed is False
 
 
 def test_version_bump_ignores_compacted_manifest_false_negative() -> None:
@@ -575,6 +809,8 @@ def test_version_bump_may_exonerate_unrelated_test_failure() -> None:
     unrelated_group = _group("g2", "CVE-2025-0002")
     contexts = [_task_context(group, "task-1"), _task_context(unrelated_group, "task-2")]
     results = _results(tests=(False, "test failed"))
+    results.scan_evidence_by_task["task-1"] = _absence_evidence()
+    results.scan_target_skipped_by_task["task-1"] = "no_matching_target"
     policies = {context.task_id: QAPolicy.VERSION_BUMP for context in contexts}
     gates, _ = _evaluate_policy_gates(contexts, results, policies)
     evaluations, _ = _apply_policy_decision(
@@ -598,6 +834,10 @@ def test_version_bump_may_exonerate_unrelated_test_failure() -> None:
         policies,
     )
     assert evaluations["task-1"].passed is True
+    assert (
+        evaluations["task-1"].deterministic_gates is not None
+        and evaluations["task-1"].deterministic_gates.target_package_absent is True
+    )
 
 
 def test_hard_test_policy_ignores_llm_exoneration() -> None:

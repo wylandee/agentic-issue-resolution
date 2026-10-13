@@ -43,10 +43,14 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
+    FinalFullScanResult,
+    IncrementalScanRecord,
     IssueType,
     MultiPackageAction,
     NoFixMitigationStage,
+    ODCScanEvidence,
     PackageMutation,
+    PackageScanOccurrence,
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
@@ -58,10 +62,12 @@ from remediation_engine.contracts.schemas import (
     SupervisorRetryPlan,
     TacticalStrategy,
     TaskAttemptSnapshot,
+    TaskScanRecord,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
+    VulnerabilityIssue,
     WorkaroundContext,
     WorkaroundPhase,
     WorkaroundReplayPlan,
@@ -72,6 +78,12 @@ from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
 )
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
+from remediation_engine.orchestration._qa_runtime import (
+    _lockfile_paths_for_group,
+    _parse_package_occurrence_key,
+)
+from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
+from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.supervisor_planner import (
     _OVERRIDE_DEPENDENCY_TYPES,
@@ -136,6 +148,13 @@ from remediation_engine.tools.npm_graph import (
 
 logger = logging.getLogger(__name__)
 
+_VERIFIED_ABSENT_REMEDIATION_ACTION = (
+    "Removed due to another package upgrade; target absent from every covered package-lock input."
+)
+_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON = (
+    "Verified target-package absence changed portfolio membership."
+)
+
 # Supervisor dispatch commits one task attempt at a time. Worker and QA
 # boundaries consume only the typed task/attempt envelopes.
 
@@ -144,11 +163,570 @@ _VALID_NEXT_NODES: set[str] = {
     "update_subagent",
     "workaround_subagent",
     "qa_critic",
-    "triage",
     "final_full_scan",
+    "triage",
     "teardown",
 }
 _WORKER_NODES = frozenset({"update_subagent", "workaround_subagent", "qa_critic"})
+
+
+def _final_full_scan_due(
+    state: OrchestratorState,
+    task_queue: Mapping[str, RemediationTask],
+) -> bool:
+    """Return whether the enabled final full scan still needs to run."""
+    if (
+        not state.get("final_full_scan_enabled")
+        or not state.get("workspace_volume")
+        or not task_queue
+        or any(task.status not in _TERMINAL_STATUSES for task in task_queue.values())
+    ):
+        return False
+    previous_scan = state.get("final_full_scan_result")
+    return _final_full_scan_value(previous_scan, "coverage_scope") != "full_workspace"
+
+
+def _final_full_scan_value(value: Any, field: str, default: Any = None) -> Any:
+    """Read a final scan result field from a model or serialized mapping."""
+    if isinstance(value, Mapping):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
+def _task_scan_record_from_qa_result(
+    qa_result: QAAttemptResult,
+) -> TaskScanRecord | None:
+    """Build a task record only from a complete, passing attempt envelope."""
+    evaluation = qa_result.evaluation
+    evidence = evaluation.scan_evidence
+    if (
+        not evaluation.passed
+        or evaluation.contract_error
+        or evaluation.evidence_inconclusive
+        or evidence is None
+        or not evidence.complete
+    ):
+        return None
+    if (
+        not evidence.scan_performed
+        and evidence.scan_skip_reason != "no_matching_target"
+        and (evidence.inventory_updates or not evidence.removed_occurrence_keys)
+    ):
+        return None
+    return TaskScanRecord(
+        task_id=qa_result.task_id,
+        attempt_id=qa_result.attempt_id,
+        task_revision=qa_result.task_revision,
+        new_identifiers=list(evidence.new_identifiers),
+        found_identifiers=list(evidence.found_identifiers),
+        remaining_target_identifiers=list(evidence.remaining_target_identifiers),
+        found_issues=list(evidence.found_issues),
+        closure_package_names=list(evidence.closure_package_names),
+        closure_lockfile_keys=list(evidence.closure_lockfile_keys),
+        covered_input_paths=list(evidence.covered_input_paths),
+        covered_occurrences=list(evidence.covered_occurrences),
+        removed_occurrence_keys=list(evidence.removed_occurrence_keys),
+        inventory_updates=dict(evidence.inventory_updates),
+        complete=evidence.complete,
+    )
+
+
+def _verified_absent_package_tasks(
+    task_queue: Mapping[str, RemediationTask],
+    group_by_id: Mapping[str, VulnerabilityGroup],
+    latest_successful_scan_by_task: Mapping[str, TaskScanRecord],
+    accepted_package_inventory_by_lockfile: Mapping[str, str],
+) -> dict[str, str]:
+    """Find untouched SCA tasks whose target is proven absent from covered lockfiles.
+
+    A candidate requires a complete accepted scan record covering every
+    supported package-lock input, a valid target-removal tombstone in those
+    inputs, and no current inventory occurrence of the target package.
+
+    Args:
+        task_queue: Authoritative tasks eligible for Supervisor reconciliation.
+        group_by_id: Vulnerability groups keyed by their stable group IDs.
+        latest_successful_scan_by_task: Complete QA-passed scan records accepted
+            by the Supervisor.
+        accepted_package_inventory_by_lockfile: Current physical package-lock
+            occurrence inventory after accepted scan deltas.
+
+    Returns:
+        Task IDs mapped to target package names when absence is fully verified.
+    """
+
+    def normalized_input_path(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            not normalized
+            or normalized != value
+            or normalized.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            return None
+        return normalized
+
+    inventory_packages_by_path: dict[str, set[str]] = {}
+    for occurrence_key in accepted_package_inventory_by_lockfile:
+        occurrence = _parse_package_occurrence_key(occurrence_key)
+        if occurrence is None:
+            return {}
+        source_path, _lockfile_key, package_name, _version, _index = occurrence
+        inventory_packages_by_path.setdefault(source_path, set()).add(package_name)
+
+    verified: dict[str, str] = {}
+    for task_id, task in sorted(task_queue.items()):
+        if (
+            task.is_synthetic
+            or task.status not in {TaskStatus.PENDING, TaskStatus.NEEDS_RETRY}
+            or task.current_attempt_id is not None
+        ):
+            continue
+        group = group_by_id.get(task.parent_group_id)
+        if group is None or group.issue_type != IssueType.SCA:
+            continue
+        target_package_name = (task.target_package_name or group.vulnerable_component or "").strip()
+        if not target_package_name:
+            continue
+        target_package_key = target_package_name.casefold()
+
+        lockfile_paths = _lockfile_paths_for_group(group)
+        if not lockfile_paths:
+            continue
+        normalized_lockfile_paths: set[str] = set()
+        paths_supported = True
+        for raw_path in lockfile_paths:
+            path = normalized_input_path(raw_path)
+            if path is None or path.rsplit("/", 1)[-1].casefold() != "package-lock.json":
+                paths_supported = False
+                break
+            normalized_lockfile_paths.add(path)
+        if not paths_supported or not normalized_lockfile_paths:
+            continue
+
+        covered_paths: set[str] = set()
+        has_target_tombstone = False
+        malformed_record = False
+        for record_task_id, scan_record in latest_successful_scan_by_task.items():
+            if not scan_record.complete or scan_record.task_id != record_task_id:
+                continue
+            record_paths: set[str] = set()
+            for raw_path in scan_record.covered_input_paths:
+                path = normalized_input_path(raw_path)
+                if path is None:
+                    malformed_record = True
+                    break
+                record_paths.add(path)
+            if malformed_record:
+                break
+
+            for tombstone in scan_record.removed_occurrence_keys:
+                occurrence = _parse_package_occurrence_key(tombstone)
+                if occurrence is None:
+                    if record_paths.intersection(normalized_lockfile_paths):
+                        malformed_record = True
+                        break
+                    continue
+                source_path, _lockfile_key, package_name, _version, _index = occurrence
+                if source_path not in normalized_lockfile_paths:
+                    continue
+                if source_path not in record_paths:
+                    malformed_record = True
+                    break
+                if package_name == target_package_key:
+                    has_target_tombstone = True
+            if malformed_record:
+                break
+            covered_paths.update(record_paths.intersection(normalized_lockfile_paths))
+
+        if (
+            malformed_record
+            or covered_paths != normalized_lockfile_paths
+            or not has_target_tombstone
+            or any(
+                target_package_key in package_names
+                for package_names in inventory_packages_by_path.values()
+            )
+        ):
+            continue
+        verified[task_id] = target_package_name
+
+    return verified
+
+
+def _incremental_scan_records_from_evidence(
+    evidence: ODCScanEvidence,
+    *,
+    task_ids: list[str],
+    attempt_ids: list[str],
+    baseline_scan_identifiers: Iterable[str],
+) -> dict[str, IncrementalScanRecord]:
+    """Build report-wide snapshots for each fully scanned input path.
+
+    Args:
+        evidence: Shared QA scan evidence, including report-wide occurrences.
+        task_ids: Passing tasks whose candidate changes were covered.
+        attempt_ids: Current QA attempts that produced the shared scan.
+        baseline_scan_identifiers: Immutable pre-remediation identifiers.
+
+    Returns:
+        Complete snapshots keyed by source input path. Incomplete or skipped
+        scans return no snapshots so they cannot erase earlier observations.
+    """
+    if not evidence.complete or not evidence.scan_performed or evidence.scan_skip_reason:
+        return {}
+
+    input_paths = sorted(
+        {
+            path.strip().replace("\\", "/")
+            for path in evidence.covered_input_paths
+            if isinstance(path, str) and path.strip()
+        }
+    )
+    if not input_paths:
+        return {}
+
+    found_by_path: dict[str, set[str]] = {path: set() for path in input_paths}
+    issues_by_path: dict[str, dict[str, VulnerabilityIssue]] = {path: {} for path in input_paths}
+    for occurrence in evidence.covered_occurrences:
+        input_path = occurrence.source_input_path.strip().replace("\\", "/")
+        if input_path not in found_by_path:
+            continue
+        found_by_path[input_path].update(
+            identifier.upper().strip()
+            for identifier in occurrence.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        )
+        for issue in occurrence.found_issues:
+            issues_by_path[input_path].setdefault(stable_issue_fingerprint(issue), issue)
+
+    if len(input_paths) == 1:
+        input_path = input_paths[0]
+        found_by_path[input_path].update(
+            identifier.upper().strip()
+            for identifier in evidence.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        )
+        for issue in evidence.found_issues:
+            issues_by_path[input_path].setdefault(stable_issue_fingerprint(issue), issue)
+    else:
+        mapped_identifiers = set().union(*found_by_path.values())
+        unmapped_identifiers = {
+            identifier.upper().strip()
+            for identifier in evidence.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        } - mapped_identifiers
+        if unmapped_identifiers:
+            # Preserve every parsed identifier even if its report occurrence
+            # could not be split across multiple scanned inputs.
+            found_by_path[input_paths[0]].update(unmapped_identifiers)
+
+    baseline = {
+        identifier.upper().strip()
+        for identifier in baseline_scan_identifiers
+        if isinstance(identifier, str) and identifier.strip()
+    }
+    task_ids = sorted(set(task_ids))
+    attempt_ids = sorted(set(attempt_ids))
+    return {
+        input_path: IncrementalScanRecord(
+            source_input_path=input_path,
+            task_ids=task_ids,
+            attempt_ids=attempt_ids,
+            found_identifiers=sorted(found_by_path[input_path]),
+            new_identifiers=sorted(found_by_path[input_path] - baseline),
+            found_issues=[
+                issues_by_path[input_path][fingerprint]
+                for fingerprint in sorted(issues_by_path[input_path])
+            ],
+            complete=True,
+        )
+        for input_path in input_paths
+    }
+
+
+def _scan_ledger_state_snapshot(state: OrchestratorState) -> dict[str, Any]:
+    """Return complete copies for the four authoritative scan ledger maps."""
+    return {
+        "accepted_package_inventory_by_lockfile": dict(
+            state.get("accepted_package_inventory_by_lockfile", {}) or {}
+        ),
+        "current_scan_observations_by_occurrence": dict(
+            state.get("current_scan_observations_by_occurrence", {}) or {}
+        ),
+        "latest_successful_scan_by_task": dict(
+            state.get("latest_successful_scan_by_task", {}) or {}
+        ),
+        "latest_incremental_scan_by_input": dict(
+            state.get("latest_incremental_scan_by_input", {}) or {}
+        ),
+        "setup_scan_evidence": state.get("setup_scan_evidence"),
+        "setup_scan_committed": bool(state.get("setup_scan_committed", False)),
+    }
+
+
+def _prune_setup_scan_evidence(
+    setup_evidence: ODCScanEvidence | None,
+    scan_record: TaskScanRecord | None,
+    baseline_scan_identifiers: Iterable[str],
+    *,
+    superseded_input_paths: Iterable[str] = (),
+) -> ODCScanEvidence | None:
+    """Remove setup findings superseded by a later complete scan."""
+    if setup_evidence is None:
+        return None
+    normalized_superseded_input_paths = {
+        path.strip().replace("\\", "/")
+        for path in superseded_input_paths
+        if isinstance(path, str) and path.strip()
+    }
+    if not setup_evidence.complete and not normalized_superseded_input_paths:
+        return setup_evidence
+    superseded_keys = set(scan_record.removed_occurrence_keys) if scan_record is not None else set()
+    if scan_record is not None:
+        superseded_keys.update(
+            package_scan_occurrence_key(
+                occurrence.source_input_path,
+                occurrence.lockfile_key,
+                occurrence.package_name,
+                occurrence.version,
+                occurrence.occurrence_index,
+            )
+            for occurrence in scan_record.covered_occurrences
+        )
+    if not superseded_keys and not normalized_superseded_input_paths:
+        return setup_evidence
+    remaining_occurrences = [
+        occurrence
+        for occurrence in setup_evidence.covered_occurrences
+        if occurrence.source_input_path.replace("\\", "/") not in normalized_superseded_input_paths
+        and package_scan_occurrence_key(
+            occurrence.source_input_path,
+            occurrence.lockfile_key,
+            occurrence.package_name,
+            occurrence.version,
+            occurrence.occurrence_index,
+        )
+        not in superseded_keys
+    ]
+    found_identifiers = sorted(
+        {
+            identifier.upper().strip()
+            for occurrence in remaining_occurrences
+            for identifier in occurrence.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+    )
+    baseline = {
+        identifier.upper().strip()
+        for identifier in baseline_scan_identifiers
+        if isinstance(identifier, str) and identifier.strip()
+    }
+    issues_by_fingerprint: dict[str, VulnerabilityIssue] = {}
+    for occurrence in remaining_occurrences:
+        for issue in occurrence.found_issues:
+            issues_by_fingerprint.setdefault(stable_issue_fingerprint(issue), issue)
+    remaining_paths = {occurrence.source_input_path for occurrence in remaining_occurrences}
+    covered_input_paths = [
+        path
+        for path in setup_evidence.covered_input_paths
+        if path.replace("\\", "/") not in normalized_superseded_input_paths
+        and path in remaining_paths
+    ]
+    if not remaining_occurrences and not covered_input_paths:
+        return None
+    return setup_evidence.model_copy(
+        update={
+            "covered_input_paths": covered_input_paths,
+            "covered_occurrences": remaining_occurrences,
+            "closure_package_names": sorted(
+                {occurrence.package_name for occurrence in remaining_occurrences}
+            ),
+            "closure_lockfile_keys": sorted(
+                {
+                    occurrence.lockfile_key
+                    for occurrence in remaining_occurrences
+                    if occurrence.lockfile_key is not None
+                }
+            ),
+            "found_identifiers": found_identifiers,
+            "new_identifiers": sorted(set(found_identifiers) - baseline),
+            "found_issues": [
+                issues_by_fingerprint[fingerprint] for fingerprint in sorted(issues_by_fingerprint)
+            ],
+        }
+    )
+
+
+def _calculate_cumulative_scan_metrics(
+    task_queue: Mapping[str, RemediationTask],
+    scan_records: Mapping[str, TaskScanRecord],
+    baseline_scan_identifiers: Iterable[str],
+    setup_scan_evidence: ODCScanEvidence | None = None,
+    incremental_scan_records_by_input: Mapping[str, IncrementalScanRecord] | None = None,
+) -> tuple[list[str], list[str], list[str], list[VulnerabilityIssue]]:
+    """Aggregate current task and workspace-setup scan observations.
+
+    Args:
+        task_queue: Current task state; only ``QA_PASSED`` tasks contribute.
+        scan_records: Latest accepted task-scoped QA snapshots.
+        baseline_scan_identifiers: Immutable pre-remediation ODC identifier set.
+        setup_scan_evidence: Attempt-independent scan evidence from workspace setup.
+        incremental_scan_records_by_input: Latest report-wide snapshot per input path.
+
+    Returns:
+        Sorted newly discovered identifiers, all observed identifiers,
+        remaining task-target identifiers, and deduplicated findings.
+    """
+    baseline = {
+        identifier.upper().strip()
+        for identifier in baseline_scan_identifiers
+        if isinstance(identifier, str) and identifier.strip()
+    }
+    new_identifiers: set[str] = set()
+    found_identifiers: set[str] = set()
+    remaining_target_identifiers: set[str] = set()
+    findings_by_fingerprint: dict[str, VulnerabilityIssue] = {}
+    for task_id, record in sorted(scan_records.items()):
+        task = task_queue.get(task_id)
+        if (
+            task is None
+            or task.status != TaskStatus.QA_PASSED
+            or record.task_id != task_id
+            or not record.complete
+        ):
+            continue
+        record_paths = {
+            path.strip().replace("\\", "/")
+            for path in record.covered_input_paths
+            if isinstance(path, str) and path.strip()
+        }
+        superseded_paths = record_paths & set(incremental_scan_records_by_input or {})
+        if superseded_paths and record.covered_occurrences:
+            current_occurrences = [
+                occurrence
+                for occurrence in record.covered_occurrences
+                if occurrence.source_input_path.replace("\\", "/") not in superseded_paths
+            ]
+            found = {
+                identifier.upper().strip()
+                for occurrence in current_occurrences
+                for identifier in occurrence.found_identifiers
+                if isinstance(identifier, str) and identifier.strip()
+            }
+            new = found - baseline
+            issues = {
+                stable_issue_fingerprint(issue): issue
+                for occurrence in current_occurrences
+                for issue in occurrence.found_issues
+            }
+        elif superseded_paths:
+            found = set()
+            new = set()
+            issues = {}
+        else:
+            found = {
+                identifier.upper().strip()
+                for identifier in record.found_identifiers
+                if isinstance(identifier, str) and identifier.strip()
+            }
+            new = {
+                identifier.upper().strip()
+                for identifier in record.new_identifiers
+                if isinstance(identifier, str) and identifier.strip()
+            }
+            issues = {stable_issue_fingerprint(issue): issue for issue in record.found_issues}
+        found_identifiers.update(found)
+        new_identifiers.update((new | found) - baseline)
+        remaining_target_identifiers.update(
+            identifier.upper().strip()
+            for identifier in record.remaining_target_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        )
+        for fingerprint, issue in issues.items():
+            findings_by_fingerprint.setdefault(fingerprint, issue)
+    for input_path, record in sorted((incremental_scan_records_by_input or {}).items()):
+        if record.source_input_path != input_path or not record.complete:
+            continue
+        found = {
+            identifier.upper().strip()
+            for identifier in record.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+        new = {
+            identifier.upper().strip()
+            for identifier in record.new_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+        found_identifiers.update(found)
+        new_identifiers.update((new | found) - baseline)
+        for issue in record.found_issues:
+            findings_by_fingerprint.setdefault(stable_issue_fingerprint(issue), issue)
+    if setup_scan_evidence is not None:
+        setup_found = {
+            identifier.upper().strip()
+            for identifier in setup_scan_evidence.found_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+        setup_new = {
+            identifier.upper().strip()
+            for identifier in setup_scan_evidence.new_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+        found_identifiers.update(setup_found)
+        new_identifiers.update((setup_new | setup_found) - baseline)
+        remaining_target_identifiers.update(
+            identifier.upper().strip()
+            for identifier in setup_scan_evidence.remaining_target_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        )
+        for issue in setup_scan_evidence.found_issues:
+            findings_by_fingerprint.setdefault(stable_issue_fingerprint(issue), issue)
+
+    return (
+        sorted(new_identifiers),
+        sorted(found_identifiers),
+        sorted(remaining_target_identifiers),
+        [findings_by_fingerprint[fingerprint] for fingerprint in sorted(findings_by_fingerprint)],
+    )
+
+
+def _incremental_scan_coverage_complete(
+    state: OrchestratorState,
+    setup_scan_evidence: ODCScanEvidence | None,
+) -> bool:
+    """Fail closed when baseline or the latest QA scan evidence is incomplete."""
+    if not state.get("baseline_scan_complete", False):
+        return False
+    if not state.get("package_inventory_baseline_complete", False):
+        return False
+    if setup_scan_evidence is not None and not setup_scan_evidence.complete:
+        return False
+
+    snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    latest_by_task: dict[str, tuple[tuple[int, int, int, str], QAAttemptResult]] = {}
+    for attempt_key, qa_result in (state.get("qa_results_by_attempt", {}) or {}).items():
+        task_id = qa_result.task_id
+        attempt_id = qa_result.attempt_id or attempt_key
+        snapshot = snapshots.get(attempt_id)
+        try:
+            attempt_number = int(snapshot.attempt_number) if snapshot is not None else 0
+            state_revision = int(snapshot.state_revision) if snapshot is not None else 0
+        except (TypeError, ValueError):
+            attempt_number = 0
+            state_revision = 0
+        order = (qa_result.task_revision, attempt_number, state_revision, attempt_id)
+        previous = latest_by_task.get(task_id)
+        if previous is None or order >= previous[0]:
+            latest_by_task[task_id] = (order, qa_result)
+
+    return all(
+        qa_result.evaluation.scan_evidence is None or qa_result.evaluation.scan_evidence.complete
+        for _order, qa_result in latest_by_task.values()
+    )
 
 
 __all__ = [
@@ -1033,6 +1611,7 @@ def _commit_task_transition(
     close_attempt: bool = False,
     clear_selected_version: bool = False,
     allow_breaking_change_pivot: bool = False,
+    allow_verified_absent_target_pass: bool = False,
     consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     with _supervisor_execution_helpers._bind_dependencies(
@@ -1048,6 +1627,7 @@ def _commit_task_transition(
             close_attempt=close_attempt,
             clear_selected_version=clear_selected_version,
             allow_breaking_change_pivot=allow_breaking_change_pivot,
+            allow_verified_absent_target_pass=allow_verified_absent_target_pass,
             consistency_events=consistency_events,
         )
 
@@ -1351,8 +1931,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
     4. Mark UNFIXABLE any task whose retry_count has reached MAX_RETRIES.
     5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic.
-    6. If QA produced a parseable scan and set ``triage_required``, route to
-       the post-QA triage node before any worker or teardown decision.
+    6. Project accepted incremental scan results before terminal routing.
     7. Plan retry inputs from deterministic registry facts and committed state.
     8. Route through the deterministic state machine and validate its
        dispatch projection.
@@ -1361,23 +1940,70 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     10. Return state patch.
     """
     if state.get("post_qa_retriage_limit_reached"):
+        scan_due = _final_full_scan_due(state, dict(state.get("task_queue", {}) or {}))
+        next_node = "final_full_scan" if scan_due else "teardown"
         decision = SupervisorDecision(
-            decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
-            next_node="teardown",
+            decision_code=(
+                DecisionCode.FINAL_FULL_SCAN_REQUIRED
+                if scan_due
+                else DecisionCode.NO_ACTIONABLE_TASKS
+            ),
+            next_node=next_node,
             target_task_ids=[],
-            instructions="Development post-QA re-triage limit reached; proceed to teardown.",
-            decision_reason="The configured development post-QA re-triage limit was reached.",
+            instructions=(
+                "Run the enabled final full-workspace scan before teardown."
+                if scan_due
+                else "Development post-QA re-triage limit reached; proceed to teardown."
+            ),
+            decision_reason=(
+                "The re-triage limit was reached; the configured final scan remains due."
+                if scan_due
+                else "The configured development post-QA re-triage limit was reached."
+            ),
         )
         return {
             "status": "supervisor_routed",
-            "next_routing_step": "teardown",
+            "next_routing_step": next_node,
             "active_target_task_ids": [],
             "decision_code": decision.decision_code,
             "supervisor_audit": _emit_audit(decision, [], int(state.get("state_revision", 0)) + 1),
             "supervisor_instructions": decision.instructions,
+            "post_remediation_scan_identifiers": list(
+                state.get("post_remediation_scan_identifiers", []) or []
+            ),
+            "post_remediation_scan_issues": list(
+                state.get("post_remediation_scan_issues", []) or []
+            ),
+            "new_vulnerability_identifiers": list(
+                state.get("new_vulnerability_identifiers", []) or []
+            ),
+            "new_vulnerability_status": state.get("new_vulnerability_status", "not_scanned"),
+            "triage_required": False,
+            **_scan_ledger_state_snapshot(state),
         }
     valid_groups: list[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
+        if _final_full_scan_due(state, dict(state.get("task_queue", {}) or {})):
+            decision = SupervisorDecision(
+                decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
+                next_node="final_full_scan",
+                target_task_ids=[],
+                instructions="Run the configured final full-workspace scan before teardown.",
+                decision_reason=(
+                    "All remediation tasks are terminal and the development final full scan is enabled."
+                ),
+            )
+            return {
+                "status": "supervisor_routed",
+                "next_routing_step": "final_full_scan",
+                "active_target_task_ids": [],
+                "decision_code": decision.decision_code,
+                "supervisor_audit": _emit_audit(
+                    decision, [], int(state.get("state_revision", 0)) + 1
+                ),
+                "supervisor_instructions": decision.instructions,
+                **_scan_ledger_state_snapshot(state),
+            }
         if state.get("triage_required") and state.get("status") in {
             "qa_completed",
             "qa_failed",
@@ -1399,6 +2025,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     decision, [], int(state.get("state_revision", 0)) + 1
                 ),
                 "supervisor_instructions": "Route the parseable post-remediation scan to triage.",
+                **_scan_ledger_state_snapshot(state),
             }
         logger.info("supervisor: no valid groups â€” routing to teardown.")
         decision = SupervisorDecision(
@@ -1415,6 +2042,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             "decision_code": decision.decision_code,
             "supervisor_audit": _emit_audit(decision, [], int(state.get("state_revision", 0)) + 1),
             "supervisor_instructions": "No groups to process.",
+            **_scan_ledger_state_snapshot(state),
         }
 
     group_by_id: dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
@@ -1434,6 +2062,39 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     )
     qa_results_by_attempt: dict[str, QAAttemptResult] = dict(state.get("qa_results_by_attempt", {}))
     qa_rerun_counts_by_attempt: dict[str, int] = dict(state.get("qa_rerun_counts_by_attempt", {}))
+    accepted_package_inventory_by_lockfile: dict[str, str] = dict(
+        state.get("accepted_package_inventory_by_lockfile", {}) or {}
+    )
+    current_scan_observations_by_occurrence: dict[str, PackageScanOccurrence] = dict(
+        state.get("current_scan_observations_by_occurrence", {}) or {}
+    )
+    latest_successful_scan_by_task: dict[str, TaskScanRecord] = dict(
+        state.get("latest_successful_scan_by_task", {}) or {}
+    )
+    latest_incremental_scan_by_input: dict[str, IncrementalScanRecord] = dict(
+        state.get("latest_incremental_scan_by_input", {}) or {}
+    )
+    setup_scan_evidence: ODCScanEvidence | None = state.get("setup_scan_evidence")
+    setup_scan_committed = bool(state.get("setup_scan_committed", False))
+    if setup_scan_evidence is not None and not setup_scan_committed:
+        if setup_scan_evidence.complete:
+            for occurrence_key in setup_scan_evidence.inventory_removals:
+                accepted_package_inventory_by_lockfile.pop(occurrence_key, None)
+                current_scan_observations_by_occurrence.pop(occurrence_key, None)
+            accepted_package_inventory_by_lockfile.update(setup_scan_evidence.inventory_updates)
+            for occurrence in setup_scan_evidence.covered_occurrences:
+                occurrence_key = package_scan_occurrence_key(
+                    occurrence.source_input_path,
+                    occurrence.lockfile_key,
+                    occurrence.package_name,
+                    occurrence.version,
+                    occurrence.occurrence_index,
+                )
+                current_scan_observations_by_occurrence[occurrence_key] = occurrence
+        setup_scan_committed = True
+    candidate_scan_records_by_task: dict[str, TaskScanRecord] = {}
+    candidate_scan_evidence_by_attempt: dict[str, QAAttemptResult] = {}
+    current_qa_results_by_task: dict[str, QAAttemptResult] = {}
     processed_worker_attempt_ids: set[str] = set(state.get("processed_worker_attempt_ids", []))
     processed_qa_attempt_ids: set[str] = set(state.get("processed_qa_attempt_ids", []))
     prior_consistency_events: list[StateConsistencyEvent] = list(
@@ -1539,6 +2200,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             "valid_groups": valid_groups,
             "portfolio_replan_request": request,
             "portfolio_dirty": True,
+            "accepted_package_inventory_by_lockfile": accepted_package_inventory_by_lockfile,
+            "current_scan_observations_by_occurrence": current_scan_observations_by_occurrence,
+            "latest_successful_scan_by_task": latest_successful_scan_by_task,
+            "setup_scan_evidence": setup_scan_evidence,
+            "setup_scan_committed": setup_scan_committed,
             "state_revision": state_revision,
         }
 
@@ -2012,7 +2678,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task = task_queue.get(task_id)
         if task is None or not task.current_attempt_id:
             continue
-        qa_result = qa_results_by_attempt.get(task.current_attempt_id)
+        qa_result_map_key = task.current_attempt_id
+        qa_result = qa_results_by_attempt.get(qa_result_map_key)
         for stale_result in qa_results_by_attempt.values():
             if (
                 stale_result.task_id == task_id
@@ -2066,8 +2733,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         )
         if (
             qa_result.task_id != task_id
+            or qa_result_map_key != qa_result.attempt_id
+            or qa_result.attempt_id != task.current_attempt_id
             or qa_result.task_revision != task.task_revision
             or snapshot is None
+            or snapshot.attempt_id != task.current_attempt_id
+            or snapshot.task_id != task_id
             or (snapshot is not None and snapshot.task_revision != qa_result.task_revision)
             or (
                 snapshot is not None
@@ -2099,6 +2770,12 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 f"attempt {qa_result.attempt_id}."
             )
         else:
+            scan_record = _task_scan_record_from_qa_result(qa_result)
+            if scan_record is not None:
+                candidate_scan_records_by_task[task_id] = scan_record
+            current_qa_results_by_task[task_id] = qa_result
+            if qa_result.batch_scan_evidence is not None:
+                candidate_scan_evidence_by_attempt[qa_result.attempt_id] = qa_result
             qa_evaluations[task_id] = qa_result.evaluation
             qa_result_task_ids.add(task_id)
             qa_requires_rerun = (
@@ -2437,6 +3114,107 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     clear_selected_version=True,
                 )
 
+    # Commit only records that remain accepted after the cluster-wide QA gate.
+    # In an atomic batch, no member reaches QA_PASSED unless every evaluation
+    # passes; failed or inconclusive attempts therefore cannot alter ledgers.
+    for task_id, scan_record in sorted(candidate_scan_records_by_task.items()):
+        task = task_queue.get(task_id)
+        if task is None or task.status != TaskStatus.QA_PASSED:
+            continue
+        latest_successful_scan_by_task[task_id] = scan_record
+        for occurrence_key in scan_record.removed_occurrence_keys:
+            accepted_package_inventory_by_lockfile.pop(occurrence_key, None)
+            current_scan_observations_by_occurrence.pop(occurrence_key, None)
+        accepted_package_inventory_by_lockfile.update(scan_record.inventory_updates)
+        for occurrence in scan_record.covered_occurrences:
+            occurrence_key = package_scan_occurrence_key(
+                occurrence.source_input_path,
+                occurrence.lockfile_key,
+                occurrence.package_name,
+                occurrence.version,
+                occurrence.occurrence_index,
+            )
+            current_scan_observations_by_occurrence[occurrence_key] = occurrence
+        setup_scan_evidence = _prune_setup_scan_evidence(
+            setup_scan_evidence,
+            scan_record,
+            state.get("baseline_scan_identifiers", []) or [],
+        )
+    baseline_scan_identifiers = state.get("baseline_scan_identifiers", []) or []
+    for qa_result in candidate_scan_evidence_by_attempt.values():
+        evidence = qa_result.batch_scan_evidence
+        if evidence is None or not qa_result.batch_scan_candidate_retained:
+            continue
+        covered_task_ids = sorted(set(evidence.covered_task_ids))
+        if not covered_task_ids or not set(covered_task_ids).issubset(current_qa_results_by_task):
+            continue
+        covered_results = [current_qa_results_by_task[task_id] for task_id in covered_task_ids]
+        input_snapshots = _incremental_scan_records_from_evidence(
+            evidence,
+            task_ids=covered_task_ids,
+            attempt_ids=[result.attempt_id for result in covered_results],
+            baseline_scan_identifiers=baseline_scan_identifiers,
+        )
+        latest_incremental_scan_by_input.update(input_snapshots)
+        if input_snapshots:
+            setup_scan_evidence = _prune_setup_scan_evidence(
+                setup_scan_evidence,
+                None,
+                baseline_scan_identifiers,
+                superseded_input_paths=input_snapshots,
+            )
+
+    (
+        new_vulnerability_identifiers,
+        post_remediation_scan_identifiers,
+        remaining_target_identifiers,
+        post_remediation_scan_issues,
+    ) = _calculate_cumulative_scan_metrics(
+        task_queue,
+        latest_successful_scan_by_task,
+        state.get("baseline_scan_identifiers", []) or [],
+        setup_scan_evidence,
+        latest_incremental_scan_by_input,
+    )
+    incremental_scan_coverage_complete = _incremental_scan_coverage_complete(
+        state,
+        setup_scan_evidence,
+    )
+    new_vulnerability_status = (
+        "detected"
+        if new_vulnerability_identifiers or remaining_target_identifiers
+        else "none"
+        if incremental_scan_coverage_complete
+        else "scan_failed"
+    )
+    triage_required = (
+        bool(state.get("post_qa_triage_enabled", True))
+        and not bool(state.get("post_qa_retriage_limit_reached", False))
+        and bool(new_vulnerability_identifiers or remaining_target_identifiers)
+    )
+    prior_final_scan = state.get("final_full_scan_result")
+    if _final_full_scan_value(prior_final_scan, "coverage_scope") == "full_workspace":
+        new_vulnerability_identifiers = list(
+            _final_full_scan_value(prior_final_scan, "new_identifiers", []) or []
+        )
+        post_remediation_scan_identifiers = list(
+            _final_full_scan_value(prior_final_scan, "found_identifiers", []) or []
+        )
+        remaining_target_identifiers = list(
+            _final_full_scan_value(prior_final_scan, "remaining_target_identifiers", []) or []
+        )
+        post_remediation_scan_issues = list(
+            _final_full_scan_value(prior_final_scan, "found_issues", []) or []
+        )
+        new_vulnerability_status = str(
+            _final_full_scan_value(prior_final_scan, "status", "scan_failed")
+        )
+        triage_required = (
+            bool(state.get("post_qa_triage_enabled", True))
+            and not bool(state.get("post_qa_retriage_limit_reached", False))
+            and bool(_final_full_scan_value(prior_final_scan, "triage_required", False))
+        )
+
     # ------------------------------------------------------------------
     # Normalize any escalation emitted while reconciling the final QA result.
     if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
@@ -2457,6 +3235,39 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 portfolio_replan_request = None
+    verified_absent_package_tasks = _verified_absent_package_tasks(
+        task_queue,
+        group_by_id,
+        latest_successful_scan_by_task,
+        accepted_package_inventory_by_lockfile,
+    )
+    verified_absent_portfolio_task_ids: set[str] = set()
+    for task_id, package_name in verified_absent_package_tasks.items():
+        committed_task = _commit_task_transition(
+            task_queue,
+            task_id,
+            updates={
+                "status": TaskStatus.QA_PASSED,
+                "remediation_action": _VERIFIED_ABSENT_REMEDIATION_ACTION,
+            },
+            close_attempt=True,
+            clear_selected_version=True,
+            allow_verified_absent_target_pass=True,
+        )
+        if committed_task is None or committed_task.status != TaskStatus.QA_PASSED:
+            continue
+        logger.info(
+            "supervisor: closed task %s without a worker because %s is absent.",
+            task_id,
+            package_name,
+        )
+        if committed_plan is not None and task_id in set(committed_plan.task_ids):
+            verified_absent_portfolio_task_ids.add(task_id)
+    if verified_absent_portfolio_task_ids and committed_plan is not None:
+        portfolio_replan_request = PortfolioReplanRequest(
+            reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+            source_portfolio_plan_id=(committed_plan.portfolio_plan_id or committed_plan.plan_id),
+        )
     # 4. Mark UNFIXABLE tasks that hit the retry cap
     # ------------------------------------------------------------------
     for task_id, task in task_queue.items():
@@ -2551,16 +3362,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # deliberately applied after the optimistic QA guard so Supervisor stays
     # the sole routing authority while preserving the required order:
     # worker -> supervisor -> QA -> supervisor -> triage -> supervisor.
-    if state.get("triage_required") and state.get("status") in {
-        "qa_completed",
-        "qa_failed",
-        "final_scan_completed",
-    }:
+    all_tasks_terminal = all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
+    if triage_required and all_tasks_terminal:
         decision = SupervisorDecision(
             next_node="triage",
             target_task_ids=[],
-            instructions="Route the completed QA scan to post-remediation triage before dispatching more work.",
-            decision_reason="Supervisor guardrail: triage_required is set after a parseable QA scan.",
+            instructions="Route cumulative accepted scan findings to post-remediation triage.",
+            decision_reason=(
+                "No actionable remediation tasks remain and accepted scans contain "
+                "baseline-absent or remaining target findings."
+            ),
         )
 
     # Short-circuit: all remaining non-terminal tasks are optimistically_fixed
@@ -2674,25 +3485,162 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
         for task in task_queue.values()
     )
-    portfolio_replan_required = bool(
-        state.get("portfolio_plan") is not None
-        and not active_attempt_is_open
-        and not unfixable_replan_cleared
-        and _portfolio_plan_is_stale(
-            state.get("portfolio_plan"),
-            task_queue,
-            valid_groups,
-            state.get("repo_root"),
+    verified_absent_portfolio_replan_pending = bool(
+        committed_plan is not None
+        and isinstance(portfolio_replan_request, PortfolioReplanRequest)
+        and portfolio_replan_request.reason == _VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON
+        and portfolio_replan_request.source_portfolio_plan_id
+        == (
+            getattr(committed_plan, "portfolio_plan_id", None)
+            or getattr(committed_plan, "plan_id", None)
         )
     )
+    portfolio_replan_required = bool(
+        not active_attempt_is_open
+        and (
+            verified_absent_portfolio_replan_pending
+            or (
+                state.get("portfolio_plan") is not None
+                and not unfixable_replan_cleared
+                and _portfolio_plan_is_stale(
+                    state.get("portfolio_plan"),
+                    task_queue,
+                    valid_groups,
+                    state.get("repo_root"),
+                )
+            )
+        )
+    )
+    defer_verified_absent_portfolio_replan = (
+        verified_absent_portfolio_replan_pending and active_attempt_is_open
+    )
+    resumable_open_attempt_task_ids: set[str] = set()
+
+    def existing_attempt_targets(next_node: str, target_ids: Iterable[str]) -> list[str]:
+        """Keep only targets that can resume their current committed worker attempt."""
+        selected: list[str] = []
+        for task_id in target_ids:
+            if task_id not in resumable_open_attempt_task_ids:
+                continue
+            task = task_queue.get(task_id)
+            if (
+                task is None
+                or task.current_attempt_id is None
+                or task.status not in _WORKABLE_STATUSES
+            ):
+                continue
+            snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+            if (
+                snapshot is None
+                or snapshot.task_id != task_id
+                or snapshot.dispatch_node != next_node
+            ):
+                continue
+            if next_node == "update_subagent" and task.strategy != RoutingStrategy.VERSION_BUMP:
+                continue
+            if (
+                next_node == "workaround_subagent"
+                and task.strategy != RoutingStrategy.CODE_WORKAROUND
+            ):
+                continue
+            selected.append(task_id)
+        return selected
+
     if portfolio_replan_required:
         deterministic_decision = SupervisorDecision(
             decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
             next_node="portfolio",
             target_task_ids=[],
             instructions="Rebuild the package-group portfolio plan after task reconciliation.",
-            decision_reason="The committed portfolio plan is stale after a completed attempt.",
+            decision_reason=(
+                _VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON
+                if verified_absent_portfolio_replan_pending
+                else "The committed portfolio plan is stale after a completed attempt."
+            ),
         )
+    elif defer_verified_absent_portfolio_replan:
+        open_attempt_task_ids = [
+            task_id
+            for task_id, task in sorted(task_queue.items())
+            if task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
+        ]
+        atomic_open_task_ids = [
+            task_id for task_id in atomic_cluster_task_ids if task_id in open_attempt_task_ids
+        ]
+        atomic_batch_qa_ready = bool(atomic_open_task_ids) and all(
+            task_queue[task_id].status == TaskStatus.OPTIMISTICALLY_FIXED
+            for task_id in atomic_open_task_ids
+        )
+        qa_preferred_ids = (
+            atomic_open_task_ids
+            if atomic_batch_qa_ready
+            else [
+                task_id for task_id in open_attempt_task_ids if task_id not in atomic_open_task_ids
+            ]
+        )
+        qa_ready_ids = _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=qa_preferred_ids,
+            limit=None if atomic_batch_qa_ready else QA_DISPATCH_LIMIT,
+        )
+        if qa_ready_ids:
+            qa_cluster_id = None
+            if atomic_batch_qa_ready and len(qa_ready_ids) > 1:
+                qa_cluster_id = attempt_snapshots_by_id[
+                    task_queue[qa_ready_ids[0]].current_attempt_id
+                ].cluster_id
+            deterministic_decision = SupervisorDecision(
+                next_node="qa_critic",
+                target_task_ids=qa_ready_ids,
+                cluster_id=qa_cluster_id,
+                instructions="Finish QA for committed attempts before rebuilding the portfolio.",
+                decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+            )
+        else:
+            resumable_attempts: list[tuple[str, TaskAttemptSnapshot]] = []
+            for task_id in open_attempt_task_ids:
+                task = task_queue[task_id]
+                if task.status == TaskStatus.OPTIMISTICALLY_FIXED:
+                    continue
+                snapshot = attempt_snapshots_by_id.get(task.current_attempt_id or "")
+                if (
+                    snapshot is not None
+                    and snapshot.task_id == task_id
+                    and snapshot.dispatch_node in {"update_subagent", "workaround_subagent"}
+                ):
+                    resumable_attempts.append((task_id, snapshot))
+            if resumable_attempts:
+                first_task_id, first_snapshot = resumable_attempts[0]
+                if first_snapshot.dispatch_batch_id:
+                    resume_ids = [
+                        task_id
+                        for task_id, snapshot in resumable_attempts
+                        if snapshot.dispatch_node == first_snapshot.dispatch_node
+                        and snapshot.dispatch_batch_id == first_snapshot.dispatch_batch_id
+                    ]
+                else:
+                    resume_ids = [first_task_id]
+                resumable_open_attempt_task_ids.update(resume_ids)
+                resume_cluster_id = first_snapshot.cluster_id if len(resume_ids) > 1 else None
+                deterministic_decision = SupervisorDecision(
+                    next_node=first_snapshot.dispatch_node,
+                    target_task_ids=resume_ids,
+                    cluster_id=resume_cluster_id,
+                    instructions="Continue existing committed attempts before rebuilding the portfolio.",
+                    decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+                )
+            else:
+                errors.append(
+                    "supervisor: verified absence dirtied the portfolio while a live attempt "
+                    "had no resumable committed snapshot."
+                )
+                deterministic_decision = SupervisorDecision(
+                    decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+                    next_node="portfolio",
+                    target_task_ids=[],
+                    instructions="Rebuild the portfolio after reconciling the invalid live attempt.",
+                    decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+                )
     else:
         deterministic_decision = _deterministic_routing(
             task_queue,
@@ -2702,7 +3650,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             action_summaries=action_summaries,
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
-            triage_required=bool(state.get("triage_required")),
+            triage_required=triage_required,
             portfolio_plan=state.get("portfolio_plan"),
         )
     # The deterministic decision is authoritative. QA feedback below is
@@ -2796,11 +3744,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 limit=None if decision.cluster_id else QA_DISPATCH_LIMIT,
             )
         elif decision.next_node == "update_subagent":
-            valid_target_ids = _update_worker_task_ids(
-                task_queue,
-                retry_diagnostics_by_task,
-                preferred_ids=list(decision.target_task_ids),
-                limit=None if decision.cluster_id else UPDATE_DISPATCH_LIMIT,
+            valid_target_ids = (
+                existing_attempt_targets("update_subagent", decision.target_task_ids)
+                if defer_verified_absent_portfolio_replan
+                else _update_worker_task_ids(
+                    task_queue,
+                    retry_diagnostics_by_task,
+                    preferred_ids=list(decision.target_task_ids),
+                    limit=None if decision.cluster_id else UPDATE_DISPATCH_LIMIT,
+                    group_by_id=group_by_id,
+                )
             )
         elif decision.next_node == "workaround_subagent":
             valid_target_ids = []
@@ -2808,6 +3761,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 if t_id not in known_task_ids:
                     continue
                 task = task_queue[t_id]
+                if defer_verified_absent_portfolio_replan:
+                    valid_target_ids.extend(existing_attempt_targets("workaround_subagent", [t_id]))
+                    continue
                 if (
                     task.status in _TERMINAL_STATUSES
                     or task.status not in _WORKABLE_STATUSES
@@ -3010,7 +3966,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     action_summaries=action_summaries,
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
-                    triage_required=bool(state.get("triage_required")),
+                    triage_required=triage_required,
                     portfolio_plan=state.get("portfolio_plan"),
                 )
                 valid_target_ids = list(decision.target_task_ids)
@@ -3304,8 +4260,8 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 else:
                     # A replayed pivot may find a child that is already
                     # optimistic/terminal.  It is valid evidence that the
-                    # pivot exists, but it is not a worker target.  Let the
-                    # deterministic reroute below choose QA, final scanning,
+                    # pivot exists, but it is not a worker target. Let the
+                    # deterministic reroute below choose QA, triage,
                     # teardown, or another actionable task.
                     logger.info(
                         "supervisor: pivot child '%s' is not dispatchable "
@@ -3323,66 +4279,56 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if task_id in decision.feedback_by_task:
             remapped_feedback_by_task[task_id] = decision.feedback_by_task[task_id]
 
-    resolved_next_node = decision.next_node
-    all_tasks_terminal = bool(task_queue) and all(
-        task.status in _TERMINAL_STATUSES for task in task_queue.values()
-    )
-    if (
-        all_tasks_terminal
-        and state.get("workspace_volume")
-        and not state.get("final_full_scan_completed", False)
-    ):
-        decision = decision.model_copy(
-            update={
-                "decision_code": DecisionCode.FINAL_FULL_SCAN_REQUIRED,
-                "next_node": "final_full_scan",
-                "target_task_ids": [],
-                "instructions": "Run the authoritative full Dependency-Check scan before teardown.",
-                "decision_reason": (
-                    "Supervisor routing barrier required the final full scan before teardown."
-                ),
-            }
+    if _final_full_scan_due(state, task_queue):
+        decision = SupervisorDecision(
+            decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
+            next_node="final_full_scan",
+            target_task_ids=[],
+            instructions="Run the configured final full-workspace scan before reconciliation.",
+            decision_reason=(
+                "All remediation tasks are terminal and the development final full scan is enabled."
+            ),
         )
-        resolved_next_node = "final_full_scan"
         resolved_target_task_ids = []
-    elif resolved_next_node == "final_full_scan":
-        errors.append(
-            "supervisor: rejected final_full_scan because the terminal workspace gate is not satisfied."
+        remapped_feedback_by_task = {}
+    resolved_next_node = decision.next_node
+    if defer_verified_absent_portfolio_replan and resolved_next_node in {
+        "update_subagent",
+        "workaround_subagent",
+    }:
+        resolved_target_task_ids = existing_attempt_targets(
+            resolved_next_node,
+            resolved_target_task_ids,
         )
-        decision = _deterministic_routing(
+    else:
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            resolved_target_task_ids,
             task_queue,
-            group_by_id,
-            qa_evaluations,
             retry_diagnostics_by_task,
-            action_summaries=action_summaries,
-            active_target_task_ids=active_target_task_ids,
-            current_status=str(state.get("status") or ""),
-            triage_required=bool(state.get("triage_required")),
-            workspace_volume=state.get("workspace_volume"),
-            final_full_scan_completed=bool(state.get("final_full_scan_completed")),
-            portfolio_plan=state.get("portfolio_plan"),
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
         )
-        resolved_next_node = decision.next_node
-        resolved_target_task_ids = list(decision.target_task_ids)
-    resolved_target_task_ids = _normalize_target_task_ids_for_node(
-        resolved_next_node,
-        resolved_target_task_ids,
-        task_queue,
-        retry_diagnostics_by_task,
-        group_by_id,
-        allow_cluster=bool(decision.cluster_id),
-    )
     # Status overrides and parent terminalization above are also untrusted
     # router requests. Re-clamp after those mutations so a task that became
     # terminal in this transition cannot remain in the dispatch projection.
-    resolved_target_task_ids = _normalize_target_task_ids_for_node(
-        resolved_next_node,
-        resolved_target_task_ids,
-        task_queue,
-        retry_diagnostics_by_task,
-        group_by_id,
-        allow_cluster=bool(decision.cluster_id),
-    )
+    if defer_verified_absent_portfolio_replan and resolved_next_node in {
+        "update_subagent",
+        "workaround_subagent",
+    }:
+        resolved_target_task_ids = existing_attempt_targets(
+            resolved_next_node,
+            resolved_target_task_ids,
+        )
+    else:
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            resolved_target_task_ids,
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
+        )
     remapped_feedback_by_task = {
         task_id: feedback
         for task_id, feedback in remapped_feedback_by_task.items()
@@ -3417,9 +4363,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             action_summaries=action_summaries,
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
-            triage_required=bool(state.get("triage_required")),
-            workspace_volume=state.get("workspace_volume"),
-            final_full_scan_completed=bool(state.get("final_full_scan_completed")),
+            triage_required=triage_required,
             portfolio_plan=state.get("portfolio_plan"),
         )
         resolved_next_node = decision.next_node
@@ -3455,35 +4399,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             f"target remained. Marked unresolved tasks unfixable: {stalled_task_ids}."
         )
 
-        terminal_workspace = (
-            bool(task_queue)
-            and bool(state.get("workspace_volume"))
-            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
-            and not state.get("final_full_scan_completed", False)
+        resolved_next_node = "teardown"
+        decision = SupervisorDecision(
+            decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
+            next_node=resolved_next_node,
+            target_task_ids=[],
+            instructions="No dispatchable tasks remain; proceed to teardown.",
+            decision_reason=(
+                "The Supervisor fail-closed after a worker route had no dispatchable target."
+            ),
         )
-        if terminal_workspace:
-            resolved_next_node = "final_full_scan"
-            decision = SupervisorDecision(
-                decision_code=DecisionCode.FINAL_FULL_SCAN_REQUIRED,
-                next_node=resolved_next_node,
-                target_task_ids=[],
-                instructions="Run the authoritative full Dependency-Check scan before teardown.",
-                decision_reason=(
-                    "All tasks were terminalized after the Supervisor found no "
-                    "dispatchable worker target."
-                ),
-            )
-        else:
-            resolved_next_node = "teardown"
-            decision = SupervisorDecision(
-                decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
-                next_node=resolved_next_node,
-                target_task_ids=[],
-                instructions="No dispatchable tasks remain; proceed to teardown.",
-                decision_reason=(
-                    "The Supervisor fail-closed after a worker route had no dispatchable target."
-                ),
-            )
         resolved_target_task_ids = []
         remapped_feedback_by_task = {}
 
@@ -3618,7 +4543,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     active_dispatch_batch_id: str | None = None
     active_multi_package_action: MultiPackageAction | None = None
     portfolio_dispatch_rejected = False
-    if resolved_next_node == "update_subagent" and decision.cluster_id:
+    if (
+        defer_verified_absent_portfolio_replan
+        and resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}
+        and resolved_target_task_ids
+    ):
+        resumed_snapshots = [
+            attempt_snapshots_by_id.get(task_queue[task_id].current_attempt_id or "")
+            for task_id in resolved_target_task_ids
+        ]
+        resumed_snapshots = [snapshot for snapshot in resumed_snapshots if snapshot is not None]
+        if resumed_snapshots:
+            active_cluster_id = resumed_snapshots[0].cluster_id
+            active_dispatch_batch_id = resumed_snapshots[0].dispatch_batch_id
+            active_multi_package_action = state.get("active_multi_package_action")
+    elif resolved_next_node == "update_subagent" and decision.cluster_id:
         action = _build_multi_package_action(
             decision.cluster_id,
             resolved_target_task_ids,
@@ -3663,7 +4602,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         active_cluster_id = decision.cluster_id
         active_dispatch_batch_id = state.get("active_dispatch_batch_id")
         active_multi_package_action = state.get("active_multi_package_action")
-
     if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}:
         for task_id in list(resolved_target_task_ids):
             task = task_queue.get(task_id)
@@ -3676,6 +4614,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     errors.append(
                         f"supervisor: rejected QA target '{task_id}' because no "
                         "committed worker attempt exists."
+                    )
+                continue
+            if defer_verified_absent_portfolio_replan and task.current_attempt_id is not None:
+                snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+                if snapshot is None or snapshot.dispatch_node != resolved_next_node:
+                    errors.append(
+                        f"supervisor: preserved live attempt for {task_id} because its "
+                        "committed snapshot does not match the resumed route."
                     )
                 continue
             plan = retry_plans_by_task.get(task_id)
@@ -3830,6 +4776,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         or portfolio_dispatch_rejected
         or unfixable_replan_required
         or pending_unfixable_replan
+        or verified_absent_portfolio_replan_pending
     )
     if state.get("portfolio_plan") is not None and not suppress_unfixable_replan_without_sca:
         portfolio_dirty = portfolio_dirty or _portfolio_plan_is_stale(
@@ -3868,10 +4815,46 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # 9. Return state patch
     # ------------------------------------------------------------------
+    final_full_scan_result = (
+        prior_final_scan
+        if _final_full_scan_value(prior_final_scan, "coverage_scope") == "full_workspace"
+        else None
+    )
+    if final_full_scan_result is None and all(
+        task.status in _TERMINAL_STATUSES for task in task_queue.values()
+    ):
+        final_full_scan_result = FinalFullScanResult(
+            completed=incremental_scan_coverage_complete,
+            authoritative=False,
+            coverage_scope="incremental_dependency_inputs",
+            coverage_complete=incremental_scan_coverage_complete,
+            found_identifiers=post_remediation_scan_identifiers,
+            remaining_target_identifiers=remaining_target_identifiers,
+            new_identifiers=new_vulnerability_identifiers,
+            found_issues=post_remediation_scan_issues,
+            status=new_vulnerability_status,
+            triage_required=triage_required,
+            error=(
+                None
+                if incremental_scan_coverage_complete
+                else "Incremental dependency scan coverage is incomplete."
+            ),
+        )
+    # Keep the compact per-input snapshots in state; the shared QA report can
+    # contain every package occurrence from a large lockfile and is consumed.
+    qa_results_by_attempt = {
+        attempt_id: (
+            result.model_copy(update={"batch_scan_evidence": None})
+            if result.batch_scan_evidence is not None
+            else result
+        )
+        for attempt_id, result in qa_results_by_attempt.items()
+    }
     return {
         "status": "supervisor_routed",
         "next_routing_step": resolved_next_node,
         "decision_code": decision.decision_code,
+        "final_full_scan_result": final_full_scan_result,
         "supervisor_audit": _emit_audit(decision, consistency_events, state_revision),
         "active_target_task_ids": resolved_target_task_ids,
         "active_cluster_id": active_cluster_id,
@@ -3895,8 +4878,20 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         "worker_results_by_attempt": worker_results_by_attempt,
         "qa_results_by_attempt": qa_results_by_attempt,
         "qa_rerun_counts_by_attempt": qa_rerun_counts_by_attempt,
+        "post_remediation_scan_identifiers": post_remediation_scan_identifiers,
+        "post_remediation_scan_issues": post_remediation_scan_issues,
+        "new_vulnerability_identifiers": new_vulnerability_identifiers,
+        "new_vulnerability_status": new_vulnerability_status,
+        "triage_required": triage_required,
+        "post_qa_triage_enabled": bool(state.get("post_qa_triage_enabled", True)),
         "processed_worker_attempt_ids": list(new_worker_attempt_ids),
         "processed_qa_attempt_ids": list(new_qa_attempt_ids),
+        "accepted_package_inventory_by_lockfile": accepted_package_inventory_by_lockfile,
+        "current_scan_observations_by_occurrence": current_scan_observations_by_occurrence,
+        "latest_successful_scan_by_task": latest_successful_scan_by_task,
+        "latest_incremental_scan_by_input": latest_incremental_scan_by_input,
+        "setup_scan_evidence": setup_scan_evidence,
+        "setup_scan_committed": setup_scan_committed,
         "consistency_events": consistency_events,
         "state_revision": state_revision,
         # constraints_ledger uses operator.add â€” return only NEW entries
@@ -3913,42 +4908,19 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
 def supervisor_router(state: OrchestratorState) -> str:
     """Return the committed route, recomputing it when state is invalid."""
     if state.get("post_qa_retriage_limit_reached"):
+        if state.get("next_routing_step") == "final_full_scan":
+            return "final_full_scan"
         logger.warning("supervisor_router: post-QA re-triage limit reached; routing to teardown.")
         return "teardown"
     step = state.get("next_routing_step", "")
     task_queue = dict(state.get("task_queue", {}) or {})
-    if (
-        step == "teardown"
-        and state.get("workspace_volume")
-        and task_queue
-        and not state.get("final_full_scan_completed", False)
-        and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
-    ):
-        logger.warning("supervisor_router: enforcing final_full_scan before teardown.")
-        return "final_full_scan"
-    if step == "final_full_scan":
-        terminal_workspace = (
-            bool(task_queue)
-            and bool(state.get("workspace_volume"))
-            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
-            and not state.get("final_full_scan_completed", False)
-        )
-        if not terminal_workspace:
-            logger.warning("supervisor_router: rejecting premature final_full_scan route.")
-            step = ""
     if step in _WORKER_NODES and task_queue and not state.get("active_target_task_ids"):
         logger.error(
             "supervisor_router: refusing worker route '%s' without active targets; "
             "failing closed to teardown.",
             step,
         )
-        terminal_workspace = (
-            bool(task_queue)
-            and bool(state.get("workspace_volume"))
-            and all(task.status in _TERMINAL_STATUSES for task in task_queue.values())
-            and not state.get("final_full_scan_completed", False)
-        )
-        return "final_full_scan" if terminal_workspace else "teardown"
+        return "teardown"
     if step in _VALID_NEXT_NODES:
         return step
     logger.error("supervisor_router: invalid next_routing_step '%s' - recomputing.", step)
@@ -3956,15 +4928,13 @@ def supervisor_router(state: OrchestratorState) -> str:
     valid_groups = list(state.get("valid_groups", []) or [])
     group_by_id = {group.group_id: group for group in valid_groups}
     decision = _deterministic_routing(
-        dict(state.get("task_queue", {}) or {}),
+        task_queue,
         group_by_id,
         dict(state.get("qa_evaluations", {}) or {}),
         dict(state.get("retry_diagnostics_by_task", {}) or {}),
         active_target_task_ids=list(state.get("active_target_task_ids", []) or []),
         current_status=str(state.get("status") or ""),
         triage_required=bool(state.get("triage_required")),
-        workspace_volume=state.get("workspace_volume"),
-        final_full_scan_completed=bool(state.get("final_full_scan_completed")),
         portfolio_plan=state.get("portfolio_plan"),
     )
     if decision.next_node not in _VALID_NEXT_NODES:

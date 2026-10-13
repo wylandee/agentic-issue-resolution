@@ -185,19 +185,20 @@ def _impl__commit_task_transition(
     close_attempt: bool = False,
     clear_selected_version: bool = False,
     allow_breaking_change_pivot: bool = False,
+    allow_verified_absent_target_pass: bool = False,
     consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     """Commit one coherent supervisor transition for a task.
 
-    ``task_queue`` is the authoritative projection.  This helper makes the
+    ``task_queue`` is the authoritative projection. This helper makes the
     transition explicit and ensures that any change to worker-input fields is
     either paired with a new task revision or closes the old attempt first.
     Worker successes that are waiting for QA intentionally do not use this
     helper for a status-only update: their current snapshot remains valid QA
-    input.  Every replan, surrender, terminalization, and pivot does use it.
+    input. Every replan, surrender, terminalization, and pivot does use it.
     ``allow_breaking_change_pivot`` is retained for the Supervisor-owned
-    breaking-change pivot path; the normal ``NEEDS_RETRY -> PIVOTED`` transition
-    is now explicit in the shared transition table.
+    breaking-change pivot path. ``allow_verified_absent_target_pass`` is
+    reserved for workerless SCA completion after accepted absence proof.
     """
     task = task_queue.get(task_id)
     if task is None:
@@ -213,6 +214,12 @@ def _impl__commit_task_transition(
             )
         except (TypeError, ValueError):
             new_status = None
+        verified_absent_transition_allowed = (
+            allow_verified_absent_target_pass
+            and task.current_attempt_id is None
+            and current_status in {TaskStatus.PENDING, TaskStatus.NEEDS_RETRY}
+            and new_status == TaskStatus.QA_PASSED
+        )
         pivot_transition_allowed = (
             allow_breaking_change_pivot
             and current_status == TaskStatus.NEEDS_RETRY
@@ -222,6 +229,7 @@ def _impl__commit_task_transition(
             new_status != current_status
             and not _validate_transition(current_status, new_status)
             and not pivot_transition_allowed
+            and not verified_absent_transition_allowed
         ):
             event = _build_consistency_event(
                 error_code="INVALID_TRANSITION",

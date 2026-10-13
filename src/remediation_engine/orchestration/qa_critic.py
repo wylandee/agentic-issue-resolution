@@ -33,6 +33,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from langsmith import traceable
@@ -40,7 +41,7 @@ from langsmith import traceable
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FailureCategory,
-    FinalFullScanResult,
+    ODCScanEvidence,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
@@ -60,21 +61,26 @@ from . import qa_policy_engine as _qa_policy_engine_module
 from . import qa_test_parsing as _qa_test_parsing_module
 from ._qa_runtime import (
     _attempt_version_evidence,
+    _attribute_reported_occurrences,
     _build_qa_scan_targets,
     _build_qa_task_contexts,
+    _changed_package_lock_inputs,
     _cleanup_targeted_artifacts,
     _collect_baseline_identifiers,
     _collect_group_package_state,
     _collect_target_identifiers,
     _derive_qa_task_policies,
     _derive_qa_task_strategies,
+    _parse_package_occurrence_key,
     _resolve_action_summary_task_ids,
     _resolve_targeted_packages,
     _scan_evidence,
+    _scan_evidence_by_task,
     _scan_state_projection,
     _store_scan_outcome,
     _targeted_extra_args_conflict,
-    _workspace_remediation_fingerprint,
+    _targeted_project_for_report_path,
+    _TargetedPackageBatch,
     _write_targeted_artifacts,
 )
 from .qa_policy_engine import (
@@ -98,6 +104,126 @@ logger = logging.getLogger(__name__)
 _QA_NPM_LS_ENABLED = False
 
 
+def _missing_targeted_input_paths(
+    artifact_manifest: Any,
+    reported_paths: Sequence[str],
+) -> list[str]:
+    """Return staged input paths not represented in ODC dependency file paths."""
+    paths_by_project: dict[str, set[str]] = {}
+    for raw_path in reported_paths:
+        normalized = str(raw_path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        parts = [part for part in normalized.split("/") if part]
+        if len(parts) < 3 or parts[0] != ".odc-targeted":
+            continue
+        relative_path = "/".join(parts[2:])
+        if relative_path.rsplit("/", 1)[-1] in {
+            _qa_odc_module._ODC_REPORT_NAME,
+            _qa_odc_module._ODC_HTML_REPORT_NAME,
+        }:
+            continue
+        project_path = f"{parts[0]}/{parts[1]}"
+        paths_by_project.setdefault(project_path, set()).add(relative_path)
+
+    missing_paths: set[str] = set()
+    for project_path, input_paths in artifact_manifest.input_paths_by_project.items():
+        report_files = paths_by_project.get(project_path, set())
+        if not report_files:
+            missing_paths.update(input_paths)
+            continue
+        if artifact_manifest.occurrences_by_project.get(project_path):
+            continue
+        for input_path in input_paths:
+            basename = input_path.replace("\\", "/").rsplit("/", 1)[-1]
+            if not any(
+                report_file == basename or report_file.startswith(f"{basename}/")
+                for report_file in report_files
+            ):
+                missing_paths.add(input_path)
+    return sorted(missing_paths)
+
+
+def _removed_target_task_ids(batch: Any, targets: Sequence[QAScanTarget]) -> set[str]:
+    """Return active tasks whose exact target occurrence has a tombstone."""
+    removed_occurrences = [
+        parsed
+        for occurrence_key in batch.inventory_removals
+        if (parsed := _parse_package_occurrence_key(occurrence_key)) is not None
+        and parsed[0] in batch.covered_input_paths
+    ]
+    removed_task_ids: set[str] = set()
+    for target in targets:
+        target_paths = {str(path).replace("\\", "/") for path in target.manifest_paths}
+        target_name = target.target_package.casefold()
+        if any(
+            source_path in target_paths
+            and package_name == target_name
+            and (not target.expected_version or version == target.expected_version)
+            for source_path, _lockfile_key, package_name, version, _index in removed_occurrences
+        ):
+            removed_task_ids.add(target.task_id)
+    return removed_task_ids
+
+
+def _clear_expected_removed_target_failures(
+    batch: Any,
+    targets: Sequence[QAScanTarget],
+) -> Any:
+    """Ignore target-resolution failures proven to be intentional removals."""
+    removed_task_ids = _removed_target_task_ids(batch, targets)
+    removed_paths = {
+        parsed[0]
+        for occurrence_key in batch.inventory_removals
+        if (parsed := _parse_package_occurrence_key(occurrence_key)) is not None
+        and parsed[0] in batch.covered_input_paths
+    }
+    target_paths_by_task = {
+        target.task_id: {str(path).replace("\\", "/") for path in target.manifest_paths}
+        for target in targets
+    }
+    failures: dict[str, Any] = {}
+    for task_id, failure in batch.failures_by_task.items():
+        if task_id in removed_task_ids and failure.reason == ScanFallbackReason.NO_MATCHING_TARGET:
+            continue
+        if (
+            task_id in removed_task_ids
+            and failure.reason == ScanFallbackReason.MISSING_LOCKFILE
+            and any(
+                path in target_paths_by_task[task_id] and path in failure.detail
+                for path in removed_paths
+            )
+        ):
+            continue
+        failures[task_id] = failure
+    first_failure = next(iter(failures.values()), None)
+    return replace(
+        batch,
+        failures_by_task=failures,
+        fallback_reason=first_failure.reason if first_failure else None,
+        fallback_detail=(
+            "; ".join(failure.detail for failure in failures.values()) if failures else None
+        ),
+    )
+
+
+def _is_deletion_only_no_fix_batch(
+    batch: Any,
+    targets: Sequence[QAScanTarget],
+) -> bool:
+    """Return whether a NO_FIX removal attempt has only covered npm tombstones."""
+    if (
+        not targets
+        or not batch.inventory_removals
+        or batch.inventory_updates
+        or batch.target_packages
+        or batch.non_npm_input_projects
+        or batch.failures_by_task
+    ):
+        return False
+    return _removed_target_task_ids(batch, targets) == {target.task_id for target in targets}
+
+
 def _run_global_execution(
     sandbox: DockerSandbox,
     workspace_volume: str,
@@ -108,6 +234,7 @@ def _run_global_execution(
     scan_skip_reason: str | None = None,
     package_state_collector: Callable[[DockerSandbox, bool], Mapping[str, _QAPackageState]]
     | None = None,
+    scan_state: OrchestratorState | None = None,
 ) -> _QAExecutionResults:
     """
     Run install, optional package evidence, security scan, and unit tests in order.
@@ -125,7 +252,66 @@ def _run_global_execution(
     if package_state_collector is not None:
         results.package_state_by_task.update(package_state_collector(sandbox, install_ok))
 
-    if skip_scan:
+    deletion_only_skip = False
+    precomputed_resolution_batch = None
+    if skip_scan and scan_skip_reason == "no_fix_package_removal":
+        precomputed_resolution_batch = _resolve_targeted_packages(
+            sandbox,
+            scan_targets or (),
+            scan_state,
+        )
+        precomputed_resolution_batch = _clear_expected_removed_target_failures(
+            precomputed_resolution_batch,
+            scan_targets or (),
+        )
+        if _is_deletion_only_no_fix_batch(
+            precomputed_resolution_batch,
+            scan_targets or (),
+        ):
+            deletion_only_skip = True
+            deletion_task_ids = [target.task_id for target in scan_targets or ()]
+            deletion_batch = replace(
+                precomputed_resolution_batch,
+                covered_task_ids=tuple(deletion_task_ids),
+                failures_by_task={},
+                fallback_reason=None,
+                fallback_detail=None,
+            )
+            deletion_result = _SecurityScanResult(
+                True,
+                "Dependency-Check was not run because the accepted input delta contains deletions only.",
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.NOT_RUN,
+            )
+            results.scan_skipped = True
+            results.scan_skip_reason = "no_fix_package_removal_deletions_only"
+            _store_scan_outcome(results, deletion_result, label="odc:deletion-only")
+            results.scan_evidence = _scan_evidence(
+                targets=scan_targets or (),
+                scan_result=deletion_result,
+                effective_scope=ScanScope.TARGETED,
+                complete=True,
+                covered_task_ids=deletion_task_ids,
+                batch=deletion_batch,
+                scan_performed=False,
+            )
+            results.scan_evidence_by_task = _scan_evidence_by_task(
+                results.scan_evidence,
+                targets=scan_targets or (),
+                baseline_identifiers=(
+                    baseline_identifiers if baseline_identifiers is not None else target_identifiers
+                ),
+                batch=deletion_batch,
+                artifact_manifest=None,
+            )
+        else:
+            skip_scan = False
+
+    if deletion_only_skip:
+        logger.info("qa_critic: skipping ODC for deletion-only package-removal attempt.")
+    elif skip_scan:
         results.scan_skipped = True
         results.scan_skip_reason = scan_skip_reason or "explicitly skipped by QA policy"
         _append_qa_log_records(
@@ -150,7 +336,15 @@ def _run_global_execution(
     else:
         logger.info("qa_critic: [Step 0] running security scan (install_ok=%s).", install_ok)
     scan_started = time.monotonic()
-    if not skip_scan and scan_targets is None:
+    has_active_task_scan = bool(scan_state is not None and scan_state.get("active_target_task_ids"))
+    if deletion_only_skip:
+        pass
+    elif (
+        not skip_scan
+        and scan_targets is None
+        and not has_active_task_scan
+        and scan_skip_reason != "no_fix_package_removal"
+    ):
         if baseline_identifiers is None:
             _store_scan_outcome(
                 results,
@@ -172,20 +366,38 @@ def _run_global_execution(
             )
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
+        active_scan_targets = scan_targets or ()
+        targeted_scan_label = "odc:targeted"
         target_packages: list[TargetPackageResolution] = []
         covered_task_ids: list[str] = []
         targeted_subdir: str | None = None
         incomplete_reason: ScanFallbackReason | None = None
         incomplete_detail: str | None = None
         targeted_result: _SecurityScanResult | None = None
+        resolution_batch = None
+        artifact_manifest = None
         scanner_coverage_complete = False
+        has_targeted_inputs = False
         try:
             if _targeted_extra_args_conflict():
                 incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
                 incomplete_detail = "ODC_EXTRA_ARGS conflicts with safe targeted scan scope."
             else:
-                resolution_batch = _resolve_targeted_packages(sandbox, scan_targets)
+                resolution_batch = precomputed_resolution_batch or _resolve_targeted_packages(
+                    sandbox,
+                    active_scan_targets,
+                    scan_state,
+                )
                 target_packages = list(resolution_batch.target_packages)
+                results.scan_target_skipped_by_task = {
+                    task_id: ScanFallbackReason.NO_MATCHING_TARGET.value
+                    for task_id in resolution_batch.skipped_task_ids
+                }
+                has_targeted_inputs = bool(
+                    target_packages
+                    or resolution_batch.non_npm_input_projects
+                    or any(resolution_batch.closures_by_task.values())
+                )
                 results.scan_target_failures_by_task = {
                     task_id: (failure.reason, failure.detail)
                     for task_id, failure in resolution_batch.failures_by_task.items()
@@ -195,24 +407,58 @@ def _run_global_execution(
                         "qa_critic: some targeted packages could not be resolved: %s",
                         resolution_batch.fallback_detail,
                     )
-                if not target_packages:
-                    incomplete_reason = (
-                        resolution_batch.fallback_reason or ScanFallbackReason.NO_MATCHING_TARGET
-                    )
-                    incomplete_detail = (
-                        resolution_batch.fallback_detail
-                        or "No task target resolved to a scannable package."
-                    )
-            if incomplete_reason is None and target_packages:
+                if not has_targeted_inputs:
+                    if resolution_batch.skipped_task_ids and not resolution_batch.failures_by_task:
+                        incomplete_detail = (
+                            "Targeted Dependency-Check was skipped because the target package "
+                            "is absent from the live lockfiles."
+                        )
+                        targeted_result = _SecurityScanResult(
+                            True,
+                            incomplete_detail,
+                            set(),
+                            set(),
+                            set(),
+                            execution_status=ScannerExecutionStatus.NOT_RUN,
+                        )
+                        targeted_scan_label = "odc:skipped"
+                        covered_task_ids = list(resolution_batch.covered_task_ids)
+                        results.scan_skipped = True
+                        results.scan_skip_reason = "target_package_absent"
+                        scanner_coverage_complete = True
+                    else:
+                        incomplete_reason = (
+                            resolution_batch.fallback_reason
+                            or ScanFallbackReason.NO_MATCHING_TARGET
+                        )
+                        incomplete_detail = (
+                            resolution_batch.fallback_detail
+                            or "No task target or changed input resolved to a scannable project."
+                        )
+            if incomplete_reason is None and has_targeted_inputs:
                 targeted_subdir = ".odc-targeted"
-                _write_targeted_artifacts(sandbox, target_packages)
-                targeted_result = _qa_odc_module._run_targeted_security_scan(
+                artifact_manifest = _write_targeted_artifacts(
                     sandbox,
-                    workspace_volume,
-                    target_identifiers,
-                    baseline,
-                    targeted_subdir,
+                    resolution_batch.closures_by_task,
+                    resolution_batch.non_npm_input_projects,
                 )
+                targeted_subdir = artifact_manifest.scan_subdir
+                if target_identifiers:
+                    targeted_result = _qa_odc_module._run_targeted_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        target_identifiers,
+                        baseline,
+                        targeted_subdir,
+                    )
+                else:
+                    targeted_scan_label = "odc:incremental"
+                    targeted_result = _qa_odc_module._run_incremental_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        targeted_subdir,
+                        baseline,
+                    )
                 if targeted_result.execution_status != ScannerExecutionStatus.SUCCESS:
                     incomplete_reason = (
                         ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
@@ -220,49 +466,105 @@ def _run_global_execution(
                         else ScanFallbackReason.TARGETED_SCAN_FAILED
                     )
                     incomplete_detail = targeted_result.summary
-                elif targeted_result.reported_packages is None:
+                elif targeted_result.reported_paths is None:
                     incomplete_reason = ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
-                    incomplete_detail = "ODC report did not contain parseable package identities."
-                else:
-                    expected_packages: list[tuple[str, str]] = []
-                    seen_physical_entries: set[tuple[str, str, str]] = set()
-                    for resolution in target_packages:
-                        node = resolution.target_node
-                        if node is None:
-                            continue
-                        physical_identity = (
-                            resolution.source_lockfile,
-                            node.lockfile_key,
-                            node.version,
-                        )
-                        if physical_identity in seen_physical_entries:
-                            continue
-                        seen_physical_entries.add(physical_identity)
-                        expected_packages.append((node.package_name.casefold(), node.version))
-                    missing_packages = Counter(expected_packages) - Counter(
-                        targeted_result.reported_packages
+                    incomplete_detail = (
+                        "ODC report did not contain parseable dependency file paths."
                     )
-                    if missing_packages:
-                        missing_text = ", ".join(
-                            f"{name}@{version} (missing {count})"
-                            for (name, version), count in sorted(missing_packages.items())
+                else:
+                    # ODC merges identical npm PURLs across physical lockfile
+                    # entries. Validate each identity per source project here;
+                    # the lockfile inventory retains the physical multiplicity.
+                    expected_by_project: dict[str, set[tuple[str, str]]] = {
+                        project_path: {
+                            (occurrence.package_name.casefold(), occurrence.version)
+                            for occurrence in occurrences
+                        }
+                        for project_path, occurrences in artifact_manifest.occurrences_by_project.items()
+                    }
+                    reported_by_project: dict[str, set[tuple[str, str]]] = {
+                        project_path: set()
+                        for project_path in artifact_manifest.input_paths_by_project
+                    }
+                    unexpected_packages: Counter[tuple[str, str]] = Counter()
+                    for occurrence in targeted_result.reported_package_occurrences or ():
+                        if str(_scan_result_value(occurrence, "ecosystem", "")).casefold() != "npm":
+                            continue
+                        identity = (
+                            str(_scan_result_value(occurrence, "package_name", "")).casefold(),
+                            str(_scan_result_value(occurrence, "version", "")),
                         )
+                        project_path = _targeted_project_for_report_path(
+                            _scan_result_value(occurrence, "file_path", None)
+                        )
+                        if project_path not in expected_by_project:
+                            unexpected_packages[identity] += 1
+                            continue
+                        reported_by_project[project_path].add(identity)
+
+                    missing_packages: Counter[tuple[str, str]] = Counter()
+                    for project_path, expected_identities in expected_by_project.items():
+                        reported_identities = reported_by_project.get(project_path, set())
+                        for identity in expected_identities - reported_identities:
+                            missing_packages[identity] += 1
+                        for identity in reported_identities - expected_identities:
+                            unexpected_packages[identity] += 1
+                    missing_inputs = _missing_targeted_input_paths(
+                        artifact_manifest,
+                        targeted_result.reported_paths,
+                    )
+                    if missing_packages or unexpected_packages:
+                        package_diagnostics: list[str] = []
+                        if missing_packages:
+                            package_diagnostics.append(
+                                "missing "
+                                + ", ".join(
+                                    f"{name}@{version} ({count})"
+                                    for (name, version), count in sorted(missing_packages.items())
+                                )
+                            )
+                        if unexpected_packages:
+                            package_diagnostics.append(
+                                "unexpected "
+                                + ", ".join(
+                                    f"{name}@{version} ({count})"
+                                    for (name, version), count in sorted(
+                                        unexpected_packages.items()
+                                    )
+                                )
+                            )
                         incomplete_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
                         incomplete_detail = (
-                            "ODC report did not enumerate every targeted package occurrence: "
-                            f"{missing_text}."
+                            "ODC report package occurrences differed from the targeted "
+                            f"closure: {'; '.join(package_diagnostics)}."
+                        )
+                    elif missing_inputs:
+                        incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                        incomplete_detail = (
+                            "ODC report did not cover every staged changed input: "
+                            f"{', '.join(missing_inputs)}."
                         )
                     else:
-                        scanner_coverage_complete = True
+                        artifact_manifest, occurrences_mapped = _attribute_reported_occurrences(
+                            artifact_manifest,
+                            targeted_result,
+                        )
                         covered_task_ids = list(resolution_batch.covered_task_ids)
-                        if resolution_batch.failures_by_task:
-                            incomplete_reason = resolution_batch.fallback_reason
-                            incomplete_detail = resolution_batch.fallback_detail
-
+                        if not occurrences_mapped:
+                            incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                            incomplete_detail = (
+                                "ODC report package occurrences could not be attributed "
+                                "to their original scan inputs."
+                            )
+                        else:
+                            scanner_coverage_complete = True
+                            if resolution_batch.failures_by_task:
+                                incomplete_reason = resolution_batch.fallback_reason
+                                incomplete_detail = resolution_batch.fallback_detail
             if scanner_coverage_complete and targeted_result is not None:
-                _store_scan_outcome(results, targeted_result, label="odc:targeted")
+                _store_scan_outcome(results, targeted_result, label=targeted_scan_label)
                 results.scan_evidence = _scan_evidence(
-                    targets=scan_targets,
+                    targets=active_scan_targets,
                     scan_result=targeted_result,
                     effective_scope=ScanScope.TARGETED,
                     complete=not results.scan_target_failures_by_task,
@@ -273,6 +575,24 @@ def _run_global_execution(
                     ),
                     target_packages=target_packages,
                     covered_task_ids=covered_task_ids,
+                    batch=resolution_batch,
+                    scan_performed=(
+                        targeted_result.execution_status != ScannerExecutionStatus.NOT_RUN
+                    ),
+                    scan_skip_reason=(
+                        "no_matching_target"
+                        if targeted_result.execution_status == ScannerExecutionStatus.NOT_RUN
+                        and resolution_batch.skipped_task_ids
+                        else None
+                    ),
+                    artifact_manifest=artifact_manifest,
+                )
+                results.scan_evidence_by_task = _scan_evidence_by_task(
+                    results.scan_evidence,
+                    targets=active_scan_targets,
+                    baseline_identifiers=baseline,
+                    batch=resolution_batch,
+                    artifact_manifest=artifact_manifest,
                 )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("qa_critic: targeted scan setup failed — %s", exc)
@@ -305,21 +625,34 @@ def _run_global_execution(
                     targeted_result,
                     ok=False,
                     summary=summary,
-                    remaining_identifiers=set(),
-                    found_identifiers=set(),
-                    new_identifiers=set(),
-                    found_issues=[],
+                    remaining_identifiers=targeted_result.remaining_identifiers,
+                    found_identifiers=targeted_result.found_identifiers,
+                    new_identifiers=targeted_result.new_identifiers,
+                    found_issues=targeted_result.found_issues,
                     execution_status=execution_status,
                 )
-            _store_scan_outcome(results, incomplete_result, label="odc:targeted")
+            _store_scan_outcome(results, incomplete_result, label=targeted_scan_label)
             results.scan_evidence = _scan_evidence(
-                targets=scan_targets,
+                targets=active_scan_targets,
                 scan_result=incomplete_result,
                 effective_scope=ScanScope.TARGETED,
                 complete=False,
                 fallback_reason=incomplete_reason,
                 target_packages=target_packages,
                 covered_task_ids=[],
+                batch=resolution_batch,
+                artifact_manifest=artifact_manifest,
+                scan_performed=(
+                    targeted_result is not None
+                    and targeted_result.execution_status != ScannerExecutionStatus.NOT_RUN
+                ),
+            )
+            results.scan_evidence_by_task = _scan_evidence_by_task(
+                results.scan_evidence,
+                targets=active_scan_targets,
+                baseline_identifiers=baseline,
+                batch=resolution_batch,
+                artifact_manifest=artifact_manifest,
             )
 
     if results.scan_skipped:
@@ -591,6 +924,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 baseline_identifiers=baseline_identifiers,
                 scan_targets=scan_targets,
                 skip_scan=skip_scan,
+                scan_state=state,
                 scan_skip_reason="no_fix_package_removal" if skip_scan else None,
                 package_state_collector=(
                     collect_package_states
@@ -644,6 +978,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     results.scan_evidence,
                     task_contexts,
                     task_failures=results.scan_target_failures_by_task,
+                    evidence_by_task=results.scan_evidence_by_task,
                 )
                 return {
                     "qa_evaluations": failed_evals,
@@ -699,6 +1034,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     results.scan_evidence,
                     task_contexts,
                     task_failures=results.scan_target_failures_by_task,
+                    evidence_by_task=results.scan_evidence_by_task,
                 )
                 report = json.dumps(
                     {
@@ -797,6 +1133,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         results.scan_evidence,
         task_contexts,
         task_failures=results.scan_target_failures_by_task,
+        evidence_by_task=results.scan_evidence_by_task,
     )
     for task_id, (reason, detail) in results.scan_target_failures_by_task.items():
         current = qa_evaluations.get(task_id)
@@ -912,110 +1249,250 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
-@traceable(name="final_full_scan")
-def run_final_full_scan_node(state: OrchestratorState) -> dict[str, Any]:
-    """Run the authoritative full ODC scan immediately before teardown."""
+def run_workspace_setup_scan_node(state: OrchestratorState) -> dict[str, Any]:
+    """Scan package-lock dependency closures changed by workspace installation.
+
+    The source inventory was captured before ``npm install`` by the workspace
+    builder. This QA-owned bridge compares that baseline with the live Docker
+    volume, scans only complete closures for changed package occurrences, and
+    returns attempt-independent evidence for the Supervisor's terminal ledger.
+    """
     workspace_volume = state.get("workspace_volume")
-    groups: list[VulnerabilityGroup] = list(state.get("valid_groups") or [])
-    baseline = _collect_baseline_identifiers(state, groups)
-    target_identifiers = _collect_target_identifiers(groups)
-    previous_workspace_fingerprint = state.get("final_scan_workspace_fingerprint")
     if not workspace_volume:
-        error = "final_full_scan: workspace_volume is missing."
-        result = FinalFullScanResult(
-            completed=False,
-            found_identifiers=[],
-            remaining_target_identifiers=[],
-            new_identifiers=[],
-            status="scan_failed",
-            triage_required=False,
-            error=error,
+        evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            complete=False,
+            scan_performed=False,
+            fallback_reason=ScanFallbackReason.TARGETED_SCAN_FAILED,
         )
         return {
-            "final_full_scan_result": result,
-            "final_full_scan_completed": True,
-            "new_vulnerability_status": "scan_failed",
-            "triage_required": False,
-            "status": "final_scan_failed",
-            "errors": [error],
+            "setup_scan_evidence": evidence,
+            "errors": ["workspace setup scan skipped: workspace volume is missing."],
         }
 
+    if not state.get("package_inventory_baseline_complete", False):
+        logger.warning(
+            "workspace setup scan skipped because the source package inventory is incomplete."
+        )
+        return {}
+    setup_task_id = "workspace_setup"
+    source_inventory = state.get("accepted_package_inventory_by_lockfile", {}) or {}
+    source_paths = {
+        parts[0]
+        for occurrence_key in source_inventory
+        if isinstance(occurrence_key, str)
+        and (parts := _parse_package_occurrence_key(occurrence_key)) is not None
+    }
+    try:
+        from .workspace_builder import _discover_package_directories
+
+        repo_root = Path(str(state.get("repo_root") or "."))
+        source_paths.update(
+            (package_directory / "package-lock.json").as_posix()
+            for package_directory in _discover_package_directories(repo_root)
+        )
+    except (OSError, ValueError) as exc:
+        evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            complete=False,
+            scan_performed=False,
+            fallback_reason=ScanFallbackReason.TARGETED_SCAN_FAILED,
+        )
+        return {
+            "setup_scan_evidence": evidence,
+            "errors": [f"workspace setup scan could not enumerate package inputs: {exc}"],
+        }
+
+    targets = [
+        QAScanTarget(
+            task_id=setup_task_id,
+            group_id=setup_task_id,
+            target_package=setup_task_id,
+            expected_version=None,
+            manifest_paths=(source_path,),
+            dependency_ancestry=(),
+            target_identifiers=frozenset(),
+        )
+        for source_path in sorted(source_paths)
+    ]
+    scan_state = dict(state)
+    scan_state.update(
+        {
+            "active_target_task_ids": [setup_task_id],
+            "task_queue": {},
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "worker_results_by_attempt": {},
+            "attempt_snapshots_by_id": {},
+        }
+    )
+    manifest = None
+    scan_result = None
+    failure_reason: ScanFallbackReason | None = None
+    failure_details: list[str] = []
+    batch: _TargetedPackageBatch | None = None
     try:
         with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-            scan = _qa_odc_module._run_security_scan(
-                sandbox,
-                workspace_volume,
-                target_identifiers,
-                baseline,
-            )
-            workspace_fingerprint = _workspace_remediation_fingerprint(
-                str(state.get("repo_root")) if state.get("repo_root") else None,
-                sandbox,
-                list(state.get("changed_files") or []),
-            )
-    except Exception as exc:  # noqa: BLE001 - scan failures must reach teardown/report
-        error = f"final_full_scan: Docker sandbox unavailable - {exc}"
-        result = FinalFullScanResult(
-            completed=False,
-            found_identifiers=[],
-            remaining_target_identifiers=[],
-            new_identifiers=[],
-            status="scan_failed",
-            triage_required=False,
-            error=error,
-        )
-        return {
-            "final_full_scan_result": result,
-            "final_full_scan_completed": True,
-            "new_vulnerability_status": "scan_failed",
-            "triage_required": False,
-            "status": "final_scan_failed",
-            "errors": [error],
-        }
 
-    found = sorted(scan.found_identifiers)
-    remaining = sorted(scan.remaining_identifiers)
-    new_identifiers = sorted(scan.new_identifiers)
-    hard_failure = not scan.ok and not scan.found_identifiers and not scan.remaining_identifiers
-    status = (
-        "scan_failed"
-        if hard_failure
-        else "detected"
-        if new_identifiers
-        else "unresolved"
-        if remaining
-        else "none"
-    )
-    triage_required = bool(new_identifiers or remaining)
-    result = FinalFullScanResult(
-        completed=not hard_failure,
-        found_identifiers=found,
-        remaining_target_identifiers=remaining,
-        new_identifiers=new_identifiers,
-        found_issues=list(scan.found_issues),
-        status=status,
-        triage_required=triage_required,
-        error=scan.summary if hard_failure else None,
-    )
-    logger.info(
-        "final_full_scan: completed=%s found=%d remaining=%d new=%d triage_required=%s",
-        result.completed,
-        len(found),
-        len(remaining),
-        len(new_identifiers),
-        triage_required,
+            def load_lockfile(
+                source_path: str,
+            ) -> tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None]:
+                """Read one installed lockfile using the shared delta resolver contract."""
+                try:
+                    raw_document = sandbox.read_file(source_path)
+                except (OSError, RuntimeError) as exc:
+                    return (
+                        None,
+                        None,
+                        ScanFallbackReason.MISSING_LOCKFILE,
+                        f"Installed package-lock input {source_path} could not be read: {exc}",
+                    )
+                if raw_document is None:
+                    return (
+                        None,
+                        None,
+                        ScanFallbackReason.MISSING_LOCKFILE,
+                        f"Installed package-lock input {source_path} could not be read.",
+                    )
+                try:
+                    document = json.loads(raw_document)
+                except (TypeError, ValueError) as exc:
+                    return (
+                        None,
+                        None,
+                        ScanFallbackReason.INVALID_LOCKFILE,
+                        f"Installed package-lock input {source_path} is invalid JSON: {exc}",
+                    )
+                packages = document.get("packages") if isinstance(document, Mapping) else None
+                lockfile_version = (
+                    document.get("lockfileVersion") if isinstance(document, Mapping) else None
+                )
+                if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
+                    return (
+                        None,
+                        None,
+                        ScanFallbackReason.INVALID_LOCKFILE,
+                        f"Installed package-lock input {source_path} lacks a supported packages map.",
+                    )
+                return packages, lockfile_version, None, None
+
+            if _targeted_extra_args_conflict():
+                failure_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                failure_details.append("ODC_EXTRA_ARGS conflicts with safe incremental scan scope.")
+            else:
+                change_batch = _changed_package_lock_inputs(
+                    scan_state,
+                    targets,
+                    load_lockfile,
+                )
+                if change_batch.failures_by_task:
+                    first_failure = next(iter(change_batch.failures_by_task.values()))
+                    failure_reason = first_failure.reason
+                    failure_details.extend(
+                        failure.detail for failure in change_batch.failures_by_task.values()
+                    )
+                batch = _TargetedPackageBatch(
+                    target_packages=change_batch.target_packages,
+                    closures_by_task=change_batch.closures_by_task,
+                    covered_task_ids=(setup_task_id,),
+                    failures_by_task=change_batch.failures_by_task,
+                    inventory_updates=change_batch.inventory_updates,
+                    inventory_removals=change_batch.inventory_removals,
+                    covered_input_paths=change_batch.covered_input_paths,
+                    non_npm_input_projects=(),
+                    fallback_reason=failure_reason,
+                    fallback_detail="; ".join(failure_details) or None,
+                )
+                if change_batch.closures_by_task.get(setup_task_id):
+                    manifest = _write_targeted_artifacts(
+                        sandbox,
+                        change_batch.closures_by_task,
+                    )
+                    scan_result = _qa_odc_module._run_incremental_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        manifest.scan_subdir,
+                        {
+                            identifier.upper().strip()
+                            for identifier in (state.get("baseline_scan_identifiers") or [])
+                            if isinstance(identifier, str) and identifier.strip()
+                        },
+                    )
+                    if scan_result.execution_status != ScannerExecutionStatus.SUCCESS:
+                        failure_reason = (
+                            ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
+                            if scan_result.execution_status == ScannerExecutionStatus.UNPARSEABLE
+                            else ScanFallbackReason.TARGETED_SCAN_FAILED
+                        )
+                        failure_details.append(scan_result.summary)
+                    elif scan_result.reported_paths is None:
+                        failure_reason = ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
+                        failure_details.append(
+                            "ODC report did not contain parseable dependency file paths."
+                        )
+                    else:
+                        expected_packages = [
+                            (name.casefold(), version)
+                            for name, version in manifest.expected_package_occurrences
+                        ]
+                        reported_package_counts = Counter(scan_result.reported_packages or [])
+                        if reported_package_counts != Counter(expected_packages):
+                            failure_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
+                            failure_details.append(
+                                "ODC report package occurrences differed from changed closures."
+                            )
+                        missing_inputs = _missing_targeted_input_paths(
+                            manifest,
+                            scan_result.reported_paths,
+                        )
+                        if missing_inputs:
+                            failure_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                            failure_details.append(
+                                "ODC report did not cover installed lockfiles: "
+                                + ", ".join(missing_inputs)
+                                + "."
+                            )
+                        manifest, occurrences_mapped = _attribute_reported_occurrences(
+                            manifest,
+                            scan_result,
+                        )
+                        if not occurrences_mapped:
+                            failure_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                            failure_details.append(
+                                "ODC report package occurrences could not be mapped to "
+                                "their source lockfile inputs."
+                            )
+    except Exception as exc:  # noqa: BLE001 - incomplete setup evidence must reach Supervisor
+        failure_reason = failure_reason or ScanFallbackReason.TARGETED_SCAN_FAILED
+        failure_details.append(f"workspace setup scan failed: {exc}")
+    finally:
+        if manifest is not None:
+            try:
+                with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+                    _cleanup_targeted_artifacts(sandbox, manifest.scan_subdir)
+            except Exception as exc:  # noqa: BLE001
+                failure_details.append(f"workspace setup scan cleanup failed: {exc}")
+                failure_reason = failure_reason or ScanFallbackReason.TARGETED_SCAN_FAILED
+
+    complete = failure_reason is None
+    evidence = _scan_evidence(
+        targets=targets,
+        scan_result=scan_result,
+        effective_scope=ScanScope.TARGETED,
+        complete=complete,
+        fallback_reason=failure_reason,
+        target_packages=batch.target_packages if batch is not None else (),
+        covered_task_ids=[],
+        batch=batch,
+        artifact_manifest=manifest,
+        scan_performed=scan_result is not None,
     )
     return {
-        "final_full_scan_result": result,
-        "final_full_scan_completed": True,
-        "previous_final_scan_workspace_fingerprint": previous_workspace_fingerprint,
-        "final_scan_workspace_fingerprint": workspace_fingerprint,
-        "baseline_scan_identifiers": sorted(baseline),
-        "post_remediation_scan_identifiers": found,
-        "post_remediation_scan_issues": list(scan.found_issues),
-        "new_vulnerability_identifiers": new_identifiers,
-        "new_vulnerability_status": status,
-        "triage_required": triage_required,
-        "status": "final_scan_completed" if not hard_failure else "final_scan_failed",
-        "errors": [scan.summary] if hard_failure else [],
+        "setup_scan_evidence": evidence,
+        "errors": (
+            [f"workspace setup scan incomplete: {'; '.join(failure_details)}"]
+            if failure_details
+            else []
+        ),
     }

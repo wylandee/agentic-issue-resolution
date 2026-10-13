@@ -31,9 +31,11 @@ from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FinalFullScanResult,
+    IncrementalScanRecord,
     IssueType,
     MultiPackageAction,
     ODCScanEvidence,
+    PackageScanOccurrence,
     PortfolioPlan,
     QAAttemptResult,
     QAEvaluation,
@@ -42,6 +44,7 @@ from remediation_engine.contracts.schemas import (
     SupervisorRetryPlan,
     SystemContext,
     TaskAttemptSnapshot,
+    TaskScanRecord,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -494,7 +497,17 @@ class OrchestratorState(TypedDict, total=False):
     # Counts same-attempt QA reruns caused by inconclusive evidence or an
     # invalid evaluator contract. The Supervisor owns this bounded ledger.
     qa_rerun_counts_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
-    scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
+    accepted_package_inventory_by_lockfile: Annotated[dict[str, str], replace_dict_reducer]
+    current_scan_observations_by_occurrence: Annotated[
+        dict[str, PackageScanOccurrence], replace_dict_reducer
+    ]
+    latest_successful_scan_by_task: Annotated[dict[str, TaskScanRecord], replace_dict_reducer]
+    latest_incremental_scan_by_input: Annotated[
+        dict[str, IncrementalScanRecord], replace_dict_reducer
+    ]
+    setup_scan_evidence: ODCScanEvidence | None
+    setup_scan_committed: bool
+    package_inventory_baseline_complete: bool
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
     # Phase 5 Task Queue (primary orchestration unit)
@@ -528,16 +541,16 @@ class OrchestratorState(TypedDict, total=False):
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
+    baseline_scan_complete: bool
     baseline_scan_identifiers: list[str]
     post_remediation_scan_identifiers: list[str]
     post_remediation_scan_issues: list[VulnerabilityIssue]
     new_vulnerability_identifiers: list[str]
     new_vulnerability_status: str
     final_full_scan_result: FinalFullScanResult | None
-    final_full_scan_completed: bool
-    final_scan_workspace_fingerprint: str | None
-    previous_final_scan_workspace_fingerprint: str | None
+    final_full_scan_enabled: bool
     triage_required: bool
+    post_qa_triage_enabled: bool
     post_qa_retriage_count: int
     post_qa_retriage_limit_reached: bool
     initial_triage_status: str
@@ -610,14 +623,15 @@ def initial_orchestrator_state(
         system_context,
     )
     valid_groups = normalize_group_paths(valid_groups, repo_root)
-    valid_groups = filter_groups_to_target_packages(valid_groups, normalized_target_packages)
-    if issues is not None:
-        issues = filter_issues_to_target_packages(issues, normalized_target_packages)
+    baseline_scan_complete = issues is not None
     baseline_scan_identifiers = (
         _scan_identifiers_from_issues(issues)
         if issues is not None
         else _scan_identifiers_from_groups(valid_groups)
     )
+    valid_groups = filter_groups_to_target_packages(valid_groups, normalized_target_packages)
+    if issues is not None:
+        issues = filter_issues_to_target_packages(issues, normalized_target_packages)
     state: dict[str, Any] = {
         "repo_root": repo_root,
         "run_id": "",
@@ -638,7 +652,6 @@ def initial_orchestrator_state(
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
         "qa_rerun_counts_by_attempt": {},
-        "scan_evidence_by_task": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],
         "consistency_events": [],
@@ -666,15 +679,22 @@ def initial_orchestrator_state(
         "eval_status": "",
         "qa_investigation_report": "",
         "baseline_scan_identifiers": baseline_scan_identifiers,
+        "baseline_scan_complete": baseline_scan_complete,
+        "package_inventory_baseline_complete": False,
+        "accepted_package_inventory_by_lockfile": {},
+        "current_scan_observations_by_occurrence": {},
+        "latest_successful_scan_by_task": {},
+        "latest_incremental_scan_by_input": {},
+        "setup_scan_evidence": None,
+        "setup_scan_committed": False,
         "post_remediation_scan_identifiers": [],
         "post_remediation_scan_issues": [],
         "new_vulnerability_identifiers": [],
         "new_vulnerability_status": "not_scanned",
         "final_full_scan_result": None,
-        "final_full_scan_completed": False,
-        "final_scan_workspace_fingerprint": None,
-        "previous_final_scan_workspace_fingerprint": None,
+        "final_full_scan_enabled": False,
         "triage_required": False,
+        "post_qa_triage_enabled": True,
         "post_qa_retriage_count": 0,
         "post_qa_retriage_limit_reached": False,
         "initial_triage_status": "pending",

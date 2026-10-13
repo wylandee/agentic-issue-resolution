@@ -1041,6 +1041,7 @@ def _finalize_qa_workspace_snapshot(
     Supervisor. Other QA failures restore the immutable task baseline when one
     exists, so a rejected retry cannot leak into the next task.
     """
+    result["candidate_workspace_retained"] = False
     if snapshot_id is None:
         return []
     attempt_snapshots = state.get("attempt_snapshots_by_id", {})
@@ -1077,6 +1078,7 @@ def _finalize_qa_workspace_snapshot(
         if _qa_result_requires_non_remediation_rerun(result):
             # QA infrastructure/contract failures must rerun against the
             # candidate rather than restoring the worker's baseline.
+            result["candidate_workspace_retained"] = True
             return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
         return restore_failed_workaround() if workaround_attempt else restore_failed_update()
     evaluations = result.get("qa_evaluations") or {}
@@ -1122,12 +1124,15 @@ def _finalize_qa_workspace_snapshot(
             # candidate after any real QA rejection.
             return restore_failed_update()
         if has_non_remediation_rerun:
+            result["candidate_workspace_retained"] = True
             return []
+        result["candidate_workspace_retained"] = True
         return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
     if update_candidate and has_regression:
         # The next Supervisor decision may dispatch a workaround child. The
         # child creates its own checkpoint from this retained candidate, while
         # the anchor map continues to point to the first pre-task baseline.
+        result["candidate_workspace_retained"] = True
         return []
     if has_regression:
         return restore_failed_workaround()
@@ -1138,11 +1143,13 @@ def _finalize_qa_workspace_snapshot(
         # the child source edit must remain together for all later tasks. Any
         # anchor retained before this QA run points at an older workspace and
         # must not be allowed to restore over the promoted candidate.
+        result["candidate_workspace_retained"] = True
         errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
         if not has_non_remediation_rerun:
             errors.extend(_finish_all_workspace_rollback_anchors(state, restore=False))
         return errors
 
+    result["candidate_workspace_retained"] = True
     errors = _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
     if not has_non_remediation_rerun:
         errors.extend(discard_task_rollback_anchors())
@@ -1700,6 +1707,8 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         workspace_snapshot_id,
         result,
     )
+    if delta_isolation is not None and delta_isolation.get("candidate_restored") is True:
+        result["candidate_workspace_retained"] = False
     rollback_anchor_updates = _qa_workspace_rollback_anchor_updates(
         state,
         target_tasks,
@@ -1938,7 +1947,17 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     evaluations = result.get("qa_evaluations", {}) or {}
     reports_by_task = result.get("qa_investigation_reports_by_task", {}) or {}
     errors_by_task = result.get("qa_errors_by_task", {}) or {}
-    scan_evidence_by_task: dict[str, Any] = {}
+    batch_scan_evidence = result.get("scan_evidence")
+    raw_batch_scan_task_ids = (
+        batch_scan_evidence.get("covered_task_ids", [])
+        if isinstance(batch_scan_evidence, Mapping)
+        else getattr(batch_scan_evidence, "covered_task_ids", ())
+    )
+    batch_scan_task_ids = set(raw_batch_scan_task_ids or ())
+    batch_scan_owner_task_id = next(
+        (task_id for task_id in active_task_ids if task_id in batch_scan_task_ids),
+        None,
+    )
     for task_id in active_task_ids:
         task = task_queue[task_id]
         attempt_id = task.current_attempt_id
@@ -1983,19 +2002,23 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
             qa_policy=attempt_policy,
             qa_policy_source="attempt_snapshot",
             evaluation=evaluation,
+            batch_scan_evidence=(
+                batch_scan_evidence if task_id == batch_scan_owner_task_id else None
+            ),
+            batch_scan_candidate_retained=(
+                bool(result.get("candidate_workspace_retained", False))
+                if task_id == batch_scan_owner_task_id
+                else False
+            ),
             investigation_report=reports_by_task.get(task_id, ""),
             errors=list(errors_by_task.get(task_id, []) or []),
         )
-        if evaluation.scan_evidence is not None:
-            scan_evidence_by_task[task_id] = evaluation.scan_evidence
     if qa_results_by_attempt:
         out["qa_results_by_attempt"] = qa_results_by_attempt
     if qa_batch_passed or qa_passed_workspace_prefix is not None:
         # Clear an older checkpoint when a newer all-passed QA batch cannot
         # produce complete provenance; retaining it would omit those changes.
         out["qa_passed_workspace_prefix"] = qa_passed_workspace_prefix
-    if scan_evidence_by_task:
-        out["scan_evidence_by_task"] = scan_evidence_by_task
     # Emit the complete projection so the replace reducer can clear anchors
     # after a successful update or an abandoned workaround.
     out["workspace_rollback_anchors_by_task"] = rollback_anchor_updates

@@ -30,17 +30,19 @@ from remediation_engine.orchestration._qa_runtime import (
     _collect_baseline_identifiers,
     _collect_target_identifiers,
     _scan_state_projection,
-    _workspace_remediation_fingerprint,
 )
-from remediation_engine.orchestration.qa_critic import run_final_full_scan_node
+from remediation_engine.orchestration.qa_critic import run_workspace_setup_scan_node
 from remediation_engine.orchestration.qa_odc import (
     _ODC_CACHE_VOLUME,
     _ODC_HTML_REPORT_NAME,
     _ODC_INTERNAL_FULL_SCAN_EXCLUDES,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
+    _parse_report_dependency_paths,
     _parse_report_identifiers,
+    _parse_report_package_occurrences,
     _read_report_from_workspace,
+    _run_incremental_security_scan,
     _run_odc,
     _run_security_scan,
     _run_targeted_odc,
@@ -63,69 +65,161 @@ from tests.test_qa_critic_support import (
 )
 
 
-def test_final_full_scan_converts_docker_api_error_to_scan_failure() -> None:
-    """A Docker/API teardown error must return typed state instead of raising."""
-    state = {"workspace_volume": "agent_workspace_deadbeef", "valid_groups": []}
-    with patch(
-        "remediation_engine.orchestration.qa_critic.DockerSandbox",
-        side_effect=Exception("409 Client Error: Conflict (volume is in use)"),
-    ):
-        result = run_final_full_scan_node(state)
-
-    assert result["final_full_scan_completed"] is True
-    assert result["status"] == "final_scan_failed"
-    assert result["final_full_scan_result"].status == "scan_failed"
-    assert "409" in result["errors"][0]
-
-
-def test_final_full_scan_records_workspace_fingerprint_for_next_validation(tmp_path) -> None:
-    """Final scans retain the prior workspace fingerprint for no-op detection."""
-    group = _make_group()
-    state = {
-        "repo_root": str(tmp_path),
-        "workspace_volume": "agent_workspace_fingerprint",
-        "valid_groups": [group],
-        "changed_files": [],
-    }
-    scan = _SecurityScanResult(
-        ok=True,
-        summary="Dependency-Check found no remaining target vulnerability identifiers.",
-        remaining_identifiers=set(),
-        found_identifiers=set(),
-        new_identifiers=set(),
+def test_report_dependency_paths_preserve_empty_reports_and_targeted_project_ids() -> None:
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "filePath": "/scan/.odc-targeted/001/pom.xml",
+                    "vulnerabilities": [],
+                },
+                {
+                    "filePath": ("scan/.odc-targeted/000/package-lock.json?node_modules/a"),
+                    "packages": [],
+                    "relatedDependencies": [
+                        {"filePath": ("/scan/.odc-targeted/002/package-lock.json?node_modules/a")},
+                        {"filePath": ("/scan/.odc-targeted/002/package-lock.json?node_modules/a")},
+                    ],
+                },
+            ]
+        }
     )
 
-    with (
-        patch("remediation_engine.orchestration.qa_critic.DockerSandbox"),
-        patch(
-            "remediation_engine.orchestration.qa_odc._run_security_scan",
-            return_value=scan,
+    assert _parse_report_dependency_paths(report) == [
+        ".odc-targeted/001/pom.xml",
+        ".odc-targeted/000/package-lock.json",
+        ".odc-targeted/002/package-lock.json",
+    ]
+    assert _parse_report_dependency_paths('{"dependencies": []}') == []
+    assert _parse_report_dependency_paths("{}") is None
+
+
+def test_report_package_occurrences_preserve_ecosystem_and_project_path() -> None:
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "filePath": "/scan/.odc-targeted/000/node_modules/a/package.json",
+                    "packages": [{"id": "pkg:npm/a@1.0.0"}],
+                },
+                {
+                    "filePath": "scan/.odc-targeted/001/pom.xml",
+                    "packages": [{"id": "pkg:maven/org.example/library@2.1.0"}],
+                },
+            ]
+        }
+    )
+    occurrences = _parse_report_package_occurrences(report)
+
+    assert occurrences is not None
+    assert [
+        (item.package_name, item.version, item.ecosystem, item.file_path) for item in occurrences
+    ] == [
+        ("a", "1.0.0", "npm", ".odc-targeted/000/node_modules/a/package.json"),
+        ("org.example:library", "2.1.0", "maven", ".odc-targeted/001/pom.xml"),
+    ]
+
+
+def test_report_package_occurrences_include_related_dependencies() -> None:
+    purl = "pkg:npm/buffer-equal-constant-time@1.0.1"
+    primary_path = (
+        "/scan/.odc-targeted/002/package-lock.json?jwa:1.4.2/buffer-equal-constant-time:^1.0.1"
+    )
+    direct_path = "/scan/.odc-targeted/002/package-lock.json?/buffer-equal-constant-time:1.0.1"
+    related_path = "/scan/.odc-targeted/000/package-lock.json?/buffer-equal-constant-time:1.0.1"
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "filePath": primary_path,
+                    "packages": [{"id": purl}],
+                    "relatedDependencies": [
+                        {"filePath": related_path, "packageIds": [{"id": purl}]},
+                        {"filePath": related_path, "packageIds": [{"id": purl}]},
+                        {"filePath": direct_path, "packageIds": [{"id": purl}]},
+                    ],
+                }
+            ]
+        }
+    )
+
+    occurrences = _parse_report_package_occurrences(report)
+
+    assert occurrences is not None
+    assert [
+        (item.package_name, item.version, item.file_path, item.raw_file_path)
+        for item in occurrences
+    ] == [
+        (
+            "buffer-equal-constant-time",
+            "1.0.1",
+            ".odc-targeted/002/package-lock.json",
+            primary_path,
         ),
-    ):
-        first = run_final_full_scan_node(state)
-        second = run_final_full_scan_node({**state, **first})
+        (
+            "buffer-equal-constant-time",
+            "1.0.1",
+            ".odc-targeted/000/package-lock.json",
+            related_path,
+        ),
+        (
+            "buffer-equal-constant-time",
+            "1.0.1",
+            ".odc-targeted/002/package-lock.json",
+            direct_path,
+        ),
+    ]
 
-    assert first["previous_final_scan_workspace_fingerprint"] is None
-    assert first["final_scan_workspace_fingerprint"]
-    assert (
-        second["previous_final_scan_workspace_fingerprint"]
-        == first["final_scan_workspace_fingerprint"]
-    )
-    assert second["final_scan_workspace_fingerprint"] == first["final_scan_workspace_fingerprint"]
 
-
-def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
-    """The fingerprint reflects content changes, not only candidate file names."""
-    (tmp_path / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
+def test_incremental_security_scan_reuses_targeted_runner_without_task_ids() -> None:
     sandbox = MagicMock()
-    sandbox.read_file.return_value = '{"version":"1.0.0"}'
+    scan_result = _SecurityScanResult(
+        True,
+        "incremental",
+        set(),
+        {"CVE-NEW"},
+        {"CVE-NEW"},
+    )
+    with patch(
+        "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+        return_value=scan_result,
+    ) as targeted_scan:
+        result = _run_incremental_security_scan(
+            sandbox,
+            "workspace-volume",
+            ".odc-targeted",
+            {"CVE-BASE"},
+        )
 
-    unchanged = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+    targeted_scan.assert_called_once_with(
+        sandbox,
+        "workspace-volume",
+        set(),
+        {"CVE-BASE"},
+        ".odc-targeted",
+    )
+    assert result.new_identifiers == {"CVE-NEW"}
 
-    sandbox.read_file.return_value = '{"version":"2.0.0"}'
-    changed = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
 
-    assert changed != unchanged
+def test_workspace_setup_scan_without_volume_returns_incomplete_evidence():
+    result = run_workspace_setup_scan_node({"workspace_volume": None})
+
+    assert result["setup_scan_evidence"].complete is False
+    assert result["setup_scan_evidence"].scan_performed is False
+    assert "workspace volume is missing" in result["errors"][0]
+
+
+def test_workspace_setup_scan_skips_incomplete_source_inventory():
+    with patch("remediation_engine.orchestration.qa_critic.DockerSandbox") as sandbox:
+        result = run_workspace_setup_scan_node(
+            {
+                "workspace_volume": "workspace-volume",
+                "package_inventory_baseline_complete": False,
+            }
+        )
+
+    sandbox.assert_not_called()
+    assert result == {}
 
 
 def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
