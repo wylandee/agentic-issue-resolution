@@ -1216,12 +1216,12 @@ def _qa_workspace_rollback_anchor_updates(
             anchors.pop(task.task_id, None)
             continue
         evidence = evaluation.failure_evidence
-        if evaluation.failure_category == FailureCategory.BREAKING_CHANGE or bool(
-            evidence and evidence.failed_tests
+        if result.get("candidate_workspace_retained") and (
+            evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+            or bool(evidence and evidence.failed_tests)
         ):
-            # setdefault makes this an immutable task baseline. The current
-            # failed candidate remains available to a workaround child, but
-            # it is never promoted to the rollback anchor for later retries.
+            # A persistent rollback anchor must still have a live archive.
+            # Finalization restores and deletes rejected atomic-batch snapshots.
             anchors.setdefault(task.task_id, snapshot_id)
     if workaround_passed:
         # The current workspace is now the authoritative cumulative patch.

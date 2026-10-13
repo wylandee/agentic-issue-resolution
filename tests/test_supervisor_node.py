@@ -4148,7 +4148,7 @@ def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attem
     assert set(result["attempt_snapshots_by_id"]) == {"attempt-source", "attempt-open"}
 
 
-def test_retained_regression_candidate_contributes_batch_scan_findings():
+def test_retained_regression_candidate_does_not_commit_batch_scan_findings():
     group = _sca_group("g-regression")
     attempt_id = "attempt-regression"
     task_revision = 1
@@ -4240,10 +4240,9 @@ def test_retained_regression_candidate_contributes_batch_scan_findings():
 
     assert result["task_queue"][task.task_id].status != TaskStatus.QA_PASSED
     assert result["latest_successful_scan_by_task"] == {}
-    assert result["new_vulnerability_identifiers"] == ["CVE-2026-10003"]
-    assert result["latest_incremental_scan_by_input"]["package-lock.json"].found_identifiers == [
-        "CVE-2026-10003"
-    ]
+    assert result["new_vulnerability_identifiers"] == []
+    assert result["latest_incremental_scan_by_input"] == {}
+    assert result["qa_results_by_attempt"][attempt_id].batch_scan_candidate_retained is True
 
 
 @pytest.mark.parametrize(

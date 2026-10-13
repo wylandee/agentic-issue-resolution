@@ -1576,6 +1576,76 @@ class TestPhase5GraphIntegration:
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-security")
         assert result["qa_results_by_attempt"]["attempt-security"].evaluation.passed is False
 
+    def test_atomic_regression_does_not_anchor_removed_batch_snapshot(self):
+        target_tasks = [
+            SimpleNamespace(
+                task_id="task-a",
+                parent_task_id=None,
+                current_attempt_id="attempt-a",
+            ),
+            SimpleNamespace(
+                task_id="task-b",
+                parent_task_id=None,
+                current_attempt_id="attempt-b",
+            ),
+        ]
+        attempt_snapshots = {
+            "attempt-a": SimpleNamespace(
+                dispatch_node="update_subagent",
+                cluster_id="cluster-atomic",
+            ),
+            "attempt-b": SimpleNamespace(
+                dispatch_node="update_subagent",
+                cluster_id="cluster-atomic",
+            ),
+        }
+        state = {
+            "workspace_volume": "workspace-volume",
+            "attempt_snapshots_by_id": attempt_snapshots,
+            "workspace_rollback_anchors_by_task": {},
+        }
+        result = {
+            "status": "qa_completed",
+            "qa_evaluations": {
+                task.task_id: QAEvaluation(
+                    task_id=task.task_id,
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The atomic candidate failed tests.",
+                )
+                for task in target_tasks
+            },
+        }
+        snapshot_id = "batch-atomic"
+        sandbox = MagicMock()
+        sandbox.__enter__.return_value = sandbox
+        graph_module = SimpleNamespace(
+            DockerSandbox=MagicMock(return_value=sandbox),
+        )
+
+        with patch(
+            "remediation_engine.orchestration.graph_wrappers._graph_module",
+            return_value=graph_module,
+        ):
+            cleanup_errors = _graph_wrappers._finalize_qa_workspace_snapshot(
+                state,
+                target_tasks,
+                snapshot_id,
+                result,
+            )
+            rollback_anchors = _graph_wrappers._qa_workspace_rollback_anchor_updates(
+                state,
+                target_tasks,
+                snapshot_id,
+                result,
+            )
+
+        assert cleanup_errors == []
+        sandbox.restore_workspace_snapshot.assert_called_once_with(snapshot_id)
+        sandbox.remove_workspace_snapshot.assert_called_once_with(snapshot_id)
+        assert result["candidate_workspace_retained"] is False
+        assert rollback_anchors == {}
+
     def test_workaround_regression_restores_to_original_pre_update_workspace(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(

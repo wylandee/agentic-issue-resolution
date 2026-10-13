@@ -3149,6 +3149,13 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         if not covered_task_ids or not set(covered_task_ids).issubset(current_qa_results_by_task):
             continue
         covered_results = [current_qa_results_by_task[task_id] for task_id in covered_task_ids]
+        # Retained candidates can still be useful for a workaround, but their
+        # report-wide findings are not part of the accepted cumulative ledger.
+        if any(not result.evaluation.passed for result in covered_results):
+            continue
+        covered_tasks = [task_queue.get(task_id) for task_id in covered_task_ids]
+        if any(task is None or task.status != TaskStatus.QA_PASSED for task in covered_tasks):
+            continue
         input_snapshots = _incremental_scan_records_from_evidence(
             evidence,
             task_ids=covered_task_ids,
