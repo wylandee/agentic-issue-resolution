@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from remediation_engine.contracts.schemas import (
     DependencyEvidenceStatus,
     FailureCategory,
+    IssueType,
     ODCScanEvidence,
     QADeterministicGates,
     QAEvaluation,
@@ -222,9 +223,21 @@ def _evaluate_policy_gates(
         task_id = context.task_id
         group = context.group
         policy = task_policies.get(task_id)
+        task_scan_evidence = results.scan_evidence_by_task.get(task_id)
+        target_package_absent = (
+            group.issue_type == IssueType.SCA
+            and results.scan_target_skipped_by_task.get(task_id)
+            == ScanFallbackReason.NO_MATCHING_TARGET.value
+            and task_id not in results.scan_target_failures_by_task
+            and task_scan_evidence is not None
+            and task_scan_evidence.complete
+            and task_id in task_scan_evidence.covered_task_ids
+            and task_scan_evidence.scan_skip_reason == ScanFallbackReason.NO_MATCHING_TARGET.value
+        )
         effective_scanner_status = (
             ScannerExecutionStatus.SUCCESS
-            if results.scan_skipped and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL
+            if target_package_absent
+            or (results.scan_skipped and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL)
             else scanner_status
         )
         remaining = sorted(group_target_identifiers(group) & remaining_global)
@@ -241,16 +254,17 @@ def _evaluate_policy_gates(
                 f"Scanner execution status: {effective_scanner_status.value}. "
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
             )
-        if task_id in results.scan_target_skipped_by_task:
+        if target_package_absent:
             diagnostics.append(
-                "Targeted ODC was skipped because the target package was absent "
-                "from the live lockfile."
+                "Targeted ODC was skipped because complete lockfile evidence proved "
+                "the target package absent."
             )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED:
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
             diagnostics.extend(package_state.diagnostics)
         if (
             _QA_PACKAGE_STATE_CHECKS_ENABLED
             and policy == QAPolicy.VERSION_BUMP
+            and not target_package_absent
             and dependency_evidence is None
         ):
             diagnostics.append("Deterministic dependency evidence was not collected.")
@@ -265,19 +279,25 @@ def _evaluate_policy_gates(
             deterministic_pass = deterministic_pass and target_cleared
         if policy in _HARD_TEST_QA_POLICIES:
             deterministic_pass = deterministic_pass and tests_passed is True
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.VERSION_BUMP:
+        if (
+            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            and policy == QAPolicy.VERSION_BUMP
+            and not target_package_absent
+        ):
             deterministic_pass = (
                 deterministic_pass
                 and dependency_evidence is not None
                 and dependency_evidence.status == DependencyEvidenceStatus.VERIFIED
             )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
-            deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
-            deterministic_pass = deterministic_pass and package_state.graph_state == "absent"
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_CODE_REMOVAL:
-            deterministic_pass = deterministic_pass and package_state.manifest_state == "present"
-            deterministic_pass = deterministic_pass and package_state.graph_state == "present"
-
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
+            if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
+                deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
+                deterministic_pass = deterministic_pass and package_state.graph_state == "absent"
+            if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+                deterministic_pass = (
+                    deterministic_pass and package_state.manifest_state == "present"
+                )
+                deterministic_pass = deterministic_pass and package_state.graph_state == "present"
         gates_by_task[task_id] = QADeterministicGates(
             dependency_evidence=dependency_evidence,
             status="pass" if deterministic_pass else "fail",
@@ -285,6 +305,7 @@ def _evaluate_policy_gates(
             scanner_execution_status=effective_scanner_status,
             target_remaining_identifiers=remaining,
             target_scanner_cleared=target_cleared,
+            target_package_absent=target_package_absent,
             tests_passed=tests_passed,
             package_manifest_state=package_state.manifest_state,
             package_graph_state=package_state.graph_state,
@@ -466,6 +487,38 @@ def _apply_policy_decision(
         policy = task_policies.get(task_id)
         current = normalized[task_id]
         gates = gates_by_task[task_id]
+        if (
+            policy is not None
+            and group.issue_type == IssueType.SCA
+            and gates.target_package_absent
+            and gates.install_passed
+            and gates.scanner_execution_status == ScannerExecutionStatus.SUCCESS
+            and gates.target_scanner_cleared is True
+            and not gates.target_remaining_identifiers
+        ):
+            attribution = current.test_attribution
+            version_bump_test_exonerated = (
+                policy == QAPolicy.VERSION_BUMP
+                and gates.tests_passed is False
+                and not current.contract_error
+                and attribution is not None
+                and attribution.verdict == TestAttributionVerdict.EXONERATED
+                and _valid_test_attribution(current, group.group_id, known_group_ids)
+            )
+            tests_satisfied = (
+                gates.tests_passed is True
+                or version_bump_test_exonerated
+                or (policy not in _HARD_TEST_QA_POLICIES and policy != QAPolicy.VERSION_BUMP)
+            )
+            if tests_satisfied:
+                final[task_id] = QAEvaluation(
+                    task_id=task_id,
+                    passed=True,
+                    deterministic_gates=gates,
+                    test_attribution=attribution,
+                )
+                continue
+
         if current.contract_error:
             reason = (
                 current.contract_error_reason.strip()
@@ -509,6 +562,7 @@ def _apply_policy_decision(
         dependency_evidence_inconclusive = (
             _QA_PACKAGE_STATE_CHECKS_ENABLED
             and policy == QAPolicy.VERSION_BUMP
+            and not gates.target_package_absent
             and (
                 gates.dependency_evidence is None
                 or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
@@ -584,6 +638,7 @@ def _apply_policy_decision(
         if (
             _QA_PACKAGE_STATE_CHECKS_ENABLED
             and policy == QAPolicy.VERSION_BUMP
+            and not gates.target_package_absent
             and gates.dependency_evidence is not None
             and gates.dependency_evidence.status == DependencyEvidenceStatus.MISMATCH
         ):
@@ -619,40 +674,46 @@ def _apply_policy_decision(
                         "VERSION_BUMP tests failed without valid structured exoneration evidence.",
                     )
                 )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
-            if gates.package_manifest_state != "absent":
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "NO_FIX Stage 1 requires the package to be absent from every authorized direct manifest.",
+        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not gates.target_package_absent:
+            if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
+                if gates.package_manifest_state != "absent":
+                    failures.append(
+                        (
+                            FailureCategory.SECURITY_FLAG,
+                            "NO_FIX Stage 1 requires the package to be absent from every authorized direct manifest.",
+                        )
                     )
-                )
-            if gates.package_graph_state != "absent":
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "NO_FIX Stage 1 requires the package to be absent from the resolved dependency graph.",
+                if gates.package_graph_state != "absent":
+                    failures.append(
+                        (
+                            FailureCategory.SECURITY_FLAG,
+                            "NO_FIX Stage 1 requires the package to be absent from the resolved dependency graph.",
+                        )
                     )
-                )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.NO_FIX_CODE_REMOVAL:
-            if gates.package_manifest_state != "present":
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "NO_FIX Stage 2 requires the package to remain present in the direct manifest.",
+            if policy == QAPolicy.NO_FIX_CODE_REMOVAL:
+                if gates.package_manifest_state != "present":
+                    failures.append(
+                        (
+                            FailureCategory.SECURITY_FLAG,
+                            "NO_FIX Stage 2 requires the package to remain present in the direct manifest.",
+                        )
                     )
-                )
-            if gates.package_graph_state != "present":
-                failures.append(
-                    (
-                        FailureCategory.SECURITY_FLAG,
-                        "NO_FIX Stage 2 requires the package to remain present in the resolved dependency graph.",
+                if gates.package_graph_state != "present":
+                    failures.append(
+                        (
+                            FailureCategory.SECURITY_FLAG,
+                            "NO_FIX Stage 2 requires the package to remain present in the resolved dependency graph.",
+                        )
                     )
-                )
 
         semantic_review = current.semantic_security_review
-        if policy in _REQUIRED_SEMANTIC_QA_POLICIES and not _semantic_review_is_evidence_backed(
-            semantic_review, (investigations_by_task or {}).get(task_id)
+
+        if (
+            policy in _REQUIRED_SEMANTIC_QA_POLICIES
+            and not gates.target_package_absent
+            and not _semantic_review_is_evidence_backed(
+                semantic_review, (investigations_by_task or {}).get(task_id)
+            )
         ):
             if semantic_review is None or semantic_review.verdict == SecurityReviewVerdict.PASS:
                 semantic_review = QASemanticSecurityReview(

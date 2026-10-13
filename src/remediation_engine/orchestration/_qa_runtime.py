@@ -2377,7 +2377,7 @@ def _resolve_targeted_packages(
             )
             continue
         if not task_resolutions:
-            if target.task_id in failures_by_task or not missing_target_paths:
+            if target.task_id in change_batch.failures_by_task or not missing_target_paths:
                 retain_failure(
                     target.task_id,
                     _TargetedPackageResolutionFailure(
@@ -2387,11 +2387,7 @@ def _resolve_targeted_packages(
                 )
                 continue
             covered_task_ids.add(target.task_id)
-            has_other_scan_input = bool(closures_by_task.get(target.task_id)) or any(
-                target.task_id in project.task_ids for project in non_npm_input_projects
-            )
-            if not has_other_scan_input:
-                skipped_task_ids.add(target.task_id)
+            skipped_task_ids.add(target.task_id)
             logger.info(
                 "qa_critic: target package %s was absent from its live lockfiles; "
                 "skipping that package's targeted scan.",
@@ -3148,9 +3144,11 @@ def _scan_evidence_by_task(
                 "removed_occurrence_keys": task_inventory_removals,
                 "inventory_updates": task_inventory_updates,
                 "inventory_removals": task_inventory_removals,
-                "scan_performed": evidence.scan_performed and not target_skipped,
-                "scan_skip_reason": "no_matching_target" if target_skipped else None,
-                "complete": task_complete,
+                "scan_performed": evidence.scan_performed
+                and (not target_skipped or bool(project_paths)),
+                "scan_skip_reason": (
+                    "no_matching_target" if target_skipped and task_complete else None
+                ),
                 "fallback_reason": (
                     task_failure.reason
                     if task_failure is not None

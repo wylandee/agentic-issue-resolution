@@ -78,6 +78,10 @@ from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
 )
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
+from remediation_engine.orchestration._qa_runtime import (
+    _lockfile_paths_for_group,
+    _parse_package_occurrence_key,
+)
 from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
 from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
@@ -143,6 +147,13 @@ from remediation_engine.tools.npm_graph import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VERIFIED_ABSENT_REMEDIATION_ACTION = (
+    "Removed due to another package upgrade; target absent from every covered package-lock input."
+)
+_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON = (
+    "Verified target-package absence changed portfolio membership."
+)
 
 # Supervisor dispatch commits one task attempt at a time. Worker and QA
 # boundaries consume only the typed task/attempt envelopes.
@@ -218,6 +229,132 @@ def _task_scan_record_from_qa_result(
         inventory_updates=dict(evidence.inventory_updates),
         complete=evidence.complete,
     )
+
+
+def _verified_absent_package_tasks(
+    task_queue: Mapping[str, RemediationTask],
+    group_by_id: Mapping[str, VulnerabilityGroup],
+    latest_successful_scan_by_task: Mapping[str, TaskScanRecord],
+    accepted_package_inventory_by_lockfile: Mapping[str, str],
+) -> dict[str, str]:
+    """Find untouched SCA tasks whose target is proven absent from covered lockfiles.
+
+    A candidate requires a complete accepted scan record covering every
+    supported package-lock input, a valid target-removal tombstone in those
+    inputs, and no current inventory occurrence of the target package.
+
+    Args:
+        task_queue: Authoritative tasks eligible for Supervisor reconciliation.
+        group_by_id: Vulnerability groups keyed by their stable group IDs.
+        latest_successful_scan_by_task: Complete QA-passed scan records accepted
+            by the Supervisor.
+        accepted_package_inventory_by_lockfile: Current physical package-lock
+            occurrence inventory after accepted scan deltas.
+
+    Returns:
+        Task IDs mapped to target package names when absence is fully verified.
+    """
+
+    def normalized_input_path(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            not normalized
+            or normalized != value
+            or normalized.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            return None
+        return normalized
+
+    inventory_packages_by_path: dict[str, set[str]] = {}
+    for occurrence_key in accepted_package_inventory_by_lockfile:
+        occurrence = _parse_package_occurrence_key(occurrence_key)
+        if occurrence is None:
+            return {}
+        source_path, _lockfile_key, package_name, _version, _index = occurrence
+        inventory_packages_by_path.setdefault(source_path, set()).add(package_name)
+
+    verified: dict[str, str] = {}
+    for task_id, task in sorted(task_queue.items()):
+        if (
+            task.is_synthetic
+            or task.status not in {TaskStatus.PENDING, TaskStatus.NEEDS_RETRY}
+            or task.current_attempt_id is not None
+        ):
+            continue
+        group = group_by_id.get(task.parent_group_id)
+        if group is None or group.issue_type != IssueType.SCA:
+            continue
+        target_package_name = (task.target_package_name or group.vulnerable_component or "").strip()
+        if not target_package_name:
+            continue
+        target_package_key = target_package_name.casefold()
+
+        lockfile_paths = _lockfile_paths_for_group(group)
+        if not lockfile_paths:
+            continue
+        normalized_lockfile_paths: set[str] = set()
+        paths_supported = True
+        for raw_path in lockfile_paths:
+            path = normalized_input_path(raw_path)
+            if path is None or path.rsplit("/", 1)[-1].casefold() != "package-lock.json":
+                paths_supported = False
+                break
+            normalized_lockfile_paths.add(path)
+        if not paths_supported or not normalized_lockfile_paths:
+            continue
+
+        covered_paths: set[str] = set()
+        has_target_tombstone = False
+        malformed_record = False
+        for record_task_id, scan_record in latest_successful_scan_by_task.items():
+            if not scan_record.complete or scan_record.task_id != record_task_id:
+                continue
+            record_paths: set[str] = set()
+            for raw_path in scan_record.covered_input_paths:
+                path = normalized_input_path(raw_path)
+                if path is None:
+                    malformed_record = True
+                    break
+                record_paths.add(path)
+            if malformed_record:
+                break
+
+            for tombstone in scan_record.removed_occurrence_keys:
+                occurrence = _parse_package_occurrence_key(tombstone)
+                if occurrence is None:
+                    if record_paths.intersection(normalized_lockfile_paths):
+                        malformed_record = True
+                        break
+                    continue
+                source_path, _lockfile_key, package_name, _version, _index = occurrence
+                if source_path not in normalized_lockfile_paths:
+                    continue
+                if source_path not in record_paths:
+                    malformed_record = True
+                    break
+                if package_name == target_package_key:
+                    has_target_tombstone = True
+            if malformed_record:
+                break
+            covered_paths.update(record_paths.intersection(normalized_lockfile_paths))
+
+        if (
+            malformed_record
+            or covered_paths != normalized_lockfile_paths
+            or not has_target_tombstone
+            or any(
+                target_package_key in package_names
+                for package_names in inventory_packages_by_path.values()
+            )
+        ):
+            continue
+        verified[task_id] = target_package_name
+
+    return verified
 
 
 def _incremental_scan_records_from_evidence(
@@ -1437,6 +1574,7 @@ def _commit_task_transition(
     close_attempt: bool = False,
     clear_selected_version: bool = False,
     allow_breaking_change_pivot: bool = False,
+    allow_verified_absent_target_pass: bool = False,
     consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     with _supervisor_execution_helpers._bind_dependencies(
@@ -1452,6 +1590,7 @@ def _commit_task_transition(
             close_attempt=close_attempt,
             clear_selected_version=clear_selected_version,
             allow_breaking_change_pivot=allow_breaking_change_pivot,
+            allow_verified_absent_target_pass=allow_verified_absent_target_pass,
             consistency_events=consistency_events,
         )
 
@@ -3038,6 +3177,39 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 portfolio_replan_request = None
+    verified_absent_package_tasks = _verified_absent_package_tasks(
+        task_queue,
+        group_by_id,
+        latest_successful_scan_by_task,
+        accepted_package_inventory_by_lockfile,
+    )
+    verified_absent_portfolio_task_ids: set[str] = set()
+    for task_id, package_name in verified_absent_package_tasks.items():
+        committed_task = _commit_task_transition(
+            task_queue,
+            task_id,
+            updates={
+                "status": TaskStatus.QA_PASSED,
+                "remediation_action": _VERIFIED_ABSENT_REMEDIATION_ACTION,
+            },
+            close_attempt=True,
+            clear_selected_version=True,
+            allow_verified_absent_target_pass=True,
+        )
+        if committed_task is None or committed_task.status != TaskStatus.QA_PASSED:
+            continue
+        logger.info(
+            "supervisor: closed task %s without a worker because %s is absent.",
+            task_id,
+            package_name,
+        )
+        if committed_plan is not None and task_id in set(committed_plan.task_ids):
+            verified_absent_portfolio_task_ids.add(task_id)
+    if verified_absent_portfolio_task_ids and committed_plan is not None:
+        portfolio_replan_request = PortfolioReplanRequest(
+            reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+            source_portfolio_plan_id=(committed_plan.portfolio_plan_id or committed_plan.plan_id),
+        )
     # 4. Mark UNFIXABLE tasks that hit the retry cap
     # ------------------------------------------------------------------
     for task_id, task in task_queue.items():
@@ -3255,24 +3427,159 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
         for task in task_queue.values()
     )
-    portfolio_replan_required = bool(
-        state.get("portfolio_plan") is not None
-        and not active_attempt_is_open
-        and _portfolio_plan_is_stale(
-            state.get("portfolio_plan"),
-            task_queue,
-            valid_groups,
-            state.get("repo_root"),
+    verified_absent_portfolio_replan_pending = bool(
+        committed_plan is not None
+        and isinstance(portfolio_replan_request, PortfolioReplanRequest)
+        and portfolio_replan_request.reason == _VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON
+        and portfolio_replan_request.source_portfolio_plan_id
+        == (
+            getattr(committed_plan, "portfolio_plan_id", None)
+            or getattr(committed_plan, "plan_id", None)
         )
     )
+    portfolio_replan_required = bool(
+        committed_plan is not None
+        and not active_attempt_is_open
+        and (
+            verified_absent_portfolio_replan_pending
+            or _portfolio_plan_is_stale(
+                committed_plan,
+                task_queue,
+                valid_groups,
+                state.get("repo_root"),
+            )
+        )
+    )
+    defer_verified_absent_portfolio_replan = (
+        verified_absent_portfolio_replan_pending and active_attempt_is_open
+    )
+    resumable_open_attempt_task_ids: set[str] = set()
+
+    def existing_attempt_targets(next_node: str, target_ids: Iterable[str]) -> list[str]:
+        """Keep only targets that can resume their current committed worker attempt."""
+        selected: list[str] = []
+        for task_id in target_ids:
+            if task_id not in resumable_open_attempt_task_ids:
+                continue
+            task = task_queue.get(task_id)
+            if (
+                task is None
+                or task.current_attempt_id is None
+                or task.status not in _WORKABLE_STATUSES
+            ):
+                continue
+            snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+            if (
+                snapshot is None
+                or snapshot.task_id != task_id
+                or snapshot.dispatch_node != next_node
+            ):
+                continue
+            if next_node == "update_subagent" and task.strategy != RoutingStrategy.VERSION_BUMP:
+                continue
+            if (
+                next_node == "workaround_subagent"
+                and task.strategy != RoutingStrategy.CODE_WORKAROUND
+            ):
+                continue
+            selected.append(task_id)
+        return selected
+
     if portfolio_replan_required:
         deterministic_decision = SupervisorDecision(
             decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
             next_node="portfolio",
             target_task_ids=[],
             instructions="Rebuild the package-group portfolio plan after task reconciliation.",
-            decision_reason="The committed portfolio plan is stale after a completed attempt.",
+            decision_reason=(
+                _VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON
+                if verified_absent_portfolio_replan_pending
+                else "The committed portfolio plan is stale after a completed attempt."
+            ),
         )
+    elif defer_verified_absent_portfolio_replan:
+        open_attempt_task_ids = [
+            task_id
+            for task_id, task in sorted(task_queue.items())
+            if task.current_attempt_id is not None and task.status not in _TERMINAL_STATUSES
+        ]
+        atomic_open_task_ids = [
+            task_id for task_id in atomic_cluster_task_ids if task_id in open_attempt_task_ids
+        ]
+        atomic_batch_qa_ready = bool(atomic_open_task_ids) and all(
+            task_queue[task_id].status == TaskStatus.OPTIMISTICALLY_FIXED
+            for task_id in atomic_open_task_ids
+        )
+        qa_preferred_ids = (
+            atomic_open_task_ids
+            if atomic_batch_qa_ready
+            else [
+                task_id for task_id in open_attempt_task_ids if task_id not in atomic_open_task_ids
+            ]
+        )
+        qa_ready_ids = _qa_ready_task_ids(
+            task_queue,
+            preferred_ids=qa_preferred_ids,
+            limit=None if atomic_batch_qa_ready else QA_DISPATCH_LIMIT,
+        )
+        if qa_ready_ids:
+            qa_cluster_id = None
+            if atomic_batch_qa_ready and len(qa_ready_ids) > 1:
+                qa_cluster_id = attempt_snapshots_by_id[
+                    task_queue[qa_ready_ids[0]].current_attempt_id
+                ].cluster_id
+            deterministic_decision = SupervisorDecision(
+                next_node="qa_critic",
+                target_task_ids=qa_ready_ids,
+                cluster_id=qa_cluster_id,
+                instructions="Finish QA for committed attempts before rebuilding the portfolio.",
+                decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+            )
+        else:
+            resumable_attempts: list[tuple[str, TaskAttemptSnapshot]] = []
+            for task_id in open_attempt_task_ids:
+                task = task_queue[task_id]
+                if task.status == TaskStatus.OPTIMISTICALLY_FIXED:
+                    continue
+                snapshot = attempt_snapshots_by_id.get(task.current_attempt_id or "")
+                if (
+                    snapshot is not None
+                    and snapshot.task_id == task_id
+                    and snapshot.dispatch_node in {"update_subagent", "workaround_subagent"}
+                ):
+                    resumable_attempts.append((task_id, snapshot))
+            if resumable_attempts:
+                first_task_id, first_snapshot = resumable_attempts[0]
+                if first_snapshot.dispatch_batch_id:
+                    resume_ids = [
+                        task_id
+                        for task_id, snapshot in resumable_attempts
+                        if snapshot.dispatch_node == first_snapshot.dispatch_node
+                        and snapshot.dispatch_batch_id == first_snapshot.dispatch_batch_id
+                    ]
+                else:
+                    resume_ids = [first_task_id]
+                resumable_open_attempt_task_ids.update(resume_ids)
+                resume_cluster_id = first_snapshot.cluster_id if len(resume_ids) > 1 else None
+                deterministic_decision = SupervisorDecision(
+                    next_node=first_snapshot.dispatch_node,
+                    target_task_ids=resume_ids,
+                    cluster_id=resume_cluster_id,
+                    instructions="Continue existing committed attempts before rebuilding the portfolio.",
+                    decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+                )
+            else:
+                errors.append(
+                    "supervisor: verified absence dirtied the portfolio while a live attempt "
+                    "had no resumable committed snapshot."
+                )
+                deterministic_decision = SupervisorDecision(
+                    decision_code=DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+                    next_node="portfolio",
+                    target_task_ids=[],
+                    instructions="Rebuild the portfolio after reconciling the invalid live attempt.",
+                    decision_reason=_VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON,
+                )
     else:
         deterministic_decision = _deterministic_routing(
             task_queue,
@@ -3376,11 +3683,16 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 limit=None if decision.cluster_id else QA_DISPATCH_LIMIT,
             )
         elif decision.next_node == "update_subagent":
-            valid_target_ids = _update_worker_task_ids(
-                task_queue,
-                retry_diagnostics_by_task,
-                preferred_ids=list(decision.target_task_ids),
-                limit=None if decision.cluster_id else UPDATE_DISPATCH_LIMIT,
+            valid_target_ids = (
+                existing_attempt_targets("update_subagent", decision.target_task_ids)
+                if defer_verified_absent_portfolio_replan
+                else _update_worker_task_ids(
+                    task_queue,
+                    retry_diagnostics_by_task,
+                    preferred_ids=list(decision.target_task_ids),
+                    limit=None if decision.cluster_id else UPDATE_DISPATCH_LIMIT,
+                    group_by_id=group_by_id,
+                )
             )
         elif decision.next_node == "workaround_subagent":
             valid_target_ids = []
@@ -3388,6 +3700,9 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 if t_id not in known_task_ids:
                     continue
                 task = task_queue[t_id]
+                if defer_verified_absent_portfolio_replan:
+                    valid_target_ids.extend(existing_attempt_targets("workaround_subagent", [t_id]))
+                    continue
                 if (
                     task.status in _TERMINAL_STATUSES
                     or task.status not in _WORKABLE_STATUSES
@@ -3916,25 +4231,43 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         resolved_target_task_ids = []
         remapped_feedback_by_task = {}
     resolved_next_node = decision.next_node
-    resolved_target_task_ids = _normalize_target_task_ids_for_node(
-        resolved_next_node,
-        resolved_target_task_ids,
-        task_queue,
-        retry_diagnostics_by_task,
-        group_by_id,
-        allow_cluster=bool(decision.cluster_id),
-    )
+    if defer_verified_absent_portfolio_replan and resolved_next_node in {
+        "update_subagent",
+        "workaround_subagent",
+    }:
+        resolved_target_task_ids = existing_attempt_targets(
+            resolved_next_node,
+            resolved_target_task_ids,
+        )
+    else:
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            resolved_target_task_ids,
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
+        )
     # Status overrides and parent terminalization above are also untrusted
     # router requests. Re-clamp after those mutations so a task that became
     # terminal in this transition cannot remain in the dispatch projection.
-    resolved_target_task_ids = _normalize_target_task_ids_for_node(
-        resolved_next_node,
-        resolved_target_task_ids,
-        task_queue,
-        retry_diagnostics_by_task,
-        group_by_id,
-        allow_cluster=bool(decision.cluster_id),
-    )
+    if defer_verified_absent_portfolio_replan and resolved_next_node in {
+        "update_subagent",
+        "workaround_subagent",
+    }:
+        resolved_target_task_ids = existing_attempt_targets(
+            resolved_next_node,
+            resolved_target_task_ids,
+        )
+    else:
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            resolved_target_task_ids,
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
+        )
     remapped_feedback_by_task = {
         task_id: feedback
         for task_id, feedback in remapped_feedback_by_task.items()
@@ -4025,7 +4358,21 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     active_dispatch_batch_id: str | None = None
     active_multi_package_action: MultiPackageAction | None = None
     portfolio_dispatch_rejected = False
-    if resolved_next_node == "update_subagent" and decision.cluster_id:
+    if (
+        defer_verified_absent_portfolio_replan
+        and resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}
+        and resolved_target_task_ids
+    ):
+        resumed_snapshots = [
+            attempt_snapshots_by_id.get(task_queue[task_id].current_attempt_id or "")
+            for task_id in resolved_target_task_ids
+        ]
+        resumed_snapshots = [snapshot for snapshot in resumed_snapshots if snapshot is not None]
+        if resumed_snapshots:
+            active_cluster_id = resumed_snapshots[0].cluster_id
+            active_dispatch_batch_id = resumed_snapshots[0].dispatch_batch_id
+            active_multi_package_action = state.get("active_multi_package_action")
+    elif resolved_next_node == "update_subagent" and decision.cluster_id:
         action = _build_multi_package_action(
             decision.cluster_id,
             resolved_target_task_ids,
@@ -4070,7 +4417,6 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         active_cluster_id = decision.cluster_id
         active_dispatch_batch_id = state.get("active_dispatch_batch_id")
         active_multi_package_action = state.get("active_multi_package_action")
-
     if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}:
         for task_id in list(resolved_target_task_ids):
             task = task_queue.get(task_id)
@@ -4083,6 +4429,14 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                     errors.append(
                         f"supervisor: rejected QA target '{task_id}' because no "
                         "committed worker attempt exists."
+                    )
+                continue
+            if defer_verified_absent_portfolio_replan and task.current_attempt_id is not None:
+                snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+                if snapshot is None or snapshot.dispatch_node != resolved_next_node:
+                    errors.append(
+                        f"supervisor: preserved live attempt for {task_id} because its "
+                        "committed snapshot does not match the resumed route."
                     )
                 continue
             plan = retry_plans_by_task.get(task_id)
@@ -4232,7 +4586,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
     # attempt-correlated audit record.
     errors = list(dict.fromkeys(error for error in errors if error not in prior_error_messages))
 
-    portfolio_dirty = bool(state.get("portfolio_dirty", False)) or portfolio_dispatch_rejected
+    portfolio_dirty = (
+        bool(state.get("portfolio_dirty", False))
+        or portfolio_dispatch_rejected
+        or verified_absent_portfolio_replan_pending
+    )
     if state.get("portfolio_plan") is not None:
         portfolio_dirty = portfolio_dirty or _portfolio_plan_is_stale(
             state.get("portfolio_plan"),

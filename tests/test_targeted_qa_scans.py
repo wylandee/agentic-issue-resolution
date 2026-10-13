@@ -10,14 +10,22 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from remediation_engine.contracts.schemas import (
+    FailureCategory,
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
     ODCScanEvidence,
     PackageScanOccurrence,
+    QAEvaluation,
+    QAPolicy,
+    RemediationTask,
+    RoutingStrategy,
     ScanFallbackReason,
     ScannerExecutionStatus,
     ScanScope,
     Severity,
+    VulnerabilityGroup,
     VulnerabilityIssue,
 )
 from remediation_engine.orchestration._qa_runtime import (
@@ -35,12 +43,17 @@ from remediation_engine.orchestration.qa_critic import (
     _run_global_execution,
     run_workspace_setup_scan_node,
 )
+from remediation_engine.orchestration.qa_policy_engine import (
+    _apply_policy_decision,
+    _evaluate_policy_gates,
+)
 from remediation_engine.orchestration.qa_test_parsing import (
     _QAInstallOutcome,
     _QATestExecutionOutcome,
 )
 from remediation_engine.orchestration.qa_types import (
     QAScanTarget,
+    QATaskContext,
     _QAExecutionResults,
     _QALogRecord,
     _SecurityScanResult,
@@ -71,6 +84,41 @@ def _lockfile() -> str:
             },
         }
     )
+
+
+def _target_qa_context() -> QATaskContext:
+    """Build a VERSION_BUMP task matching the targeted scan fixture."""
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-0001",
+        package_name="a",
+        package_version="1.0.0",
+    )
+    group = VulnerabilityGroup(
+        group_id="group-1",
+        issue_type=IssueType.SCA,
+        vulnerable_component="a",
+        file_paths=["package.json"],
+        cve_ids=["CVE-2026-0001"],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        fix_plan=FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="2.0.0",
+            instruction="Upgrade a to 2.0.0.",
+            strategy_used="test",
+        ),
+    )
+    task = RemediationTask(
+        task_id="task-1",
+        parent_group_id=group.group_id,
+        strategy=RoutingStrategy.VERSION_BUMP,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        target_package_name="a",
+    )
+    return QATaskContext(task=task, group=group)
 
 
 def _install_outcome(ok: bool = True) -> _QAInstallOutcome:
@@ -747,6 +795,155 @@ def test_missing_target_package_skips_odc_and_is_complete_evidence() -> None:
     assert task_evidence.scan_performed is False
     assert task_evidence.scan_skip_reason == "no_matching_target"
     assert _scan_state_projection(results, {"CVE-2026-0001"})["new_vulnerability_status"] == "none"
+    context = _target_qa_context()
+    task_policies = {context.task_id: QAPolicy.VERSION_BUMP}
+    gates, _ = _evaluate_policy_gates([context], results, task_policies)
+    assert gates[context.task_id].target_package_absent is True
+    evaluation_by_task, _ = _apply_policy_decision(
+        [context],
+        [
+            QAEvaluation(
+                task_id=context.task_id,
+                passed=False,
+                failure_category=FailureCategory.SECURITY_FLAG,
+                retry_feedback="Package-specific review failed.",
+            )
+        ],
+        gates,
+        task_policies,
+    )
+    assert evaluation_by_task[context.task_id].passed is True
+
+
+def test_target_package_at_another_version_is_not_absent() -> None:
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/a": {"version": "0.9.0"},
+            },
+        }
+    )
+
+    batch = _resolve_targeted_packages(sandbox, [_target()])
+
+    assert batch.skipped_task_ids == ()
+    assert batch.failures_by_task["task-1"].reason == ScanFallbackReason.TARGETED_SCAN_FAILED
+
+
+@pytest.mark.parametrize(
+    ("lockfile_text", "reason"),
+    [
+        (None, ScanFallbackReason.MISSING_LOCKFILE),
+        ("{", ScanFallbackReason.INVALID_LOCKFILE),
+        (json.dumps({"lockfileVersion": 3, "packages": []}), ScanFallbackReason.INVALID_LOCKFILE),
+    ],
+    ids=["unreadable", "malformed-json", "invalid-packages-map"],
+)
+def test_unreadable_or_invalid_lockfile_is_not_absence_evidence(
+    lockfile_text: str | None,
+    reason: ScanFallbackReason,
+) -> None:
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = lockfile_text
+
+    batch = _resolve_targeted_packages(sandbox, [_target()])
+
+    assert batch.skipped_task_ids == ()
+    assert batch.failures_by_task["task-1"].reason == reason
+
+
+def test_absent_target_keeps_other_changed_closures_and_findings() -> None:
+    baseline_lockfile = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {},
+            "node_modules/other": {"version": "1.0.0"},
+        },
+    }
+    current_lockfile = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {},
+            "node_modules/other": {"version": "2.0.0"},
+        },
+    }
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = json.dumps(current_lockfile)
+    state = {
+        "accepted_package_inventory_by_lockfile": _package_lock_inventory(
+            "package-lock.json",
+            baseline_lockfile,
+        ),
+        "task_queue": {
+            "task-1": SimpleNamespace(
+                current_attempt_id="attempt-1",
+                parent_task_id=None,
+                status="optimistically_fixed",
+            )
+        },
+        "worker_results_by_attempt": {
+            "attempt-1": SimpleNamespace(
+                task_id="task-1",
+                attempt_id="attempt-1",
+                task_revision=1,
+                changed_files=["package-lock.json"],
+            )
+        },
+    }
+
+    batch = _resolve_targeted_packages(sandbox, [_target()], state)
+
+    assert batch.skipped_task_ids == ("task-1",)
+    assert batch.failures_by_task == {}
+    assert any(
+        node.package_name == "other"
+        for closure in batch.closures_by_task["task-1"]
+        for node in closure.nodes
+    )
+    other = next(
+        node
+        for closure in batch.closures_by_task["task-1"]
+        for node in closure.nodes
+        if node.package_name == "other"
+    )
+    occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="other",
+        version=other.version,
+        lockfile_key=other.lockfile_key,
+        found_identifiers=["CVE-2026-70001"],
+    )
+    project_path = ".odc-targeted/000"
+    manifest = _TargetedArtifactManifest(
+        scan_subdir=".odc-targeted",
+        expected_package_occurrences=(("other", "2.0.0"),),
+        occurrences_by_project={project_path: (occurrence,)},
+        task_ids_by_project={project_path: ("task-1",)},
+        input_paths_by_project={project_path: ("package-lock.json",)},
+    )
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        complete=True,
+    )
+
+    task_evidence = _scan_evidence_by_task(
+        evidence,
+        targets=[_target()],
+        baseline_identifiers=set(),
+        batch=batch,
+        artifact_manifest=manifest,
+    )["task-1"]
+
+    assert task_evidence.complete is True
+    assert task_evidence.scan_performed is True
+    assert task_evidence.scan_skip_reason == "no_matching_target"
+    assert task_evidence.covered_occurrences == [occurrence]
+    assert task_evidence.new_identifiers == ["CVE-2026-70001"]
 
 
 def test_missing_target_does_not_invalidate_other_targets_new_identifier_list() -> None:

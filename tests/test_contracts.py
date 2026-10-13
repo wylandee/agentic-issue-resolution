@@ -33,8 +33,8 @@ from remediation_engine.contracts import (
     LocalizedIssue,
     MultiPackageAction,
     ODCScanEvidence,
-    PackageScanOccurrence,
     PackageMutation,
+    PackageScanOccurrence,
     QAEvaluation,
     QAFailureEvidence,
     QATestAttribution,
@@ -53,7 +53,11 @@ from remediation_engine.contracts import (
 from remediation_engine.contracts.schemas import (
     CWEEntry,
     LineRange,
+    QAAttemptResult,
+    RemediationTask,
     SupervisorDecision,
+    TaskAttemptSnapshot,
+    WorkerAttemptResult,
 )
 
 # ===========================================================================
@@ -918,3 +922,25 @@ def test_qa_test_attribution_remains_fail_closed():
     )
     assert inconclusive.verdict == TestAttributionVerdict.INCONCLUSIVE
     assert inconclusive.reasoning == ""
+
+
+def test_workerless_remediation_action_is_normalized_and_stays_out_of_attempt_envelopes():
+    task = RemediationTask(
+        task_id="task-absent",
+        parent_group_id="group-1",
+        strategy=RoutingStrategy.VERSION_BUMP,
+        remediation_action="  Removed after another package upgrade.  ",
+    )
+    assert task.remediation_action == "Removed after another package upgrade."
+    assert (
+        RemediationTask(
+            task_id="task-empty",
+            parent_group_id="group-1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            remediation_action="  ",
+        ).remediation_action
+        is None
+    )
+    assert "remediation_action" not in TaskAttemptSnapshot.model_fields
+    assert "remediation_action" not in WorkerAttemptResult.model_fields
+    assert "remediation_action" not in QAAttemptResult.model_fields

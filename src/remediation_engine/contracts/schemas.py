@@ -1513,6 +1513,10 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    target_package_absent: bool = Field(
+        default=False,
+        description="Complete task-owned lockfile evidence proves the SCA target is absent.",
+    )
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
@@ -2891,3 +2895,17 @@ class RemediationTask(BaseModel):
         default=None,
         description="Committed outer portfolio plan authorizing the task input.",
     )
+
+    remediation_action: str | None = Field(
+        default=None,
+        description=(
+            "Supervisor-authored workerless completion action; not a worker instruction "
+            "or worker/QA envelope field."
+        ),
+    )
+
+    @field_validator("remediation_action", mode="before")
+    @classmethod
+    def _normalize_remediation_action(cls, value: Any) -> str | None:
+        """Trim an optional Supervisor-authored completion action."""
+        return _trim_optional_contract_text(value, "remediation_action")

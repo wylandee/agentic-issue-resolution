@@ -2162,11 +2162,21 @@ def _successful_remediation_evidence(
     elif diff_blocks:
         changes.append("Code workaround: source changes applied")
     if not changes:
-        changes.append(
-            "No validated change in emitted patch"
-            if context.diff.strip()
-            else "Validated remediation recorded"
-        )
+        for task_id in reversed(_task_ids_for_group(context, group_id)):
+            task = context.task_queue.get(task_id)
+            if task is None or _text(_value(task, "status")).casefold() != "qa_passed":
+                continue
+            remediation_action = _text(_value(task, "remediation_action")).strip()
+            if remediation_action:
+                changes.append(remediation_action)
+                files = []
+                break
+        if not changes:
+            changes.append(
+                "No validated change in emitted patch"
+                if context.diff.strip()
+                else "Validated remediation recorded"
+            )
     return "; ".join(_unique_texts(changes)), files, _unique_texts(code_summaries), diff_blocks
 
 

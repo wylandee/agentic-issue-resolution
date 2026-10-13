@@ -10,12 +10,14 @@ Tests have been updated to use the task-centric architecture:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from remediation_engine.contracts import DecisionCode
 from remediation_engine.contracts.schemas import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
     AgentActionStatus,
@@ -66,6 +68,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _peer_conflict_escalation,
     _repair_invalid_planner_plans,
     _task_scan_record_from_qa_result,
+    _verified_absent_package_tasks,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
@@ -3606,6 +3609,379 @@ def test_supervisor_commits_complete_passing_scan_into_ledgers():
         old_key: old_occurrence,
         new_key: stale_new_occurrence,
     }
+
+
+def _workerless_absence_state(
+    *,
+    include_portfolio_plan: bool = False,
+    other_attempt_open: bool = False,
+    open_attempt_status: TaskStatus = TaskStatus.OPTIMISTICALLY_FIXED,
+) -> tuple[dict, str]:
+    """Build a current passing QA result that removes an untouched SCA target."""
+    source_group = _sca_group("g-source")
+    target_group = _sca_group("g-target").model_copy(
+        update={"vulnerable_component": "base64url", "file_path": "package.json"}
+    )
+    old_key = '["package-lock.json","node_modules/base64url","base64url","0.0.6",0]'
+    source_task_id = "task-source"
+    source_attempt_id = "attempt-source"
+    source_instruction = "Upgrade test-pkg to 2.0.0."
+    source_task = _make_task(
+        source_task_id,
+        source_group.group_id,
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": source_attempt_id,
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "target_package_name": "test-pkg",
+            "selected_version": "2.0.0",
+            "instruction": source_instruction,
+        }
+    )
+    target_task_id = "task-absent"
+    target_task = _make_task(target_task_id, target_group.group_id).model_copy(
+        update={"target_package_name": "base64url"}
+    )
+    source_snapshot = TaskAttemptSnapshot(
+        attempt_id=source_attempt_id,
+        task_id=source_task_id,
+        state_revision=1,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=source_task.strategy_stage,
+        selected_version="2.0.0",
+        instruction=source_instruction,
+        instruction_digest=instruction_digest(source_instruction),
+        dispatch_node="update_subagent",
+    )
+    source_scan_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[source_task_id],
+        covered_input_paths=["package-lock.json"],
+        removed_occurrence_keys=[old_key],
+        complete=True,
+        scan_performed=True,
+    )
+    source_qa_result = QAAttemptResult(
+        attempt_id=source_attempt_id,
+        task_id=source_task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=source_task_id,
+            passed=True,
+            scan_evidence=source_scan_evidence,
+        ),
+    )
+
+    groups = [source_group, target_group]
+    task_queue = {
+        source_task_id: source_task,
+        target_task_id: target_task,
+    }
+    snapshots = {source_attempt_id: source_snapshot}
+    active_target_task_ids = [source_task_id]
+    if other_attempt_open:
+        open_group = _sca_group("g-open")
+        waiting_group = _sca_group("g-waiting").model_copy(
+            update={"vulnerable_component": "waiting-package"}
+        )
+        open_task = _make_task(
+            "task-open",
+            open_group.group_id,
+            status=open_attempt_status,
+        ).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-open",
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "instruction": "Upgrade the open package.",
+            }
+        )
+        waiting_task = _make_task("task-waiting", waiting_group.group_id).model_copy(
+            update={"target_package_name": "waiting-package"}
+        )
+        open_snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-open",
+            task_id="task-open",
+            state_revision=1,
+            task_revision=1,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            instruction=open_task.instruction,
+            instruction_digest=instruction_digest(open_task.instruction),
+            dispatch_node="update_subagent",
+        )
+        groups.extend([open_group, waiting_group])
+        task_queue.update(
+            {
+                "task-open": open_task,
+                "task-waiting": waiting_task,
+            }
+        )
+        snapshots["attempt-open"] = open_snapshot
+        active_target_task_ids.append("task-open")
+
+    overrides: dict[str, object] = {
+        "status": "qa_completed",
+        "task_queue": task_queue,
+        "active_target_task_ids": active_target_task_ids,
+        "attempt_snapshots_by_id": snapshots,
+        "qa_results_by_attempt": {source_attempt_id: source_qa_result},
+        "accepted_package_inventory_by_lockfile": {old_key: "old-fingerprint"},
+    }
+    if include_portfolio_plan:
+        plan_task_ids = list(task_queue)
+        overrides["portfolio_plan"] = SimpleNamespace(
+            plan_id="portfolio-current",
+            portfolio_plan_id="portfolio-current",
+            task_ids=plan_task_ids,
+            clusters=[],
+            cluster_order=[],
+            task_order=plan_task_ids,
+            task_to_cluster={},
+            diagnostics=[],
+        )
+    return _base_state(groups, **overrides), old_key
+
+
+def test_verified_absent_package_helper_fails_closed() -> None:
+    group = _sca_group("g-target").model_copy(
+        update={"vulnerable_component": "base64url", "file_path": "package.json"}
+    )
+    task = _make_task("task-target", group.group_id).model_copy(
+        update={"target_package_name": "base64url"}
+    )
+    old_key = '["package-lock.json","node_modules/base64url","base64url","0.0.6",0]'
+    accepted_record = TaskScanRecord(
+        task_id="task-scan",
+        attempt_id="attempt-scan",
+        task_revision=1,
+        covered_input_paths=["package-lock.json"],
+        removed_occurrence_keys=[old_key],
+        complete=True,
+    )
+    task_queue = {task.task_id: task}
+    groups = {group.group_id: group}
+
+    assert _verified_absent_package_tasks(
+        task_queue,
+        groups,
+        {"task-scan": accepted_record},
+        {},
+    ) == {"task-target": "base64url"}
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record.model_copy(update={"complete": False})},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record.model_copy(update={"covered_input_paths": []})},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            {
+                group.group_id: group.model_copy(
+                    update={"file_path": "yarn.lock", "file_paths": ["yarn.lock"]}
+                )
+            },
+            {"task-scan": accepted_record},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {"malformed-occurrence-key": "fingerprint"},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {
+                '["package-lock.json","node_modules/nested/node_modules/base64url",'
+                '"base64url","0.0.7",0]': "present-fingerprint"
+            },
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {
+                '["another/package-lock.json","node_modules/base64url","base64url","0.0.7",0]': (
+                    "present-fingerprint"
+                )
+            },
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {
+                "task-scan": accepted_record.model_copy(
+                    update={"removed_occurrence_keys": ["not-a-canonical-tombstone"]}
+                )
+            },
+            {},
+        )
+        == {}
+    )
+
+    worker_decision = _deterministic_routing(
+        task_queue,
+        groups,
+        {},
+        {},
+        portfolio_plan=None,
+    )
+    assert worker_decision.next_node == "update_subagent"
+    assert worker_decision.target_task_ids == ["task-target"]
+
+
+def test_supervisor_completes_absent_package_without_worker_attempt() -> None:
+    state, old_key = _workerless_absence_state()
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+
+    target = result["task_queue"]["task-absent"]
+    assert target.status == TaskStatus.QA_PASSED
+    assert (
+        target.remediation_action
+        == "Removed due to another package upgrade; target absent from every covered package-lock input."
+    )
+    assert target.current_attempt_id is None
+    assert "task-absent" not in result["active_target_task_ids"]
+    assert result["accepted_package_inventory_by_lockfile"] == {}
+    assert result["latest_successful_scan_by_task"]["task-source"].removed_occurrence_keys == [
+        old_key
+    ]
+    assert all(
+        snapshot.task_id != "task-absent" for snapshot in result["attempt_snapshots_by_id"].values()
+    )
+    assert all(
+        worker_result.task_id != "task-absent"
+        for worker_result in result["worker_results_by_attempt"].values()
+    )
+    assert all(
+        qa_result.task_id != "task-absent" for qa_result in result["qa_results_by_attempt"].values()
+    )
+
+
+def test_verified_absent_portfolio_member_requires_replan_before_workers() -> None:
+    state, _old_key = _workerless_absence_state(include_portfolio_plan=True)
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["decision_code"] == DecisionCode.PORTFOLIO_PLAN_REQUIRED
+    assert result["next_routing_step"] == "portfolio"
+    assert result["portfolio_dirty"] is True
+    assert result["portfolio_replan_request"].reason == (
+        "Verified target-package absence changed portfolio membership."
+    )
+    assert result["portfolio_replan_request"].source_portfolio_plan_id == "portfolio-current"
+    assert "task-absent" not in result["active_target_task_ids"]
+
+
+def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans() -> None:
+    state, _old_key = _workerless_absence_state(
+        include_portfolio_plan=True,
+        other_attempt_open=True,
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["portfolio_dirty"] is True
+    assert result["portfolio_replan_request"].reason == (
+        "Verified target-package absence changed portfolio membership."
+    )
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == ["task-open"]
+    assert result["task_queue"]["task-waiting"].status == TaskStatus.PENDING
+
+
+def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attempt_is_open():
+    state, _old_key = _workerless_absence_state(
+        include_portfolio_plan=True,
+        other_attempt_open=True,
+        open_attempt_status=TaskStatus.PENDING,
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-open"]
+    assert result["task_queue"]["task-open"].current_attempt_id == "attempt-open"
+    assert result["task_queue"]["task-waiting"].status == TaskStatus.PENDING
+    assert set(result["attempt_snapshots_by_id"]) == {"attempt-source", "attempt-open"}
 
 
 def test_retained_regression_candidate_contributes_batch_scan_findings():

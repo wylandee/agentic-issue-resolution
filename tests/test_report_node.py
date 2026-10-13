@@ -1506,6 +1506,25 @@ def test_successful_task_only_group_uses_attempt_metadata_for_exact_change():
     assert "| Successfully remediated vulnerability groups | 2 |" in report
 
 
+def test_workerless_remediation_action_is_reported_without_claimed_files():
+    state = _state()
+    state["diff"] = ""
+    state["changed_files"] = ["package-lock.json"]
+    state["task_queue"]["task-1"]["remediation_action"] = (
+        "Removed due to another package upgrade; target absent from every covered package-lock input."
+    )
+
+    report = generate_report(state)
+    successful = report.split("## 3. Successful Remediations", 1)[1].split("## 4. References", 1)[0]
+
+    assert (
+        "| Removed due to another package upgrade; target absent from every covered "
+        "package-lock input. | Not recorded |"
+    ) in successful
+    assert "| package-lock.json |" not in successful
+    assert "Attempt 1" not in successful
+
+
 def test_package_removal_attempt_includes_manifest_and_source_changes():
     """Package-removal attempts identify both manifest and source changes."""
     state = _state()
