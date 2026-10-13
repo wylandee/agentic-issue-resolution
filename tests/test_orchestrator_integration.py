@@ -100,7 +100,7 @@ class TestTriageNodeIntegration:
         assert route_after_triage({"status": "failed"}) == "teardown"
 
     def test_route_after_post_qa_triage_only_dispatches_actionable_work(self):
-        assert route_after_post_qa_triage({"status": "triage_completed"}) == "portfolio"
+        assert route_after_post_qa_triage({"status": "triage_completed"}) == "supervisor"
         assert route_after_post_qa_triage({"status": "triage_completed_no_work"}) == "teardown"
         assert route_after_post_qa_triage({"status": "triage_failed"}) == "teardown"
 
@@ -162,10 +162,6 @@ class TestTriageNodeIntegration:
         with (
             patch("remediation_engine.orchestration.graph.run_workspace_builder_node") as mock_ws,
             patch("remediation_engine.orchestration.graph.run_supervisor_node") as mock_supervisor,
-            patch(
-                "remediation_engine.orchestration.graph.run_portfolio_node",
-                return_value={"status": "portfolio_ready"},
-            ),
             patch("remediation_engine.orchestration.graph.run_teardown_node") as mock_teardown,
         ):
             graph = build_orchestrator_graph()

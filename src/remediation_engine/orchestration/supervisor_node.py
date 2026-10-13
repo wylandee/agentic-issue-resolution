@@ -113,6 +113,10 @@ from remediation_engine.orchestration.supervisor_policy import (
     _task_sort_key,
     _worker_node_for_strategy,
 )
+from remediation_engine.orchestration.supervisor_portfolio import (
+    route_after_portfolio,
+    run_portfolio_plan_tool,
+)
 from remediation_engine.orchestration.supervisor_routing import (
     _apply_transition,
     _build_consistency_event,
@@ -159,7 +163,7 @@ _VERIFIED_ABSENT_PORTFOLIO_REPLAN_REASON = (
 # boundaries consume only the typed task/attempt envelopes.
 
 _VALID_NEXT_NODES: set[str] = {
-    "portfolio",
+    "supervisor",
     "update_subagent",
     "workaround_subagent",
     "qa_critic",
@@ -1919,9 +1923,9 @@ def _reset_no_fix_replay_plan(
 # ---------------------------------------------------------------------------
 
 
-def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
+def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     """
-    LangGraph node â€” Supervisor commander for Phase 5 orchestration.
+    Deterministic Supervisor decision body for Phase 5 orchestration.
 
     Execution stages
     ----------------
@@ -4905,6 +4909,53 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         "constraints_ledger": returned_constraints,
         "errors": errors,
     }
+
+
+def _invoke_portfolio_plan_tool(
+    state: OrchestratorState,
+    supervisor_patch: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run portfolio planning with any reconciled Supervisor state.
+
+    Args:
+        state: Incoming orchestration state before the Supervisor patch.
+        supervisor_patch: Complete fresh Supervisor result to apply before
+            planning, when a decision requested a portfolio replan.
+
+    Returns:
+        A combined state patch. The portfolio result takes precedence for
+        overlapping fields, while Supervisor-only fields and both fresh error
+        lists are preserved.
+    """
+    supervisor_result = dict(supervisor_patch or {})
+    supervisor_errors = list(supervisor_result.get("errors", []) or [])
+    portfolio_input = {**state, **supervisor_result}
+    if supervisor_patch is not None:
+        portfolio_input["errors"] = [
+            *(state.get("errors", []) or []),
+            *supervisor_errors,
+        ]
+    portfolio_result = run_portfolio_plan_tool(portfolio_input)
+    result = {**supervisor_result, **portfolio_result}
+    result["errors"] = [
+        *supervisor_errors,
+        *(portfolio_result.get("errors", []) or []),
+    ]
+    result["next_routing_step"] = route_after_portfolio(portfolio_result)
+    return result
+
+
+def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
+    """Invoke portfolio planning at the established Supervisor boundaries."""
+    if (
+        state.get("status") == "workspace_ready" and state.get("portfolio_plan") is None
+    ) or state.get("status") == "triage_completed":
+        return _invoke_portfolio_plan_tool(state)
+
+    supervisor_patch = _run_supervisor_decision_node(state)
+    if supervisor_patch.get("next_routing_step") == "portfolio":
+        return _invoke_portfolio_plan_tool(state, supervisor_patch)
+    return supervisor_patch
 
 
 # ---------------------------------------------------------------------------

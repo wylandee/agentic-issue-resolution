@@ -579,12 +579,16 @@ def test_supervisor_routes_to_teardown_after_retriage_limit():
 
 
 def test_graph_contains_separate_initial_and_post_qa_triage_nodes():
-    node_names = set(build_orchestrator_graph().get_graph().nodes)
+    compiled = build_orchestrator_graph()
+    node_names = set(compiled.get_graph().nodes)
 
     assert "initial_triage" in node_names
     assert "triage" in node_names
     assert "workspace_setup_scan" in node_names
     assert "final_full_scan" in node_names
+    assert "portfolio" not in node_names
+    assert ("workspace_setup_scan", "supervisor") in compiled.builder.edges
+    assert "route_after_post_qa_triage" in compiled.builder.branches["triage"]
 
 
 def test_graph_routes_qa_through_supervisor_to_triage_and_back():
@@ -613,10 +617,6 @@ def test_graph_routes_qa_through_supervisor_to_triage_and_back():
         patch(
             "remediation_engine.orchestration.graph.run_workspace_builder_node",
             return_value={"status": "workspace_ready", "workspace_volume": "vol"},
-        ),
-        patch(
-            "remediation_engine.orchestration.graph.run_portfolio_node",
-            return_value={"status": "portfolio_ready"},
         ),
         patch(
             "remediation_engine.orchestration.graph.run_supervisor_node",

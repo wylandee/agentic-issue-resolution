@@ -2666,7 +2666,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
 ):
     from unittest.mock import MagicMock
 
-    from remediation_engine.orchestration.graph import run_portfolio_node
+    from remediation_engine.orchestration import supervisor_portfolio
     from remediation_engine.orchestration.state import initial_orchestrator_state
     from remediation_engine.orchestration.supervisor_node import MAX_RETRIES, run_supervisor_node
     from remediation_engine.orchestration.teardown_node import run_teardown_node
@@ -2812,24 +2812,6 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             "status": "supervisor_entered",
         }
     )
-    with monkeypatch.context() as supervisor_guards:
-        supervisor_guards.setattr(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
-            lambda *args, **kwargs: [],
-        )
-        supervisor_guards.setattr(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
-            lambda *args, **kwargs: False,
-        )
-        first_supervisor = run_supervisor_node(state)
-
-    assert first_supervisor["next_routing_step"] == "portfolio"
-    assert first_supervisor["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
-    assert first_supervisor["task_queue"]["task-b"].status == TaskStatus.UNFIXABLE
-    request = first_supervisor["portfolio_replan_request"]
-    assert request.reason == "UNFIXABLE_REPLAN"
-    assert request.source_portfolio_plan_id == "prior-plan"
-    state.update(first_supervisor)
 
     settings = AppSettings(
         solver_certification_timeout_seconds=60,
@@ -2855,16 +2837,49 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
         kwargs["sandbox_factory"] = sandbox_factory
         return real_builder(*args, **kwargs)
 
+    portfolio_tool_inputs: list[dict[str, Any]] = []
+    real_portfolio_tool = supervisor_portfolio.run_portfolio_plan_tool
+
+    def capture_portfolio_tool(tool_state: dict[str, Any]) -> dict[str, Any]:
+        portfolio_tool_inputs.append(tool_state)
+        return real_portfolio_tool(tool_state)
+
     with monkeypatch.context() as portfolio_seams:
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.graph.get_runtime_settings",
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            lambda *args, **kwargs: [],
+        )
+        portfolio_seams.setattr(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            lambda *args, **kwargs: False,
+        )
+        portfolio_seams.setattr(
+            "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
             lambda: settings,
         )
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
+            "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
             build_with_fake_workspace,
         )
-        portfolio_result = run_portfolio_node(state)
+        portfolio_seams.setattr(
+            "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+            capture_portfolio_tool,
+        )
+        first_supervisor = run_supervisor_node(state)
+
+    assert len(portfolio_tool_inputs) == 1
+    request = portfolio_tool_inputs[0]["portfolio_replan_request"]
+    assert isinstance(request, PortfolioReplanRequest)
+    assert request == PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    assert first_supervisor["portfolio_replan_request"] is None
+    assert first_supervisor["next_routing_step"] == "supervisor"
+    assert first_supervisor["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert first_supervisor["task_queue"]["task-b"].status == TaskStatus.UNFIXABLE
+    state.update(first_supervisor)
+    portfolio_result = first_supervisor
     assert workspace_state.restored_workspace_snapshot_ids == ["qa-snapshot-task-a"]
 
     assert portfolio_result["status"] == "portfolio_ready", "\n".join(

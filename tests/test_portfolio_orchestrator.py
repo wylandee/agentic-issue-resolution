@@ -36,7 +36,6 @@ from remediation_engine.contracts.solver_models import (
     SolverRuntimeFingerprint,
     SolverStatus,
 )
-from remediation_engine.orchestration.graph import _portfolio_certificate_violations
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
     build_portfolio_plan,
@@ -59,6 +58,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _portfolio_plan_violations,
     run_supervisor_node,
 )
+from remediation_engine.orchestration.supervisor_portfolio import _portfolio_certificate_violations
 from remediation_engine.orchestration.supervisor_routing import _portfolio_cluster_targets
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
@@ -1221,7 +1221,10 @@ def test_synthetic_target_refresh_keeps_group_identity(tmp_path: Path):
     assert synthetic_task.task_revision == 1
 
 
-def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(tmp_path: Path):
+def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     _write_manifest(
         tmp_path,
         "package.json",
@@ -1230,13 +1233,36 @@ def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(tmp_path
     core = _group("@angular/core", "package.json")
     state = initial_orchestrator_state(str(tmp_path), [core])
 
+    portfolio_tool_inputs = []
+
+    def run_portfolio_tool(tool_state):
+        portfolio_tool_inputs.append(tool_state)
+        prepared_groups, prepared_queue, diagnostics = prepare_portfolio_inputs(
+            tool_state["repo_root"],
+            tool_state.get("valid_groups", []),
+            dict(tool_state.get("task_queue", {}) or {}),
+        )
+        return {
+            "status": "portfolio_ready",
+            "valid_groups": prepared_groups,
+            "task_queue": prepared_queue,
+            "errors": diagnostics,
+        }
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        run_portfolio_tool,
+    )
+
     result = run_supervisor_node(state)
 
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
+    assert len(portfolio_tool_inputs) == 1
+    assert portfolio_tool_inputs[0]["valid_groups"] == state["valid_groups"]
     synthetic_groups = [group for group in result["valid_groups"] if group.is_synthetic]
     synthetic_tasks = [task for task in result["task_queue"].values() if task.is_synthetic]
-    assert synthetic_groups == []
-    assert synthetic_tasks == []
+    assert synthetic_groups
+    assert synthetic_tasks
 
 
 def test_multi_kind_angular_edges_materialize_once_per_task_pair(tmp_path: Path):
@@ -1654,9 +1680,25 @@ def test_invalid_atomic_action_requests_portfolio_replan(tmp_path: Path, monkeyp
         ),
     )
 
-    result = run_supervisor_node(state)
+    portfolio_tool_inputs = []
 
-    assert result["next_routing_step"] == "portfolio"
+    def run_portfolio_tool(tool_input):
+        portfolio_tool_inputs.append(tool_input)
+        return {"status": "portfolio_ready", "errors": []}
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        run_portfolio_tool,
+    )
+
+    result = run_supervisor_node(state)
+    assert len(portfolio_tool_inputs) == 1
+    assert portfolio_tool_inputs[0]["task_queue"] == result["task_queue"]
+    assert (
+        portfolio_tool_inputs[0]["portfolio_replan_request"] == result["portfolio_replan_request"]
+    )
+
+    assert result["next_routing_step"] == "supervisor"
     assert result["active_target_task_ids"] == []
     assert result["active_cluster_id"] is None
     assert result["active_multi_package_action"] is None

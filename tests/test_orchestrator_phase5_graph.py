@@ -49,18 +49,20 @@ from remediation_engine.orchestration import (
 )
 from remediation_engine.orchestration import graph_wrappers as _graph_wrappers
 from remediation_engine.orchestration.graph import (
-    MAX_PORTFOLIO_ITERATIONS,
-    MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _finish_workspace_attempt_snapshot,
-    _record_portfolio_replan_attempt,
-    route_after_portfolio,
     route_after_workspace_builder,
-    run_portfolio_node,
     run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
 from remediation_engine.orchestration.supervisor_node import instruction_digest, run_supervisor_node
+from remediation_engine.orchestration.supervisor_portfolio import (
+    MAX_PORTFOLIO_ITERATIONS,
+    MAX_PORTFOLIO_REPLAN_ATTEMPTS,
+    _record_portfolio_replan_attempt,
+    route_after_portfolio,
+    run_portfolio_plan_tool,
+)
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.grouper import group_issues
@@ -263,8 +265,10 @@ def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
         "task_queue": {},
     }
 
-    with patch("remediation_engine.orchestration.graph.prepare_portfolio_inputs") as prepare:
-        result = run_portfolio_node(state)
+    with patch(
+        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs"
+    ) as prepare:
+        result = run_portfolio_plan_tool(state)
 
     prepare.assert_not_called()
     assert result["status"] == "portfolio_replan_guarded"
@@ -288,8 +292,10 @@ def test_unfixable_replan_respects_total_iteration_guard(tmp_path):
         "task_queue": {},
     }
 
-    with patch("remediation_engine.orchestration.graph.prepare_portfolio_inputs") as prepare:
-        result = run_portfolio_node(state)
+    with patch(
+        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs"
+    ) as prepare:
+        result = run_portfolio_plan_tool(state)
 
     prepare.assert_not_called()
     assert result["status"] == "portfolio_replan_guarded"
@@ -358,25 +364,25 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.prepare_portfolio_inputs",
+        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs",
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
     build_plan = MagicMock(return_value=candidate_plan)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
+        "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
         build_plan,
     )
     apply_plan = MagicMock()
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.apply_portfolio_plan",
+        "remediation_engine.orchestration.supervisor_portfolio.apply_portfolio_plan",
         apply_plan,
     )
 
-    result = run_portfolio_node(state)
+    result = run_portfolio_plan_tool(state)
     build_plan.assert_called_once()
     assert build_plan.call_args.kwargs["prior_portfolio_plan"] is previous_plan
 
@@ -412,23 +418,23 @@ def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, 
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.prepare_portfolio_inputs",
+        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs",
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.build_certified_portfolio_plan",
+        "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
         lambda *args, **kwargs: candidate_plan,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph._portfolio_certificate_violations",
+        "remediation_engine.orchestration.supervisor_portfolio._portfolio_certificate_violations",
         lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.apply_portfolio_plan",
+        "remediation_engine.orchestration.supervisor_portfolio.apply_portfolio_plan",
         lambda *args, **kwargs: (
             [group],
             {"task-1": task.model_copy(update={"task_revision": 2})},
@@ -436,7 +442,7 @@ def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, 
         ),
     )
 
-    result = run_portfolio_node(state)
+    result = run_portfolio_plan_tool(state)
 
     assert result["status"] == "portfolio_reconciliation_required"
     assert result["next_routing_step"] == "supervisor"
@@ -1032,7 +1038,7 @@ class TestPhase5GraphIntegration:
         sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-handoff")
 
     def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
-        """After workspace prep, portfolio routes to Supervisor, then teardown runs."""
+        """Setup scanning routes to Supervisor before ordinary dispatch."""
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
@@ -1059,14 +1065,12 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": None,
             }
         )
-        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
 
         with (
             patch(
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
-            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
@@ -1074,7 +1078,6 @@ class TestPhase5GraphIntegration:
             result = graph.invoke(_initial_state(tmp_path, groups))
 
         assert workspace_builder.call_count == 1
-        assert portfolio.call_count == 1
         assert supervisor.call_count == 1
         assert teardown.call_count == 1
         assert result["status"] == "completed"
@@ -1119,7 +1122,6 @@ class TestPhase5GraphIntegration:
                 "workspace_volume": "vol123",
             }
         )
-        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
 
         call_count = {"n": 0}
 
@@ -1155,7 +1157,6 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
-            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch(
                 "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
@@ -1166,7 +1167,6 @@ class TestPhase5GraphIntegration:
             graph.invoke(_initial_state(tmp_path, groups))
 
         assert supervisor.call_count == 2
-        assert portfolio.call_count == 1
         assert teardown.call_count == 1
 
     def test_supervisor_routes_to_qa_critic_then_back(self, tmp_path):
@@ -1180,7 +1180,6 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        portfolio = MagicMock(return_value={"status": "portfolio_ready"})
         call_count = {"n": 0}
 
         def supervisor_side_effect(state):
@@ -1226,7 +1225,6 @@ class TestPhase5GraphIntegration:
                 "remediation_engine.orchestration.graph.run_workspace_builder_node",
                 workspace_builder,
             ),
-            patch("remediation_engine.orchestration.graph.run_portfolio_node", portfolio),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
             patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
@@ -1237,7 +1235,6 @@ class TestPhase5GraphIntegration:
         assert supervisor.call_count == 2
         assert qa_critic.call_count == 1
         assert teardown.call_count == 1
-        assert portfolio.call_count == 1
         assert result["qa_investigation_report"].startswith("# INVESTIGATIVE REPORT")
         assert result["new_vulnerability_identifiers"] == ["CVE-2025-10001"]
         assert result["new_vulnerability_status"] == "detected"
@@ -3068,6 +3065,17 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
     qa_observations = []
     qa_result = _socket_stack_failed_qa_result(case.tasks)
 
+    portfolio_tool_inputs = []
+
+    def run_portfolio_tool(tool_input):
+        portfolio_tool_inputs.append(tool_input)
+        return {"status": "portfolio_ready", "errors": []}
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        run_portfolio_tool,
+    )
+
     monkeypatch.setattr(
         "remediation_engine.orchestration.graph.run_qa_critic_node",
         lambda _state: qa_result,
@@ -3150,6 +3158,10 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
         "portfolio_plan": None,
     }
     supervisor_output = run_supervisor_node(supervisor_state)
+    assert len(portfolio_tool_inputs) == 1
+    portfolio_input = portfolio_tool_inputs[0]
+    portfolio_request = portfolio_input["portfolio_replan_request"]
+    assert isinstance(portfolio_request, PortfolioReplanRequest)
 
     assert supervisor_output["task_queue"]["task-a"].status == TaskStatus.PENDING
     assert supervisor_output["task_queue"]["task-a"].retry_count == 0
@@ -3166,7 +3178,8 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
     assert request.forced_singleton_task_ids == ["task-c"]
     assert request.triggering_attempt_id == case.tasks[2].current_attempt_id
     assert request.source_portfolio_plan_id == case.portfolio_plan_id
-    assert supervisor_output["next_routing_step"] == "portfolio"
+    assert portfolio_request == request
+    assert supervisor_output["next_routing_step"] == "supervisor"
 
     stale_record = {
         **isolation,

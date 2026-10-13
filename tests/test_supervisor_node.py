@@ -244,6 +244,15 @@ def _keep_portfolio_current(monkeypatch):
     )
 
 
+def _stub_portfolio_plan_tool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    portfolio_tool = MagicMock(return_value={"status": "portfolio_ready", "errors": []})
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+    return portfolio_tool
+
+
 def _portfolio_stub():
     return SimpleNamespace(
         portfolio_plan_id="portfolio-current",
@@ -449,6 +458,7 @@ class TestSupervisorRouterFunction:
             supervisor_router({"next_routing_step": "qa_critic", **active_targets}) == "qa_critic"
         )
         assert supervisor_router({"next_routing_step": "teardown"}) == "teardown"
+        assert supervisor_router({"next_routing_step": "supervisor"}) == "supervisor"
         assert supervisor_router({"next_routing_step": "final_full_scan"}) == "final_full_scan"
 
     @pytest.mark.parametrize(
@@ -469,6 +479,98 @@ class TestSupervisorRouterFunction:
     def test_missing_or_unknown_step_defaults_to_teardown(self):
         assert supervisor_router({}) == "teardown"
         assert supervisor_router({"next_routing_step": "invalid"}) == "teardown"
+
+
+@pytest.mark.parametrize(
+    ("status", "has_portfolio_plan"),
+    [
+        ("workspace_ready", False),
+        ("triage_completed", True),
+    ],
+)
+def test_supervisor_calls_portfolio_tool_for_initial_and_post_triage_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    has_portfolio_plan: bool,
+):
+    state = _base_state(
+        [_sca_group()],
+        status=status,
+        portfolio_plan=_portfolio_stub() if has_portfolio_plan else None,
+        portfolio_dirty=False,
+    )
+    portfolio_tool = MagicMock(
+        return_value={
+            "status": "portfolio_ready",
+            "next_routing_step": "teardown",
+            "errors": [],
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_called_once_with(state)
+    assert result["next_routing_step"] == "supervisor"
+
+
+def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = _make_task("task-1", "g1")
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    reconciled_queue = {"task-1": task}
+    supervisor_patch = {
+        "status": "supervisor_routed",
+        "next_routing_step": "portfolio",
+        "decision_code": DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+        "supervisor_instructions": "Rebuild the portfolio before dispatch.",
+        "task_queue": reconciled_queue,
+        "portfolio_replan_request": request,
+        "portfolio_dirty": True,
+        "errors": ["supervisor-error"],
+    }
+    state = _base_state(
+        [_sca_group()],
+        errors=["prior-error"],
+        task_queue={"old-task": _make_task("old-task", "g1")},
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._run_supervisor_decision_node",
+        lambda _state: supervisor_patch,
+    )
+    portfolio_plan = _portfolio_stub()
+    portfolio_tool = MagicMock(
+        return_value={
+            "status": "portfolio_ready",
+            "next_routing_step": "teardown",
+            "portfolio_plan": portfolio_plan,
+            "errors": ["portfolio-error"],
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] is reconciled_queue
+    assert portfolio_input["portfolio_replan_request"] is request
+    assert portfolio_input["errors"] == ["prior-error", "supervisor-error"]
+    assert result["decision_code"] == DecisionCode.PORTFOLIO_PLAN_REQUIRED
+    assert result["supervisor_instructions"] == supervisor_patch["supervisor_instructions"]
+    assert result["portfolio_plan"] is portfolio_plan
+    assert result["errors"] == ["supervisor-error", "portfolio-error"]
+    assert result["next_routing_step"] == "supervisor"
 
 
 # ===========================================================================
@@ -2473,8 +2575,13 @@ def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
         task_queue={"task-3": task3, "task-1": task1, "task-2": task2},
         portfolio_plan=_portfolio_stub(),
     )
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
 
     result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
 
     request = result["portfolio_replan_request"]
     assert request.reason == "UNFIXABLE_REPLAN"
@@ -2482,7 +2589,7 @@ def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
     assert request.peer_conflict_pairs == []
     assert request.forced_singleton_task_ids == []
     assert result["portfolio_dirty"] is True
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
     assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
     assert result["active_target_task_ids"] == []
     assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
@@ -2508,7 +2615,9 @@ def test_existing_unfixable_sca_does_not_trigger_another_replan(monkeypatch):
         portfolio_plan=_portfolio_stub(),
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
 
     assert result["portfolio_replan_request"] is None
     assert result["next_routing_step"] == "update_subagent"
@@ -2550,7 +2659,9 @@ def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypa
         portfolio_plan=_portfolio_stub(),
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
 
     assert result["portfolio_replan_request"] == request
     assert result["portfolio_dirty"] is True
@@ -2573,10 +2684,15 @@ def test_pending_unfixable_replan_routes_when_attempt_barrier_is_clear(monkeypat
         portfolio_plan=_portfolio_stub(),
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == request
 
     assert result["portfolio_replan_request"] == request
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
     assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
     assert result["active_target_task_ids"] == []
 
@@ -2600,7 +2716,9 @@ def test_unfixable_replan_clears_without_remaining_nonterminal_sca(monkeypatch):
         portfolio_plan=_portfolio_stub(),
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
 
     assert result["portfolio_replan_request"] is None
     assert result["portfolio_dirty"] is False
@@ -2623,9 +2741,13 @@ def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
         lambda *args, **kwargs: ["committed plan is stale"],
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["portfolio_replan_request"] == request
 
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
     assert result["portfolio_replan_request"] == request
 
 
@@ -3537,7 +3659,9 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
     return state, tasks, snapshots
 
 
-def test_atomic_cluster_delta_isolation_charges_only_validated_blame():
+def test_atomic_cluster_delta_isolation_charges_only_validated_blame(
+    monkeypatch: pytest.MonkeyPatch,
+):
     state, original_tasks, snapshots = _atomic_cluster_delta_failure_state()
     approved_inputs = {
         task_id: (
@@ -3550,7 +3674,12 @@ def test_atomic_cluster_delta_isolation_charges_only_validated_blame():
         for task_id, task in original_tasks.items()
     }
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
 
     blamed = result["task_queue"]["task-b"]
     unblamed = result["task_queue"]["task-a"]
@@ -3576,7 +3705,7 @@ def test_atomic_cluster_delta_isolation_charges_only_validated_blame():
     assert request.forced_singleton_task_ids == ["task-b"]
     assert request.triggering_attempt_id == "attempt-b"
     assert request.source_portfolio_plan_id == "portfolio-source"
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
 
 
 def test_atomic_cluster_without_delta_attribution_keeps_all_member_retry_behavior():
@@ -4066,8 +4195,11 @@ def test_supervisor_completes_absent_package_without_worker_attempt() -> None:
     )
 
 
-def test_verified_absent_portfolio_member_requires_replan_before_workers() -> None:
+def test_verified_absent_portfolio_member_requires_replan_before_workers(
+    monkeypatch: pytest.MonkeyPatch,
+):
     state, _old_key = _workerless_absence_state(include_portfolio_plan=True)
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
 
     with (
         patch(
@@ -4080,10 +4212,14 @@ def test_verified_absent_portfolio_member_requires_replan_before_workers() -> No
         ),
     ):
         result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
 
     assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
     assert result["decision_code"] == DecisionCode.PORTFOLIO_PLAN_REQUIRED
-    assert result["next_routing_step"] == "portfolio"
+    assert result["next_routing_step"] == "supervisor"
     assert result["portfolio_dirty"] is True
     assert result["portfolio_replan_request"].reason == (
         "Verified target-package absence changed portfolio membership."
@@ -4092,12 +4228,15 @@ def test_verified_absent_portfolio_member_requires_replan_before_workers() -> No
     assert "task-absent" not in result["active_target_task_ids"]
 
 
-def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans() -> None:
+def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans(
+    monkeypatch: pytest.MonkeyPatch,
+):
     state, _old_key = _workerless_absence_state(
         include_portfolio_plan=True,
         other_attempt_open=True,
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     with (
         patch(
             "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
@@ -4109,6 +4248,7 @@ def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans()
         ),
     ):
         result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
 
     assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
     assert result["portfolio_dirty"] is True
@@ -4120,13 +4260,16 @@ def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans()
     assert result["task_queue"]["task-waiting"].status == TaskStatus.PENDING
 
 
-def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attempt_is_open():
+def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attempt_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+):
     state, _old_key = _workerless_absence_state(
         include_portfolio_plan=True,
         other_attempt_open=True,
         open_attempt_status=TaskStatus.PENDING,
     )
 
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     with (
         patch(
             "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
@@ -4138,6 +4281,7 @@ def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attem
         ),
     ):
         result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
 
     assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
     assert result["portfolio_dirty"] is True
