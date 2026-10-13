@@ -23,8 +23,11 @@ from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlan,
     FixPlanStatus,
+    IncrementalScanRecord,
     IssueSource,
     IssueType,
+    ODCScanEvidence,
+    PackageScanOccurrence,
     PeerConflictEvidence,
     QAAttemptResult,
     QADeterministicGates,
@@ -33,11 +36,13 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScanScope,
     SCARemediationStage,
     Severity,
     SupervisorDecision,
     SupervisorRetryPlan,
     TaskAttemptSnapshot,
+    TaskScanRecord,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
@@ -51,13 +56,16 @@ from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
+    _calculate_cumulative_scan_metrics,
     _create_attempt_snapshot,
     _deterministic_routing,
+    _incremental_scan_coverage_complete,
     _materialize_spawn_requests,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
     _peer_conflict_escalation,
     _repair_invalid_planner_plans,
+    _task_scan_record_from_qa_result,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
@@ -434,6 +442,7 @@ class TestSupervisorRouterFunction:
             supervisor_router({"next_routing_step": "qa_critic", **active_targets}) == "qa_critic"
         )
         assert supervisor_router({"next_routing_step": "teardown"}) == "teardown"
+        assert supervisor_router({"next_routing_step": "final_full_scan"}) == "final_full_scan"
 
     @pytest.mark.parametrize(
         "step",
@@ -524,6 +533,71 @@ class TestRunSupervisorNodeVersionBump:
 
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
+
+    def test_terminal_tasks_route_through_optional_final_full_scan(self):
+        group = _sast_group("g-final-scan")
+        task = _make_task(
+            "task-final-scan",
+            group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.QA_PASSED,
+        )
+        base_state = _base_state(
+            [group],
+            task_queue={task.task_id: task},
+            workspace_volume="workspace-volume",
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+        )
+
+        enabled = run_supervisor_node({**base_state, "final_full_scan_enabled": True})
+        assert enabled["next_routing_step"] == "final_full_scan"
+        assert enabled["decision_code"].value == "FINAL_FULL_SCAN_REQUIRED"
+        assert supervisor_router({**base_state, **enabled}) == "final_full_scan"
+
+        disabled = run_supervisor_node({**base_state, "final_full_scan_enabled": False})
+        assert disabled["next_routing_step"] == "teardown"
+
+    def test_supervisor_preserves_full_scan_findings_for_triage(self):
+        group = _sast_group("g-full-scan")
+        task = _make_task(
+            "task-full-scan",
+            group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.QA_PASSED,
+        )
+        full_scan = {
+            "completed": True,
+            "authoritative": True,
+            "coverage_scope": "full_workspace",
+            "coverage_complete": True,
+            "found_identifiers": ["CVE-2026-70001"],
+            "remaining_target_identifiers": [],
+            "new_identifiers": ["CVE-2026-70001"],
+            "found_issues": [],
+            "status": "detected",
+            "triage_required": True,
+            "error": None,
+        }
+
+        result = run_supervisor_node(
+            _base_state(
+                [group],
+                task_queue={task.task_id: task},
+                workspace_volume="workspace-volume",
+                final_full_scan_enabled=True,
+                final_full_scan_result=full_scan,
+                status="final_scan_completed",
+                triage_required=True,
+                post_qa_triage_enabled=True,
+            )
+        )
+
+        assert result["next_routing_step"] == "triage"
+        assert result["final_full_scan_result"] == full_scan
+        assert result["new_vulnerability_identifiers"] == ["CVE-2026-70001"]
+        assert result["new_vulnerability_status"] == "detected"
+        assert result["triage_required"] is True
 
     def test_deterministic_retry_routing_dispatches_one_task(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
@@ -1831,6 +1905,89 @@ def test_stale_qa_result_does_not_increment_retry_count():
     assert any(event.error_code == "STALE_QA_RESULT" for event in result["consistency_events"])
 
 
+def test_qa_envelope_attempt_id_must_match_current_attempt_map_key() -> None:
+    group = _sca_group("g1")
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        state_revision=2,
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction="Update test-pkg to 2.0.0.",
+        instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
+        dispatch_node="update_subagent",
+    )
+    occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="2.0.0",
+        lockfile_key="node_modules/test-pkg",
+        found_identifiers=["CVE-2026-10001"],
+    )
+    prior_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    prior_key = '["package-lock.json","node_modules/test-pkg","test-pkg","1.0.0",0]'
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        covered_occurrences=[occurrence],
+        inventory_updates={
+            '["package-lock.json","node_modules/test-pkg","test-pkg","2.0.0",0]': "fingerprint"
+        },
+        complete=True,
+    )
+    mismatched_result = QAAttemptResult(
+        attempt_id="attempt-stale",
+        task_id="task-1",
+        task_revision=2,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=True,
+            scan_evidence=evidence,
+        ),
+    )
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+        retry_count=1,
+    ).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": "attempt-current",
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": "Update test-pkg to 2.0.0.",
+        }
+    )
+    state = _base_state(
+        [group],
+        status="qa_completed",
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        qa_results_by_attempt={"attempt-current": mismatched_result},
+        accepted_package_inventory_by_lockfile={prior_key: "prior-fingerprint"},
+        current_scan_observations_by_occurrence={prior_key: prior_occurrence},
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert any(event.error_code == "QA_ATTEMPT_MISMATCH" for event in result["consistency_events"])
+    assert result["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+    assert result["latest_successful_scan_by_task"] == {}
+
+
 def test_terminal_task_cannot_retain_retry_plan():
     group = _sca_group("g1")
     task = _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE).model_copy(
@@ -2901,55 +3058,25 @@ class TestBugFixes:
         assert len(child_ids_by_parent["task-1"]) == 1
         assert errors == []
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
-        """A completed workaround child must not produce an empty worker route."""
-        group = _sca_group("g1")
-        parent_task = _make_task(
+    def test_terminal_tasks_route_to_teardown_without_final_scan(self):
+        group = _sast_group("g1")
+        task = _make_task(
             "task-1",
             "g1",
-            strategy=RoutingStrategy.VERSION_BUMP,
-            status=TaskStatus.NEEDS_RETRY,
-        )
-        existing_child = _make_task(
-            "task-2",
-            "g1",
             strategy=RoutingStrategy.CODE_WORKAROUND,
-            status=TaskStatus.UNFIXABLE,
-        ).model_copy(update={"parent_task_id": "task-1"})
+            status=TaskStatus.QA_PASSED,
+        )
         state = _base_state(
             [group],
-            task_queue={"task-1": parent_task, "task-2": existing_child},
-            qa_evaluations={
-                "task-1": QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                    retry_feedback="The update introduced a breaking runtime regression.",
-                )
-            },
-            active_target_task_ids=["task-1"],
-            retry_diagnostics_by_task={
-                "task-1": UpdateRetryDiagnostics(
-                    task_id="task-1",
-                    exhausted_update_path=True,
-                )
-            },
+            task_queue={"task-1": task},
             workspace_volume="workspace-volume",
-            final_full_scan_completed=False,
         )
-        mock_chat.side_effect = ImportError("No module named langchain_openai")
 
         result = run_supervisor_node(state)
 
-        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
-        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
-        assert result["next_routing_step"] == "final_full_scan"
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["next_routing_step"] == "teardown"
         assert result["active_target_task_ids"] == []
-        assert not any(
-            error.startswith("supervisor: routing fell back to teardown")
-            for error in result.get("errors", [])
-        )
 
     @patch("langchain_openai.ChatOpenAI")
     def test_terminal_pivot_child_releases_other_pending_tasks(self, mock_chat):
@@ -3320,3 +3447,999 @@ def test_atomic_cluster_stale_delta_provenance_retries_every_member(delta_case):
     assert request.forced_singleton_task_ids == []
     assert request.triggering_attempt_id is None
     assert request.source_portfolio_plan_id is None
+
+
+def test_supervisor_commits_complete_passing_scan_into_ledgers():
+    group = _sca_group("g1")
+    attempt_id = "attempt-current"
+    task_revision = 2
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        state_revision=2,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    old_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    new_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="2.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    stale_new_occurrence = new_occurrence.model_copy(
+        update={"found_identifiers": ["CVE-2026-10001"]}
+    )
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10002",
+            "package_name": "unrelated-pkg",
+            "package_version": "1.0.0",
+            "file_path": "package-lock.json",
+        }
+    )
+    batch_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="unrelated-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/unrelated-pkg",
+        found_identifiers=["CVE-2026-10002"],
+        found_issues=[batch_issue],
+    )
+    old_key = '["package-lock.json","node_modules/test-pkg","test-pkg","1.0.0",0]'
+    new_key = '["package-lock.json","node_modules/test-pkg","test-pkg","2.0.0",0]'
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[new_occurrence],
+        removed_occurrence_keys=[old_key],
+        inventory_updates={new_key: "new-fingerprint"},
+        complete=True,
+    )
+    batch_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        found_identifiers=["CVE-2026-10002"],
+        new_identifiers=["CVE-2026-10002"],
+        found_issues=[batch_issue],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[new_occurrence, batch_occurrence],
+        complete=True,
+        scan_performed=True,
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=True,
+            scan_evidence=evidence,
+        ),
+        batch_scan_evidence=batch_evidence,
+        batch_scan_candidate_retained=True,
+    )
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+    state = _base_state(
+        [group],
+        status="qa_completed",
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={attempt_id: snapshot},
+        qa_results_by_attempt={attempt_id: qa_result},
+        accepted_package_inventory_by_lockfile={
+            old_key: "old-fingerprint",
+            new_key: "stale-fingerprint",
+        },
+        current_scan_observations_by_occurrence={
+            old_key: old_occurrence,
+            new_key: stale_new_occurrence,
+        },
+        latest_incremental_scan_by_input={
+            "package-lock.json": IncrementalScanRecord(
+                source_input_path="package-lock.json",
+                task_ids=["task-1"],
+                attempt_ids=["attempt-old"],
+                found_identifiers=["CVE-2026-10001"],
+                new_identifiers=["CVE-2026-10001"],
+                complete=True,
+            )
+        },
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+    assert result["accepted_package_inventory_by_lockfile"] == {new_key: "new-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {new_key: new_occurrence}
+    committed_record = result["latest_successful_scan_by_task"]["task-1"]
+    assert committed_record.attempt_id == attempt_id
+    assert committed_record.task_revision == task_revision
+    assert committed_record.removed_occurrence_keys == [old_key]
+    assert committed_record.found_identifiers == []
+    assert committed_record.found_issues == []
+    incremental_record = result["latest_incremental_scan_by_input"]["package-lock.json"]
+    assert incremental_record.attempt_ids == [attempt_id]
+    assert incremental_record.found_identifiers == ["CVE-2026-10002"]
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-10002"]
+    assert result["post_remediation_scan_identifiers"] == ["CVE-2026-10002"]
+    assert result["post_remediation_scan_issues"] == [batch_issue]
+    scan_summary = result["final_full_scan_result"]
+    assert scan_summary.coverage_scope == "incremental_dependency_inputs"
+    assert scan_summary.authoritative is False
+    assert scan_summary.new_identifiers == ["CVE-2026-10002"]
+    assert state["accepted_package_inventory_by_lockfile"] == {
+        old_key: "old-fingerprint",
+        new_key: "stale-fingerprint",
+    }
+    assert state["current_scan_observations_by_occurrence"] == {
+        old_key: old_occurrence,
+        new_key: stale_new_occurrence,
+    }
+
+
+def test_retained_regression_candidate_contributes_batch_scan_findings():
+    group = _sca_group("g-regression")
+    attempt_id = "attempt-regression"
+    task_revision = 1
+    instruction = "Upgrade test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-regression",
+        state_revision=1,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-regression"],
+        covered_input_paths=["package-lock.json"],
+        complete=True,
+        scan_performed=True,
+    )
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10003",
+            "package_name": "report-wide-pkg",
+            "package_version": "1.0.0",
+        }
+    )
+    batch_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="report-wide-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/report-wide-pkg",
+        found_identifiers=["CVE-2026-10003"],
+        found_issues=[batch_issue],
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id="task-regression",
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-regression",
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="The candidate failed an API test.",
+            scan_evidence=task_evidence,
+        ),
+        batch_scan_evidence=ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-regression"],
+            found_identifiers=["CVE-2026-10003"],
+            new_identifiers=["CVE-2026-10003"],
+            found_issues=[batch_issue],
+            covered_input_paths=["package-lock.json"],
+            covered_occurrences=[batch_occurrence],
+            complete=True,
+            scan_performed=True,
+        ),
+        batch_scan_candidate_retained=True,
+    )
+    task = _make_task("task-regression", group.group_id).model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            status="qa_completed",
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+            attempt_snapshots_by_id={attempt_id: snapshot},
+            qa_results_by_attempt={attempt_id: qa_result},
+        )
+    )
+
+    assert result["task_queue"][task.task_id].status != TaskStatus.QA_PASSED
+    assert result["latest_successful_scan_by_task"] == {}
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-10003"]
+    assert result["latest_incremental_scan_by_input"]["package-lock.json"].found_identifiers == [
+        "CVE-2026-10003"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("passed", "complete"),
+    [(False, True), (True, False)],
+)
+def test_task_scan_record_rejects_failed_or_incomplete_qa(passed, complete):
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-1",
+        task_id="task-1",
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=passed,
+            failure_category=None if passed else FailureCategory.SECURITY_FLAG,
+            retry_feedback=None if passed else "The target remains vulnerable.",
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=["task-1"],
+                complete=complete,
+            ),
+        ),
+    )
+
+    assert _task_scan_record_from_qa_result(qa_result) is None
+
+
+@pytest.mark.parametrize("failing_task_id", [None, "task-b"])
+def test_atomic_cluster_commits_scan_records_only_when_every_member_passes(failing_task_id):
+    state, _tasks, _snapshots = _atomic_cluster_delta_failure_state(delta_case="ordinary_failure")
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-77777",
+            "package_name": "report-wide-pkg",
+            "package_version": "1.0.0",
+        }
+    )
+    batch_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-a", "task-b"],
+        found_identifiers=["CVE-2026-77777"],
+        new_identifiers=["CVE-2026-77777"],
+        found_issues=[batch_issue],
+        covered_input_paths=["package-lock-a.json", "package-lock-b.json"],
+        covered_occurrences=[
+            PackageScanOccurrence(
+                source_input_path="package-lock-a.json",
+                package_name="report-wide-pkg",
+                version="1.0.0",
+                lockfile_key="node_modules/report-wide-pkg",
+                found_identifiers=["CVE-2026-77777"],
+                found_issues=[batch_issue],
+            )
+        ],
+        complete=True,
+        scan_performed=True,
+    )
+    prior_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock-prior.json",
+        package_name="prior-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/prior-pkg",
+    )
+    prior_key = '["package-lock-prior.json","node_modules/prior-pkg","prior-pkg","1.0.0",0]'
+    if failing_task_id is not None:
+        state["accepted_package_inventory_by_lockfile"] = {prior_key: "prior-fingerprint"}
+        state["current_scan_observations_by_occurrence"] = {prior_key: prior_occurrence}
+    occurrence_keys = {}
+    for suffix in ("a", "b"):
+        task_id = f"task-{suffix}"
+        attempt_id = f"attempt-{suffix}"
+        occurrence = PackageScanOccurrence(
+            source_input_path=f"package-lock-{suffix}.json",
+            package_name=f"test-pkg-{suffix}",
+            version="1.2.3",
+            lockfile_key=f"node_modules/test-pkg-{suffix}",
+        )
+        occurrence_key = (
+            f'["package-lock-{suffix}.json","node_modules/test-pkg-{suffix}",'
+            f'"test-pkg-{suffix}","1.2.3",0]'
+        )
+        occurrence_keys[task_id] = occurrence_key
+        previous_result = state["qa_results_by_attempt"][attempt_id]
+        passed = failing_task_id is None or task_id != failing_task_id
+        state["qa_results_by_attempt"][attempt_id] = previous_result.model_copy(
+            update={
+                "evaluation": QAEvaluation(
+                    task_id=task_id,
+                    passed=passed,
+                    failure_category=None if passed else FailureCategory.BREAKING_CHANGE,
+                    retry_feedback=None if passed else "the atomic candidate failed tests",
+                    scan_evidence=ODCScanEvidence(
+                        requested_scope=ScanScope.TARGETED,
+                        effective_scope=ScanScope.TARGETED,
+                        covered_task_ids=[task_id],
+                        covered_input_paths=[f"package-lock-{suffix}.json"],
+                        covered_occurrences=[occurrence],
+                        inventory_updates={occurrence_key: f"fingerprint-{suffix}"},
+                        complete=True,
+                    ),
+                ),
+                "batch_scan_evidence": batch_evidence if suffix == "a" else None,
+                "batch_scan_candidate_retained": (
+                    failing_task_id is None if suffix == "a" else False
+                ),
+            }
+        )
+
+    result = run_supervisor_node(state)
+
+    if failing_task_id is None:
+        assert set(result["latest_successful_scan_by_task"]) == {"task-a", "task-b"}
+        assert set(result["accepted_package_inventory_by_lockfile"]) == set(
+            occurrence_keys.values()
+        )
+        assert all(task.status == TaskStatus.QA_PASSED for task in result["task_queue"].values())
+        assert set(result["latest_incremental_scan_by_input"]) == {
+            "package-lock-a.json",
+            "package-lock-b.json",
+        }
+        assert result["new_vulnerability_identifiers"] == ["CVE-2026-77777"]
+    else:
+        assert result["latest_successful_scan_by_task"] == {}
+        assert result["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+        assert result["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+        assert state["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+        assert state["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+
+        assert result["latest_incremental_scan_by_input"] == {}
+
+
+def test_cumulative_scan_metrics_use_latest_qa_passed_records_and_baseline():
+    baseline_issue = "CVE-2024-10001"
+    introduced_a = "CVE-2026-10001"
+    introduced_b = "CVE-2026-10002"
+    shared_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": introduced_a,
+        }
+    )
+    second_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": introduced_b,
+        }
+    )
+    task_queue = {
+        "task-a": _make_task("task-a", "g1", status=TaskStatus.QA_PASSED),
+        "task-b": _make_task("task-b", "g2", status=TaskStatus.QA_PASSED),
+        "task-pending": _make_task("task-pending", "g3", status=TaskStatus.PENDING),
+    }
+    scan_records = {
+        "task-a": TaskScanRecord(
+            task_id="task-a",
+            attempt_id="attempt-a",
+            task_revision=1,
+            found_identifiers=[baseline_issue, introduced_a],
+            new_identifiers=[baseline_issue, introduced_a],
+            remaining_target_identifiers=[baseline_issue],
+            found_issues=[shared_issue],
+            complete=True,
+        ),
+        "task-b": TaskScanRecord(
+            task_id="task-b",
+            attempt_id="attempt-b",
+            task_revision=1,
+            found_identifiers=[introduced_a, introduced_b],
+            new_identifiers=[introduced_a, introduced_b],
+            found_issues=[shared_issue, second_issue],
+            complete=True,
+        ),
+        "task-pending": TaskScanRecord(
+            task_id="task-pending",
+            attempt_id="attempt-pending",
+            task_revision=1,
+            found_identifiers=["CVE-2026-19999"],
+            new_identifiers=["CVE-2026-19999"],
+            complete=True,
+        ),
+    }
+
+    new_ids, found_ids, remaining_ids, found_issues = _calculate_cumulative_scan_metrics(
+        task_queue,
+        scan_records,
+        [baseline_issue.lower()],
+    )
+
+    assert new_ids == [introduced_a, introduced_b]
+    assert found_ids == [baseline_issue, introduced_a, introduced_b]
+    assert remaining_ids == [baseline_issue]
+    assert len(found_issues) == 2
+    assert {issue.cve_id for issue in found_issues} == {introduced_a, introduced_b}
+
+
+def test_report_wide_scan_snapshot_replaces_stale_task_findings():
+    old_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10001",
+        }
+    )
+    current_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10002",
+        }
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+    stale_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="stale-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/stale-pkg",
+        found_identifiers=["CVE-2026-10001"],
+        found_issues=[old_issue],
+    )
+    stale_task_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-old",
+        task_revision=1,
+        found_identifiers=["CVE-2026-10001"],
+        new_identifiers=["CVE-2026-10001"],
+        found_issues=[old_issue],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[stale_occurrence],
+        complete=True,
+    )
+    current_input_record = IncrementalScanRecord(
+        source_input_path="package-lock.json",
+        task_ids=["task-1"],
+        attempt_ids=["attempt-current"],
+        found_identifiers=["CVE-2026-10002"],
+        new_identifiers=["CVE-2026-10002"],
+        found_issues=[current_issue],
+        complete=True,
+    )
+
+    new_ids, found_ids, remaining_ids, found_issues = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": stale_task_record},
+        [],
+        incremental_scan_records_by_input={"package-lock.json": current_input_record},
+    )
+
+    assert new_ids == ["CVE-2026-10002"]
+    assert found_ids == ["CVE-2026-10002"]
+    assert remaining_ids == []
+    assert found_issues == [current_issue]
+
+
+@pytest.mark.parametrize(
+    ("triage_enabled", "expected_route"),
+    [(True, "triage"), (False, "teardown")],
+)
+def test_supervisor_projects_incremental_metrics_before_terminal_routing(
+    triage_enabled, expected_route
+):
+    group = _sast_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-55555",
+        }
+    )
+    scan_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        task_revision=1,
+        found_identifiers=["CVE-2026-55555"],
+        new_identifiers=["CVE-2026-55555"],
+        found_issues=[issue],
+        complete=True,
+    )
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={"task-1": task},
+            latest_successful_scan_by_task={"task-1": scan_record},
+            baseline_scan_identifiers=["CVE-2024-10001"],
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+            post_qa_triage_enabled=triage_enabled,
+        )
+    )
+
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-55555"]
+    assert result["post_remediation_scan_identifiers"] == ["CVE-2026-55555"]
+    assert result["post_remediation_scan_issues"] == [issue]
+    assert result["new_vulnerability_status"] == "detected"
+    assert result["triage_required"] is triage_enabled
+    assert result["next_routing_step"] == expected_route
+    summary = result["final_full_scan_result"]
+    assert summary.authoritative is False
+    assert summary.coverage_scope == "incremental_dependency_inputs"
+    assert summary.coverage_complete is True
+
+
+def test_supervisor_defers_incremental_triage_while_remediation_remains():
+    completed_group = _sast_group("g-completed")
+    pending_group = _sast_group("g-pending")
+    completed_task = _make_task(
+        "task-completed",
+        completed_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    pending_task = _make_task(
+        "task-pending",
+        pending_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.PENDING,
+    ).model_copy(update={"instruction": "Apply the selected workaround."})
+    scan_record = TaskScanRecord(
+        task_id="task-completed",
+        attempt_id="attempt-completed",
+        task_revision=1,
+        found_identifiers=["CVE-2026-55555"],
+        new_identifiers=["CVE-2026-55555"],
+        complete=True,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [completed_group, pending_group],
+            task_queue={
+                completed_task.task_id: completed_task,
+                pending_task.task_id: pending_task,
+            },
+            latest_successful_scan_by_task={
+                completed_task.task_id: scan_record,
+            },
+            baseline_scan_identifiers=["CVE-2024-10001"],
+        )
+    )
+
+    assert result["triage_required"] is True
+    assert result["next_routing_step"] == "workaround_subagent"
+    assert result["active_target_task_ids"] == ["task-pending"]
+
+
+def test_supervisor_retriage_limit_suppresses_triage_and_preserves_metrics():
+    result = run_supervisor_node(
+        _base_state(
+            [_sast_group("g1")],
+            triage_required=True,
+            new_vulnerability_identifiers=["CVE-2026-55555"],
+            new_vulnerability_status="detected",
+            post_qa_retriage_limit_reached=True,
+        )
+    )
+
+    assert result["next_routing_step"] == "teardown"
+    assert result["triage_required"] is False
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-55555"]
+    assert result["new_vulnerability_status"] == "detected"
+
+
+def test_supervisor_preserves_known_new_ids_when_incremental_coverage_is_incomplete():
+    group_incomplete = _sast_group("g-incomplete")
+    group_scanned = _sast_group("g-scanned")
+    incomplete_task = _make_task(
+        "task-incomplete",
+        group_incomplete.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scanned_task = _make_task(
+        "task-scanned",
+        group_scanned.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scan_record = TaskScanRecord(
+        task_id=scanned_task.task_id,
+        attempt_id="attempt-scanned",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70001"],
+        new_identifiers=["CVE-2026-70001"],
+        complete=True,
+    )
+    incomplete_result = QAAttemptResult(
+        attempt_id="attempt-incomplete",
+        task_id=incomplete_task.task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=incomplete_task.task_id,
+            passed=True,
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=[incomplete_task.task_id],
+                complete=False,
+            ),
+        ),
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group_incomplete, group_scanned],
+            task_queue={
+                incomplete_task.task_id: incomplete_task,
+                scanned_task.task_id: scanned_task,
+            },
+            qa_results_by_attempt={
+                incomplete_result.attempt_id: incomplete_result,
+            },
+            latest_successful_scan_by_task={
+                scanned_task.task_id: scan_record,
+            },
+            baseline_scan_identifiers=[],
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+        )
+    )
+
+    summary = result["final_full_scan_result"]
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-70001"]
+    assert result["new_vulnerability_status"] == "detected"
+    assert summary.coverage_scope == "incremental_dependency_inputs"
+    assert summary.coverage_complete is False
+    assert summary.new_identifiers == ["CVE-2026-70001"]
+
+
+def test_absent_target_skip_preserves_cumulative_ids_from_scanned_tasks():
+    skipped_group = _sast_group("g-skipped")
+    scanned_group = _sast_group("g-scanned")
+    skipped_task = _make_task(
+        "task-skipped",
+        skipped_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scanned_task = _make_task(
+        "task-scanned",
+        scanned_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    skipped_result = QAAttemptResult(
+        attempt_id="attempt-skipped",
+        task_id=skipped_task.task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=skipped_task.task_id,
+            passed=True,
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=[skipped_task.task_id],
+                scan_performed=False,
+                scan_skip_reason="no_matching_target",
+                complete=True,
+            ),
+        ),
+    )
+    skipped_record = _task_scan_record_from_qa_result(skipped_result)
+    assert skipped_record is not None
+    assert _incremental_scan_coverage_complete(
+        {
+            "baseline_scan_complete": True,
+            "package_inventory_baseline_complete": True,
+            "qa_results_by_attempt": {skipped_result.attempt_id: skipped_result},
+            "attempt_snapshots_by_id": {},
+        },
+        None,
+    )
+
+    scanned_record = TaskScanRecord(
+        task_id=scanned_task.task_id,
+        attempt_id="attempt-scanned",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70001"],
+        new_identifiers=["CVE-2026-70001"],
+        complete=True,
+    )
+    new_ids, found_ids, remaining_ids, _ = _calculate_cumulative_scan_metrics(
+        {
+            skipped_task.task_id: skipped_task,
+            scanned_task.task_id: scanned_task,
+        },
+        {
+            skipped_task.task_id: skipped_record,
+            scanned_task.task_id: scanned_record,
+        },
+        [],
+    )
+
+    assert new_ids == ["CVE-2026-70001"]
+    assert found_ids == ["CVE-2026-70001"]
+    assert remaining_ids == []
+
+
+def test_supervisor_commits_setup_scan_findings_and_inventory_once():
+    group = _sast_group("g-setup")
+    task = _make_task(
+        "task-setup",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70002",
+            "package_name": "new-package",
+            "package_version": "1.0.0",
+        }
+    )
+    occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="new-package",
+        version="1.0.0",
+        lockfile_key="node_modules/new-package",
+        found_identifiers=["CVE-2026-70002"],
+        found_issues=[issue],
+    )
+    occurrence_key = '["package-lock.json","node_modules/new-package","new-package","1.0.0",0]'
+    setup_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_occurrences=[occurrence],
+        covered_input_paths=["package-lock.json"],
+        closure_package_names=["new-package"],
+        found_identifiers=["CVE-2026-70002"],
+        new_identifiers=["CVE-2026-70002"],
+        found_issues=[issue],
+        inventory_updates={occurrence_key: "setup-fingerprint"},
+        complete=True,
+    )
+    state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        accepted_package_inventory_by_lockfile={},
+        current_scan_observations_by_occurrence={},
+        baseline_scan_identifiers=["CVE-2024-70000"],
+        baseline_scan_complete=True,
+        package_inventory_baseline_complete=True,
+        setup_scan_evidence=setup_evidence,
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["setup_scan_committed"] is True
+    assert result["accepted_package_inventory_by_lockfile"] == {occurrence_key: "setup-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {occurrence_key: occurrence}
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-70002"]
+    assert result["post_remediation_scan_issues"] == [issue]
+    assert state["accepted_package_inventory_by_lockfile"] == {}
+    assert state.get("setup_scan_committed", False) is False
+
+
+def test_setup_scan_findings_persist_until_accepted_task_scan_replaces_them():
+    group = _sast_group("g-setup")
+    task = _make_task(
+        "task-setup",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    setup_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70003",
+            "package_name": "new-package",
+            "package_version": "1.0.0",
+        }
+    )
+    setup_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="new-package",
+        version="1.0.0",
+        lockfile_key="node_modules/new-package",
+        found_identifiers=["CVE-2026-70003"],
+        found_issues=[setup_issue],
+    )
+    occurrence_key = '["package-lock.json","node_modules/new-package","new-package","1.0.0",0]'
+    setup_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_occurrences=[setup_occurrence],
+        covered_input_paths=["package-lock.json"],
+        closure_package_names=["new-package"],
+        found_identifiers=["CVE-2026-70003"],
+        new_identifiers=["CVE-2026-70003"],
+        found_issues=[setup_issue],
+        inventory_updates={occurrence_key: "setup-fingerprint"},
+        complete=True,
+    )
+    first_state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        accepted_package_inventory_by_lockfile={},
+        current_scan_observations_by_occurrence={},
+        baseline_scan_identifiers=["CVE-2024-70000"],
+        baseline_scan_complete=True,
+        package_inventory_baseline_complete=True,
+        post_qa_triage_enabled=False,
+        setup_scan_evidence=setup_evidence,
+    )
+
+    first_result = run_supervisor_node(first_state)
+
+    assert first_result["new_vulnerability_identifiers"] == ["CVE-2026-70003"]
+    assert first_result["setup_scan_evidence"] == setup_evidence
+    assert first_result["setup_scan_committed"] is True
+
+    clean_occurrence = setup_occurrence.model_copy(
+        update={"found_identifiers": [], "found_issues": []}
+    )
+    instruction = "Apply the selected package workaround."
+    attempt_id = "attempt-clean-setup"
+    task_revision = 2
+    next_task = first_result["task_queue"][task.task_id].model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "status": TaskStatus.OPTIMISTICALLY_FIXED,
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        task_revision=task_revision,
+        state_revision=first_result["state_revision"] + 1,
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="workaround_subagent",
+    )
+    clean_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[task.task_id],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[clean_occurrence],
+        inventory_updates={occurrence_key: "clean-fingerprint"},
+        complete=True,
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=task.task_id,
+            passed=True,
+            scan_evidence=clean_evidence,
+        ),
+    )
+    second_state = {
+        **first_state,
+        **first_result,
+        "status": "qa_completed",
+        "task_queue": {task.task_id: next_task},
+        "active_target_task_ids": [task.task_id],
+        "attempt_snapshots_by_id": {
+            **first_result["attempt_snapshots_by_id"],
+            attempt_id: snapshot,
+        },
+        "qa_results_by_attempt": {
+            **first_result["qa_results_by_attempt"],
+            attempt_id: qa_result,
+        },
+    }
+
+    second_result = run_supervisor_node(second_state)
+
+    assert second_result["setup_scan_evidence"] is None
+    assert second_result["new_vulnerability_identifiers"] == []
+    assert second_result["new_vulnerability_status"] == "none"
+    assert second_result["latest_successful_scan_by_task"][task.task_id].found_identifiers == []
+
+
+def test_later_clean_task_scan_clears_prior_incremental_vulnerability():
+    task = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70020",
+        }
+    )
+    vulnerable_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-vulnerable",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70020"],
+        new_identifiers=["CVE-2026-70020"],
+        found_issues=[issue],
+        complete=True,
+    )
+    clean_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-clean",
+        task_revision=2,
+        complete=True,
+    )
+
+    first_metrics = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": vulnerable_record},
+        [],
+    )
+    later_metrics = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": clean_record},
+        [],
+    )
+
+    assert first_metrics[0] == ["CVE-2026-70020"]
+    assert first_metrics[3] == [issue]
+    assert later_metrics[0] == []
+    assert later_metrics[1] == []
+    assert later_metrics[3] == []

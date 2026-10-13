@@ -77,6 +77,8 @@ class AppSettings:
     remediation_report_dir: Path | None = None
     remedy_bypass_workaround_subagent: bool = False
     remedy_disable_post_qa_triage: bool = False
+    # Development-only opt-in; production keeps incremental scanning by default.
+    remedy_final_full_scan_enabled: bool = False
     # Development-only safety valve. Production remains unlimited by default.
     remedy_retriage_limit_enabled: bool = False
     remedy_retriage_limit: int = DEFAULT_REMEDY_RETRIAGE_LIMIT
@@ -149,6 +151,7 @@ class AppSettings:
             remediation_report_dir=Path(report_dir) if report_dir else None,
             remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),
             remedy_disable_post_qa_triage=_env_bool("REMEDY_DISABLE_POST_QA_TRIAGE"),
+            remedy_final_full_scan_enabled=_env_bool("REMEDY_FINAL_FULL_SCAN_ENABLED"),
             remedy_retriage_limit_enabled=_env_bool("REMEDY_RETRIAGE_LIMIT_ENABLED"),
             remedy_retriage_limit=_env_int(
                 "REMEDY_RETRIAGE_LIMIT",

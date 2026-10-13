@@ -21,6 +21,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     MultiPackageAction,
+    ODCScanEvidence,
     PackageMutation,
     QADeterministicGates,
     QAEvaluation,
@@ -28,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     QATestAttribution,
     RoutingStrategy,
+    ScanScope,
     SCARemediationStage,
     Severity,
     TaskAttemptSnapshot,
@@ -164,8 +166,10 @@ def _committed_dispatch(task, *, dispatch_node: str):
 
 
 class TestPhase5Routing:
-    def test_route_after_workspace_builder_routes_to_portfolio(self):
-        assert route_after_workspace_builder({"status": "workspace_ready"}) == "portfolio"
+    def test_route_after_workspace_builder_routes_to_setup_scan(self):
+        assert (
+            route_after_workspace_builder({"status": "workspace_ready"}) == "workspace_setup_scan"
+        )
 
     def test_route_after_workspace_builder_failure_routes_to_teardown(self):
         assert route_after_workspace_builder({"status": "workspace_build_failed"}) == "teardown"
@@ -1320,12 +1324,23 @@ class TestPhase5GraphIntegration:
             failure_category=FailureCategory.BREAKING_CHANGE,
             retry_feedback="The candidate breaks the test suite.",
         )
+        batch_evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-1"],
+            found_identifiers=["CVE-2026-70002"],
+            new_identifiers=["CVE-2026-70002"],
+            covered_input_paths=["package-lock.json"],
+            complete=True,
+            scan_performed=True,
+        )
         qa_critic = MagicMock(
             return_value={
                 "qa_evaluations": {task.task_id: evaluation},
                 "eval_status": "some_failed",
                 "status": "qa_completed",
                 "errors": [],
+                "scan_evidence": batch_evidence,
             }
         )
         sandbox = MagicMock()
@@ -1344,6 +1359,9 @@ class TestPhase5GraphIntegration:
         sandbox.remove_workspace_snapshot.assert_not_called()
         assert result["workspace_rollback_anchors_by_task"] == {"task-1": "attempt-attempt-qa"}
         assert result["qa_results_by_attempt"]["attempt-qa"].evaluation.passed is False
+        qa_result = result["qa_results_by_attempt"]["attempt-qa"]
+        assert qa_result.batch_scan_evidence == batch_evidence
+        assert qa_result.batch_scan_candidate_retained is True
 
     def test_inconclusive_qa_retains_candidate_workspace_for_rerun(self, tmp_path):
         """Evidence-only QA reruns must not restore the pre-worker baseline."""
@@ -1617,6 +1635,16 @@ class TestPhase5GraphIntegration:
                 "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
             }
         )
+        batch_evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-1"],
+            found_identifiers=["CVE-2026-70001"],
+            new_identifiers=["CVE-2026-70001"],
+            covered_input_paths=["package-lock.json"],
+            complete=True,
+            scan_performed=True,
+        )
         evaluation = QAEvaluation(task_id=task.task_id, passed=True)
         qa_critic = MagicMock(
             return_value={
@@ -1624,6 +1652,7 @@ class TestPhase5GraphIntegration:
                 "eval_status": "all_passed",
                 "status": "qa_completed",
                 "errors": [],
+                "scan_evidence": batch_evidence,
             }
         )
         sandbox = MagicMock()
@@ -1643,6 +1672,8 @@ class TestPhase5GraphIntegration:
         qa_result = result["qa_results_by_attempt"]["attempt-pass"]
         assert qa_result.qa_policy == task.qa_policy
         assert qa_result.qa_policy_source == "attempt_snapshot"
+        assert qa_result.batch_scan_evidence == batch_evidence
+        assert qa_result.batch_scan_candidate_retained is True
 
     def test_regression_retries_keep_first_pre_task_baseline(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]

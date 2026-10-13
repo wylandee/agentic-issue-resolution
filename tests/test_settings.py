@@ -65,6 +65,16 @@ def test_retriage_limit_is_disabled_by_default_and_toggleable(monkeypatch):
     assert AppSettings.from_env().remedy_retriage_limit == 7
 
 
+def test_final_full_scan_is_disabled_by_default_and_toggleable(monkeypatch):
+    variable = "REMEDY_FINAL_FULL_SCAN_ENABLED"
+    monkeypatch.delenv(variable, raising=False)
+    assert AppSettings().remedy_final_full_scan_enabled is False
+    assert AppSettings.from_env().remedy_final_full_scan_enabled is False
+
+    monkeypatch.setenv(variable, "true")
+    assert AppSettings.from_env().remedy_final_full_scan_enabled is True
+
+
 def test_retriage_limit_rejects_invalid_values(monkeypatch):
     monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT", "not-a-number")
 

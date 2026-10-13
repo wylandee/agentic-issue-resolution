@@ -12,11 +12,16 @@ from langgraph.graph import END, START, StateGraph
 
 from remediation_engine.contracts.schemas import (
     CommandResult,
+    IssueSource,
+    IssueType,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
+    Severity,
+    SystemContext,
     TaskAttemptSnapshot,
     TaskStatus,
+    VulnerabilityIssue,
 )
 from remediation_engine.orchestration.state import (
     ChangedFilesProjection,
@@ -47,10 +52,42 @@ class TestStateDefaults:
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
         assert state["changed_files"] == []
+        assert state["package_inventory_baseline_complete"] is False
         assert "changed_files" in OrchestratorState.__annotations__
+        assert state["baseline_scan_complete"] is False
+        assert state["accepted_package_inventory_by_lockfile"] == {}
+        assert state["current_scan_observations_by_occurrence"] == {}
+        assert state["latest_successful_scan_by_task"] == {}
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
         assert "messages" not in state
+
+        assert (
+            initial_orchestrator_state(str(tmp_path), [], issues=[])["baseline_scan_complete"]
+            is True
+        )
+
+    def test_package_scope_preserves_the_full_supplied_scan_baseline(self, tmp_path):
+        def issue(package_name: str, cve_id: str) -> VulnerabilityIssue:
+            return VulnerabilityIssue(
+                source=IssueSource.ODC,
+                issue_type=IssueType.SCA,
+                severity=Severity.HIGH,
+                cve_id=cve_id,
+                package_name=package_name,
+                package_version="1.0.0",
+            )
+
+        state = initial_orchestrator_state(
+            str(tmp_path),
+            [],
+            issues=[issue("selected", "CVE-2025-0001"), issue("outside", "CVE-2025-0002")],
+            system_context=SystemContext(environment="development"),
+            target_packages=["selected"],
+        )
+
+        assert state["baseline_scan_identifiers"] == ["CVE-2025-0001", "CVE-2025-0002"]
+        assert [item.package_name for item in state["issues"]] == ["selected"]
 
     def test_graph_preserves_changed_file_channel_and_teardown_projection(self):
         workflow = StateGraph(OrchestratorState)
@@ -83,6 +120,14 @@ class TestWorkspaceBuilderNode:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         (tmp_path / "frontend").mkdir()
         (tmp_path / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text(
+            '{"packages":{"":{"name":"root","version":"1.0.0"}}}',
+            encoding="utf-8",
+        )
+        (tmp_path / "frontend" / "package-lock.json").write_text(
+            '{"packages":{"":{"name":"frontend","version":"1.0.0"}}}',
+            encoding="utf-8",
+        )
         client = MagicMock()
         sandbox = _sandbox_mock()
 
@@ -106,6 +151,11 @@ class TestWorkspaceBuilderNode:
         ]
         assert result["status"] == "workspace_ready"
         assert result["workspace_volume"].startswith("agent_workspace_")
+        inventory = result["accepted_package_inventory_by_lockfile"]
+        assert result["package_inventory_baseline_complete"] is True
+        assert len(inventory) == 2
+        assert any(key.startswith('["package-lock.json",') for key in inventory)
+        assert any(key.startswith('["frontend/package-lock.json",') for key in inventory)
 
     def test_no_package_repository_skips_install(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])

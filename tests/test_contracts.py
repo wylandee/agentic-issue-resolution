@@ -25,6 +25,7 @@ from remediation_engine.contracts import (
     ASTNodeType,
     DecisionCode,
     FailureCategory,
+    FinalFullScanResult,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -32,6 +33,7 @@ from remediation_engine.contracts import (
     LocalizedIssue,
     MultiPackageAction,
     ODCScanEvidence,
+    PackageScanOccurrence,
     PackageMutation,
     QAEvaluation,
     QAFailureEvidence,
@@ -44,6 +46,7 @@ from remediation_engine.contracts import (
     TaskCluster,
     TaskDependency,
     TaskDependencyKind,
+    TaskScanRecord,
     TestAttributionVerdict,
     VulnerabilityIssue,
 )
@@ -264,6 +267,13 @@ class TestQAEvaluation:
             effective_scope=ScanScope.TARGETED,
             covered_task_ids=["task-1"],
             closure_package_names=["express"],
+            found_identifiers=["CVE-2025-0001"],
+            new_identifiers=["CVE-2025-0001"],
+            remaining_target_identifiers=["CVE-2024-0001"],
+            covered_input_paths=["package-lock.json"],
+            inventory_updates={"occurrence": "fingerprint"},
+            inventory_removals=["removed-occurrence"],
+            scan_performed=False,
             complete=True,
         )
         evaluation = QAEvaluation(
@@ -274,6 +284,57 @@ class TestQAEvaluation:
 
         reloaded = QAEvaluation.model_validate_json(evaluation.model_dump_json())
         assert reloaded.scan_evidence == evidence
+
+
+def test_incremental_scan_contracts_round_trip_and_reject_invalid_occurrences():
+    occurrence = PackageScanOccurrence(
+        source_input_path="packages/api/package-lock.json",
+        package_name="@scope/library",
+        version="1.2.3",
+        lockfile_key="node_modules/@scope/library",
+        occurrence_index=1,
+        found_identifiers=["CVE-2025-0001"],
+    )
+    record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        task_revision=2,
+        new_identifiers=["CVE-2025-0001"],
+        covered_occurrences=[occurrence],
+        complete=True,
+    )
+
+    assert PackageScanOccurrence.model_validate_json(occurrence.model_dump_json()) == occurrence
+    assert TaskScanRecord.model_validate_json(record.model_dump_json()) == record
+    with pytest.raises(ValidationError):
+        PackageScanOccurrence(
+            source_input_path="package-lock.json",
+            package_name="library",
+            version="1.2.3",
+            occurrence_index=-1,
+        )
+    with pytest.raises(ValidationError):
+        PackageScanOccurrence(
+            source_input_path="package-lock.json",
+            package_name="library",
+            version="1.2.3",
+            unexpected="not allowed",
+        )
+
+
+def test_final_scan_result_defaults_to_legacy_full_workspace_scope():
+    legacy = FinalFullScanResult(completed=True)
+    incremental = FinalFullScanResult(
+        completed=True,
+        authoritative=False,
+        coverage_scope="incremental_dependency_inputs",
+        coverage_complete=True,
+    )
+
+    assert legacy.authoritative is True
+    assert legacy.coverage_scope == "full_workspace"
+    assert legacy.coverage_complete is None
+    assert FinalFullScanResult.model_validate_json(incremental.model_dump_json()) == incremental
 
 
 class TestAgentActionSummary:

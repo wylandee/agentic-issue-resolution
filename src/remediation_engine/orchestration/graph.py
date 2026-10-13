@@ -11,7 +11,7 @@ Phase 5 graph topology (hub-and-spoke)
       | triage_completed / skipped -> workspace_builder
       | failed | no_work -> teardown
     workspace_builder
-      | workspace_ready -> portfolio
+      | workspace_ready -> workspace_setup_scan -> portfolio
       | failed -> teardown
     portfolio
       | validated -> supervisor
@@ -24,12 +24,10 @@ Phase 5 graph topology (hub-and-spoke)
       |                                            |
       +-> qa_critic ------------------------------>+
       |                                            |
-      +-> triage (post-QA reconciliation) --------> portfolio
+      +-> triage (post-QA reconciliation) -> portfolio
+      |                                      |
+      +-> final_full_scan (optional) ------> supervisor
       |                                            |
-      +-> final_full_scan ------------------------>+
-      |                         +-> triage -> portfolio
-      |                         +-> teardown
-      |
       +-> teardown -> report -> END
 
 Public API:
@@ -59,6 +57,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     SystemContext,
+    TaskScanRecord,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -68,6 +67,7 @@ from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
 )
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
+from remediation_engine.orchestration.final_full_scan import run_final_full_scan_node
 from remediation_engine.orchestration.graph_wrappers import (
     _create_workspace_attempt_snapshot,
     _dispatch_boundary_rejection,
@@ -89,6 +89,7 @@ from remediation_engine.orchestration.graph_wrappers import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
+from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
 from remediation_engine.orchestration.langsmith_config import (
     build_phase5_runnable_config,
     mark_phase5_trace_failed,
@@ -100,8 +101,8 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
     prepare_portfolio_inputs,
 )
 from remediation_engine.orchestration.qa_critic import (
-    run_final_full_scan_node,
     run_qa_critic_node,
+    run_workspace_setup_scan_node,
 )
 from remediation_engine.orchestration.report_node import finalize_report, run_report_node
 from remediation_engine.orchestration.runtime_context import (
@@ -125,7 +126,6 @@ from remediation_engine.orchestration.supervisor_node import (
 from remediation_engine.orchestration.task_utils import (
     TERMINAL_TASK_STATUSES,
     build_initial_remediation_task,
-    task_group_lineage,
 )
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.orchestration.trajectory_exporter import (
@@ -170,7 +170,6 @@ __all__ = [
     "route_after_post_qa_triage",
     "route_after_workspace_builder",
     "route_after_portfolio",
-    "route_after_final_full_scan",
     "run_portfolio_node",
     "run_orchestrator",
     "MAX_PORTFOLIO_ITERATIONS",
@@ -289,14 +288,6 @@ def triage_node(state: OrchestratorState) -> dict[str, Any]:
         }
 
 
-def _stable_issue_fingerprint(issue: VulnerabilityIssue) -> str:
-    """Return an issue fingerprint that ignores generated ingestion metadata."""
-    payload = issue.model_dump(mode="json")
-    payload.pop("id", None)
-    payload.pop("ingested_at", None)
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-
-
 def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
     """Compare meaningful group content while ignoring volatile triage metadata."""
     payload = {
@@ -317,7 +308,7 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
             context.model_dump(mode="json") for context in group.parent_contexts or []
         ],
         "sources": sorted(source.value for source in (group.sources or [])),
-        "issues": sorted(_stable_issue_fingerprint(issue) for issue in (group.issues or [])),
+        "issues": sorted(stable_issue_fingerprint(issue) for issue in (group.issues or [])),
         "fix_plan_candidates": [
             candidate.model_dump(mode="json")
             for candidate in sorted(
@@ -330,10 +321,86 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _current_successful_scan_records(state: OrchestratorState) -> list[TaskScanRecord]:
+    """Return complete scan records still owned by currently passed tasks."""
+    task_queue = state.get("task_queue", {}) or {}
+    scan_records = state.get("latest_successful_scan_by_task", {}) or {}
+    return [
+        record
+        for task_id, record in sorted(scan_records.items())
+        if (
+            task_id in task_queue
+            and task_queue[task_id].status == TaskStatus.QA_PASSED
+            and record.task_id == task_id
+            and record.complete
+        )
+    ]
+
+
+def _incremental_target_package_scope(state: OrchestratorState) -> list[str]:
+    """Extend development package scope only with accepted scan closures."""
+    packages = list(state.get("target_packages", []) or [])
+    seen = {package.casefold() for package in packages if isinstance(package, str)}
+    for record in _current_successful_scan_records(state):
+        for package in record.closure_package_names:
+            if not isinstance(package, str) or not package.strip():
+                continue
+            normalized = package.strip().casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            packages.append(package.strip())
+    setup_evidence = state.get("setup_scan_evidence")
+    if setup_evidence is not None and setup_evidence.complete:
+        for package in setup_evidence.closure_package_names:
+            if not isinstance(package, str) or not package.strip():
+                continue
+            normalized = package.strip().casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            packages.append(package.strip())
+    return packages
+
+
+def _has_accepted_scan_change_for_group(
+    state: OrchestratorState,
+    task_id: str,
+    group: VulnerabilityGroup,
+) -> bool:
+    """Check whether this passed task's complete scan covered the group package."""
+    task = (state.get("task_queue", {}) or {}).get(task_id)
+    record = (state.get("latest_successful_scan_by_task", {}) or {}).get(task_id)
+    if (
+        task is None
+        or task.status != TaskStatus.QA_PASSED
+        or record is None
+        or record.task_id != task_id
+        or not record.complete
+    ):
+        return False
+    group_package_names = {
+        value.strip().casefold()
+        for value in (
+            group.vulnerable_component,
+            group.parent_package_name,
+            *(issue.package_name for issue in group.issues or []),
+            *(localized.issue.package_name for localized in group.localized_issues or []),
+        )
+        if isinstance(value, str) and value.strip()
+    }
+    closure_package_names = {
+        package.strip().casefold()
+        for package in record.closure_package_names
+        if isinstance(package, str) and package.strip()
+    }
+    return bool(group_package_names & closure_package_names)
+
+
 def _post_triage_issue_input(
     state: OrchestratorState,
 ) -> list[VulnerabilityIssue] | None:
-    """Build the current issue universe from the parseable QA scan snapshot."""
+    """Build triage input from baseline non-ODC findings and accepted ODC deltas."""
     if "post_remediation_scan_issues" not in state:
         return None
 
@@ -341,24 +408,27 @@ def _post_triage_issue_input(
     baseline_issues = list(state.get("issues") or [])
     retained_non_odc = [issue for issue in baseline_issues if issue.source != IssueSource.ODC]
 
-    # Skip-triage callers may omit the full initial issue set.  Preserve any
-    # non-ODC findings carried by the supplied groups in that compatibility
-    # mode, while the post-remediation ODC snapshot remains authoritative for
-    # dependency findings.
+    # Skip-triage callers may omit the full initial issue set. Preserve any
+    # non-ODC findings carried by the supplied groups; accepted task records
+    # provide only the current ODC observations for changed dependency closures.
     if not baseline_issues:
-        seen_issue_fingerprints = {_stable_issue_fingerprint(issue) for issue in retained_non_odc}
         for group in state.get("valid_groups", []) or []:
-            for issue in group.issues or []:
-                if issue.source == IssueSource.ODC:
-                    continue
-                fingerprint = _stable_issue_fingerprint(issue)
-                if fingerprint not in seen_issue_fingerprints:
-                    retained_non_odc.append(issue)
-                    seen_issue_fingerprints.add(fingerprint)
+            retained_non_odc.extend(
+                issue for issue in group.issues or [] if issue.source != IssueSource.ODC
+            )
+
+    unique_issues: list[VulnerabilityIssue] = []
+    seen_issue_fingerprints: set[str] = set()
+    for issue in retained_non_odc + post_scan_issues:
+        fingerprint = stable_issue_fingerprint(issue)
+        if fingerprint in seen_issue_fingerprints:
+            continue
+        seen_issue_fingerprints.add(fingerprint)
+        unique_issues.append(issue)
 
     return filter_issues_to_target_packages(
-        retained_non_odc + post_scan_issues,
-        state.get("target_packages", []),
+        unique_issues,
+        _incremental_target_package_scope(state),
     )
 
 
@@ -371,10 +441,10 @@ def _accepted_remediation_task_ids(
 ) -> set[str]:
     """Return tasks whose changed workspace was accepted by QA.
 
-    Worker status is provisional. The final scan accepts only the latest
-    worker result associated with the task's committed attempt, together with
-    a passing task-keyed QA evaluation and matching attempt provenance. A
-    stale changed-file projection or failed attempt cannot prove remediation.
+    Worker status is provisional. Only the latest worker result paired with
+    a passing task-keyed QA evaluation and matching attempt provenance proves
+    accepted remediation. Stale changed-file projections and failed attempts
+    cannot authorize task reopening.
     """
     worker_results = state.get("worker_results_by_attempt", {}) or {}
     qa_results = state.get("qa_results_by_attempt", {}) or {}
@@ -429,9 +499,9 @@ def _accepted_remediation_task_ids(
                 accepted.add(result_task_id)
             continue
 
-        # Compatibility callers may not emit a QA envelope. Only accept the
+        # Compatibility callers may omit a QA envelope. Only accept the
         # worker's own validated result in that legacy case; a non-success
-        # result can never make a final scan reopen a group.
+        # result can never authorize task reopening.
         status = _worker_result_value(result, "status")
         status_value = str(getattr(status, "value", status)).casefold()
         diagnostics = _worker_result_value(result, "execution_diagnostics")
@@ -443,70 +513,14 @@ def _accepted_remediation_task_ids(
     return accepted
 
 
-def _final_scan_has_material_remediation_change(
-    state: OrchestratorState,
-    group_id: str | None = None,
-) -> bool:
-    """Return whether a final-scan target has an accepted material change.
-
-    Final-scan findings are not enough to reopen work. A group must have an
-    accepted worker change associated with its task lineage. Fingerprint
-    comparison remains a compatibility fallback for old manually constructed
-    states that have no attempt envelopes.
-
-    Args:
-        state: Current orchestrator state after the final full scan.
-        group_id: Optional group whose task lineage is being evaluated. When
-            omitted, the helper checks whether any accepted remediation changed
-            the workspace.
-
-    Returns:
-        ``True`` when the supplied group (or any group) has material accepted
-        remediation since the prior final scan; otherwise ``False``.
-    """
-    task_ids: set[str] | None = None
-    task_queue = state.get("task_queue", {}) or {}
-    if group_id is not None:
-        task_ids = {
-            str(task_id)
-            for task in task_group_lineage(task_queue, group_id)
-            if (task_id := _worker_result_value(task, "task_id"))
-        }
-
-    accepted_task_ids = _accepted_remediation_task_ids(state, task_ids)
-    if accepted_task_ids:
-        return True
-
-    # A state with worker/QA envelopes is current-format state. Fail closed
-    # for that state: a global fingerprint change from another group must not
-    # reopen this group.
-    has_attempt_evidence = bool(
-        state.get("worker_results_by_attempt") or state.get("qa_results_by_attempt")
-    )
-    if has_attempt_evidence:
-        return False
-
-    if "final_scan_workspace_fingerprint" not in state:
-        return False
-    previous = state.get("previous_final_scan_workspace_fingerprint")
-    if previous is None:
-        # A first final scan has no prior fingerprint to compare. Without an
-        # accepted attempt envelope, there is no authoritative proof that
-        # this group's workspace changed.
-        return False
-    current = state.get("final_scan_workspace_fingerprint")
-    return current is not None and current != previous
-
-
 def _reconcile_triaged_groups(
     state: OrchestratorState,
     candidate_groups: list[VulnerabilityGroup],
 ) -> tuple[list[VulnerabilityGroup], dict[str, list[str]]]:
-    """Reuse unchanged groups and retain active removed groups for QA handoff."""
+    """Retain prior groups absent from an incremental observation delta."""
     previous_groups = list(state.get("valid_groups", []) or [])
     previous_by_id = {group.group_id: group for group in previous_groups}
     task_queue = state.get("task_queue", {}) or {}
-    active_task_ids = set(state.get("active_target_task_ids", []) or [])
 
     reused: list[str] = []
     changed: list[str] = []
@@ -540,26 +554,10 @@ def _reconcile_triaged_groups(
     for previous in previous_groups:
         if previous.group_id in candidate_ids:
             continue
-        if getattr(previous, "is_synthetic", False):
-            # Synthetic coordination groups do not have scanner identifiers,
-            # so a post-QA scan can never reconstitute them. Keep their stable
-            # package identity while the corresponding task remains part of
-            # the portfolio audit trail.
-            result.append(previous)
-            retained.append(previous.group_id)
-            continue
-        matching_tasks = [
-            (task_id, task)
-            for task_id, task in task_queue.items()
-            if task.parent_group_id == previous.group_id
-        ]
-        if any(
-            task_id in active_task_ids or task.status not in TERMINAL_TASK_STATUSES
-            for task_id, task in matching_tasks
-        ):
-            result.append(previous)
-            retained.append(previous.group_id)
-
+        # Incremental scans cover changed dependency closures, not the entire
+        # repository. An absent group is therefore unobserved, not resolved.
+        result.append(previous)
+        retained.append(previous.group_id)
     reconciliation = {
         "reused_group_ids": sorted(reused),
         "changed_group_ids": sorted(changed),
@@ -639,7 +637,7 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         candidate_groups = [group for group, triage_result in results if triage_result.is_valid]
         candidate_groups = filter_groups_to_target_packages(
             candidate_groups,
-            state.get("target_packages", []),
+            _incremental_target_package_scope(state),
         )
         valid_groups, reconciliation = _reconcile_triaged_groups(
             state,
@@ -649,39 +647,27 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
         changed_group_ids = set(reconciliation["changed_group_ids"])
         changed_group_ids.update(reconciliation["reappeared_group_ids"])
         changed_group_ids.update(reconciliation["new_group_ids"])
-        final_scan = state.get("final_full_scan_result")
-        final_scan_identifiers = set(
-            (
-                final_scan.get("remaining_target_identifiers", [])
-                if isinstance(final_scan, dict)
-                else getattr(final_scan, "remaining_target_identifiers", [])
-            )
-            or []
-        )
-        final_scan_reopened_group_ids = sorted(
+        remaining_target_identifiers = {
+            identifier.upper().strip()
+            for record in _current_successful_scan_records(state)
+            for identifier in record.remaining_target_identifiers
+            if isinstance(identifier, str) and identifier.strip()
+        }
+        remaining_target_group_ids = sorted(
             group.group_id
-            for group in state.get("valid_groups", []) or []
-            if group_target_identifiers(group) & final_scan_identifiers
+            for group in valid_groups
+            if group_target_identifiers(group) & remaining_target_identifiers
         )
-        changed_group_ids.update(final_scan_reopened_group_ids)
-        if final_scan_reopened_group_ids:
-            reconciliation["final_scan_reopened_group_ids"] = final_scan_reopened_group_ids
-        if final_scan_reopened_group_ids:
-            skipped_reopens = {
-                group_id
-                for group_id in final_scan_reopened_group_ids
-                if not _final_scan_has_material_remediation_change(state, group_id)
-            }
-            changed_group_ids.difference_update(skipped_reopens)
-            if skipped_reopens:
-                reconciliation["final_scan_reopen_skipped_no_material_change_group_ids"] = sorted(
-                    skipped_reopens
-                )
+        changed_group_ids.update(remaining_target_group_ids)
+        if remaining_target_group_ids:
+            reconciliation["remaining_target_group_ids"] = remaining_target_group_ids
         groups_by_id = {group.group_id: group for group in valid_groups}
         reopened_task_ids: set[str] = set()
         preserved_unfixable_task_ids: set[str] = set()
         preserved_pivoted_task_ids: set[str] = set()
+        skipped_unaccepted_reopen_group_ids: set[str] = set()
         prior_qa_evaluations = dict(state.get("qa_evaluations", {}) or {})
+        accepted_worker_task_ids = _accepted_remediation_task_ids(state)
         for task_id, task in list(task_queue.items()):
             if task.parent_group_id not in changed_group_ids:
                 continue
@@ -693,8 +679,17 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
                 # child. Re-triage must not resurrect it as a fresh task.
                 preserved_pivoted_task_ids.add(task_id)
                 continue
+            if task.status != TaskStatus.QA_PASSED:
+                continue
             group = groups_by_id.get(task.parent_group_id)
             if group is None:
+                continue
+            if task_id not in accepted_worker_task_ids and not _has_accepted_scan_change_for_group(
+                state,
+                task_id,
+                group,
+            ):
+                skipped_unaccepted_reopen_group_ids.add(task.parent_group_id)
                 continue
             fresh_task = build_initial_remediation_task(group, task_id)
             task_queue[task_id] = task.model_copy(
@@ -722,6 +717,28 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             for key, value in prior_qa_evaluations.items()
             if key not in reopened_task_ids
         }
+        if skipped_unaccepted_reopen_group_ids:
+            reconciliation["reopen_skipped_without_accepted_change_group_ids"] = sorted(
+                skipped_unaccepted_reopen_group_ids
+            )
+        latest_successful_scan_by_task = {
+            task_id: record
+            for task_id, record in (state.get("latest_successful_scan_by_task", {}) or {}).items()
+            if (
+                task_id not in reopened_task_ids
+                and task_id in task_queue
+                and task_queue[task_id].status == TaskStatus.QA_PASSED
+                and record.task_id == task_id
+                and record.complete
+            )
+        }
+        latest_incremental_scan_by_input = {
+            input_path: record
+            for input_path, record in (
+                state.get("latest_incremental_scan_by_input", {}) or {}
+            ).items()
+            if not (set(record.task_ids) & reopened_task_ids)
+        }
         log.info(
             "post_qa_triage_node: produced %d valid groups (%d reused, %d new, %d changed).",
             len(valid_groups),
@@ -745,14 +762,13 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "post_qa_retriage_count": retriage_count,
             "triage_reconciliation": reconciliation,
             "task_queue": task_queue,
+            "latest_successful_scan_by_task": latest_successful_scan_by_task,
+            "latest_incremental_scan_by_input": latest_incremental_scan_by_input,
             "qa_evaluations": qa_evaluations,
             "active_target_task_ids": [],
             "portfolio_dirty": work_reopened,
             "portfolio_plan": None if work_reopened else state.get("portfolio_plan"),
             "portfolio_solver_plan": None if work_reopened else state.get("portfolio_solver_plan"),
-            "final_full_scan_completed": False
-            if work_reopened
-            else state.get("final_full_scan_completed", False),
             "final_full_scan_result": None
             if work_reopened
             else state.get("final_full_scan_result"),
@@ -787,9 +803,9 @@ def route_after_post_qa_triage(state: OrchestratorState) -> str:
 
 
 def route_after_workspace_builder(state: OrchestratorState) -> str:
-    """Route successful workspace preparation into the outer portfolio."""
+    """Run the scoped setup scan after a successful workspace installation."""
     if state.get("status") == "workspace_ready":
-        return "portfolio"
+        return "workspace_setup_scan"
     return "teardown"
 
 
@@ -1279,24 +1295,6 @@ def route_after_portfolio(state: OrchestratorState) -> str:
     )
 
 
-def route_after_final_full_scan(state: OrchestratorState) -> str:
-    """Re-enter triage only when the authoritative scan requires it."""
-    if state.get("status") != "final_scan_completed":
-        return "teardown"
-    required = bool(state.get("triage_required"))
-    result = state.get("final_full_scan_result")
-    if isinstance(result, dict):
-        required = required or bool(
-            result.get("new_identifiers") or result.get("remaining_target_identifiers")
-        )
-    else:
-        required = required or bool(
-            getattr(result, "new_identifiers", ())
-            or getattr(result, "remaining_target_identifiers", ())
-        )
-    return "triage" if required else "teardown"
-
-
 # ---------------------------------------------------------------------------
 # Phase 5 graph construction
 # ---------------------------------------------------------------------------
@@ -1311,6 +1309,7 @@ def build_orchestrator_graph():
     workflow.add_node("initial_triage", triage_node)
     workflow.add_node("triage", post_qa_triage_node)
     workflow.add_node("workspace_builder", run_workspace_builder_node)
+    workflow.add_node("workspace_setup_scan", run_workspace_setup_scan_node)
     workflow.add_node("supervisor", run_supervisor_node)
     workflow.add_node("portfolio", run_portfolio_node)
     workflow.add_node("update_subagent", run_update_subagent_from_orchestrator)
@@ -1323,13 +1322,14 @@ def build_orchestrator_graph():
     workflow.add_edge(START, "initial_triage")
     workflow.add_conditional_edges("initial_triage", route_after_triage)
     workflow.add_conditional_edges("workspace_builder", route_after_workspace_builder)
+    workflow.add_edge("workspace_setup_scan", "portfolio")
     workflow.add_conditional_edges("supervisor", supervisor_router)
     workflow.add_conditional_edges("portfolio", route_after_portfolio)
     workflow.add_edge("update_subagent", "supervisor")
     workflow.add_edge("workaround_subagent", "supervisor")
     workflow.add_edge("qa_critic", "supervisor")
+    workflow.add_edge("final_full_scan", "supervisor")
     workflow.add_conditional_edges("triage", route_after_post_qa_triage)
-    workflow.add_conditional_edges("final_full_scan", route_after_final_full_scan)
     workflow.add_edge("teardown", "report")
     workflow.add_edge("report", END)
 
@@ -1379,6 +1379,8 @@ def run_orchestrator(
         system_context=system_context,
         target_packages=normalized_target_packages,
     )
+    initial_state["post_qa_triage_enabled"] = not settings.remedy_disable_post_qa_triage
+    initial_state["final_full_scan_enabled"] = settings.remedy_final_full_scan_enabled
     config, run_id = build_phase5_runnable_config(
         repo_root,
         valid_groups,

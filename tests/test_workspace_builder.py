@@ -57,7 +57,7 @@ class TestWorkspaceBuilderNode:
         volume_name = f"agent_workspace_{_VOLUME_HEX[:8]}"
         client.volumes.create.assert_called_once_with(name=volume_name)
         client.close.assert_called_once_with()
-        sandbox_type.assert_called_once_with(str(tmp_path), workspace_volume=volume_name)
+        sandbox_type.assert_called_once_with(tmp_path, workspace_volume=volume_name)
         sandbox.__enter__.assert_called_once_with()
         sandbox.__exit__.assert_called_once()
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
@@ -65,7 +65,10 @@ class TestWorkspaceBuilderNode:
             "cd packages/web && npm install --package-lock=true",
         ]
         assert all(call.kwargs == {"timeout": 900} for call in sandbox.run.call_args_list)
-        assert result == {"workspace_volume": volume_name, "status": "workspace_ready"}
+        assert result["workspace_volume"] == volume_name
+        assert result["status"] == "workspace_ready"
+        assert result["accepted_package_inventory_by_lockfile"] == {}
+        assert result["package_inventory_baseline_complete"] is True
 
     def test_volume_creation_failure_closes_client_and_does_not_start_sandbox(self, tmp_path):
         """A failed volume transaction reports failure and releases its client."""

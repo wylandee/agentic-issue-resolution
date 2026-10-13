@@ -456,6 +456,23 @@ def _lockfile_dependency_requirements(metadata: dict[str, Any]) -> dict[str, str
     }
 
 
+def _lockfile_package_candidate_keys(parent_key: str, package_name: str) -> list[str]:
+    """Return npm's package-local-to-root physical lookup order."""
+    parent_parts = [part for part in parent_key.split("/") if part]
+    scopes: list[list[str]] = [parent_parts + ["node_modules"]]
+    for index in range(len(parent_parts) - 1, -1, -1):
+        if parent_parts[index] == "node_modules":
+            scopes.append(parent_parts[: index + 1])
+    keys: list[str] = []
+    seen_keys: set[str] = set()
+    for scope in scopes:
+        key = "/".join([*scope, package_name])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            keys.append(key)
+    return keys
+
+
 def _lockfile_package_candidates(
     packages: dict[str, Any],
     parent_key: str,
@@ -478,19 +495,8 @@ def _lockfile_package_candidates(
     Returns:
         Matching ``(package_key, metadata)`` pairs in npm resolution order.
     """
-    parent_parts = [part for part in parent_key.split("/") if part]
-    scopes: list[list[str]] = [parent_parts + ["node_modules"]]
-    for index in range(len(parent_parts) - 1, -1, -1):
-        if parent_parts[index] == "node_modules":
-            scopes.append(parent_parts[: index + 1])
-
     candidates: list[tuple[str, dict[str, Any]]] = []
-    seen_keys: set[str] = set()
-    for scope in scopes:
-        key = "/".join([*scope, package_name])
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
+    for key in _lockfile_package_candidate_keys(parent_key, package_name):
         metadata = packages.get(key)
         if not isinstance(metadata, dict):
             continue

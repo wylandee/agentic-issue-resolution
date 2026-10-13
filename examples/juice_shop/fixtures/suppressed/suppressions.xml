@@ -111,11 +111,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for esbuild (npm)</notes>
+        <notes>Keep esbuild as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
@@ -135,11 +137,13 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for got (npm)</notes>
+        <notes>Keep got as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>

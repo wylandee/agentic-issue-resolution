@@ -241,6 +241,11 @@ def _evaluate_policy_gates(
                 f"Scanner execution status: {effective_scanner_status.value}. "
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
             )
+        if task_id in results.scan_target_skipped_by_task:
+            diagnostics.append(
+                "Targeted ODC was skipped because the target package was absent "
+                "from the live lockfile."
+            )
         if _QA_PACKAGE_STATE_CHECKS_ENABLED:
             diagnostics.extend(package_state.diagnostics)
         if (
@@ -913,12 +918,53 @@ def _attach_scan_evidence_to_evaluations(
     evidence: ODCScanEvidence | None,
     task_contexts: list[QATaskContext],
     task_failures: Mapping[str, tuple[ScanFallbackReason, str]] | None = None,
+    *,
+    evidence_by_task: Mapping[str, ODCScanEvidence] | None = None,
 ) -> dict[str, QAEvaluation]:
-    """Attach task-scoped projections of attempt-local scan evidence."""
+    """Attach task-owned occurrence evidence to each matching evaluation.
+
+    When the artifact manifest produced an exact task projection, it is
+    authoritative: tasks without an entry do not inherit the batch-wide
+    summary. The legacy batch projection remains for callers without a
+    manifest, while preserving findings outside the task's original target IDs.
+    """
+    if evidence_by_task is not None:
+        enriched: dict[str, QAEvaluation] = {}
+        for task_id, evaluation in evaluations.items():
+            if evaluation.task_id != task_id:
+                logger.warning(
+                    "QA skipped scan evidence for key %r because the evaluation identifies task %r.",
+                    task_id,
+                    evaluation.task_id,
+                )
+                enriched[task_id] = evaluation
+                continue
+            task_evidence = evidence_by_task.get(task_id)
+            if task_evidence is None:
+                enriched[task_id] = evaluation
+                continue
+            task_failure = (task_failures or {}).get(task_id)
+            task_complete = task_failure is None and task_evidence.complete
+            scoped_evidence = task_evidence.model_copy(
+                update={
+                    "covered_task_ids": [task_id],
+                    "complete": task_complete,
+                    "fallback_reason": (
+                        task_failure[0]
+                        if task_failure is not None
+                        else task_evidence.fallback_reason
+                        if not task_complete
+                        else None
+                    ),
+                }
+            )
+            enriched[task_id] = evaluation.model_copy(update={"scan_evidence": scoped_evidence})
+        return enriched
+
     if evidence is None:
         return evaluations
     groups_by_task = {context.task_id: context.group for context in task_contexts}
-    enriched: dict[str, QAEvaluation] = {}
+    enriched = {}
     for task_id, evaluation in evaluations.items():
         if evaluation.task_id != task_id:
             logger.warning(
@@ -940,7 +986,6 @@ def _attach_scan_evidence_to_evaluations(
         scoped_evidence = evidence.model_copy(
             update={
                 "covered_task_ids": [task_id],
-                "found_identifiers": sorted(set(evidence.found_identifiers) & target_ids),
                 "remaining_target_identifiers": sorted(
                     set(evidence.remaining_target_identifiers) & target_ids
                 ),

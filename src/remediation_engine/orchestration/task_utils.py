@@ -303,8 +303,7 @@ def terminal_outcome_issues(state: Mapping[str, Any]) -> list[str]:
 
     This pure projection is shared by teardown, report generation, and the
     public API. A worker success cannot override an unfixable or incomplete
-    task, and the authoritative final scan must not contain blocking findings.
-
+    task, and incomplete incremental coverage cannot be reported as a clean run.
     Args:
         state: Current or final orchestration state.
 
@@ -331,26 +330,37 @@ def terminal_outcome_issues(state: Mapping[str, Any]) -> list[str]:
 
     final_scan = state.get("final_full_scan_result")
     if final_scan is not None:
+        coverage_scope = str(
+            _task_value(final_scan, "coverage_scope", "full_workspace") or "full_workspace"
+        )
+        is_incremental = coverage_scope == "incremental_dependency_inputs"
         completed = _task_value(final_scan, "completed")
+        coverage_complete = _task_value(final_scan, "coverage_complete")
         scan_status = str(_task_value(final_scan, "status", "")).lower()
-        if completed is False or scan_status in {"scan_failed", "failed", "error", "timeout"}:
+        if is_incremental:
+            if coverage_complete is not True:
+                reasons.append("incremental dependency scan coverage is incomplete")
+        elif completed is False or scan_status in {
+            "scan_failed",
+            "failed",
+            "error",
+            "timeout",
+        }:
             reasons.append("authoritative final scan failed")
         remaining = list(_task_value(final_scan, "remaining_target_identifiers", []) or [])
         if remaining:
+            scope_label = "incremental scan" if is_incremental else "authoritative final scan"
             reasons.append(
-                f"authoritative final scan still contains {len(set(remaining))} target identifier(s)"
+                f"{scope_label} still contains {len(set(remaining))} target identifier(s)"
             )
-        new_identifiers = list(_task_value(final_scan, "new_identifiers", []) or [])
+        new_identifiers = list(
+            _task_value(final_scan, "new_identifiers")
+            or state.get("new_vulnerability_identifiers", [])
+            or []
+        )
         if new_identifiers:
-            reasons.append(
-                f"authoritative final scan detected {len(set(new_identifiers))} new identifier(s)"
-            )
-    elif (
-        task_queue
-        and state.get("workspace_volume")
-        and not state.get("final_full_scan_completed", False)
-    ):
-        reasons.append("authoritative final scan was not completed")
+            scope_label = "incremental scans" if is_incremental else "authoritative final scan"
+            reasons.append(f"{scope_label} detected {len(set(new_identifiers))} new identifier(s)")
 
     # Keep the result stable when a malformed task projection repeats the same
     # reason through multiple compatibility paths.

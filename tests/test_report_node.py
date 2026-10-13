@@ -139,6 +139,63 @@ def test_non_authoritative_scan_does_not_change_the_four_section_contract():
     assert "New groups discovered" not in report
 
 
+def test_incremental_incomplete_report_keeps_known_new_identifiers_visible():
+    state = _state()
+    identifier = "CVE-2026-0042"
+    state.update(
+        {
+            "triage_required": True,
+            "new_vulnerability_identifiers": [identifier],
+            "new_vulnerability_status": "detected",
+            "post_remediation_scan_issues": [
+                {
+                    "cve_id": identifier,
+                    "package_name": "new-package",
+                    "file_path": "package-lock.json",
+                    "severity": "HIGH",
+                    "source": "odc",
+                }
+            ],
+            "final_full_scan_result": {
+                "completed": False,
+                "authoritative": False,
+                "coverage_scope": "incremental_dependency_inputs",
+                "coverage_complete": False,
+                "status": "detected",
+                "found_identifiers": [identifier],
+                "new_identifiers": [identifier],
+                "triage_required": True,
+            },
+        }
+    )
+
+    report = generate_report(state)
+
+    assert "| Dependency scan coverage | Incremental dependency inputs (incomplete) |" in report
+    assert f"| Known new vulnerability identifiers | {identifier} |" in report
+    assert identifier in report
+    assert "Incremental scan coverage is incomplete." in report
+    assert "| Successfully remediated vulnerability groups | 1 |" in report
+
+
+def test_incremental_complete_report_names_its_limited_scope():
+    state = _state()
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": False,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": True,
+        "status": "none",
+        "triage_required": False,
+    }
+    state["new_vulnerability_status"] = "none"
+
+    report = generate_report(state)
+
+    assert "| Dependency scan coverage | Incremental dependency inputs (complete) |" in report
+    assert "Incremental scan coverage is incomplete." not in report
+
+
 def test_successful_remediation_table_shows_only_final_change():
     """Attempt detail is reserved for follow-up rows, not successful findings."""
     state = _state()

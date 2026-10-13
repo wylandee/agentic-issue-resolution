@@ -8,6 +8,7 @@ edits and validation against the initialized volume.
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import uuid
@@ -61,6 +62,48 @@ def _discover_package_directories(repo_root: Path) -> list[Path]:
     )
 
 
+def _collect_source_package_lock_inventory(
+    repo_root: Path,
+) -> tuple[dict[str, str], list[str]]:
+    """Read and fingerprint all source package-lock files before npm installs.
+
+    Args:
+        repo_root: Host repository root copied into the Docker workspace.
+
+    Returns:
+        A complete occurrence inventory and diagnostics. The inventory is
+        empty when any source lockfile cannot be parsed, preventing a partial
+        snapshot from being treated as authoritative.
+    """
+    from remediation_engine.orchestration._qa_runtime import _package_lock_inventory
+
+    lockfiles = sorted(
+        (
+            path
+            for path in repo_root.rglob("package-lock.json")
+            if path.is_file()
+            and not any(
+                part in _SKIP_PACKAGE_DIR_NAMES
+                for part in path.relative_to(repo_root).parts
+            )
+        ),
+        key=lambda path: path.relative_to(repo_root).as_posix(),
+    )
+    inventory: dict[str, str] = {}
+    errors: list[str] = []
+    for lockfile_path in lockfiles:
+        relative_path = lockfile_path.relative_to(repo_root).as_posix()
+        try:
+            document = json.loads(lockfile_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("package-lock root must be an object")
+            inventory.update(_package_lock_inventory(relative_path, document))
+        except (OSError, UnicodeError, ValueError) as exc:
+            errors.append(f"{relative_path}: {exc}")
+    return ({} if errors else inventory), errors
+
+
+
 def _install_workspace_dependencies(
     sandbox: DockerSandbox,
     package_directories: list[Path],
@@ -69,7 +112,7 @@ def _install_workspace_dependencies(
 
     Args:
         sandbox: Running Docker sandbox mounted at ``/workspace``.
-        package_directories: Relative package directories in parent-first
+        package_directories: Relative package-directory paths in parent-first
             order, as returned by :func:`_discover_package_directories`.
 
     Raises:
@@ -105,15 +148,15 @@ def _install_workspace_dependencies(
 
 
 def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
-    """
-    LangGraph node - Workspace Builder.
+    """Copy the source repository and install npm dependencies in Docker.
 
-    Creates a Docker named volume, copies the host repository into it, and
-    installs all discovered npm packages so Specialist workers can edit and
-    validate a fully initialized workspace in-place using native tools.
+    The source package-lock inventory is captured before any npm install can
+    rewrite the workspace lockfiles. Invalid source lockfiles are reported as
+    incomplete inventory evidence without preventing ordinary setup.
     """
-    repo_root_str: str = state.get("repo_root", "")
-    if not repo_root_str or not Path(repo_root_str).is_dir():
+    repo_root_str = state.get("repo_root", "")
+    repo_root = Path(repo_root_str)
+    if not repo_root_str or not repo_root.is_dir():
         msg = f"workspace_builder_node: repo_root '{repo_root_str}' is not a valid directory."
         logger.error(msg)
         return {
@@ -121,6 +164,17 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
             "workspace_volume": None,
             "errors": [msg],
         }
+
+    source_inventory, inventory_errors = _collect_source_package_lock_inventory(repo_root)
+    inventory_diagnostics = [
+        f"workspace_builder_node: source package-lock inventory failed: {error}"
+        for error in inventory_errors
+    ]
+    if inventory_errors:
+        logger.warning(
+            "workspace_builder_node: source package-lock inventory is incomplete: %s",
+            "; ".join(inventory_errors),
+        )
 
     volume_name = f"agent_workspace_{uuid.uuid4().hex[:8]}"
     logger.info("workspace_builder_node: creating workspace volume %s.", volume_name)
@@ -135,19 +189,21 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
         return {
             "status": "workspace_build_failed",
             "workspace_volume": None,
-            "errors": [msg],
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "package_inventory_baseline_complete": not inventory_errors,
+            "errors": [msg, *inventory_diagnostics],
         }
     finally:
         if client is not None:
             _close_client(client)
 
     try:
-        with DockerSandbox(repo_root_str, workspace_volume=volume_name) as sandbox:
+        with DockerSandbox(repo_root, workspace_volume=volume_name) as sandbox:
             logger.info(
                 "workspace_builder_node: repository copied into shared volume %s.",
                 volume_name,
             )
-            package_directories = _discover_package_directories(Path(repo_root_str))
+            package_directories = _discover_package_directories(repo_root)
             if package_directories:
                 _install_workspace_dependencies(
                     sandbox=sandbox,
@@ -164,10 +220,15 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
         return {
             "status": "workspace_build_failed",
             "workspace_volume": volume_name,
-            "errors": [msg],
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "package_inventory_baseline_complete": not inventory_errors,
+            "errors": [msg, *inventory_diagnostics],
         }
 
     return {
         "workspace_volume": volume_name,
         "status": "workspace_ready",
+        "accepted_package_inventory_by_lockfile": source_inventory,
+        "package_inventory_baseline_complete": not inventory_errors,
+        "errors": inventory_diagnostics,
     }

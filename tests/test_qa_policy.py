@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     ODCScanEvidence,
+    PackageScanOccurrence,
     QAAttemptResult,
     QADependencyEvidence,
     QAEvaluation,
@@ -199,6 +200,85 @@ def test_scan_evidence_projection_is_isolated_by_task_id() -> None:
     assert enriched["task-2"].scan_evidence.remaining_target_identifiers == ["CVE-2025-0002"]
 
 
+def test_task_specific_scan_evidence_preserves_new_ids_and_closure_metadata() -> None:
+    group_one = _group("group-1", identifier="CVE-2025-0001")
+    group_two = _group("group-2", identifier="CVE-2025-0002")
+    context_one = _task_context(group_one, task_id="task-1")
+    context_two = _task_context(group_two, task_id="task-2")
+    evaluations = {
+        "task-1": QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Retry task one.",
+        ),
+        "task-2": QAEvaluation(
+            task_id="task-2",
+            passed=False,
+            failure_category=FailureCategory.SECURITY_FLAG,
+            retry_feedback="Retry task two.",
+        ),
+    }
+    shared_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1", "task-2"],
+        complete=True,
+    )
+    evidence_by_task = {
+        "task-1": ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-1"],
+            closure_package_names=["express", "body-parser"],
+            closure_lockfile_keys=["node_modules/express", "node_modules/body-parser"],
+            found_identifiers=["CVE-2025-0001", "GHSA-2026-ABCD-EFGH-IJKL"],
+            new_identifiers=["GHSA-2026-ABCD-EFGH-IJKL"],
+            remaining_target_identifiers=["CVE-2025-0001"],
+            covered_occurrences=[
+                PackageScanOccurrence(
+                    source_input_path="package-lock.json",
+                    package_name="body-parser",
+                    version="2.2.0",
+                    lockfile_key="node_modules/body-parser",
+                    found_identifiers=["GHSA-2026-ABCD-EFGH-IJKL"],
+                )
+            ],
+            complete=True,
+        ),
+        "task-2": ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-2"],
+            closure_package_names=["helmet"],
+            closure_lockfile_keys=["node_modules/helmet"],
+            found_identifiers=["CVE-2025-0002"],
+            remaining_target_identifiers=["CVE-2025-0002"],
+            complete=True,
+        ),
+    }
+
+    enriched = _attach_scan_evidence_to_evaluations(
+        evaluations,
+        shared_evidence,
+        [context_one, context_two],
+        evidence_by_task=evidence_by_task,
+    )
+
+    task_one_evidence = enriched["task-1"].scan_evidence
+    task_two_evidence = enriched["task-2"].scan_evidence
+    assert task_one_evidence is not None
+    assert task_one_evidence.found_identifiers == [
+        "CVE-2025-0001",
+        "GHSA-2026-ABCD-EFGH-IJKL",
+    ]
+    assert task_one_evidence.new_identifiers == ["GHSA-2026-ABCD-EFGH-IJKL"]
+    assert task_one_evidence.closure_package_names == ["express", "body-parser"]
+    assert task_two_evidence is not None
+    assert task_two_evidence.closure_package_names == ["helmet"]
+    assert task_two_evidence.found_identifiers == ["CVE-2025-0002"]
+
+
 def _investigation() -> GroupInvestigation:
     return GroupInvestigation(
         group_id="g1",
@@ -256,6 +336,41 @@ def test_version_bump_scanner_is_group_scoped() -> None:
     )
     assert evaluations["task-1"].passed is True
     assert evaluations["task-2"].failure_category == FailureCategory.SECURITY_FLAG
+
+
+def test_missing_target_skip_satisfies_strict_scanner_gate() -> None:
+    group = _group("g1")
+    context = _task_context(group)
+    results = _results(scanner_status=ScannerExecutionStatus.NOT_RUN)
+    results.scan = _SecurityScanResult(
+        ok=True,
+        summary="Targeted ODC skipped because the target package was absent.",
+        remaining_identifiers=set(),
+        found_identifiers=set(),
+        new_identifiers=set(),
+        execution_status=ScannerExecutionStatus.NOT_RUN,
+    )
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[context.task_id],
+        scan_performed=False,
+        scan_skip_reason="no_matching_target",
+        complete=True,
+    )
+    results.scan_evidence_by_task[context.task_id] = evidence
+    results.scan_target_skipped_by_task[context.task_id] = "no_matching_target"
+
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates[context.task_id].status == "pass"
+    assert gates[context.task_id].scanner_execution_status == ScannerExecutionStatus.SUCCESS
+    assert gates[context.task_id].target_scanner_cleared is True
+    assert any("was absent" in item for item in gates[context.task_id].diagnostics)
 
 
 def test_version_bump_ignores_compacted_manifest_false_negative() -> None:
