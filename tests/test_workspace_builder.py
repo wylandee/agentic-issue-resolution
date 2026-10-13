@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
-from remediation_engine.language import ProjectLanguage
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 _VOLUME_HEX = "deadbeefcafebabe"
@@ -186,14 +186,16 @@ class TestWorkspaceBuilderNode:
         volume_name = f"agent_workspace_{_VOLUME_HEX[:8]}"
         sandbox_type.assert_called_once_with(
             str(tmp_path),
-            image="python:3.11-slim",
+            image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
             workspace_volume=volume_name,
         )
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "rm -rf .venv .remedy-pipenv",
             "python -m venv .remedy-pipenv",
+            ".remedy-pipenv/bin/python -m pip install --upgrade pip==26.2.1",
             ".remedy-pipenv/bin/python -m pip install pipenv",
             "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv --python 3.11",
+            ".venv/bin/python -m pip install --upgrade pip==26.2.1",
             "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv sync --dev",
             (
                 "if ! .venv/bin/python -c 'import pytest' >/dev/null 2>&1; "
@@ -226,10 +228,14 @@ class TestWorkspaceBuilderNode:
             )
 
         sandbox_type.assert_called_once()
-        assert sandbox_type.call_args.kwargs["image"] == "python:3.11-slim"
+        assert (
+            sandbox_type.call_args.kwargs["image"]
+            == LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
+        )
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "rm -rf .venv .remedy-pipenv",
             "python -m venv .venv",
+            ".venv/bin/python -m pip install --upgrade pip==26.2.1",
             ".venv/bin/python -m pip install -r requirements.txt",
             ".venv/bin/python -m pip install -e .",
             (
@@ -264,6 +270,7 @@ class TestWorkspaceBuilderNode:
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "rm -rf .venv .remedy-pipenv",
             "python -m venv .venv",
+            ".venv/bin/python -m pip install --upgrade pip==26.2.1",
             (
                 "if ! .venv/bin/python -c 'import pytest' >/dev/null 2>&1; "
                 "then .venv/bin/python -m pip install pytest; fi"
@@ -381,6 +388,9 @@ class TestWorkspaceBuilderNode:
 
         commands = [call.args[0] for call in sandbox.run.call_args_list]
         assert "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv install --dev" in commands
+
+        assert ".remedy-pipenv/bin/python -m pip install --upgrade pip==26.2.1" in commands
+        assert ".venv/bin/python -m pip install --upgrade pip==26.2.1" in commands
         assert not any(command.endswith("pipenv sync --dev") for command in commands)
         assert result["status"] == "workspace_ready"
 

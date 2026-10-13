@@ -11,16 +11,21 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
+    AgentActionSummary,
     FailureCategory,
     QAAttemptResult,
     RemediationTask,
     RoutingStrategy,
     StateConsistencyEvent,
+    TaskAttemptSnapshot,
+    UpdateRetryDiagnostics,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import (
@@ -49,6 +54,107 @@ def _graph_module():
     from remediation_engine.orchestration import graph
 
     return graph
+
+
+def _recover_update_worker_results(
+    target_tasks: list[RemediationTask],
+    target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot],
+    action_summaries: Sequence[AgentActionSummary],
+    retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics],
+    changed_files: Sequence[str],
+    errors: Sequence[str],
+) -> tuple[dict[str, WorkerAttemptResult], list[StateConsistencyEvent]]:
+    """Rebuild a missing single-task worker envelope from committed evidence.
+
+    The Supervisor needs an attempt-correlated result to route a successful
+    update to QA. If a worker returns its action summary but omits that typed
+    envelope, this boundary can safely recover the result only when the task,
+    snapshot, summary, and retry diagnostics all identify the same attempt.
+    Multi-task batches are left untouched because their aggregate changed-file
+    list cannot be attributed safely to individual tasks.
+    """
+    if len(target_tasks) != 1:
+        return {}, []
+
+    task = target_tasks[0]
+    snapshot = target_attempt_snapshots.get(task.task_id)
+    summary = next(
+        (item for item in reversed(action_summaries) if item.task_id == task.task_id),
+        None,
+    )
+    if snapshot is None or summary is None:
+        return {}, []
+    if (
+        task.current_attempt_id != snapshot.attempt_id
+        or task.task_revision != snapshot.task_revision
+        or summary.attempt_id != snapshot.attempt_id
+        or summary.task_revision != snapshot.task_revision
+        or summary.instruction_digest != snapshot.instruction_digest
+    ):
+        return {}, []
+
+    diagnostics = retry_diagnostics_by_task.get(task.task_id)
+    if (
+        diagnostics is not None
+        and diagnostics.committed_attempt_id is not None
+        and diagnostics.committed_attempt_id != snapshot.attempt_id
+    ):
+        return {}, []
+    if summary.status not in {AgentActionStatus.SUCCESS, AgentActionStatus.SURRENDER}:
+        return {}, []
+    if errors and summary.status == AgentActionStatus.SUCCESS:
+        return {}, []
+
+    succeeded = summary.status == AgentActionStatus.SUCCESS
+    attempted_versions = list(diagnostics.attempted_versions) if diagnostics else []
+    executed_versions = list(diagnostics.executed_versions) if diagnostics else []
+    effective_version = diagnostics.effective_target_version if diagnostics else None
+    effective_dependency_type = diagnostics.effective_dependency_type if diagnostics else None
+    if succeeded:
+        effective_version = effective_version or snapshot.selected_version
+        effective_dependency_type = effective_dependency_type or snapshot.target_dependency_type
+        if not executed_versions and effective_version:
+            executed_versions = [effective_version]
+    failure_reason = (
+        diagnostics.failure_reason
+        if diagnostics is not None and diagnostics.failure_reason
+        else ""
+        if succeeded
+        else summary.summary
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=snapshot.task_revision,
+        status=summary.status,
+        executed_versions=executed_versions,
+        changed_files=list(changed_files),
+        action_summary=summary,
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=attempted_versions or executed_versions,
+            executed_versions=executed_versions,
+            effective_target_version=effective_version,
+            effective_dependency_type=effective_dependency_type,
+            manifest_transaction_attempts=1 if succeeded else 0,
+            validation_calls=1 if succeeded else 0,
+            validation_passed=succeeded,
+            failure_reason=failure_reason,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+        errors=list(errors),
+    )
+    event = StateConsistencyEvent(
+        error_code="UPDATE_WORKER_RESULT_RECOVERED",
+        task_id=task.task_id,
+        expected_attempt_id=snapshot.attempt_id,
+        received_attempt_id=summary.attempt_id,
+        action="repaired",
+        details=(
+            "Recovered a missing typed update-worker result from a matching "
+            "attempt-tagged action summary."
+        ),
+    )
+    return {snapshot.attempt_id: worker_result}, [event]
 
 
 def _dispatch_boundary_rejection(
@@ -941,9 +1047,30 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
             summaries = [summary]
     if summaries:
         out["action_summaries"] = summaries
-    worker_results = result.get("worker_results_by_attempt") or {}
+    worker_results = dict(result.get("worker_results_by_attempt") or {})
+    recovery_events: list[StateConsistencyEvent] = []
+    if not worker_results:
+        worker_results, recovery_events = _recover_update_worker_results(
+            target_tasks=target_tasks,
+            target_attempt_snapshots=target_attempt_snapshots,
+            action_summaries=summaries,
+            retry_diagnostics_by_task=result.get("retry_diagnostics_by_task", {}) or {},
+            changed_files=result.get("changed_files", []) or [],
+            errors=result.get("errors", []) or [],
+        )
+        if recovery_events:
+            log.warning(
+                "update_subagent omitted a typed worker result for %s; "
+                "reconstructed it from the committed action summary.",
+                target_tasks[0].task_id,
+            )
     if worker_results:
-        out["worker_results_by_attempt"] = dict(worker_results)
+        out["worker_results_by_attempt"] = worker_results
+    if recovery_events:
+        out["consistency_events"] = [
+            *(result.get("consistency_events", []) or []),
+            *recovery_events,
+        ]
     if result.get("retry_diagnostics_by_task"):
         # Keep cumulative version/type evidence available to the Supervisor in
         # addition to the attempt-correlated worker envelope.

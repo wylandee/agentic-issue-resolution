@@ -16,6 +16,7 @@ from remediation_engine.contracts.schemas import (
     TaskAttemptSnapshot,
     TaskStatus,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import (
     ChangedFilesProjection,
     initial_orchestrator_state,
@@ -262,7 +263,7 @@ class TestTeardownNode:
         sandbox.read_file.assert_called_once_with("routes/login.ts")
         sandbox_type.assert_called_once_with(
             repo_root=None,
-            image="python:3.11-slim",
+            image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
             workspace_volume="agent_workspace_deadbeef",
         )
         client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")

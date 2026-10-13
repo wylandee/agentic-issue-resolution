@@ -11,10 +11,21 @@ from remediation_engine.api import RemediationResult
 from remediation_engine.cli import build_parser, main
 from remediation_engine.contracts.schemas import SystemContext
 from remediation_engine.language import (
+    LANGUAGE_CONFIGS,
     ProjectLanguage,
     detect_project_language,
     resolve_project_language,
 )
+
+
+def test_python_profile_uses_reusable_image_with_native_build_dependencies() -> None:
+    image = LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
+    assert image == "remediation-engine-python:3.11"
+
+    dockerfile = Path(__file__).resolve().parents[1] / "docker" / "python-workspace.Dockerfile"
+    contents = dockerfile.read_text(encoding="utf-8")
+    assert "FROM python:3.11-slim-bookworm" in contents
+    assert all(package in contents for package in ("build-essential", "libpq-dev", "python3-dev"))
 
 
 def _issues_file(tmp_path: Path) -> Path:

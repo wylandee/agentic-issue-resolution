@@ -43,7 +43,7 @@ from remediation_engine.orchestration.graph import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
-from remediation_engine.orchestration.supervisor_node import instruction_digest
+from remediation_engine.orchestration.supervisor_node import instruction_digest, run_supervisor_node
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
@@ -377,6 +377,105 @@ class TestPhase5GraphIntegration:
             result = run_update_subagent_from_orchestrator(state)
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
+
+    def test_update_wrapper_recovers_matching_worker_result_and_rejects_stale_summary(
+        self, tmp_path
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-task-1",
+                "selected_version": "4.17.21",
+                "target_package_name": "lodash",
+                "target_dependency_type": "dependencies",
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-task-1",
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task.task_revision,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            allowed_target_versions=["4.17.21"],
+            target_package_name="lodash",
+            target_dependency_type="dependencies",
+            allowed_dependency_types=["dependencies"],
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        summary = AgentActionSummary(
+            task_id="task-1",
+            attempt_id=snapshot.attempt_id,
+            task_revision=snapshot.task_revision,
+            instruction_digest=snapshot.instruction_digest,
+            status=AgentActionStatus.SUCCESS,
+            summary="Validated update to lodash 4.17.21.",
+        )
+        retry_diagnostics = UpdateRetryDiagnostics(
+            task_id="task-1",
+            committed_attempt_id=snapshot.attempt_id,
+            attempted_versions=["4.17.21"],
+            executed_versions=["4.17.21"],
+            effective_target_version="4.17.21",
+            effective_dependency_type="dependencies",
+        )
+        worker_output = {
+            "errors": [],
+            "action_summaries": [summary],
+            "changed_files": ["package.json"],
+            "retry_diagnostics_by_task": {"task-1": retry_diagnostics},
+        }
+
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            return_value=worker_output,
+        ):
+            result = run_update_subagent_from_orchestrator(state)
+
+        worker_result = result["worker_results_by_attempt"][snapshot.attempt_id]
+        assert worker_result.task_id == "task-1"
+        assert worker_result.task_revision == snapshot.task_revision
+        assert worker_result.status is AgentActionStatus.SUCCESS
+        assert worker_result.executed_versions == ["4.17.21"]
+        assert worker_result.changed_files == ["package.json"]
+        assert worker_result.execution_diagnostics.validation_passed is True
+        assert any(
+            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
+            for event in result["consistency_events"]
+        )
+
+        supervisor_result = run_supervisor_node({**state, **result})
+        assert supervisor_result["next_routing_step"] == "qa_critic"
+        assert supervisor_result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+
+        stale_summary = summary.model_copy(update={"attempt_id": "attempt-stale"})
+        stale_output = {
+            **worker_output,
+            "action_summaries": [stale_summary],
+        }
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            return_value=stale_output,
+        ):
+            stale_result = run_update_subagent_from_orchestrator(state)
+
+        assert "worker_results_by_attempt" not in stale_result
+        assert not any(
+            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
+            for event in stale_result.get("consistency_events", [])
+        )
 
     def test_workaround_wrapper_preserves_typed_attempt_result(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]

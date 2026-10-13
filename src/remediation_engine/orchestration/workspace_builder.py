@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _NPM_INSTALL_COMMAND = "npm install --package-lock=true"
 _NPM_INSTALL_TIMEOUT_SECONDS = 900
 _PYTHON_SETUP_TIMEOUT_SECONDS = 900
+_PYTHON_PIP_VERSION = "26.2.1"
 _INSTALL_LOG_TAIL_LINES = 80
 _SKIP_PACKAGE_DIR_NAMES = frozenset(
     {".git", "node_modules", ".venv", "venv", ".remedy-pipenv", "__pycache__"}
@@ -235,8 +236,10 @@ def _python_project_setup_plan(repo_root: Path) -> tuple[str, ...]:
         commands = [
             "rm -rf .venv .remedy-pipenv",
             "python -m venv .remedy-pipenv",
+            f".remedy-pipenv/bin/python -m pip install --upgrade pip=={_PYTHON_PIP_VERSION}",
             ".remedy-pipenv/bin/python -m pip install pipenv",
             "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv --python 3.11",
+            f".venv/bin/python -m pip install --upgrade pip=={_PYTHON_PIP_VERSION}",
         ]
         if not (repo_root / "Pipfile.lock").is_file():
             commands.append("PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv install --dev")
@@ -290,7 +293,11 @@ def _python_project_setup_plan(repo_root: Path) -> tuple[str, ...]:
             )
 
         constraints = _python_requires_constraints(repo_root, pipfile=False)
-        commands = ["rm -rf .venv .remedy-pipenv", "python -m venv .venv"]
+        commands = [
+            "rm -rf .venv .remedy-pipenv",
+            "python -m venv .venv",
+            f".venv/bin/python -m pip install --upgrade pip=={_PYTHON_PIP_VERSION}",
+        ]
         if (repo_root / "requirements.txt").is_file():
             commands.append(".venv/bin/python -m pip install -r requirements.txt")
 

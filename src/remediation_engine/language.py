@@ -35,7 +35,7 @@ LANGUAGE_CONFIGS: Mapping[ProjectLanguage, LanguageConfig] = MappingProxyType(
             ),
         ),
         ProjectLanguage.PYTHON: LanguageConfig(
-            docker_image="python:3.11-slim",
+            docker_image="remediation-engine-python:3.11",
             root_manifest_markers=(
                 "requirements.txt",
                 "setup.py",

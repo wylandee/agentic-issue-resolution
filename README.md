@@ -12,6 +12,23 @@ python -m pip install -e ".[dev]"
 ```
 
 Python 3.11 or newer and Docker are required. Copy `.env.example` to `.env`.
+
+Before running a Python project, build the reusable workspace image once from
+the repository root:
+
+```bash
+docker build -f docker/python-workspace.Dockerfile \
+  -t remediation-engine-python:3.11 .
+```
+
+The engine uses this local image for Python sandboxes. It includes the
+PostgreSQL and Python development headers and compiler toolchain needed by
+dependencies that build native extensions.
+
+Each fresh Python virtual environment also upgrades pip to the verified
+`26.2.1` release before project dependencies are installed, updating pip's
+bundled certificate store for that workspace.
+
 Set `OPENAI_API_KEY` to enable the QA-aware tactical Supervisor and other
 LLM-backed agents. The tactical Supervisor uses a stable system prompt plus a
 bounded dynamic context, may select an immediate remediation pivot, and falls

@@ -52,6 +52,15 @@ environment imports this checkout, not another editable installation:
 ```
 
 The printed path should be under this checkout's `src/remediation_engine`.
+
+Before the first Python remediation run, build the workspace image from the
+repository root:
+
+```bash
+docker build -f docker/python-workspace.Dockerfile \
+  -t remediation-engine-python:3.11 .
+```
+
 Then run the live example with the same environment:
 
 ```bash
@@ -63,11 +72,37 @@ Then run the live example with the same environment:
 ```
 
 A live run requires Docker, `OPENAI_API_KEY`, and network access needed for
-PyPI metadata and Dependency-Check. Python execution uses `python:3.11-slim`.
+PyPI metadata and Dependency-Check. Python workspaces use the prebuilt
+`remediation-engine-python:3.11` image shown above.
 The engine edits only its isolated workspace; it never applies the proposed
 patch to the host clone. Review `/tmp/pygoat.patch` before applying anything.
 The default pytest suite does not clone PyGoat, invoke Docker, contact PyPI, or
 call an LLM.
+
+## Batch remediation runs
+
+`run_batch.py` samples distinct package batches from the baseline issues. Each
+batch's canonical JSONL input, result, and proposed patch is written under
+`data/trajectories/`, along with an aggregate summary:
+
+```bash
+python examples/pygoat/run_batch.py \
+  --iterations 2 --batch-size 2 --seed 7
+```
+
+Use `--dry-run` to write the sampled issue subsets and summary without needing a
+PyGoat checkout or invoking remediation services:
+
+```bash
+python examples/pygoat/run_batch.py \
+  --iterations 2 --batch-size 2 --seed 7 --dry-run
+```
+
+The batch inputs are saved as `pygoat-run-01-issues.jsonl` (with the iteration
+number substituted); live runs also write the corresponding result JSON and
+patch. The summary is `pygoat-batch-runs-summary.json`. PyGoat has no checked-in
+suppression XML, so each request receives only its selected issues. The runner
+does not rewrite the baseline fixture or the host checkout.
 
 ## Offline fixture test
 
