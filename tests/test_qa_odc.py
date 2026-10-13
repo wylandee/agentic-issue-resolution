@@ -348,6 +348,14 @@ class TestRunOdc:
             joined = " ".join(args)
             assert _ODC_CACHE_VOLUME in joined
 
+    def test_disables_central_analyzer(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _run_odc("test-vol")
+            args = mock_run.call_args[0][0]
+
+        assert "--disableCentral" in args
+
     def test_excludes_engine_state_from_full_scan(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")

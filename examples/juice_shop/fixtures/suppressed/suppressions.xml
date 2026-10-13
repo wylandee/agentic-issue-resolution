@@ -64,12 +64,6 @@
     </suppress>
 
     <suppress>
-        <notes>Suppress all vulnerabilities for blaze.jar</notes>
-        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
-        <cpe>cpe:/a:apache:ivy</cpe>
-    </suppress>
-
-    <suppress>
         <notes>Suppress all vulnerabilities for body-parser (npm)</notes>
         <packageUrl regex="true">^pkg:npm/body-parser@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
@@ -123,13 +117,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep express-jwt as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
         <packageUrl regex="true">^pkg:npm/express-jwt@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for file-type (npm)</notes>
@@ -143,13 +135,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep got as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for got (npm)</notes>
         <packageUrl regex="true">^pkg:npm/got@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for grunt-cli (npm)</notes>
@@ -241,13 +231,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep notevil as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for notevil (npm)</notes>
         <packageUrl regex="true">^pkg:npm/notevil@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for parseuri (npm)</notes>
@@ -261,13 +249,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep sanitize-html as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for sanitize-html (npm)</notes>
         <packageUrl regex="true">^pkg:npm/sanitize-html@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for serialize-javascript (npm)</notes>

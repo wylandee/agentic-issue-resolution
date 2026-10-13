@@ -489,6 +489,9 @@ def _odc_command(
         "--out",
         scan_path,
         "--noupdate",
+        # Central Analyzer waits on Maven Central and exponentially retries
+        # failed requests; Maven QA already validates the resolved dependency tree.
+        "--disableCentral",
     ]
 
     if scan_subdir is None:
